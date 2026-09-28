@@ -40,7 +40,9 @@ behaviours on the engine, added and removed like any other.
 1. **Input.** The window's events are polled and `ae3d.input` resolves the
    actions and axes a program bound (`pressed`, `held`, `axis`) before any
    script asks for them. The camera's own controls are actions too, so a
-   gamepad flies every example.
+   gamepad flies every example, and the camera they fly keeps out of the
+   scene: `ae3d.viewpoint` sweeps it through the static geometry
+   ([rendering.md](rendering.md#the-camera)).
 2. **`fixed_update`** as many times as the frame's time covers at the fixed
    step (1/60 s by default, `engine_set_fixed_step`). Simulation goes here:
    the physics world steps, the horde separates and moves, the weather's
@@ -109,7 +111,7 @@ says what it is for and why it is shaped as it is.
 
 | Area | Modules |
 |---|---|
-| Foundation | `core` (linear algebra, scene types, camera, the backend vtable), `platform` (the window, input and timing, over GLFW called directly), `engine` (the loop, behaviours, the window), `behaviour` (game objects and components), `input` (actions and axes), `jobs` (the pool) |
+| Foundation | `core` (linear algebra, scene types, camera, the backend vtable), `platform` (the window, input and timing, over GLFW called directly), `engine` (the loop, behaviours, the window), `behaviour` (game objects and components), `input` (actions and axes), `jobs` (the pool), `viewpoint` (where the camera may stand -- a sphere the scene's static geometry keeps out -- and where it stands to frame something) |
 | Rendering | `vulkan`, `gl`, `glapi` (the GL entry points), `capture` (a GL frame read back), `vkmeter` (the frame's light), `vkreadback` (a frame read back, offscreen or captured), `vktexture` (textures made and uploaded), `vkoverlay` (the HUD recorded into the frame), `vkhost` (their buffers and memory; the five on contrib.vulkan.vk), `shaders` (the GLSL), `vkscene` (generated), `rendering` (shading presets), `offscreen` (a frame to a buffer), `sky` (the sun by the hour), `cloudnoise` (the clouds' textures), `water` (a Gerstner sea), `weather` (rain, snow, dust, storm) |
 | Geometry and assets | `geometry` (the mesh and instance stores the renderers read), `posing` (bone palettes, pose banks), `loader` (OBJ, primitives), `gltf`, `figure` (an animated glTF figure as one game object, and its scene record), `assets` (the Blender export), `blob` (a file as bytes), `picture` (an image file as RGBA: PNG, JPEG, TGA, BMP, and images registered by name), `jpeg` (its JPEG decoder), `inflate` (its PNG's deflate), `png` (a frame as a file), `noise`, `voxel`, `terrain`, `raycast`, `skin`, `anim`, `ik`, `glyphs` (a TrueType font, and its glyphs as a distance-field atlas; [ui.md](ui.md)) |
 | Game UI | `hud` (text and rectangles over the frame in the window's pixels, drawn by both renderers; [ui.md](ui.md)) |
