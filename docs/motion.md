@@ -2,7 +2,7 @@
 
 `ae3d.motion` is an active ragdoll (#414): a figure whose animation is played by its muscles rather than pasted onto its bones. It's what GTA IV and V get from NaturalMotion's Euphoria. Hit it, and it gives where it was hit and comes back; hit it harder than it can take, and it falls. It's an option on the engine's own motion system, a component on any ragdoll that wears a skinned figure (`physics.ragdoll_dress`), and off unless asked for.
 
-It has muscles, balance, reactions to hits, a protective fall and getting up again. Balance that steps to catch a fall, and writhing, come next.
+It has muscles, balance, reactions to hits, a protective fall, steps and staggers that catch it, writhing on the ground, and getting up again.
 
 ## A figure
 
@@ -50,16 +50,30 @@ The first version drove joint springs instead. A spring's stiffness is relative 
 A `POWERED` figure that leans more than 0.35 rad (20°) from its pose is falling (`falling(body)`), and it protects itself, as a person does (`set_protective(body, false)` turns this off):
 
 - it stops fighting for a balance that is lost: the pelvis's assist goes to 0;
-- its arms reach toward where it is falling, 0.7 down to 1 along the fall and a little out to each side so the hands land apart, and straight, since a straight arm takes the landing through its joints where a bent one folds on its elbow's muscle;
-- its head tucks 0.5 rad away from the fall, as far as the neck goes.
+- its arms reach toward where it is falling, 0.5 down to 1 along the fall and as far out to each side, so the hands land wide of the chest rather than under it, and as straight as the elbow lets them, since a straight arm takes the landing through its joints where a bent one folds on its elbow's muscle;
+- its trunk curls away from the fall, 0.5 rad at each joint of the spine, and its head tucks 0.5 rad: the rounded back and tucked chin of a breakfall, which keep the head off the ground as the trunk lands.
 
-If it catches itself (leans less than half the threshold again), the reach and the tuck let go and the balance comes back. If it lands, meaning it leans past 1.2 rad (69°) and holds still for ten steps, it lets go and lies (`lying(body)`): the reach and the tuck release and the muscles keep 15% of their budget, so it lies instead of holding a pose on the ground.
+Every one of these is built from the limb's rest place under its parent, as the parent is now, and kept 0.05 rad inside its joint's limits: a shoulder's 45° cone, a hip's 30°, the spine's 35°, the neck's 30°, and an elbow's or knee's hinge. A target past a limit only saturates the motor, and its torque, against the limit, turns the whole body instead of the limb.
+
+If it catches itself (leans less than half the threshold again), the reach and the curl let go and the balance comes back. Once it has landed, meaning it leans past 1.2 rad (69°) and its centre of mass comes down slower than 0.3 m/s, the reach and the curl let go, their work done; renewed on the ground, they pushed the figure along it and rolled it. Once it holds still there for ten steps, it lies (`lying(body)`): the muscles keep 15% of their budget, so it lies instead of holding a pose on the ground.
 
 **In the street.** `street_drive`'s bystanders are active ragdolls. The ones that stand hold themselves up on their muscles, and the walkers walk by their animation until struck. The car's blow is about 60 N·s per m/s it was closing at, along its heading. Past 4 m/s it lands on the pelvis, which takes the balance with it, and the figure goes down reaching for the road. Below that it lands on the spine, and the figure is knocked back and recovers. On the autopilot's run the three bystanders in the road are struck at 7 to 10 m/s and all three go down. Before this they went limp the moment they were touched.
 
-The reach and tuck are **aims** (`physics.ragdoll_aim(ragdoll, bone, rotation)`): a bone's joint drives it to a rotation in the world, from wherever its parent is, instead of to the animation's pose. The bones below it keep the animation's pose relative to it. Any controller can aim a bone this way, for example to turn a head toward a threat. `ragdoll_clear_aim` and `ragdoll_clear_aims` hand the bones back to the animation.
+The reach and the curl are **aims** (`physics.ragdoll_aim(ragdoll, bone, rotation)`): a bone's joint drives it to a rotation in the world, from wherever its parent is, instead of to the animation's pose. The bones below it keep the animation's pose relative to it. Any controller can aim a bone this way, for example to turn a head toward a threat. `ragdoll_clear_aim` and `ragdoll_clear_aims` hand the bones back to the animation. A limb's direction is its capsule's (`physics.ragdoll_bone_axis`): the reference ragdoll's limbs are mirrored, the left thigh and calf along their bodies' -x and the right along +x, the arms the other way about.
 
-The settings were chosen by measurement. Each setting was tried on falls backward, forward and sideways, against a twin that does not protect itself, measuring the head's speed as it met the ground. The one chosen did better in all three directions, and so did its neighbours. Softening the knees in a fall, the obvious idea, made every direction worse.
+**Which way it falls** is where its pelvis's up leans to: the world's up, turned as the pelvis is turned from the reference's pose. It is not the pelvis body's +y. The reference ragdoll's trunk bodies are made upside down (half a turn about x), so their +y points at the ground, and until this the arms reached away from the fall and the head tucked into it.
+
+The settings were chosen by measurement: thirty falls each way (blows of 376 to 424 N·s to the chest, a step or two apart in time), each against a twin that does not protect itself, measuring the head's speed as it met the ground. The one chosen did better in all three directions, and so did its neighbours:
+
+| | from behind (forwards) | from the front (over backwards) | from the side |
+|---|---|---|---|
+| protected, the head's speed, mean | 1.18 m/s | 0.33 m/s | 0.61 m/s |
+| its unprotected twin | 3.46 m/s | 2.41 m/s | 1.68 m/s |
+| protected slower, of 30 | 30 | 30 | 23 |
+| the hands down before the head, of 30 | 30 | 30 | 30 |
+| lying still within three seconds of the blow, of 30 | 27 | 30 | 24 |
+
+From the side, the seven not slower met the ground with the head one to one and a half seconds after they landed, rolling over on the ground, not in the fall; in most of the others the head never touches it. Before the fall's way and the limbs' axes were set right, the protection did no better than the twin on average, in any direction. Softening the legs in a fall, tried, left the figure crumpled on its knees rather than lying.
 
 ## Stepping to catch itself
 
@@ -67,12 +81,14 @@ Pushed, a `POWERED` figure steps to catch itself (`set_stepping`, on by
 default; `steps_taken` counts them). Every fixed step it watches its
 capture point: the centre of mass carried on by its velocity times
 √(height / g), where it would come to rest over a foot. When that point
-leaves the ground the two feet cover (heel to toe) by more than 8 cm, and
-the figure is moving over the ground at 0.25 m/s or more, a foot swings to
-put itself under it. The thigh reaches toward the spot with the knee let
-bend for 0.12 s, so the foot clears the ground, then the leg straightens
-onto it; the whole step takes 0.3 s. It lands 5 cm past the capture point,
-and at most half a metre from under the hip.
+leaves the ground the two feet cover (heel under the ankle, toe 0.2 m
+ahead) by more than 24 cm, as far as the balance the pelvis keeps brings
+back without a step, and the figure is moving over the ground at 0.25 m/s
+or more, a foot swings to put itself under it. The thigh reaches toward
+the spot, within the hip's cone, with the knee bent 0.5 rad for the first
+0.12 s so the foot clears the ground, then the leg straightens onto it;
+the whole step takes 0.3 s. It lands 5 cm past the capture point, and at
+most half a metre from under the hip.
 
 Which foot moves:
 - **Pushed forward:** the foot further behind swings through.
@@ -84,7 +100,13 @@ Which foot moves:
   have held.
 - **A push past a stride and a half:** that's a fall, and the protective
   fall has it. A leg swinging as the figure goes over only took the fall
-  from the arms: the head met the ground at 5.3 m/s instead of 1.8.
+  from the arms.
+
+The feet are where the calves' own capsules end. A calf body carries its
+foot as a second capsule, and the first a body lists is the last it was
+given: taken for the calf, the foot put the ankle at the toe, 13 cm too
+far forward, and aimed the shin along the foot, 50° off. The margin was
+8 cm while the feet were measured from the toes.
 
 `tests/test_balance.ae` pushes figures at the chest, each push with and
 without stepping:
@@ -92,15 +114,95 @@ without stepping:
 | push | without stepping | stepping |
 |---|---|---|
 | 60 N·s from behind | stands | stands, no step |
-| 270 N·s from behind | falls | stands, 4 steps |
+| 270 N·s from behind | falls | stands, 2 steps |
 | 180 N·s from the side | stands | stands, 1 step |
 | 150 N·s from in front | stands | stands, no step |
 
-A sweep from 60 to 270 N·s found how far each way holds:
-- **Forward:** 240 N·s without stepping, 270 or more with it.
+Over thirty runs of each push (the push 5% and 10% either way, a step or
+two later), the nudge is held without a step, the push from behind caught
+and the push from the side stepped out from every time, and the push onto
+the heels held without a step in 29; the thirtieth, 165 N·s, is past
+what the pelvis holds backwards, and falls either way.
+
+How far each way holds:
+- **Forward:** 240 N·s without stepping, 340 N·s staggering.
 - **Sideways:** 210 N·s either way; stepping moves the feet rather than
   holding the pose.
 - **Backward:** 150 N·s either way.
+
+## Staggering
+
+A shove one step does not catch, the figure staggers from
+(`staggering(body)`): once a step has been taken and the capture point is
+still off the feet, the steps come in a run, each to where the capture
+point is by then, quicker than the first (0.22 s each, 0.03 s apart), for
+as long as the capture point is within three strides. While it staggers,
+the protective fall waits until the figure leans past 0.8 rad (46°) rather
+than 0.35: a figure still catching itself is not yet falling. It ends
+standing, or falls into the protective fall.
+
+`tests/test_stagger.ae` shoves figures from behind, each with and without
+stepping, and runs the whole twice:
+
+| shove | without stepping | stepping |
+|---|---|---|
+| 330 N·s | falls | staggers 3 steps (0.03, 0.37 and 0.63 s after the shove) and stands |
+| 360 N·s | falls | staggers 2 steps (0.17 and 0.5 s), then falls into the protective fall |
+
+It holds two or more steps for the 330 N·s shove, none more than 0.4 s
+after the last, the stagger over once it stands, and the same steps at the
+same fixed steps, and the same end to the bit, on the second run. Across
+330 N·s shoves a step or four apart in time, it staggers two to four steps
+and stands every time; from 290 to 340 N·s, thirty runs, it stands in
+every one, where stepping without the stagger's quicker steps two of them
+fell. At 350 N·s it stands in three of five, and from 360 it falls.
+
+## Writhing
+
+Down and hurt, a `POWERED` figure writhes (`set_writhing(body, seconds)`,
+off by default; `writhing(body)` says it is): for the seconds it is given
+after it lands, then it lies still and settles, so `set_get_up` counts from
+then. A `LIMP` figure is past it.
+
+- **The legs** draw up together and let down, once every 1.7 s: the hips
+  bend forward 0.6 rad and the knees 0.2 at the top. The knees bent less
+  than the hips lift the feet off the ground; a foot dragged along it,
+  the legs half a cycle apart, pushed the figure across the ground.
+- **The arms** fold over its front, toward where it was last struck: the
+  shoulders forward 0.7 rad and in 0.3, the elbows 0.6, rocking 0.12 rad
+  every 1.1 s. The reference ragdoll's shoulders and elbows turn too little
+  for a hand to reach its own chest, so the fold is as far as they go.
+- **It fades:** full for the first half of its time, then less and less.
+- **Face down**, it turns over onto its back first, and again whenever it
+  rolls onto its front: the arm on the side that is higher already pushes
+  the ground away, driven back to its rest at the figure's side with its
+  full muscle, the leg on that side draws up (the hip 0.5 rad, the knee
+  0.8), and the other arm and leg let go so the body rolls over them.
+  Writhing face down, the arms folding toward a wound under the body
+  pressed into the ground and pushed the figure up onto them.
+- **A limb a blow left weak**, or the struck arm, doesn't take part: shot in
+  the arm, it clutches with the other, and it turns over on the other side.
+
+Limbs that writhe have 45% of their muscle, turning over all of it; the
+rest keep the 15% lying leaves them, since a limb not aimed drives toward
+the standing pose and, strong, would push the body over. Every bend is
+from the limb's rest place under its parent, within its joint's limits.
+
+`tests/test_writhe.ae` knocks three figures down with 450 N·s from behind:
+one writhes for three seconds, a twin lies still, and a third is struck
+on the right forearm once down. They land face down.
+
+| | Measured |
+|---|---|
+| the left hip's swing, 0.5 to 2.5 s after landing | 1.18 rad writhing, 0.006 still |
+| the left upper arm toward the chest's front (cosine) | 0.47 writhing, -0.01 still, 0.52 struck on the right forearm |
+| the pelvis's drift from 1.5 s down to the end of writhing | 0.25 m (the still twin's, over three seconds, 0.08) |
+| it stops | 3 s after landing, down 0.15 s later |
+| the struck arm | never aimed |
+| the same run twice | the same to the bit |
+
+Across twenty shoves from behind, 420 to 515 N·s, every one of them passes
+all of these.
 
 ## On a figure
 
@@ -261,20 +363,19 @@ The networked horde (`ae3d.nethorde`) keeps its own columns and hands nothing ov
 | the felled, 400 N·s to the chest | down |
 | the struck, 8 N·s to the right upper arm | its muscle at 5% (the forearm's at half), then back to full |
 | the limp | down |
-| three protected fallers, felled by 400 N·s from the front, from behind and from the side | the hands reach the ground first each time (6, 4 and 15 steps before the head); the head meets it at 1.82, 1.73 and 1.22 m/s |
-| their unprotected twins | the head meets it at 4.53, 3.68 and 2.01 m/s |
+| three protected fallers, felled by 400 N·s from behind (forwards), from the front (over backwards) and from the side | the hands reach the ground first each time (26 and 40 steps before the head, and the head never does from the side); the head meets it at 1.04 and 0.83 m/s |
+| their unprotected twins | the head meets it at 1.95, 3.68 and 2.19 m/s |
 | the protected fallers, landed | each lets go and lies |
 | the felled, as drawn | its drawn hips at 0.19 m, with its pelvis body (a standing figure's are above 0.8 m) |
 
-The shoved never takes itself for falling. Hands and head are measured by their capsules' lowest points (the forearm's hand end, and the neck bone's capsule, which is the head).
+The shoved never takes itself for falling. Hands and head are measured by their capsules' lowest points (the forearm's hand end, and the neck bone's capsule, which is the head). The figures face -z, the way their toes and knees point, so a blow along -z is from behind; the test named the first two ways the other way round, and measured the left hand on the right forearm's capsule, 0.31 m behind the elbow, until the limbs' mirroring was found.
 
 Pose error is measured per joint (a bone against its parent), which is what a muscle answers for. The lean is the pelvis's up against the animation's. A figure turned about the vertical is still on its pose.
 
 ## Next
 
 As #414 lays out:
-- balance by feedback on the hips and the stance foot, stepping when the centre of mass leaves the feet;
-- stagger and writhe;
+- balance by feedback on the hips and the stance foot, in place of the pelvis's assist;
 - get-up clips from the pipeline in place of the keyed ways up, once a figure has them;
 - the inspector's section, with a Hit button in the viewport;
 - handing over from the networked horde: the strike and the giving back as horde inputs, so every peer takes the same zombie out at the same tick;
