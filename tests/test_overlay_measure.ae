@@ -1,0 +1,826 @@
+// What #449 asks the overlay to be held to, measured on both renderers:
+//
+// - Text at 96, 24 and 12 px, read back and compared along every pixel row
+//   with the glyphs' own shapes: where the drawn edge crosses half ink
+//   against where the atlas's field crosses 0.5 at that place (what the
+//   atlas says the glyph is) and against the font's outline itself (what
+//   the glyph is); and how far the edge takes to rise from 10% to 90% ink.
+//   A distance field is sharp at any size: the edge rises over the same
+//   fraction of a pixel at 96 px as at 12, where a picture of the glyphs
+//   baked at 64 px and scaled up would blur by half again.
+// - What the overlay costs a frame at 1280 x 720: 1,000 rectangles, and
+//   5,000 glyphs -- the CPU's time to lay them out and the device's to
+//   draw them, from its own timers.
+// - The two renderers' frames against each other, at the backend-parity
+//   test's tolerance.
+//
+// Every edge measured is one a reader sees: a crossing of a row with the
+// outline that is at least 1.5 px from any other on the row (so the ramp
+// of the edge beside it does not reach it), on an edge no more than 60
+// degrees from upright (so a row crosses it cleanly). Distances are across
+// the edge -- along the row, times the cosine of its slant.
+
+import std.mem
+import std.list
+import std.string
+import ae3d.core
+import ae3d.platform
+import ae3d.hud
+import ae3d.glyphs
+import ae3d.gl
+import ae3d.vulkan
+import ae3d.vkoverlay
+import ae3d.offscreen
+import ae3d.png
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern fflush(stream: ptr) -> int
+extern floor(x: float) -> float
+extern sqrt(x: float) -> float
+
+const WIDTH = 1280
+const HEIGHT = 720
+const SAMPLE = "HOgaxe4"
+const TEXT_X = 16
+const QUADS = 1000
+const GLYPHS = 5000
+const FRAMES_TIMED = 40
+const WARM = 6
+// A text frame's rows: each size's first line at its own height.
+const SIZE_COUNT = 3
+
+var g_checks = 0
+var g_failures = 0
+// OpenGL's frames, for Vulkan's to be held to.
+var g_opengl: ptr = null            // ptr[3]: the text, the quads, the glyphs
+var g_face: ptr = null
+
+check(name: string, condition: bool) {
+    g_checks = g_checks + 1
+    if condition {
+        println("  ok   ${name}")
+    } else {
+        println("  FAIL ${name}")
+        g_failures = g_failures + 1
+    }
+    fflush(null)
+}
+
+phase(name: string) {
+    println("  -- ${name}")
+    fflush(null)
+}
+
+fabs(v: float) -> float {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+iabs(v: int) -> int {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// How far a drawn edge may stand from the shape's on average, at each
+// size: what this machine measures (docs/ui.md) and a third again. A field
+// sampled at a pixel's centre departs most from the pixel's area where a
+// stroke is a pixel wide, at 12 px.
+edge_bound(k: int) -> float {
+    if k == 0 { return 0.06 }
+    if k == 1 { return 0.08 }
+    return 0.14
+}
+
+size_at(k: int) -> float {
+    if k == 0 { return 96.0 }
+    if k == 1 { return 24.0 }
+    return 12.0
+}
+
+top_at(k: int) -> float {
+    if k == 0 { return 8.0 }
+    if k == 1 { return 150.0 }
+    return 200.0
+}
+
+// --- the glyphs' own shapes, where they were drawn ----------------------------------------------------
+
+// One glyph of the sample as drawn: its pen and baseline on the screen, its
+// quad, its place in the atlas, its outline's segments on the screen.
+struct MeasureGlyph {
+    pen_x: float
+    baseline: float
+    qx0: float
+    qy0: float
+    per_texel: float          // screen pixels an atlas pixel
+    atlas_x: int
+    atlas_y: int
+    atlas_w: int
+    atlas_h: int
+    segments: ptr             // float[count * 4]: x0 y0 x1 y1, screen pixels, y down
+    count: int
+}
+
+// The sample at a size, glyph by glyph, as hud.text lays it out at (x, y).
+sample_glyphs(a: *GlyphAtlas, face: *Typeface, size: float, x: float, y: float) -> ptr {
+    placed = list.new()
+    gs = a.glyphs as AtlasGlyph[]
+    scale = size / (a.units_per_em as float)
+    texel = size / a.size_px
+    baseline = y + (a.ascender as float) * scale
+    pen = 0.0
+    previous = 0 - 1
+    length = 7
+    codes = [72, 79, 103, 97, 120, 101, 52]
+    k = 0
+    while k < length {
+        slot = glyphs.slot_of(a, codes[k])
+        if previous >= 0 { pen = pen + (glyphs.atlas_kerning(a, previous, slot) as float) * scale }
+        if gs[slot].atlas_w > 0 {
+            g = calloc(1, sizeof(MeasureGlyph)) as *MeasureGlyph
+            g.pen_x = x + pen
+            g.baseline = baseline
+            g.qx0 = x + pen + (gs[slot].bearing_x as float) * texel
+            g.qy0 = baseline - (gs[slot].bearing_y as float) * texel
+            g.per_texel = texel
+            g.atlas_x = gs[slot].atlas_x
+            g.atlas_y = gs[slot].atlas_y
+            g.atlas_w = gs[slot].atlas_w
+            g.atlas_h = gs[slot].atlas_h
+            o = glyphs.outline(face, gs[slot].glyph, scale, 0.001)
+            g.count = o.count
+            g.segments = calloc(o.count * 4, 8)
+            src = o.segments as float[]
+            dst = g.segments as float[]
+            s = 0
+            while s < o.count {
+                dst[s * 4] = g.pen_x + src[s * 4]
+                dst[s * 4 + 1] = baseline - src[s * 4 + 1]
+                dst[s * 4 + 2] = g.pen_x + src[s * 4 + 2]
+                dst[s * 4 + 3] = baseline - src[s * 4 + 3]
+                s = s + 1
+            }
+            glyphs.outline_free(o)
+            list.add_raw(placed, g as ptr)
+        }
+        pen = pen + (gs[slot].advance as float) * scale
+        previous = slot
+        k = k + 1
+    }
+    return placed
+}
+
+glyphs_free(placed: ptr) {
+    k = 0
+    while k < list.size(placed) {
+        g = list.get_raw(placed, k) as *MeasureGlyph
+        free(g.segments)
+        free(g as ptr)
+        k = k + 1
+    }
+    list.free(placed)
+}
+
+// --- the edges, measured -------------------------------------------------------------------------------
+//
+// The text is compared by pixels with a perfect rendering of the same
+// shape: each pixel's area inside it, from sixteen lines across the pixel,
+// each line filled between the shape's edges exactly (a scanline fill). The
+// shape is the atlas's own -- where its field, filtered as a sampler
+// filters it, is above one half -- and the font's outline, by the non-zero
+// rule TrueType fills by. A pixel holds as much more ink than the perfect
+// one as an edge through it stands further out, so the ink the two differ
+// by over the whole text, divided by the length of its edges, is how far
+// the drawn edge stands from the shape's on average, in pixels; its sign
+// says bolder (+) or thinner. How soft the edge is drawn is how much ink is
+// in part-covered pixels, a(1 - a) summed, against the perfect rendering's:
+// 1 is as sharp as the pixels allow, and a blurred edge is more.
+
+struct EdgeStats {
+    length: float                 // the outline's, pixels
+    atlas_bias: float             // sums over the pixels, divided by length at the end
+    atlas_mean: float
+    atlas_worst: float            // one pixel's ink, 0..1
+    outline_bias: float
+    outline_mean: float
+    outline_worst: float
+    soft_drawn: float
+    soft_atlas: float
+}
+
+const SUBROWS = 16
+const FIELD_STEP = 0.125          // px between the field's samples along a line, then bisected
+
+// The atlas as floats, read once.
+var g_field: ptr = null
+
+field_texel(a: *GlyphAtlas, x: int, y: int) -> float {
+    if x < 0 || y < 0 || x >= a.width || y >= a.height { return 0.0 }
+    return (g_field as float[])[y * a.width + x]
+}
+
+field_ready(a: *GlyphAtlas) {
+    if g_field != null { return }
+    g_field = calloc(a.width * a.height, 8)
+    k = 0
+    while k < a.width * a.height {
+        (g_field as float[])[k] = (mem.get_uint8(a.pixels, k) as float) / 255.0
+        k = k + 1
+    }
+}
+
+field_at(a: *GlyphAtlas, g: *MeasureGlyph, sx: float, sy: float) -> float {
+    return bilinear_field(a, (g.atlas_x as float) + (sx - g.qx0) / g.per_texel,
+                          (g.atlas_y as float) + (sy - g.qy0) / g.per_texel)
+}
+
+// The field at a point of the atlas, its texels' centres at half-texels.
+bilinear_field(a: *GlyphAtlas, ax: float, ay: float) -> float {
+    tx = ax - 0.5
+    ty = ay - 0.5
+    ix = floor(tx)
+    iy = floor(ty)
+    fx = tx - ix
+    fy = ty - iy
+    x0 = ix as int
+    y0 = iy as int
+    top = field_texel(a, x0, y0) * (1.0 - fx) + field_texel(a, x0 + 1, y0) * fx
+    bottom = field_texel(a, x0, y0 + 1) * (1.0 - fx) + field_texel(a, x0 + 1, y0 + 1) * fx
+    return top * (1.0 - fy) + bottom * fy
+}
+
+ink(pixels: ptr, x: int, y: int) -> float {
+    if x < 0 || y < 0 || x >= WIDTH || y >= HEIGHT { return 0.0 }
+    return (mem.get_uint8(pixels, (y * WIDTH + x) * 4) as float) / 255.0
+}
+
+// A box of the frame's ink, 0..1, as floats.
+drawn_region(pixels: ptr, x0: int, y0: int, x1: int, y1: int) -> ptr {
+    region = calloc((x1 - x0) * (y1 - y0), 8)
+    row = y0
+    while row < y1 {
+        i = x0
+        while i < x1 {
+            (region as float[])[(row - y0) * (x1 - x0) + (i - x0)] = ink(pixels, i, row)
+            i = i + 1
+        }
+        row = row + 1
+    }
+    return region
+}
+
+// What a bitmap font draws: each glyph's coverage baked into texels at the
+// atlas's size (each texel's area inside the atlas's shape, from sixteen
+// samples), and scaled to the size drawn by filtering those texels
+// bilinearly at each pixel's centre -- the same atlas, as a picture of the
+// glyphs rather than a field.
+bitmap_region(a: *GlyphAtlas, placed: ptr, x0: int, y0: int, x1: int, y1: int) -> ptr {
+    region = calloc((x1 - x0) * (y1 - y0), 8)
+    k = 0
+    while k < list.size(placed) {
+        g = list.get_raw(placed, k) as *MeasureGlyph
+        cover = calloc(g.atlas_w * g.atlas_h, 8)
+        j = 0
+        while j < g.atlas_h {
+            i = 0
+            while i < g.atlas_w {
+                inside = 0
+                sy = 0
+                while sy < 4 {
+                    sx = 0
+                    while sx < 4 {
+                        ax = (g.atlas_x + i) as float + ((sx as float) + 0.5) / 4.0
+                        ay = (g.atlas_y + j) as float + ((sy as float) + 0.5) / 4.0
+                        if bilinear_field(a, ax, ay) > 0.5 { inside = inside + 1 }
+                        sx = sx + 1
+                    }
+                    sy = sy + 1
+                }
+                (cover as float[])[j * g.atlas_w + i] = (inside as float) / 16.0
+                i = i + 1
+            }
+            j = j + 1
+        }
+        row = y0
+        while row < y1 {
+            px = x0
+            while px < x1 {
+                // The pixel's centre in the glyph's texels, and its bilinear
+                // sample of their coverage.
+                tx = ((px as float) + 0.5 - g.qx0) / g.per_texel - 0.5
+                ty = ((row as float) + 0.5 - g.qy0) / g.per_texel - 0.5
+                if tx > 0.0 - 1.0 && ty > 0.0 - 1.0 && tx < (g.atlas_w as float) && ty < (g.atlas_h as float) {
+                    ix = floor(tx)
+                    iy = floor(ty)
+                    fx = tx - ix
+                    fy = ty - iy
+                    c00 = cover_at(cover, g, ix as int, iy as int)
+                    c10 = cover_at(cover, g, (ix as int) + 1, iy as int)
+                    c01 = cover_at(cover, g, ix as int, (iy as int) + 1)
+                    c11 = cover_at(cover, g, (ix as int) + 1, (iy as int) + 1)
+                    v = (c00 * (1.0 - fx) + c10 * fx) * (1.0 - fy) + (c01 * (1.0 - fx) + c11 * fx) * fy
+                    at = (row - y0) * (x1 - x0) + (px - x0)
+                    if v > (region as float[])[at] { (region as float[])[at] = v }
+                }
+                px = px + 1
+            }
+            row = row + 1
+        }
+        free(cover)
+        k = k + 1
+    }
+    return region
+}
+
+cover_at(cover: ptr, g: *MeasureGlyph, i: int, j: int) -> float {
+    if i < 0 || j < 0 || i >= g.atlas_w || j >= g.atlas_h { return 0.0 }
+    return (cover as float[])[j * g.atlas_w + i]
+}
+
+// A span [from, to) of a line, one sixteenth of a pixel tall, into a row
+// of coverage starting at pixel x0.
+add_span(cover: ptr, x0: int, count: int, from: float, to: float) {
+    if to <= from { return }
+    first = (floor(from)) as int
+    last = (floor(to)) as int
+    px = first
+    while px <= last {
+        if px >= x0 && px < x0 + count {
+            left = from
+            if (px as float) > left { left = px as float }
+            right = to
+            if ((px + 1) as float) < right { right = (px + 1) as float }
+            if right > left { (cover as float[])[px - x0] = (cover as float[])[px - x0] + (right - left) / (SUBROWS as float) }
+        }
+        px = px + 1
+    }
+}
+
+// Sorts n (x, weight) pairs by x: insertion, a line's crossings are few.
+sort_pairs(xs: ptr, ws: ptr, n: int) {
+    x = xs as float[]
+    w = ws as float[]
+    i = 1
+    while i < n {
+        kx = x[i]
+        kw = w[i]
+        j = i - 1
+        while j >= 0 && x[j] > kx {
+            x[j + 1] = x[j]
+            w[j + 1] = w[j]
+            j = j - 1
+        }
+        x[j + 1] = kx
+        w[j + 1] = kw
+        i = i + 1
+    }
+}
+
+// The outline's coverage of a line at height y: its crossings with their
+// winding, filled where the winding is not zero.
+outline_line(placed: ptr, y: float, cover: ptr, x0: int, count: int, xs: ptr, ws: ptr) {
+    n = 0
+    k = 0
+    while k < list.size(placed) {
+        g = list.get_raw(placed, k) as *MeasureGlyph
+        seg = g.segments as float[]
+        s = 0
+        while s < g.count {
+            y0 = seg[s * 4 + 1]
+            y1 = seg[s * 4 + 3]
+            if ((y > y0 && y <= y1) || (y > y1 && y <= y0)) && n < 4096 {
+                (xs as float[])[n] = seg[s * 4] + (y - y0) * (seg[s * 4 + 2] - seg[s * 4]) / (y1 - y0)
+                direction = 1.0
+                if y1 < y0 { direction = 0.0 - 1.0 }
+                (ws as float[])[n] = direction
+                n = n + 1
+            }
+            s = s + 1
+        }
+        k = k + 1
+    }
+    sort_pairs(xs, ws, n)
+    winding = 0.0
+    opened = 0.0
+    k = 0
+    while k < n {
+        before = winding
+        winding = winding + (ws as float[])[k]
+        if before == 0.0 && winding != 0.0 { opened = (xs as float[])[k] }
+        if before != 0.0 && winding == 0.0 { add_span(cover, x0, count, opened, (xs as float[])[k]) }
+        k = k + 1
+    }
+}
+
+// The atlas's shape's coverage of a line at height y: each glyph's field
+// sampled along its quad, where it crosses one half bisected, the spans
+// inside it merged across glyphs.
+atlas_line(a: *GlyphAtlas, placed: ptr, y: float, cover: ptr, x0: int, count: int, xs: ptr, ws: ptr) {
+    n = 0
+    k = 0
+    while k < list.size(placed) {
+        g = list.get_raw(placed, k) as *MeasureGlyph
+        qy1 = g.qy0 + (g.atlas_h as float) * g.per_texel
+        if y > g.qy0 && y < qy1 {
+            left = g.qx0
+            right = g.qx0 + (g.atlas_w as float) * g.per_texel
+            x = left
+            inside = field_at(a, g, x, y) > 0.5
+            start = left
+            while x < right {
+                nx = x + FIELD_STEP
+                now = field_at(a, g, nx, y) > 0.5
+                if now != inside {
+                    lo = x
+                    hi = nx
+                    m = 0
+                    while m < 24 {
+                        mid = (lo + hi) * 0.5
+                        if (field_at(a, g, mid, y) > 0.5) == now { hi = mid } else { lo = mid }
+                        m = m + 1
+                    }
+                    edge = (lo + hi) * 0.5
+                    if now {
+                        start = edge
+                    } else if n + 1 < 4096 {
+                        (xs as float[])[n] = start
+                        (ws as float[])[n] = edge
+                        n = n + 1
+                    }
+                    inside = now
+                }
+                x = nx
+            }
+            if inside && n + 1 < 4096 {
+                (xs as float[])[n] = start
+                (ws as float[])[n] = right
+                n = n + 1
+            }
+        }
+        k = k + 1
+    }
+    // Spans from neighbouring glyphs that overlap are one.
+    sort_pairs(xs, ws, n)
+    k = 0
+    while k < n {
+        from = (xs as float[])[k]
+        to = (ws as float[])[k]
+        j = k + 1
+        while j < n && (xs as float[])[j] <= to {
+            if (ws as float[])[j] > to { to = (ws as float[])[j] }
+            j = j + 1
+        }
+        add_span(cover, x0, count, from, to)
+        k = j
+    }
+}
+
+// The drawn text in a box of the frame against the perfect renderings of
+// the atlas's shape and of the outline.
+measure_edges(region: ptr, a: *GlyphAtlas, placed: ptr, x0: int, y0: int, x1: int, y1: int) -> EdgeStats {
+    stats = EdgeStats { length: 0.0, atlas_bias: 0.0, atlas_mean: 0.0, atlas_worst: 0.0, outline_bias: 0.0,
+                        outline_mean: 0.0, outline_worst: 0.0, soft_drawn: 0.0, soft_atlas: 0.0 }
+    field_ready(a)
+    k = 0
+    while k < list.size(placed) {
+        g = list.get_raw(placed, k) as *MeasureGlyph
+        seg = g.segments as float[]
+        s = 0
+        while s < g.count {
+            dx = seg[s * 4 + 2] - seg[s * 4]
+            dy = seg[s * 4 + 3] - seg[s * 4 + 1]
+            stats.length = stats.length + sqrt(dx * dx + dy * dy)
+            s = s + 1
+        }
+        k = k + 1
+    }
+    count = x1 - x0
+    atlas_cover = calloc(count, 8)
+    outline_cover = calloc(count, 8)
+    xs = calloc(4096, 8)
+    ws = calloc(4096, 8)
+    row = y0
+    while row < y1 {
+        i = 0
+        while i < count {
+            (atlas_cover as float[])[i] = 0.0
+            (outline_cover as float[])[i] = 0.0
+            i = i + 1
+        }
+        sub = 0
+        while sub < SUBROWS {
+            y = (row as float) + ((sub as float) + 0.5) / (SUBROWS as float)
+            outline_line(placed, y, outline_cover, x0, count, xs, ws)
+            atlas_line(a, placed, y, atlas_cover, x0, count, xs, ws)
+            sub = sub + 1
+        }
+        i = 0
+        while i < count {
+            drawn = (region as float[])[(row - y0) * count + i]
+            shape = (atlas_cover as float[])[i]
+            truth = (outline_cover as float[])[i]
+            stats.atlas_bias = stats.atlas_bias + (drawn - shape)
+            stats.atlas_mean = stats.atlas_mean + fabs(drawn - shape)
+            if fabs(drawn - shape) > stats.atlas_worst { stats.atlas_worst = fabs(drawn - shape) }
+            stats.outline_bias = stats.outline_bias + (drawn - truth)
+            stats.outline_mean = stats.outline_mean + fabs(drawn - truth)
+            if fabs(drawn - truth) > stats.outline_worst { stats.outline_worst = fabs(drawn - truth) }
+            stats.soft_drawn = stats.soft_drawn + drawn * (1.0 - drawn)
+            stats.soft_atlas = stats.soft_atlas + shape * (1.0 - shape)
+            i = i + 1
+        }
+        row = row + 1
+    }
+    stats.atlas_bias = stats.atlas_bias / stats.length
+    stats.atlas_mean = stats.atlas_mean / stats.length
+    stats.outline_bias = stats.outline_bias / stats.length
+    stats.outline_mean = stats.outline_mean / stats.length
+    free(atlas_cover)
+    free(outline_cover)
+    free(xs)
+    free(ws)
+    return stats
+}
+
+// --- a renderer, offscreen ------------------------------------------------------------------------------
+
+frame_of(backend: *Backend) -> ptr {
+    core.backend_frame_pixels(backend)
+    return core.backend_frame_pixels(backend)
+}
+
+copy_frame(pixels: ptr) -> ptr {
+    if pixels == null { return null }
+    copy = calloc(WIDTH * HEIGHT, 4)
+    mem.copy(copy, pixels, (WIDTH * HEIGHT * 4) as long)
+    return copy
+}
+
+// The text frame: the sample at each size, white over black.
+text_frame(backend: *Backend, name: string, cam: *Camera, light: *Light) -> ptr {
+    o = hud.hud_new()
+    core.backend_set_overlay(backend, o as ptr)
+    if !hud.font_ready(o) {
+        core.backend_set_overlay(backend, null)
+        hud.hud_free(o)
+        return null
+    }
+    white = hud.rgba(1.0, 1.0, 1.0, 1.0)
+    k = 0
+    while k < SIZE_COUNT {
+        hud.text(o, TEXT_X as float, top_at(k), size_at(k), SAMPLE, white)
+        k = k + 1
+    }
+    core.backend_render(backend, cam, light)
+    drawn = copy_frame(frame_of(backend))
+    if drawn != null {
+        if core.env_int("AE3D_MEASURE_PNG", 0) == 1 { png.write("build/measure_text_${name}.png", drawn, WIDTH, HEIGHT) }
+        a = hud.atlas(o)
+        face = g_face as *Typeface
+        k = 0
+        while k < SIZE_COUNT {
+            size = size_at(k)
+            top = top_at(k)
+            placed = sample_glyphs(a, face, size, TEXT_X as float, top)
+            w, h = hud.measure(o, SAMPLE, size)
+            x0 = TEXT_X - 3
+            y0 = (top as int) - 2
+            x1 = TEXT_X + (w as int) + 4
+            y1 = ((top + h) as int) + 3
+            region = drawn_region(drawn, x0, y0, x1, y1)
+            stats = measure_edges(region, a, placed, x0, y0, x1, y1)
+            free(region)
+            soft = stats.soft_drawn / stats.soft_atlas
+            if k == 0 {
+                // The same atlas as a picture of the glyphs, scaled up: what
+                // the field is instead of.
+                picture = bitmap_region(a, placed, x0, y0, x1, y1)
+                scaled = measure_edges(picture, a, placed, x0, y0, x1, y1)
+                free(picture)
+                scaled_soft = scaled.soft_drawn / scaled.soft_atlas
+                println("  ${name}: the same atlas as a coverage bitmap scaled to ${size} px would stand ${scaled.atlas_mean} px off and be part-inked ${scaled_soft} of a perfect rendering's")
+                check("${name}: at ${size} px the field is sharper than the bitmap it replaces (part-inked ${soft} against ${scaled_soft})",
+                      soft * 1.3 < scaled_soft && stats.atlas_mean < scaled.atlas_mean)
+            }
+            glyphs_free(placed)
+            println("  ${name}: ${size} px, ${stats.length} px of edge: ${stats.atlas_mean} px from the atlas's shape on average (${stats.atlas_bias} bolder), ${stats.outline_mean} from the outline (${stats.outline_bias}); a pixel ${stats.atlas_worst} and ${stats.outline_worst} of ink off at worst; part-inked ${soft} of a perfect rendering's")
+            check("${name}: at ${size} px the drawn edge is where the atlas's shape is, ${stats.atlas_mean} px off on average",
+                  stats.atlas_mean < edge_bound(k) && fabs(stats.atlas_bias) < 0.03)
+            check("${name}: and where the font's outline is, ${stats.outline_mean} px off on average",
+                  stats.outline_mean < edge_bound(k) && fabs(stats.outline_bias) < 0.03)
+            check("${name}: no blur -- part-inked pixels ${soft} of a perfect rendering's", soft < 1.0)
+            k = k + 1
+        }
+    }
+    core.backend_set_overlay(backend, null)
+    hud.hud_free(o)
+    return drawn
+}
+
+// A frame's overlay: 1,000 rectangles in a grid over the frame, or 5,000
+// glyphs in a hundred labels of fifty.
+fill_overlay(o: *Hud, glyph_frame: bool) {
+    if glyph_frame {
+        label = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx"
+        colour = hud.rgba(0.95, 0.95, 0.9, 1.0)
+        k = 0
+        while k < 100 {
+            hud.text(o, 10.0 + ((k % 4) * 315) as float, 8.0 + ((k / 4) * 28) as float, 12.0, label, colour)
+            k = k + 1
+        }
+        return
+    }
+    colour = hud.rgba(0.2, 0.6, 0.9, 0.6)
+    k = 0
+    while k < QUADS {
+        column = k % 40
+        row = k / 40
+        hud.rect(o, (column * 32) as float + 2.0, (row * 28) as float + 4.0, 28.0, 24.0, colour)
+        k = k + 1
+    }
+}
+
+// What a frame of it costs: the CPU laying it out (a clear and the calls,
+// over two hundred frames) and the device drawing it (its timer, over the
+// frames drawn after a few to warm up).
+cost_frame(backend: *Backend, name: string, glyph_frame: bool, cam: *Camera, light: *Light,
+           gl_renderer: *GLRenderer, software: bool) -> ptr {
+    what = "1,000 rectangles"
+    if glyph_frame { what = "5,000 glyphs" }
+    o = hud.hud_new()
+    hud.font_ready(o)
+    started = platform.time()
+    k = 0
+    while k < 200 {
+        hud.clear(o)
+        fill_overlay(o, glyph_frame)
+        k = k + 1
+    }
+    cpu_ms = (platform.time() - started) * 1000.0 / 200.0
+    quads = hud.quad_count(o)
+    core.backend_set_overlay(backend, o as ptr)
+    device_total = 0.0
+    timed = 0
+    k = 0
+    while k < WARM + FRAMES_TIMED {
+        hud.clear(o)
+        fill_overlay(o, glyph_frame)
+        core.backend_render(backend, cam, light)
+        if k >= WARM {
+            ms = 0.0
+            if gl_renderer != null { ms = gl.renderer_overlay_ms(gl_renderer) } else { ms = vkoverlay.gpu_ms() }
+            device_total = device_total + ms
+            timed = timed + 1
+        }
+        k = k + 1
+    }
+    drawn = copy_frame(frame_of(backend))
+    device_ms = device_total / (timed as float)
+    println("  ${name}: ${what}, ${quads} quads: ${cpu_ms} ms of CPU to lay out, ${device_ms} ms of the device's to draw at ${WIDTH} x ${HEIGHT}")
+    check("${name}: ${what} are ${quads} quads", (glyph_frame && quads == GLYPHS) || (!glyph_frame && quads == QUADS))
+    check("${name}: ${what} cost the CPU under ${cpu_bound(glyph_frame)} ms a frame (${cpu_ms})", cpu_ms < cpu_bound(glyph_frame))
+    if software {
+        println("  ${name}: a software rasteriser: its ${device_ms} ms is the CPU rasterising, not a device's, and is not held to one")
+    } else {
+        check("${name}: and the device under a millisecond (${device_ms})", device_ms > 0.0 && device_ms < 1.0)
+    }
+    core.backend_set_overlay(backend, null)
+    hud.hud_free(o)
+    return drawn
+}
+
+// The CPU's bound: ten times what this machine takes (docs/ui.md), for a
+// runner that is slower.
+cpu_bound(glyph_frame: bool) -> float {
+    if glyph_frame { return 3.0 }
+    return 0.5
+}
+
+// A device that is software: its timer measures a CPU.
+is_software(name: string) -> bool {
+    lowered = string.to_lower(name)
+    return string.contains(lowered, "llvmpipe") == 1 || string.contains(lowered, "lavapipe") == 1 ||
+           string.contains(lowered, "softpipe") == 1 || string.contains(lowered, "swiftshader") == 1 ||
+           string.contains(lowered, "basic render") == 1
+}
+
+// Vulkan's frame against OpenGL's, at the backend-parity test's tolerance:
+// fewer than 2% of the channels more than 8 apart, lit areas within 5%.
+parity(name: string, opengl: ptr, vulkan: ptr) {
+    worst = 0
+    differing = 0
+    lit_gl = 0
+    lit_vk = 0
+    total = 0
+    i = 0
+    while i < WIDTH * HEIGHT * 4 {
+        if i % 4 != 3 {
+            a = mem.get_uint8(opengl, i)
+            b = mem.get_uint8(vulkan, i)
+            if a > 12 { lit_gl = lit_gl + 1 }
+            if b > 12 { lit_vk = lit_vk + 1 }
+            d = iabs(a - b)
+            if d > worst { worst = d }
+            if d > 8 { differing = differing + 1 }
+            total = total + 1
+        }
+        i = i + 1
+    }
+    println("  vulkan against opengl, ${name}: ${differing} of ${total} channels differ by more than 8, the most by ${worst}; lit ${lit_gl} and ${lit_vk}")
+    check("vulkan draws what opengl draws: ${name}", differing * 100 < total * 2 && iabs(lit_gl - lit_vk) * 20 < lit_gl + 1)
+}
+
+run(backend: *Backend, name: string, gl_renderer: *GLRenderer, device: string) {
+    core.backend_set_clear_color(backend, 0.0, 0.0, 0.0)
+    cam = core.camera_new(WIDTH, HEIGHT)
+    light = core.light_sun(core.vec3(0.2, 1.0, 0.4))
+    software = is_software(device)
+    frames = calloc(3, 8)
+    (frames as ptr[])[0] = text_frame(backend, name, cam, light)
+    (frames as ptr[])[1] = cost_frame(backend, name, false, cam, light, gl_renderer, software)
+    (frames as ptr[])[2] = cost_frame(backend, name, true, cam, light, gl_renderer, software)
+    names = ["the text", "1,000 rectangles", "5,000 glyphs"]
+    k = 0
+    while k < 3 {
+        mine = (frames as ptr[])[k]
+        if g_opengl == null {
+            // OpenGL keeps its frames for Vulkan's.
+        } else if (g_opengl as ptr[])[k] != null && mine != null {
+            parity(names[k], (g_opengl as ptr[])[k], mine)
+        }
+        k = k + 1
+    }
+    if g_opengl == null {
+        g_opengl = frames
+    } else {
+        k = 0
+        while k < 3 {
+            if (frames as ptr[])[k] != null { free((frames as ptr[])[k]) }
+            k = k + 1
+        }
+        free(frames)
+    }
+    core.camera_free(cam)
+    core.light_free(light)
+}
+
+main() {
+    face = glyphs.load(hud.DEFAULT_FONT)
+    if face == null {
+        println("overlay_measure: SKIP no font (${glyphs.last_error()})")
+        return
+    }
+    g_face = face as ptr
+
+    phase("OpenGL, offscreen")
+    context = offscreen.context_create(WIDTH, HEIGHT)
+    if context == null {
+        println("overlay_measure: SKIP no OpenGL context")
+        return
+    }
+    renderer = gl.renderer_new()
+    pass = gl.backend(renderer)
+    if !core.backend_init(&pass, context, WIDTH, HEIGHT) {
+        println("overlay_measure: SKIP the OpenGL backend would not initialise")
+        return
+    }
+    target = offscreen.target_create(WIDTH, HEIGHT)
+    gl.renderer_set_target(renderer, target)
+    run(&pass, "opengl", renderer, gl.device_name())
+    core.backend_cleanup(&pass)
+    offscreen.target_destroy(target)
+    gl.renderer_free(renderer)
+    offscreen.context_destroy(context)
+
+    if !vulkan.available() {
+        println("overlay_measure: no Vulkan driver (${vulkan.last_error()}), measured OpenGL only")
+    } else {
+        phase("Vulkan, offscreen")
+        vk_renderer = vulkan.renderer_new()
+        vk_pass = vulkan.backend(vk_renderer)
+        if !core.backend_init(&vk_pass, null, WIDTH, HEIGHT) {
+            println("overlay_measure: SKIP Vulkan would not start (${vulkan.last_error()})")
+        } else {
+            run(&vk_pass, "vulkan", null, vulkan.device_name())
+            core.backend_cleanup(&vk_pass)
+        }
+        vulkan.renderer_free(vk_renderer)
+    }
+    if g_opengl != null {
+        k = 0
+        while k < 3 {
+            if (g_opengl as ptr[])[k] != null { free((g_opengl as ptr[])[k]) }
+            k = k + 1
+        }
+        free(g_opengl)
+    }
+    glyphs.typeface_free(face)
+    if g_field != null { free(g_field) }
+
+    if g_failures == 0 {
+        println("overlay_measure: all checks passed (${g_checks})")
+    } else {
+        println("overlay_measure: ${g_failures} of ${g_checks} checks failed")
+    }
+}

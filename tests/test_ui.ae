@@ -1,0 +1,1376 @@
+// The game's UI has to be where it was asked to be at any window size and
+// any scale, draw nothing outside the panels that clip it, and take every
+// click, key and character to the widget it belongs to and to nothing
+// behind it -- while the game's own input hears none of it.
+//
+// #449 slices 3 (#459) and 4 (#484). Four ways in:
+// - Layout, with no GPU: an ae3d.ui2d screen drawn into an overlay at two
+//   window sizes and two scales, and where every node was drawn asked
+//   about in whole pixels.
+// - Input, with no GPU: the same screen driven a frame at a time the way
+//   the engine drives it -- blocked from the game while a menu is open,
+//   ae3d.input polled with injected cursor, clicks, keys and characters,
+//   the UI's input step, then the draw -- and what each widget and each of
+//   the game's actions saw asked about every frame.
+// - Pixels: the layout drawn through each renderer offscreen and read back
+//   (anchors to the pixel, a bar's fill, wrapped text inside its width,
+//   nothing outside a clip, images to the texel and without a dark fringe,
+//   an image rewritten in place), and the two renderers held to each other
+//   at the backend-parity test's tolerance.
+// - The engine on OpenGL, where a script opens a pause menu, the cursor and
+//   the button are injected to press Resume, and the game's actions are
+//   read every frame.
+
+import std.mem
+import std.list
+import ae3d.core
+import ae3d.platform
+import ae3d.input
+import ae3d.hud
+import ae3d.ui2d
+import ae3d.engine
+import ae3d.gl
+import ae3d.vulkan
+import ae3d.offscreen
+import ae3d.capture
+import ae3d.png
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern fflush(stream: ptr) -> int
+
+// The size ci.sh gives every window, and a large one.
+const SMALL_W = 320
+const SMALL_H = 180
+const LARGE_W = 1280
+const LARGE_H = 720
+const STEP = 0.016666666
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, condition: bool) {
+    g_checks = g_checks + 1
+    if condition {
+        println("  ok   ${name}")
+    } else {
+        println("  FAIL ${name}")
+        g_failures = g_failures + 1
+    }
+    fflush(null)
+}
+
+phase(name: string) {
+    println("  -- ${name}")
+    fflush(null)
+}
+
+absolute(v: float) -> float {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+// --- a screen driven the way the engine drives it -----------------------------------------------------
+
+struct UiTestRig {
+    screen: ptr          // *UiScreen
+    overlay: ptr         // *Hud
+    keys: ptr            // *Input
+    width: int
+    height: int
+}
+
+rig_new(width: int, height: int, factor: float) -> *UiTestRig {
+    rig = calloc(1, sizeof(UiTestRig)) as *UiTestRig
+    rig.screen = ui2d.screen_new() as ptr
+    rig.overlay = hud.hud_new() as ptr
+    rig.keys = input.input_new(null) as ptr
+    rig.width = width
+    rig.height = height
+    ui2d.attach(rig.screen as *UiScreen, rig.overlay as *Hud)
+    ui2d.set_scale(rig.screen as *UiScreen, factor)
+    input.bind_mouse(rig.keys as *Input, "fire", platform.MOUSE_LEFT)
+    input.bind_key(rig.keys as *Input, "jump", platform.KEY_SPACE)
+    input.bind_key(rig.keys as *Input, "use", platform.KEY_E)
+    input.bind_button(rig.keys as *Input, "jump", input.PAD_A)
+    input.bind_axis(rig.keys as *Input, "forward", platform.KEY_W, platform.KEY_S)
+    input.bind_mouse_axis(rig.keys as *Input, "turn", input.MOUSE_X, 1.0)
+    return rig
+}
+
+rig_free(rig: *UiTestRig) {
+    ui2d.screen_free(rig.screen as *UiScreen)
+    hud.hud_free(rig.overlay as *Hud)
+    input.input_free(rig.keys as *Input)
+    free(rig as ptr)
+}
+
+// One frame: the game blocked while the UI holds the input, the poll, the
+// UI's input step (the game's scripts would run here), then the frame drawn
+// -- the overlay cleared and the screen laid out at the window's size.
+rig_frame(rig: *UiTestRig) {
+    ui = rig.screen as *UiScreen
+    keys = rig.keys as *Input
+    input.set_blocked(keys, ui2d.blocking(ui))
+    input.poll(keys)
+    ui2d.screen_input(ui, keys, STEP)
+}
+
+rig_draw(rig: *UiTestRig) {
+    hud.clear(rig.overlay as *Hud)
+    hud.prepare(rig.overlay as *Hud, rig.width, rig.height)
+}
+
+// What the game's actions heard this frame: any of it is an event.
+game_heard(rig: *UiTestRig) -> bool {
+    keys = rig.keys as *Input
+    heard = input.held(keys, "fire") || input.pressed(keys, "fire") || input.released(keys, "fire") ||
+            input.held(keys, "jump") || input.pressed(keys, "jump") || input.released(keys, "jump") ||
+            input.held(keys, "use") || input.pressed(keys, "use") ||
+            input.axis(keys, "forward") != 0.0 || input.axis(keys, "turn") != 0.0 ||
+            input.mouse_dx(keys) != 0.0 || input.mouse_dy(keys) != 0.0 || input.scroll(keys) != 0.0
+    return heard
+}
+
+// The middle of a node as it was drawn.
+centre_of(n: *UiNode) -> (float, float) {
+    x0, y0, x1, y1 = ui2d.drawn_rect(n)
+    return (x0 + x1) * 0.5, (y0 + y1) * 0.5
+}
+
+// A click at a point: pressed on one frame, let go on the next.
+click_at(rig: *UiTestRig, x: float, y: float) {
+    keys = rig.keys as *Input
+    input.inject_cursor(keys, x, y)
+    input.inject_mouse(keys, platform.MOUSE_LEFT, true)
+    rig_frame(rig)
+    rig_draw(rig)
+    input.inject_mouse(keys, platform.MOUSE_LEFT, false)
+    rig_frame(rig)
+    rig_draw(rig)
+}
+
+// A key tapped, one frame.
+tap(rig: *UiTestRig, key: int, mods: int) {
+    input.inject_key_press(rig.keys as *Input, key, mods)
+    rig_frame(rig)
+    rig_draw(rig)
+}
+
+// --- layout ------------------------------------------------------------------------------------------------
+
+// Nine rectangles, one at each anchor, 40 by 20 units, twelve units in from
+// the edges they are anchored to: each must be exactly there in pixels, at
+// both sizes and both scales.
+anchors_exact(width: int, height: int, factor: float) -> int {
+    rig = rig_new(width, height, factor)
+    ui = rig.screen as *UiScreen
+    hud_layer = ui2d.layer(ui)
+    nodes = list.new()
+    a = 0
+    while a < 9 {
+        column = a % 3
+        row = a / 3
+        ox = 12.0
+        if column == 1 { ox = 0.0 }
+        if column == 2 { ox = 0.0 - 12.0 }
+        oy = 12.0
+        if row == 1 { oy = 0.0 }
+        if row == 2 { oy = 0.0 - 12.0 }
+        list.add_raw(nodes, ui2d.rect(hud_layer, a, ox, oy, 40.0, 20.0, hud.rgba(1.0, 1.0, 1.0, 1.0)) as ptr)
+        a = a + 1
+    }
+    rig_draw(rig)
+    exact = 0
+    w = 40.0 * factor
+    h = 20.0 * factor
+    inset = 12.0 * factor
+    fw = width as float
+    fh = height as float
+    a = 0
+    while a < 9 {
+        n = list.get_raw(nodes, a) as *UiNode
+        x0, y0, x1, y1 = ui2d.drawn_rect(n)
+        column = a % 3
+        row = a / 3
+        // The edge it is anchored to, the distance asked for from it.
+        ex = inset
+        if column == 1 { ex = (fw - w) * 0.5 }
+        if column == 2 { ex = fw - inset - w }
+        ey = inset
+        if row == 1 { ey = (fh - h) * 0.5 }
+        if row == 2 { ey = fh - inset - h }
+        if x0 == ex && y0 == ey && x1 == ex + w && y1 == ey + h {
+            exact = exact + 1
+        } else {
+            println("    anchor ${a} at ${width} x ${height}, scale ${factor}: drawn ${x0},${y0} to ${x1},${y1}; asked ${ex},${ey} to ${ex + w},${ey + h}")
+        }
+        a = a + 1
+    }
+    list.free(nodes)
+    rig_free(rig)
+    return exact
+}
+
+headless_layout() {
+    phase("layout")
+    total = 0
+    total = total + anchors_exact(SMALL_W, SMALL_H, 1.0)
+    total = total + anchors_exact(LARGE_W, LARGE_H, 1.0)
+    total = total + anchors_exact(SMALL_W, SMALL_H, 1.5)
+    total = total + anchors_exact(LARGE_W, LARGE_H, 2.0)
+    check("the nine anchors to the pixel at two window sizes and two scales (${total} of 36)", total == 36)
+
+    rig = rig_new(SMALL_W, SMALL_H, 1.0)
+    ui = rig.screen as *UiScreen
+    base = ui2d.layer(ui)
+    // A strip stretched along the bottom, ten in from the sides and the bottom.
+    strip = ui2d.rect(base, ui2d.TOP_LEFT, 0.0, 0.0, 0.0, 16.0, hud.rgba(0.2, 0.2, 0.2, 1.0))
+    ui2d.stretch(strip, 10.0, 154.0, 10.0, 10.0)
+    // Text wrapped to 120 units, each alignment.
+    words = "The quick brown fox jumps over the lazy dog, twice over."
+    left_text = ui2d.text(base, ui2d.TOP_LEFT, 10.0, 10.0, words, 16.0)
+    ui2d.set_wrap(left_text, 120.0)
+    right_text = ui2d.text(base, ui2d.TOP_LEFT, 180.0, 10.0, words, 16.0)
+    ui2d.set_wrap(right_text, 120.0)
+    ui2d.set_align(right_text, ui2d.ALIGN_RIGHT)
+    rig_draw(rig)
+    sx0, sy0, sx1, sy1 = ui2d.drawn_rect(strip)
+    check("a stretched node spans its parent less its margins (${sx0},${sy0} to ${sx1},${sy1})",
+          sx0 == 10.0 && sy0 == 154.0 && sx1 == 310.0 && sy1 == 170.0)
+    lx0, ly0, lx1, ly1 = ui2d.drawn_rect(left_text)
+    _rx0, _ry0, _rx1, ry1 = ui2d.drawn_rect(right_text)
+    check("wrapped text is its box's width and several lines tall (${lx1 - lx0} wide, ${ly1 - ly0} tall)",
+          lx1 - lx0 == 120.0 && ly1 - ly0 > 60.0 && ry1 == ly1)
+    // Its lines, measured the way they are laid out, are no wider than the
+    // box: the ink itself is held to it in pixels below.
+    widest, _tall = hud.measure_box(rig.overlay as *Hud, words, 16.0, 120.0)
+    unwrapped, _one = hud.measure_box(rig.overlay as *Hud, words, 16.0, 0.0)
+    check("its widest line is inside the width (${widest} of 120; ${unwrapped} unwrapped)",
+          widest <= 120.0 && widest > 90.0 && unwrapped > 300.0)
+    rig_free(rig)
+
+    // The scale: every size and offset, and a text's em, times it.
+    rig = rig_new(LARGE_W, LARGE_H, 2.0)
+    ui = rig.screen as *UiScreen
+    base = ui2d.layer(ui)
+    label = ui2d.text(base, ui2d.TOP_LEFT, 0.0, 0.0, "Scale", 20.0)
+    rig_draw(rig)
+    wide_x0, _a, wide_x1, _b = ui2d.drawn_rect(label)
+    ui2d.set_scale(ui, 1.0)
+    rig_draw(rig)
+    narrow_x0, _c, narrow_x1, _d = ui2d.drawn_rect(label)
+    ratio = (wide_x1 - wide_x0) / (narrow_x1 - narrow_x0)
+    check("text at scale 2 is twice the width it is at 1 (${ratio})", absolute(ratio - 2.0) < 0.05)
+    rig_free(rig)
+
+    // A panel clips and scrolls what is in it: a row of rectangles past its
+    // bottom drawn cut to it, and moved up by its scroll.
+    rig = rig_new(SMALL_W, SMALL_H, 1.0)
+    ui = rig.screen as *UiScreen
+    base = ui2d.layer(ui)
+    box = ui2d.panel(base, ui2d.TOP_LEFT, 20.0, 20.0, 100.0, 60.0, hud.rgba(0.1, 0.1, 0.1, 1.0))
+    ui2d.set_scrollable(box, true)
+    rows = list.new()
+    k = 0
+    while k < 6 {
+        list.add_raw(rows, ui2d.rect(box, ui2d.TOP_LEFT, 0.0, (k * 20) as float, 100.0, 18.0, hud.rgba(0.9, 0.9, 0.2, 1.0)) as ptr)
+        k = k + 1
+    }
+    rig_draw(rig)
+    last = list.get_raw(rows, 5) as *UiNode
+    _e, last_y0, _f, _g = ui2d.drawn_rect(last)
+    cx0, cy0, cx1, cy1 = ui2d.drawn_clip(last)
+    check("a panel's contents are clipped to it (clip ${cx0},${cy0} to ${cx1},${cy1})",
+          cx0 == 20.0 && cy0 == 20.0 && cx1 == 120.0 && cy1 == 80.0)
+    check("and reach below it (the last row at ${last_y0}, contents ${ui2d.content_height(box)} tall)",
+          last_y0 == 120.0 && ui2d.content_height(box) == 118.0)
+    // The quads the overlay was given stop at the clip.
+    o = rig.overlay as *Hud
+    verts = hud.vertex_data(o) as f32[]
+    below = 0
+    k = 0
+    while k < hud.vertex_count(o) {
+        y = verts[k * hud.VERTEX_FLOATS + 1] as float
+        if y > 80.0 + 0.001 { below = below + 1 }
+        k = k + 1
+    }
+    check("no quad inside the panel reaches past its clip (${below} vertices below it)", below == 0)
+    ui2d.set_scroll(box, 0.0, 40.0)
+    rig_draw(rig)
+    _h, scrolled_y0, _i, _j = ui2d.drawn_rect(last)
+    check("scrolled 40 units, its contents move up 40 pixels (${scrolled_y0})", scrolled_y0 == 80.0)
+    list.free(rows)
+    rig_free(rig)
+}
+
+// --- input ---------------------------------------------------------------------------------------------------
+
+// A menu of a column of four buttons, a toggle, a slider and a text field,
+// over a HUD with a button of its own where the menu has none; each click
+// at the centre of each of them, and a pixel outside each, at a window size
+// and a scale. Returns the clicks that landed where they should have.
+clicks_land(width: int, height: int, factor: float) -> (int, int) {
+    rig = rig_new(width, height, factor)
+    ui = rig.screen as *UiScreen
+    base = ui2d.layer(ui)
+    corner = ui2d.button(base, ui2d.TOP_LEFT, 8.0, 8.0, 60.0, 24.0, "HUD")
+    pause = ui2d.menu(ui)
+    card = ui2d.panel(pause, ui2d.CENTER, 0.0, 0.0, 200.0, 150.0, hud.rgba(0.1, 0.1, 0.12, 0.95))
+    buttons = list.new()
+    k = 0
+    while k < 4 {
+        list.add_raw(buttons, ui2d.button(card, ui2d.TOP, 0.0, 8.0 + (k * 26) as float, 180.0, 22.0, "Button") as ptr)
+        k = k + 1
+    }
+    // A button half over the last: the later is on top where they overlap.
+    over = ui2d.button(card, ui2d.TOP, 60.0, 90.0, 60.0, 22.0, "Over")
+    ui2d.push(ui, pause)
+    rig_draw(rig)
+
+    landed = 0
+    tried = 0
+    k = 0
+    while k < 4 {
+        b = list.get_raw(buttons, k) as *UiNode
+        x0, y0, x1, y1 = ui2d.drawn_rect(b)
+        // In the left half, where nothing is over any of them.
+        cx = x0 + (x1 - x0) * 0.25
+        cy = (y0 + y1) * 0.5
+        click_at(rig, cx, cy)
+        tried = tried + 1
+        if ui2d.clicked(b) && !ui2d.clicked(over) && !ui2d.clicked(corner) { landed = landed + 1 }
+        // A pixel above its top edge is the card, not it.
+        click_at(rig, cx, y0 - 1.0)
+        tried = tried + 1
+        if !ui2d.clicked(b) { landed = landed + 1 }
+        k = k + 1
+    }
+    // Where "Over" covers the last button, it takes the click and the one
+    // behind it does not.
+    ox, oy = centre_of(over)
+    click_at(rig, ox, oy)
+    tried = tried + 1
+    under = list.get_raw(buttons, 3) as *UiNode
+    if ui2d.clicked(over) && !ui2d.clicked(under) { landed = landed + 1 }
+    // The HUD's button is under the menu's dimming: a click there is the
+    // menu's, and nothing's.
+    hx, hy = centre_of(corner)
+    click_at(rig, hx, hy)
+    tried = tried + 1
+    if !ui2d.clicked(corner) { landed = landed + 1 }
+    list.free(buttons)
+    rig_free(rig)
+    return landed, tried
+}
+
+headless_input() {
+    phase("input")
+    landed = 0
+    tried = 0
+    a, b = clicks_land(SMALL_W, SMALL_H, 1.0)
+    landed = landed + a
+    tried = tried + b
+    a, b = clicks_land(LARGE_W, LARGE_H, 1.0)
+    landed = landed + a
+    tried = tried + b
+    a, b = clicks_land(SMALL_W, SMALL_H, 1.25)
+    landed = landed + a
+    tried = tried + b
+    a, b = clicks_land(LARGE_W, LARGE_H, 2.0)
+    landed = landed + a
+    tried = tried + b
+    check("every click lands on the widget under it and on none behind it, two sizes, three scales (${landed} of ${tried})",
+          landed == tried && tried == 40)
+
+    focus_and_navigation()
+    typing()
+    game_blocked()
+    hud_clicks()
+}
+
+// Tab and Shift+Tab visit a menu's widgets in the order they were made,
+// round; the arrows move to the nearest widget that way, round; the pad's
+// d-pad steps once, again after 0.4 s and every 0.08 s after.
+focus_and_navigation() {
+    rig = rig_new(SMALL_W, SMALL_H, 1.0)
+    ui = rig.screen as *UiScreen
+    options = ui2d.menu(ui)
+    // Two columns of three, the second made inside a panel.
+    column = list.new()
+    k = 0
+    while k < 3 {
+        list.add_raw(column, ui2d.button(options, ui2d.TOP_LEFT, 20.0, 20.0 + (k * 30) as float, 100.0, 24.0, "Left") as ptr)
+        k = k + 1
+    }
+    side = ui2d.panel(options, ui2d.TOP_LEFT, 160.0, 20.0, 120.0, 90.0, hud.rgba(0.0, 0.0, 0.0, 0.0))
+    k = 0
+    while k < 3 {
+        list.add_raw(column, ui2d.button(side, ui2d.TOP_LEFT, 0.0, (k * 30) as float, 100.0, 24.0, "Right") as ptr)
+        k = k + 1
+    }
+    ui2d.push(ui, options)
+    rig_draw(rig)
+    first = list.get_raw(column, 0) as *UiNode
+    check("a menu opens with its first widget focused", ui2d.focused(options) == first)
+
+    // Tab through all six and round to the first; Shift+Tab back round.
+    order_right = 0
+    k = 1
+    while k <= 6 {
+        tap(rig, platform.KEY_TAB, 0)
+        if ui2d.focused(options) == list.get_raw(column, k % 6) as *UiNode { order_right = order_right + 1 }
+        k = k + 1
+    }
+    k = 1
+    while k <= 6 {
+        tap(rig, platform.KEY_TAB, platform.MOD_SHIFT)
+        if ui2d.focused(options) == list.get_raw(column, (6 - k) % 6) as *UiNode { order_right = order_right + 1 }
+        k = k + 1
+    }
+    check("Tab and Shift+Tab visit the six in order and wrap round (${order_right} of 12)", order_right == 12)
+
+    // Arrows: down the left column and round, across to the right, up round.
+    moves_right = 0
+    tap(rig, platform.KEY_DOWN, 0)
+    if ui2d.focused(options) == list.get_raw(column, 1) as *UiNode { moves_right = moves_right + 1 }
+    tap(rig, platform.KEY_DOWN, 0)
+    if ui2d.focused(options) == list.get_raw(column, 2) as *UiNode { moves_right = moves_right + 1 }
+    tap(rig, platform.KEY_DOWN, 0)
+    if ui2d.focused(options) == list.get_raw(column, 0) as *UiNode { moves_right = moves_right + 1 }
+    tap(rig, platform.KEY_RIGHT, 0)
+    if ui2d.focused(options) == list.get_raw(column, 3) as *UiNode { moves_right = moves_right + 1 }
+    tap(rig, platform.KEY_UP, 0)
+    if ui2d.focused(options) == list.get_raw(column, 5) as *UiNode { moves_right = moves_right + 1 }
+    tap(rig, platform.KEY_LEFT, 0)
+    if ui2d.focused(options) == list.get_raw(column, 2) as *UiNode { moves_right = moves_right + 1 }
+    check("the arrows move to the nearest widget that way and wrap (${moves_right} of 6)", moves_right == 6)
+
+    // The d-pad held down from the first: one step at once, then after
+    // 0.4 s, then every 0.08 s -- over 0.6 s that is 1 + 1 + 2 steps. A
+    // step from the bottom wraps to the top: from the first, four steps
+    // down a column of three is the second.
+    tap(rig, platform.KEY_UP, 0)
+    ui2d.focus(first)
+    keys = rig.keys as *Input
+    input.inject_button(keys, input.PAD_DOWN, true)
+    frames = 0
+    while frames < 36 {
+        rig_frame(rig)
+        rig_draw(rig)
+        frames = frames + 1
+    }
+    input.inject_button(keys, input.PAD_DOWN, false)
+    rig_frame(rig)
+    rig_draw(rig)
+    check("the d-pad held 0.6 s steps four times (at 0, 0.4, 0.48, 0.56 s)",
+          ui2d.focused(options) == list.get_raw(column, 1) as *UiNode)
+    // The pad's A activates the focused button; B closes the menu.
+    input.inject_button(keys, input.PAD_A, true)
+    rig_frame(rig)
+    pad_clicked = ui2d.clicked(list.get_raw(column, 1) as *UiNode)
+    rig_draw(rig)
+    input.inject_button(keys, input.PAD_A, false)
+    input.inject_button(keys, input.PAD_B, true)
+    rig_frame(rig)
+    rig_draw(rig)
+    input.inject_button(keys, input.PAD_B, false)
+    rig_frame(rig)
+    rig_draw(rig)
+    check("the pad's A clicks the focused button and B closes the menu", pad_clicked && ui2d.depth(ui) == 0)
+
+    // The left stick past half way is a direction held, as the d-pad is:
+    // pushed down for one frame, one step.
+    ui2d.push(ui, options)
+    rig_draw(rig)
+    ui2d.focus(first)
+    input.inject_pad_axis(keys, input.PAD_LEFT_Y, 0.9, true)
+    rig_frame(rig)
+    rig_draw(rig)
+    input.inject_pad_axis(keys, input.PAD_LEFT_Y, 0.0, false)
+    rig_frame(rig)
+    rig_draw(rig)
+    check("the left stick pushed down steps the focus once", ui2d.focused(options) == list.get_raw(column, 1) as *UiNode)
+    // Enter clicks the focused button.
+    input.inject_key_press(keys, platform.KEY_ENTER, 0)
+    rig_frame(rig)
+    entered = ui2d.clicked(list.get_raw(column, 1) as *UiNode)
+    rig_draw(rig)
+    check("Enter clicks the focused button", entered)
+    list.free(column)
+    rig_free(rig)
+
+    stacked()
+}
+
+// Menus stack: settings opened over pause takes the input, a click where
+// only pause has a button lands on nothing, Escape closes settings alone
+// and pause has its focus back where it was.
+stacked() {
+    rig = rig_new(SMALL_W, SMALL_H, 1.0)
+    ui = rig.screen as *UiScreen
+    pause = ui2d.menu(ui)
+    resume = ui2d.button(pause, ui2d.TOP_LEFT, 10.0, 10.0, 100.0, 24.0, "Resume")
+    options = ui2d.button(pause, ui2d.TOP_LEFT, 10.0, 40.0, 100.0, 24.0, "Settings")
+    settings = ui2d.menu(ui)
+    ui2d.set_dim(settings, hud.rgba(0.0, 0.0, 0.0, 0.0))
+    back = ui2d.button(settings, ui2d.TOP_LEFT, 160.0, 10.0, 100.0, 24.0, "Back")
+    ui2d.push(ui, pause)
+    rig_draw(rig)
+    tap(rig, platform.KEY_TAB, 0)
+    ui2d.push(ui, settings)
+    rig_draw(rig)
+    rx, ry = centre_of(resume)
+    click_at(rig, rx, ry)
+    under_ignored = !ui2d.clicked(resume) && ui2d.depth(ui) == 2
+    top_focused = ui2d.focused(settings) == back
+    tap(rig, platform.KEY_ESCAPE, 0)
+    one_left = ui2d.depth(ui) == 1 && ui2d.top(ui) == pause
+    kept = ui2d.focused(pause) == options
+    check("a menu over a menu takes the input alone; Escape closes it alone and the one under has its focus back",
+          under_ignored && top_focused && one_left && kept)
+    rig_free(rig)
+}
+
+// A text field ends with exactly the characters typed and edited, UTF-8
+// and all; a toggle flips from the keyboard; a slider steps and drags.
+typing() {
+    rig = rig_new(SMALL_W, SMALL_H, 1.0)
+    ui = rig.screen as *UiScreen
+    lobby = ui2d.menu(ui)
+    name = ui2d.field(lobby, ui2d.TOP_LEFT, 20.0, 20.0, 200.0, 28.0, "Your name")
+    ready = ui2d.toggle(lobby, ui2d.TOP_LEFT, 20.0, 60.0, 160.0, 22.0, "Ready", false)
+    volume = ui2d.slider(lobby, ui2d.TOP_LEFT, 20.0, 100.0, 200.0, 20.0, 0.0, 10.0, 5.0)
+    ui2d.set_step(volume, 1.0)
+    ui2d.push(ui, lobby)
+    rig_draw(rig)
+    keys = rig.keys as *Input
+    // "Héllo wörld" typed: é and ö are two bytes each.
+    typed = [72, 233, 108, 108, 111, 32, 119, 246, 114, 108, 100]
+    k = 0
+    while k < 11 {
+        input.inject_char(keys, typed[k])
+        k = k + 1
+    }
+    rig_frame(rig)
+    rig_draw(rig)
+    as_typed = ui2d.field_text(name) == "Héllo wörld"
+    // Two back, three left, an X; home, a <; end, delete (nothing); a
+    // space from the keyboard goes in as a character, not a click.
+    tap(rig, platform.KEY_BACKSPACE, 0)
+    tap(rig, platform.KEY_BACKSPACE, 0)
+    tap(rig, platform.KEY_LEFT, 0)
+    tap(rig, platform.KEY_LEFT, 0)
+    tap(rig, platform.KEY_LEFT, 0)
+    input.inject_char(keys, 88)
+    rig_frame(rig)
+    rig_draw(rig)
+    tap(rig, platform.KEY_HOME, 0)
+    input.inject_char(keys, 60)
+    rig_frame(rig)
+    rig_draw(rig)
+    tap(rig, platform.KEY_END, 0)
+    tap(rig, platform.KEY_DELETE, 0)
+    input.inject_key_press(keys, platform.KEY_SPACE, 0)
+    input.inject_char(keys, 33)
+    rig_frame(rig)
+    rig_draw(rig)
+    final_text = ui2d.field_text(name)
+    println("    the field reads \"${final_text}\", caret at byte ${ui2d.caret(name)}")
+    check("a text field ends with exactly what was typed and edited",
+          as_typed && final_text == "<Héllo Xwör!" && ui2d.caret(name) == 14)
+    // Enter submits it.
+    input.inject_key_press(keys, platform.KEY_ENTER, 0)
+    rig_frame(rig)
+    was_submitted = ui2d.submitted(name)
+    rig_draw(rig)
+    check("Enter submits the field", was_submitted)
+
+    // Tab to the toggle, Space flips it; Tab to the slider, the arrows step
+    // it; a click on its right end drags it to its top.
+    tap(rig, platform.KEY_TAB, 0)
+    input.inject_key_press(keys, platform.KEY_SPACE, 0)
+    rig_frame(rig)
+    flipped = ui2d.changed(ready) && ui2d.is_on(ready)
+    rig_draw(rig)
+    tap(rig, platform.KEY_TAB, 0)
+    tap(rig, platform.KEY_RIGHT, 0)
+    tap(rig, platform.KEY_RIGHT, 0)
+    tap(rig, platform.KEY_LEFT, 0)
+    stepped = ui2d.value(volume)
+    _sx0, sy0, sx1, sy1 = ui2d.drawn_rect(volume)
+    click_at(rig, sx1 - 1.0, (sy0 + sy1) * 0.5)
+    check("Space flips a toggle, the arrows step a slider (5 to ${stepped}), a click at its end takes it to its top (${ui2d.value(volume)})",
+          flipped && stepped == 6.0 && ui2d.value(volume) == 10.0)
+    // Characters typed while the field is not focused go nowhere.
+    before = ui2d.field_text(name)
+    input.inject_char(keys, 90)
+    rig_frame(rig)
+    rig_draw(rig)
+    check("a field without the focus takes no characters", ui2d.field_text(name) == before)
+    rig_free(rig)
+}
+
+// While a menu is open the game's actions hear nothing -- clicks, keys,
+// characters, the mouse moving, the wheel -- and the click that pressed
+// Resume fires nothing on the frames after the menu is gone; nor does a
+// key held while the menu was closed by Escape, until it is let go.
+game_blocked() {
+    rig = rig_new(SMALL_W, SMALL_H, 1.0)
+    ui = rig.screen as *UiScreen
+    keys = rig.keys as *Input
+    pause = ui2d.menu(ui)
+    resume = ui2d.button(pause, ui2d.CENTER, 0.0, 0.0, 120.0, 30.0, "Resume")
+    rig_frame(rig)
+    rig_draw(rig)
+    ui2d.push(ui, pause)
+    rig_draw(rig)
+    heard = 0
+    frames = 0
+    // A storm of input over the open menu.
+    rx, ry = centre_of(resume)
+    k = 0
+    while k < 20 {
+        input.inject_cursor(keys, 10.0 + (k * 7) as float, 20.0 + k as float)
+        input.inject_mouse(keys, platform.MOUSE_LEFT, k % 2 == 0)
+        input.inject_key(keys, platform.KEY_SPACE, k % 3 == 0)
+        input.inject_key(keys, platform.KEY_W, k % 4 < 2)
+        input.inject_key_press(keys, platform.KEY_E, 0)
+        input.inject_char(keys, 101)
+        input.inject_scroll(keys, 1.0)
+        rig_frame(rig)
+        if game_heard(rig) { heard = heard + 1 }
+        frames = frames + 1
+        rig_draw(rig)
+        k = k + 1
+    }
+    input.inject_mouse(keys, platform.MOUSE_LEFT, false)
+    input.inject_key(keys, platform.KEY_SPACE, false)
+    input.inject_key(keys, platform.KEY_W, false)
+    // Resume pressed and let go; the frame it is clicked in, the script pops.
+    input.inject_cursor(keys, rx, ry)
+    input.inject_mouse(keys, platform.MOUSE_LEFT, true)
+    rig_frame(rig)
+    if game_heard(rig) { heard = heard + 1 }
+    rig_draw(rig)
+    input.inject_mouse(keys, platform.MOUSE_LEFT, false)
+    rig_frame(rig)
+    if game_heard(rig) { heard = heard + 1 }
+    frames = frames + 2
+    resumed = ui2d.clicked(resume)
+    if resumed { ui2d.pop(ui) }
+    rig_draw(rig)
+    check("the game's input hears nothing while the menu is open (${heard} of ${frames} frames heard something)",
+          heard == 0 && resumed)
+    after = 0
+    k = 0
+    while k < 5 {
+        rig_frame(rig)
+        if input.pressed(keys, "fire") || input.released(keys, "fire") || input.held(keys, "fire") { after = after + 1 }
+        rig_draw(rig)
+        k = k + 1
+    }
+    check("and the click that pressed Resume fires no shot after it (${after} frames)", after == 0)
+    // The game hears a real click again.
+    input.inject_mouse(keys, platform.MOUSE_LEFT, true)
+    rig_frame(rig)
+    fires = input.pressed(keys, "fire")
+    rig_draw(rig)
+    input.inject_mouse(keys, platform.MOUSE_LEFT, false)
+    rig_frame(rig)
+    rig_draw(rig)
+    check("the next click is the game's", fires)
+
+    // Space held down, the menu opened and closed by Escape over it: Space
+    // is the game's again only once it is let go and pressed anew.
+    input.inject_key(keys, platform.KEY_SPACE, true)
+    rig_frame(rig)
+    held_before = input.held(keys, "jump")
+    rig_draw(rig)
+    ui2d.push(ui, pause)
+    rig_draw(rig)
+    tap(rig, platform.KEY_ESCAPE, 0)
+    closed = ui2d.depth(ui) == 0
+    swallowed = 0
+    k = 0
+    while k < 4 {
+        rig_frame(rig)
+        if input.held(keys, "jump") || input.pressed(keys, "jump") { swallowed = swallowed + 1 }
+        rig_draw(rig)
+        k = k + 1
+    }
+    input.inject_key(keys, platform.KEY_SPACE, false)
+    rig_frame(rig)
+    rig_draw(rig)
+    input.inject_key(keys, platform.KEY_SPACE, true)
+    rig_frame(rig)
+    again = input.pressed(keys, "jump")
+    rig_draw(rig)
+    input.inject_key(keys, platform.KEY_SPACE, false)
+    check("a key held through a menu stays the menu's until it is let go (${swallowed} frames heard it)",
+          held_before && closed && swallowed == 0 && again)
+    rig_free(rig)
+}
+
+// With no menu open, a click on a HUD's button is the button's and not the
+// game's; a click beside it is the game's.
+hud_clicks() {
+    rig = rig_new(SMALL_W, SMALL_H, 1.0)
+    ui = rig.screen as *UiScreen
+    keys = rig.keys as *Input
+    base = ui2d.layer(ui)
+    map_button = ui2d.button(base, ui2d.TOP_RIGHT, 0.0 - 8.0, 8.0, 50.0, 20.0, "Map")
+    rig_frame(rig)
+    rig_draw(rig)
+    mx, my = centre_of(map_button)
+    input.inject_cursor(keys, mx, my)
+    input.inject_mouse(keys, platform.MOUSE_LEFT, true)
+    rig_frame(rig)
+    shot = input.pressed(keys, "fire") || input.held(keys, "fire")
+    rig_draw(rig)
+    input.inject_mouse(keys, platform.MOUSE_LEFT, false)
+    rig_frame(rig)
+    opened = ui2d.clicked(map_button)
+    rig_draw(rig)
+    input.inject_cursor(keys, 100.0, 100.0)
+    input.inject_mouse(keys, platform.MOUSE_LEFT, true)
+    rig_frame(rig)
+    beside = input.pressed(keys, "fire")
+    rig_draw(rig)
+    input.inject_mouse(keys, platform.MOUSE_LEFT, false)
+    rig_frame(rig)
+    rig_draw(rig)
+    check("a click on a HUD's button is the button's, not the game's; beside it, the game's",
+          opened && !shot && beside && !ui2d.blocking(ui))
+    rig_free(rig)
+}
+
+// --- pixels, through each renderer --------------------------------------------------------------------------
+
+const FRAME_ANCHORS = 0
+const FRAME_TEXT = 1
+const FRAME_CLIP = 2
+const FRAME_MENU = 3
+const FRAMES = 4
+// A pixel differs from the frame when its luma is this far off, of 255.
+const INK = 24
+const CHECKER = 16
+const SPRITE = 8
+
+// OpenGL's frames, for Vulkan's to be held to; the menu's nodes, found again
+// by the checks.
+var g_opengl: ptr = null            // ptr[FRAMES]
+var g_ring: ptr = null
+var g_dimmed: ptr = null
+var g_checker = 0 - 1
+var g_sprite = 0 - 1
+var g_icon = 0 - 1
+
+pixel(pixels: ptr, x: int, y: int, c: int) -> int {
+    return mem.get_uint8(pixels, (y * SMALL_W + x) * 4 + c)
+}
+
+luma(pixels: ptr, x: int, y: int) -> int {
+    return (299 * pixel(pixels, x, y, 0) + 587 * pixel(pixels, x, y, 1) + 114 * pixel(pixels, x, y, 2)) / 1000
+}
+
+// Whether a pixel is this colour, each channel within `slack` of 255.
+is_colour(pixels: ptr, x: int, y: int, r: int, g: int, b: int, slack: int) -> bool {
+    if x < 0 || y < 0 || x >= SMALL_W || y >= SMALL_H { return false }
+    return iabs(pixel(pixels, x, y, 0) - r) <= slack && iabs(pixel(pixels, x, y, 1) - g) <= slack &&
+           iabs(pixel(pixels, x, y, 2) - b) <= slack
+}
+
+iabs(v: int) -> int {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// The nine anchors' colours: each channel 0 or 255, none the ground's.
+anchor_colour(a: int) -> Vec4 {
+    r = 0.0
+    g = 0.0
+    b = 0.0
+    if (a + 1) % 2 == 1 { r = 1.0 }
+    if ((a + 1) / 2) % 2 == 1 { g = 1.0 }
+    if ((a + 1) / 4) % 2 == 1 { b = 1.0 }
+    if a == 7 {
+        r = 1.0
+        g = 0.5
+    }
+    return hud.rgba(r, g, b, 1.0)
+}
+
+// A checker of four colours, 4 texels a square, top row first.
+checker_pixels() -> ptr {
+    p = calloc(CHECKER * CHECKER, 4)
+    row = 0
+    while row < CHECKER {
+        column = 0
+        while column < CHECKER {
+            at = (row * CHECKER + column) * 4
+            quadrant = (row / 4) % 2 * 2 + (column / 4) % 2
+            if quadrant == 0 { mem.set_byte(p, at, 255) }
+            if quadrant == 1 { mem.set_byte(p, at + 1, 255) }
+            if quadrant == 2 { mem.set_byte(p, at + 2, 255) }
+            if quadrant == 3 {
+                mem.set_byte(p, at, 255)
+                mem.set_byte(p, at + 1, 255)
+            }
+            mem.set_byte(p, at + 3, 255)
+            column = column + 1
+        }
+        row = row + 1
+    }
+    return p
+}
+
+// The checker's colour at a texel, as checker_pixels made it (or inverted).
+checker_at(row: int, column: int, c: int, inverted: bool) -> int {
+    quadrant = (row / 4) % 2 * 2 + (column / 4) % 2
+    v = 0
+    if c == 0 && (quadrant == 0 || quadrant == 3) { v = 255 }
+    if c == 1 && (quadrant == 1 || quadrant == 3) { v = 255 }
+    if c == 2 && quadrant == 2 { v = 255 }
+    if inverted { v = 255 - v }
+    return v
+}
+
+// An opaque red square in a transparent border -- what a cut-out icon is.
+// Its transparent texels are black, as an editor exports them: a filter
+// that mixed them in unpremultiplied would draw a dark ring.
+sprite_pixels() -> ptr {
+    p = calloc(SPRITE * SPRITE, 4)
+    row = 2
+    while row < 6 {
+        column = 2
+        while column < 6 {
+            at = (row * SPRITE + column) * 4
+            mem.set_byte(p, at, 255)
+            mem.set_byte(p, at + 3, 255)
+            column = column + 1
+        }
+        row = row + 1
+    }
+    return p
+}
+
+// A frame of the UI, built into a fresh screen over the backend's overlay.
+build(ui: *UiScreen, o: *Hud, kind: int) {
+    base = ui2d.layer(ui)
+    if kind == FRAME_ANCHORS {
+        a = 0
+        while a < 9 {
+            column = a % 3
+            row = a / 3
+            ox = 12.0
+            if column == 1 { ox = 0.0 }
+            if column == 2 { ox = 0.0 - 12.0 }
+            oy = 12.0
+            if row == 1 { oy = 0.0 }
+            if row == 2 { oy = 0.0 - 12.0 }
+            ui2d.rect(base, a, ox, oy, 40.0, 20.0, anchor_colour(a))
+            a = a + 1
+        }
+        // A bar 200 wide, 30% full: 60 pixels of fill over its well.
+        bar = ui2d.rect(base, ui2d.TOP, 0.0, 44.0, 200.0, 12.0, hud.rgba(0.0, 1.0, 0.0, 1.0))
+        ui2d.set_back(bar, hud.rgba(0.0, 0.0, 1.0, 1.0))
+        ui2d.set_fill(bar, 0.3)
+    } else if kind == FRAME_TEXT {
+        words = "Wrapped to its width, aligned in it: justly, quickly, jauntily. Nothing past the edge."
+        left_text = ui2d.text(base, ui2d.TOP_LEFT, 10.0, 10.0, words, 15.0)
+        ui2d.set_wrap(left_text, 140.0)
+        right_text = ui2d.text(base, ui2d.TOP_LEFT, 170.0, 10.0, words, 15.0)
+        ui2d.set_wrap(right_text, 140.0)
+        ui2d.set_align(right_text, ui2d.ALIGN_RIGHT)
+    } else if kind == FRAME_CLIP {
+        // A panel with rows running past its bottom and a line of text past
+        // its right, clipped; and the images.
+        box = ui2d.panel(base, ui2d.TOP_LEFT, 20.0, 20.0, 100.0, 60.0, hud.rgba(0.0, 0.0, 0.0, 0.0))
+        k = 0
+        while k < 5 {
+            ui2d.rect(box, ui2d.TOP_LEFT, 4.0, (k * 20) as float, 120.0, 14.0, hud.rgba(1.0, 1.0, 0.0, 1.0))
+            k = k + 1
+        }
+        ui2d.text(box, ui2d.TOP_LEFT, 0.0, 30.0, "a line far longer than its panel", 16.0)
+        g_checker = ui2d.add_image(ui, CHECKER, CHECKER, checker_pixels_kept())
+        ui2d.image(base, ui2d.TOP_LEFT, 180.0, 20.0, CHECKER as float, CHECKER as float, g_checker)
+        // The sprite four times its size over white.
+        ui2d.rect(base, ui2d.TOP_LEFT, 220.0, 16.0, 48.0, 48.0, hud.rgba(1.0, 1.0, 1.0, 1.0))
+        g_sprite = ui2d.add_image(ui, SPRITE, SPRITE, sprite_pixels_kept())
+        ui2d.image(base, ui2d.TOP_LEFT, 228.0, 24.0, 32.0, 32.0, g_sprite)
+        // An icon read from a PNG, which is stored bottom row first.
+        g_icon = ui2d.load_image(ui, "build/test_ui_icon.png")
+        ui2d.image(base, ui2d.TOP_LEFT, 180.0, 60.0, CHECKER as float, CHECKER as float, g_icon)
+    } else {
+        // A HUD with a white panel, and a pause menu over it.
+        ui2d.rect(base, ui2d.TOP_LEFT, 0.0, 0.0, 60.0, 180.0, hud.rgba(1.0, 1.0, 1.0, 1.0))
+        pause = ui2d.menu(ui)
+        card = ui2d.panel(pause, ui2d.CENTER, 0.0, 0.0, 220.0, 150.0, hud.rgba(0.1, 0.11, 0.13, 0.96))
+        title = ui2d.text(card, ui2d.TOP, 0.0, 6.0, "Paused", 22.0)
+        ui2d.set_outline(title, hud.rgba(0.0, 0.0, 0.0, 1.0), 1.0)
+        resume = ui2d.button(card, ui2d.TOP, 0.0, 36.0, 180.0, 26.0, "Resume")
+        ui2d.toggle(card, ui2d.TOP_LEFT, 20.0, 70.0, 120.0, 18.0, "Subtitles", true)
+        ui2d.slider(card, ui2d.TOP_LEFT, 20.0, 94.0, 180.0, 16.0, 0.0, 1.0, 0.5)
+        name = ui2d.field(card, ui2d.TOP_LEFT, 20.0, 116.0, 180.0, 26.0, "Your name")
+        ui2d.set_field_text(name, "Ada")
+        ui2d.push(ui, pause)
+        g_ring = resume as ptr
+    }
+}
+
+var g_kept_checker: ptr = null
+var g_kept_sprite: ptr = null
+
+checker_pixels_kept() -> ptr {
+    if g_kept_checker == null { g_kept_checker = checker_pixels() }
+    return g_kept_checker
+}
+
+sprite_pixels_kept() -> ptr {
+    if g_kept_sprite == null { g_kept_sprite = sprite_pixels() }
+    return g_kept_sprite
+}
+
+// A frame the backend has read back: the pipelined read hands back the one
+// before the latest, so it is asked twice.
+frame_of(backend: *Backend) -> ptr {
+    core.backend_frame_pixels(backend)
+    return core.backend_frame_pixels(backend)
+}
+
+copy_frame(pixels: ptr) -> ptr {
+    if pixels == null { return null }
+    copy = calloc(SMALL_W * SMALL_H, 4)
+    mem.copy(copy, pixels, (SMALL_W * SMALL_H * 4) as long)
+    return copy
+}
+
+// Ink in a box: pixels whose luma is off the ground's.
+ink_in(pixels: ptr, x: int, y: int, w: int, h: int, ground: int) -> int {
+    count = 0
+    row = y
+    while row < y + h {
+        column = x
+        while column < x + w {
+            if row >= 0 && row < SMALL_H && column >= 0 && column < SMALL_W {
+                if iabs(luma(pixels, column, row) - ground) > INK { count = count + 1 }
+            }
+            column = column + 1
+        }
+        row = row + 1
+    }
+    return count
+}
+
+check_anchors(name: string, pixels: ptr) {
+    edges = 0
+    a = 0
+    while a < 9 {
+        column = a % 3
+        row = a / 3
+        x0 = 12
+        if column == 1 { x0 = 140 }
+        if column == 2 { x0 = 268 }
+        y0 = 12
+        if row == 1 { y0 = 80 }
+        if row == 2 { y0 = 148 }
+        c = anchor_colour(a)
+        r = (c.x * 255.0 + 0.5) as int
+        g = (c.y * 255.0 + 0.5) as int
+        b = (c.z * 255.0 + 0.5) as int
+        // In at its four corners, out a pixel past each edge.
+        if is_colour(pixels, x0, y0, r, g, b, 1) { edges = edges + 1 }
+        if is_colour(pixels, x0 + 39, y0, r, g, b, 1) { edges = edges + 1 }
+        if is_colour(pixels, x0, y0 + 19, r, g, b, 1) { edges = edges + 1 }
+        if is_colour(pixels, x0 + 39, y0 + 19, r, g, b, 1) { edges = edges + 1 }
+        if !is_colour(pixels, x0 - 1, y0 + 10, r, g, b, 40) { edges = edges + 1 }
+        if !is_colour(pixels, x0 + 40, y0 + 10, r, g, b, 40) { edges = edges + 1 }
+        if !is_colour(pixels, x0 + 20, y0 - 1, r, g, b, 40) { edges = edges + 1 }
+        if !is_colour(pixels, x0 + 20, y0 + 20, r, g, b, 40) { edges = edges + 1 }
+        a = a + 1
+    }
+    check("${name}: the nine anchored rectangles end at their edges to the pixel (${edges} of 72 probes)", edges == 72)
+    filled = is_colour(pixels, 60, 50, 0, 255, 0, 1) && is_colour(pixels, 119, 50, 0, 255, 0, 1) &&
+             is_colour(pixels, 120, 50, 0, 0, 255, 1) && is_colour(pixels, 259, 50, 0, 0, 255, 1) &&
+             !is_colour(pixels, 260, 50, 0, 0, 255, 40)
+    check("${name}: a bar 30% full is 60 of its 200 pixels filled, its well the rest", filled)
+}
+
+check_text(name: string, pixels: ptr, ground: int) {
+    // Outside the two boxes, in the rows the text is in: nothing.
+    left_in = ink_in(pixels, 10, 10, 140, 150, ground)
+    right_in = ink_in(pixels, 170, 10, 140, 150, ground)
+    outside = ink_in(pixels, 0, 10, 10, 150, ground) + ink_in(pixels, 150, 10, 20, 150, ground) +
+              ink_in(pixels, 310, 10, 10, 150, ground)
+    // The right-aligned lines reach its right edge; the left ones its left.
+    rightmost = 0
+    leftmost = SMALL_W
+    row = 10
+    while row < 160 {
+        column = 170
+        while column < 310 {
+            if iabs(luma(pixels, column, row) - ground) > INK && column > rightmost { rightmost = column }
+            column = column + 1
+        }
+        column = 10
+        while column < 150 {
+            if iabs(luma(pixels, column, row) - ground) > INK && column < leftmost { leftmost = column }
+            column = column + 1
+        }
+        row = row + 1
+    }
+    println("  ${name}: wrapped text inks ${left_in} and ${right_in} pixels in its boxes, ${outside} outside; lines reach x ${leftmost} and ${rightmost}")
+    check("${name}: wrapped text is inked inside its width and nowhere beside it", left_in > 400 && right_in > 400 && outside == 0)
+    check("${name}: left-aligned lines start at the box's left, right-aligned ones end at its right",
+          leftmost <= 11 && rightmost >= 306)
+}
+
+check_clip(name: string, pixels: ptr, ground: int, inverted: bool) {
+    inside = ink_in(pixels, 20, 20, 100, 60, ground)
+    beyond = ink_in(pixels, 120, 16, 50, 70, ground) + ink_in(pixels, 16, 80, 110, 60, ground) +
+             ink_in(pixels, 16, 16, 108, 4, ground) + ink_in(pixels, 16, 16, 4, 70, ground)
+    check("${name}: a panel's contents are drawn inside it (${inside} pixels) and none outside it (${beyond})",
+          inside > 3000 && beyond == 0)
+    exact = 0
+    row = 0
+    while row < CHECKER {
+        column = 0
+        while column < CHECKER {
+            c = 0
+            same = true
+            while c < 3 {
+                if iabs(pixel(pixels, 180 + column, 20 + row, c) - checker_at(row, column, c, inverted)) > 1 { same = false }
+                c = c + 1
+            }
+            if same { exact = exact + 1 }
+            column = column + 1
+        }
+        row = row + 1
+    }
+    check("${name}: an image drawn at its size is its pixels to the texel (${exact} of 256)", exact == 256)
+    // Over white, a red cut-out scaled four times: nowhere darker than red
+    // itself (luma 76), which a dark fringe would be.
+    darkest = 255
+    row = 24
+    while row < 56 {
+        column = 228
+        while column < 260 {
+            l = luma(pixels, column, row)
+            if l < darkest { darkest = l }
+            column = column + 1
+        }
+        row = row + 1
+    }
+    check("${name}: a cut-out icon scaled up has no dark fringe (its darkest luma ${darkest}, red's 76)", darkest >= 74)
+    // The icon read from a PNG is the right way up: the checker's top-left
+    // square is red.
+    upright = is_colour(pixels, 181, 61, checker_at(0, 0, 0, false), checker_at(0, 0, 1, false),
+                        checker_at(0, 0, 2, false), 1) &&
+              is_colour(pixels, 181, 73, checker_at(12, 0, 0, false), checker_at(12, 0, 1, false),
+                        checker_at(12, 0, 2, false), 1)
+    check("${name}: an image read from a file is drawn the right way up", upright)
+}
+
+check_menu(name: string, pixels: ptr) {
+    // The HUD's white panel under the menu's dimming: half.
+    under = pixel(pixels, 20, 20, 0)
+    check("${name}: a menu dims what is under it (white reads ${under})", iabs(under - 128) <= 2)
+    // The focus ring on Resume: its colour along its top edge.
+    resume = g_ring as *UiNode
+    x0, y0, x1, _y1 = ui2d.drawn_rect(resume)
+    ring = is_colour(pixels, ((x0 + x1) * 0.5) as int, y0 as int, 255, 199, 56, 3)
+    check("${name}: the focused button wears the focus ring", ring)
+}
+
+// Vulkan's frame against OpenGL's, at the backend-parity test's tolerance:
+// fewer than 2% of the channels more than 8 apart, and lit areas within 5%.
+parity(name: string, opengl: ptr, vulkan: ptr) {
+    worst = 0
+    differing = 0
+    lit_gl = 0
+    lit_vk = 0
+    total = 0
+    i = 0
+    while i < SMALL_W * SMALL_H * 4 {
+        if i % 4 != 3 {
+            a = mem.get_uint8(opengl, i)
+            b = mem.get_uint8(vulkan, i)
+            if a > 12 { lit_gl = lit_gl + 1 }
+            if b > 12 { lit_vk = lit_vk + 1 }
+            d = iabs(a - b)
+            if d > worst { worst = d }
+            if d > 8 { differing = differing + 1 }
+            total = total + 1
+        }
+        i = i + 1
+    }
+    println("  vulkan against opengl, ${name}: ${differing} of ${total} channels differ by more than 8, the most by ${worst}; lit ${lit_gl} and ${lit_vk}")
+    check("vulkan draws what opengl draws: ${name}", differing * 100 < total * 2 && iabs(lit_gl - lit_vk) * 20 < lit_gl)
+}
+
+// Every frame through one backend, offscreen.
+render_frames(backend: *Backend, name: string) {
+    core.backend_set_clear_color(backend, 0.08, 0.1, 0.14)
+    cam = core.camera_new(SMALL_W, SMALL_H)
+    light = core.light_sun(core.vec3(0.2, 1.0, 0.4))
+    kind = 0
+    while kind < FRAMES {
+        o = hud.hud_new()
+        ui = ui2d.screen_new()
+        ui2d.attach(ui, o)
+        core.backend_set_overlay(backend, o as ptr)
+        build(ui, o, kind)
+        core.backend_render(backend, cam, light)
+        drawn = copy_frame(frame_of(backend))
+        if drawn == null {
+            println("ui: SKIP ${name} gave no pixels")
+        } else {
+            ground = luma(drawn, SMALL_W - 2, SMALL_H - 2)
+            if core.env_int("AE3D_UI_PNG", 0) == 1 { png.write("build/ui_${name}_${kind}.png", drawn, SMALL_W, SMALL_H) }
+            if kind == FRAME_ANCHORS { check_anchors(name, drawn) }
+            if kind == FRAME_TEXT { check_text(name, drawn, ground) }
+            if kind == FRAME_CLIP {
+                check_clip(name, drawn, ground, false)
+                // The checker rewritten in place, inverted: the next frame
+                // shows the new texels, sent as the rows that changed.
+                inverted = checker_pixels()
+                k = 0
+                while k < CHECKER * CHECKER * 4 {
+                    if k % 4 != 3 { mem.set_byte(inverted, k, 255 - mem.get_uint8(inverted, k)) }
+                    k = k + 1
+                }
+                ui2d.update_image(ui, g_checker, inverted)
+                free(inverted)
+                first, end = hud.image_dirty(o)
+                core.backend_render(backend, cam, light)
+                again = copy_frame(frame_of(backend))
+                println("  ${name}: the rewritten image sends rows ${first} to ${end} of the atlas's ${hud.image_atlas_height(o)}")
+                check_clip("${name}, the image rewritten", again, ground, true)
+                free(again)
+            }
+            if kind == FRAME_MENU { check_menu(name, drawn) }
+            opengl = g_opengl as ptr[]
+            if opengl[kind] == null {
+                opengl[kind] = drawn
+                drawn = null
+            } else {
+                parity("frame ${kind}", opengl[kind], drawn)
+            }
+        }
+        if drawn != null { free(drawn) }
+        core.backend_set_overlay(backend, null)
+        ui2d.screen_free(ui)
+        hud.hud_free(o)
+        kind = kind + 1
+    }
+    core.camera_free(cam)
+    core.light_free(light)
+}
+
+rendered() {
+    // The icon file: the checker, top row first, as PNG writes it.
+    png.write("build/test_ui_icon.png", checker_pixels_kept(), CHECKER, CHECKER)
+    g_opengl = calloc(FRAMES, 8)
+    phase("pixels, OpenGL offscreen")
+    context = offscreen.context_create(SMALL_W, SMALL_H)
+    if context == null {
+        println("ui: SKIP no OpenGL context")
+        return
+    }
+    renderer = gl.renderer_new()
+    pass = gl.backend(renderer)
+    if !core.backend_init(&pass, context, SMALL_W, SMALL_H) {
+        println("ui: SKIP the OpenGL backend would not initialise")
+        return
+    }
+    target = offscreen.target_create(SMALL_W, SMALL_H)
+    gl.renderer_set_target(renderer, target)
+    render_frames(&pass, "opengl")
+    core.backend_cleanup(&pass)
+    offscreen.target_destroy(target)
+    gl.renderer_free(renderer)
+    offscreen.context_destroy(context)
+
+    if !vulkan.available() {
+        println("ui: no Vulkan driver (${vulkan.last_error()}), checked OpenGL only")
+    } else {
+        phase("pixels, Vulkan offscreen")
+        vk_renderer = vulkan.renderer_new()
+        vk_pass = vulkan.backend(vk_renderer)
+        if !core.backend_init(&vk_pass, null, SMALL_W, SMALL_H) {
+            println("ui: SKIP Vulkan would not start (${vulkan.last_error()})")
+        } else {
+            render_frames(&vk_pass, "vulkan")
+            core.backend_cleanup(&vk_pass)
+        }
+        vulkan.renderer_free(vk_renderer)
+    }
+    opengl = g_opengl as ptr[]
+    k = 0
+    while k < FRAMES {
+        if opengl[k] != null { free(opengl[k]) }
+        k = k + 1
+    }
+    free(g_opengl)
+    if g_kept_checker != null { free(g_kept_checker) }
+    if g_kept_sprite != null { free(g_kept_sprite) }
+}
+
+// --- the engine ------------------------------------------------------------------------------------------------
+
+// A game: a HUD with a health bar, a pause menu with Resume and a name field.
+// On frame 3 the script opens the menu; on 6 it types into the field; on 8
+// the cursor goes to Resume and the button goes down, on 9 up; the frame
+// Resume is clicked the script closes the menu. The game's actions are read
+// every frame by the script, as a game's would be.
+struct UiTestGame {
+    pause: ptr
+    resume: ptr
+    name: ptr
+    bar: ptr
+    heard_open: int       // frames the menu was open and the game heard something
+    open_frames: int
+    heard_after: int      // frames after it closed that fire was heard
+    closed_at: int
+    typed: bool
+    menu_pixels: ptr      // the frame read back with the menu open
+    bar_lit: int          // the bar's fill, read without the menu, and under it
+    bar_dimmed: int
+    scale: float          // the UI's scale, and the window's content scale
+    content_scale: float
+}
+
+var g_game: ptr = null
+
+game_start(state: ptr, go: *GameObject) {
+    play = state as *UiTestGame
+    e = engine.of(go)
+    ui = engine.engine_ui(e)
+    keys = engine.engine_input(e)
+    input.bind_mouse(keys, "fire", platform.MOUSE_LEFT)
+    input.bind_key(keys, "jump", platform.KEY_SPACE)
+    base = ui2d.layer(ui)
+    bar = ui2d.rect(base, ui2d.BOTTOM_LEFT, 10.0, 0.0 - 10.0, 120.0, 12.0, hud.rgba(0.1, 0.9, 0.2, 1.0))
+    ui2d.set_back(bar, hud.rgba(0.2, 0.05, 0.05, 1.0))
+    ui2d.set_fill(bar, 0.75)
+    play.bar = bar as ptr
+    pause = ui2d.menu(ui)
+    card = ui2d.panel(pause, ui2d.CENTER, 0.0, 0.0, 200.0, 100.0, hud.rgba(0.1, 0.11, 0.13, 0.96))
+    play.resume = ui2d.button(card, ui2d.TOP, 0.0, 10.0, 160.0, 30.0, "Resume") as ptr
+    play.name = ui2d.field(card, ui2d.TOP, 0.0, 54.0, 160.0, 30.0, "Your name") as ptr
+    play.pause = pause as ptr
+}
+
+game_update(state: ptr, go: *GameObject, delta: float) {
+    play = state as *UiTestGame
+    e = engine.of(go)
+    ui = engine.engine_ui(e)
+    keys = engine.engine_input(e)
+    frame = engine.engine_frame_count(e)
+    if frame == 1 {
+        play.scale = ui2d.scale(ui)
+        play.content_scale = platform.window_content_scale(engine.engine_window(e))
+    }
+    heard = input.held(keys, "fire") || input.pressed(keys, "fire") || input.released(keys, "fire") ||
+            input.held(keys, "jump") || input.pressed(keys, "jump")
+    if ui2d.depth(ui) > 0 {
+        play.open_frames = play.open_frames + 1
+        if heard { play.heard_open = play.heard_open + 1 }
+    } else if play.closed_at > 0 && (input.pressed(keys, "fire") || input.held(keys, "fire")) {
+        play.heard_after = play.heard_after + 1
+    }
+    if frame == 3 { ui2d.push(ui, play.pause as *UiNode) }
+    if frame == 5 {
+        // Clicks into the field, keys and characters, while the menu is open.
+        fx, fy = centre_of(play.name as *UiNode)
+        input.inject_cursor(keys, fx, fy)
+        input.inject_mouse(keys, platform.MOUSE_LEFT, true)
+        input.inject_key(keys, platform.KEY_SPACE, true)
+    }
+    if frame == 6 {
+        input.inject_mouse(keys, platform.MOUSE_LEFT, false)
+        input.inject_key(keys, platform.KEY_SPACE, false)
+        input.inject_char(keys, 65)
+        input.inject_char(keys, 100)
+        input.inject_char(keys, 97)
+    }
+    if frame == 8 {
+        rx, ry = centre_of(play.resume as *UiNode)
+        input.inject_cursor(keys, rx, ry)
+        input.inject_mouse(keys, platform.MOUSE_LEFT, true)
+    }
+    if frame == 9 { input.inject_mouse(keys, platform.MOUSE_LEFT, false) }
+    if ui2d.clicked(play.resume as *UiNode) {
+        play.typed = ui2d.field_text(play.name as *UiNode) == "Ada"
+        ui2d.pop(ui)
+        play.closed_at = frame
+    }
+}
+
+// After the draw: the frame read back with the menu open, and without.
+game_read(state: ptr, go: *GameObject, delta: float) {
+    play = state as *UiTestGame
+    e = engine.of(go)
+    frame = engine.engine_frame_count(e)
+    if frame != 2 && frame != 4 { return }
+    width = platform.window_fb_width(engine.engine_window(e))
+    height = platform.window_fb_height(engine.engine_window(e))
+    if width != SMALL_W || height != SMALL_H { return }
+    if capture.frame(SMALL_W, SMALL_H) == 0 { return }
+    x0, y0, x1, y1 = ui2d.drawn_rect(play.bar as *UiNode)
+    out = calloc(4, 8)
+    capture.pixel(((x0 + x1) * 0.25) as int, ((y0 + y1) * 0.5) as int, out)
+    green = ((out as float[])[1]) as int
+    free(out)
+    if frame == 2 { play.bar_lit = green } else { play.bar_dimmed = green }
+}
+
+through_engine() {
+    phase("the engine, on OpenGL")
+    e = engine.engine_new_with(platform.API_GL)
+    engine.engine_set_size(e, SMALL_W, SMALL_H)
+    engine.engine_set_title(e, "ae3d ui test")
+    engine.engine_set_frame_limit(e, 14)
+    engine.engine_set_camera_input(e, false)
+    engine.engine_set_vsync(e, 0)
+    engine.engine_set_clear_color(e, 0.08, 0.1, 0.14)
+    light = core.light_sun(core.vec3(0.2, 1.0, 0.4))
+    engine.engine_set_light(e, light)
+    play = UiTestGame { heard_open: 0, open_frames: 0, heard_after: 0, closed_at: 0, typed: false,
+                  bar_lit: 0 - 1, bar_dimmed: 0 - 1 }
+    manager = engine.object(e, "Game", null)
+    engine.script(manager, "Game", &play, game_start, game_update, null, game_read)
+    if !engine.engine_run(e) {
+        println("ui: SKIP no window for the engine")
+    } else {
+        println("  engine: the menu was open ${play.open_frames} frames, the game heard something in ${play.heard_open}; closed on frame ${play.closed_at}, fire heard ${play.heard_after} frames after")
+        check("engine: the UI is at the window's content scale (${play.scale}, the window's ${play.content_scale})",
+              play.content_scale > 0.0 && play.scale == play.content_scale)
+        check("engine: a script opens the menu, a click on Resume closes it", play.closed_at == 10 && ui2d.depth(engine.engine_ui(e)) == 0)
+        check("engine: the game's input hears nothing while the menu is open", play.open_frames >= 5 && play.heard_open == 0)
+        check("engine: and the click on Resume fires nothing after", play.heard_after == 0)
+        check("engine: the field took what was typed into it (\"Ada\")", play.typed)
+        if play.bar_lit >= 0 && play.bar_dimmed >= 0 {
+            println("  engine: the health bar's green reads ${play.bar_lit}, and ${play.bar_dimmed} under the menu")
+            check("engine: the HUD is drawn, and the menu over it dims it", play.bar_lit >= 225 && iabs(play.bar_dimmed * 2 - play.bar_lit) <= 4)
+        } else {
+            println("ui: the engine's frame could not be read at ${SMALL_W} x ${SMALL_H}; its pixels not checked")
+        }
+    }
+    core.light_free(light)
+    engine.engine_free(e)
+}
+
+main() {
+    headless_layout()
+    headless_input()
+    rendered()
+    through_engine()
+
+    if g_failures == 0 {
+        println("ui: all checks passed (${g_checks})")
+    } else {
+        println("ui: ${g_failures} of ${g_checks} checks failed")
+    }
+}

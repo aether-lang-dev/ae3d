@@ -1569,6 +1569,9 @@ int ae3d_vk_overlay_code_size(int stage) {
    image is presenting when the hooks see it, and goes back to presenting. */
 int ae3d_vk_frame_offscreen(void) { return vk.offscreen ? 1 : 0; }
 int ae3d_vk_frame_copyable(void) { return (vk.offscreen || vk.can_capture) ? 1 : 0; }
+/* Milliseconds a tick of the graphics queue's timestamps, for a hook that
+   times its own work (ae3d.vkoverlay); 0 when the queue keeps no time. */
+double ae3d_vk_timestamp_ms(void) { return vk.timestamps_usable ? vk.timestamp_ms : 0.0; }
 
 static int ae3d_vk_choose_surface_format(void) {
     VkSurfaceFormatKHR *formats;

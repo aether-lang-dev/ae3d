@@ -133,6 +133,7 @@ const void *ae3d_vk_overlay_code(int stage);
 int    ae3d_vk_overlay_code_size(int stage);
 int    ae3d_vk_frame_offscreen(void);
 int    ae3d_vk_frame_copyable(void);
+double ae3d_vk_timestamp_ms(void);
 void   ae3d_vk_set_ray_budget(int figures);
 int    ae3d_vk_ray_budget(void);
 int    ae3d_vk_ray_figures(void);

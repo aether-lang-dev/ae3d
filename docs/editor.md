@@ -178,6 +178,23 @@ every model is put back exactly where it stood: the simulation is for
 looking at, and what it did to the scene is not kept. Loading a scene
 while one runs stops it first.
 
+The viewport draws the game's overlay over the scene, as the game does
+([ui.md](ui.md)): a HUD script on an object -- `health_bar` is one --
+draws its bar there, and a layer or a menu of the game's UI shows there,
+so a HUD is seen and tuned where the scene is built. While the scene is
+simulated the viewport is the game's screen: its pointer, buttons, keys
+and wheel go to the game's input, so the game's own menus take their
+clicks and typing in it exactly as in the game, and the game's actions
+read what is done there. A click the game's UI takes -- a menu is open, or
+it lands on a widget -- neither orbits nor picks, and the keys are the
+game's until it stops; stopping closes its menus. The toolkit's canvas
+reports keys by name, and on Windows those names lose shift and
+punctuation and never include Tab (aether-lang-dev/aether-ui#214), so a
+field of the game's typed into in the viewport takes letters, digits and
+spaces there until the toolkit gives a canvas the text typed; and on
+macOS, whose canvas is not told a key was let go
+(aether-lang-dev/aether-ui#215), a key is a tap, down for one frame.
+
 **Console** keeps the last few messages. The status line under the viewport
 carries the newest, and the stats bar beside it says what the last frame
 cost: the rate, then the device's own time for each pass -- the shadow map,
@@ -299,7 +316,9 @@ tested without a window: `tests/test_history.ae`.
 
 ## Behaviours
 
-Spin, bob and orbit can be attached to any object and run in the frame loop.
+Spin, bob, orbit and pulse can be attached to any object and run in the frame
+loop; health_bar draws a HUD over the viewport through the overlay its
+object's scene is drawn under (`behaviour.object_overlay`).
 Gopher3D compiles and hot-reloads Go scripts; these are built in, because the
 part that matters in an editor is attaching a behaviour and watching it run.
 

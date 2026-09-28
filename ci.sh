@@ -808,6 +808,14 @@ check_editor_run() {
         # (the world never stepped under the editor) or did not come back.
         fail "$name (the simulation did not run, or did not put the scene back)"
         sed 's/^/        /' "$report"
+    elif [ "$(sed -n 's/^overlay_stuck //p' "$report")" != "0" ]; then
+        # The overlay in the viewport (#460): the health bar script attached to
+        # an object draws its bar over the rendered viewport, a layer of the
+        # game's UI draws there to the channel, and in play mode a click on a
+        # menu's button through the viewport's own handlers clicks it, the
+        # game's input hears none of it, and stopping closes the menu.
+        fail "$name ($(sed -n 's/^overlay_stuck //p' "$report") of the viewport's overlay checks failed)"
+        sed 's/^/        /' "$report"
     elif [ "$(sed -n 's/^viewport_path //p' "$report")" = "gpu-unbuilt" ]; then
         # The GPU path was taken and the renderer was never built on it, so the
         # viewport is a rectangle that never draws. Nothing else notices: the
@@ -905,9 +913,10 @@ check_editor_run() {
         fail "$name ($(sed -n 's/^unundone_drags //p' "$report") gizmo drag(s) cannot be undone)"
         sed 's/^/        /' "$report"
     elif [ "$(sed -n 's/^idle_actions //p' "$report")" != "0" ]; then
-        # Duplicate, delete, frame selection and the three scripts, each asked
-        # for its effect: a button that dispatches to nothing looks exactly like
-        # one that works when the only witness is a person watching.
+        # Duplicate, delete, frame selection and every script (moving its object,
+        # or drawing over the view), each asked for its effect: a button that
+        # dispatches to nothing looks exactly like one that works when the only
+        # witness is a person watching.
         fail "$name ($(sed -n 's/^idle_actions //p' "$report") action(s) do nothing)"
         sed 's/^/        /' "$report"
     elif grep -q '^selected none$' "$report"; then

@@ -55,7 +55,7 @@ interleaved with the first.
 | `light.list` |  | Every light: kind, position, direction, colour, intensity and ambient. |
 | `model.set` | `index, [position], [rotation], [scale], [diffuse], [metallic], [roughness], [reflectivity], [alpha], [visible], [casts_shadow], [name]` | Change a model. Only the fields present are written; answers with the model as it now is. |
 | `camera.set` | `[position], [look_at], [fov], [near], [far]` | Move or reframe the camera. |
-| `input.set` | `[key], [mouse], [button], [axis], [value], [down], [clear]` | Press or release a key, mouse button or pad button, hold a pad axis at a value, or clear every injection: what the engine's input reads next frame beside the real devices. |
+| `input.set` | `[key], [mouse], [button], [axis], [value], [down], [cursor], [text], [scroll], [clear]` | Press or release a key, mouse button or pad button, hold a pad axis at a value, put the cursor at [x, y] in the frame's pixels, type text as characters, turn the wheel, or clear every injection: what the engine's input reads next frame beside the real devices. A key pressed is a key event too, so a menu (ae3d.ui2d) takes it the way it takes a keyboard's; blocked says whether a menu is open and the game's actions read nothing. |
 | `input.get` |  | Every bound action with its state this frame: down, pressed, released, value. |
 | `light.set` | `[index], [position], [direction], [color], [intensity], [ambient]` | Change a light. |
 | `scene.save` | `path, [mesh_directory]` | Write the scene to JSON, with generated geometry beside it. |
