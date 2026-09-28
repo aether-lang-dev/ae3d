@@ -103,7 +103,8 @@ const TRAFFIC_HANDSHAKE = 8          // UDP: the connection's handshake and its 
 
 // 2: snapshots are deltas against an acknowledged one; 3: events, objects
 // created mid-game; 4: events carrying bytes; 5: quantised, prioritised
-// snapshots, acknowledgements riding on inputs, the welcome's precision.
+// snapshots, acknowledgements riding on inputs, every unacknowledged
+// command in each input (a repeated one a bit), the welcome's precision.
 const PROTOCOL = 5
 const MSG_HELLO = 1                  // client -> host: [u8][u32 protocol]
 const MSG_WELCOME = 2                // host -> client: [u8][u32 client id][u32 tick rate][f64 precision]
@@ -114,9 +115,11 @@ const MSG_WELCOME = 2                // host -> client: [u8][u32 client id][u32 
 // itself when the base does not have the object), the rotation as 48 bits. An object with no record is
 // as it was in the base (gap 0: none).
 const MSG_SNAPSHOT = 3
-// client -> host, unreliable: [u8][u16 newest snapshot][u32 first seq][u8 count], then a command each:
-// [f32 walk x z][f32 jump]. The snapshot is the client's acknowledgement, riding on its commands: its
-// tick's low 16 bits, which the host puts back beside its own tick.
+// client -> host, unreliable: [u8][u16 newest snapshot][u32 first seq][u8 count][(count + 7) / 8 bytes,
+// bit k of byte k / 8 set where command k is sent], then each command sent: [f32 walk x z][f32 jump]; one
+// not sent is the one before it again (the first is always sent). The snapshot is the client's
+// acknowledgement, riding on its commands: its tick's low 16 bits, which the host puts back beside its
+// own tick.
 const MSG_INPUT = 4
 const MSG_SPAWN = 5                  // host -> client, reliable: [u8][u32 net id][u32 owner]
 const MSG_ACK = 6                    // client -> host, unreliable: [u8][u16 tick], a snapshot it has, when no input carried it
@@ -158,7 +161,7 @@ const TCP_CHUNK = 65536
 const HUB_ENDPOINTS = 64
 const COMMANDS = 128                 // a client's commands kept until the host has applied them
 const COMMAND = 4                    // floats a command: seq, walk x, walk z, jump
-const RESENT = 4                     // the unacknowledged commands every input message carries: four lost in a row costs a correction
+const INPUTS_MOST = 64               // the unacknowledged commands an input message carries at most, the oldest: a second of them
 const PLAYER_STEP = 0.016666666666666666   // a command's step, seconds: the fixed step's
 const QUEUE_DEPTH = 3                // host: the commands a client's queue holds before it catches up
 const EVENT_VALUES = 4               // the numbers an event carries at most
@@ -441,7 +444,6 @@ struct Peer {
     // after a later one (a UDP link reorders) is applied in its turn.
     queued: ptr
     last_queued: int                 // the newest command received
-    waited: int                      // host steps the next command has been missing, later ones here
     // Host: the snapshots told it, a ring of KEPT, and the newest it has
     // acknowledged, which the next is a delta against.
     ring: ptr                        // ptr[KEPT]: *Snapshot
@@ -939,10 +941,11 @@ host_udp(address: string, port: int) -> *Net {
     return n
 }
 
-// A client's inputs are handed over late or not: each carries the last
-// RESENT commands, so one the link reordered behind a newer may still
-// hold a command no other message did, and the host keeps only the ones
-// it has not queued. Snapshots and acknowledgements stay sequenced.
+// A client's inputs are handed over late or not: each carries every
+// command the host had not acknowledged when it was sent, so an older one
+// the link reordered behind a newer holds nothing the newer did not, and
+// the host keeps only the ones it has not queued. Snapshots and
+// acknowledgements stay sequenced.
 unsequenced_inputs(ep: *UdpEndpoint) {
     netudp.set_sequenced(ep, MSG_INPUT, false)
 }
@@ -2332,12 +2335,22 @@ apply_inputs(n: *Net, p: *Peer, r: *NetReader) {
     q = p.queued as float[]
     first = get_u32(r)
     count = get_u8(r)
+    mask_at = r.at
+    r.at = r.at + (count + 7) / 8
+    if count == 0 || r.at > r.length { return }
+    wx = 0.0
+    wz = 0.0
+    jump = 0.0
     i = 0
     while i < count {
         seq = first + i
-        wx = get_f32(r)
-        wz = get_f32(r)
-        jump = get_f32(r)
+        if (mem.get_byte(r.data, mask_at + i / 8) & (1 << (i % 8))) != 0 {
+            wx = get_f32(r)
+            wz = get_f32(r)
+            jump = get_f32(r)
+        } else if i == 0 {
+            return
+        }
         if !r.ok { return }
         // Not yet applied, and within the ring: kept at its place by
         // sequence, whatever came before it.
@@ -2353,27 +2366,21 @@ apply_inputs(n: *Net, p: *Peer, r: *NetReader) {
     }
 }
 
-// A client's next command, applied to its player. One that is not here
-// while later ones are may still be on its way behind them: it is waited
-// for QUEUE_DEPTH steps, and then taken as lost -- every message that
-// carried it (RESENT in a row) was -- and skipped; the client reconciles.
+// A client's next command, applied to its player. The queue never has a
+// gap: every input message starts at the oldest command the client has not
+// seen acknowledged, which is at most one past the last the host applied
+// (the host's acknowledgement is its last applied), and runs on without
+// one missing, so whatever the link lost or reordered, what the host takes
+// joins on to what it has. The next is always here while a later one is.
 apply_queued(p: *Peer) {
     if p.queued == null || p.last_queued <= p.last_input { return }
     next = p.last_input + 1
     q = p.queued as float[]
     slot = (next % COMMANDS) * COMMAND
-    if (q[slot]) as int != next {
-        p.waited = p.waited + 1
-        if p.waited > QUEUE_DEPTH {
-            p.last_input = next
-            p.waited = 0
-        }
-        return
-    }
+    if (q[slot]) as int != next { return }
     pl = p.player as *NetPlayer
     physics.character_move(pl.controller, core.vec3(q[slot + 1], 0.0, q[slot + 2]), q[slot + 3], PLAYER_STEP)
     p.last_input = next
-    p.waited = 0
 }
 
 // The host's player steps due by `now`: a command a client each, and a
@@ -2442,26 +2449,53 @@ player_input(n: *Net, walk: Vec3, jump: float, now: float) {
     cmds[slot + 3] = jump
     n.command_count = n.command_count + 1
     physics.character_move(mine.controller, core.vec3(walk.x, 0.0, walk.z), jump, PLAYER_STEP)
-    // The newest RESENT of the unacknowledged.
+    // Every command the host has not acknowledged, the oldest first, up to
+    // INPUTS_MOST: whichever of these messages the host takes, it has every
+    // command after the last it applied, so neither loss nor reordering
+    // ever costs a correction, only the wait for one message to get
+    // through. A command is sent where it differs from the one before it;
+    // a key held is the same command step after step, a bit each.
     b = n.out
     b.length = 0
     put_u8(b, MSG_INPUT)
     put_u16(b, n.newest_tick & 65535)
-    first = n.command_count - RESENT
-    if first < 0 { first = 0 }
-    put_u32(b, (cmds[((n.command_first + first) % COMMANDS) * COMMAND]) as int)
-    put_u8(b, n.command_count - first)
-    k = first
-    while k < n.command_count {
-        at = ((n.command_first + k) % COMMANDS) * COMMAND
-        put_f32(b, cmds[at + 1])
-        put_f32(b, cmds[at + 2])
-        put_f32(b, cmds[at + 3])
+    count = n.command_count
+    if count > INPUTS_MOST { count = INPUTS_MOST }
+    put_u32(b, (cmds[n.command_first * COMMAND]) as int)
+    put_u8(b, count)
+    mask = 0
+    k = 0
+    while k < count {
+        if command_differs(n, k) { mask = mask | (1 << (k % 8)) }
+        if k % 8 == 7 || k == count - 1 {
+            put_u8(b, mask)
+            mask = 0
+        }
+        k = k + 1
+    }
+    k = 0
+    while k < count {
+        if command_differs(n, k) {
+            at = ((n.command_first + k) % COMMANDS) * COMMAND
+            put_f32(b, cmds[at + 1])
+            put_f32(b, cmds[at + 2])
+            put_f32(b, cmds[at + 3])
+        }
         k = k + 1
     }
     deliver(n, peer_by_id(n, 0), false, b.data, b.length, now)
     n.ack_due = false
     n.inputs_sent = n.inputs_sent + 1
+}
+
+// Whether the client's unacknowledged command `k` is sent in full: the
+// first always, another where it is not the one before it again.
+command_differs(n: *Net, k: int) -> bool {
+    if k == 0 { return true }
+    cmds = n.commands as float[]
+    at = ((n.command_first + k) % COMMANDS) * COMMAND
+    was = ((n.command_first + k - 1) % COMMANDS) * COMMAND
+    return cmds[at + 1] != cmds[was + 1] || cmds[at + 2] != cmds[was + 2] || cmds[at + 3] != cmds[was + 3]
 }
 
 // The host says where this client's player was after command `ack`: the
