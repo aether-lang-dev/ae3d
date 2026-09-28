@@ -280,7 +280,7 @@ CC="${CC:-cc}"
 ae3d_glfw_flags
 ae3d_vulkan_flags
 for src in native/*/*.c; do
-    if "$CC" -c -O2 -Wall -Wextra -Werror -Inative $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o /dev/null 2>/tmp/ae3d_cc.log; then
+    if "$CC" -c -O2 $(ae3d_fp_flags) -Wall -Wextra -Werror -Inative $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o /dev/null 2>/tmp/ae3d_cc.log; then
         pass "$src"
     else
         fail "$src"
@@ -288,7 +288,7 @@ for src in native/*/*.c; do
     fi
 done
 if [ "$(uname -s)" = "Darwin" ]; then
-    if "$CC" -c -O2 -Wall -Wextra -Werror -fobjc-arc $GLFW_CFLAGS -Inative native/platform/metal_surface.m -o /dev/null 2>/tmp/ae3d_cc.log; then
+    if "$CC" -c -O2 $(ae3d_fp_flags) -Wall -Wextra -Werror -fobjc-arc $GLFW_CFLAGS -Inative native/platform/metal_surface.m -o /dev/null 2>/tmp/ae3d_cc.log; then
         pass "native/platform/metal_surface.m"
     else
         fail "native/platform/metal_surface.m"

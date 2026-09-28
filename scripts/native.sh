@@ -100,6 +100,20 @@ ae3d_native_library() {
     printf '%s' "build/libae3d_native$(ae3d_native_suffix)"
 }
 
+# How floating point is compiled: every multiply and add rounded on its own,
+# never fused into one instruction. An FMA rounds a*b+c once where the pair
+# rounds twice, so a program that fuses and one that does not part in the last
+# bit, and the networked horde (ae3d.nethorde) and aephysics are simulated on
+# every peer and held to the bit (#441). x86-64 without -march has no FMA to
+# fuse into; Apple Clang on arm64 fuses within an expression by default
+# (-ffp-contract=on), and GCC's default outside ISO mode is `fast`, which
+# fuses across statements too. Named on every compile line of every build
+# script -- the engine's library, the generated program, the editor, a
+# script -- so no part of a program is built the other way.
+ae3d_fp_flags() {
+    printf '%s' "-ffp-contract=off"
+}
+
 # Link the objects the caller has just compiled into that library. The engine's
 # own dependencies are named here rather than taken from the caller: the
 # editor's link line carries aether-ui's libraries, which are nothing to do
