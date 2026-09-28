@@ -59,6 +59,13 @@ adds the layer's synchronization validation, and every example is clean
 under it too: a hazard is ordering a GPU forgives today and a driver that
 overlaps more will not.
 
+The examples draw to a window and read nothing back, so the readback's
+ordering is held by `ci.sh` instead. It runs the suites that copy frames out
+(`test_fog`, `test_overlay`, `test_backend_parity`) under the layer, with
+synchronization validation on, wherever the layer is installed. A validation
+error fails that suite. A run the loader did not insert the layer into is
+reported as a skip, not a pass (#458).
+
 A number in a document is quoted with its pair from the same run on the
 same machine, because two runs on a shared GPU differ by more than most
 optimisations gain.
