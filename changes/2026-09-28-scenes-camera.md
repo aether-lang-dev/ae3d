@@ -57,6 +57,28 @@
   the horde removed, against 2.08); its blocks throw no shadow, which by ray
   cost 0.85 ms for shadows behind the terraces. `tools/probe_image.ae --key
   R G B [ROW]` counts one colour's pixels.
+- **An instanced model is its instances, however many** (found by the
+  sweep: `zombie_city` on OpenGL drew triangles stretched across the frame).
+  OpenGL gave an instanced model a vertex array and instance streams of its
+  own only when it was added with instances; the city's blocks, added empty
+  and filled as the camera walks, went through the shared geometry cache and
+  drew their instances through a vertex array with no stream. Now every
+  instanced model has its own from the start, sized as its instances come.
+  An instanced model with no instances draws and casts nothing on either
+  backend: it was its mesh once where it stood, merged into a batch on
+  OpenGL and the draw's identity instance on Vulkan. A point stream's size is
+  counted at its 32 bytes an instance, not a matrix's 64 (two points raised
+  to four wrote past the buffer); the colours and phases go out with the
+  matrices, as Vulkan's one stream does (a count raised over instances
+  coloured earlier read past the colour buffer); the shadow pass sends a
+  stream that changed before it draws it. `tests/test_instance_streams.ae`:
+  blocks added with none, then three, five moved and recoloured, two, five
+  by the count alone, none; points raised from two to four; every place
+  named by its colour on both backends, and the two frames the same place by
+  place. Without the fix OpenGL fails all six frames and Vulkan the two
+  empty ones. `zombie_city` no longer hides an empty set itself.
+  `test_framing` read OpenGL's frame through the backend's pipelined
+  readback, a frame behind; it reads the target now.
 - **Window panes** (#478, not closed: no Blender here). 222 of the street's
   346 pane triangles face into their buildings -- `recalc_face_normals` over
   loose sheets in one plane -- so those windows are holes onto the hollow

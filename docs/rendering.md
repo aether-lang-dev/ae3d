@@ -23,7 +23,13 @@ The feature list in full, with the reasoning behind each. The [README](../README
   -- a position, a scale, a colour and a phase in eight floats, with the
   model's own rotation and scale applied to all of them in the shader. A
   million grains of sand that all move in a frame are a 32 MB stream
-  instead of an 80 MB one built matrix by matrix, on both backends.
+  instead of an 80 MB one built matrix by matrix, on both backends. An
+  instanced model is its instances, however many: it can be added with none
+  and filled later (`model_set_instance_draw_count` up and down its
+  capacity, a city streamed around the camera), and with none it draws and
+  casts nothing, not its mesh where it stands (`tests/test_instance_streams.ae`
+  holds the two backends to the same frames as the count, the places and
+  the colours change).
 - **Skinned crowds in one draw.** A figure's walk is baked once into a pose
   bank (a texture of bone palettes); every instance carries its own phase and
   is posed from the bank in the vertex shader. A crowd of the real 26,636-
