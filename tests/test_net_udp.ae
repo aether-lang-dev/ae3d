@@ -1,0 +1,538 @@
+// Multiplayer over UDP (#473): a host and two clients in one process, each
+// a world of its own, over real datagrams on this machine's loopback
+// interface, with ports the system picks. Every side's link is the
+// simulated one ae3d.netudp puts on what it sends: 50 ms +- 20 ms each way
+// (30 ms and up to 40 more) and 10% of datagrams lost, reliable ones
+// among them -- the reliable channel is the transport's own now, and has
+// to earn it. Held to numbers:
+//
+//   - the handshake: both clients welcomed, and how long it took;
+//   - every event arrives exactly once and in order: a client's honks at
+//     the host, the host's scores at every client, and a 100 KB block of
+//     bytes, sliced into a hundred reliable messages, whole at each; and
+//     how long the slowest took, lost datagrams sent again and all;
+//   - snapshots never go backwards: each a client takes is newer than the
+//     one before, and the late ones the link reordered are counted and
+//     dropped;
+//   - a snapshot larger than a datagram (the first, whole, of 364 objects)
+//     goes in fragments and is put back together, and no datagram is over
+//     1,200 bytes;
+//   - prediction: the most a reconciliation moved a player stays within
+//     the bound the loopback and TCP runs hold it to (1 cm), and at rest
+//     each client's own player is where the host has it;
+//   - the drawing: sixteen objects round a circle, drawn against where the
+//     host had them at the client's view time, within the geometry's bound
+//     for the longest run of snapshots the link lost in a row;
+//   - what it cost: bytes a second of snapshots, events, inputs, acks and
+//     headers, and what was sent again;
+//   - a disconnect is seen by the host at once, a host that falls silent
+//     is found by its client's timeout, and a handshake nobody answers is
+//     given up.
+//
+// On the real clock, like the TCP runs, so the numbers are this machine's
+// and a run's; the loss and the jitter are the simulator's own generator.
+
+import std.mem
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.loader
+import ae3d.physics
+import ae3d.platform
+import ae3d.net
+
+extern calloc(count: int, size: int) -> ptr
+extern malloc(size: long) -> ptr
+extern free(p: ptr)
+extern cos(x: float) -> float
+extern sin(x: float) -> float
+extern sqrt(x: float) -> float
+
+const MOVING = 16
+const STILL = 348                    // with the moving: 364, a first snapshot of several datagrams
+const RADIUS = 10.0
+const STEP = 0.016666666666666666
+const RUN = 5.0                      // seconds on the real clock
+const WALK_UNTIL = 3.8               // the players stop, and settle before the end
+const BLOCK_BYTES = 100000                  // bytes in the large reliable message
+const LATENCY = 0.03
+const JITTER = 0.04
+const LOSS = 0.1
+// How far behind the host a client draws: a snapshot's interval (33 ms),
+// another for one lost, the link's jitter (40 ms), and a frame on each
+// side, since the real clock's steps here are the system timer's 16 ms.
+const DRAW_DELAY = 0.15
+const EVENTS = 256                   // honks and scores at most, their send times kept
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+// One side: its world and session, and what it counted.
+struct Side {
+    world: *Engine
+    session: *Net
+    moving: ptr                      // *GameObject[MOVING]
+    still: ptr                       // *GameObject[STILL]
+    honks: int                       // host: honks taken
+    honker: int                      // host: the client id they come from
+    honk_next: int
+    scores: int                      // client: scores taken
+    score_next: int
+    wrong: int                       // events out of order, twice, or with the wrong numbers
+    blobs: int                       // client: large messages taken whole
+    blobs_bad: int
+    left: int                        // host: clients it heard leave
+    last_tick: int
+    backwards: int                   // client: snapshots taken not newer than the one before
+    gap: int                         // client: the most ticks missing between two it took, while drawn from
+    sent_times: ptr                  // float[EVENTS]: when the events this side receives were sent, by number
+    slowest: float                   // the most an event took, sent to handled
+    welcomed_at: float
+}
+
+// A world: an engine never run, its physics, a ground 80 m across.
+world() -> *Engine {
+    e = engine.engine_new()
+    physics.attach(e)
+    ground = engine.object(e, "Ground", loader.cube(1.0))
+    behaviour.object_set_position(ground, core.vec3(0.0, 0.0 - 0.5, 0.0))
+    physics.box_collider(ground, core.vec3(40.0, 0.5, 40.0), physics.material(0.8, 0.0))
+    return e
+}
+
+make_player(context: ptr, client: int) -> *CharacterController {
+    e = context as *Engine
+    o = engine.object(e, "Player ${client}", null)
+    behaviour.object_set_position(o, core.vec3(((client - 1) * 6) as float, 0.0, 0.0))
+    return physics.character_controller(o, 0.3, 1.8)
+}
+
+free_players(n: *Net) {
+    i = 0
+    while i <= 2 {
+        pl = net.player_of(n, i)
+        if pl != null { physics.character_free(pl.controller) }
+        i = i + 1
+    }
+}
+
+// Object i round a circle a radian a second, at its own height.
+path_x(i: int, t: float) -> float { return RADIUS * cos(t + (i as float)) }
+path_y(i: int, t: float) -> float { return (i as float) * 0.5 }
+path_z(i: int, t: float) -> float { return RADIUS * sin(t + (i as float)) }
+
+// The scene both sides build, networked in the same order: the moving
+// ones, then the still ones in rows 30 m off.
+build_scene(s: *Side) {
+    s.moving = calloc(MOVING, 8)
+    s.still = calloc(STILL, 8)
+    i = 0
+    while i < MOVING {
+        o = behaviour.object_new("car")
+        behaviour.object_set_model(o, core.model_new())
+        net.networked(s.session, o)
+        (s.moving as ptr[])[i] = o as ptr
+        i = i + 1
+    }
+    k = 0
+    while k < STILL {
+        c = behaviour.object_new("crate")
+        behaviour.object_set_model(c, core.model_new())
+        core.model_set_position(behaviour.object_model(c), ((k % 29) as float) * 2.0 - 28.0, 0.0, 30.0 + ((k / 29) as float) * 2.0)
+        core.model_set_rotation(behaviour.object_model(c), core.quat_rotate((k as float) * 0.1, core.vec3(0.0, 1.0, 0.0)))
+        net.networked(s.session, c)
+        (s.still as ptr[])[k] = c as ptr
+        k = k + 1
+    }
+}
+
+free_scene(s: *Side) {
+    i = 0
+    while i < MOVING {
+        o = (s.moving as ptr[])[i] as *GameObject
+        core.model_free(behaviour.object_model(o))
+        behaviour.object_free(o)
+        i = i + 1
+    }
+    k = 0
+    while k < STILL {
+        c = (s.still as ptr[])[k] as *GameObject
+        core.model_free(behaviour.object_model(c))
+        behaviour.object_free(c)
+        k = k + 1
+    }
+    free(s.moving)
+    free(s.still)
+}
+
+// A honk at the host: its number, which it must see in order.
+honked(context: ptr, call: *NetCall) {
+    s = context as *Side
+    s.honks = s.honks + 1
+    if (call.a) as int != s.honk_next || call.sender != s.honker { s.wrong = s.wrong + 1 }
+    took(s, (call.a) as int, call.now)
+    s.honk_next = (call.a) as int + 1
+}
+
+scored(context: ptr, call: *NetCall) {
+    s = context as *Side
+    s.scores = s.scores + 1
+    if (call.a) as int != s.score_next || call.b != call.a * 3.0 { s.wrong = s.wrong + 1 }
+    took(s, (call.a) as int, call.now)
+    s.score_next = (call.a) as int + 1
+}
+
+// How long event `number` took, sent to handled.
+took(s: *Side, number: int, now: float) {
+    if number < 1 || number >= EVENTS { return }
+    spent = now - (s.sent_times as float[])[number]
+    if spent > s.slowest { s.slowest = spent }
+}
+
+// The large block: every byte where the host put it.
+blobbed(context: ptr, call: *NetCall) {
+    s = context as *Side
+    ok = call.length == BLOCK_BYTES
+    k = 0
+    while ok && k < BLOCK_BYTES {
+        if mem.get_byte(call.data, k) != (k * 7 + 3) % 251 { ok = false }
+        k = k + 1
+    }
+    if ok { s.blobs = s.blobs + 1 } else { s.blobs_bad = s.blobs_bad + 1 }
+}
+
+left_host(context: ptr, client: int, now: float) {
+    s = context as *Side
+    s.left = s.left + 1
+}
+
+side_new(session: *Net) -> *Side {
+    s = calloc(1, sizeof(Side)) as *Side
+    s.world = world()
+    s.session = session
+    s.honk_next = 1
+    s.score_next = 1
+    s.welcomed_at = 0.0 - 1.0
+    s.sent_times = calloc(EVENTS, 8)
+    net.set_player_maker(session, make_player, s.world as ptr)
+    net.on_event(session, "honk", honked, s as ptr)
+    net.on_event(session, "score", scored, s as ptr)
+    net.on_event(session, "blob", blobbed, s as ptr)
+    build_scene(s)
+    return s
+}
+
+side_free(s: *Side) {
+    free_players(s.session)
+    net.net_free(s.session)
+    free_scene(s)
+    engine.engine_free(s.world)
+    free(s.sent_times)
+    free(s as ptr)
+}
+
+// A snapshot taken this step is newer than the last, always; and the
+// longest run of ticks the link lost between two, once the drawing is
+// measured (a second in: the view is 150 ms behind the half second the
+// measure starts at).
+watch_ticks(s: *Side, now: float) {
+    t = net.snapshot_tick(s.session)
+    if t != s.last_tick {
+        if t < s.last_tick { s.backwards = s.backwards + 1 }
+        if now >= 1.0 && s.last_tick > 0 && t - s.last_tick - 1 > s.gap { s.gap = t - s.last_tick - 1 }
+        s.last_tick = t
+    }
+}
+
+// How far a client draws the moving objects from where the host had them
+// at its view time, the worst of them.
+drawn_error(s: *Side, now: float) -> float {
+    t = net.view_time(s.session, now)
+    if t < 0.0 { return 0.0 - 1.0 }
+    worst = 0.0
+    i = 0
+    while i < MOVING {
+        m = behaviour.object_model((s.moving as ptr[])[i] as *GameObject)
+        dx = m.position.x - path_x(i, t)
+        dy = m.position.y - path_y(i, t)
+        dz = m.position.z - path_z(i, t)
+        d = sqrt(dx * dx + dy * dy + dz * dz)
+        if d > worst { worst = d }
+        i = i + 1
+    }
+    return worst
+}
+
+where(pl: *NetPlayer) -> Vec3 {
+    return behaviour.object_position(pl.controller.object as *GameObject)
+}
+
+apart(a: Vec3, b: Vec3) -> float {
+    return core.v3_len(core.v3_sub(a, b))
+}
+
+walk_one(t: float) -> Vec3 {
+    if t < 0.8 || t >= WALK_UNTIL { return core.vec3(0.0, 0.0, 0.0) }
+    if t < 2.0 { return core.vec3(0.0, 0.0, 3.0) }
+    return core.vec3(2.0, 0.0, 0.0 - 1.0)
+}
+
+walk_two(t: float) -> Vec3 {
+    if t < 0.8 || t >= WALK_UNTIL { return core.vec3(0.0, 0.0, 0.0) }
+    return core.vec3(0.0 - 1.5, 0.0, 0.0 - 2.0)
+}
+
+kb(bytes: long, seconds: float) -> float { return (bytes as float) / seconds / 1024.0 }
+
+// The next step's moment, waited for: 60 steps a second on the real
+// clock, as a game's frames come. The system timer's 16 ms would make
+// every step late by a different amount; a yield at a time does not.
+pace(start: float, step: int) {
+    due = start + (step as float) * STEP
+    while platform.time() < due { sleep(0) }
+}
+
+main() {
+    println("udp: a host and two clients over loopback UDP, 50 +- 20 ms each way and 10% of datagrams lost")
+    host_session = net.host_udp("127.0.0.1", 0)
+    if host_session == null {
+        println("  SKIP ${net.last_error()}")
+        return
+    }
+    port = net.udp_port(host_session)
+    net.set_conditions(host_session, LATENCY, JITTER, LOSS)
+    host = side_new(host_session)
+    net.on_leave(host_session, left_host, host as ptr)
+    net.host_play(host_session, 0.0)
+    one = side_new(net.join_udp("127.0.0.1", port))
+    net.set_conditions(one.session, LATENCY, JITTER, LOSS)
+    net.set_interpolation_delay(one.session, DRAW_DELAY)
+    two = side_new(net.join_udp("127.0.0.1", port))
+    net.set_conditions(two.session, LATENCY, JITTER, LOSS)
+    net.set_interpolation_delay(two.session, DRAW_DELAY)
+
+    blob = malloc(BLOCK_BYTES as long)
+    k = 0
+    while k < BLOCK_BYTES {
+        mem.set_byte(blob, k, (k * 7 + 3) % 251)
+        k = k + 1
+    }
+    honks = 0
+    scores = 0
+    blob_sent = false
+    commands = 0.0
+    events_at = 0.0
+    measured = 0
+    close = 0
+    worst_drawn = 0.0
+    worst_at = 0.0
+    full_at = 0.0 - 1.0
+    start = platform.time()
+    last = 0.0
+    frame = 0
+    while true {
+        frame = frame + 1
+        pace(start, frame)
+        now = platform.time() - start
+        if now >= RUN { break }
+        if one.welcomed_at < 0.0 && net.connected(one.session) { one.welcomed_at = now }
+        if two.welcomed_at < 0.0 && net.connected(two.session) { two.welcomed_at = now }
+        // The objects round their circle on the host.
+        i = 0
+        while i < MOVING {
+            m = behaviour.object_model((host.moving as ptr[])[i] as *GameObject)
+            core.model_set_position(m, path_x(i, now), path_y(i, now), path_z(i, now))
+            core.model_set_rotation(m, core.quat_rotate(now + (i as float), core.vec3(0.0, 1.0, 0.0)))
+            i = i + 1
+        }
+        // The players' commands at the fixed step, as an engine's fixed
+        // update gives them.
+        commands = commands + (now - last)
+        last = now
+        while commands >= STEP {
+            commands = commands - STEP
+            if net.my_player(one.session) != null { net.player_input(one.session, walk_one(now), 0.0, now) }
+            if net.my_player(two.session) != null { net.player_input(two.session, walk_two(now), 0.0, now) }
+            net.player_input(host.session, core.vec3(0.0, 0.0, 0.0), 0.0, now)
+        }
+        // Honks and scores twenty a second, once everyone is in; the block
+        // at two seconds.
+        if net.connected(one.session) && net.peer_count(host.session) == 2 && now - events_at >= 0.05 && honks < EVENTS - 1 {
+            events_at = now
+            host.honker = net.client_id(one.session)
+            honks = honks + 1
+            (host.sent_times as float[])[honks] = now
+            net.send_event(one.session, "honk", net.HOST, now, honks as float, 1.0)
+            scores = scores + 1
+            (one.sent_times as float[])[scores] = now
+            (two.sent_times as float[])[scores] = now
+            net.send_event(host.session, "score", net.EVERYONE, now, scores as float, (scores * 3) as float)
+        }
+        if !blob_sent && now >= 2.0 && net.peer_count(host.session) == 2 {
+            net.send_event_bytes(host.session, "blob", net.EVERYONE, now, blob, BLOCK_BYTES)
+            blob_sent = true
+        }
+        net.step(host.session, now)
+        net.step(one.session, now)
+        net.step(two.session, now)
+        watch_ticks(one, now)
+        watch_ticks(two, now)
+        if full_at < 0.0 && net.known(one.session, MOVING + STILL) && net.known(two.session, MOVING + STILL) { full_at = now }
+        if now >= 1.5 {
+            e = drawn_error(one, now)
+            if e >= 0.0 {
+                measured = measured + 1
+                if e <= 0.006 { close = close + 1 }
+                if e > worst_drawn {
+                    worst_drawn = e
+                    worst_at = now
+                }
+            }
+        }
+    }
+    seconds = RUN
+    // What the run cost, before the quiet second after it.
+    hs = host.session
+    os = one.session
+    host_bytes = net.bytes_sent(hs)
+    host_datagrams = net.datagrams_sent(hs)
+    host_snapshots = net.traffic(hs, net.TRAFFIC_SNAPSHOTS)
+    host_events = net.traffic(hs, net.TRAFFIC_EVENTS)
+    host_headers = net.traffic(hs, net.TRAFFIC_HEADERS)
+    host_ack_packets = net.traffic(hs, net.TRAFFIC_ACK_PACKETS)
+    host_resent = net.traffic(hs, net.TRAFFIC_RESENT)
+    one_bytes = net.bytes_sent(os)
+    one_datagrams = net.datagrams_sent(os)
+    one_inputs = net.traffic(os, net.TRAFFIC_INPUTS)
+    one_acks = net.traffic(os, net.TRAFFIC_ACKS)
+    one_events = net.traffic(os, net.TRAFFIC_EVENTS)
+    one_headers = net.traffic(os, net.TRAFFIC_HEADERS)
+    one_resent = net.traffic(os, net.TRAFFIC_RESENT)
+    // A second more, nothing new sent, for what is still on its way.
+    drain = frame + 60
+    while frame < drain {
+        frame = frame + 1
+        pace(start, frame)
+        now = platform.time() - start
+        net.step(host.session, now)
+        net.step(one.session, now)
+        net.step(two.session, now)
+    }
+
+    println("  welcomed: client 1 ${one.welcomed_at * 1000.0} ms after it joined, client 2 ${two.welcomed_at * 1000.0} ms; round trip ${net.round_trip(one.session, 0) * 1000.0} ms")
+    // Two round trips of handshake and a third of hello and welcome, 400 ms
+    // or so on this link, and each datagram of them lost costs a resend:
+    // a second and a half is four of the six lost.
+    check("both clients are welcomed, through the handshake and the hello, within a second and a half", one.welcomed_at > 0.0 && one.welcomed_at < 1.5 && two.welcomed_at > 0.0 && two.welcomed_at < 1.5)
+    slowest = host.slowest
+    if one.slowest > slowest { slowest = one.slowest }
+    if two.slowest > slowest { slowest = two.slowest }
+    println("  events: ${honks} honks sent, ${host.honks} taken; ${scores} scores sent, ${one.scores} and ${two.scores} taken; ${host.wrong + one.wrong + two.wrong} out of order, twice or wrong; the slowest took ${slowest * 1000.0} ms")
+    check("every honk reaches the host exactly once and in order", honks > 50 && host.honks == honks && host.wrong == 0)
+    check("every score reaches every client exactly once and in order", scores > 50 && one.scores == scores && two.scores == scores && one.wrong == 0 && two.wrong == 0)
+    println("  the ${BLOCK_BYTES}-byte block: whole at client 1 ${one.blobs} time(s), client 2 ${two.blobs}; broken ${one.blobs_bad + two.blobs_bad}")
+    check("a 100 KB block of bytes arrives whole, once, at each client", blob_sent && one.blobs == 1 && two.blobs == 1 && one.blobs_bad == 0 && two.blobs_bad == 0)
+    println("  snapshots: client 1 took ${net.snapshots_received(one.session)}, client 2 ${net.snapshots_received(two.session)}; late ones dropped: ${net.stale_snapshots(one.session)} and ${net.stale_snapshots(two.session)}; backwards: ${one.backwards + two.backwards}")
+    check("snapshots never go backwards", one.backwards == 0 && two.backwards == 0 && net.snapshots_received(one.session) > 80)
+    largest = net.largest_snapshot(host.session, 1)
+    println("  whole snapshots: ${net.whole_snapshots(host.session, 1)} to client 1 and ${net.whole_snapshots(host.session, 2)} to client 2, of ${net.snapshots_sent(host.session, 1)} and ${net.snapshots_sent(host.session, 2)}")
+    println("  the largest snapshot ${largest} bytes, every object known ${full_at * 1000.0} ms in; the largest datagram ${net.largest_datagram(host.session)}, ${net.largest_datagram(one.session)} and ${net.largest_datagram(two.session)} bytes")
+    check("a snapshot larger than a datagram goes in fragments and is put back together", largest > 1200 && full_at > 0.0)
+    check("no datagram is over 1,200 bytes", net.largest_datagram(host.session) <= 1200 && net.largest_datagram(one.session) <= 1200 && net.largest_datagram(two.session) <= 1200)
+    worst_one = net.prediction_error(one.session)
+    worst_two = net.prediction_error(two.session)
+    own_one = apart(where(net.my_player(one.session)), where(net.player_of(host.session, net.client_id(one.session))))
+    own_two = apart(where(net.my_player(two.session)), where(net.player_of(host.session, net.client_id(two.session))))
+    println("  prediction: reconciliation moved client 1's player at most ${worst_one * 1000.0} mm, client 2's ${worst_two * 1000.0} mm; at rest ${own_one * 1000.0} and ${own_two * 1000.0} mm from the host's")
+    check("what each client predicted is what the host did, within the TCP run's centimetre", worst_one <= 0.01 && worst_two <= 0.01 && net.my_player(one.session) != null)
+    check("and at rest each client's own player is where the host has it, within a millimetre", own_one <= 0.001 && own_two <= 0.001)
+    // Interpolating over a gap of g ticks lost, a circle of 10 m at a
+    // radian a second is off its chord by at most 10 (1 - cos((g + 1) / 60)):
+    // 1.39 mm for none, 5.55 for one, 12.5 for two, 22.2 for three.
+    bound = RADIUS * (1.0 - cos(((one.gap + 1) as float) / 60.0)) + 0.0001
+    println("  drawing: sixteen moving objects within 6 mm of the host at the view time on ${close} of ${measured} steps, at most ${worst_drawn * 1000.0} mm (at ${worst_at} s); at most ${one.gap} snapshots lost in a row, a chord of ${bound * 1000.0} mm")
+    check("the moving objects are drawn where the host had them: within 6 mm on 90% of steps, and within the chord of the longest gap always",
+          measured > 100 && (close as float) >= 0.9 * (measured as float) && worst_drawn <= bound)
+    println("  the host sent ${kb(host_bytes, seconds)} KB a second to two clients in ${host_datagrams} datagrams: snapshots ${kb(host_snapshots, seconds)}, events ${kb(host_events, seconds)} (the block among them), headers ${kb(host_headers, seconds)} (of them ${kb(host_ack_packets, seconds)} in acknowledgement-only datagrams), sent again ${kb(host_resent, seconds)}")
+    println("  client 1 sent ${kb(one_bytes, seconds)} KB a second in ${one_datagrams} datagrams: inputs and their acknowledgements ${kb(one_inputs, seconds)}, acknowledgements alone ${kb(one_acks, seconds)}, honks ${kb(one_events, seconds)}, headers ${kb(one_headers, seconds)}, sent again ${kb(one_resent, seconds)}")
+    check("the bytes are counted by kind, and a client's inputs, acknowledgements and honks cost it under 8 KB a second",
+          host_snapshots > 0 && host_events > (BLOCK_BYTES as long) && host_resent > 0 && one_inputs > 0 && kb(one_bytes, seconds) < 8.0)
+
+    // Client 2 leaves: its disconnect goes at once, and the host hears it.
+    free_players(two.session)
+    net.net_free(two.session)
+    two.session = null
+    left_after = 0.0 - 1.0
+    begin = platform.time()
+    while platform.time() - begin < 0.5 {
+        now = platform.time() - start
+        net.step(host.session, now)
+        net.step(one.session, now)
+        if left_after < 0.0 && host.left == 1 { left_after = platform.time() - begin }
+        frame = frame + 1
+        pace(start, frame)
+    }
+    println("  client 2 left; the host heard it ${left_after * 1000.0} ms later, and has ${net.peer_count(host.session)} client")
+    check("a client that leaves is gone from the host at once, its leaving told", host.left == 1 && left_after >= 0.0 && left_after < 0.1 && net.peer_count(host.session) == 1)
+
+    // The host falls silent: every datagram it sends lost. Client 1 finds
+    // it by its timeout.
+    net.set_timeout(one.session, 1.0)
+    net.set_conditions(host.session, 0.0, 0.0, 1.0)
+    silent_at = platform.time()
+    gone_after = 0.0 - 1.0
+    while platform.time() - silent_at < 2.0 {
+        now = platform.time() - start
+        net.step(host.session, now)
+        net.step(one.session, now)
+        if gone_after < 0.0 && net.disconnected(one.session) { gone_after = platform.time() - silent_at }
+        frame = frame + 1
+        pace(start, frame)
+    }
+    println("  the host fell silent; client 1 gave it up ${gone_after * 1000.0} ms later (a timeout of 1 s)")
+    check("a host that falls silent is found by the client's timeout", gone_after >= 1.0 && gone_after < 1.3 && !net.connected(one.session))
+
+    // A handshake nobody answers: a port with no host behind it.
+    nobody = net.host_udp("127.0.0.1", 0)
+    empty_port = net.udp_port(nobody)
+    net.set_conditions(nobody, 0.0, 0.0, 1.0)
+    lonely = net.join_udp("127.0.0.1", empty_port)
+    net.set_timeout(lonely, 0.5)
+    tried_at = platform.time()
+    given_up = 0.0 - 1.0
+    while platform.time() - tried_at < 1.0 {
+        now = platform.time() - start
+        net.step(nobody, now)
+        net.step(lonely, now)
+        if given_up < 0.0 && net.disconnected(lonely) { given_up = platform.time() - tried_at }
+        frame = frame + 1
+        pace(start, frame)
+    }
+    println("  a handshake with no answer given up after ${given_up * 1000.0} ms (a timeout of 0.5 s)")
+    check("a handshake nobody answers is given up at the timeout", given_up >= 0.5 && given_up < 0.7 && !net.connected(lonely))
+    net.net_free(lonely)
+    net.net_free(nobody)
+
+    free(blob)
+    side_free(one)
+    side_free(host)
+    free_scene(two)
+    engine.engine_free(two.world)
+    free(two as ptr)
+    check("every session made is let go", net.alive() == 0)
+    if g_failures == 0 {
+        println("udp: all checks passed (${g_checks})")
+    } else {
+        println("udp: ${g_failures} failure(s) of ${g_checks}")
+    }
+}

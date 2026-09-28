@@ -10,19 +10,27 @@
 //
 //   - a transport moves messages between the host and each peer: loopback
 //     (in-process, with a conditions simulator -- latency, jitter, loss --
-//     for tests and the editor's host-and-clients play), and TCP over
-//     std.tcp. UDP joins them when Aether has datagrams (aether#2201) and
-//     Steam's sockets behind the same calls when a game wants them. A
-//     message is reliable (never lost, in order: the handshake, events) or
-//     not (a snapshot: the next one supersedes it, so waiting for a lost one
-//     would only make it later);
+//     for tests and the editor's host-and-clients play), TCP over std.tcp,
+//     and UDP over std.udp (ae3d.netudp: a handshake, a reliable ordered
+//     channel of its own with acknowledgements and resends, unreliable
+//     sequenced channels, fragments, and the same conditions simulator).
+//     A message is reliable (never lost, in order: the handshake, events,
+//     objects created) or not (a snapshot, an input: the next one
+//     supersedes it, so waiting for a lost one would only make it later);
 //   - the protocol: a hello, a welcome with the client's id, snapshots,
-//     and events (a game's own messages, reliable, either way, four
-//     numbers or a block of bytes);
+//     inputs, and events (a game's own messages, reliable, either way,
+//     four numbers or a block of bytes);
 //   - replication: net ids by the order objects are marked networked, the
 //     same on both sides for a scene both build, then by the order the host
 //     creates objects mid-game (a rocket, a car), told to each client as it
-//     does; and a history of samples a client interpolates from.
+//     does; and a history of samples a client interpolates from;
+//   - what each client is sent, a tick at a time: its objects' states
+//     quantised (a tenth of a millimetre, a rotation in 48 bits), as a delta
+//     against the newest snapshot it has acknowledged (the host keeps the
+//     last 32 it sent each client, and one older than that is sent whole);
+//     only what is relevant to it (near its player, or always, never); and
+//     within its budget of bytes a tick, the most urgent first, by a
+//     priority that grows while an object waits unsent.
 //
 // Time is passed in (seconds, any origin): the engine passes its clock, a
 // test a clock of its own, so a run under simulated conditions is the same
@@ -37,6 +45,7 @@ import std.tcp
 import ae3d.core
 import ae3d.behaviour
 import ae3d.engine
+import ae3d.netudp
 import ae3d.platform
 import ae3d.physics
 
@@ -45,12 +54,19 @@ exports (
     ROLE_HOST, ROLE_CLIENT,
     hub_new, hub_free, hub_set_conditions,
     host_loopback, join_loopback, host_tcp, join_tcp, tcp_port,
-    networked, networked_count, step, attach, connected, hosting, client_id, peer_count, view_time,
-    set_tick_rate, set_interpolation_delay, set_relevance, objects_sent, bytes_sent, bytes_received, snapshots_received,
+    host_udp, join_udp, udp_port, set_conditions, set_timeout, flush,
+    networked, networked_count, step, attach, connected, disconnected, hosting, client_id, peer_count, view_time,
+    set_tick_rate, set_interpolation_delay, set_precision, precision, set_deltas,
+    set_relevance, set_relevant, RELEVANT_NEAR, RELEVANT_ALWAYS, RELEVANT_NEVER, set_priority,
+    set_budget, set_client_budget, worst_wait, largest_snapshot, snapshot_bytes, snapshots_sent, whole_snapshots,
+    objects_sent, bytes_sent, bytes_received, snapshots_received, stale_snapshots,
+    host_tick, snapshot_tick, known, state_at,
+    traffic, TRAFFIC_SNAPSHOTS, TRAFFIC_EVENTS, TRAFFIC_INPUTS, TRAFFIC_ACKS, TRAFFIC_HEADERS,
+    TRAFFIC_ACK_PACKETS, TRAFFIC_RESENT, TRAFFIC_HANDSHAKE, datagrams_sent, largest_datagram, round_trip,
     NetPlayer, set_player_maker, host_play, player_input, my_player, player_of, player_count, prediction_error, input_sent,
-    NetCall, HOST, EVERYONE, on_event, send_event, send_event_bytes, on_join,
+    NetCall, HOST, EVERYONE, on_event, send_event, send_event_bytes, on_join, on_leave,
     object_kind, create_object, destroy_object, object_of, id_of,
-    net_free, last_error
+    net_free, alive, last_error
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -60,6 +76,7 @@ extern free(p: ptr)
 extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
 extern memmove(dst: ptr, src: ptr, n: long) -> ptr
 extern sqrt(x: float) -> float
+extern floor(x: float) -> float
 
 const ROLE_HOST = 1
 const ROLE_CLIENT = 2
@@ -67,16 +84,42 @@ const ROLE_CLIENT = 2
 const HOST = 0                       // an event's recipient: the host, the only one a client sends to
 const EVERYONE = 0 - 1               // an event's recipients: every client the host has welcomed
 
-const PROTOCOL = 4                   // 2: snapshots are deltas against an acknowledged one; 3: events, objects created mid-game; 4: events carrying bytes
+// Whether an object is relevant to a client: by its distance from the
+// client's player (the session's relevance radius), always, or never.
+const RELEVANT_NEAR = 0
+const RELEVANT_ALWAYS = 1
+const RELEVANT_NEVER = 2
+
+// What traffic counts, a kind at a time: the messages by what they are,
+// and what the UDP transport adds around them.
+const TRAFFIC_SNAPSHOTS = 1          // snapshot messages
+const TRAFFIC_EVENTS = 2             // reliable messages: the handshake's, events, spawns, objects created and destroyed
+const TRAFFIC_INPUTS = 3             // input messages, and the acknowledgements riding on them
+const TRAFFIC_ACKS = 4               // acknowledgements of snapshots sent on their own
+const TRAFFIC_HEADERS = 5            // UDP: every datagram's header (which carries its acknowledgements); TCP: the length frames
+const TRAFFIC_ACK_PACKETS = 6        // UDP: datagrams with nothing but acknowledgements, whole (a part of the headers)
+const TRAFFIC_RESENT = 7             // UDP: reliable messages sent again
+const TRAFFIC_HANDSHAKE = 8          // UDP: the connection's handshake and its disconnects
+
+// 2: snapshots are deltas against an acknowledged one; 3: events, objects
+// created mid-game; 4: events carrying bytes; 5: quantised, prioritised
+// snapshots, acknowledgements riding on inputs, the welcome's precision.
+const PROTOCOL = 5
 const MSG_HELLO = 1                  // client -> host: [u8][u32 protocol]
-const MSG_WELCOME = 2                // host -> client: [u8][u32 client id][u32 tick rate]
-// host -> client, unreliable: [u8][u32 tick][f32 time][u32 ack][u32 baseline][u16 objects][u16 changed],
-// then a changed object each: [u16 index][f32 x y z][f32 qx qy qz qw][u8 character][f32 vy][u8 grounded].
-// An object not listed is as it was in the baseline (tick 0: none, every object listed).
+const MSG_WELCOME = 2                // host -> client: [u8][u32 client id][u32 tick rate][f64 precision]
+// host -> client, unreliable: [u8][u32 tick][f32 time][u32 ack][u8 base gap][varint objects][varint records]
+// [u8 flags]; with flag 1 the client's player at full precision, [f32 x y z][f32 vy][u8 grounded]; with
+// flag 2 the previous tick's time, [f32]; then a record each: [varint index gap][u8 fields], and the
+// fields it names -- x, y, z as zigzag varints of their change in steps of the precision (the value
+// itself when the base does not have the object), the rotation as 48 bits. An object with no record is
+// as it was in the base (gap 0: none).
 const MSG_SNAPSHOT = 3
-const MSG_INPUT = 4                  // client -> host, unreliable: [u8][u32 first seq][u8 count], then a command each: [f32 walk x z][f32 jump]
+// client -> host, unreliable: [u8][u16 newest snapshot][u32 first seq][u8 count], then a command each:
+// [f32 walk x z][f32 jump]. The snapshot is the client's acknowledgement, riding on its commands: its
+// tick's low 16 bits, which the host puts back beside its own tick.
+const MSG_INPUT = 4
 const MSG_SPAWN = 5                  // host -> client, reliable: [u8][u32 net id][u32 owner]
-const MSG_ACK = 6                    // client -> host, unreliable: [u8][u32 tick], a snapshot it has
+const MSG_ACK = 6                    // client -> host, unreliable: [u8][u16 tick], a snapshot it has, when no input carried it
 const MSG_EVENT = 7                  // either way, reliable: [u8][u16 event][u8 count], then count f32 values
 // host -> client, reliable: [u8][u32 net id][u16 kind][f32 host time][f32 x y z][f32 qx qy qz qw],
 // an object the host created, where it has it now.
@@ -86,16 +129,30 @@ const MSG_CREATE = 8
 const MSG_DESTROY = 9
 const MSG_EVENT_BYTES = 10           // either way, reliable: [u8][u16 event][u32 length], then length bytes
 
+// A snapshot's flags.
+const SNAP_OWN = 1                   // the client's own player follows
+const SNAP_PREVIOUS = 2              // the previous tick's time follows
+
+// A record's fields.
+const FIELD_X = 1
+const FIELD_Y = 2
+const FIELD_Z = 4
+const FIELD_ROTATION = 8
+const FIELD_WHOLE = 16               // the base does not have it: every field, as its value
+const FIELD_HELD = 32                // the base's state was still its state at the previous tick
+
 const KIND_LOOP = 1
 const KIND_TCP = 2
+const KIND_UDP = 3
 
 const EVENT_CONNECTED = 1
 const EVENT_DISCONNECTED = 2
 const EVENT_MESSAGE = 3
 
 const HISTORY = 32                   // samples an object keeps: a second at 30 a second
-const KEPT = 32                      // snapshots each side keeps to delta against: a second at 30 a second
-const STATE = 10                     // floats an object's state: x y z, qx qy qz qw, character, vy, grounded
+const KEPT = 33                      // snapshots each side keeps to delta against: the 32 newest, and the one being built
+const STATE = 4                      // numbers an object's quantised state: x y z in steps, the rotation's 48 bits
+const OWN = 5                        // numbers the client's own player: x y z, vy, grounded
 const SAMPLE = 8                     // floats a sample: the host's time, x y z, qx qy qz qw
 const TCP_CHUNK = 65536
 const HUB_ENDPOINTS = 64
@@ -105,10 +162,19 @@ const RESENT = 4                     // the unacknowledged commands every input 
 const PLAYER_STEP = 0.016666666666666666   // a command's step, seconds: the fixed step's
 const QUEUE_DEPTH = 3                // host: the commands a client's queue holds before it catches up
 const EVENT_VALUES = 4               // the numbers an event carries at most
+const HALF_ROOT_TWO = 0.7071067811865476   // a unit quaternion's second largest component is at most this
+const ROTATION_STEPS = 32767.0       // a component of the three smallest in 15 bits
+const NEAR_WEIGHT = 10.0             // metres: an object this close to a client's player waits a tenth as long
 
 var g_error = ""
+var g_alive = 0                      // sessions made and not yet freed
+var g_hubs = 0
 
 last_error() -> string { return g_error }
+
+// Sessions and hubs made and not yet freed: what a program that tears its
+// play down checks it let go of.
+alive() -> int { return g_alive + g_hubs }
 
 // --- bytes ---------------------------------------------------------------------------------
 
@@ -164,6 +230,45 @@ put_f32(b: *NetBuf, value: float) {
     b.length = b.length + 4
 }
 
+put_f64(b: *NetBuf, value: float) {
+    buf_reserve(b, 8)
+    mem.set_float64(b.data, b.length, value)
+    b.length = b.length + 8
+}
+
+// An unsigned number seven bits a byte, low first, the top bit saying
+// another follows (LEB128): a change of a few steps is one byte.
+put_varint(b: *NetBuf, value: long) {
+    v = value
+    while v >= (128 as long) {
+        put_u8(b, ((v % (128 as long)) as int) + 128)
+        v = v / (128 as long)
+    }
+    put_u8(b, v as int)
+}
+
+varint_size(value: long) -> int {
+    size = 1
+    v = value
+    while v >= (128 as long) {
+        v = v / (128 as long)
+        size = size + 1
+    }
+    return size
+}
+
+// A signed number folded onto the unsigned ones, small either way first:
+// 0, -1, 1, -2, 2 ... as 0, 1, 2, 3, 4 ...
+zigzag(value: long) -> long {
+    if value >= (0 as long) { return value * (2 as long) }
+    return (0 as long) - value * (2 as long) - (1 as long)
+}
+
+unzigzag(value: long) -> long {
+    if value % (2 as long) == (0 as long) { return value / (2 as long) }
+    return (0 as long) - (value + (1 as long)) / (2 as long)
+}
+
 // A message read from the front: `at` moves on, and a read past the end
 // leaves `ok` false rather than reading what is not there.
 struct NetReader {
@@ -201,6 +306,29 @@ get_f32(r: *NetReader) -> float {
     return v
 }
 
+get_f64(r: *NetReader) -> float {
+    if r.at + 8 > r.length { r.ok = false ; return 0.0 }
+    v = mem.get_float64(r.data, r.at)
+    r.at = r.at + 8
+    return v
+}
+
+get_varint(r: *NetReader) -> long {
+    value = 0 as long
+    scale = 1 as long
+    k = 0
+    while k < 10 {
+        octet = get_u8(r)
+        if !r.ok { return 0 as long }
+        value = value + ((octet % 128) as long) * scale
+        if octet < 128 { return value }
+        scale = scale * (128 as long)
+        k = k + 1
+    }
+    r.ok = false
+    return 0 as long
+}
+
 // --- the loopback transport ------------------------------------------------------------------
 //
 // Every loopback endpoint of a session shares a hub, and a message is a
@@ -236,6 +364,7 @@ hub_new() -> *LoopHub {
     h.joining = calloc(HUB_ENDPOINTS, 4)
     h.last_reliable = calloc(HUB_ENDPOINTS, 8)
     h.seed = 12345
+    g_hubs = g_hubs + 1
     return h
 }
 
@@ -252,6 +381,7 @@ hub_free(h: *LoopHub) {
     free(h.joining)
     free(h.last_reliable)
     free(h as ptr)
+    g_hubs = g_hubs - 1
 }
 
 // The link every parcel crosses: `latency` and up to `jitter` more seconds
@@ -296,6 +426,7 @@ struct Peer {
     id: int                          // the session's id for it: 1, 2, ... on the host; 0 is the host on a client
     endpoint: int                    // loopback: its hub endpoint
     socket: ptr                      // tcp: the connection
+    conn: int                        // udp: the endpoint's connection
     pending: ptr                     // tcp: bytes read and not yet a whole message
     pending_length: int
     pending_capacity: int
@@ -304,28 +435,47 @@ struct Peer {
     last_input: int                  // host: the newest command of this client's it has applied
     player: ptr                      // host: this client's *NetPlayer
     // Host: the client's commands received and not yet applied, a ring of
-    // float[COMMANDS * COMMAND]. One is applied a host step, so a player
-    // moves in the host's world at the pace it walked, whatever the link's
-    // jitter did to when the commands arrived.
+    // float[COMMANDS * COMMAND] by sequence. One is applied a host step, so
+    // a player moves in the host's world at the pace it walked, whatever the
+    // link's jitter did to when the commands arrived; one that arrives
+    // after a later one (a UDP link reorders) is applied in its turn.
     queued: ptr
-    queued_first: int
-    queued_count: int
-    last_queued: int
-    // Host: the snapshots sent it (list of *Snapshot, oldest first) and the
-    // newest it has acknowledged, which the next is a delta against.
-    sent: ptr
+    last_queued: int                 // the newest command received
+    waited: int                      // host steps the next command has been missing, later ones here
+    // Host: the snapshots told it, a ring of KEPT, and the newest it has
+    // acknowledged, which the next is a delta against.
+    ring: ptr                        // ptr[KEPT]: *Snapshot
     acked_tick: int
+    // Host: what the priority works with, an entry an object: the
+    // priority it has gathered waiting, the ticks it has waited changed
+    // and unsent, the most it ever waited, and the tick it was last sent.
+    capacity: int
+    accum: ptr                       // float[capacity]
+    waits: ptr                       // int[capacity]
+    worst: ptr                       // int[capacity]
+    marked: ptr                      // int[capacity]: the tick it was chosen for
+    budget: int                      // bytes a snapshot at most, this client's own; 0 the session's
+    largest: int                     // the largest snapshot it was sent
+    snapshot_bytes: long
+    snapshots: int
+    wholes: int                      // of them, whole: no base the client was known to hold
 }
 
-// A snapshot as one side keeps it: every object's state at a tick, and
-// whether that state is known -- to the client, whether it has been told;
-// to the host, whether it has told this client (an object outside the
-// client's relevance keeps what it was last told).
+// A snapshot as one side keeps it: every object's quantised state at a
+// tick, and whether that state is known -- to the client, whether it has
+// been told; to the host, whether it has told this client (an object
+// outside the client's relevance, or past its budget, keeps what it was
+// last told). And the client's own player, at full precision.
 struct Snapshot {
     tick: int
+    time: float                      // the host's time at it
     count: int
-    states: ptr                      // float[count * STATE]
-    known: ptr                       // int[count]
+    capacity: int
+    states: ptr                      // float[capacity * STATE]
+    known: ptr                       // int[capacity]
+    own: ptr                         // float[OWN]
+    own_known: bool
+    used: bool
 }
 
 struct NetEvent {
@@ -355,6 +505,8 @@ struct NetObject {
     kind: int                        // a created object's kind id; 0 for one the scene marked, or a player
     leaving: bool                    // client: the host has destroyed it, and it goes at `leaves`
     leaves: float                    // the host's time it was destroyed
+    relevance: int                   // host: RELEVANT_NEAR, _ALWAYS or _NEVER
+    priority: float                  // host: how fast its priority grows while it waits (1 by default)
 }
 
 // What an event brings its handler: which event it is, who sent it (a
@@ -375,7 +527,7 @@ struct NetCall {
     now: float
 }
 
-// Called on the host with every client it welcomes.
+// Called on the host with every client it welcomes, or that leaves.
 struct NetJoinHook {
     hook: fn(ptr, int, float)
     context: ptr
@@ -404,6 +556,7 @@ struct Net {
     hub: *LoopHub
     endpoint: int                    // loopback: this side's
     server: ptr                      // tcp host: the listener
+    udp: *UdpEndpoint                // udp: the socket and its connections
     port: int
     peers: ptr                       // list of *Peer
     events: ptr                      // list of *NetEvent, this step's
@@ -416,10 +569,29 @@ struct Net {
     offset: float                    // client: the host's time minus ours, from the least-delayed snapshot
     offset_known: bool
     my_id: int                       // client: the id the host gave it, 0 before
+    closed: bool                     // client: the link to the host is gone
     out: *NetBuf
+    measured: *NetBuf                // host: a record measured before it goes
     sent: long
     got: long
     snapshots: int
+    stale: int                       // client: snapshots dropped for arriving after a newer one
+    scratch: ptr                     // 8 bytes: a number rounded through f32
+    // Replication: the precision positions go in, and the host's states
+    // this tick and the tick before (whether an object that starts to move
+    // was still where the client last had it).
+    unit: float
+    deltas: bool
+    current: *Snapshot
+    previous: *Snapshot
+    candidates: ptr                  // host: int[scratch_capacity]
+    records: ptr                     // client: int[scratch_capacity], the indices a snapshot carried
+    fields: ptr                      // client: int[scratch_capacity], their fields
+    scratch_capacity: int
+    budget: int                      // host: bytes a snapshot at most, every client's that has none of its own; 0 no limit
+    // Traffic, a kind at a time (TRAFFIC_*), and what the UDP transport
+    // adds is read off it.
+    traffic: ptr                     // long[9]
     // Players: made by the game's maker, on the host for every client it
     // welcomes and on a client for every spawn it is told of.
     player_maker: fn(ptr, int) -> *CharacterController
@@ -435,12 +607,15 @@ struct Net {
     inputs_sent: int
     player_clock: float              // host: time since the first step, less the player steps taken
     player_started: bool
-    received: ptr                    // client: list of *Snapshot, oldest first, rebuilt from their deltas
+    received: ptr                    // client: ptr[KEPT], *Snapshot rebuilt from their deltas
+    newest_tick: int                 // client: the newest snapshot it holds
+    ack_due: bool                    // client: it holds a snapshot it has not acknowledged
     relevance: float                 // host: metres around a client's player beyond which it is not sent anything; 0 for all
-    objects_sent: long               // host: object states written, all clients
+    objects_sent: long               // host: records written, all clients
     handlers: ptr                    // list of *NetHandler, by event id - 1
     kinds: ptr                       // list of *NetKind, by kind id - 1
     joins: ptr                       // host: list of *NetJoinHook
+    leaves: ptr                      // host: list of *NetJoinHook
 }
 
 net_new(role: int, kind: int) -> *Net {
@@ -454,59 +629,107 @@ net_new(role: int, kind: int) -> *Net {
     n.interpolation_delay = 0.1
     n.last_step = 0.0 - 1.0
     n.out = buf_new(2048)
+    n.measured = buf_new(64)
+    n.scratch = calloc(1, 8)
+    n.unit = 0.0001
+    n.deltas = true
+    n.current = snapshot_new()
+    n.previous = snapshot_new()
+    n.traffic = calloc(9, 8)
     n.players = list.new()
     n.commands = calloc(COMMANDS * COMMAND, 8)
     n.next_seq = 1
-    n.received = list.new()
+    n.received = calloc(KEPT, 8)
     n.handlers = list.new()
     n.kinds = list.new()
     n.joins = list.new()
+    n.leaves = list.new()
+    g_alive = g_alive + 1
     return n
 }
 
-snapshot_new(tick: int, count: int) -> *Snapshot {
+// A number as a 32-bit float carries it.
+as_f32(n: *Net, x: float) -> float {
+    mem.set_float32(n.scratch, 0, x)
+    return mem.get_float32(n.scratch, 0)
+}
+
+snapshot_new() -> *Snapshot {
     shot = calloc(1, sizeof(Snapshot)) as *Snapshot
-    shot.tick = tick
-    shot.count = count
-    shot.states = calloc(count * STATE + 1, 8)
-    shot.known = calloc(count + 1, 4)
+    shot.own = calloc(OWN, 8)
     return shot
 }
 
 snapshot_free(shot: *Snapshot) {
-    free(shot.states)
-    free(shot.known)
+    if shot == null { return }
+    if shot.states != null { free(shot.states) }
+    if shot.known != null { free(shot.known) }
+    free(shot.own)
     free(shot as ptr)
 }
 
-// A list of snapshots kept to KEPT, the oldest let go.
-keep_snapshot(kept: ptr, shot: *Snapshot) {
-    list.add_raw(kept, shot as ptr)
-    while list.size(kept) > KEPT {
-        snapshot_free(list.get_raw(kept, 0) as *Snapshot)
-        list.remove(kept, 0)
+// A snapshot made ready for `count` objects at a tick, nothing known.
+snapshot_reset(shot: *Snapshot, tick: int, time: float, count: int) {
+    if count > shot.capacity || shot.states == null {
+        wanted = shot.capacity * 2
+        if wanted < 16 { wanted = 16 }
+        while wanted < count { wanted = wanted * 2 }
+        if shot.states != null { free(shot.states) }
+        if shot.known != null { free(shot.known) }
+        shot.states = calloc(wanted * STATE, 8)
+        shot.known = calloc(wanted, 4)
+        shot.capacity = wanted
     }
+    shot.tick = tick
+    shot.time = time
+    shot.count = count
+    mem.set(shot.known, 0, (count * 4) as long)
+    shot.own_known = false
+    shot.used = true
 }
 
-snapshot_at(kept: ptr, tick: int) -> *Snapshot {
-    if tick == 0 { return null }
-    i = list.size(kept) - 1
-    while i >= 0 {
-        shot = list.get_raw(kept, i) as *Snapshot
-        if shot.tick == tick { return shot }
-        i = i - 1
+// A ring of KEPT snapshots: the one at a tick, and one to write the next
+// into -- never the base the next is a delta against.
+ring_find(ring: ptr, tick: int) -> *Snapshot {
+    if tick <= 0 { return null }
+    slots = ring as ptr[]
+    k = 0
+    while k < KEPT {
+        shot = slots[k] as *Snapshot
+        if shot != null && shot.used && shot.tick == tick { return shot }
+        k = k + 1
     }
     return null
 }
 
-free_snapshots(kept: ptr) {
-    if kept == null { return }
-    i = 0
-    while i < list.size(kept) {
-        snapshot_free(list.get_raw(kept, i) as *Snapshot)
-        i = i + 1
+ring_take(ring: ptr, keep: *Snapshot) -> *Snapshot {
+    slots = ring as ptr[]
+    best = 0 - 1
+    k = 0
+    while k < KEPT {
+        shot = slots[k] as *Snapshot
+        if shot == null {
+            slots[k] = snapshot_new() as ptr
+            return slots[k] as *Snapshot
+        }
+        if shot != keep {
+            if !shot.used { return shot }
+            if best < 0 || shot.tick < (slots[best] as *Snapshot).tick { best = k }
+        }
+        k = k + 1
     }
-    list.free(kept)
+    return slots[best] as *Snapshot
+}
+
+ring_free(ring: ptr) {
+    if ring == null { return }
+    slots = ring as ptr[]
+    k = 0
+    while k < KEPT {
+        snapshot_free(slots[k] as *Snapshot)
+        k = k + 1
+    }
+    free(ring)
 }
 
 // Objects farther than `metres` from a client's player are not sent to it:
@@ -514,15 +737,97 @@ free_snapshots(kept: ptr) {
 // back within reach. 0 sends everything to everyone (the default).
 set_relevance(n: *Net, metres: float) { n.relevance = metres }
 
-// Object states the host has written into snapshots, every client's.
+// One object's relevance, whatever the radius: RELEVANT_ALWAYS (a
+// scoreboard, the ball), RELEVANT_NEVER (what only the host needs), or
+// RELEVANT_NEAR (the default: by its distance).
+set_relevant(n: *Net, o: *GameObject, mode: int) {
+    no = net_object_of(n, o)
+    if no != null { no.relevance = mode }
+}
+
+// How fast an object's priority grows while it waits unsent: 1 by
+// default; 2 is sent twice as often as its neighbours when the budget is
+// tight.
+set_priority(n: *Net, o: *GameObject, priority: float) {
+    no = net_object_of(n, o)
+    if no != null && priority > 0.0 { no.priority = priority }
+}
+
+// The bytes a snapshot may take, every client's that has no budget of its
+// own: what does not fit goes next tick, first. 0 (the default) sends all
+// that changed.
+set_budget(n: *Net, bytes: int) {
+    if bytes >= 0 { n.budget = bytes }
+}
+
+// One client's budget, over the session's.
+set_client_budget(n: *Net, client: int, bytes: int) {
+    p = peer_by_id(n, client)
+    if p != null && bytes >= 0 { p.budget = bytes }
+}
+
+// The precision positions are sent at, metres (a tenth of a millimetre by
+// default). The host's, before any client joins: a client takes it from
+// its welcome.
+set_precision(n: *Net, metres: float) {
+    if n.role == ROLE_HOST && metres > 0.0 { n.unit = metres }
+}
+
+precision(n: *Net) -> float { return n.unit }
+
+// Whether snapshots are deltas against what each client has acknowledged
+// (the default), or whole, every relevant object every tick: what the
+// deltas save is measured against the second.
+set_deltas(n: *Net, on: bool) { n.deltas = on }
+
+// Records the host has written into snapshots, every client's.
 objects_sent(n: *Net) -> long { return n.objects_sent }
 
 peer_new(id: int) -> *Peer {
     p = calloc(1, sizeof(Peer)) as *Peer
     p.id = id
     p.open = true
-    p.sent = list.new()
+    p.ring = calloc(KEPT, 8)
     return p
+}
+
+peer_free(p: *Peer) {
+    if p.socket != null { tcp.tcp_close(p.socket) }
+    if p.pending != null { free(p.pending) }
+    if p.queued != null { free(p.queued) }
+    ring_free(p.ring)
+    if p.accum != null { free(p.accum) }
+    if p.waits != null { free(p.waits) }
+    if p.worst != null { free(p.worst) }
+    if p.marked != null { free(p.marked) }
+    free(p as ptr)
+}
+
+// A peer's priority entries grown to `count` objects, the new ones empty.
+peer_grow(p: *Peer, count: int) {
+    if count <= p.capacity { return }
+    wanted = p.capacity * 2
+    if wanted < 64 { wanted = 64 }
+    while wanted < count { wanted = wanted * 2 }
+    accum = calloc(wanted, 8)
+    waits = calloc(wanted, 4)
+    worst = calloc(wanted, 4)
+    marked = calloc(wanted, 4)
+    if p.capacity > 0 {
+        memcpy(accum, p.accum, (p.capacity * 8) as long)
+        memcpy(waits, p.waits, (p.capacity * 4) as long)
+        memcpy(worst, p.worst, (p.capacity * 4) as long)
+        memcpy(marked, p.marked, (p.capacity * 4) as long)
+        free(p.accum)
+        free(p.waits)
+        free(p.worst)
+        free(p.marked)
+    }
+    p.accum = accum
+    p.waits = waits
+    p.worst = worst
+    p.marked = marked
+    p.capacity = wanted
 }
 
 peer_by_id(n: *Net, id: int) -> *Peer {
@@ -533,6 +838,21 @@ peer_by_id(n: *Net, id: int) -> *Peer {
         i = i + 1
     }
     return null
+}
+
+// The session's scratch index lists grown to `count` objects.
+scratch_grow(n: *Net, count: int) {
+    if count <= n.scratch_capacity { return }
+    wanted = n.scratch_capacity * 2
+    if wanted < 64 { wanted = 64 }
+    while wanted < count { wanted = wanted * 2 }
+    if n.candidates != null { free(n.candidates) }
+    if n.records != null { free(n.records) }
+    if n.fields != null { free(n.fields) }
+    n.candidates = calloc(wanted, 4)
+    n.records = calloc(wanted, 4)
+    n.fields = calloc(wanted, 4)
+    n.scratch_capacity = wanted
 }
 
 // Host a session on a loopback hub: clients join the same hub.
@@ -603,6 +923,63 @@ join_tcp(host: string, port: int) -> *Net {
     return n
 }
 
+// Host a session over UDP on `address` and `port` (0 for one the system
+// picks; udp_port says which): clients are welcomed as their handshakes
+// complete (ae3d.netudp).
+host_udp(address: string, port: int) -> *Net {
+    ep = netudp.listen(address, port)
+    if ep == null {
+        g_error = netudp.last_error()
+        return null
+    }
+    n = net_new(ROLE_HOST, KIND_UDP)
+    n.udp = ep
+    n.port = netudp.port(ep)
+    unsequenced_inputs(ep)
+    return n
+}
+
+// A client's inputs are handed over late or not: each carries the last
+// RESENT commands, so one the link reordered behind a newer may still
+// hold a command no other message did, and the host keeps only the ones
+// it has not queued. Snapshots and acknowledgements stay sequenced.
+unsequenced_inputs(ep: *UdpEndpoint) {
+    netudp.set_sequenced(ep, MSG_INPUT, false)
+}
+
+// Join a session hosted over UDP. The handshake starts at the first step;
+// the hello follows it, and the welcome the hello. A host that does not
+// answer within the timeout leaves the session disconnected.
+join_udp(host: string, port: int) -> *Net {
+    ep = netudp.connect(host, port)
+    if ep == null {
+        g_error = netudp.last_error()
+        return null
+    }
+    n = net_new(ROLE_CLIENT, KIND_UDP)
+    n.udp = ep
+    unsequenced_inputs(ep)
+    link = peer_new(0)
+    link.conn = 1
+    list.add_raw(n.peers, link as ptr)
+    return n
+}
+
+udp_port(n: *Net) -> int { return n.port }
+
+// UDP: the link every datagram this side sends crosses -- `latency` and up
+// to `jitter` more seconds, and a share `loss` lost -- for a test or the
+// editor's play, as a hub's conditions are for loopback.
+set_conditions(n: *Net, latency: float, jitter: float, loss: float) {
+    if n.udp != null { netudp.set_conditions(n.udp, latency, jitter, loss) }
+}
+
+// UDP: seconds the other side is heard from nothing before its connection
+// is closed (5 by default), and a client's handshake given up.
+set_timeout(n: *Net, seconds: float) {
+    if n.udp != null { netudp.set_timeout(n.udp, seconds) }
+}
+
 push_event(n: *Net, kind: int, peer: int, data: ptr, length: int) {
     ev = calloc(1, sizeof(NetEvent)) as *NetEvent
     ev.kind = kind
@@ -626,16 +1003,41 @@ clear_events(n: *Net) {
     list.clear(n.events)
 }
 
+// The traffic a message is counted as.
+count_traffic(n: *Net, reliable: bool, data: ptr, length: int) {
+    counts = n.traffic as long[]
+    kind = TRAFFIC_EVENTS
+    if !reliable {
+        what = mem.get_byte(data, 0)
+        kind = TRAFFIC_ACKS
+        if what == MSG_SNAPSHOT { kind = TRAFFIC_SNAPSHOTS }
+        if what == MSG_INPUT { kind = TRAFFIC_INPUTS }
+    }
+    counts[kind] = counts[kind] + (length as long)
+}
+
 // A message to one peer.
 deliver(n: *Net, p: *Peer, reliable: bool, data: ptr, length: int, now: float) {
     if p == null || !p.open { return }
     n.sent = n.sent + (length as long)
+    count_traffic(n, reliable, data, length)
     if n.kind == KIND_LOOP {
         hub_post(n.hub, n.endpoint, p.endpoint, reliable, data, length, now)
         return
     }
+    if n.kind == KIND_UDP {
+        // The reliable channel, or an unreliable one of the message's own
+        // kind: a snapshot is never dropped for an input, only for a newer
+        // snapshot.
+        channel = netudp.RELIABLE
+        if !reliable { channel = mem.get_byte(data, 0) }
+        netudp.post(n.udp, p.conn, channel, data, length)
+        return
+    }
     // TCP: the length, then the message, in one write. The stream keeps the
     // order and loses nothing, so reliable or not is the same here.
+    counts = n.traffic as long[]
+    counts[TRAFFIC_HEADERS] = counts[TRAFFIC_HEADERS] + 4
     total = length + 4
     frame = malloc(total as long)
     mem.set_u32_le(frame, 0, length as long)
@@ -654,10 +1056,19 @@ deliver(n: *Net, p: *Peer, reliable: bool, data: ptr, length: int, now: float) {
     free(frame)
 }
 
+// UDP: what this side has queued since the last step, into datagrams and
+// out now; the step does it itself at its start and its end. For a game
+// that sends from its own code and wants it gone before the next frame.
+flush(n: *Net, now: float) {
+    if n != null && n.udp != null { netudp.flush(n.udp, now) }
+}
+
 // This step's arrivals, into n.events.
 pump(n: *Net, now: float) {
     if n.kind == KIND_LOOP {
         pump_loop(n, now)
+    } else if n.kind == KIND_UDP {
+        pump_udp(n, now)
     } else {
         pump_tcp(n)
     }
@@ -711,6 +1122,49 @@ peer_from_endpoint(n: *Net, endpoint: int) -> *Peer {
         i = i + 1
     }
     return null
+}
+
+peer_from_conn(n: *Net, conn: int) -> *Peer {
+    i = 0
+    while i < list.size(n.peers) {
+        p = list.get_raw(n.peers, i) as *Peer
+        if p.conn == conn { return p }
+        i = i + 1
+    }
+    return null
+}
+
+// UDP: the endpoint's events as the session's: a connection opened is a
+// peer (the host's, on a client), one closed a disconnect, a message a
+// message.
+pump_udp(n: *Net, now: float) {
+    ep = n.udp
+    netudp.update(ep, now)
+    k = 0
+    while k < netudp.event_count(ep) {
+        ev = netudp.event_at(ep, k)
+        if ev.kind == netudp.UDP_CONNECTED {
+            if n.role == ROLE_HOST {
+                p = peer_new(list.size(n.peers) + 1)
+                p.conn = ev.conn
+                list.add_raw(n.peers, p as ptr)
+                push_event(n, EVENT_CONNECTED, p.id, null, 0)
+            } else {
+                push_event(n, EVENT_CONNECTED, 0, null, 0)
+            }
+        } else if ev.kind == netudp.UDP_DISCONNECTED {
+            p = peer_from_conn(n, ev.conn)
+            if p != null { close_peer(n, p) }
+        } else {
+            p = peer_from_conn(n, ev.conn)
+            if p != null && p.open {
+                n.got = n.got + (ev.length as long)
+                push_event(n, EVENT_MESSAGE, p.id, ev.data, ev.length)
+            }
+        }
+        k = k + 1
+    }
+    netudp.clear_events(ep)
 }
 
 pump_tcp(n: *Net) {
@@ -792,12 +1246,18 @@ close_peer(n: *Net, p: *Peer) {
 // draws it from what arrived. Its id is its order among the networked, so a
 // scene both sides build the same way has the same ids on both.
 networked(n: *Net, o: *GameObject) -> int {
-    no = calloc(1, sizeof(NetObject)) as *NetObject
-    no.id = list.size(n.objects) + 1
-    no.object = o
-    no.history = calloc(HISTORY * SAMPLE, 8)
+    no = net_object_new(list.size(n.objects) + 1, o)
     list.add_raw(n.objects, no as ptr)
     return no.id
+}
+
+net_object_new(id: int, o: *GameObject) -> *NetObject {
+    no = calloc(1, sizeof(NetObject)) as *NetObject
+    no.id = id
+    no.object = o
+    no.history = calloc(HISTORY * SAMPLE, 8)
+    no.priority = 1.0
+    return no
 }
 
 networked_count(n: *Net) -> int { return list.size(n.objects) }
@@ -807,16 +1267,23 @@ object_by_id(n: *Net, id: int) -> *NetObject {
     return list.get_raw(n.objects, id - 1) as *NetObject
 }
 
+net_object_of(n: *Net, o: *GameObject) -> *NetObject {
+    if o == null { return null }
+    i = 0
+    while i < list.size(n.objects) {
+        no = list.get_raw(n.objects, i) as *NetObject
+        if no != null && no.object == o { return no }
+        i = i + 1
+    }
+    return null
+}
+
 // A networked object at a given id, as a spawn names it: the list grows to
 // it, and an id already taken is left as it is.
 networked_at(n: *Net, o: *GameObject, id: int) {
     while list.size(n.objects) < id { list.add_raw(n.objects, null) }
     if list.get_raw(n.objects, id - 1) != null { return }
-    no = calloc(1, sizeof(NetObject)) as *NetObject
-    no.id = id
-    no.object = o
-    no.history = calloc(HISTORY * SAMPLE, 8)
-    list.set(n.objects, id - 1, no as ptr)
+    list.set(n.objects, id - 1, net_object_new(id, o) as ptr)
 }
 
 // Where a networked object is: its model's place, or for an object with no
@@ -846,11 +1313,95 @@ set_transform(o: *GameObject, where: Vec3, turn: Quat) {
     }
 }
 
-// Every networked object's state now: STATE floats each, and whether there
-// is an object at that id at all (a destroyed one's id has none).
-current_states(n: *Net) -> *Snapshot {
+// --- the quantised state ----------------------------------------------------------------------
+//
+// A position goes in whole steps of the session's precision (a tenth of a
+// millimetre by default): its x, y and z as integers, and a record carries
+// each one's change against what the client has, as a varint of a few
+// bytes. A rotation goes as its three smallest components in 15 bits
+// each and which one was dropped in 2 (the dropped one is the largest, so
+// the others are within +-1/sqrt 2, and a unit quaternion's length gives
+// it back): 48 bits, 6 bytes, a hundredth of a milliradian. The host keeps
+// the quantised values themselves, so a delta is an exact difference of
+// integers and a client that adds it holds what the host told it, to the
+// bit.
+
+quantise(n: *Net, x: float) -> float {
+    return floor(x / n.unit + 0.5)
+}
+
+// A rotation's 48 bits, as a whole number a double holds exactly.
+pack_rotation(q: Quat) -> float {
+    x = q.x
+    y = q.y
+    z = q.z
+    w = q.w
+    length = sqrt(x * x + y * y + z * z + w * w)
+    if length < 0.000000001 {
+        x = 0.0
+        y = 0.0
+        z = 0.0
+        w = 1.0
+    } else {
+        x = x / length
+        y = y / length
+        z = z / length
+        w = w / length
+    }
+    largest = 0
+    big = abs_of(x)
+    if abs_of(y) > big { largest = 1 ; big = abs_of(y) }
+    if abs_of(z) > big { largest = 2 ; big = abs_of(z) }
+    if abs_of(w) > big { largest = 3 }
+    // q and -q are the same turn: the dropped component made positive.
+    sign = 1.0
+    if (largest == 0 && x < 0.0) || (largest == 1 && y < 0.0) || (largest == 2 && z < 0.0) || (largest == 3 && w < 0.0) { sign = 0.0 - 1.0 }
+    a = y
+    b = z
+    c = w
+    if largest == 1 { a = x }
+    if largest == 2 { a = x ; b = y }
+    if largest == 3 { a = x ; b = y ; c = z }
+    return (largest as float) * 35184372088832.0 + rotation_step(a * sign) * 1073741824.0 +
+           rotation_step(b * sign) * 32768.0 + rotation_step(c * sign)
+}
+
+rotation_step(v: float) -> float {
+    k = floor((v + HALF_ROOT_TWO) / (2.0 * HALF_ROOT_TWO) * ROTATION_STEPS + 0.5)
+    if k < 0.0 { k = 0.0 }
+    if k > ROTATION_STEPS { k = ROTATION_STEPS }
+    return k
+}
+
+rotation_value(k: float) -> float {
+    return k / ROTATION_STEPS * (2.0 * HALF_ROOT_TWO) - HALF_ROOT_TWO
+}
+
+unpack_rotation(packed: float) -> Quat {
+    bits = packed as long
+    largest = (bits / (35184372088832 as long)) as int
+    a = rotation_value(((bits / (1073741824 as long)) % (32768 as long)) as float)
+    b = rotation_value(((bits / (32768 as long)) % (32768 as long)) as float)
+    c = rotation_value((bits % (32768 as long)) as float)
+    rest = 1.0 - a * a - b * b - c * c
+    d = 0.0
+    if rest > 0.0 { d = sqrt(rest) }
+    if largest == 0 { return core.quat(d, a, b, c) }
+    if largest == 1 { return core.quat(a, d, b, c) }
+    if largest == 2 { return core.quat(a, b, d, c) }
+    return core.quat(a, b, c, d)
+}
+
+abs_of(v: float) -> float {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+// Every networked object's state now, quantised, into `shot`; and whether
+// there is an object at that id at all (a destroyed one's id has none).
+current_states(n: *Net, shot: *Snapshot, now: float) {
     count = list.size(n.objects)
-    shot = snapshot_new(n.tick, count)
+    snapshot_reset(shot, n.tick, now, count)
     states = shot.states as float[]
     known = shot.known as int[]
     i = 0
@@ -859,213 +1410,471 @@ current_states(n: *Net) -> *Snapshot {
         if no != null {
             at = i * STATE
             where = position_of(no.object)
-            turn = rotation_of(no.object)
-            states[at] = where.x
-            states[at + 1] = where.y
-            states[at + 2] = where.z
-            states[at + 3] = turn.x
-            states[at + 4] = turn.y
-            states[at + 5] = turn.z
-            states[at + 6] = turn.w
-            player = player_by_id(n, i + 1)
-            if player != null {
-                states[at + 7] = 1.0
-                states[at + 8] = player.controller.velocity.y
-                if player.controller.grounded { states[at + 9] = 1.0 }
-            }
+            states[at] = quantise(n, where.x)
+            states[at + 1] = quantise(n, where.y)
+            states[at + 2] = quantise(n, where.z)
+            states[at + 3] = pack_rotation(rotation_of(no.object))
             known[i] = 1
         }
         i = i + 1
     }
-    return shot
 }
 
-// The host's snapshot, to every welcomed client: each a delta against the
-// newest snapshot that client has acknowledged, so an object that has not
-// moved since costs it nothing, and a lost snapshot costs nothing either
-// (the next is against one the client is known to have).
+same_state(a: float[], b: float[], index: int) -> bool {
+    at = index * STATE
+    return a[at] == b[at] && a[at + 1] == b[at + 1] && a[at + 2] == b[at + 2] && a[at + 3] == b[at + 3]
+}
+
+// A shot's state of object `index` as a place and a turn: 7 floats into
+// `values` at `into`.
+state_values(n: *Net, shot: *Snapshot, index: int, values: float[], into: int) {
+    s = shot.states as float[]
+    at = index * STATE
+    values[into] = s[at] * n.unit
+    values[into + 1] = s[at + 1] * n.unit
+    values[into + 2] = s[at + 2] * n.unit
+    q = unpack_rotation(s[at + 3])
+    values[into + 3] = q.x
+    values[into + 4] = q.y
+    values[into + 5] = q.z
+    values[into + 6] = q.w
+}
+
+// --- what each client is sent ------------------------------------------------------------------
+
+// The host's snapshot, to every welcomed client: each its own, of what is
+// relevant to it, within its budget, as a delta against the newest
+// snapshot it has acknowledged.
 send_snapshot(n: *Net, now: float) {
-    now_states = current_states(n)
+    current_states(n, n.current, now)
+    scratch_grow(n, n.current.count)
     i = 0
     while i < list.size(n.peers) {
         p = list.get_raw(n.peers, i) as *Peer
-        if p.welcomed { snapshot_to(n, p, now_states, now) }
+        if p.welcomed && p.open { snapshot_to(n, p, now) }
         i = i + 1
     }
-    snapshot_free(now_states)
+    // This tick's states are the next tick's previous ones.
+    was = n.previous
+    n.previous = n.current
+    n.current = was
 }
 
-// Whether object `index` is within this client's relevance: everything is
-// when there is no radius or no player to measure from.
-relevant(n: *Net, p: *Peer, states: float[], index: int) -> bool {
+// Whether object `index` is relevant to this client: by its own setting,
+// else within the relevance radius of the client's player (everything is
+// when there is no radius or no player to measure from).
+relevant(n: *Net, p: *Peer, index: int) -> bool {
+    no = list.get_raw(n.objects, index) as *NetObject
+    if no == null { return false }
+    if no.relevance == RELEVANT_NEVER { return false }
+    if no.relevance == RELEVANT_ALWAYS { return true }
     if n.relevance <= 0.0 || p.player == null { return true }
+    d = distance_to_player(n, p, index)
+    return d <= n.relevance
+}
+
+// Metres from this client's player to object `index`, now; 0 without a
+// player.
+distance_to_player(n: *Net, p: *Peer, index: int) -> float {
+    if p.player == null { return 0.0 }
     pl = p.player as *NetPlayer
-    if pl.net_id == index + 1 { return true }
+    s = n.current.states as float[]
     at = (pl.net_id - 1) * STATE
     here = index * STATE
-    dx = states[here] - states[at]
-    dy = states[here + 1] - states[at + 1]
-    dz = states[here + 2] - states[at + 2]
-    return dx * dx + dy * dy + dz * dz <= n.relevance * n.relevance
+    dx = (s[here] - s[at]) * n.unit
+    dy = (s[here + 1] - s[at + 1]) * n.unit
+    dz = (s[here + 2] - s[at + 2]) * n.unit
+    return sqrt(dx * dx + dy * dy + dz * dz)
 }
 
-snapshot_to(n: *Net, p: *Peer, now_states: *Snapshot, now: float) {
-    base = snapshot_at(p.sent, p.acked_tick)
-    count = now_states.count
-    told = snapshot_new(n.tick, count)
-    states = now_states.states as float[]
-    known = now_states.known as int[]
-    told_states = told.states as float[]
-    told_known = told.known as int[]
-    base_states = null as float[]
-    base_known = null as int[]
-    base_count = 0
-    if base != null {
-        base_states = base.states as float[]
-        base_known = base.known as int[]
-        base_count = base.count
+// How fast an object's priority grows for this client while it waits: its
+// own priority, and more the nearer it is to the client's player --
+// 1 + NEAR_WEIGHT / d, so one at a metre gathers eleven times what a far
+// one does and is never left waiting behind the far ones for long.
+weight(n: *Net, p: *Peer, index: int) -> float {
+    no = list.get_raw(n.objects, index) as *NetObject
+    w = no.priority
+    if p.player == null { return w }
+    d = distance_to_player(n, p, index)
+    if d < 1.0 { d = 1.0 }
+    return w * (1.0 + NEAR_WEIGHT / d)
+}
+
+// The candidates, most urgent first: by priority gathered, and by index
+// among equals, so the order is the same on every run. A heap sort, in
+// place, of `count` indices by `key`.
+sort_urgent(order: int[], key: float[], count: int) {
+    if count < 2 { return }
+    start = count / 2 - 1
+    while start >= 0 {
+        sift(order, key, start, count)
+        start = start - 1
     }
-    // What this client is told: the objects within its relevance as they
-    // are now, the rest as it was last told them (or nothing, never told).
-    // A destroyed object is not told at all: its id is never given again,
-    // so no later object is read as a change against its old state.
-    changed = 0
+    end = count - 1
+    while end > 0 {
+        swap = order[0]
+        order[0] = order[end]
+        order[end] = swap
+        sift(order, key, 0, end)
+        end = end - 1
+    }
+}
+
+// The heap's root is the least urgent, so the sort leaves the most urgent
+// first.
+less_urgent(key: float[], a: int, b: int) -> bool {
+    if key[a] != key[b] { return key[a] < key[b] }
+    return a > b
+}
+
+sift(order: int[], key: float[], root: int, count: int) {
+    r = root
+    while true {
+        child = r * 2 + 1
+        if child >= count { return }
+        if child + 1 < count && less_urgent(key, order[child + 1], order[child]) { child = child + 1 }
+        if !less_urgent(key, order[child], order[r]) { return }
+        swap = order[r]
+        order[r] = order[child]
+        order[child] = swap
+        r = child
+    }
+}
+
+// Object `index`'s fields against the base: what changed, all of it when
+// the base does not have it, and whether it was still as the base has it
+// at the tick before this one -- the client then holds it there until
+// that moment, so an object that starts to move after standing still is
+// not drawn sliding from wherever it stood, over all the time it stood.
+record_fields(n: *Net, base: *Snapshot, index: int) -> int {
+    s = n.current.states as float[]
+    at = index * STATE
+    if base == null || index >= base.count || (base.known as int[])[index] != 1 {
+        return FIELD_WHOLE | FIELD_X | FIELD_Y | FIELD_Z | FIELD_ROTATION
+    }
+    bs = base.states as float[]
+    fields = 0
+    if s[at] != bs[at] { fields = fields | FIELD_X }
+    if s[at + 1] != bs[at + 1] { fields = fields | FIELD_Y }
+    if s[at + 2] != bs[at + 2] { fields = fields | FIELD_Z }
+    if s[at + 3] != bs[at + 3] { fields = fields | FIELD_ROTATION }
+    prev = n.previous
+    if prev.used && index < prev.count && (prev.known as int[])[index] == 1 && same_state(prev.states as float[], bs, index) {
+        fields = fields | FIELD_HELD
+    }
+    return fields
+}
+
+// Object `index`'s record against the base into `b`: its fields, and the
+// fields' values or changes.
+write_record(n: *Net, b: *NetBuf, base: *Snapshot, index: int) {
+    s = n.current.states as float[]
+    at = index * STATE
+    fields = record_fields(n, base, index)
+    whole = (fields & FIELD_WHOLE) != 0
+    put_u8(b, fields)
+    k = 0
+    while k < 3 {
+        if (fields & (1 << k)) != 0 {
+            value = (s[at + k]) as long
+            if !whole { value = value - ((base.states as float[])[at + k]) as long }
+            put_varint(b, zigzag(value))
+        }
+        k = k + 1
+    }
+    if (fields & FIELD_ROTATION) != 0 {
+        bits = (s[at + 3]) as long
+        put_u16(b, (bits % (65536 as long)) as int)
+        put_u32(b, (bits / (65536 as long)) as int)
+    }
+}
+
+// The client's player at full precision, as the wire carries it: what it
+// reconciles against, so its prediction is not moved by a quantum.
+own_state(n: *Net, pl: *NetPlayer, into: *Snapshot) {
+    o = pl.controller.object as *GameObject
+    where = behaviour.object_position(o)
+    own = into.own as float[]
+    own[0] = as_f32(n, where.x)
+    own[1] = as_f32(n, where.y)
+    own[2] = as_f32(n, where.z)
+    own[3] = as_f32(n, pl.controller.velocity.y)
+    own[4] = 0.0
+    if pl.controller.grounded { own[4] = 1.0 }
+    into.own_known = true
+}
+
+same_own(a: *Snapshot, b: *Snapshot) -> bool {
+    if !a.own_known || !b.own_known { return false }
+    x = a.own as float[]
+    y = b.own as float[]
+    k = 0
+    while k < OWN {
+        if x[k] != y[k] { return false }
+        k = k + 1
+    }
+    return true
+}
+
+snapshot_to(n: *Net, p: *Peer, now: float) {
+    cur = n.current
+    count = cur.count
+    peer_grow(p, count)
+    base = null as *Snapshot
+    if n.deltas { base = ring_find(p.ring, p.acked_tick) }
+    told = ring_take(p.ring, base)
+    snapshot_reset(told, n.tick, now, count)
+    cur_states = cur.states as float[]
+    cur_known = cur.known as int[]
+    accum = p.accum as float[]
+    waits = p.waits as int[]
+    worst = p.worst as int[]
+    marked = p.marked as int[]
+    order = n.candidates as int[]
+    // The client's own player: reconciled from its own block, never drawn
+    // from a record.
+    own_index = 0 - 1
+    if p.player != null {
+        pl = p.player as *NetPlayer
+        own_index = pl.net_id - 1
+        own_state(n, pl, told)
+    }
+    send_own = told.own_known && (base == null || !same_own(told, base))
+    // The candidates: relevant, and not what the base already has. Every
+    // one gathers priority for waiting; one that is not a candidate has
+    // nothing to wait for.
+    candidates = 0
     i = 0
     while i < count {
-        at = i * STATE
-        if known[i] == 1 && relevant(n, p, states, i) {
-            k = 0
-            while k < STATE {
-                told_states[at + k] = states[at + k]
-                k = k + 1
-            }
-            told_known[i] = 1
-        } else if known[i] == 1 && base != null && i < base_count && base_known[i] == 1 {
-            k = 0
-            while k < STATE {
-                told_states[at + k] = base_states[at + k]
-                k = k + 1
-            }
-            told_known[i] = 1
+        wanted = cur_known[i] == 1 && i != own_index && relevant(n, p, i)
+        if wanted && base != null && i < base.count && (base.known as int[])[i] == 1 && same_state(cur_states, base.states as float[], i) {
+            wanted = false
         }
-        if told_known[i] == 1 && differs(told_states, base_states, base_known, base_count, i) { changed = changed + 1 }
+        if wanted {
+            accum[i] = accum[i] + weight(n, p, i)
+            order[candidates] = i
+            candidates = candidates + 1
+        } else {
+            accum[i] = 0.0
+            waits[i] = 0
+        }
         i = i + 1
     }
+    sort_urgent(order, accum, candidates)
+    // The most urgent first, while the budget lasts; one that does not fit
+    // leaves room for a smaller one after it. The header's size is known
+    // but for the records' count, which is taken at its largest; a
+    // record's index gap at most the varint of its index.
+    budget = p.budget
+    if budget <= 0 { budget = n.budget }
+    // A held record wants the previous tick's time; the client knows it
+    // when the base is that tick, and is told it otherwise (4 bytes, kept
+    // out of the budget's room from the start).
+    send_previous = base != null && base.tick < n.tick - 1 && n.previous.used
+    room = 0
+    if budget > 0 {
+        room = budget - (1 + 4 + 4 + 4 + 1 + varint_size(count as long) + varint_size(count as long) + 1)
+        if send_own { room = room - 17 }
+        if send_previous { room = room - 4 }
+    }
+    rec = n.measured
+    chosen = 0
+    k = 0
+    while k < candidates {
+        i = order[k]
+        take = true
+        if budget > 0 {
+            rec.length = 0
+            write_record(n, rec, base, i)
+            size = rec.length + varint_size((i + 1) as long)
+            if size > room { take = false } else { room = room - size }
+        }
+        if take {
+            marked[i] = n.tick
+            if waits[i] > worst[i] { worst[i] = waits[i] }
+            waits[i] = 0
+            accum[i] = 0.0
+            chosen = chosen + 1
+        } else {
+            waits[i] = waits[i] + 1
+        }
+        k = k + 1
+    }
+    // What the client will hold once it has this snapshot: the chosen as
+    // they are now, the rest as the base had them (or unknown). And
+    // whether any chosen one is held.
+    held = false
+    told_states = told.states as float[]
+    told_known = told.known as int[]
+    i = 0
+    while i < count {
+        if send_previous && !held && i != own_index && marked[i] == n.tick && cur_known[i] == 1 {
+            held = (record_fields(n, base, i) & FIELD_HELD) != 0
+        }
+        at = i * STATE
+        if i != own_index && marked[i] == n.tick && cur_known[i] == 1 {
+            told_states[at] = cur_states[at]
+            told_states[at + 1] = cur_states[at + 1]
+            told_states[at + 2] = cur_states[at + 2]
+            told_states[at + 3] = cur_states[at + 3]
+            told_known[i] = 1
+        } else if i != own_index && cur_known[i] == 1 && base != null && i < base.count && (base.known as int[])[i] == 1 {
+            bs = base.states as float[]
+            told_states[at] = bs[at]
+            told_states[at + 1] = bs[at + 1]
+            told_states[at + 2] = bs[at + 2]
+            told_states[at + 3] = bs[at + 3]
+            told_known[i] = 1
+        }
+        i = i + 1
+    }
+    // The snapshot.
     b = n.out
     b.length = 0
     put_u8(b, MSG_SNAPSHOT)
     put_u32(b, n.tick)
     put_f32(b, now)
     put_u32(b, p.last_input)
-    if base != null { put_u32(b, base.tick) } else { put_u32(b, 0) }
-    put_u16(b, count)
-    put_u16(b, changed)
+    if base != null { put_u8(b, n.tick - base.tick) } else { put_u8(b, 0) }
+    put_varint(b, count as long)
+    put_varint(b, chosen as long)
+    flags = 0
+    if send_own { flags = flags | SNAP_OWN }
+    if send_previous && held { flags = flags | SNAP_PREVIOUS }
+    put_u8(b, flags)
+    if send_own {
+        own = told.own as float[]
+        put_f32(b, own[0])
+        put_f32(b, own[1])
+        put_f32(b, own[2])
+        put_f32(b, own[3])
+        put_u8(b, (own[4]) as int)
+    }
+    if (flags & SNAP_PREVIOUS) != 0 { put_f32(b, n.previous.time) }
+    previous = 0 - 1
     i = 0
     while i < count {
-        if told_known[i] == 1 && differs(told_states, base_states, base_known, base_count, i) {
-            at = i * STATE
-            put_u16(b, i)
-            k = 0
-            while k < 7 {
-                put_f32(b, told_states[at + k])
-                k = k + 1
-            }
-            if told_states[at + 7] > 0.5 {
-                put_u8(b, 1)
-                put_f32(b, told_states[at + 8])
-                if told_states[at + 9] > 0.5 { put_u8(b, 1) } else { put_u8(b, 0) }
-            } else {
-                put_u8(b, 0)
-            }
+        if i != own_index && marked[i] == n.tick && cur_known[i] == 1 {
+            put_varint(b, (i - previous - 1) as long)
+            previous = i
+            write_record(n, b, base, i)
         }
         i = i + 1
     }
-    n.objects_sent = n.objects_sent + changed
+    n.objects_sent = n.objects_sent + (chosen as long)
+    p.snapshots = p.snapshots + 1
+    if base == null { p.wholes = p.wholes + 1 }
+    p.snapshot_bytes = p.snapshot_bytes + (b.length as long)
+    if b.length > p.largest { p.largest = b.length }
     deliver(n, p, false, b.data, b.length, now)
-    keep_snapshot(p.sent, told)
 }
 
-// Whether object `index`'s told state is not what the baseline had: always,
-// with no baseline or an object the baseline did not know.
-differs(told: float[], base: float[], base_known: int[], base_count: int, index: int) -> bool {
-    if base == null || index >= base_count || base_known[index] != 1 { return true }
-    at = index * STATE
-    k = 0
-    while k < STATE {
-        if told[at + k] != base[at + k] { return true }
-        k = k + 1
-    }
-    return false
-}
-
+// A snapshot arrived: rebuilt from its base and its records, kept,
+// acknowledged, and its records sampled for drawing; the client's own
+// player reconciled.
 take_snapshot(n: *Net, r: *NetReader, now: float) {
     tick = get_u32(r)
     host_time = get_f32(r)
     ack = get_u32(r)
-    baseline = get_u32(r)
-    count = get_u16(r)
-    changed = get_u16(r)
-    if !r.ok { return }
+    gap = get_u8(r)
+    count = (get_varint(r)) as int
+    records = (get_varint(r)) as int
+    flags = get_u8(r)
+    if !r.ok || count < 0 || records < 0 || records > count { return }
+    // Never backwards: one older than a snapshot already held is late,
+    // and what it says is already superseded.
+    if n.newest_tick > 0 && tick <= n.newest_tick {
+        n.stale = n.stale + 1
+        return
+    }
     // A delta against a snapshot this side no longer has (or never had)
     // cannot be read; the host moves on to one it has acknowledged.
-    base = snapshot_at(n.received, baseline)
-    if baseline != 0 && base == null { return }
-    shot = snapshot_new(tick, count)
+    base = null as *Snapshot
+    if gap > 0 {
+        base = ring_find(n.received, tick - gap)
+        if base == null { return }
+    }
+    shot = ring_take(n.received, base)
+    snapshot_reset(shot, tick, host_time, count)
     states = shot.states as float[]
     known = shot.known as int[]
     if base != null {
-        base_states = base.states as float[]
-        base_known = base.known as int[]
+        bs = base.states as float[]
+        bk = base.known as int[]
         i = 0
         while i < count && i < base.count {
-            if base_known[i] == 1 {
-                k = 0
-                while k < STATE {
-                    states[i * STATE + k] = base_states[i * STATE + k]
-                    k = k + 1
-                }
+            if bk[i] == 1 {
+                at = i * STATE
+                states[at] = bs[at]
+                states[at + 1] = bs[at + 1]
+                states[at + 2] = bs[at + 2]
+                states[at + 3] = bs[at + 3]
                 known[i] = 1
             }
             i = i + 1
         }
     }
-    j = 0
-    while j < changed {
-        index = get_u16(r)
-        values = calloc(STATE, 8)
-        v = values as float[]
+    own = shot.own as float[]
+    if (flags & SNAP_OWN) != 0 {
+        own[0] = get_f32(r)
+        own[1] = get_f32(r)
+        own[2] = get_f32(r)
+        own[3] = get_f32(r)
+        own[4] = get_u8(r) as float
+        shot.own_known = true
+    } else if base != null && base.own_known {
+        bo = base.own as float[]
         k = 0
-        while k < 7 {
-            v[k] = get_f32(r)
+        while k < OWN {
+            own[k] = bo[k]
             k = k + 1
         }
-        if get_u8(r) == 1 {
-            v[7] = 1.0
-            v[8] = get_f32(r)
-            if get_u8(r) == 1 { v[9] = 1.0 }
-        }
-        if r.ok && index < count {
-            k = 0
-            while k < STATE {
-                states[index * STATE + k] = v[k]
-                k = k + 1
+        shot.own_known = true
+    }
+    // When a held object was last still: the previous tick's time, told,
+    // or the base's when the base is the previous tick.
+    held_at = 0.0 - 1.0
+    if (flags & SNAP_PREVIOUS) != 0 {
+        held_at = get_f32(r)
+    } else if base != null {
+        held_at = base.time
+    }
+    scratch_grow(n, count)
+    carried = n.records as int[]
+    carried_fields = n.fields as int[]
+    index = 0 - 1
+    j = 0
+    while j < records && r.ok {
+        index = index + ((get_varint(r)) as int) + 1
+        fields = get_u8(r)
+        if !r.ok || index >= count { r.ok = false ; break }
+        whole = (fields & FIELD_WHOLE) != 0
+        if !whole && known[index] != 1 { r.ok = false ; break }
+        at = index * STATE
+        k = 0
+        while k < 3 {
+            if (fields & (1 << k)) != 0 {
+                change = (unzigzag(get_varint(r))) as float
+                if whole { states[at + k] = change } else { states[at + k] = states[at + k] + change }
             }
-            known[index] = 1
+            k = k + 1
         }
-        free(values)
+        if (fields & FIELD_ROTATION) != 0 {
+            low = get_u16(r)
+            high = get_u32(r)
+            states[at + 3] = (high as float) * 65536.0 + (low as float)
+        }
+        known[index] = 1
+        carried[j] = index
+        carried_fields[j] = fields
         j = j + 1
     }
     if !r.ok {
-        snapshot_free(shot)
+        shot.used = false
         return
     }
-    keep_snapshot(n.received, shot)
-    // Told the host, so its next is a delta against this one.
-    b = n.out
-    b.length = 0
-    put_u8(b, MSG_ACK)
-    put_u32(b, tick)
-    deliver(n, peer_by_id(n, 0), false, b.data, b.length, now)
+    n.newest_tick = tick
+    n.ack_due = true
     n.snapshots = n.snapshots + 1
     // The host's clock against ours, from the least-delayed snapshot seen: a
     // snapshot can arrive later than its time, never earlier.
@@ -1074,24 +1883,64 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
         n.offset = offset
         n.offset_known = true
     }
-    i = 0
-    while i < count {
-        if known[i] == 1 {
-            at = i * STATE
-            id = i + 1
-            mine = n.mine as *NetPlayer
-            if mine != null && id == mine.net_id {
-                reconcile(n, core.vec3(states[at], states[at + 1], states[at + 2]), states[at + 8], states[at + 9] > 0.5, ack)
-            } else {
-                // An id with no object here -- destroyed, or created and not
-                // told of yet -- has nothing to draw; a leaving one has its
-                // last sample already.
-                no = object_by_id(n, id)
-                if no != null && !no.leaving { add_sample(no, host_time, states, at) }
+    // The records, drawn: each at its moment, and one that was still where
+    // the client had it at the tick before held there until then.
+    values = calloc(14, 8)
+    v = values as float[]
+    mine = n.mine as *NetPlayer
+    j = 0
+    while j < records {
+        index = carried[j]
+        id = index + 1
+        no = object_by_id(n, id)
+        if no != null && !no.leaving && (mine == null || id != mine.net_id) {
+            if (carried_fields[j] & FIELD_HELD) != 0 && base != null && held_at >= 0.0 {
+                state_values(n, base, index, v, 7)
+                add_sample(no, held_at, v, 7)
             }
+            state_values(n, shot, index, v, 0)
+            add_sample(no, host_time, v, 0)
         }
-        i = i + 1
+        j = j + 1
     }
+    free(values)
+    if mine != null && shot.own_known {
+        reconcile(n, core.vec3(own[0], own[1], own[2]), own[3], own[4] > 0.5, ack)
+    }
+}
+
+// An object made on this side after the snapshots began -- a player told
+// of, an object created -- given what the newest snapshot has of it, so
+// one that stands still is drawn: its state went in a record before the
+// object was here, and a still one is not sent again.
+seed_from_snapshot(n: *Net, no: *NetObject) {
+    shot = ring_find(n.received, n.newest_tick)
+    if shot == null { return }
+    index = no.id - 1
+    if index >= shot.count || (shot.known as int[])[index] != 1 { return }
+    values = calloc(7, 8)
+    state_values(n, shot, index, values as float[], 0)
+    add_sample(no, shot.time, values as float[], 0)
+    free(values)
+}
+
+// The client's acknowledgement of its newest snapshot on its own, when no
+// input has carried it.
+send_ack(n: *Net, now: float) {
+    b = n.out
+    b.length = 0
+    put_u8(b, MSG_ACK)
+    put_u16(b, n.newest_tick & 65535)
+    deliver(n, peer_by_id(n, 0), false, b.data, b.length, now)
+    n.ack_due = false
+}
+
+// A snapshot the client holds, its tick's low 16 bits: the next is a
+// delta against it. The tick is the newest at or before the host's own
+// with those bits (a client acknowledges only what it was sent).
+take_ack(n: *Net, p: *Peer, wire: int) {
+    tick = n.tick - ((n.tick - wire) & 65535)
+    if tick > p.acked_tick && ring_find(p.ring, tick) != null { p.acked_tick = tick }
 }
 
 // A sample of an object at the host's time `host_time`, the seven floats of
@@ -1127,45 +1976,15 @@ interpolate(n: *Net, now: float) {
     i = 0
     while i < list.size(n.objects) {
         no = list.get_raw(n.objects, i) as *NetObject
-        m = null as *Model
-        if no != null { m = behaviour.object_model(no.object) }
-        if no != null && m == null && no.count > 0 {
-            h = no.history as float[]
-            place_interpolated(no, h, at)
-        } else if m != null && no.count > 0 {
-            h = no.history as float[]
-            after = 0 - 1
-            before = 0 - 1
-            k = 0
-            while k < no.count {
-                slot = (no.newest - k + HISTORY) % HISTORY
-                if h[slot * SAMPLE] > at {
-                    after = slot
-                } else {
-                    before = slot
-                    break
-                }
-                k = k + 1
-            }
-            if before < 0 { before = after }
-            if after < 0 { after = before }
-            a = before * SAMPLE
-            c = after * SAMPLE
-            t = 0.0
-            if h[c] > h[a] { t = (at - h[a]) / (h[c] - h[a]) }
-            if t < 0.0 { t = 0.0 }
-            if t > 1.0 { t = 1.0 }
-            core.model_set_position(m, h[a + 1] + (h[c + 1] - h[a + 1]) * t,
-                                       h[a + 2] + (h[c + 2] - h[a + 2]) * t,
-                                       h[a + 3] + (h[c + 3] - h[a + 3]) * t)
-            core.model_set_rotation(m, nlerp(h, a + 4, c + 4, t))
-        }
+        if no != null && no.count > 0 { place_interpolated(no, at) }
         i = i + 1
     }
 }
 
-// An object with no model (a remote player) at the interpolated position.
-place_interpolated(no: *NetObject, h: float[], at: float) {
+// An object at its interpolated place and turn: its model's, or its game
+// object's when it has none (a remote player, a ragdoll's bone).
+place_interpolated(no: *NetObject, at: float) {
+    h = no.history as float[]
     after = 0 - 1
     before = 0 - 1
     k = 0
@@ -1187,9 +2006,10 @@ place_interpolated(no: *NetObject, h: float[], at: float) {
     if h[c] > h[a] { t = (at - h[a]) / (h[c] - h[a]) }
     if t < 0.0 { t = 0.0 }
     if t > 1.0 { t = 1.0 }
-    behaviour.object_set_position(no.object, core.vec3(h[a + 1] + (h[c + 1] - h[a + 1]) * t,
-                                                       h[a + 2] + (h[c + 2] - h[a + 2]) * t,
-                                                       h[a + 3] + (h[c + 3] - h[a + 3]) * t))
+    set_transform(no.object, core.vec3(h[a + 1] + (h[c + 1] - h[a + 1]) * t,
+                                       h[a + 2] + (h[c + 2] - h[a + 2]) * t,
+                                       h[a + 3] + (h[c + 3] - h[a + 3]) * t),
+                  nlerp(h, a + 4, c + 4, t))
 }
 
 // Between two rotations (four floats of `h` at `a` and at `c`) the short way
@@ -1217,6 +2037,11 @@ step(n: *Net, now: float) {
     delta = 0.0
     if n.last_step >= 0.0 { delta = now - n.last_step }
     n.last_step = now
+    // A client whose newest snapshot no input has acknowledged since the
+    // last step says so on its own.
+    if n.role == ROLE_CLIENT && n.ack_due { send_ack(n, now) }
+    // What was sent since the last step goes first, then what arrived.
+    flush(n, now)
     // Events queued outside a step (a client's connection) are handled in
     // this one, with what arrives.
     pump(n, now)
@@ -1244,7 +2069,10 @@ step(n: *Net, now: float) {
     } else {
         interpolate(n, now)
         let_go(n, now)
+        // Without a player there is no input to carry the acknowledgement.
+        if n.ack_due && n.mine == null { send_ack(n, now) }
     }
+    flush(n, now)
 }
 
 handle(n: *Net, ev: *NetEvent, now: float) {
@@ -1256,6 +2084,15 @@ handle(n: *Net, ev: *NetEvent, now: float) {
         deliver(n, peer_by_id(n, 0), true, b.data, b.length, now)
         return
     }
+    if ev.kind == EVENT_DISCONNECTED {
+        if n.role == ROLE_CLIENT {
+            n.closed = true
+        } else {
+            p = peer_by_id(n, ev.peer)
+            if p != null && p.welcomed { left(n, p.id, now) }
+        }
+        return
+    }
     if ev.kind != EVENT_MESSAGE { return }
     r = NetReader { data: ev.data, length: ev.length, at: 0, ok: true }
     kind = get_u8(&r)
@@ -1263,13 +2100,14 @@ handle(n: *Net, ev: *NetEvent, now: float) {
     if n.role == ROLE_HOST && kind == MSG_HELLO {
         if get_u32(&r) != PROTOCOL { return }
         p = peer_by_id(n, ev.peer)
-        if p == null { return }
+        if p == null || p.welcomed { return }
         p.welcomed = true
         b = n.out
         b.length = 0
         put_u8(b, MSG_WELCOME)
         put_u32(b, p.id)
         put_u32(b, (n.tick_rate) as int)
+        put_f64(b, n.unit)
         deliver(n, p, true, b.data, b.length, now)
         host_player(n, p, now)
         tell_objects(n, p, now)
@@ -1304,14 +2142,17 @@ handle(n: *Net, ev: *NetEvent, now: float) {
     }
     if n.role == ROLE_HOST && kind == MSG_INPUT {
         p = peer_by_id(n, ev.peer)
-        if p == null || p.player == null { return }
-        apply_inputs(n, p, &r)
+        if p == null { return }
+        tick = get_u16(&r)
+        if !r.ok { return }
+        take_ack(n, p, tick)
+        if p.player != null { apply_inputs(n, p, &r) }
         return
     }
     if n.role == ROLE_HOST && kind == MSG_ACK {
         p = peer_by_id(n, ev.peer)
-        tick = get_u32(&r)
-        if p != null && r.ok && tick > p.acked_tick && snapshot_at(p.sent, tick) != null { p.acked_tick = tick }
+        tick = get_u16(&r)
+        if p != null && r.ok { take_ack(n, p, tick) }
         return
     }
     if n.role == ROLE_CLIENT && kind == MSG_SPAWN {
@@ -1322,7 +2163,13 @@ handle(n: *Net, ev: *NetEvent, now: float) {
         return
     }
     if n.role == ROLE_CLIENT && kind == MSG_WELCOME {
-        n.my_id = get_u32(&r)
+        id = get_u32(&r)
+        rate = get_u32(&r)
+        unit = get_f64(&r)
+        if !r.ok { return }
+        n.my_id = id
+        if rate > 0 { n.tick_rate = rate as float }
+        if unit > 0.0 { n.unit = unit }
         return
     }
     if n.role == ROLE_CLIENT && kind == MSG_SNAPSHOT {
@@ -1330,11 +2177,16 @@ handle(n: *Net, ev: *NetEvent, now: float) {
     }
 }
 
-// Whether a client has been welcomed; a host always is.
+// Whether a client has been welcomed, and its host is still there; a host
+// always is connected.
 connected(n: *Net) -> bool {
     if n.role == ROLE_HOST { return true }
-    return n.my_id > 0
+    return n.my_id > 0 && !n.closed
 }
+
+// Whether a client's link to its host has gone: the host said so, or
+// fell silent past the timeout (UDP), or the stream closed (TCP).
+disconnected(n: *Net) -> bool { return n.closed }
 
 client_id(n: *Net) -> int { return n.my_id }
 
@@ -1460,7 +2312,12 @@ tell_spawn(n: *Net, p: *Peer, pl: *NetPlayer, now: float) {
 client_spawn(n: *Net, id: int, owner: int) {
     if player_by_id(n, id) != null { return }
     pl = make_player(n, owner, id)
-    if pl != null && owner == n.my_id { n.mine = pl as ptr }
+    if pl == null { return }
+    if owner == n.my_id {
+        n.mine = pl as ptr
+    } else {
+        seed_from_snapshot(n, object_by_id(n, id))
+    }
 }
 
 // The host applies a client's commands it has not applied yet, oldest
@@ -1477,30 +2334,41 @@ apply_inputs(n: *Net, p: *Peer, r: *NetReader) {
         wz = get_f32(r)
         jump = get_f32(r)
         if !r.ok { return }
-        // Newer than the last queued: in order, and past a gap only when
-        // RESENT messages in a row were lost (the client reconciles then).
-        if seq > p.last_queued && p.queued_count < COMMANDS {
-            slot = ((p.queued_first + p.queued_count) % COMMANDS) * COMMAND
+        // Not yet applied, and within the ring: kept at its place by
+        // sequence, whatever came before it.
+        if seq > p.last_input && seq <= p.last_input + COMMANDS {
+            slot = (seq % COMMANDS) * COMMAND
             q[slot] = (seq) as float
             q[slot + 1] = wx
             q[slot + 2] = wz
             q[slot + 3] = jump
-            p.queued_count = p.queued_count + 1
-            p.last_queued = seq
+            if seq > p.last_queued { p.last_queued = seq }
         }
         i = i + 1
     }
 }
 
-// The oldest of a client's queued commands, applied to its player.
+// A client's next command, applied to its player. One that is not here
+// while later ones are may still be on its way behind them: it is waited
+// for QUEUE_DEPTH steps, and then taken as lost -- every message that
+// carried it (RESENT in a row) was -- and skipped; the client reconciles.
 apply_queued(p: *Peer) {
-    pl = p.player as *NetPlayer
+    if p.queued == null || p.last_queued <= p.last_input { return }
+    next = p.last_input + 1
     q = p.queued as float[]
-    slot = p.queued_first * COMMAND
+    slot = (next % COMMANDS) * COMMAND
+    if (q[slot]) as int != next {
+        p.waited = p.waited + 1
+        if p.waited > QUEUE_DEPTH {
+            p.last_input = next
+            p.waited = 0
+        }
+        return
+    }
+    pl = p.player as *NetPlayer
     physics.character_move(pl.controller, core.vec3(q[slot + 1], 0.0, q[slot + 2]), q[slot + 3], PLAYER_STEP)
-    p.last_input = (q[slot]) as int
-    p.queued_first = (p.queued_first + 1) % COMMANDS
-    p.queued_count = p.queued_count - 1
+    p.last_input = next
+    p.waited = 0
 }
 
 // The host's player steps due by `now`: a command a client each, and a
@@ -1517,9 +2385,9 @@ step_players(n: *Net, delta: float) {
         i = 0
         while i < list.size(n.peers) {
             p = list.get_raw(n.peers, i) as *Peer
-            if p.player != null && p.queued_count > 0 {
+            if p.player != null && p.last_queued > p.last_input {
                 apply_queued(p)
-                if p.queued_count > QUEUE_DEPTH { apply_queued(p) }
+                if p.last_queued - p.last_input > QUEUE_DEPTH { apply_queued(p) }
             }
             i = i + 1
         }
@@ -1547,9 +2415,10 @@ host_play(n: *Net, now: float) -> *NetPlayer {
 
 // A client's command for this fixed step: its own player moves by it now,
 // ahead of the host, and it goes to the host with the ones the host has not
-// yet acknowledged (so a lost message costs nothing). Before the host has
-// spawned the player, nothing. On the host, its own player (host_play)
-// moves, and that is all.
+// yet acknowledged (so a lost message costs nothing), and the newest
+// snapshot the client holds (its acknowledgement, riding along). Before the
+// host has spawned the player, nothing. On the host, its own player
+// (host_play) moves, and that is all.
 player_input(n: *Net, walk: Vec3, jump: float, now: float) {
     mine = n.mine as *NetPlayer
     if mine == null { return }
@@ -1572,6 +2441,7 @@ player_input(n: *Net, walk: Vec3, jump: float, now: float) {
     b = n.out
     b.length = 0
     put_u8(b, MSG_INPUT)
+    put_u16(b, n.newest_tick & 65535)
     first = n.command_count - RESENT
     if first < 0 { first = 0 }
     put_u32(b, (cmds[((n.command_first + first) % COMMANDS) * COMMAND]) as int)
@@ -1585,6 +2455,7 @@ player_input(n: *Net, walk: Vec3, jump: float, now: float) {
         k = k + 1
     }
     deliver(n, peer_by_id(n, 0), false, b.data, b.length, now)
+    n.ack_due = false
     n.inputs_sent = n.inputs_sent + 1
 }
 
@@ -1682,7 +2553,7 @@ send_event(n: *Net, name: string, to: int, now: float, a: float = 0.0, b: float 
     if count > 2 { put_f32(out, c) }
     if count > 3 { put_f32(out, d) }
     if n.role == ROLE_CLIENT {
-        if n.my_id == 0 { return false }
+        if n.my_id == 0 || n.closed { return false }
         deliver(n, peer_by_id(n, 0), true, out.data, out.length, now)
         return true
     }
@@ -1722,7 +2593,7 @@ send_event_bytes(n: *Net, name: string, to: int, now: float, data: ptr, length: 
         out.length = out.length + length
     }
     if n.role == ROLE_CLIENT {
-        if n.my_id == 0 { return false }
+        if n.my_id == 0 || n.closed { return false }
         deliver(n, peer_by_id(n, 0), true, out.data, out.length, now)
         return true
     }
@@ -1760,10 +2631,31 @@ on_join(n: *Net, hook: fn(ptr, int, float), context: ptr) {
     list.add_raw(n.joins, j as ptr)
 }
 
+// On the host, `hook(context, client, now)` is called with every welcomed
+// client whose link goes: it said so, or it fell silent past the timeout
+// (UDP), or its stream closed (TCP). Its player stays, the game's to take
+// away.
+on_leave(n: *Net, hook: fn(ptr, int, float), context: ptr) {
+    j = heap.new(NetJoinHook)
+    j.hook = hook
+    j.context = context
+    list.add_raw(n.leaves, j as ptr)
+}
+
 joined(n: *Net, client: int, now: float) {
     i = 0
     while i < list.size(n.joins) {
         j = list.get_raw(n.joins, i) as *NetJoinHook
+        hook = j.hook
+        hook(j.context, client, now)
+        i = i + 1
+    }
+}
+
+left(n: *Net, client: int, now: float) {
+    i = 0
+    while i < list.size(n.leaves) {
+        j = list.get_raw(n.leaves, i) as *NetJoinHook
         hook = j.hook
         hook(j.context, client, now)
         i = i + 1
@@ -1900,13 +2792,9 @@ object_of(n: *Net, id: int) -> *GameObject {
 
 // A networked object's net id, or 0: what an event names it by.
 id_of(n: *Net, o: *GameObject) -> int {
-    i = 0
-    while i < list.size(n.objects) {
-        no = list.get_raw(n.objects, i) as *NetObject
-        if no != null && no.object == o { return no.id }
-        i = i + 1
-    }
-    return 0
+    no = net_object_of(n, o)
+    if no == null { return 0 }
+    return no.id
 }
 
 // A created object told to one client: its id, its kind, and where it is
@@ -1966,6 +2854,7 @@ client_create(n: *Net, r: *NetReader) {
             no = object_by_id(n, id)
             no.kind = kind
             add_sample(no, host_time, v, 0)
+            seed_from_snapshot(n, no)
         }
     }
     free(values)
@@ -2010,8 +2899,8 @@ let_go(n: *Net, now: float) {
     }
 }
 
-// A created object let go: its kind's unmaker called, and its id left
-// empty for good.
+// A created object let go: its kind's unmaker called (which can still
+// ask its id), and its id left empty for good.
 forget(n: *Net, no: *NetObject) {
     k = list.get_raw(n.kinds, no.kind - 1) as *NetKind
     unmaker = k.unmaker
@@ -2021,9 +2910,123 @@ forget(n: *Net, no: *NetObject) {
     free(no as ptr)
 }
 
-bytes_sent(n: *Net) -> long { return n.sent }
-bytes_received(n: *Net) -> long { return n.got }
+// --- what it costs --------------------------------------------------------------------------------
+
+bytes_sent(n: *Net) -> long {
+    if n.udp != null { return netudp.bytes_sent(n.udp) }
+    return n.sent
+}
+
+bytes_received(n: *Net) -> long {
+    if n.udp != null { return netudp.bytes_received(n.udp) }
+    return n.got
+}
+
 snapshots_received(n: *Net) -> int { return n.snapshots }
+
+// Client: snapshots that arrived after a newer one and were dropped.
+stale_snapshots(n: *Net) -> int { return n.stale }
+
+// This side's traffic of one kind (TRAFFIC_*), bytes sent: the messages
+// by what they are, on every transport, and what UDP adds around them.
+traffic(n: *Net, kind: int) -> long {
+    if kind >= TRAFFIC_SNAPSHOTS && kind <= TRAFFIC_ACKS { return (n.traffic as long[])[kind] }
+    if n.udp == null {
+        if kind == TRAFFIC_HEADERS { return (n.traffic as long[])[kind] }
+        return 0 as long
+    }
+    if kind == TRAFFIC_HEADERS { return netudp.header_bytes(n.udp) }
+    if kind == TRAFFIC_ACK_PACKETS { return netudp.ack_bytes(n.udp) }
+    if kind == TRAFFIC_RESENT { return netudp.resent_bytes(n.udp) }
+    if kind == TRAFFIC_HANDSHAKE { return netudp.handshake_bytes(n.udp) }
+    return 0 as long
+}
+
+// UDP: datagrams sent, the largest of them, and the round trip to the
+// host (a client) or to client `client` (the host), seconds.
+datagrams_sent(n: *Net) -> long {
+    if n.udp == null { return 0 as long }
+    return netudp.datagrams_sent(n.udp)
+}
+
+largest_datagram(n: *Net) -> int {
+    if n.udp == null { return 0 }
+    return netudp.largest(n.udp)
+}
+
+round_trip(n: *Net, client: int) -> float {
+    if n.udp == null { return 0.0 }
+    p = peer_by_id(n, client)
+    if n.role == ROLE_CLIENT { p = peer_by_id(n, 0) }
+    if p == null { return 0.0 }
+    return netudp.rtt(n.udp, p.conn)
+}
+
+// Host: the most ticks object `id` ever waited, changed and relevant but
+// past client `client`'s budget, before it was sent.
+worst_wait(n: *Net, client: int, id: int) -> int {
+    p = peer_by_id(n, client)
+    if p == null || id < 1 || id > p.capacity { return 0 }
+    return (p.worst as int[])[id - 1]
+}
+
+// Host: the largest snapshot client `client` was sent, bytes; all it was
+// sent; how many.
+largest_snapshot(n: *Net, client: int) -> int {
+    p = peer_by_id(n, client)
+    if p == null { return 0 }
+    return p.largest
+}
+
+snapshot_bytes(n: *Net, client: int) -> long {
+    p = peer_by_id(n, client)
+    if p == null { return 0 as long }
+    return p.snapshot_bytes
+}
+
+snapshots_sent(n: *Net, client: int) -> int {
+    p = peer_by_id(n, client)
+    if p == null { return 0 }
+    return p.snapshots
+}
+
+// Host: the snapshots client `client` was sent whole, against no base: its
+// first, and any after it held nothing the host still kept (the last 32).
+whole_snapshots(n: *Net, client: int) -> int {
+    p = peer_by_id(n, client)
+    if p == null { return 0 }
+    return p.wholes
+}
+
+// The host's tick; a client's newest snapshot's.
+host_tick(n: *Net) -> int { return n.tick }
+snapshot_tick(n: *Net) -> int { return n.newest_tick }
+
+// Whether object `id`'s state is known: on a client, whether its newest
+// snapshot has it (it has been told it); on the host, whether it was
+// networked at the last tick.
+known(n: *Net, id: int) -> bool {
+    shot = newest_states(n)
+    if shot == null || id < 1 || id > shot.count { return false }
+    return (shot.known as int[])[id - 1] == 1
+}
+
+// Object `id`'s state as the wire carries it, quantised, into `out` (7
+// floats: x y z, qx qy qz qw): on a client, its newest snapshot's; on the
+// host, its state at the last tick. False when it is not known.
+state_at(n: *Net, id: int, out: ptr) -> bool {
+    if !known(n, id) { return false }
+    state_values(n, newest_states(n), id - 1, out as float[], 0)
+    return true
+}
+
+newest_states(n: *Net) -> *Snapshot {
+    if n.role == ROLE_HOST {
+        if n.previous.used { return n.previous }
+        return null
+    }
+    return ring_find(n.received, n.newest_tick)
+}
 
 // --- in the engine ---------------------------------------------------------------------------
 
@@ -2042,14 +3045,15 @@ net_free(n: *Net) {
     if n == null { return }
     clear_events(n)
     list.free(n.events)
+    // A UDP session says it is going, to every connection, before its
+    // socket closes.
+    if n.udp != null {
+        netudp.close(n.udp, n.last_step)
+        netudp.endpoint_free(n.udp)
+    }
     i = 0
     while i < list.size(n.peers) {
-        p = list.get_raw(n.peers, i) as *Peer
-        if p.socket != null { tcp.tcp_close(p.socket) }
-        if p.pending != null { free(p.pending) }
-        if p.queued != null { free(p.queued) }
-        free_snapshots(p.sent)
-        free(p as ptr)
+        peer_free(list.get_raw(n.peers, i) as *Peer)
         i = i + 1
     }
     list.free(n.peers)
@@ -2086,15 +3090,30 @@ net_free(n: *Net) {
     }
     list.free(n.joins)
     i = 0
+    while i < list.size(n.leaves) {
+        heap.free(list.get_raw(n.leaves, i) as *NetJoinHook)
+        i = i + 1
+    }
+    list.free(n.leaves)
+    i = 0
     while i < list.size(n.players) {
         free(list.get_raw(n.players, i))
         i = i + 1
     }
     list.free(n.players)
     free(n.commands)
-    free_snapshots(n.received)
+    ring_free(n.received)
+    snapshot_free(n.current)
+    snapshot_free(n.previous)
+    if n.candidates != null { free(n.candidates) }
+    if n.records != null { free(n.records) }
+    if n.fields != null { free(n.fields) }
+    free(n.traffic)
+    free(n.scratch)
     if n.server != null { tcp.tcp_server_close(n.server) }
     if n.kind == KIND_LOOP && n.role == ROLE_HOST && n.hub != null { n.hub.host_open = false }
     buf_free(n.out)
+    buf_free(n.measured)
     free(n as ptr)
+    g_alive = g_alive - 1
 }
