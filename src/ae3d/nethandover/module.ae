@@ -1,0 +1,501 @@
+// ae3d.nethandover -- a networked horde's struck zombies handed to active
+// ragdolls on every peer (#466).
+//
+// ae3d.handover hands a struck zombie to an active ragdoll and takes it
+// back when the figure recovers, a player alone. A networked horde
+// (ae3d.nethorde) is simulated on every peer and hashed, so a zombie has
+// to leave it at the same tick everywhere, and come back to the same bits;
+// and a ragdoll is physics, which is not bit-exact across machines. So:
+//
+//   - The host strikes. Its pool (ae3d.handover over the host's horde
+//     columns) takes a figure, stands it where the zombie was drawn and
+//     strikes it; the horde's `hand_over` input takes the zombie out on
+//     every peer at the next tick, its flag set and its place parked.
+//   - Only the host simulates the ragdoll. Its twelve bones are created
+//     objects of the kind "horde.bone" (net.create_object), sent as
+//     objects are -- quantised, as deltas, within each client's relevance
+//     and budget -- and a "horde.ragdoll" event says which zombie they
+//     are. A client stands a figure of its own pool as a puppet, its
+//     bodies parked, and poses it every frame from the bones as it draws
+//     them (at its view time, interpolated), from the moment its view
+//     reaches the handover: the zombie leaves its horde and the figure
+//     appears in the same frame.
+//   - The figure gets up and goes back: the pool writes where it stands
+//     into the host's columns, the horde's `rejoin` input gives the zombie
+//     back quantised on every peer at the next tick, and the bones are
+//     destroyed, so every client's puppet goes when its view reaches that
+//     moment, as the zombie comes back into its horde.
+//   - A zombie killed while handed over lies as a limp figure, its flag
+//     set, until the pool despawns it; then the horde kills it too, which
+//     compacts it away (at the glue's next step, not inside the pool's
+//     own, so a strike the despawn made room for keeps its index).
+//   - A client that joins mid-handover is sent the horde with the out
+//     flags (nethorde's state), the bones alive (net's created objects),
+//     and the "horde.ragdoll" for each: it draws what everyone else does.
+//
+// Both sides make it at the same point among their registrations, after
+// the horde (handover_new registers a kind and an event), each over a pool
+// of its own of the same figure. It is stepped after the session and the
+// horde (attach, or step from a test's clock), and freed after the
+// session (whose objects' unmakers are its own) and before the pool.
+
+import std.list
+import std.heap
+import aephysics.human
+import ae3d.core
+import ae3d.behaviour
+import ae3d.engine
+import ae3d.handover
+import ae3d.motion
+import ae3d.net
+import ae3d.nethorde
+import ae3d.physics
+import ae3d.platform
+
+exports (
+    NetHandover,
+    handover_new, handover_free, attach, step,
+    strike, kill, ragdolls, puppets, drawn, refused, pelvis_id
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+// A zombie's ragdoll as the glue keeps it: on the host its pool slot and
+// its bones' objects, on a client the puppet and the bones' proxies.
+struct NetRagdoll {
+    zombie: int
+    slot: int                        // the pool's; -1 on a client with no figure free
+    first: int                       // the net id of the first bone: the bones are first .. first + 11, in the human's order
+    since: float                     // the host's time it was handed over
+    bones: ptr                       // *GameObject[BONE_COUNT]
+    shown: bool                      // client: its view has reached `since`
+}
+
+struct NetHandover {
+    horde: *NetHorde
+    pool: *Handover
+    session: *Net
+    ragdolls: ptr                    // list of *NetRagdoll
+    pending: ptr                     // host: the bone the kind's maker hands the session
+    compact: ptr                     // host: int[capacity], zombies despawned, to kill in the horde at the next step
+    compact_count: int
+    compact_capacity: int
+    now: float                       // the newest time the step was given
+    pose: ptr                        // float[BONE_COUNT * POSE_STRIDE]
+    refused: int                     // client: ragdolls it had no free figure for
+    stepper: ptr                     // *Behaviour, when attached
+}
+
+// The glue over a horde and a pool, on either side, at the same point
+// among their registrations.
+handover_new(horde: *NetHorde, pool: *Handover) -> *NetHandover {
+    if horde == null || pool == null { return null }
+    nh = heap.new(NetHandover)
+    nh.horde = horde
+    nh.pool = pool
+    nh.session = horde.session
+    nh.ragdolls = list.new()
+    nh.compact_capacity = 16
+    nh.compact = calloc(nh.compact_capacity, 4)
+    nh.pose = calloc(human.BONE_COUNT * physics.POSE_STRIDE, 8)
+    net.object_kind(nh.session, "horde.bone", make_bone, unmake_bone, nh as ptr)
+    net.on_event(nh.session, "horde.ragdoll", on_ragdoll, nh as ptr)
+    net.on_join(nh.session, on_joined, nh as ptr)
+    nethorde.set_on_move(horde, moved, nh as ptr)
+    handover.set_on_return(pool, returned, nh as ptr)
+    handover.set_on_despawn(pool, despawned, nh as ptr)
+    return nh
+}
+
+// After the session is freed: its created objects' unmakers are these.
+handover_free(nh: *NetHandover) {
+    if nh == null { return }
+    k = 0
+    while k < list.size(nh.ragdolls) {
+        rec = list.get_raw(nh.ragdolls, k) as *NetRagdoll
+        free(rec.bones)
+        heap.free(rec)
+        k = k + 1
+    }
+    list.free(nh.ragdolls)
+    free(nh.compact)
+    free(nh.pose)
+    heap.free(nh)
+}
+
+// The ragdolls handed over now: the host's simulated, a client's drawn or
+// waiting for its view.
+ragdolls(nh: *NetHandover) -> int { return list.size(nh.ragdolls) }
+
+// Client: the puppets its view has reached, posed this frame.
+puppets(nh: *NetHandover) -> int {
+    n = 0
+    k = 0
+    while k < list.size(nh.ragdolls) {
+        rec = list.get_raw(nh.ragdolls, k) as *NetRagdoll
+        if rec.shown && rec.slot >= 0 { n = n + 1 }
+        k = k + 1
+    }
+    return n
+}
+
+// Client: whether zombie `zombie`'s puppet is drawn now.
+drawn(nh: *NetHandover, zombie: int) -> bool {
+    rec = by_zombie(nh, zombie)
+    return rec != null && rec.shown && rec.slot >= 0
+}
+
+refused(nh: *NetHandover) -> int { return nh.refused }
+
+// The net id of zombie `zombie`'s ragdoll's pelvis, on either side; 0 when
+// it is not handed over.
+pelvis_id(nh: *NetHandover, zombie: int) -> int {
+    rec = by_zombie(nh, zombie)
+    if rec == null { return 0 }
+    return rec.first + human.BONE_PELVIS
+}
+
+by_zombie(nh: *NetHandover, zombie: int) -> *NetRagdoll {
+    k = 0
+    while k < list.size(nh.ragdolls) {
+        rec = list.get_raw(nh.ragdolls, k) as *NetRagdoll
+        if rec.zombie == zombie { return rec }
+        k = k + 1
+    }
+    return null
+}
+
+by_slot(nh: *NetHandover, slot: int) -> *NetRagdoll {
+    k = 0
+    while k < list.size(nh.ragdolls) {
+        rec = list.get_raw(nh.ragdolls, k) as *NetRagdoll
+        if rec.slot == slot { return rec }
+        k = k + 1
+    }
+    return null
+}
+
+forget_record(nh: *NetHandover, rec: *NetRagdoll) {
+    k = 0
+    while k < list.size(nh.ragdolls) {
+        if list.get_raw(nh.ragdolls, k) == rec as ptr {
+            list.remove(nh.ragdolls, k)
+            break
+        }
+        k = k + 1
+    }
+    free(rec.bones)
+    heap.free(rec)
+}
+
+// The pool sees the horde as it is now: its columns, and how many.
+sync_pool(nh: *NetHandover) {
+    h = nh.horde
+    handover.set_horde(nh.pool, nethorde.positions(h), nethorde.yaws(h), nethorde.phases(h), nethorde.horde_count(h))
+}
+
+// --- the host -----------------------------------------------------------------------------------------
+
+// A zombie struck: handed to a figure of the host's pool, POWERED, hit at
+// the bone nearest `point` with `impulse`, out of the horde on every peer
+// at the next tick, and its ragdoll sent. A zombie already handed over is
+// hit again where its figure stands. The slot, or -1 on a client, for no
+// such zombie, or when the pool has no figure to give (the strike is
+// refused and the zombie stays in the horde).
+strike(nh: *NetHandover, zombie: int, point: Vec3, impulse: Vec3, now: float) -> int {
+    return hand(nh, zombie, point, impulse, false, now)
+}
+
+// The same, killed: the figure LIMP, lying until the pool despawns it,
+// when the horde kills the zombie too.
+kill(nh: *NetHandover, zombie: int, point: Vec3, impulse: Vec3, now: float) -> int {
+    return hand(nh, zombie, point, impulse, true, now)
+}
+
+hand(nh: *NetHandover, zombie: int, point: Vec3, impulse: Vec3, killed: bool, now: float) -> int {
+    if !net.hosting(nh.session) || !nethorde.started(nh.horde) { return 0 - 1 }
+    if zombie < 0 || zombie >= nethorde.horde_count(nh.horde) { return 0 - 1 }
+    nh.now = now
+    sync_pool(nh)
+    if nethorde.is_out(nh.horde, zombie) {
+        // Its figure, hit again (or refused, one being compacted away).
+        if by_zombie(nh, zombie) == null { return 0 - 1 }
+        if killed { return handover.kill(nh.pool, zombie, point, impulse) }
+        return handover.strike(nh.pool, zombie, point, impulse)
+    }
+    // The pool first: it stands the figure where the horde drew the zombie
+    // (and, full, may give another back or despawn one to make room: those
+    // are told through returned and despawned).
+    slot = 0 - 1
+    if killed {
+        slot = handover.kill(nh.pool, zombie, point, impulse)
+    } else {
+        slot = handover.strike(nh.pool, zombie, point, impulse)
+    }
+    if slot < 0 { return slot }
+    nethorde.hand_over(nh.horde, zombie, now)
+    replicate(nh, slot, zombie, now)
+    return slot
+}
+
+// A figure's twelve bones networked as created objects -- the kind's
+// maker hands the session each bone's own object -- and every client
+// told which zombie they are.
+replicate(nh: *NetHandover, slot: int, zombie: int, now: float) {
+    body = handover.slot_motion(nh.pool, slot)
+    rec = heap.new(NetRagdoll)
+    rec.zombie = zombie
+    rec.slot = slot
+    rec.since = next_tick_time(nh)
+    rec.bones = calloc(human.BONE_COUNT, 8)
+    b = 0
+    while b < human.BONE_COUNT {
+        o = physics.ragdoll_bone(body.ragdoll, b)
+        (rec.bones as ptr[])[b] = o as ptr
+        nh.pending = o as ptr
+        made = net.create_object(nh.session, "horde.bone", place_of(o), turn_of(o), now)
+        if b == 0 { rec.first = net.id_of(nh.session, made) }
+        b = b + 1
+    }
+    nh.pending = null
+    list.add_raw(nh.ragdolls, rec as ptr)
+    net.send_event(nh.session, "horde.ragdoll", net.EVERYONE, now, rec.first as float, zombie as float, rec.since)
+}
+
+// The host's time of the horde's next tick: when an input sent now takes
+// effect on every peer. A puppet appears at it and goes at it, so on a
+// client the zombie leaves its horde and its figure is drawn in the same
+// frame, and the other way round.
+next_tick_time(nh: *NetHandover) -> float {
+    h = nh.horde
+    return h.start_time + ((nethorde.horde_tick(h) + 1) as float) / (h.rate as float)
+}
+
+// A bone's object where the session reads it: its model's place, or its
+// own.
+place_of(o: *GameObject) -> Vec3 {
+    m = behaviour.object_model(o)
+    if m != null { return m.position }
+    return behaviour.object_position(o)
+}
+
+turn_of(o: *GameObject) -> Quat {
+    m = behaviour.object_model(o)
+    if m != null { return m.rotation }
+    return behaviour.object_rotation(o)
+}
+
+// The kind's maker: on the host the bone being networked, on a client a
+// proxy the session draws the bone on.
+make_bone(context: ptr, id: int) -> *GameObject {
+    nh = context as *NetHandover
+    if net.hosting(nh.session) { return nh.pending as *GameObject }
+    return behaviour.object_new("horde bone ${id}")
+}
+
+// And its unmaker: nothing on the host (the bone is the ragdoll's); on a
+// client, the proxy freed, and its ragdoll's puppet let go with its
+// first bone.
+unmake_bone(context: ptr, o: *GameObject) {
+    nh = context as *NetHandover
+    if net.hosting(nh.session) { return }
+    id = net.id_of(nh.session, o)
+    k = 0
+    while k < list.size(nh.ragdolls) {
+        rec = list.get_raw(nh.ragdolls, k) as *NetRagdoll
+        if rec.first == id {
+            if rec.slot >= 0 { handover.puppet_end(nh.pool, rec.slot) }
+            forget_record(nh, rec)
+            break
+        }
+        k = k + 1
+    }
+    behaviour.object_free(o)
+}
+
+// The bones of a figure gone, destroyed as of the horde's next tick:
+// every client's puppet goes when its view reaches that moment, as the
+// zombie comes back into its horde (or, killed, is let go).
+unreplicate(nh: *NetHandover, rec: *NetRagdoll) {
+    at = next_tick_time(nh)
+    b = 0
+    while b < human.BONE_COUNT {
+        net.destroy_object(nh.session, (rec.bones as ptr[])[b] as *GameObject, at)
+        b = b + 1
+    }
+    forget_record(nh, rec)
+}
+
+// The pool gave a figure back: the zombie back in the horde where the
+// figure stood -- the pool wrote it into the host's columns, and the
+// horde's rejoin quantises it and tells every peer -- and its bones gone.
+returned(context: ptr, pool: *Handover, slot: int, zombie: int) {
+    nh = context as *NetHandover
+    if !net.hosting(nh.session) { return }
+    rec = by_slot(nh, slot)
+    if rec == null { return }
+    pos = nethorde.positions(nh.horde) as float[]
+    yaws = nethorde.yaws(nh.horde) as float[]
+    phases = nethorde.phases(nh.horde) as float[]
+    nethorde.rejoin(nh.horde, zombie, pos[zombie * 3], pos[zombie * 3 + 2], yaws[zombie], phases[zombie], nh.now)
+    unreplicate(nh, rec)
+}
+
+// The pool parked a killed figure: its bones gone, and the zombie killed
+// in the horde at the next step.
+despawned(context: ptr, pool: *Handover, slot: int, zombie: int) {
+    nh = context as *NetHandover
+    if !net.hosting(nh.session) { return }
+    rec = by_slot(nh, slot)
+    if rec == null { return }
+    if nh.compact_count >= nh.compact_capacity {
+        grown = calloc(nh.compact_capacity * 2, 4)
+        k = 0
+        while k < nh.compact_count {
+            (grown as int[])[k] = (nh.compact as int[])[k]
+            k = k + 1
+        }
+        free(nh.compact)
+        nh.compact = grown
+        nh.compact_capacity = nh.compact_capacity * 2
+    }
+    (nh.compact as int[])[nh.compact_count] = zombie
+    nh.compact_count = nh.compact_count + 1
+    unreplicate(nh, rec)
+}
+
+// The horde moved a zombie (a kill's swap), on any peer: the pool's figure
+// follows it, and so do this side's records.
+moved(context: ptr, from: int, to: int) {
+    nh = context as *NetHandover
+    handover.renumber(nh.pool, from, to)
+    k = 0
+    while k < list.size(nh.ragdolls) {
+        rec = list.get_raw(nh.ragdolls, k) as *NetRagdoll
+        if rec.zombie == from { rec.zombie = to }
+        k = k + 1
+    }
+    queued = nh.compact as int[]
+    k = 0
+    while k < nh.compact_count {
+        if queued[k] == from { queued[k] = to }
+        k = k + 1
+    }
+}
+
+// A client welcomed after a handover: told which zombie each ragdoll alive
+// is (its bones and the out flags are on their way already).
+on_joined(context: ptr, client: int, now: float) {
+    nh = context as *NetHandover
+    k = 0
+    while k < list.size(nh.ragdolls) {
+        rec = list.get_raw(nh.ragdolls, k) as *NetRagdoll
+        net.send_event(nh.session, "horde.ragdoll", client, now, rec.first as float, rec.zombie as float, rec.since)
+        k = k + 1
+    }
+}
+
+// --- a client ---------------------------------------------------------------------------------------------
+
+// A ragdoll's bones are here: which zombie they are, and since when. A
+// figure of this side's pool is made its puppet.
+on_ragdoll(context: ptr, call: *NetCall) {
+    nh = context as *NetHandover
+    if net.hosting(nh.session) { return }
+    first = (call.a) as int
+    if by_first(nh, first) != null { return }
+    rec = heap.new(NetRagdoll)
+    rec.first = first
+    rec.zombie = (call.b) as int
+    rec.since = call.c
+    rec.bones = calloc(human.BONE_COUNT, 8)
+    b = 0
+    while b < human.BONE_COUNT {
+        (rec.bones as ptr[])[b] = net.object_of(nh.session, first + b) as ptr
+        b = b + 1
+    }
+    sync_pool(nh)
+    rec.slot = handover.puppet(nh.pool, rec.zombie)
+    if rec.slot < 0 { nh.refused = nh.refused + 1 }
+    list.add_raw(nh.ragdolls, rec as ptr)
+}
+
+by_first(nh: *NetHandover, first: int) -> *NetRagdoll {
+    k = 0
+    while k < list.size(nh.ragdolls) {
+        rec = list.get_raw(nh.ragdolls, k) as *NetRagdoll
+        if rec.first == first { return rec }
+        k = k + 1
+    }
+    return null
+}
+
+// Every puppet whose moment the view has reached, posed from its bones as
+// the session draws them now.
+pose_puppets(nh: *NetHandover, now: float) {
+    view = net.view_time(nh.session, now)
+    pose = nh.pose as float[]
+    k = 0
+    while k < list.size(nh.ragdolls) {
+        rec = list.get_raw(nh.ragdolls, k) as *NetRagdoll
+        if !rec.shown && view >= 0.0 && view >= rec.since { rec.shown = true }
+        if rec.shown && rec.slot >= 0 {
+            complete = true
+            b = 0
+            while b < human.BONE_COUNT {
+                o = (rec.bones as ptr[])[b] as *GameObject
+                if o == null {
+                    complete = false
+                } else {
+                    at = behaviour.object_position(o)
+                    turn = behaviour.object_rotation(o)
+                    s = b * physics.POSE_STRIDE
+                    pose[s] = turn.x
+                    pose[s + 1] = turn.y
+                    pose[s + 2] = turn.z
+                    pose[s + 3] = turn.w
+                    pose[s + 4] = at.x
+                    pose[s + 5] = at.y
+                    pose[s + 6] = at.z
+                }
+                b = b + 1
+            }
+            if complete { handover.puppet_pose(nh.pool, rec.slot, nh.pose) }
+        }
+        k = k + 1
+    }
+}
+
+// --- the step --------------------------------------------------------------------------------------------
+
+// After the session and the horde, every frame, on either side: the host
+// kills in the horde the zombies whose figures were despawned; a client
+// poses its puppets.
+step(nh: *NetHandover, now: float) {
+    if nh == null { return }
+    nh.now = now
+    if net.hosting(nh.session) {
+        while nh.compact_count > 0 {
+            nh.compact_count = nh.compact_count - 1
+            zombie = (nh.compact as int[])[nh.compact_count]
+            nethorde.kill(nh.horde, zombie, now)
+        }
+    } else {
+        pose_puppets(nh, now)
+    }
+    sync_pool(nh)
+}
+
+nethandover_update(state: ptr, e: *Engine, delta: float) {
+    step(state as *NetHandover, platform.time())
+}
+
+// Stepped by the engine every frame, on the engine's clock, after the
+// session and the horde (attach it after nethorde.attach).
+attach(e: *Engine, nh: *NetHandover) {
+    b = engine.behaviour_new("nethandover", nh as ptr)
+    b.update = nethandover_update
+    engine.engine_add_behaviour(e, b)
+    nh.stepper = b as ptr
+}
