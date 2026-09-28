@@ -180,9 +180,10 @@ while one runs stops it first.
 
 **Play** (#476) tries a multiplayer game the way it is played: by several
 players at once. The PLAY section under Edit picks how many clients join
-(one to four) and the link between them -- latency, jitter and loss, over
-`ae3d.net`'s loopback ([networking.md](networking.md)); a slider moved
-while it plays changes the link at once. Play runs the scene as a host
+(one to four, a slider with a notch a count) and the link between them --
+latency, jitter and loss, over `ae3d.net`'s loopback
+([networking.md](networking.md)); a link slider moved while it plays
+changes the link at once, and the count holds until Stop. Play runs the scene as a host
 and each client as an engine of its own, in this process:
 
 - the host is the editor's engine over its scene, simulated as Simulate
