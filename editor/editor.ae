@@ -37,6 +37,7 @@ import ae3d.rendering
 import ae3d.engine
 import ae3d.weather
 import ae3d.physics
+import ae3d.net
 import ae3d.figure
 import ae3d.motion
 import ae3d.skin
@@ -3414,6 +3415,8 @@ start_motions(e: *Engine) -> int {
     return made
 }
 
+const FLOOR_HALF = 20.0               // metres: half a floor laid for the simulation, across
+
 // Ground under a figure about to stand on its muscles: what the scene's
 // static bodies give it, or -- where a ray from a metre over its feet meets
 // none within three -- a floor at its feet for the simulation, which goes
@@ -3427,7 +3430,7 @@ floor_under(e: *Engine, group: *Model) {
     if physics.ray_hits(p, core.vec3(feet.x, feet.y + 1.0, feet.z), core.vec3(0.0, 0.0 - 1.0, 0.0), 3.0) { return }
     floor = engine.object(e, "floor", loader.cube(1.0))
     behaviour.object_set_position(floor, core.vec3(feet.x, feet.y - 0.5, feet.z))
-    physics.box_collider(floor, core.vec3(20.0, 0.5, 20.0), physics.material(0.8, 0.0))
+    physics.box_collider(floor, core.vec3(FLOOR_HALF, 0.5, FLOOR_HALF), physics.material(0.8, 0.0))
     if g_floors == null { g_floors = list.new() }
     list.add_raw(g_floors, floor as ptr)
 }
@@ -3442,14 +3445,25 @@ remove_floors(e: *Engine) {
 }
 
 // Natural motion let go of before the world goes, and every figure put back
-// in the pose it had.
+// in the pose it had. A ragdoll's twelve bones are objects of the editor's
+// engine, each with its capsule in the renderer: out with them, or every
+// stop left twelve objects and twelve models behind (the play's clean stop
+// counts them).
 stop_motions() {
     if g_figure_rows == null { return }
     i = 0
     while i < list.size(g_figure_rows) {
         r = list.get_raw(g_figure_rows, i) as *FigureRow
         if r.live != null {
-            motion.release(r.live as *Motion)
+            live = r.live as *Motion
+            if g_engine != null && live.ragdoll != null {
+                bone = 0
+                while bone < human.BONE_COUNT {
+                    engine.destroy(g_engine as *Engine, physics.ragdoll_bone(live.ragdoll, bone))
+                    bone = bone + 1
+                }
+            }
+            motion.release(live)
             r.live = null
         }
         i = i + 1
@@ -3908,6 +3922,785 @@ simulation_stuck() -> int {
     return wrong
 }
 
+// --- play as a host and its clients (#476) -----------------------------------------------------------------
+//
+// A multiplayer game is tried by playing it with several players, so Play
+// runs the scene as a host and one to four clients in this process, over
+// ae3d.net's loopback, with the link's latency, jitter and loss from the
+// PLAY section's sliders. Each is an engine of its own:
+//
+//   - the host is the editor's engine over its scene, simulated as Simulate
+//     simulates it (every body, the figures on their muscles, the scripts
+//     running), and it plays too, with a player of its own;
+//   - a client is an engine over the same renderer, with a physics world of
+//     its own holding the scene's static bodies (the rows' own meshes,
+//     which never move) for its player to walk on, a stand-in for each row
+//     the host moves (a body that is not static, or a script), networked in
+//     the same order, and its players;
+//   - every world's players are capsules of its own.
+//
+// The viewport shows one world at a time, chosen on the bar over it: the
+// host's, or a client's -- its players, and every networked row where that
+// client draws it (at its view time, interpolated, hidden until it has
+// been told it); a static row is the same in every world. The keys go to
+// the player of the world shown: W, A, S and D walk and space jumps,
+// predicted on a client and reconciled against the host. Stop lets every
+// world and every session go, and puts the scene back as Simulate's stop
+// does.
+
+const PLAY_CLIENTS_MAX = 4
+const PLAY_STEP = 0.016666666666666666
+const PLAY_WALK = 3.0                  // m/s a key walks
+const PLAY_JUMP = 4.2                  // m/s up a jump
+const PLAY_SPREAD = 3.0                // metres between players where they start
+const PLAY_DISTANCE = 14.0             // the orbit's distance while playing: a player's-eye view
+const PLAY_REACH = 400.0               // metres a spawn looks down for ground
+const KEY_W = 1
+const KEY_A = 2
+const KEY_S = 4
+const KEY_D = 8
+const KEY_JUMP = 16
+
+// One world of the play: the host's, or a client's.
+struct PlayWorld {
+    index: int                         // 0 the host, 1.. the clients
+    engine: ptr                        // *Engine: the editor's for the host, one over its renderer for a client
+    session: ptr                       // *Net
+    proxies: ptr                       // client: list of *GameObject, the networked rows' stand-ins, in their order
+    colliders: ptr                     // client: list of *GameObject, the static rows' bodies
+    floors: ptr                        // list of *GameObject: floors laid where a player has no ground
+    players: ptr                       // list of *GameObject: the players this world made
+}
+
+var g_playing = false
+var g_play_clients = 2                 // chosen before Play: 1 to 4
+var g_play_latency = 0.06              // seconds one way
+var g_play_jitter = 0.01               // seconds, up to this more
+var g_play_loss = 0.02                 // the share of snapshots and inputs lost
+var g_play_hub: ptr = null
+var g_play_worlds: ptr = null          // list of *PlayWorld: the host's, then each client's
+var g_play_rows: ptr = null            // int[]: the networked rows, in their order
+var g_play_row_count = 0
+var g_play_rest: ptr = null            // float[rows * 7]: where the networked rows stood before Play
+var g_play_saved: ptr = null           // float[rows * 8]: the host's transforms and visibility while another world is drawn
+var g_play_spawns: ptr = null          // float[(PLAY_CLIENTS_MAX + 1) * 4]: x y z a player, and 1 where a floor is laid
+var g_play_view = 0                    // the world shown, whose player takes the keys
+var g_play_clock = 0.0
+var g_play_fixed = 0.0                 // time toward the next command
+var g_play_keys = 0                    // the keys held
+var g_play_jump = false                // space pressed since the last command
+var g_play_bots = false                // every player walks a circle of its own (the bounded run's check)
+var g_play_bots_from = 0.0             // the play's time the bots began
+var g_play_drawn: ptr = null           // int[PLAY_CLIENTS_MAX + 1]: frames each world was shown
+var g_play_btn = 0
+var g_play_count_buttons: ptr = null   // int[PLAY_CLIENTS_MAX]
+var g_play_view_buttons: ptr = null    // int[PLAY_CLIENTS_MAX + 1]
+var g_play_readouts: ptr = null        // int[3]: the latency, jitter and loss beside their sliders
+var g_play_auto = 0                    // AE3D_EDITOR_PLAY: clients to start with at the first frame, 0 none
+var g_play_cycle = false               // and each world shown in turn, a frame each
+var g_play_orbit = 0.0                 // the orbit's distance before Play
+var g_play_models = 0                  // the renderer's models before Play
+var g_play_objects = 0                 // the editor's engine's objects before Play
+
+// A row the host moves, and so networks: one drawn, with a body that is
+// not static or a script on it.
+play_networked(index: int) -> bool {
+    if model_at(index) == null { return false }
+    kind = body_kind_of(spec_at(index))
+    if kind == BODY_DYNAMIC || kind == BODY_KINEMATIC || kind == BODY_CHARACTER { return true }
+    return script_at(index) != SCRIPT_NONE
+}
+
+play_world_new(index: int, e: *Engine, session: *Net) -> *PlayWorld {
+    w = heap.new(PlayWorld)
+    w.index = index
+    w.engine = e as ptr
+    w.session = session as ptr
+    w.proxies = list.new()
+    w.colliders = list.new()
+    w.floors = list.new()
+    w.players = list.new()
+    return w
+}
+
+play_world(index: int) -> *PlayWorld {
+    if g_play_worlds == null || index < 0 || index >= list.size(g_play_worlds) { return null }
+    return list.get_raw(g_play_worlds, index) as *PlayWorld
+}
+
+// The renderer's models: what a clean stop hands back to the count it had.
+play_model_count() -> int {
+    if g_renderer == null { return 0 }
+    if g_vulkan { return vulkan.renderer_model_count(g_renderer as *VKRenderer) }
+    return gl.renderer_model_count(g_renderer as *GLRenderer)
+}
+
+// Where each player starts, in every world the same: the nearest free
+// places to the point the editor looks at, outward a ring at a time. A
+// place stands on the static ground under it (the host's world, simulated,
+// answers where; a figure or a crate is not ground), with room for a
+// player's capsule -- nothing static or moving in it, no other player
+// beside it. Where there is no ground under it within reach, the player
+// stands on the grid's plane, on a floor laid for the play.
+play_place_spawns(e: *Engine) {
+    g_play_spawns = calloc((PLAY_CLIENTS_MAX + 1) * 4, 8)
+    spawns = g_play_spawns as float[]
+    p = physics.of(e)
+    top = g_focus_y + PLAY_REACH * 0.5
+    c = 0
+    ring = 0
+    while c <= PLAY_CLIENTS_MAX && ring < 60 {
+        dx = 0 - ring
+        while dx <= ring && c <= PLAY_CLIENTS_MAX {
+            dz = 0 - ring
+            while dz <= ring && c <= PLAY_CLIENTS_MAX {
+                if abs_int(dx) == ring || abs_int(dz) == ring {
+                    x = g_focus_x + (dx as float) * PLAY_SPREAD
+                    z = g_focus_z + (dz as float) * PLAY_SPREAD
+                    down = physics.ray_static_distance(p, core.vec3(x, top, z), core.vec3(0.0, 0.0 - 1.0, 0.0), PLAY_REACH)
+                    y = 0.0
+                    if down >= 0.0 { y = top - down }
+                    room = physics.capsule_clear(p, core.vec3(x, y + 0.02, z), 0.3, 1.8)
+                    if room {
+                        at = c * 4
+                        spawns[at] = x
+                        spawns[at + 1] = y
+                        spawns[at + 2] = z
+                        spawns[at + 3] = 0.0
+                        if down < 0.0 { spawns[at + 3] = 1.0 }
+                        c = c + 1
+                    }
+                }
+                dz = dz + 1
+            }
+            dx = dx + 1
+        }
+        ring = ring + 1
+    }
+}
+
+play_spawn(client: int) -> Vec3 {
+    spawns = g_play_spawns as float[]
+    at = client * 4
+    return core.vec3(spawns[at], spawns[at + 1], spawns[at + 2])
+}
+
+// The floor a world's players need where the scene has no ground under
+// them, the same in every world: a slab on the grid's plane round the
+// point the editor looks at, as wide as a simulation's floor, drawn by
+// nothing (the grid is there).
+play_floors(w: *PlayWorld) {
+    spawns = g_play_spawns as float[]
+    needed = false
+    c = 0
+    while c <= g_play_clients {
+        if spawns[c * 4 + 3] > 0.5 { needed = true }
+        c = c + 1
+    }
+    if !needed { return }
+    slab = engine.object(w.engine as *Engine, "play floor", null)
+    behaviour.object_set_position(slab, core.vec3(g_focus_x, 0.0 - 0.5, g_focus_z))
+    physics.box_collider(slab, core.vec3(FLOOR_HALF, 0.5, FLOOR_HALF), physics.material(0.8, 0.0))
+    list.add_raw(w.floors, slab as ptr)
+}
+
+// A client's physics: a body for every static row, its own mesh shared --
+// a static body is never pulled back onto its object, so the row is not
+// moved -- and a slab for every floor the simulation laid under a figure,
+// so its player walks on what the host's does.
+play_colliders(w: *PlayWorld) {
+    e = w.engine as *Engine
+    scene = engine.engine_scene(e)
+    i = 0
+    while i < row_count() {
+        spec = spec_at(i)
+        m = model_at(i)
+        if m != null && body_kind_of(spec) == BODY_STATIC {
+            o = behaviour.object_new(core.text(m.name))
+            behaviour.object_set_model(o, m)
+            behaviour.scene_add(scene, o)
+            physics.apply_spec(o, spec)
+            list.add_raw(w.colliders, o as ptr)
+        }
+        i = i + 1
+    }
+    if g_floors == null { return }
+    i = 0
+    while i < list.size(g_floors) {
+        laid = list.get_raw(g_floors, i) as *GameObject
+        slab = engine.object(e, "floor", null)
+        behaviour.object_set_position(slab, behaviour.object_position(laid))
+        physics.box_collider(slab, core.vec3(FLOOR_HALF, 0.5, FLOOR_HALF), physics.material(0.8, 0.0))
+        list.add_raw(w.colliders, slab as ptr)
+        i = i + 1
+    }
+}
+
+// A player, in whichever world asks: a capsule of its client's colour, a
+// character controller on it, at its client's spawn. Released with its
+// world's physics.
+play_make_player(context: ptr, client: int) -> *CharacterController {
+    w = context as *PlayWorld
+    e = w.engine as *Engine
+    body = loader.capsule(core.vec3(0.0, 0.3, 0.0), core.vec3(0.0, 1.5, 0.0), 0.3, 16, 8)
+    shade = client % 5
+    if shade == 0 { core.model_matte(body, 0.92, 0.72, 0.22) }
+    if shade == 1 { core.model_matte(body, 0.26, 0.62, 0.95) }
+    if shade == 2 { core.model_matte(body, 0.35, 0.82, 0.45) }
+    if shade == 3 { core.model_matte(body, 0.90, 0.36, 0.40) }
+    if shade == 4 { core.model_matte(body, 0.70, 0.46, 0.92) }
+    o = engine.object(e, "Player ${client}", body)
+    behaviour.object_set_position(o, play_spawn(client))
+    c = physics.character_controller(o, 0.3, 1.8)
+    if c != null { c.owned = true }
+    list.add_raw(w.players, o as ptr)
+    return c
+}
+
+// Play: the scene simulated as the host's world, and each client's made.
+start_play() {
+    if g_playing || g_engine == null || g_renderer == null { return }
+    if g_simulating { stop_simulation() }
+    e = g_engine as *Engine
+    // What Stop has to hand back to: counted before the simulation, which
+    // lays floors of its own and takes them away, and after the selection's
+    // outline is made (the first frame makes it, the play or not).
+    update_outline()
+    g_play_models = play_model_count()
+    g_play_objects = behaviour.scene_count(engine.engine_scene(e))
+    start_simulation()
+    if !g_simulating { return }
+    count = row_count()
+    g_play_rows = calloc(count + 1, 4)
+    rows = g_play_rows as int[]
+    g_play_row_count = 0
+    i = 0
+    while i < count {
+        if play_networked(i) {
+            rows[g_play_row_count] = i
+            g_play_row_count = g_play_row_count + 1
+        }
+        i = i + 1
+    }
+    g_play_rest = calloc(g_play_row_count * 7 + 1, 8)
+    g_play_saved = calloc(g_play_row_count * 8 + 1, 8)
+    rest = g_play_rest as float[]
+    k = 0
+    while k < g_play_row_count {
+        m = model_at(rows[k])
+        rest[k * 7] = m.position.x
+        rest[k * 7 + 1] = m.position.y
+        rest[k * 7 + 2] = m.position.z
+        rest[k * 7 + 3] = m.rotation.x
+        rest[k * 7 + 4] = m.rotation.y
+        rest[k * 7 + 5] = m.rotation.z
+        rest[k * 7 + 6] = m.rotation.w
+        k = k + 1
+    }
+    play_place_spawns(e)
+    g_play_hub = net.hub_new() as ptr
+    net.hub_set_conditions(g_play_hub as *LoopHub, g_play_latency, g_play_jitter, g_play_loss)
+    g_play_worlds = list.new()
+    g_play_clock = 0.0
+    g_play_fixed = 0.0
+    host = net.host_loopback(g_play_hub as *LoopHub)
+    world = play_world_new(0, e, host)
+    list.add_raw(g_play_worlds, world as ptr)
+    k = 0
+    while k < g_play_row_count {
+        net.networked(host, row_object(rows[k]))
+        k = k + 1
+    }
+    net.set_player_maker(host, play_make_player, world as ptr)
+    play_floors(world)
+    net.host_play(host, g_play_clock)
+    api = platform.API_GL
+    if g_vulkan { api = platform.API_VULKAN }
+    c = 1
+    while c <= g_play_clients {
+        ce = engine.engine_over(g_renderer, api, g_camera as *Camera, g_light as *Light)
+        physics.attach(ce)
+        session = net.join_loopback(g_play_hub as *LoopHub)
+        cw = play_world_new(c, ce, session)
+        list.add_raw(g_play_worlds, cw as ptr)
+        play_colliders(cw)
+        k = 0
+        while k < g_play_row_count {
+            stand = behaviour.object_new("stand-in")
+            net.networked(session, stand)
+            list.add_raw(cw.proxies, stand as ptr)
+            k = k + 1
+        }
+        net.set_player_maker(session, play_make_player, cw as ptr)
+        play_floors(cw)
+        c = c + 1
+    }
+    g_play_drawn = calloc(PLAY_CLIENTS_MAX + 1, 4)
+    g_play_view = 0
+    g_play_keys = 0
+    g_play_jump = false
+    g_play_orbit = g_orbit_distance
+    g_orbit_distance = PLAY_DISTANCE
+    g_playing = true
+    refresh_play_buttons()
+    mark_dirty()
+    say("playing: a host and ${g_play_clients} client(s), ${(g_play_latency * 1000.0) as int} ms, ${(g_play_loss * 100.0) as int}% lost; W A S D walk the player in view, space jumps")
+}
+
+// Stop: every client's world and session let go, the host's players and
+// floors out of the editor's engine, and the scene back where it stood.
+stop_play() {
+    if !g_playing { return }
+    e = g_engine as *Engine
+    k = list.size(g_play_worlds) - 1
+    while k >= 1 {
+        cw = play_world(k)
+        ce = cw.engine as *Engine
+        // The session first: its players' controllers are the world's, and
+        // go with its physics; its objects (colliders, floors, players) with
+        // the engine, the players' capsules out of the renderer.
+        net.net_free(cw.session as *Net)
+        physics.physics_free(physics.of(ce))
+        engine.engine_free(ce)
+        i = 0
+        while i < list.size(cw.proxies) {
+            behaviour.object_free(list.get_raw(cw.proxies, i) as *GameObject)
+            i = i + 1
+        }
+        list.free(cw.proxies)
+        list.free(cw.colliders)
+        list.free(cw.floors)
+        list.free(cw.players)
+        heap.free(cw)
+        k = k - 1
+    }
+    hw = play_world(0)
+    net.net_free(hw.session as *Net)
+    i = 0
+    while i < list.size(hw.players) {
+        engine.destroy(e, list.get_raw(hw.players, i) as *GameObject)
+        i = i + 1
+    }
+    i = 0
+    while i < list.size(hw.floors) {
+        engine.destroy(e, list.get_raw(hw.floors, i) as *GameObject)
+        i = i + 1
+    }
+    list.free(hw.proxies)
+    list.free(hw.colliders)
+    list.free(hw.floors)
+    list.free(hw.players)
+    heap.free(hw)
+    list.free(g_play_worlds)
+    g_play_worlds = null
+    net.hub_free(g_play_hub as *LoopHub)
+    g_play_hub = null
+    // The host's physics (and its players' controllers with it), and the
+    // rows where they stood; the players and floors destroyed above are let
+    // go as the engine's scene steps, which it does now.
+    stop_simulation()
+    engine.engine_update(e, 0.0)
+    free(g_play_rows)
+    free(g_play_rest)
+    free(g_play_saved)
+    free(g_play_spawns)
+    free(g_play_drawn)
+    g_play_rows = null
+    g_play_rest = null
+    g_play_saved = null
+    g_play_spawns = null
+    g_play_drawn = null
+    g_play_row_count = 0
+    g_orbit_distance = g_play_orbit
+    g_playing = false
+    g_play_view = 0
+    refresh_play_buttons()
+    apply_orbit()
+    say("the play stopped; every world and session let go, the scene as it was")
+}
+
+toggle_play() {
+    if g_playing { stop_play() } else { start_play() }
+}
+
+// The clients the next Play makes, 1 to 4.
+set_play_clients(count: int) {
+    if count < 1 || count > PLAY_CLIENTS_MAX || g_playing { return }
+    g_play_clients = count
+    refresh_play_buttons()
+}
+
+// The link's conditions, from their sliders: at once, while it plays.
+set_play_conditions(latency: float, jitter: float, loss: float) {
+    g_play_latency = latency
+    g_play_jitter = jitter
+    g_play_loss = loss
+    if g_play_hub != null { net.hub_set_conditions(g_play_hub as *LoopHub, latency, jitter, loss) }
+    if g_play_readouts != null {
+        shown = g_play_readouts as int[]
+        if shown[0] != 0 { ui.set_text(shown[0], "${(latency * 1000.0) as int} ms") }
+        if shown[1] != 0 { ui.set_text(shown[1], "${(jitter * 1000.0) as int} ms") }
+        if shown[2] != 0 { ui.set_text(shown[2], "${(loss * 100.0) as int}%") }
+    }
+}
+
+// The world shown, and whose player the keys move.
+set_play_view(index: int) {
+    if !g_playing || index < 0 || index >= list.size(g_play_worlds) { return }
+    g_play_view = index
+    g_play_keys = 0
+    refresh_play_buttons()
+    mark_dirty()
+    if index == 0 { say("the host's view: its player takes the keys") } else { say("client ${index}'s view: its player takes the keys") }
+}
+
+refresh_play_buttons() {
+    if g_play_btn != 0 {
+        if g_playing { ui.set_text(g_play_btn, "Stop") } else { ui.set_text(g_play_btn, "Play") }
+    }
+    if g_play_count_buttons != null {
+        counts = g_play_count_buttons as int[]
+        k = 0
+        while k < PLAY_CLIENTS_MAX {
+            paint_mode_button(counts[k], k + 1 == g_play_clients)
+            k = k + 1
+        }
+    }
+    if g_play_view_buttons != null {
+        views = g_play_view_buttons as int[]
+        k = 0
+        while k <= PLAY_CLIENTS_MAX {
+            if views[k] != 0 {
+                ui.set_hidden(views[k], hidden_flag(g_playing && k <= g_play_clients))
+                paint_mode_button(views[k], g_playing && k == g_play_view)
+            }
+            k = k + 1
+        }
+    }
+}
+
+// A key pressed or let go while playing: W A S D held, space once.
+play_key(key: string, down: bool) {
+    bit = 0
+    if string.equals(key, "w") == 1 || string.equals(key, "W") == 1 { bit = KEY_W }
+    if string.equals(key, "a") == 1 || string.equals(key, "A") == 1 { bit = KEY_A }
+    if string.equals(key, "s") == 1 || string.equals(key, "S") == 1 { bit = KEY_S }
+    if string.equals(key, "d") == 1 || string.equals(key, "D") == 1 { bit = KEY_D }
+    if string.equals(key, "space") == 1 || string.equals(key, " ") == 1 {
+        if down { g_play_jump = true }
+        return
+    }
+    if bit == 0 { return }
+    if down {
+        g_play_keys = g_play_keys | bit
+    } else {
+        g_play_keys = g_play_keys & (31 - bit)
+    }
+}
+
+// The keys as a walk, along the ground the way the camera looks.
+play_walk() -> Vec3 {
+    ahead = 0.0
+    side = 0.0
+    if (g_play_keys & KEY_W) != 0 { ahead = ahead + 1.0 }
+    if (g_play_keys & KEY_S) != 0 { ahead = ahead - 1.0 }
+    if (g_play_keys & KEY_D) != 0 { side = side + 1.0 }
+    if (g_play_keys & KEY_A) != 0 { side = side - 1.0 }
+    if ahead == 0.0 && side == 0.0 { return core.vec3(0.0, 0.0, 0.0) }
+    cam = g_camera as *Camera
+    core.camera_update_vectors(cam)
+    fx = cam.front.x
+    fz = cam.front.z
+    length = core.sqrt_of(fx * fx + fz * fz)
+    if length < 0.0001 {
+        fx = 0.0
+        fz = 0.0 - 1.0
+    } else {
+        fx = fx / length
+        fz = fz / length
+    }
+    x = fx * ahead - fz * side
+    z = fz * ahead + fx * side
+    scale = PLAY_WALK / core.sqrt_of(x * x + z * z)
+    return core.vec3(x * scale, 0.0, z * scale)
+}
+
+// A bot's walk (the bounded run's check): a circle of its own for two and
+// a half seconds from when the bots began, then still.
+play_bot_walk(index: int, now: float) -> Vec3 {
+    walked = now - g_play_bots_from
+    if walked >= 2.5 { return core.vec3(0.0, 0.0, 0.0) }
+    turn = walked * 1.2 + (index as float) * 1.7
+    return core.vec3(core.cos_of(turn) * 2.0, 0.0, core.sin_of(turn) * 2.0)
+}
+
+// Every world's player given its command for this fixed step: the one in
+// view the keys (or, the bounded run's bots, a circle each), the others
+// standing.
+play_commands(now: float) {
+    k = 0
+    while k < list.size(g_play_worlds) {
+        w = play_world(k)
+        walk = core.vec3(0.0, 0.0, 0.0)
+        jump = 0.0
+        if g_play_bots {
+            walk = play_bot_walk(k, now)
+        } else if k == g_play_view {
+            walk = play_walk()
+            if g_play_jump { jump = PLAY_JUMP }
+        }
+        net.player_input(w.session as *Net, walk, jump, now)
+        k = k + 1
+    }
+    g_play_jump = false
+}
+
+// A frame of the play: the commands due, every session stepped (the host's
+// first), every client's world stepped; the host's world steps with the
+// editor's engine after this. The camera follows the player in view.
+play_frame(delta: float) {
+    if !g_playing { return }
+    g_play_clock = g_play_clock + delta
+    now = g_play_clock
+    g_play_fixed = g_play_fixed + delta
+    while g_play_fixed >= PLAY_STEP * 0.999 {
+        g_play_fixed = g_play_fixed - PLAY_STEP
+        play_commands(now)
+    }
+    k = 0
+    while k < list.size(g_play_worlds) {
+        w = play_world(k)
+        net.step(w.session as *Net, now)
+        if k > 0 { engine.engine_update(w.engine as *Engine, delta) }
+        k = k + 1
+    }
+    if g_play_cycle {
+        g_play_view = (g_play_view + 1) % list.size(g_play_worlds)
+        refresh_play_buttons()
+    }
+    play_follow()
+}
+
+// The player of the world shown, as that world has it.
+play_own(w: *PlayWorld) -> *GameObject {
+    mine = net.my_player(w.session as *Net)
+    if mine == null { return null }
+    return mine.controller.object as *GameObject
+}
+
+play_follow() {
+    o = play_own(play_world(g_play_view))
+    if o == null { return }
+    at = behaviour.object_position(o)
+    g_focus_x = at.x
+    g_focus_y = at.y + 1.2
+    g_focus_z = at.z
+    apply_orbit()
+}
+
+// Before the viewport draws: only the shown world's players, and on a
+// client's view every networked row where that client draws it -- hidden
+// until it has been told it. After: the host's back.
+play_view_begin() {
+    if !g_playing { return }
+    shown = play_world(g_play_view)
+    k = 0
+    while k < list.size(g_play_worlds) {
+        w = play_world(k)
+        i = 0
+        while i < list.size(w.players) {
+            m = behaviour.object_model(list.get_raw(w.players, i) as *GameObject)
+            if m != null { m.visible = k == g_play_view }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    drawn = g_play_drawn as int[]
+    drawn[g_play_view] = drawn[g_play_view] + 1
+    if g_play_view == 0 { return }
+    rows = g_play_rows as int[]
+    saved = g_play_saved as float[]
+    session = shown.session as *Net
+    k = 0
+    while k < g_play_row_count {
+        m = model_at(rows[k])
+        at = k * 8
+        saved[at] = m.position.x
+        saved[at + 1] = m.position.y
+        saved[at + 2] = m.position.z
+        saved[at + 3] = m.rotation.x
+        saved[at + 4] = m.rotation.y
+        saved[at + 5] = m.rotation.z
+        saved[at + 6] = m.rotation.w
+        saved[at + 7] = 0.0
+        if m.visible { saved[at + 7] = 1.0 }
+        stand = list.get_raw(shown.proxies, k) as *GameObject
+        if net.known(session, k + 1) {
+            where = behaviour.object_position(stand)
+            core.model_set_position(m, where.x, where.y, where.z)
+            core.model_set_rotation(m, behaviour.object_rotation(stand))
+        } else {
+            m.visible = false
+        }
+        k = k + 1
+    }
+}
+
+play_view_end() {
+    if !g_playing || g_play_view == 0 { return }
+    rows = g_play_rows as int[]
+    saved = g_play_saved as float[]
+    k = 0
+    while k < g_play_row_count {
+        m = model_at(rows[k])
+        at = k * 8
+        core.model_set_position(m, saved[at], saved[at + 1], saved[at + 2])
+        core.model_set_rotation(m, core.quat(saved[at + 3], saved[at + 4], saved[at + 5], saved[at + 6]))
+        m.visible = saved[at + 7] > 0.5
+        k = k + 1
+    }
+}
+
+// --- play, held to numbers: the bounded run's report --------------------------------------------------------
+//
+// AE3D_EDITOR_PLAY=<clients> starts Play at the first frame the scene is
+// ready and shows each world in turn, a frame each, so a bounded run draws
+// every one through the viewport. The report then plays on, headless, on
+// the play's own clock at the fixed step: every player walks a circle for
+// two and a half seconds and stands, and is measured against the host;
+// then the keys are given to client 2's view and W held half a second;
+// then Stop, and what it let go is counted.
+
+struct PlayReport {
+    clients: int
+    views: int                         // worlds the viewport drew
+    welcomed: int
+    prediction_um: int                 // the most a reconciliation moved a client's player
+    own_um: int                        // at rest, a client's own player from the host's
+    remote_um: int                     // at rest, the other players a client draws from the host's
+    focus: int                         // 1 when the keys walked only the player in view
+    leaked: int                        // sessions, renderer models and engine objects not given back
+    restored: int                      // 1 when every networked row stood where it did before
+}
+
+play_step_headless(steps: int) {
+    k = 0
+    while k < steps {
+        play_frame(PLAY_STEP)
+        engine.engine_update(g_engine as *Engine, PLAY_STEP)
+        k = k + 1
+    }
+}
+
+play_where(w: *PlayWorld, client: int) -> Vec3 {
+    pl = net.player_of(w.session as *Net, client)
+    if pl == null { return core.vec3(0.0, 0.0 - 1000.0, 0.0) }
+    return behaviour.object_position(pl.controller.object as *GameObject)
+}
+
+report_play() -> *PlayReport {
+    r = heap.new(PlayReport)
+    if g_engine == null { return r }
+    if !g_playing {
+        g_play_clients = 2
+        start_play()
+    }
+    if !g_playing { return r }
+    g_play_cycle = false
+    r.clients = g_play_clients
+    drawn = g_play_drawn as int[]
+    k = 0
+    while k <= g_play_clients {
+        if drawn[k] > 0 { r.views = r.views + 1 }
+        k = k + 1
+    }
+    // Bots walk and stand: four seconds on the play's clock, from where
+    // the frames left it.
+    g_play_bots = true
+    g_play_bots_from = g_play_clock
+    play_step_headless(240)
+    g_play_bots = false
+    host = play_world(0)
+    k = 1
+    while k <= g_play_clients {
+        w = play_world(k)
+        session = w.session as *Net
+        if net.connected(session) { r.welcomed = r.welcomed + 1 }
+        e_um = (net.prediction_error(session) * 1000000.0) as int
+        if e_um > r.prediction_um { r.prediction_um = e_um }
+        me = net.client_id(session)
+        own = (core.v3_len(core.v3_sub(play_where(w, me), play_where(host, me))) * 1000000.0) as int
+        if own > r.own_um { r.own_um = own }
+        other = 0
+        while other <= g_play_clients {
+            if other != me {
+                off = (core.v3_len(core.v3_sub(play_where(w, other), play_where(host, other))) * 1000000.0) as int
+                if off > r.remote_um { r.remote_um = off }
+            }
+            other = other + 1
+        }
+        k = k + 1
+    }
+    // The keys to client 2's view: W held half a second walks its player,
+    // and no other.
+    if g_play_clients >= 2 {
+        before_two = play_where(play_world(2), net.client_id(play_world(2).session as *Net))
+        before_one = play_where(play_world(1), net.client_id(play_world(1).session as *Net))
+        before_host = play_where(host, 0)
+        set_play_view(2)
+        play_key("w", true)
+        play_step_headless(30)
+        play_key("w", false)
+        play_step_headless(30)
+        moved_two = core.v3_len(core.v3_sub(play_where(play_world(2), net.client_id(play_world(2).session as *Net)), before_two))
+        moved_one = core.v3_len(core.v3_sub(play_where(play_world(1), net.client_id(play_world(1).session as *Net)), before_one))
+        moved_host = core.v3_len(core.v3_sub(play_where(host, 0), before_host))
+        if moved_two > 1.0 && moved_one < 0.01 && moved_host < 0.01 { r.focus = 1 }
+    }
+    // Stop, and what it gave back.
+    rows = g_play_rows as int[]
+    count = g_play_row_count
+    rest = calloc(count * 7 + 1, 8)
+    memcpy_floats(rest, g_play_rest, count * 7)
+    indices = calloc(count + 1, 4)
+    k = 0
+    while k < count {
+        (indices as int[])[k] = rows[k]
+        k = k + 1
+    }
+    models = g_play_models
+    objects = g_play_objects
+    stop_play()
+    r.leaked = net.alive() + abs_int(play_model_count() - models) + abs_int(behaviour.scene_count(engine.engine_scene(g_engine as *Engine)) - objects)
+    r.restored = 1
+    back = rest as float[]
+    k = 0
+    while k < count {
+        m = model_at((indices as int[])[k])
+        if m == null || core.abs_of(m.position.x - back[k * 7]) > 0.0001 || core.abs_of(m.position.y - back[k * 7 + 1]) > 0.0001 ||
+           core.abs_of(m.position.z - back[k * 7 + 2]) > 0.0001 { r.restored = 0 }
+        k = k + 1
+    }
+    free(rest)
+    free(indices)
+    return r
+}
+
+memcpy_floats(target: ptr, source: ptr, count: int) {
+    a = target as float[]
+    b = source as float[]
+    k = 0
+    while k < count {
+        a[k] = b[k]
+        k = k + 1
+    }
+}
+
+abs_int(v: int) -> int {
+    if v < 0 { return 0 - v }
+    return v
+}
+
 selected_water() -> *Simulation {
     c = component_at(g_selected)
     if c == null || c.kind != behaviour.KIND_WATER { return null }
@@ -4030,6 +4823,7 @@ settle_layout() {
     refresh_mode_buttons()
     refresh_preset_buttons()
     refresh_script_buttons()
+    refresh_play_buttons()
     g_layout_settled = true
 }
 
@@ -4138,6 +4932,16 @@ draw_frame_body() {
         update_water(delta)
         update_figures(delta)
         run_scripts(delta)
+        // Play: started at the first frame of a bounded run that asks for it
+        // (AE3D_EDITOR_PLAY), and stepped before the host's world, which is
+        // the editor's engine.
+        if g_play_auto > 0 && !g_playing && g_scene_ready {
+            g_play_clients = g_play_auto
+            g_play_cycle = true
+            g_play_auto = 0
+            start_play()
+        }
+        play_frame(delta)
         if g_engine != null { engine.engine_update(g_engine as *Engine, delta) }
     }
     update_outline()
@@ -4163,7 +4967,9 @@ draw_frame_body() {
         return
     }
 
+    play_view_begin()
     core.backend_render(&backend, g_camera as *Camera, g_light as *Light)
+    play_view_end()
 
     blit_started = seconds()
     pixels = core.backend_frame_pixels(&backend)
@@ -4200,7 +5006,9 @@ draw_frame_body() {
 render_viewport() {
     if g_renderer == null { return }
     backend = viewport_backend()
+    play_view_begin()
     core.backend_render(&backend, g_camera as *Camera, g_light as *Light)
+    play_view_end()
     frame_finished(&backend)
 }
 
@@ -4694,6 +5502,10 @@ report_state() {
     // asks for a repaint, and a frame drawn for the report is not a frame the
     // run was asked for.
     frames = g_frames
+    // The play first: it simulates the scene, which the checks below do
+    // too, one at a time, and it has to have stopped and put the scene back
+    // before they begin.
+    played = report_play()
     stuck = rows_that_do_nothing()
     blind = blind_fields()
     refresh_swatch()
@@ -4816,6 +5628,30 @@ report_state() {
     lines = string.concat(lines, string.from_int(unreached_shading()))
     lines = string.concat(lines, "\nidle_actions ")
     lines = string.concat(lines, string.from_int(idle))
+    // Play as a host and its clients (#476): the clients, the worlds the
+    // viewport drew, the clients welcomed, the players against the host
+    // (micrometres: the most a reconciliation moved one, a client's own at
+    // rest, the others it draws at rest), whether the keys walked only the
+    // player in view, and what Stop failed to give back.
+    lines = string.concat(lines, "\nplay_clients ")
+    lines = string.concat(lines, string.from_int(played.clients))
+    lines = string.concat(lines, "\nplay_views ")
+    lines = string.concat(lines, string.from_int(played.views))
+    lines = string.concat(lines, "\nplay_welcomed ")
+    lines = string.concat(lines, string.from_int(played.welcomed))
+    lines = string.concat(lines, "\nplay_prediction_um ")
+    lines = string.concat(lines, string.from_int(played.prediction_um))
+    lines = string.concat(lines, "\nplay_own_um ")
+    lines = string.concat(lines, string.from_int(played.own_um))
+    lines = string.concat(lines, "\nplay_remote_um ")
+    lines = string.concat(lines, string.from_int(played.remote_um))
+    lines = string.concat(lines, "\nplay_focus ")
+    lines = string.concat(lines, string.from_int(played.focus))
+    lines = string.concat(lines, "\nplay_leaked ")
+    lines = string.concat(lines, string.from_int(played.leaked))
+    lines = string.concat(lines, "\nplay_restored ")
+    lines = string.concat(lines, string.from_int(played.restored))
+    heap.free(played)
     lines = string.concat(lines, "\nframes ")
     lines = string.concat(lines, string.from_int(frames))
     lines = string.concat(lines, "\n")
@@ -7679,6 +8515,11 @@ main() {
 
     g_snapshot = env("AE3D_EDITOR_SNAPSHOT")
     g_report = env("AE3D_EDITOR_REPORT")
+    // A bounded run that plays: this many clients, from the first frame.
+    g_play_auto = core.env_int("AE3D_EDITOR_PLAY", 0)
+    if g_play_auto > PLAY_CLIENTS_MAX { g_play_auto = PLAY_CLIENTS_MAX }
+    if g_play_auto < 0 { g_play_auto = 0 }
+    g_play_drawn = null
     g_scene_path = DEFAULT_SCENE_PATH
     if env("AE3D_SCENE") != "" { g_scene_path = env("AE3D_SCENE") }
     if os.args_count() >= 2 { g_scene_path = os.args_get(1) }
@@ -7910,6 +8751,70 @@ main() {
         // The scene's bodies run, and stopped, put back: the same button.
         g_simulate_btn = ui.btn(panel_row(edit_body), "Simulate") callback { toggle_simulation() }
         style_button(g_simulate_btn, "action")
+
+        // Play the scene as a host and its clients: how many, the link
+        // between them, and the button. Each world is shown from the bar
+        // over the viewport.
+        ui.divider(left)
+        play_body = fold_section(left, "PLAY")
+        g_play_count_buttons = calloc(PLAY_CLIENTS_MAX, 4)
+        counts = g_play_count_buttons as int[]
+        clients_row = as_row(ui.hstack(play_body, 6))
+        clients_caption = ui.text(clients_row, "clients")
+        ui.add_css_class(clients_caption, "label")
+        ui.width(clients_caption, LABEL_COLUMN)
+        one_btn = ui.btn(clients_row, "1") callback { set_play_clients(1) }
+        style_button(one_btn, "action")
+        counts[0] = one_btn
+        two_btn = ui.btn(clients_row, "2") callback { set_play_clients(2) }
+        style_button(two_btn, "action")
+        counts[1] = two_btn
+        three_btn = ui.btn(clients_row, "3") callback { set_play_clients(3) }
+        style_button(three_btn, "action")
+        counts[2] = three_btn
+        four_btn = ui.btn(clients_row, "4") callback { set_play_clients(4) }
+        style_button(four_btn, "action")
+        counts[3] = four_btn
+        g_play_readouts = calloc(3, 4)
+        readouts = g_play_readouts as int[]
+        latency_row = as_row(ui.hstack(play_body, 8))
+        latency_caption = ui.text(latency_row, "latency")
+        ui.add_css_class(latency_caption, "label")
+        ui.width(latency_caption, LABEL_COLUMN)
+        latency_slider = ui.slider(latency_row, 0.0, 300.0, g_play_latency * 1000.0) callback |value: float| {
+            set_play_conditions(value / 1000.0, g_play_jitter, g_play_loss)
+        }
+        ui.height(latency_slider, 16)
+        ui.fill_width(latency_slider)
+        readouts[0] = ui.text(latency_row, "${(g_play_latency * 1000.0) as int} ms")
+        ui.add_css_class(readouts[0], "value")
+        ui.width(readouts[0], READOUT_W)
+        jitter_row = as_row(ui.hstack(play_body, 8))
+        jitter_caption = ui.text(jitter_row, "jitter")
+        ui.add_css_class(jitter_caption, "label")
+        ui.width(jitter_caption, LABEL_COLUMN)
+        jitter_slider = ui.slider(jitter_row, 0.0, 100.0, g_play_jitter * 1000.0) callback |value: float| {
+            set_play_conditions(g_play_latency, value / 1000.0, g_play_loss)
+        }
+        ui.height(jitter_slider, 16)
+        ui.fill_width(jitter_slider)
+        readouts[1] = ui.text(jitter_row, "${(g_play_jitter * 1000.0) as int} ms")
+        ui.add_css_class(readouts[1], "value")
+        ui.width(readouts[1], READOUT_W)
+        loss_row = as_row(ui.hstack(play_body, 8))
+        loss_caption = ui.text(loss_row, "loss")
+        ui.add_css_class(loss_caption, "label")
+        ui.width(loss_caption, LABEL_COLUMN)
+        loss_slider = ui.slider(loss_row, 0.0, 30.0, g_play_loss * 100.0) callback |value: float| {
+            set_play_conditions(g_play_latency, g_play_jitter, value / 100.0)
+        }
+        ui.height(loss_slider, 16)
+        ui.fill_width(loss_slider)
+        readouts[2] = ui.text(loss_row, "${(g_play_loss * 100.0) as int}%")
+        ui.add_css_class(readouts[2], "value")
+        ui.width(readouts[2], READOUT_W)
+        g_play_btn = ui.btn(panel_row(play_body), "Play") callback { toggle_play() }
+        style_button(g_play_btn, "primary")
         ui.spacer(left)
 
         // The rest of the window: the viewport, and the inspector beside it.
@@ -7932,6 +8837,20 @@ main() {
         style_mode_button(g_mode_rotate)
         g_mode_scale = ui.btn(viewport_bar, "Scale") callback { set_gizmo_mode(GIZMO_SCALE) }
         style_mode_button(g_mode_scale)
+        // While playing: the world shown, the host's or a client's.
+        g_play_view_buttons = calloc(PLAY_CLIENTS_MAX + 1, 4)
+        views = g_play_view_buttons as int[]
+        views[0] = ui.btn(viewport_bar, "Host") callback { set_play_view(0) }
+        views[1] = ui.btn(viewport_bar, "Client 1") callback { set_play_view(1) }
+        views[2] = ui.btn(viewport_bar, "Client 2") callback { set_play_view(2) }
+        views[3] = ui.btn(viewport_bar, "Client 3") callback { set_play_view(3) }
+        views[4] = ui.btn(viewport_bar, "Client 4") callback { set_play_view(4) }
+        view_at = 0
+        while view_at <= PLAY_CLIENTS_MAX {
+            style_mode_button(views[view_at])
+            ui.set_hidden(views[view_at], 1)
+            view_at = view_at + 1
+        }
         ui.spacer(viewport_bar)
         g_mode_hint = ui.text(viewport_bar, "W move   E rotate   R scale   F frame")
         ui.add_css_class(g_mode_hint, "stats")
@@ -8051,6 +8970,11 @@ main() {
         }
         // W, E and R are what every engine editor binds these to.
         ui.canvas_on_key(g_canvas) callback |key: string| {
+            // Playing, the keys are the player's in view.
+            if g_playing {
+                play_key(key, true)
+                return
+            }
             if string.equals(key, "w") == 1 { set_gizmo_mode(GIZMO_TRANSLATE) }
             if string.equals(key, "e") == 1 { set_gizmo_mode(GIZMO_ROTATE) }
             if string.equals(key, "r") == 1 { set_gizmo_mode(GIZMO_SCALE) }
@@ -8060,6 +8984,10 @@ main() {
             if string.equals(key, "z") == 1 { undo_step() }
             if string.equals(key, "Z") == 1 { redo_step() }
             if string.equals(key, "d") == 1 { duplicate_selected() }
+        }
+        // A walk is a key held: let go, it stops.
+        ui.canvas_on_key_release(g_canvas) callback |key: string| {
+            if g_playing { play_key(key, false) }
         }
         ui.canvas_on_scroll(g_canvas) callback |dx: float, dy: float| {
             if dy > 0.0 {

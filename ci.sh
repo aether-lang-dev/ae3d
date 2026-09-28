@@ -719,6 +719,13 @@ fi
 # The editor runs on either renderer, so both are checked: the Vulkan option
 # used to report Vulkan and build an OpenGL renderer, which no OpenGL-only run
 # could have caught.
+# A number off the editor's report, or one no bound passes when the line is
+# missing: a report without its play lines fails rather than reads as zero.
+play_number() {   # play_number <key>
+    play_value="$(sed -n "s/^$1 //p" "$report")"
+    echo "${play_value:-999999999}"
+}
+
 check_editor_run() {
     editor_backend="$1"
     editor_scene="${2:-components}"
@@ -735,9 +742,13 @@ check_editor_run() {
     # backend per scene and took the keyboard with it, which makes it unusable
     # beside anything else. The window still exists and still answers the test
     # server; it is only never ordered to the front.
+    # Every run plays too (#476): a host and two clients from the first
+    # frame, each world drawn in turn, then measured and stopped before the
+    # rest of the report is taken.
     AETHER_UI_HEADLESS=1 \
     AE3D_EDITOR_BACKEND="$editor_backend" \
     AE3D_EDITOR_FRAMES=30 \
+    AE3D_EDITOR_PLAY=2 \
     AE3D_EDITOR_SCENE="$editor_scene" \
     AE3D_EDITOR_SNAPSHOT="$snapshot" \
     AE3D_EDITOR_REPORT="$report" \
@@ -912,6 +923,31 @@ check_editor_run() {
         sed 's/^/        /' "$report"
     elif grep -q '^selected none$' "$report"; then
         fail "$name (nothing selected)"
+        sed 's/^/        /' "$report"
+    elif [ "$(play_number play_views)" != "3" ] || [ "$(play_number play_welcomed)" != "2" ]; then
+        # Play as a host and two clients: each of the three worlds drawn
+        # through the viewport in the bounded run's frames, and both clients
+        # welcomed over the loopback's 60 ms and 2% loss.
+        fail "$name (play: $(play_number play_views) of 3 worlds drawn, $(play_number play_welcomed) of 2 clients welcomed)"
+        sed 's/^/        /' "$report"
+    elif [ "$(play_number play_prediction_um)" -gt 10000 ] || \
+         [ "$(play_number play_own_um)" -gt 1000 ] || \
+         [ "$(play_number play_remote_um)" -gt 10000 ]; then
+        # Every player walked and stood: what a client predicted is what the
+        # host did, within a centimetre, as tests/test_players.ae holds it;
+        # at rest its own player within a millimetre of the host's, and the
+        # others it draws within a centimetre.
+        fail "$name (play: players off the host's -- reconciled $(play_number play_prediction_um) um, own $(play_number play_own_um) um, others $(play_number play_remote_um) um)"
+        sed 's/^/        /' "$report"
+    elif [ "$(play_number play_focus)" != "1" ]; then
+        # W held in client 2's view walks client 2's player, and no other.
+        fail "$name (play: the keys did not walk the player in view, and only it)"
+        sed 's/^/        /' "$report"
+    elif [ "$(play_number play_leaked)" != "0" ] || [ "$(play_number play_restored)" != "1" ]; then
+        # Stop lets every session, world, player and floor go -- the
+        # renderer's models and the editor's engine's objects back to what
+        # they were -- and puts every networked row where it stood.
+        fail "$name (play: Stop left $(play_number play_leaked) behind, or the scene not put back)"
         sed 's/^/        /' "$report"
     else
         pass "$name"
