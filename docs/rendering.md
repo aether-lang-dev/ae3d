@@ -125,6 +125,12 @@ The feature list in full, with the reasoning behind each. The [README](../README
   voxel palette, an island's albedo baked from its own height and slope: made
   by the engine from its own noise, registered under a name any texture path
   can use, nothing downloaded and nothing written to disk that need not be.
+- **A camera that keeps out of the scene, and frames what it is shown.** The
+  camera the engine flies is a sphere the static geometry keeps out: swept
+  and slid, never inside a wall or under the ground, at 200 m/s as at a
+  walk. One call places a camera where a model or a group fills a share of
+  the frame from a chosen angle, its near and far planes fitted to it,
+  whatever its size ([The camera](#the-camera)).
 - **Also:** Perlin terrain, an OBJ/MTL loader, ray casting, keyframe animation
   in glTF's shape (step, linear, cubic), scenes that save and load with
   everything attached to them, a scene editor, and `AE3D_API=vulkan` to run
@@ -442,6 +448,82 @@ faces up goes darker (its pores filled), smoother, and a mirror at a
 grazing angle, so the lamps smear down a wet road; walls, which water
 runs off, hardly change. The weather sets it with the rain and the storm
 and takes it back with the clear.
+
+### The camera
+
+**It keeps out of the scene** (#470). The camera the engine flies by the
+input (`engine_set_camera_input`, on by default) is a sphere around the eye,
+0.2 m unless the near plane's corners reach further (they widen it), that
+the scene's static geometry keeps out. A move is swept and slid the way the
+character controller walks -- Box3D's mover in aephysics: the sphere cast
+along what is left of the move, the planes it then touches gathered and
+solved out of, the rest of the move clipped against them, five times -- so
+the eye slides along a wall at the speed its move has along the wall,
+stops in a corner a radius from both faces, and does not pass through a
+0.5 m wall at 200 m/s, three metres a frame. It never goes under the
+ground: a move is held to a radius over the lowest surface of the static
+world as it is swept, so past the ground's edge the eye cannot drop below
+the street and look up at it. `engine_set_camera_collision(e, false)`
+turns it off; the editor flies its own camera, which passes through
+everything, over `engine_over`, which starts with it off.
+
+What it collides with is `ae3d.viewpoint`'s. With physics attached
+(`physics.attach` lends its world), the physics world's static bodies --
+what the scene says stands still; not a crate, a car or a figure. Without,
+a world of its own made from the scene's static models: every model the
+renderer draws that nothing moves -- not skinned, not a crowd or its
+picture, not a particle, not driven by a clip or hung off something that
+is, and not instanced unless `core.model_set_solid(m, true)` says its
+instances stand still (a city's buildings drawn a part at a time) -- as
+its own triangles, both sides of each (a pane an export wound the wrong
+way round let the eye into the hollow building behind it), at its own
+transform or each instance's. The scene is read once a frame the camera
+moves, a couple of milliseconds the first time for a street of 1,500
+models and then only what moved; a model's collision mesh is built the
+first time the eye comes near it (`engine_camera_prepare` builds a large
+one as the scene loads instead), and its body is let go when the eye has
+been away for a while, so a city streamed around the camera never fills
+the world. A move through the street costs 0.15 ms on average.
+
+A camera a script places each frame -- `street_drive`'s chase camera --
+asks `engine_camera_boom(e, pivot, wanted)`: the sphere cast from over
+what it follows toward where it wants to be, so a wall that comes between
+them brings the camera in front of the wall rather than through it.
+
+`tests/test_camera_collision` flies the camera by injected keys into a
+road, a wall and a corner at 60 and 200 m/s, and holds it, every frame,
+to at least its radius from every box measured from the boxes themselves
+(0.205 m, the radius and the solver's slop); at 45 degrees into the wall it
+slides at 14.14 m/s of the 14.14 its move has along it; with physics it
+keeps out of the static body and passes the kinematic crate; a pane
+facing away stops it; an instanced model stops it only when marked solid;
+a sweep costs 2.4 us. `AE3D_CAMERA_WANDER=n` flies the camera at random
+through any scene for n frames by the same injected keys and measures every
+move against the drawn triangles themselves, closest point by closest
+point, with a ray's crossings for whether it is inside anything: thousands
+of frames through `zombie_street` and `zombie_city`, up to 20 m/s, come
+no nearer anything than 0.205 m, never inside, never under the ground.
+
+**It frames what it is shown** (#471). `engine_frame(e, models, share,
+yaw, pitch)` puts the camera where the models -- every vertex where it is
+drawn: through its transform, its skin's pose, each instance, a crowd's
+figures at their phases -- fill `share` of the frame's height seen along
+yaw and pitch, centred, further back where they would be wider than the
+frame, never inside the sphere about them, with the near plane at half the
+nearest point's depth and the far at four times the furthest's.
+`engine_frame_bounds` frames a box, and `engine_frame_points` points a
+program gathered (`viewpoint.points_add_*`), eased over a time so a
+framing that follows something moving does not cut. `gltf_viewer` frames
+whatever file it is given over its whole clip; `gltf_crowd` frames its
+horde from a raised three-quarter view and follows it. `tests/test_framing`
+frames every glTF file in the repository -- the box man, the fox a hundred
+units long, the arm as `.glb` and `.gltf` -- and the box man a hundred
+times over and a hundredth: each spans 55% of the frame's height by its
+projected vertices, the camera outside every model's bounds, nothing
+behind the near plane; drawn through OpenGL and Vulkan off the screen, each
+lands on the rows the numbers give, within a pixel; a crowd of foxes at
+their own poses the same; a walking group followed stays 55-62% of the
+height and never moves the camera further in a frame than it moved.
 
 ### The scene's depth
 

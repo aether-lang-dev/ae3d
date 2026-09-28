@@ -148,7 +148,8 @@ to read them.
 | `AE3D_RENDER_SCALE=50` | draw the scene at half the window's size, the composite scaling it up |
 | `AE3D_TIME=HHMM` | the time of day, where a scene takes one |
 | `AE3D_WEATHER=rain\|snow\|dust\|storm` | the weather over a scene that takes one; `AE3D_WEATHER_LEVEL` its strength |
-| `AE3D_CROWD=n` | the crowd's count in the crowd examples; `AE3D_HUNT=1` sends the horde after the camera |
+| `AE3D_CROWD=n` | the crowd's count in the crowd examples; `zombie_city`'s horde hunts the camera, `AE3D_HUNT=0` lets it wander |
+| `AE3D_CAMERA_WANDER=n` | fly the camera at random for `n` frames by injected keys and say the nearest it came to anything drawn ([rendering.md](rendering.md#the-camera)); `AE3D_CAMERA_WANDER_SPEED`, `_RANGE`, `_SEED` |
 | `AE3D_PHYSICS_SCENE=pyramid\|pile\|ragdolls\|cloth` | the reference scene `examples/physics` runs |
 | `AE3D_VIEW=3`, `AE3D_CAMX/Y/Z`, `AE3D_AIMX/Y/Z` | a camera placed by number, for sweeps ([testing.md](testing.md)) |
 | `AE3D_DIAG=1` | a scene's own diagnostics on the console |

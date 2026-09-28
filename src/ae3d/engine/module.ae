@@ -21,6 +21,7 @@ import ae3d.scene
 import ae3d.loader
 import ae3d.exposure
 import ae3d.hud
+import ae3d.viewpoint
 import std.os
 import std.fs
 
@@ -40,6 +41,9 @@ exports (
     engine_set_size, engine_set_title, engine_set_msaa, engine_set_decorated, engine_set_post,
     engine_set_render_scale, engine_set_shadows, engine_shadows, engine_set_fog, engine_fog, engine_set_shadow_distance, engine_shadow_distance,
     engine_set_vsync, engine_set_camera_input, engine_set_fixed_step,
+    engine_set_camera_collision, engine_camera_collision, engine_set_camera_radius, engine_camera_radius,
+    engine_camera_move, engine_camera_boom, engine_camera_prepare, engine_viewpoint,
+    engine_frame, engine_frame_bounds, engine_frame_points,
     engine_set_skybox, engine_set_sky, engine_sky_path, engine_set_clear_color, engine_draw_calls, engine_set_clouds, engine_clouds, engine_cloud_wind, engine_set_sky_overcast, engine_sky_overcast, engine_sky_overcast_color, engine_set_ssao, engine_set_capture_channel, engine_set_wetness, engine_set_taa, engine_taa, engine_set_dlss, engine_dlss, engine_ray_query, engine_set_ray_shadows, engine_ray_shadows, engine_set_sun_size, engine_sun_size, engine_set_ray_occlusion, engine_ray_occlusion, engine_set_lamp_size, engine_set_ray_budget, engine_ray_figures, engine_ray_reach, engine_set_eye_adaptation, engine_eye_adaptation, engine_frame_exposure, engine_set_ssr, engine_load_texture,
     engine_set_time_of_day, engine_time_of_day,
     engine_delta_time, engine_frame_count, engine_fps, engine_set_frame_limit,
@@ -152,6 +156,19 @@ struct Engine {
     visible: bool
     vsync: int
     camera_input: bool
+    // The camera's collision (ae3d.viewpoint): a sphere around the eye the
+    // scene's static geometry keeps out, on by default for the camera the
+    // engine flies; the radius asked for (the near plane's corners widen
+    // it where they reach further); and the frame the scene was last
+    // scanned for it, so a frame scans once however many ask.
+    viewpoint: ptr
+    camera_collision: bool
+    camera_radius: float
+    viewpoint_scanned: int
+    // AE3D_CAMERA_WANDER=n: the camera flown at random through the scene
+    // for n frames by injected input, measured after every move (see
+    // wander_camera).
+    wander: ptr
     shadows: bool
     shadow_distance: float
     fog: Fog
@@ -352,6 +369,8 @@ default_input() -> *Input {
 // The camera flown by the actions: the heading added up from the axes
 // and scaled once, so the diagonal is no faster than an axis; the look
 // from the mouse while its button is held, and from the right stick.
+// With the camera's collision on (the default), the move is swept
+// through the scene and slid along what it meets (engine_camera_move).
 fly_camera(e: *Engine, cam: *Camera, delta: float) {
     i = e.input as *Input
     velocity = cam.speed * delta
@@ -360,7 +379,14 @@ fly_camera(e: *Engine, cam: *Camera, delta: float) {
     heading = core.v3_add(heading, core.v3_mul(cam.front, input.axis(i, "forward")))
     heading = core.v3_add(heading, core.v3_mul(cam.right, input.axis(i, "strafe")))
     heading = core.v3_add(heading, core.v3_mul(cam.world_up, input.axis(i, "rise")))
-    core.camera_move(cam, heading, velocity)
+    // The scene read for the collision on the first frame, with the scene
+    // just built and the frame a slow one anyway, rather than on the first
+    // frame the camera moves: a street of fifteen hundred models is a
+    // couple of milliseconds to read.
+    if e.camera_collision && e.viewpoint_scanned < 0 { sync_viewpoint(e) }
+    if core.v3_len(heading) >= 0.0001 {
+        cam.position = engine_camera_move(e, cam.position, core.v3_mul(core.v3_normalize(heading), velocity))
+    }
 
     if input.held(i, "look") {
         process_mouse_look(e, cam)
@@ -409,6 +435,7 @@ script(o: *GameObject, name: string, state: ptr,
 destroy(e: *Engine, o: *GameObject) {
     if o == null { return }
     if o.model != null {
+        viewpoint.forget(e.viewpoint as *Viewpoint, o.model as *Model)
         if e.running {
             e.backend_remove_model(e.backend_state, o.model as *Model)
         } else {
@@ -549,6 +576,10 @@ engine_new_with(api: int) -> *Engine {
     e.visible = true
     e.vsync = 1
     e.camera_input = true
+    e.camera_collision = true
+    e.camera_radius = CAMERA_RADIUS
+    e.viewpoint = viewpoint.viewpoint_new(CAMERA_RADIUS) as ptr
+    e.viewpoint_scanned = 0 - 1
     e.shadows = true
     e.fog = core.fog_none()
     e.ssao_on = false
@@ -602,6 +633,13 @@ engine_over(renderer: ptr, api: int, camera: *Camera, light: *Light) -> *Engine 
     e.input = default_input() as ptr
     e.api = api
     e.borrowed = true
+    // The camera is the owner's and flown by the owner (the editor's
+    // passes through the scene), but what attaches to the engine -- the
+    // physics -- still finds the viewpoint to lend its world to.
+    e.camera_collision = false
+    e.camera_radius = CAMERA_RADIUS
+    e.viewpoint = viewpoint.viewpoint_new(CAMERA_RADIUS) as ptr
+    e.viewpoint_scanned = 0 - 1
     e.width = 1024
     e.height = 768
     e.fog = core.fog_none()
@@ -852,6 +890,12 @@ engine_free(e: *Engine) {
     if e.input != null {
         input.input_free(e.input as *Input)
         e.input = null
+    }
+    // After the systems' own release (the physics hands its world back
+    // first), so nothing it lent is still being asked.
+    if e.viewpoint != null {
+        viewpoint.viewpoint_free(e.viewpoint as *Viewpoint)
+        e.viewpoint = null
     }
     // Out of the renderer before it goes: the Vulkan one's is the process's.
     if e.overlay != null {
@@ -1366,6 +1410,279 @@ engine_set_decorated(e: *Engine, decorated: bool) { e.decorated = decorated }
 engine_set_vsync(e: *Engine, interval: int) { e.vsync = interval }
 engine_set_camera_input(e: *Engine, enabled: bool) { e.camera_input = enabled }
 
+// --- the camera, wandering --------------------------------------------------------------------------------
+
+// AE3D_CAMERA_WANDER=n flies the camera at random through the scene for n
+// frames, the way a player who does not know the street would: a new
+// heading every half second to second and a half, mostly level or down
+// toward the road, a sprint a third of the time, turned back toward where
+// it began once it is more than AE3D_CAMERA_WANDER_RANGE metres off (60 by
+// default), at AE3D_CAMERA_WANDER_SPEED metres a second (6). The keys are
+// injected, so the move is the fly camera's own. After every move the eye
+// is measured against the scene's drawn triangles (viewpoint.nearest_surface
+// and inside_count), and the run ends by saying the nearest it came to any
+// and how many frames it ended inside a solid or under the ground.
+struct Wander {
+    frames: int
+    left: int
+    seed: int
+    turn_in: float
+    start: Vec3
+    range: float
+    nearest: float
+    nearest_at: Vec3
+    nearest_to: string
+    inside: int
+    inside_at: Vec3
+    under: int
+    travelled: float
+    last: Vec3
+    radius: float
+    // What the moves cost: the fly camera's time, scan and sweep, summed
+    // over the frames it moved in, and the most one frame took.
+    began: float
+    seconds: float
+    worst: float
+    moved: int
+}
+
+wander_from_env(e: *Engine) {
+    frames = core.env_int("AE3D_CAMERA_WANDER", 0)
+    if frames <= 0 || e.wander != null { return }
+    w = heap.new(Wander)
+    w.frames = frames
+    w.left = frames
+    w.seed = core.env_int("AE3D_CAMERA_WANDER_SEED", 0x5bd1e995)
+    w.range = core.env_int("AE3D_CAMERA_WANDER_RANGE", 60) as float
+    w.nearest = 1000000.0
+    w.start = core.vec3(0.0, 0.0 - 1000000.0, 0.0)
+    e.wander = w as ptr
+}
+
+wander_random(w: *Wander) -> float {
+    w.seed = (w.seed * 1103515245 + 12345) & 0x7FFFFFFF
+    return (w.seed as float) / 2147483647.0
+}
+
+wander_steer(e: *Engine, cam: *Camera, delta: float) {
+    w = e.wander as *Wander
+    keys = e.input as *Input
+    if w.left <= 0 {
+        if w.left == 0 {
+            input.inject_clear(keys)
+            w.left = 0 - 1
+        }
+        return
+    }
+    if w.start.y < 0.0 - 999999.0 {
+        w.start = cam.position
+        w.last = cam.position
+        core.camera_set_speed(cam, core.env_int("AE3D_CAMERA_WANDER_SPEED", 6) as float)
+    }
+    w.turn_in = w.turn_in - delta
+    if w.turn_in <= 0.0 {
+        w.turn_in = 0.5 + wander_random(w)
+        yaw = wander_random(w) * 360.0
+        pitch = 0.0 - 70.0 + wander_random(w) * 95.0
+        away = core.v3_sub(cam.position, w.start)
+        if core.v3_len(away) > w.range {
+            // Back toward where it began.
+            yaw = core.rad_to_deg(core.atan2_of(0.0 - away.z, 0.0 - away.x))
+            pitch = 0.0 - 10.0
+        }
+        cam.yaw = yaw
+        cam.pitch = pitch
+        core.camera_update_vectors(cam)
+        input.inject_clear(keys)
+        input.inject_key(keys, platform.KEY_W, true)
+        if wander_random(w) < 0.33 { input.inject_key(keys, platform.KEY_LEFT_SHIFT, true) }
+    }
+    w.left = w.left - 1
+    w.began = platform.time()
+}
+
+wander_measure(e: *Engine, cam: *Camera) {
+    w = e.wander as *Wander
+    if w.left < 0 { return }
+    took = platform.time() - w.began
+    w.seconds = w.seconds + took
+    // The first frame reads the scene for the collision (fly_camera): not a move.
+    if w.moved > 0 && took > w.worst { w.worst = took }
+    w.moved = w.moved + 1
+    v = e.viewpoint as *Viewpoint
+    w.radius = viewpoint.viewpoint_radius(v)
+    w.travelled = w.travelled + core.v3_distance(cam.position, w.last)
+    w.last = cam.position
+    if !e.camera_collision || viewpoint.lends_world(v) { return }
+    gap = viewpoint.nearest_surface(v, cam.position, 2.0)
+    if gap < w.nearest {
+        w.nearest = gap
+        w.nearest_at = cam.position
+        near = viewpoint.nearest_model(v)
+        w.nearest_to = "nothing"
+        if near != null { w.nearest_to = core.text(near.name) }
+    }
+    if viewpoint.inside_count(v, cam.position) > 0 {
+        if w.inside == 0 { w.inside_at = cam.position }
+        w.inside = w.inside + 1
+    }
+    if viewpoint.has_lowest(v) && cam.position.y < viewpoint.lowest(v) + w.radius - 0.001 { w.under = w.under + 1 }
+}
+
+wander_report(e: *Engine) {
+    if e.wander == null { return }
+    w = e.wander as *Wander
+    v = e.viewpoint as *Viewpoint
+    moved = w.frames - w.left
+    if w.left < 0 { moved = w.frames }
+    mean = 0.0
+    if w.moved > 0 { mean = w.seconds * 1000.0 / (w.moved as float) }
+    println("ae3d: the camera wandered ${moved} frames, ${w.travelled} m: the nearest it came to a drawn surface ${w.nearest} m (radius ${w.radius}), to ${w.nearest_to} at (${w.nearest_at.x}, ${w.nearest_at.y}, ${w.nearest_at.z}); ${w.inside} frames inside a solid, ${w.under} under the ground; ${viewpoint.solid_count(v)} solids, ${viewpoint.mesh_count(v)} collision meshes of ${viewpoint.collision_triangles(v)} triangles made, ${viewpoint.body_count(v)} bodies held; a move ${mean} ms on average, ${w.worst * 1000.0} ms at most")
+    if w.inside > 0 { println("ae3d: the camera was first inside a solid at (${w.inside_at.x}, ${w.inside_at.y}, ${w.inside_at.z})") }
+    heap.free(w)
+    e.wander = null
+}
+
+// --- the camera's collision and framing -----------------------------------------------------------------
+
+// The eye's clearance from every surface, in metres, unless the near
+// plane's corners reach further (see eye_radius).
+const CAMERA_RADIUS = 0.2
+
+// Whether the camera the engine flies keeps out of the scene: on by
+// default. Off, it flies through everything, as an editor's may.
+engine_set_camera_collision(e: *Engine, on: bool) { e.camera_collision = on }
+engine_camera_collision(e: *Engine) -> bool { return e.camera_collision }
+
+// How far from every surface the eye stays, in metres. The near plane's
+// corners are further from the eye than its centre, so the sphere is never
+// smaller than the distance to them: a wall never cuts the near plane.
+engine_set_camera_radius(e: *Engine, metres: float) {
+    if metres < 0.0 { return }
+    e.camera_radius = metres
+}
+
+engine_camera_radius(e: *Engine) -> float {
+    return eye_radius(e, e.camera as *Camera)
+}
+
+eye_radius(e: *Engine, cam: *Camera) -> float {
+    wanted = e.camera_radius
+    if cam == null { return wanted }
+    t = core.tan_of(core.deg_to_rad(cam.fov) * 0.5)
+    corner = cam.near * core.sqrt_of(1.0 + t * t * (1.0 + cam.aspect * cam.aspect)) * 1.05
+    if corner > wanted { return corner }
+    return wanted
+}
+
+// The engine's viewpoint (ae3d.viewpoint): the world the camera collides
+// with, for the physics to lend its own to and a test to ask.
+engine_viewpoint(e: *Engine) -> *Viewpoint { return e.viewpoint as *Viewpoint }
+
+// The scene as the camera's collision sees it, read once a frame: what
+// the clips drive, and every model the renderer draws.
+sync_viewpoint(e: *Engine) {
+    v = e.viewpoint as *Viewpoint
+    if v == null || e.viewpoint_scanned == e.frame_count { return }
+    e.viewpoint_scanned = e.frame_count
+    viewpoint.viewpoint_set_radius(v, eye_radius(e, e.camera as *Camera))
+    viewpoint.scan_begin(v)
+    if viewpoint.lends_world(v) { return }
+    registry = e.animations as *Registry
+    if registry != null {
+        bound = anim.registry_count(registry)
+        k = 0
+        while k < bound {
+            viewpoint.scan_mark_animated(v, anim.binding_model(anim.registry_binding(registry, k)))
+            k = k + 1
+        }
+    }
+    if e.api == platform.API_VULKAN && e.backend_state != null {
+        vkr = e.backend_state as *VKRenderer
+        count = vulkan.renderer_model_count(vkr)
+        i = 0
+        while i < count {
+            viewpoint.scan_model(v, vulkan.renderer_model(vkr, i))
+            i = i + 1
+        }
+    } else if e.gl_renderer != null {
+        renderer = e.gl_renderer as *GLRenderer
+        count = gl.renderer_model_count(renderer)
+        i = 0
+        while i < count {
+            viewpoint.scan_model(v, gl.renderer_model(renderer, i))
+            i = i + 1
+        }
+    }
+    viewpoint.scan_end(v)
+}
+
+// The eye moved from `at` by `move` as far as the scene lets it, sliding
+// along what it meets and never under the ground: where the fly camera
+// goes. With the collision off, simply `at` plus `move`.
+engine_camera_move(e: *Engine, at: Vec3, move: Vec3) -> Vec3 {
+    if !e.camera_collision { return core.v3_add(at, move) }
+    sync_viewpoint(e)
+    return viewpoint.sweep(e.viewpoint as *Viewpoint, at, move)
+}
+
+// A chase camera's eye: from `pivot`, over what it follows, toward
+// `wanted`, as far as the scene lets it -- in front of a wall that comes
+// between them, never inside it or under the ground. A camera a script
+// places each frame asks this rather than standing where it wanted.
+engine_camera_boom(e: *Engine, pivot: Vec3, wanted: Vec3) -> Vec3 {
+    if !e.camera_collision { return wanted }
+    sync_viewpoint(e)
+    return viewpoint.boom(e.viewpoint as *Viewpoint, pivot, wanted)
+}
+
+// A large solid's collision made now, as the scene loads, rather than in
+// the frame the camera first comes near it (ae3d.viewpoint prepare): a
+// merged city block of ten thousand triangles is milliseconds to build.
+engine_camera_prepare(e: *Engine, m: *Model) {
+    viewpoint.prepare(e.viewpoint as *Viewpoint, m)
+}
+
+// The camera placed so the models fill `share` of the frame's height (0.55
+// when not between 0 and 1), looked at along `yaw` and `pitch` in the
+// camera's degrees (yaw -90 looks down -z, a pitch under zero looks
+// down), its near and far planes fitted to them -- whatever their size
+// and wherever they stand. Every vertex is where it is drawn: through
+// its transform, its skin's pose, its instances. False when there is
+// nothing to frame. `models` is a list of *Model.
+engine_frame(e: *Engine, models: ptr, share: float, yaw: float, pitch: float) -> bool {
+    if e.camera == null || models == null { return false }
+    pts = viewpoint.points_new()
+    i = 0
+    while i < list.size(models) {
+        viewpoint.points_add_model(pts, list.get_raw(models, i) as *Model)
+        i = i + 1
+    }
+    framed = viewpoint.frame(e.camera as *Camera, pts, share, yaw, pitch)
+    viewpoint.points_free(pts)
+    return framed.ok
+}
+
+// The same, for a box in the world: a group, a crowd, a region.
+engine_frame_bounds(e: *Engine, lo: Vec3, hi: Vec3, share: float, yaw: float, pitch: float) -> bool {
+    if e.camera == null { return false }
+    pts = viewpoint.points_new()
+    viewpoint.points_add_box(pts, lo, hi)
+    framed = viewpoint.frame(e.camera as *Camera, pts, share, yaw, pitch)
+    viewpoint.points_free(pts)
+    return framed.ok
+}
+
+// The same for points a program gathered (viewpoint.points_add_*), eased
+// over `seconds` -- the time the camera takes to close most of the gap --
+// so a framing that follows something moving does not cut; zero seconds
+// frames at once.
+engine_frame_points(e: *Engine, pts: *Points, share: float, yaw: float, pitch: float, seconds: float) -> bool {
+    if e.camera == null || pts == null { return false }
+    if seconds <= 0.0 { return viewpoint.frame(e.camera as *Camera, pts, share, yaw, pitch).ok }
+    return viewpoint.frame_eased(e.camera as *Camera, pts, share, yaw, pitch, e.delta_time, seconds).ok
+}
+
 // Called as many times a frame as the fixed step fits into it, with the step
 // rather than the frame's own delta, which is what a behaviour scene's
 // fixed_update wants.
@@ -1442,6 +1759,8 @@ engine_add_model(e: *Engine, m: *Model) {
 
 engine_remove_model(e: *Engine, m: *Model) {
     if m == null { return }
+    // Out of the camera's world with it: its owner may free it next.
+    viewpoint.forget(e.viewpoint as *Viewpoint, m)
     if e.running {
         e.backend_remove_model(e.backend_state, m)
         return
@@ -1814,6 +2133,8 @@ engine_start(e: *Engine, x: int, y: int) -> bool {
             engine_set_taa(e, true)
         }
     }
+    // AE3D_CAMERA_WANDER=n: the camera wanders the scene by the input.
+    wander_from_env(e)
     // AE3D_CAPTURE=n draws the frame as a capture channel (1 albedo, 2
     // normals, 3 motion), so a snapshot can be read as numbers.
     channel = core.env_int("AE3D_CAPTURE", 0)
@@ -2097,6 +2418,7 @@ engine_shutdown(e: *Engine) {
     // Between runs there is no running engine for a script to find.
     if g_running == e as ptr { g_running = null }
     say_perf(e)
+    wander_report(e)
     if e.agent_on {
         agent.capture_release()
         agent.stop()
@@ -2163,7 +2485,11 @@ engine_loop(e: *Engine) {
         // The input first, so every script in the frame reads the same
         // state and an edge (pressed, released) is between two frames.
         input.poll(e.input as *Input)
-        if e.camera_input { fly_camera(e, cam, delta) }
+        if e.camera_input {
+            if e.wander != null { wander_steer(e, cam, delta) }
+            fly_camera(e, cam, delta)
+            if e.wander != null { wander_measure(e, cam) }
+        }
 
         // The accumulator was drained a step at a time and nothing was called
         // in between, so the fixed step was a number the engine subtracted from

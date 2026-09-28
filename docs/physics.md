@@ -211,7 +211,11 @@ a ragdoll -- stand on the pavements and in the road or walk the
 pavements on the export's gait cycle, sprung or driven until the car's
 hit events name them, and fall as their ragdolls fall. The street is
 five blocks into a fog whole by 230 m; `AE3D_CAMX/Y/Z` and
-`AE3D_AIMX/Y/Z` place the camera by number. Left
+`AE3D_AIMX/Y/Z` place the camera by number. The chase camera hangs on a
+boom from over the car (`engine_camera_boom`) against the world's static
+bodies, so a building or a lamp post between the car and where it wants
+to be brings it in front, not through; `AE3D_DIAG=1` says the nearest it
+came to them. Left
 alone for three seconds the car drives itself up and down the street with
 a lane controller and a U-turn on the open tarmac at each end, so the
 scene runs unattended and `AE3D_FRAMES=n` gives a fixed run; `AE3D_DIAG=1`

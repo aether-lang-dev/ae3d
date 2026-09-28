@@ -1,0 +1,1480 @@
+// ae3d.viewpoint -- where a camera may stand, and where it stands to show
+// something.
+//
+// The first half is the camera's collision. A sphere around the eye is
+// kept out of the scene's static geometry: a move is swept and slid the
+// way the character controller walks (Box3D's mover -- the sphere cast
+// along what is left of the move, the planes it then touches gathered and
+// solved out of, the rest of the move clipped against them, up to five
+// times), so the eye slides along a wall at the speed its move has along
+// the wall, stops in a corner a radius from both faces, and does not pass
+// through a wall however fast it flies. It never goes under the ground:
+// no lower than a radius over the lowest surface of the static world, so
+// past the ground's edge it cannot drop below the street and look up at
+// it from underneath.
+//
+//     v = viewpoint.viewpoint_new(0.2)
+//     viewpoint.scan_begin(v)                       // once a frame, before a query:
+//     viewpoint.scan_model(v, m)                    //   every model the renderer draws
+//     viewpoint.scan_end(v)
+//     eye = viewpoint.sweep(v, eye, move)           // the fly camera's move
+//     eye = viewpoint.boom(v, pivot, wanted)        // a chase camera's, from what it follows
+//
+// What it collides with is an aephysics world. When the scene has physics
+// (physics.attach lends its world, use_world), it is that world's static
+// bodies -- the ground, the buildings, what the scene said stands still --
+// and nothing that moves. When it has none, it is a world of the
+// viewpoint's own, made from the scene's static models: every model the
+// renderer draws that nothing moves -- not skinned, not a crowd, not
+// driven by a clip, not instanced unless the model says its instances
+// stand still (core.model_set_solid) -- as its own triangles at its own
+// transform. That world holds only what the eye comes near: a model's
+// collision mesh is built the first time the eye's sweep reaches its
+// bounds and kept while the model is drawn, and its body is let go when
+// the eye has been away from it for a while, so a street of thousands of
+// models costs the handful around the camera, and a city streamed around
+// it never fills the world. Which models are static is asked every scan,
+// so a model that starts moving, or is taken out of the scene, leaves the
+// world with it.
+//
+// The sphere collides at its radius and two of the solver's slops more:
+// the mover rests a slop into what it touches and the cast stops a slop
+// short of it, so the eye itself ends no nearer a surface than the radius
+// it was given.
+//
+// The second half is framing: the camera placed where a set of world
+// points -- a model's vertices where it is drawn, a crowd's box -- fill a
+// share of the frame's height, looked at from a chosen angle, with the
+// near and far planes fitted to them (frame, frame_eased).
+import std.list
+import std.heap
+import aephysics.math
+import aephysics.manifold
+import aephysics.mesh
+import aephysics.shape
+import aephysics.dynamics
+import aephysics.physics_world
+import aephysics.mover
+import ae3d.core
+import ae3d.geometry
+import ae3d.skin
+import ae3d.posing
+
+exports (
+    Viewpoint, Points, Framing,
+    viewpoint_new, viewpoint_free, viewpoint_set_radius, viewpoint_radius,
+    use_world, use_models, lends_world,
+    scan_begin, scan_mark_animated, scan_model, scan_end, prepare, forget,
+    sweep, boom, clearance, lowest, has_lowest, nearest_surface, nearest_model, inside_count,
+    solid_count, body_count, mesh_count, collision_triangles,
+    points_new, points_free, points_clear, points_add, points_add_box, points_add_model, points_add_bank,
+    points_count, points_at, points_lo, points_hi,
+    framing_of, frame, frame_eased, fit_depth, coverage
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern realloc(block: ptr, size: long) -> ptr
+extern free(block: ptr)
+extern exp(x: float) -> float
+
+const PLANES = 32
+const ITERATIONS = 5
+// Two of the solver's slops (math.LINEAR_SLOP): what the sphere collides
+// at beyond its radius, so the eye ends no nearer a surface than the radius.
+const MARGIN = 0.01
+// How far past the swept sphere the models are gathered, so a body made
+// for a move is there for the next one.
+const GATHER = 1.0
+// A body the eye has not come near for this many scans is let go.
+const LET_GO_SCANS = 240
+// The widest the framed points may be across the frame, as a share of it:
+// a long low model is framed by its width, and stands shorter than asked.
+const WIDEST = 0.92
+
+// A model as the viewpoint's world knows it: its mesh's own box, each
+// instance's box in the world (one for a model drawn once), and the
+// collision mesh, made the first time the eye comes near.
+struct Piece {
+    model: ptr                     // *Model; read only in a scan that found it drawn
+    id: int                        // the model's id, which no other model ever has
+    drawn: ptr                     // the mesh the piece was read from
+    vertices: int
+    indices: int
+    local_lo: Vec3
+    local_hi: Vec3
+    stamp: int                     // the model's world_stamp its boxes were taken at
+    count: int                     // 1, or the instances drawn
+    capacity: int
+    boxes: ptr                     // float[capacity * 6]: each one's box in the world
+    matrices: ptr                  // float[capacity * 16]: each one's world matrix, column by column
+    versions: ptr                  // int[capacity]: bumped when that one moved
+    held: ptr                      // ptr[capacity]: its *Held body, or null
+    data: ptr                      // *MeshData
+    seen: int                      // the scan that last found it drawn
+}
+
+// A body in the viewpoint's world: one instance of a piece, as it stood.
+struct Held {
+    piece: ptr                     // *Piece
+    instance: int
+    version: int
+    body: BodyId
+    used: int                      // the scan that last needed it
+}
+
+struct Viewpoint {
+    radius: float
+    world_id: WorldId
+    made: bool                     // its own world exists
+    lent: bool                     // a physics world is lent: its static bodies are the scene
+    pieces: ptr                    // list of *Piece
+    by_id: ptr                     // int[ids]: a model id's piece, index + 1
+    animated: ptr                  // int[ids]: the scan a clip was found driving the model
+    ids: int
+    held: ptr                      // list of *Held
+    scan: int
+    lowest: float
+    has_lowest: bool
+    planes: ptr                    // CollisionPlane[PLANES]
+    plane_count: int
+    triangles: int                 // triangles made into collision meshes so far
+    meshes: int                    // collision meshes made so far
+    nearest: ptr                   // the *Model the last nearest_surface found nearest, or null
+}
+
+viewpoint_new(radius: float) -> *Viewpoint {
+    v = heap.new(Viewpoint)
+    v.radius = radius
+    if v.radius < 0.0 { v.radius = 0.0 }
+    v.pieces = list.new()
+    v.held = list.new()
+    v.planes = calloc(PLANES, sizeof(CollisionPlane))
+    return v
+}
+
+viewpoint_free(v: *Viewpoint) {
+    if v == null { return }
+    drop_models(v)
+    list.free(v.pieces)
+    list.free(v.held)
+    if v.by_id != null { free(v.by_id) }
+    if v.animated != null { free(v.animated) }
+    free(v.planes)
+    heap.free(v)
+}
+
+viewpoint_set_radius(v: *Viewpoint, radius: float) {
+    if v == null || radius < 0.0 { return }
+    v.radius = radius
+}
+
+viewpoint_radius(v: *Viewpoint) -> float {
+    if v == null { return 0.0 }
+    return v.radius
+}
+
+// The physics world's static bodies are the scene from now on: what
+// physics.attach does, so a scene with physics collides with what its
+// physics says stands still. The world stays its owner's.
+use_world(v: *Viewpoint, id: WorldId) {
+    if v == null { return }
+    drop_models(v)
+    v.world_id = id
+    v.lent = true
+}
+
+// Back to the scene's own static models: what physics does when it is freed.
+use_models(v: *Viewpoint) {
+    if v == null || !v.lent { return }
+    v.lent = false
+    v.world_id = WorldId { index1: 0, generation: 0 }
+}
+
+lends_world(v: *Viewpoint) -> bool {
+    if v == null { return false }
+    return v.lent
+}
+
+// Every body, collision mesh and record of the models, and the world they
+// were in.
+drop_models(v: *Viewpoint) {
+    while list.size(v.held) > 0 {
+        let_go(v, list.get_raw(v.held, list.size(v.held) - 1) as *Held)
+    }
+    i = 0
+    while i < list.size(v.pieces) {
+        piece_free(list.get_raw(v.pieces, i) as *Piece)
+        i = i + 1
+    }
+    list.clear(v.pieces)
+    if v.by_id != null {
+        slots = v.by_id as int[]
+        i = 0
+        while i < v.ids {
+            slots[i] = 0
+            i = i + 1
+        }
+    }
+    if v.made {
+        dynamics.destroy_world(v.world_id)
+        v.made = false
+        v.world_id = WorldId { index1: 0, generation: 0 }
+    }
+    v.has_lowest = false
+}
+
+solid_count(v: *Viewpoint) -> int {
+    if v == null { return 0 }
+    return list.size(v.pieces)
+}
+
+body_count(v: *Viewpoint) -> int {
+    if v == null { return 0 }
+    return list.size(v.held)
+}
+
+mesh_count(v: *Viewpoint) -> int {
+    if v == null { return 0 }
+    return v.meshes
+}
+
+collision_triangles(v: *Viewpoint) -> int {
+    if v == null { return 0 }
+    return v.triangles
+}
+
+// The lowest surface of the static world, as of the last scan: the eye is
+// kept a radius over it.
+lowest(v: *Viewpoint) -> float {
+    if v == null { return 0.0 }
+    return v.lowest
+}
+
+has_lowest(v: *Viewpoint) -> bool {
+    if v == null { return false }
+    return v.has_lowest
+}
+
+lesser(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+greater(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// --- the scan ----------------------------------------------------------------------------------------------------
+
+// A scan says what the scene is now: begun, told which models a clip
+// drives and every model the renderer draws, and ended. A query between
+// scans asks the world as the last scan left it.
+scan_begin(v: *Viewpoint) {
+    if v == null { return }
+    v.scan = v.scan + 1
+    v.lowest = 0.0
+    v.has_lowest = false
+    if v.lent {
+        lent_lowest(v)
+        return
+    }
+    if !v.made {
+        wdef = dynamics.default_world_def()
+        wdef.worker_count = 1
+        wdef.enable_sleep = false
+        v.world_id = dynamics.create_world(&wdef)
+        v.made = v.world_id.index1 != 0
+    }
+}
+
+// A model a clip drives this frame: neither it nor what hangs off it
+// stands still.
+scan_mark_animated(v: *Viewpoint, m: *Model) {
+    if v == null || m == null || v.lent { return }
+    grow_ids(v, m.id)
+    marks = v.animated as int[]
+    marks[m.id] = v.scan
+}
+
+// A model the renderer draws. Kept, read again if it moved, or let go if
+// it is no longer solid.
+scan_model(v: *Viewpoint, m: *Model) {
+    if v == null || m == null || v.lent || !v.made { return }
+    core.model_sync_transform(m)
+    if !is_solid(v, m) { return }
+    grow_ids(v, m.id)
+    slots = v.by_id as int[]
+    p = null as *Piece
+    if slots[m.id] > 0 { p = list.get_raw(v.pieces, slots[m.id] - 1) as *Piece }
+    if p != null && (p.drawn != m.mesh || p.vertices != core.mesh_vertex_count(m.mesh) || p.indices != core.mesh_index_count(m.mesh)) {
+        // Another mesh: read afresh.
+        forget_piece(v, p)
+        p = null
+    }
+    if p == null {
+        p = piece_new(m)
+        list.add_raw(v.pieces, p as ptr)
+        slots[m.id] = list.size(v.pieces)
+    }
+    p.model = m as ptr
+    p.seen = v.scan
+    refresh_boxes(p, m)
+    boxes = p.boxes as float[]
+    i = 0
+    while i < p.count {
+        low = boxes[i * 6 + 1]
+        if !v.has_lowest || low < v.lowest {
+            v.lowest = low
+            v.has_lowest = true
+        }
+        i = i + 1
+    }
+}
+
+// A model's collision mesh made now rather than the first time the eye
+// comes near it: for a large solid a scene knows the camera will meet --
+// a merged block of a city, ten thousand triangles and more -- built as the
+// scene loads instead of in the frame the camera first reaches it. The
+// model is one the renderer draws, or is about to.
+prepare(v: *Viewpoint, m: *Model) {
+    if v == null || m == null || v.lent || m.mesh == null { return }
+    if core.mesh_index_count(m.mesh) < 3 || core.mesh_vertex_count(m.mesh) < 3 { return }
+    grow_ids(v, m.id)
+    slots = v.by_id as int[]
+    p = null as *Piece
+    if slots[m.id] > 0 { p = list.get_raw(v.pieces, slots[m.id] - 1) as *Piece }
+    if p == null {
+        p = piece_new(m)
+        // Seen by the scan to come, not evicted by the one before it.
+        p.seen = v.scan + 1
+        list.add_raw(v.pieces, p as ptr)
+        slots[m.id] = list.size(v.pieces)
+    }
+    if p.data != null { return }
+    p.data = collision_mesh(m) as ptr
+    if p.data != null {
+        v.meshes = v.meshes + 1
+        v.triangles = v.triangles + p.indices / 3
+    }
+}
+
+// A model out of the renderer, out of the world now: what the engine says
+// when a model is removed, so nothing asked before the next scan reaches a
+// model its owner may already have freed.
+forget(v: *Viewpoint, m: *Model) {
+    if v == null || m == null || v.by_id == null || m.id < 0 || m.id >= v.ids { return }
+    slots = v.by_id as int[]
+    if slots[m.id] <= 0 { return }
+    forget_piece(v, list.get_raw(v.pieces, slots[m.id] - 1) as *Piece)
+}
+
+// What was not drawn this scan leaves the world, and a body not needed
+// for a while is let go.
+scan_end(v: *Viewpoint) {
+    if v == null || v.lent { return }
+    i = 0
+    while i < list.size(v.pieces) {
+        p = list.get_raw(v.pieces, i) as *Piece
+        if p.seen != v.scan {
+            forget_piece(v, p)
+        } else {
+            i = i + 1
+        }
+    }
+    i = 0
+    while i < list.size(v.held) {
+        h = list.get_raw(v.held, i) as *Held
+        if v.scan - h.used > LET_GO_SCANS {
+            let_go(v, h)
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+// Solid: drawn, with triangles, standing still. Not a skin, a crowd, a
+// picture of one or a particle; not what a clip drives or hangs off it;
+// not instanced unless the model says its instances stand still.
+is_solid(v: *Viewpoint, m: *Model) -> bool {
+    if m.mesh == null || m.solid == core.SOLID_NO || !m.visible { return false }
+    if core.mesh_index_count(m.mesh) < 3 || core.mesh_vertex_count(m.mesh) < 3 { return false }
+    if m.skeleton != null || m.pose_bank != null || m.impostor_cols > 0 || m.billboard != 0 || m.device_crowd != null { return false }
+    if core.mesh_is_skinned(m.mesh) { return false }
+    if m.is_instanced {
+        if m.solid != core.SOLID_YES || m.instances == null { return false }
+        if geometry.inst_is_points(m.instances) == 1 { return false }
+    }
+    if v.animated != null {
+        marks = v.animated as int[]
+        walk = m
+        while walk != null {
+            if walk.id >= 0 && walk.id < v.ids && marks[walk.id] == v.scan { return false }
+            walk = walk.parent as *Model
+        }
+    }
+    return true
+}
+
+grow_ids(v: *Viewpoint, id: int) {
+    if id < v.ids { return }
+    wanted = v.ids
+    if wanted < 1024 { wanted = 1024 }
+    while wanted <= id { wanted = wanted * 2 }
+    slots = calloc(wanted, 4)
+    marks = calloc(wanted, 4)
+    if v.by_id != null {
+        old_slots = v.by_id as int[]
+        old_marks = v.animated as int[]
+        new_slots = slots as int[]
+        new_marks = marks as int[]
+        i = 0
+        while i < v.ids {
+            new_slots[i] = old_slots[i]
+            new_marks[i] = old_marks[i]
+            i = i + 1
+        }
+        free(v.by_id)
+        free(v.animated)
+    }
+    v.by_id = slots
+    v.animated = marks
+    v.ids = wanted
+}
+
+piece_new(m: *Model) -> *Piece {
+    p = heap.new(Piece)
+    p.model = m as ptr
+    p.id = m.id
+    p.drawn = m.mesh
+    p.vertices = core.mesh_vertex_count(m.mesh)
+    p.indices = core.mesh_index_count(m.mesh)
+    p.stamp = 0 - 1
+    lo = core.mesh_position(m.mesh, 0)
+    hi = lo
+    i = 1
+    while i < p.vertices {
+        at = core.mesh_position(m.mesh, i)
+        lo = core.vec3(lesser(lo.x, at.x), lesser(lo.y, at.y), lesser(lo.z, at.z))
+        hi = core.vec3(greater(hi.x, at.x), greater(hi.y, at.y), greater(hi.z, at.z))
+        i = i + 1
+    }
+    p.local_lo = lo
+    p.local_hi = hi
+    return p
+}
+
+piece_free(p: *Piece) {
+    if p.data != null { mesh.destroy_mesh(p.data as *MeshData) }
+    if p.boxes != null { free(p.boxes) }
+    if p.matrices != null { free(p.matrices) }
+    if p.versions != null { free(p.versions) }
+    if p.held != null { free(p.held) }
+    heap.free(p)
+}
+
+// A piece out of the world: its bodies, its mesh, its record.
+forget_piece(v: *Viewpoint, p: *Piece) {
+    if p.held != null {
+        held = p.held as ptr[]
+        i = 0
+        while i < p.capacity {
+            if held[i] != null { let_go(v, held[i] as *Held) }
+            i = i + 1
+        }
+    }
+    count = list.size(v.pieces)
+    at = 0 - 1
+    i = 0
+    while i < count {
+        if list.get_raw(v.pieces, i) == p as ptr { at = i }
+        i = i + 1
+    }
+    if at >= 0 {
+        // The last piece takes its place, and its slot follows it.
+        last = list.get_raw(v.pieces, count - 1) as *Piece
+        slots = v.by_id as int[]
+        list.set(v.pieces, at, last as ptr)
+        list.remove(v.pieces, count - 1)
+        if last != p { slots[last.id] = at + 1 }
+        slots[p.id] = 0
+    }
+    piece_free(p)
+}
+
+// Room for `count` instances.
+piece_reserve(p: *Piece, count: int) {
+    if count <= p.capacity { return }
+    capacity = p.capacity
+    if capacity < 1 { capacity = 1 }
+    while capacity < count { capacity = capacity * 2 }
+    boxes = calloc(capacity * 6, 8)
+    matrices = calloc(capacity * 16, 8)
+    versions = calloc(capacity, 4)
+    held = calloc(capacity, 8)
+    if p.capacity > 0 {
+        old_boxes = p.boxes as float[]
+        old_matrices = p.matrices as float[]
+        old_versions = p.versions as int[]
+        old_held = p.held as ptr[]
+        new_boxes = boxes as float[]
+        new_matrices = matrices as float[]
+        new_versions = versions as int[]
+        new_held = held as ptr[]
+        i = 0
+        while i < p.capacity * 16 {
+            new_matrices[i] = old_matrices[i]
+            i = i + 1
+        }
+        i = 0
+        while i < p.capacity * 6 {
+            new_boxes[i] = old_boxes[i]
+            i = i + 1
+        }
+        i = 0
+        while i < p.capacity {
+            new_versions[i] = old_versions[i]
+            new_held[i] = old_held[i]
+            i = i + 1
+        }
+        free(p.boxes)
+        free(p.matrices)
+        free(p.versions)
+        free(p.held)
+    }
+    p.boxes = boxes
+    p.matrices = matrices
+    p.versions = versions
+    p.held = held
+    p.capacity = capacity
+}
+
+// Each instance's world matrix and box as the model stands now. A model
+// drawn once is read again when its transform was rebuilt; an instanced
+// one, instance by instance, where its matrix changed.
+refresh_boxes(p: *Piece, m: *Model) {
+    if !m.is_instanced {
+        piece_reserve(p, 1)
+        if p.count == 1 && p.stamp == m.world_stamp { return }
+        p.count = 1
+        p.stamp = m.world_stamp
+        take_matrix(p, 0, m.model_matrix)
+        return
+    }
+    count = geometry.inst_count(m.instances)
+    piece_reserve(p, count)
+    // Fewer than before: the ones past the end are gone.
+    if count < p.count {
+        versions = p.versions as int[]
+        i = count
+        while i < p.count {
+            versions[i] = versions[i] + 1
+            i = i + 1
+        }
+    }
+    p.count = count
+    p.stamp = m.world_stamp
+    // An instance's matrix is its whole place in the world: it carries the
+    // model's own scale and turn (core.model_set_instance_position), and
+    // both renderers draw it with no model matrix over it, as the rays
+    // trace it.
+    data = geometry.inst_matrix_data(m.instances) as f32[]
+    i = 0
+    while i < count {
+        take_matrix(p, i, instance_matrix(data, i))
+        i = i + 1
+    }
+}
+
+instance_matrix(data: f32[], i: int) -> Mat4 {
+    at = i * 16
+    return Mat4 { m0: data[at] as float, m1: data[at + 1] as float, m2: data[at + 2] as float, m3: data[at + 3] as float,
+                  m4: data[at + 4] as float, m5: data[at + 5] as float, m6: data[at + 6] as float, m7: data[at + 7] as float,
+                  m8: data[at + 8] as float, m9: data[at + 9] as float, m10: data[at + 10] as float, m11: data[at + 11] as float,
+                  m12: data[at + 12] as float, m13: data[at + 13] as float, m14: data[at + 14] as float, m15: data[at + 15] as float }
+}
+
+// One instance's matrix, and its box from the mesh's own, when it changed.
+take_matrix(p: *Piece, i: int, world: Mat4) {
+    held = p.matrices as float[]
+    at = i * 16
+    same = held[at] == world.m0 && held[at + 1] == world.m1 && held[at + 2] == world.m2 &&
+           held[at + 4] == world.m4 && held[at + 5] == world.m5 && held[at + 6] == world.m6 &&
+           held[at + 8] == world.m8 && held[at + 9] == world.m9 && held[at + 10] == world.m10 &&
+           held[at + 12] == world.m12 && held[at + 13] == world.m13 && held[at + 14] == world.m14
+    versions = p.versions as int[]
+    if same && versions[i] > 0 { return }
+    held[at] = world.m0
+    held[at + 1] = world.m1
+    held[at + 2] = world.m2
+    held[at + 3] = world.m3
+    held[at + 4] = world.m4
+    held[at + 5] = world.m5
+    held[at + 6] = world.m6
+    held[at + 7] = world.m7
+    held[at + 8] = world.m8
+    held[at + 9] = world.m9
+    held[at + 10] = world.m10
+    held[at + 11] = world.m11
+    held[at + 12] = world.m12
+    held[at + 13] = world.m13
+    held[at + 14] = world.m14
+    held[at + 15] = world.m15
+    versions[i] = versions[i] + 1
+    // The box: the mesh's own centre through the matrix, its half extents
+    // through the matrix's absolute values.
+    centre = core.v3_mul(core.v3_add(p.local_lo, p.local_hi), 0.5)
+    half = core.v3_mul(core.v3_sub(p.local_hi, p.local_lo), 0.5)
+    c = core.mat4_transform_point(world, centre)
+    ex = core.abs_of(world.m0) * half.x + core.abs_of(world.m4) * half.y + core.abs_of(world.m8) * half.z
+    ey = core.abs_of(world.m1) * half.x + core.abs_of(world.m5) * half.y + core.abs_of(world.m9) * half.z
+    ez = core.abs_of(world.m2) * half.x + core.abs_of(world.m6) * half.y + core.abs_of(world.m10) * half.z
+    boxes = p.boxes as float[]
+    boxes[i * 6] = c.x - ex
+    boxes[i * 6 + 1] = c.y - ey
+    boxes[i * 6 + 2] = c.z - ez
+    boxes[i * 6 + 3] = c.x + ex
+    boxes[i * 6 + 4] = c.y + ey
+    boxes[i * 6 + 5] = c.z + ez
+}
+
+// --- the world -------------------------------------------------------------------------------------------------------
+
+// Bodies for every solid whose box meets this one: made where missing,
+// made again where the solid moved, and marked as needed.
+gather(v: *Viewpoint, lo: Vec3, hi: Vec3) {
+    if v.lent || !v.made { return }
+    count = list.size(v.pieces)
+    k = 0
+    while k < count {
+        p = list.get_raw(v.pieces, k) as *Piece
+        boxes = p.boxes as float[]
+        i = 0
+        while i < p.count {
+            at = i * 6
+            if boxes[at] <= hi.x && boxes[at + 3] >= lo.x && boxes[at + 1] <= hi.y && boxes[at + 4] >= lo.y &&
+               boxes[at + 2] <= hi.z && boxes[at + 5] >= lo.z {
+                hold(v, p, i)
+            }
+            i = i + 1
+        }
+        k = k + 1
+    }
+}
+
+hold(v: *Viewpoint, p: *Piece, i: int) {
+    held = p.held as ptr[]
+    versions = p.versions as int[]
+    h = held[i] as *Held
+    if h != null && h.version == versions[i] {
+        h.used = v.scan
+        return
+    }
+    if h != null { let_go(v, h) }
+    if p.data == null {
+        p.data = collision_mesh(p.model as *Model) as ptr
+        if p.data == null { return }
+        v.meshes = v.meshes + 1
+        v.triangles = v.triangles + p.indices / 3
+    }
+    // The world matrix as a place, a turn and a scale: the model's own
+    // transform composes that way and no other (core.model_update_matrix),
+    // and so does an instance's.
+    matrices = p.matrices as float[]
+    at = i * 16
+    cx = core.vec3(matrices[at], matrices[at + 1], matrices[at + 2])
+    cy = core.vec3(matrices[at + 4], matrices[at + 5], matrices[at + 6])
+    cz = core.vec3(matrices[at + 8], matrices[at + 9], matrices[at + 10])
+    sx = core.v3_len(cx)
+    sy = core.v3_len(cy)
+    sz = core.v3_len(cz)
+    if sx < 0.000001 || sy < 0.000001 || sz < 0.000001 { return }
+    if core.v3_dot(core.v3_cross(cx, cy), cz) < 0.0 { sx = 0.0 - sx }
+    turn = math.make_quat_from_matrix(Matrix3 { cx: core.v3_mul(cx, 1.0 / sx), cy: core.v3_mul(cy, 1.0 / sy), cz: core.v3_mul(cz, 1.0 / sz) })
+    bdef = dynamics.default_body_def()
+    bdef.position = core.vec3(matrices[at + 12], matrices[at + 13], matrices[at + 14])
+    bdef.rotation = turn
+    body = dynamics.create_body(v.world_id, &bdef)
+    sdef = dynamics.default_shape_def()
+    sdef.update_body_mass = false
+    sdef.invoke_contact_creation = false
+    dynamics.create_mesh_shape(body, &sdef, p.data as *MeshData, core.vec3(sx, sy, sz))
+    h = heap.new(Held)
+    h.piece = p as ptr
+    h.instance = i
+    h.version = versions[i]
+    h.body = body
+    h.used = v.scan
+    held[i] = h as ptr
+    list.add_raw(v.held, h as ptr)
+}
+
+let_go(v: *Viewpoint, h: *Held) {
+    dynamics.destroy_body(h.body)
+    p = h.piece as *Piece
+    held = p.held as ptr[]
+    if h.instance < p.capacity && held[h.instance] == h as ptr { held[h.instance] = null }
+    count = list.size(v.held)
+    i = 0
+    while i < count {
+        if list.get_raw(v.held, i) == h as ptr {
+            list.set(v.held, i, list.get_raw(v.held, count - 1))
+            list.remove(v.held, count - 1)
+            i = count
+        }
+        i = i + 1
+    }
+    heap.free(h)
+}
+
+// A drawn mesh as a collision mesh: its triangles, welded, in its own
+// frame; the shape takes the scale. Both sides of every triangle: a mesh
+// collides from its front alone (aephysics's, as Box3D's), and a surface
+// wound the wrong way round -- a window pane an export turned to face into
+// its building -- let the eye through into the hollow behind it, where every
+// wall faced away from it. Each triangle goes in again, turned.
+collision_mesh(m: *Model) -> *MeshData {
+    drawn = m.mesh
+    vertex_count = core.mesh_vertex_count(drawn)
+    index_count = core.mesh_index_count(drawn)
+    if vertex_count < 3 || index_count < 3 { return null }
+    triangles = index_count / 3
+    vertices_block = calloc(vertex_count, sizeof(Vec3))
+    vertices = vertices_block as Vec3[]
+    i = 0
+    while i < vertex_count {
+        vertices[i] = core.mesh_position(drawn, i)
+        i = i + 1
+    }
+    indices_block = calloc(triangles * 6, 4)
+    indices = indices_block as int[]
+    t = 0
+    while t < triangles {
+        a = core.mesh_index_at(drawn, t * 3)
+        b = core.mesh_index_at(drawn, t * 3 + 1)
+        c = core.mesh_index_at(drawn, t * 3 + 2)
+        indices[t * 3] = a
+        indices[t * 3 + 1] = b
+        indices[t * 3 + 2] = c
+        back = (triangles + t) * 3
+        indices[back] = a
+        indices[back + 1] = c
+        indices[back + 2] = b
+        t = t + 1
+    }
+    def = mesh.mesh_def()
+    def.vertices = vertices_block
+    def.indices = indices_block
+    def.vertex_count = vertex_count
+    def.triangle_count = triangles * 2
+    def.weld_vertices = true
+    def.weld_tolerance = 0.0001
+    md = mesh.create_mesh(&def, null, 0)
+    free(indices_block)
+    free(vertices_block)
+    return md
+}
+
+// The lowest a lent world's static shapes reach: every shape in the world
+// that is not a sensor, on a static body, in the broad phase.
+lent_lowest(v: *Viewpoint) {
+    if !physics_world.is_valid(v.world_id) { return }
+    w = dynamics.get_world(v.world_id.index1 - 1)
+    i = 0
+    while i < w.shapes.count {
+        s = dynamics.world_shape_at(w, i)
+        if s.id != dynamics.NULL_INDEX && s.sensor_index == dynamics.NULL_INDEX && s.proxy_key != dynamics.NULL_INDEX &&
+           dynamics.body_at(w, s.body_id).kind == dynamics.BODY_STATIC {
+            if !v.has_lowest || s.aabb.lower.y < v.lowest {
+                v.lowest = s.aabb.lower.y
+                v.has_lowest = true
+            }
+        }
+        i = i + 1
+    }
+}
+
+// --- the queries -------------------------------------------------------------------------------------------------
+
+// The sphere the eye is, about its centre.
+eye_sphere(v: *Viewpoint) -> Capsule {
+    return Capsule { center1: core.vec3(0.0, 0.0, 0.0), center2: core.vec3(0.0, 0.0, 0.0), radius: v.radius + MARGIN }
+}
+
+// A lent world is its static bodies alone, and never a sensor.
+static_shape(id: ShapeId) -> bool {
+    if dynamics.shape_is_sensor(id) { return false }
+    return dynamics.body_get_type(dynamics.shape_get_body(id)) == dynamics.BODY_STATIC
+}
+
+cast_filter(id: ShapeId, context: ptr) -> bool { return static_shape(id) }
+
+plane_visitor(id: ShapeId, results: PlaneResult[], count: int, context: ptr) -> bool {
+    v = context as *Viewpoint
+    if v.lent && !static_shape(id) { return true }
+    planes = v.planes as CollisionPlane[]
+    i = 0
+    while i < count && v.plane_count < PLANES {
+        planes[v.plane_count] = mover.collision_plane(results[i].plane, math.MAX_FLOAT, true)
+        v.plane_count = v.plane_count + 1
+        i = i + 1
+    }
+    return true
+}
+
+// Whether there is a world to ask.
+ready(v: *Viewpoint) -> bool {
+    if v.lent { return physics_world.is_valid(v.world_id) }
+    return v.made
+}
+
+// The planes the sphere touches at `at`, onto the viewpoint's list, and
+// the sphere pushed out of them.
+solve_out(v: *Viewpoint, at: Vec3, sphere: Capsule) -> Vec3 {
+    v.plane_count = 0
+    physics_world.collide_mover(v.world_id, at, sphere, shape.default_query_filter(), plane_visitor, v as ptr)
+    if v.plane_count == 0 { return at }
+    solved = mover.solve_planes(core.vec3(0.0, 0.0, 0.0), v.planes as CollisionPlane[], v.plane_count)
+    return core.v3_add(at, solved.delta)
+}
+
+// No lower than a radius over the static world's lowest surface: for an
+// eye that was put there, the last word. A move never needs it -- the move
+// is held to the floor as it is swept (floor_clip) -- since lifting the eye
+// after the sweep is a move no sweep checked, and lifted beside the edge of
+// a slab it had slipped under, it stood in the slab's side.
+above_lowest(v: *Viewpoint, at: Vec3) -> Vec3 {
+    if !v.has_lowest { return at }
+    least = v.lowest + v.radius + MARGIN
+    if at.y < least { return core.vec3(at.x, least, at.z) }
+    return at
+}
+
+// A move from `at` held to the floor, the plane a radius over the static
+// world's lowest surface: the part of it that would go below the floor is
+// a slide along it, and an eye below the floor is moved up to it -- swept,
+// like any move.
+floor_clip(v: *Viewpoint, at: Vec3, move: Vec3) -> Vec3 {
+    if !v.has_lowest { return move }
+    least = v.lowest + v.radius + MARGIN
+    if at.y + move.y < least { return core.vec3(move.x, least - at.y, move.z) }
+    return move
+}
+
+// The box a sphere swept from `a` to `b` fills, and a little more.
+gather_segment(v: *Viewpoint, a: Vec3, b: Vec3) {
+    reach = v.radius + MARGIN + GATHER
+    lo = core.vec3(lesser(a.x, b.x) - reach, lesser(a.y, b.y) - reach, lesser(a.z, b.z) - reach)
+    hi = core.vec3(greater(a.x, b.x) + reach, greater(a.y, b.y) + reach, greater(a.z, b.z) + reach)
+    gather(v, lo, hi)
+}
+
+// The eye moved by `translation` as far as the scene lets its sphere go,
+// sliding along what it meets: where it ends.
+sweep(v: *Viewpoint, eye: Vec3, translation: Vec3) -> Vec3 {
+    if v == null { return core.v3_add(eye, translation) }
+    if !ready(v) { return above_lowest(v, core.v3_add(eye, translation)) }
+    gather_segment(v, eye, core.v3_add(eye, translation))
+    sphere = eye_sphere(v)
+    filter = shape.default_query_filter()
+    at = solve_out(v, eye, sphere)
+    remaining = translation
+    iteration = 0
+    while iteration < ITERATIONS {
+        remaining = floor_clip(v, at, remaining)
+        if core.v3_len(remaining) < 0.00001 { break }
+        fraction = physics_world.cast_mover(v.world_id, at, sphere, remaining, filter, v.lent, cast_filter, null)
+        at = core.v3_add(at, core.v3_mul(remaining, fraction))
+        at = solve_out(v, at, sphere)
+        remaining = mover.clip_vector(core.v3_mul(remaining, 1.0 - fraction), v.planes as CollisionPlane[], v.plane_count)
+        iteration = iteration + 1
+    }
+    at = solve_out(v, at, sphere)
+    return above_lowest(v, at)
+}
+
+// A chase camera's eye: from `pivot` -- over what it follows -- toward
+// where it wants to be, as far as the sphere gets, so a wall between the
+// two brings the camera in front of the wall rather than behind it.
+boom(v: *Viewpoint, pivot: Vec3, wanted: Vec3) -> Vec3 {
+    if v == null { return wanted }
+    if !ready(v) { return above_lowest(v, wanted) }
+    gather_segment(v, pivot, wanted)
+    sphere = eye_sphere(v)
+    start = above_lowest(v, solve_out(v, pivot, sphere))
+    reach = floor_clip(v, start, core.v3_sub(wanted, start))
+    fraction = physics_world.cast_mover(v.world_id, start, sphere, reach, shape.default_query_filter(), v.lent, cast_filter, null)
+    at = core.v3_add(start, core.v3_mul(reach, fraction))
+    return above_lowest(v, solve_out(v, at, sphere))
+}
+
+// How far the nearest surface facing `at` is, looking no further than
+// `reach`: `reach` when nothing is nearer.
+clearance(v: *Viewpoint, at: Vec3, reach: float) -> float {
+    if v == null || !ready(v) || reach <= 0.0 { return reach }
+    lo = core.vec3(at.x - reach, at.y - reach, at.z - reach)
+    hi = core.vec3(at.x + reach, at.y + reach, at.z + reach)
+    gather(v, lo, hi)
+    v.plane_count = 0
+    probe = Capsule { center1: core.vec3(0.0, 0.0, 0.0), center2: core.vec3(0.0, 0.0, 0.0), radius: reach }
+    physics_world.collide_mover(v.world_id, at, probe, shape.default_query_filter(), plane_visitor, v as ptr)
+    nearest = reach
+    planes = v.planes as CollisionPlane[]
+    i = 0
+    while i < v.plane_count {
+        away = reach - planes[i].plane.offset
+        if away < nearest { nearest = away }
+        i = i + 1
+    }
+    return nearest
+}
+
+// --- the measure ----------------------------------------------------------------------------------------------
+
+// How far `at` is from the nearest triangle of the solids the last scan
+// found, either side of it, looking no further than `reach`: the drawn
+// triangles themselves, each through its model's matrix, closest point by
+// closest point -- not the collision world's answer, which is what it
+// checks. A lent world's solids are its own and not measured here.
+nearest_surface(v: *Viewpoint, at: Vec3, reach: float) -> float {
+    if v == null || v.lent { return reach }
+    v.nearest = null
+    nearest = reach
+    count = list.size(v.pieces)
+    k = 0
+    while k < count {
+        p = list.get_raw(v.pieces, k) as *Piece
+        boxes = p.boxes as float[]
+        matrices = p.matrices as float[]
+        drawn = (p.model as *Model).mesh
+        i = 0
+        while i < p.count {
+            b = i * 6
+            if boxes[b] - nearest <= at.x && boxes[b + 3] + nearest >= at.x && boxes[b + 1] - nearest <= at.y &&
+               boxes[b + 4] + nearest >= at.y && boxes[b + 2] - nearest <= at.z && boxes[b + 5] + nearest >= at.z {
+                world = matrix_at(matrices, i)
+                t = 0
+                while t + 2 < p.indices {
+                    a = core.mat4_transform_point(world, core.mesh_position(drawn, core.mesh_index_at(drawn, t)))
+                    c1 = core.mat4_transform_point(world, core.mesh_position(drawn, core.mesh_index_at(drawn, t + 1)))
+                    c2 = core.mat4_transform_point(world, core.mesh_position(drawn, core.mesh_index_at(drawn, t + 2)))
+                    d = core.v3_distance(at, closest_on_triangle(at, a, c1, c2))
+                    if d < nearest {
+                        nearest = d
+                        v.nearest = p.model
+                    }
+                    t = t + 3
+                }
+            }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    return nearest
+}
+
+// The model the last nearest_surface found nearest, or null: what a
+// measure names when it reports how near the eye came.
+nearest_model(v: *Viewpoint) -> *Model {
+    if v == null { return null }
+    return v.nearest as *Model
+}
+
+// How many of the solids hold `at` inside them: of those whose box holds
+// it, the ones a ray from it crosses an odd number of times -- inside a
+// closed mesh, the eye is somewhere nothing drawn can be seen from.
+inside_count(v: *Viewpoint, at: Vec3) -> int {
+    if v == null || v.lent { return 0 }
+    // Off every axis, so it runs along no edge and through no vertex.
+    ray = core.v3_normalize(core.vec3(1.0, 0.0013, 0.0021))
+    inside = 0
+    count = list.size(v.pieces)
+    k = 0
+    while k < count {
+        p = list.get_raw(v.pieces, k) as *Piece
+        boxes = p.boxes as float[]
+        matrices = p.matrices as float[]
+        drawn = (p.model as *Model).mesh
+        i = 0
+        while i < p.count {
+            b = i * 6
+            if boxes[b] < at.x && boxes[b + 3] > at.x && boxes[b + 1] < at.y && boxes[b + 4] > at.y &&
+               boxes[b + 2] < at.z && boxes[b + 5] > at.z {
+                world = matrix_at(matrices, i)
+                crossings = 0
+                t = 0
+                while t + 2 < p.indices {
+                    a = core.mat4_transform_point(world, core.mesh_position(drawn, core.mesh_index_at(drawn, t)))
+                    c1 = core.mat4_transform_point(world, core.mesh_position(drawn, core.mesh_index_at(drawn, t + 1)))
+                    c2 = core.mat4_transform_point(world, core.mesh_position(drawn, core.mesh_index_at(drawn, t + 2)))
+                    if ray_crosses(at, ray, a, c1, c2) { crossings = crossings + 1 }
+                    t = t + 3
+                }
+                if crossings % 2 == 1 { inside = inside + 1 }
+            }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    return inside
+}
+
+matrix_at(values: float[], i: int) -> Mat4 {
+    at = i * 16
+    return Mat4 { m0: values[at], m1: values[at + 1], m2: values[at + 2], m3: values[at + 3],
+                  m4: values[at + 4], m5: values[at + 5], m6: values[at + 6], m7: values[at + 7],
+                  m8: values[at + 8], m9: values[at + 9], m10: values[at + 10], m11: values[at + 11],
+                  m12: values[at + 12], m13: values[at + 13], m14: values[at + 14], m15: values[at + 15] }
+}
+
+// The point of triangle abc nearest p (Ericson, Real-Time Collision
+// Detection, 5.1.5): by the region of the triangle p projects into.
+closest_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    ab = core.v3_sub(b, a)
+    ac = core.v3_sub(c, a)
+    ap = core.v3_sub(p, a)
+    d1 = core.v3_dot(ab, ap)
+    d2 = core.v3_dot(ac, ap)
+    if d1 <= 0.0 && d2 <= 0.0 { return a }
+    bp = core.v3_sub(p, b)
+    d3 = core.v3_dot(ab, bp)
+    d4 = core.v3_dot(ac, bp)
+    if d3 >= 0.0 && d4 <= d3 { return b }
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 { return core.v3_add(a, core.v3_mul(ab, d1 / (d1 - d3))) }
+    cp = core.v3_sub(p, c)
+    d5 = core.v3_dot(ab, cp)
+    d6 = core.v3_dot(ac, cp)
+    if d6 >= 0.0 && d5 <= d6 { return c }
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 { return core.v3_add(a, core.v3_mul(ac, d2 / (d2 - d6))) }
+    va = d3 * d6 - d5 * d4
+    if va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0 {
+        return core.v3_add(b, core.v3_mul(core.v3_sub(c, b), (d4 - d3) / ((d4 - d3) + (d5 - d6))))
+    }
+    denominator = va + vb + vc
+    if denominator == 0.0 { return a }
+    return core.v3_add(a, core.v3_add(core.v3_mul(ab, vb / denominator), core.v3_mul(ac, vc / denominator)))
+}
+
+// Whether the ray from `origin` along `ray` crosses triangle abc, either
+// side (Moller and Trumbore).
+ray_crosses(origin: Vec3, ray: Vec3, a: Vec3, b: Vec3, c: Vec3) -> bool {
+    e1 = core.v3_sub(b, a)
+    e2 = core.v3_sub(c, a)
+    h = core.v3_cross(ray, e2)
+    det = core.v3_dot(e1, h)
+    if det > 0.0 - 0.0000000001 && det < 0.0000000001 { return false }
+    inv = 1.0 / det
+    s = core.v3_sub(origin, a)
+    u = inv * core.v3_dot(s, h)
+    if u < 0.0 || u > 1.0 { return false }
+    q = core.v3_cross(s, e1)
+    w = inv * core.v3_dot(ray, q)
+    if w < 0.0 || u + w > 1.0 { return false }
+    return inv * core.v3_dot(e2, q) > 0.0
+}
+
+// --- points to frame -------------------------------------------------------------------------------------------
+
+// World positions: what a framing looks at.
+struct Points {
+    data: ptr                      // float[capacity * 3]
+    count: int
+    capacity: int
+}
+
+points_new() -> *Points {
+    return heap.new(Points)
+}
+
+points_free(p: *Points) {
+    if p == null { return }
+    if p.data != null { free(p.data) }
+    heap.free(p)
+}
+
+points_clear(p: *Points) {
+    if p != null { p.count = 0 }
+}
+
+points_count(p: *Points) -> int {
+    if p == null { return 0 }
+    return p.count
+}
+
+points_at(p: *Points, i: int) -> Vec3 {
+    values = p.data as float[]
+    return core.vec3(values[i * 3], values[i * 3 + 1], values[i * 3 + 2])
+}
+
+points_add(p: *Points, at: Vec3) {
+    if p == null { return }
+    if p.count >= p.capacity {
+        capacity = p.capacity * 2
+        if capacity < 64 { capacity = 64 }
+        grown = realloc(p.data, (capacity * 3 * 8) as long)
+        if grown == null { return }
+        p.data = grown
+        p.capacity = capacity
+    }
+    values = p.data as float[]
+    values[p.count * 3] = at.x
+    values[p.count * 3 + 1] = at.y
+    values[p.count * 3 + 2] = at.z
+    p.count = p.count + 1
+}
+
+// A box's eight corners.
+points_add_box(p: *Points, lo: Vec3, hi: Vec3) {
+    k = 0
+    while k < 8 {
+        x = lo.x
+        y = lo.y
+        z = lo.z
+        if (k & 1) != 0 { x = hi.x }
+        if (k & 2) != 0 { y = hi.y }
+        if (k & 4) != 0 { z = hi.z }
+        points_add(p, core.vec3(x, y, z))
+        k = k + 1
+    }
+}
+
+// Every vertex of a model where it is drawn: through its transform, its
+// skin's pose as it stands, and each instance -- a crowd's figure posed
+// at its own phase.
+points_add_model(p: *Points, m: *Model) {
+    // A crowd sorted on the device has its figures there: the CPU has no
+    // place for them to give.
+    if p == null || m == null || m.mesh == null || m.device_crowd != null { return }
+    core.model_sync_transform(m)
+    n = core.mesh_vertex_count(m.mesh)
+    if m.is_instanced && m.instances != null {
+        if geometry.inst_is_points(m.instances) == 1 { return }
+        count = geometry.inst_count(m.instances)
+        data = geometry.inst_matrix_data(m.instances) as f32[]
+        phases = null as ptr
+        if geometry.inst_has_phases(m.instances) == 1 { phases = geometry.inst_phase_data(m.instances) }
+        i = 0
+        while i < count {
+            // The instance's matrix alone, as the renderers draw it.
+            world = instance_matrix(data, i)
+            frame = 0 - 1
+            if m.pose_bank != null && m.pose_bank_frames > 0 {
+                phase = 0.0
+                if phases != null { phase = (phases as f32[])[i] as float }
+                phase = phase - ((phase as int) as float)
+                if phase < 0.0 { phase = phase + 1.0 }
+                frame = (phase * (m.pose_bank_frames as float)) as int
+                if frame >= m.pose_bank_frames { frame = m.pose_bank_frames - 1 }
+            }
+            k = 0
+            while k < n {
+                at = core.mesh_position(m.mesh, k)
+                if frame >= 0 { at = skin_by_bank(m.mesh, k, m.pose_bank, frame, at) }
+                points_add(p, core.mat4_transform_point(world, at))
+                k = k + 1
+            }
+            i = i + 1
+        }
+        return
+    }
+    palette = null as ptr
+    if m.skeleton != null {
+        sk = m.skeleton as *Skeleton
+        skin.skeleton_update(sk)
+        palette = skin.skeleton_palette(sk)
+    }
+    k = 0
+    while k < n {
+        at = core.mesh_position(m.mesh, k)
+        if palette != null { at = skin_by_palette(m.mesh, k, palette, at) }
+        points_add(p, core.mat4_transform_point(m.model_matrix, at))
+        k = k + 1
+    }
+}
+
+// A crowd figure's vertices at every frame of its bank, in the figure's
+// own frame: the room it takes whatever point of its walk it is at.
+points_add_bank(p: *Points, drawn: ptr, bank: ptr, frames: int) {
+    if p == null || drawn == null || bank == null { return }
+    n = core.mesh_vertex_count(drawn)
+    f = 0
+    while f < frames {
+        k = 0
+        while k < n {
+            points_add(p, skin_by_bank(drawn, k, bank, f, core.mesh_position(drawn, k)))
+            k = k + 1
+        }
+        f = f + 1
+    }
+}
+
+// A vertex moved by its four bones' matrices, weighted.
+skin_by_palette(drawn: ptr, k: int, palette: ptr, at: Vec3) -> Vec3 {
+    if !core.mesh_is_skinned(drawn) { return at }
+    bones = posing.palette_bones(palette)
+    out = core.vec3(0.0, 0.0, 0.0)
+    weight = 0.0
+    slot = 0
+    while slot < 4 {
+        w = core.mesh_skin_weight(drawn, k, slot)
+        j = core.mesh_skin_joint(drawn, k, slot)
+        if w > 0.0 && j >= 0 && j < bones {
+            x = posing.palette_get(palette, j, 0) * at.x + posing.palette_get(palette, j, 4) * at.y + posing.palette_get(palette, j, 8) * at.z + posing.palette_get(palette, j, 12)
+            y = posing.palette_get(palette, j, 1) * at.x + posing.palette_get(palette, j, 5) * at.y + posing.palette_get(palette, j, 9) * at.z + posing.palette_get(palette, j, 13)
+            z = posing.palette_get(palette, j, 2) * at.x + posing.palette_get(palette, j, 6) * at.y + posing.palette_get(palette, j, 10) * at.z + posing.palette_get(palette, j, 14)
+            out = core.v3_add(out, core.vec3(x * w, y * w, z * w))
+            weight = weight + w
+        }
+        slot = slot + 1
+    }
+    if weight <= 0.0 { return at }
+    return core.v3_mul(out, 1.0 / weight)
+}
+
+skin_by_bank(drawn: ptr, k: int, bank: ptr, frame: int, at: Vec3) -> Vec3 {
+    if !core.mesh_is_skinned(drawn) { return at }
+    bones = posing.posebank_bones(bank)
+    out = core.vec3(0.0, 0.0, 0.0)
+    weight = 0.0
+    slot = 0
+    while slot < 4 {
+        w = core.mesh_skin_weight(drawn, k, slot)
+        j = core.mesh_skin_joint(drawn, k, slot)
+        if w > 0.0 && j >= 0 && j < bones {
+            x = posing.posebank_get(bank, frame, j, 0) * at.x + posing.posebank_get(bank, frame, j, 4) * at.y + posing.posebank_get(bank, frame, j, 8) * at.z + posing.posebank_get(bank, frame, j, 12)
+            y = posing.posebank_get(bank, frame, j, 1) * at.x + posing.posebank_get(bank, frame, j, 5) * at.y + posing.posebank_get(bank, frame, j, 9) * at.z + posing.posebank_get(bank, frame, j, 13)
+            z = posing.posebank_get(bank, frame, j, 2) * at.x + posing.posebank_get(bank, frame, j, 6) * at.y + posing.posebank_get(bank, frame, j, 10) * at.z + posing.posebank_get(bank, frame, j, 14)
+            out = core.v3_add(out, core.vec3(x * w, y * w, z * w))
+            weight = weight + w
+        }
+        slot = slot + 1
+    }
+    if weight <= 0.0 { return at }
+    return core.v3_mul(out, 1.0 / weight)
+}
+
+points_lo(p: *Points) -> Vec3 {
+    if p == null || p.count == 0 { return core.vec3(0.0, 0.0, 0.0) }
+    lo = points_at(p, 0)
+    i = 1
+    while i < p.count {
+        at = points_at(p, i)
+        lo = core.vec3(lesser(lo.x, at.x), lesser(lo.y, at.y), lesser(lo.z, at.z))
+        i = i + 1
+    }
+    return lo
+}
+
+points_hi(p: *Points) -> Vec3 {
+    if p == null || p.count == 0 { return core.vec3(0.0, 0.0, 0.0) }
+    hi = points_at(p, 0)
+    i = 1
+    while i < p.count {
+        at = points_at(p, i)
+        hi = core.vec3(greater(hi.x, at.x), greater(hi.y, at.y), greater(hi.z, at.z))
+        i = i + 1
+    }
+    return hi
+}
+
+// --- framing ---------------------------------------------------------------------------------------------------------
+
+// Where a camera stands to frame a set of points, and what it sees of them
+// from there: the share of the frame's height and width they span.
+struct Framing {
+    position: Vec3
+    aim: Vec3                      // the middle of the points
+    distance: float                // from the aim, along the view
+    height: float
+    width: float
+    ok: bool
+}
+
+// The share of the frame's height and width the points span, seen by a
+// camera at `eye` looking along its front (the camera's own fov and
+// aspect); zero when a point is behind the eye.
+coverage(cam: *Camera, pts: *Points, eye: Vec3, front: Vec3, right: Vec3, up: Vec3) -> Vec3 {
+    t = core.tan_of(core.deg_to_rad(cam.fov) * 0.5)
+    low_y = 0.0
+    high_y = 0.0
+    low_x = 0.0
+    high_x = 0.0
+    i = 0
+    while i < pts.count {
+        d = core.v3_sub(points_at(pts, i), eye)
+        z = core.v3_dot(d, front)
+        if z <= 0.0 { return core.vec3(0.0, 0.0, 0.0) }
+        ny = core.v3_dot(d, up) / (z * t)
+        nx = core.v3_dot(d, right) / (z * t * cam.aspect)
+        if i == 0 || ny < low_y { low_y = ny }
+        if i == 0 || ny > high_y { high_y = ny }
+        if i == 0 || nx < low_x { low_x = nx }
+        if i == 0 || nx > high_x { high_x = nx }
+        i = i + 1
+    }
+    return core.vec3((high_y - low_y) * 0.5, (high_x - low_x) * 0.5, 1.0)
+}
+
+// The view's axes for a yaw and a pitch in degrees, as the camera's own
+// (core.camera_update_vectors): yaw -90 looks down -z, pitch below zero
+// looks down.
+view_front(yaw: float, pitch: float) -> Vec3 {
+    y = core.deg_to_rad(yaw)
+    x = core.deg_to_rad(pitch)
+    return core.v3_normalize(core.vec3(core.cos_of(y) * core.cos_of(x), core.sin_of(x), core.sin_of(y) * core.cos_of(x)))
+}
+
+// Where the camera stands to show the points filling `share` of the
+// frame's height, looking at them along yaw and pitch (degrees), centred;
+// further back where they would be wider than the frame; never inside the
+// sphere around them. The camera's fov and aspect are the ones used.
+framing_of(cam: *Camera, pts: *Points, share: float, yaw: float, pitch: float) -> Framing {
+    out = Framing { position: cam.position, aim: cam.position, distance: 0.0, height: 0.0, width: 0.0, ok: false }
+    if cam == null || pts == null || pts.count == 0 { return out }
+    if share <= 0.0 || share >= 1.0 { share = 0.55 }
+    front = view_front(yaw, pitch)
+    right = core.v3_normalize(core.v3_cross(front, core.vec3(0.0, 1.0, 0.0)))
+    up = core.v3_normalize(core.v3_cross(right, front))
+    lo = points_lo(pts)
+    hi = points_hi(pts)
+    centre = core.v3_mul(core.v3_add(lo, hi), 0.5)
+    reach = 0.0
+    i = 0
+    while i < pts.count {
+        away = core.v3_distance(points_at(pts, i), centre)
+        if away > reach { reach = away }
+        i = i + 1
+    }
+    if reach < 0.000001 { reach = 0.000001 }
+    // Never nearer than the sphere around the points, a twentieth more.
+    nearest = reach * 1.05
+    shift = core.vec3(0.0, 0.0, 0.0)
+    distance = nearest
+    pass = 0
+    while pass < 4 {
+        base = core.v3_add(centre, shift)
+        distance = solve_distance(cam, pts, base, front, right, up, share, nearest)
+        // Centred: the points' middle on the frame moved to the frame's.
+        eye = core.v3_sub(base, core.v3_mul(front, distance))
+        mid = middle_of(cam, pts, eye, front, right, up)
+        t = core.tan_of(core.deg_to_rad(cam.fov) * 0.5)
+        shift = core.v3_add(shift, core.v3_add(core.v3_mul(right, mid.x * distance * t * cam.aspect), core.v3_mul(up, mid.y * distance * t)))
+        pass = pass + 1
+    }
+    base = core.v3_add(centre, shift)
+    eye = core.v3_sub(base, core.v3_mul(front, distance))
+    seen = coverage(cam, pts, eye, front, right, up)
+    out.position = eye
+    out.aim = base
+    out.distance = distance
+    out.height = seen.x
+    out.width = seen.y
+    out.ok = seen.z > 0.0
+    return out
+}
+
+// The distance back from `base` at which the points span `share` of the
+// height and no more than WIDEST of the width.
+solve_distance(cam: *Camera, pts: *Points, base: Vec3, front: Vec3, right: Vec3, up: Vec3, share: float, nearest: float) -> float {
+    at_nearest = coverage(cam, pts, core.v3_sub(base, core.v3_mul(front, nearest)), front, right, up)
+    if at_nearest.z > 0.0 && at_nearest.x <= share && at_nearest.y <= WIDEST { return nearest }
+    far_out = nearest * 2.0
+    tries = 0
+    while tries < 60 {
+        seen = coverage(cam, pts, core.v3_sub(base, core.v3_mul(front, far_out)), front, right, up)
+        if seen.z > 0.0 && seen.x <= share && seen.y <= WIDEST { break }
+        far_out = far_out * 2.0
+        tries = tries + 1
+    }
+    near_in = nearest
+    k = 0
+    while k < 60 {
+        middle = (near_in + far_out) * 0.5
+        seen = coverage(cam, pts, core.v3_sub(base, core.v3_mul(front, middle)), front, right, up)
+        if seen.z > 0.0 && seen.x <= share && seen.y <= WIDEST { far_out = middle } else { near_in = middle }
+        k = k + 1
+    }
+    return far_out
+}
+
+// Where the middle of the points lands on the frame, -1..1 each way.
+middle_of(cam: *Camera, pts: *Points, eye: Vec3, front: Vec3, right: Vec3, up: Vec3) -> Vec3 {
+    t = core.tan_of(core.deg_to_rad(cam.fov) * 0.5)
+    low_y = 0.0
+    high_y = 0.0
+    low_x = 0.0
+    high_x = 0.0
+    i = 0
+    while i < pts.count {
+        d = core.v3_sub(points_at(pts, i), eye)
+        z = core.v3_dot(d, front)
+        if z > 0.0 {
+            ny = core.v3_dot(d, up) / (z * t)
+            nx = core.v3_dot(d, right) / (z * t * cam.aspect)
+            if i == 0 || ny < low_y { low_y = ny }
+            if i == 0 || ny > high_y { high_y = ny }
+            if i == 0 || nx < low_x { low_x = nx }
+            if i == 0 || nx > high_x { high_x = nx }
+        }
+        i = i + 1
+    }
+    return core.vec3((high_x + low_x) * 0.5, (high_y + low_y) * 0.5, 0.0)
+}
+
+// The camera put there, turned that way, its planes fitted.
+frame(cam: *Camera, pts: *Points, share: float, yaw: float, pitch: float) -> Framing {
+    f = framing_of(cam, pts, share, yaw, pitch)
+    if !f.ok { return f }
+    cam.yaw = yaw
+    cam.pitch = pitch
+    core.camera_update_vectors(cam)
+    cam.position = f.position
+    fit_depth(cam, pts)
+    return f
+}
+
+// The same, eased toward over `seconds` (the time to close most of the
+// gap), so a framing that follows moving points does not cut: the camera
+// turned toward the angle and moved toward the place a frame's worth.
+frame_eased(cam: *Camera, pts: *Points, share: float, yaw: float, pitch: float, delta: float, seconds: float) -> Framing {
+    f = framing_of(cam, pts, share, yaw, pitch)
+    if !f.ok { return f }
+    k = 1.0
+    if seconds > 0.0 { k = 1.0 - exp(0.0 - delta / seconds) }
+    turn = yaw - cam.yaw
+    while turn > 180.0 { turn = turn - 360.0 }
+    while turn < 0.0 - 180.0 { turn = turn + 360.0 }
+    cam.yaw = cam.yaw + turn * k
+    cam.pitch = cam.pitch + (pitch - cam.pitch) * k
+    core.camera_update_vectors(cam)
+    cam.position = core.v3_add(cam.position, core.v3_mul(core.v3_sub(f.position, cam.position), k))
+    fit_depth(cam, pts)
+    return f
+}
+
+// The near and far planes fitted to the points as the camera sees them
+// now: near half the nearest one's depth, so nothing of them is cut; far
+// four times the furthest one's, with room behind them for the ground
+// they stand on.
+fit_depth(cam: *Camera, pts: *Points) {
+    if cam == null || pts == null || pts.count == 0 { return }
+    nearest = 0.0 - 1.0
+    furthest = 0.0
+    i = 0
+    while i < pts.count {
+        z = core.v3_dot(core.v3_sub(points_at(pts, i), cam.position), cam.front)
+        if z > 0.0 && (nearest < 0.0 || z < nearest) { nearest = z }
+        if z > furthest { furthest = z }
+        i = i + 1
+    }
+    if nearest <= 0.0 || furthest <= 0.0 { return }
+    near = nearest * 0.5
+    far = furthest * 4.0
+    if near < furthest * 0.0001 { near = furthest * 0.0001 }
+    if far <= near * 2.0 { far = near * 2.0 }
+    cam.near = near
+    cam.far = far
+    core.camera_update_projection(cam)
+}

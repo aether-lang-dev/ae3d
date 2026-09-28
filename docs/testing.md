@@ -95,6 +95,17 @@ teleports, one that vanishes on a zoom, a seam that shows from a grazing
 angle, a shadow that slides with the camera. So a scene is verified from a
 sweep, and by number:
 
+- `AE3D_CAMERA_WANDER=n` flies the camera at random through any scene for
+  `n` frames and measures every move against the drawn triangles
+  themselves: the nearest it came to anything, to what and where, and the
+  frames it ended inside a solid or under the ground.
+- The edge of the world, counted: `zombie_city` with `AE3D_SKY=0` draws
+  nothing where nothing is -- black, which no surface is in a frame drawn
+  as normals (`AE3D_CAPTURE=2`) -- and logs the row the horizon crosses;
+  `tools/probe_image.ae frame.png --key 0 0 0 ROW` counts the black pixels
+  from that row down, which is none where the world has no edge in view.
+  `AE3D_HORDE_ONLY=1` draws the horde alone, and the same count is the
+  share of the frame it takes.
 - `AE3D_VIEW=n`, `AE3D_CAMX/Y/Z` and `AE3D_AIMX/Y/Z` place the camera by
   number in the scenes that take them; `scripts/contact_sheet.sh <scene>
   out.png` renders the default view, a low grazing view and a view toward
