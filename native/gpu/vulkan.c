@@ -53,7 +53,9 @@
 /* A cached descriptor set whose texture has been destroyed. Not zero: zero is
    a texture handle nothing uses, and not -1 alone, which reads as an error. */
 #define AE3D_VK_SET_FREE (-2)
-#define AE3D_VK_SHADOW_SIZE 2048
+/* The shadow atlas: four cascades of 2048 texels, two by two
+   (ae3d.cascades' ATLAS and SIZE, #469). */
+#define AE3D_VK_SHADOW_SIZE 4096
 #define AE3D_VK_PROGRAM_SCENE 0
 #define AE3D_VK_PROGRAM_WATER 1
 #define AE3D_VK_PROGRAM_COUNT 2
@@ -5860,6 +5862,28 @@ int ae3d_vk_shadow_begin(void) {
     vk.in_shadow_pass = 1;
     vk.pass_open = 1;
     return 1;
+}
+
+/* The tile of the atlas the next shadow draws land in: `size` texels a
+   side from (x, y), measured from the atlas's first row -- a cascade's
+   tile (#469). */
+void ae3d_vk_shadow_viewport(int x, int y, int size) {
+    VkViewport viewport;
+    VkRect2D scissor;
+    if (!vk.recording || !vk.in_shadow_pass) return;
+    memset(&viewport, 0, sizeof(viewport));
+    viewport.x = (float)x;
+    viewport.y = (float)y;
+    viewport.width = (float)size;
+    viewport.height = (float)size;
+    viewport.maxDepth = 1.0f;
+    ae3d_vkCmdSetViewport(vk.command_buffers[vk.frame], 0, 1, &viewport);
+    memset(&scissor, 0, sizeof(scissor));
+    scissor.offset.x = x;
+    scissor.offset.y = y;
+    scissor.extent.width = (unsigned)size;
+    scissor.extent.height = (unsigned)size;
+    ae3d_vkCmdSetScissor(vk.command_buffers[vk.frame], 0, 1, &scissor);
 }
 
 void ae3d_vk_shadow_draw(int mesh_handle, int instance_handle, int instance_count) {

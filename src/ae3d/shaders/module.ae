@@ -400,12 +400,14 @@ uniform int lightCount;
 // (position and reach; colour and intensity; direction and kind; the three
 // attenuation terms and the colour temperature; the spot's cone), and the
 // words are each cell's first index and count, then the lists. The cell of a
-// point is read by clusterViewProjection and clusterForward, the matrices
+// point is read by clusterViewProjection and viewDepth, the matrices
 // the grid was cut with, so this lookup and the CPU's cannot disagree.
 uniform vec4 clusterDims;           // columns, rows, slices, cells: whole numbers
 uniform vec4 clusterDepth;          // near, far, log scale, log bias
 uniform mat4 clusterViewProjection;
-uniform vec4 clusterForward;        // depth = dot(.xyz, p) + .w
+// The view's depth plane: a point's depth along the view is dot(.xyz, p) +
+// .w. What the clusters and the shadow's cascades find a pixel by.
+uniform vec4 viewDepth;
 #ifdef VULKAN
 layout(std430, set = 0, binding = 6) readonly buffer ClusterLightBlock { vec4 clusterLightData[]; };
 layout(std430, set = 0, binding = 7) readonly buffer ClusterWordBlock { float clusterWordData[]; };
@@ -429,7 +431,7 @@ int cluster_of(vec3 p) {
     vec4 clip = clusterViewProjection * vec4(p, 1.0);
     float w = clip.w != 0.0 ? clip.w : 1.0;
     vec2 ndc = clip.xy / w;
-    float depth = dot(clusterForward.xyz, p) + clusterForward.w;
+    float depth = dot(viewDepth.xyz, p) + viewDepth.w;
     ivec3 dims = ivec3(clusterDims.xyz + 0.5);
     int x = clamp(int(floor((ndc.x * 0.5 + 0.5) * float(dims.x))), 0, dims.x - 1);
     int y = clamp(int(floor((ndc.y * 0.5 + 0.5) * float(dims.y))), 0, dims.y - 1);
@@ -570,10 +572,19 @@ uniform float shadowSoftness; // Chapter 11: Shadow edge softness for antialiasi
 // the angle it makes with the map, and using the wrong one of the two striped
 // every wall the map happened to graze.
 uniform vec3 shadowDirection;
-// How much of the world one shadow-map texel covers. Everything about the map
-// scales with the box it was fitted to, and this is the number that says by how
-// much.
-uniform float shadowTexelWorld;
+// The key light's shadow in cascades (ae3d.cascades, #469): the view cut in
+// depth into cascadeCount slices, each with a map of its own in one atlas,
+// two by two, cascade i in the tile (i % 2, i / 2). cascadeSplits is the
+// view depth each cascade ends at, cascadeTexelWorld how much of the world
+// one texel of its map covers -- what a surface's offset scales by -- and
+// cascadeMatrices the matrices its map was drawn with. Each is fitted so a
+// moving camera moves no shadow: a sphere around its slice, whose size the
+// view's angle does not change, on its own texel grid.
+#define MAX_CASCADES 4
+uniform mat4 cascadeMatrices[4];      // MAX_CASCADES: the generator reads a literal size
+uniform vec4 cascadeSplits;
+uniform vec4 cascadeTexelWorld;
+uniform int cascadeCount;
 // Shadows by ray: where the Vulkan device has ray queries and the renderer
 // has built the scene's acceleration structure, a ray from the surface
 // toward the sun says what stands in the way, exactly, at any distance,
@@ -635,6 +646,56 @@ float light_depth(float clipZ) {
     return clipZ * 0.5 + 0.5;
 }
 
+// How lit a point is in cascade `c`: 1 lit, 0 shadowed, between at an
+// edge. The sample is moved off the surface along its normal by a texel of
+// this cascade and more the more the surface grazes the light -- sideways
+// rather than deeper into the map, since a depth bias large enough to stop
+// a grazing wall striping itself lifts every shadow off the ground with
+// it -- and the 3x3 taps stay inside the cascade's tile, where a tap across
+// its edge would read the next cascade's depths.
+float cascade_lit(int c, vec3 surface, float slope) {
+    vec4 lightSpace = cascadeMatrices[c] *
+        vec4(FragPos + surface * cascadeTexelWorld[c] * (1.0 + slope), 1.0);
+    vec3 projected = lightSpace.xyz / lightSpace.w;
+    projected.xy = projected.xy * 0.5 + 0.5;
+    projected.z = light_depth(projected.z);
+    if (projected.z > 1.0) {
+        return 1.0;
+    }
+    // Outside the cascade's map sideways is outside its box, where nothing
+    // was drawn: lit, not the edge texel's depth compared against whatever
+    // lies there.
+    if (projected.x < 0.0 || projected.x > 1.0 || projected.y < 0.0 || projected.y > 1.0) {
+        return 1.0;
+    }
+
+    vec2 texel = 1.0 / vec2(textureSize(shadowMap, 0));
+    // At least one texel between taps. Below that the nine samples of the
+    // 3x3 land on the same texel and cost nine lookups to produce what one
+    // would, and the edge is as hard as no filtering at all.
+    float radius = max(shadowSoftness, 1.0);
+    vec2 tile = vec2(float(c % 2), float(c / 2)) * 0.5;
+    vec2 centre = tile + projected.xy * 0.5;
+    vec2 lo = tile + texel * (radius + 0.5);
+    vec2 hi = tile + vec2(0.5) - texel * (radius + 0.5);
+
+    // The depth a texel of the cascade spans is the same fraction of its
+    // box however large the box: a bias in texels of the cascade's own map
+    // (half the atlas a side) fits every cascade alike. The offset above
+    // has already taken the slope out of it.
+    float bias = radius / (float(textureSize(shadowMap, 0).x) * 0.5);
+
+    float lit = 0.0;
+    for (int sx = -1; sx <= 1; sx++) {
+        for (int sy = -1; sy <= 1; sy++) {
+            vec2 at = clamp(centre + vec2(float(sx), float(sy)) * texel * radius, lo, hi);
+            float closest = texture(shadowMap, at).r;
+            lit += projected.z - bias > closest ? 0.0 : 1.0;
+        }
+    }
+    return lit / 9.0;
+}
+
 float shadow_factor() {
     vec3 surface = normalize(Normal);
     vec3 toLight = normalize(-shadowDirection);
@@ -646,55 +707,30 @@ float shadow_factor() {
     float facing = max(dot(surface, toLight), 0.0);
     float slope = min(sqrt(1.0 - facing * facing) / max(facing, 0.02), 32.0);
 
-    // Offset along the surface rather than into the depth. Pushing the
-    // comparison deeper is what a depth bias does, and enough of it to stop a
-    // grazing wall striping itself is enough to lift every shadow off the
-    // ground with it. Moving the sample sideways by the width of a texel costs
-    // the same and detaches nothing.
-    vec4 lightSpace = lightSpaceMatrix *
-        vec4(FragPos + surface * shadowTexelWorld * (1.0 + slope), 1.0);
-    vec3 projected = lightSpace.xyz / lightSpace.w;
-    projected.xy = projected.xy * 0.5 + 0.5;
-    projected.z = light_depth(projected.z);
-    if (projected.z > 1.0) {
-        return 1.0;
-    }
-    // Outside the map sideways is outside the light box, where nothing was
-    // drawn into the map: lit, not the edge texel's depth compared against
-    // whatever happens to lie there. A floor running past the box was shaded
-    // by the box's border, a dark band with a straight edge across it.
-    if (projected.x < 0.0 || projected.x > 1.0 || projected.y < 0.0 || projected.y > 1.0) {
-        return 1.0;
-    }
-
-    vec2 texel = 1.0 / vec2(textureSize(shadowMap, 0));
-    // At least one texel between taps. Below that the nine samples of the 3x3
-    // land on the same texel and cost nine lookups to produce what one would,
-    // and the edge is as hard as no filtering at all.
-    float radius = max(shadowSoftness, 1.0);
-
-    // The offset a surface needs in order not to shadow itself is the depth one
-    // shadow texel spans, and a texel is worth the same fraction of the light
-    // box however large the box is: the texel and the depth range scale
-    // together. A constant in normalised depth does not, so it was sized for
-    // one scene and swallowed whole figures in a larger one -- a street ninety
-    // metres long left nothing standing in it casting anything at all. A
-    // surface nearly edge-on to the light spans more depth across that texel,
-    // which is what the slope term is for.
-    // What is left for the depth comparison is the texel the sample landed in,
-    // which the offset above has already taken the slope out of.
-    float bias = 2.0 * radius / (2.0 * float(textureSize(shadowMap, 0).x));
-
-    float lit = 0.0;
-    for (int sx = -1; sx <= 1; sx++) {
-        for (int sy = -1; sy <= 1; sy++) {
-            vec2 at = projected.xy + vec2(float(sx), float(sy)) * texel * radius;
-            float closest = texture(shadowMap, at).r;
-            lit += projected.z - bias > closest ? 0.0 : 1.0;
+    // The pixel's cascade by its depth along the view; past the last one,
+    // the shadow's range, it is lit.
+    float depth = dot(viewDepth.xyz, FragPos) + viewDepth.w;
+    int c = -1;
+    for (int i = 0; i < MAX_CASCADES; i++) {
+        if (i < cascadeCount && depth <= cascadeSplits[i]) {
+            c = i;
+            break;
         }
     }
-    lit = lit / 9.0;
-
+    if (c < 0) {
+        return 1.0;
+    }
+    float lit = cascade_lit(c, surface, slope);
+    // Over the last tenth of a cascade the next one blends in, so where the
+    // shadow's texels change size there is a gradient and no seam.
+    if (c + 1 < cascadeCount) {
+        float start = c == 0 ? 0.0 : cascadeSplits[c - 1];
+        float band = (cascadeSplits[c] - start) * 0.1;
+        float into = (cascadeSplits[c] - depth) / max(band, 0.0001);
+        if (into < 1.0) {
+            lit = mix(cascade_lit(c + 1, surface, slope), lit, into);
+        }
+    }
     return mix(shadowIntensity, 1.0, lit);
 }
 

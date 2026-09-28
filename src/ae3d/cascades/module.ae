@@ -1,0 +1,235 @@
+// The key light's shadow in cascades, fitted so the camera moves no shadow
+// (#469).
+//
+// One shadow map over the whole view is either sharp near the camera and
+// cut off a few metres out, or everywhere and blurred; and a map fitted to
+// the camera and snapped to the world's axes slides by fractions of a texel
+// whenever the camera moves, so every shadow edge crawls, and past its
+// distance there are no shadows at all. Cascades are the standing answer:
+// the view is cut in depth into COUNT slices, near ones short and far ones
+// long, and each gets a map of its own of the same size -- sharp near,
+// present far.
+//
+// Each cascade is fitted so the camera moves no shadow:
+//
+//   - its slice of the view is enclosed in the smallest sphere around it.
+//     A sphere does not change size as the camera turns -- the slice's
+//     corners turn about its axis with it -- so the map's texels stay the
+//     same size, where a box fitted to the slice's corners would grow and
+//     shrink with the view's angle to the light;
+//   - the map's origin is kept on its own texel grid: the world's origin,
+//     projected into the map, is moved to the nearest whole texel, so as
+//     the camera moves the map moves by whole texels, and a shadow edge
+//     lands on the same texels whatever the camera does;
+//   - its depth runs back from the slice toward the light as far as the
+//     scene reaches, so whatever stands between the light and the slice
+//     still casts into it.
+//
+// The splits are the "practical" scheme: LAMBDA of the logarithmic split
+// (each cascade a fixed multiple deeper than the last, which matches how a
+// texel's footprint grows with distance) and the rest uniform, so the near
+// cascade is not a sliver.
+//
+// The maps share one depth atlas of ATLAS texels a side, two by two;
+// cascade i is the tile (i % 2, i / 2). ae3d.gl and ae3d.vulkan draw each
+// cascade's casters into its tile with its matrix, and the scene shader
+// picks a pixel's cascade by its depth along the view, blending the next
+// one in over the last tenth of each so no seam shows.
+
+import std.list
+import ae3d.core
+
+exports (
+    Cascades, cascades_new, cascades_free, fit, matrix, split, texel_world, radius_of,
+    scene_sphere, travel_of,
+    COUNT, SIZE, ATLAS, LAMBDA
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern sqrt(x: float) -> float
+extern pow(x: float, y: float) -> float
+extern floor(x: float) -> float
+extern ceil(x: float) -> float
+
+const COUNT = 4
+const SIZE = 2048
+const ATLAS = 4096
+const LAMBDA = 0.75
+
+struct Cascades {
+    count: int
+    near: float
+    range: float
+    splits: ptr                  // float[COUNT]: the view depth each ends at
+    texels: ptr                  // float[COUNT]: a texel's width in metres
+    m0: Mat4
+    m1: Mat4
+    m2: Mat4
+    m3: Mat4
+    radii: ptr                   // float[COUNT]: each cascade's sphere
+    centres: ptr                 // float[COUNT * 3]
+}
+
+cascades_new() -> *Cascades {
+    c = calloc(1, sizeof(Cascades)) as *Cascades
+    c.count = COUNT
+    c.splits = calloc(COUNT, 8)
+    c.texels = calloc(COUNT, 8)
+    c.radii = calloc(COUNT, 8)
+    c.centres = calloc(COUNT * 3, 8)
+    return c
+}
+
+cascades_free(c: *Cascades) {
+    if c == null { return }
+    free(c.splits)
+    free(c.texels)
+    free(c.radii)
+    free(c.centres)
+    free(c as ptr)
+}
+
+split(c: *Cascades, i: int) -> float { return (c.splits as float[])[i] }
+radius_of(c: *Cascades, i: int) -> float { return (c.radii as float[])[i] }
+texel_world(c: *Cascades, i: int) -> float { return (c.texels as float[])[i] }
+
+matrix(c: *Cascades, i: int) -> Mat4 {
+    if i == 1 { return c.m1 }
+    if i == 2 { return c.m2 }
+    if i == 3 { return c.m3 }
+    return c.m0
+}
+
+set_matrix(c: *Cascades, i: int, m: Mat4) {
+    if i == 0 { c.m0 = m }
+    if i == 1 { c.m1 = m }
+    if i == 2 { c.m2 = m }
+    if i == 3 { c.m3 = m }
+}
+
+// The cascades for this frame: `cam`'s view out to `range` metres, lit
+// along `travel` (the way the light goes, unit length), over a scene that
+// fits in the sphere at `scene_centre` of `scene_radius`.
+fit(c: *Cascades, cam: *Camera, travel: Vec3, range: float, scene_centre: Vec3, scene_radius: float) {
+    near = cam.near
+    if near < 0.05 { near = 0.05 }
+    far = range
+    if far < near * 2.0 { far = near * 2.0 }
+    c.near = near
+    c.range = far
+    forward = core.v3_normalize(cam.front)
+    eye = cam.position
+
+    // The slice's corners sit at k times their depth off the view's axis.
+    p = core.camera_projection(cam)
+    tan_x = 1.0 / p.m0
+    tan_y = 1.0 / p.m5
+    k = sqrt(tan_x * tan_x + tan_y * tan_y)
+
+    up = core.vec3(0.0, 1.0, 0.0)
+    if travel.y > 0.99 || travel.y < 0.0 - 0.99 { up = core.vec3(0.0, 0.0, 1.0) }
+
+    splits = c.splits as float[]
+    texels = c.texels as float[]
+    radii = c.radii as float[]
+    centres = c.centres as float[]
+    i = 0
+    while i < COUNT {
+        t = ((i + 1) as float) / (COUNT as float)
+        logarithmic = near * pow(far / near, t)
+        even = near + (far - near) * t
+        splits[i] = LAMBDA * logarithmic + (1.0 - LAMBDA) * even
+        i = i + 1
+    }
+    splits[COUNT - 1] = far
+
+    i = 0
+    while i < COUNT {
+        dn = near
+        if i > 0 { dn = splits[i - 1] }
+        df = splits[i]
+        // The sphere's centre on the axis where its distance to the near
+        // corners equals its distance to the far ones; past the far cap
+        // when the slice is wide, where the far cap alone bounds it.
+        z = (df + dn) * (1.0 + k * k) * 0.5
+        if z > df { z = df }
+        r_near = sqrt((z - dn) * (z - dn) + dn * k * dn * k)
+        r_far = sqrt((df - z) * (df - z) + df * k * df * k)
+        r = r_near
+        if r_far > r { r = r_far }
+        // Rounded up to a sixteenth of a metre, so arithmetic noise in the
+        // camera's fov never changes a texel's size.
+        r = ceil(r * 16.0) / 16.0
+        centre = core.v3_add(eye, core.v3_mul(forward, z))
+
+        // Back toward the light as far as the scene goes, and a metre more.
+        reach = core.v3_dot(core.v3_sub(scene_centre, centre), core.v3_mul(travel, 0.0 - 1.0)) + scene_radius
+        back = r
+        if reach > back { back = reach }
+        back = back + 1.0
+        light_eye = core.v3_sub(centre, core.v3_mul(travel, back))
+        view = core.mat4_look_at(light_eye, centre, up)
+        projection = core.mat4_ortho(0.0 - r, r, 0.0 - r, r, 0.01, back + r)
+        m = core.mat4_mul(projection, view)
+
+        // The world's origin onto a whole texel of the map: every point then
+        // moves by whole texels as the camera does.
+        origin = core.mat4_mul_v4(m, Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 })
+        half = (SIZE as float) * 0.5
+        tx = origin.x * half
+        ty = origin.y * half
+        m.m12 = m.m12 + (floor(tx + 0.5) - tx) / half
+        m.m13 = m.m13 + (floor(ty + 0.5) - ty) / half
+
+        set_matrix(c, i, m)
+        texels[i] = 2.0 * r / (SIZE as float)
+        radii[i] = r
+        centres[i * 3] = centre.x
+        centres[i * 3 + 1] = centre.y
+        centres[i * 3 + 2] = centre.z
+        i = i + 1
+    }
+}
+
+// The sphere the scene's visible casters stand in: their bounds' centre,
+// and the farthest of them from it. xyz the centre, w the radius.
+scene_sphere(models: ptr) -> Vec4 {
+    centre = core.vec3(0.0, 0.0, 0.0)
+    shown = 0
+    count = list.size(models)
+    i = 0
+    while i < count {
+        m = list.get_raw(models, i) as *Model
+        if m != null && m.visible && m.casts_shadow {
+            centre = core.v3_add(centre, m.bounding_center)
+            shown = shown + 1
+        }
+        i = i + 1
+    }
+    if shown > 0 { centre = core.v3_mul(centre, 1.0 / (shown as float)) }
+    radius = 1.0
+    i = 0
+    while i < count {
+        m = list.get_raw(models, i) as *Model
+        if m != null && m.visible && m.casts_shadow {
+            span = core.v3_len(core.v3_sub(m.bounding_center, centre)) + m.bounding_radius
+            if span > radius { radius = span }
+        }
+        i = i + 1
+    }
+    return core.vec4(centre.x, centre.y, centre.z, radius)
+}
+
+// The way the key light's light travels, unit length. A light's direction
+// points at the light, the way the shading reads it, so a directional
+// light travels the other way about; a point light travels from where it
+// is toward what it lights.
+travel_of(light: *Light, toward: Vec3) -> Vec3 {
+    travel = core.v3_mul(core.v3_normalize(light.direction), 0.0 - 1.0)
+    if light.mode != core.MODE_DIRECTIONAL {
+        travel = core.v3_sub(toward, light.position)
+    }
+    if core.v3_len(travel) < 0.001 { return core.vec3(0.0, 0.0 - 1.0, 0.0) }
+    return core.v3_normalize(travel)
+}

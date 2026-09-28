@@ -129,6 +129,7 @@ int    ae3d_vk_frames_in_flight(void);
 void  *ae3d_vk_frame_image(void);
 void  *ae3d_vk_frame_view(void);
 int    ae3d_vk_clusters_reserve(long light_bytes, long word_bytes);
+void   ae3d_vk_shadow_viewport(int x, int y, int size);
 void  *ae3d_vk_clusters_lights(void);
 void  *ae3d_vk_clusters_words(void);
 int    ae3d_vk_frame_format(void);

@@ -18,6 +18,7 @@ import ae3d.png
 import ae3d.platform
 import ae3d.rendering
 import ae3d.lightgrid
+import ae3d.cascades
 import ae3d.shaders
 import ae3d.skin
 import ae3d.posing
@@ -1460,7 +1461,6 @@ gl_buffer_delete(buffer: int) {
 }
 
 const MAX_FBO_DIMENSION = 8192
-const SHADOW_SIZE = 2048
 const MAX_LIGHTS = 16
 const LIGHT_SLOTS = 12
 
@@ -1472,7 +1472,11 @@ struct ProgramSlots {
     cluster_dims: int
     cluster_depth: int
     cluster_view_projection: int
-    cluster_forward: int
+    view_depth: int
+    cascade_matrices: int
+    cascade_splits: int
+    cascade_texel_world: int
+    cascade_count: int
     cluster_lights: int
     cluster_words: int
     view_projection: int
@@ -1538,7 +1542,6 @@ struct ProgramSlots {
     caustics_time: int
     fog_enabled: int
     shadow_direction: int
-    shadow_texel_world: int
     enable_shadows: int
     shadow_intensity: int
     shadow_softness: int
@@ -1653,7 +1656,10 @@ struct GLRenderer {
     shadow_distance: float
     shadow_space: Mat4
     shadow_direction: Vec3
-    shadow_texel_world: float
+    // The key light's cascades this frame (ae3d.cascades, #469), and the
+    // single casters the shadow pass draws into each.
+    cascades: ptr
+    shadow_singles: ptr
     fog: Fog
 
     clear_r: float
@@ -1794,6 +1800,8 @@ renderer_free(r: *GLRenderer) {
     if r == null { return }
     renderer_cleanup(r)
     gl_geometry_shutdown()
+    if r.cascades != null { cascades.cascades_free(r.cascades as *Cascades) }
+    if r.shadow_singles != null { list.free(r.shadow_singles) }
     if r.models != null { list.free(r.models) }
     if r.lights != null { list.free(r.lights) }
     if r.programs != null {
@@ -1907,7 +1915,11 @@ slots_for(r: *GLRenderer, program: int) -> *ProgramSlots {
     s.cluster_dims = gl_uniform_location(program, "clusterDims")
     s.cluster_depth = gl_uniform_location(program, "clusterDepth")
     s.cluster_view_projection = gl_uniform_location(program, "clusterViewProjection")
-    s.cluster_forward = gl_uniform_location(program, "clusterForward")
+    s.view_depth = gl_uniform_location(program, "viewDepth")
+    s.cascade_matrices = gl_uniform_location(program, "cascadeMatrices")
+    s.cascade_splits = gl_uniform_location(program, "cascadeSplits")
+    s.cascade_texel_world = gl_uniform_location(program, "cascadeTexelWorld")
+    s.cascade_count = gl_uniform_location(program, "cascadeCount")
     s.cluster_lights = gl_uniform_location(program, "clusterLights")
     s.cluster_words = gl_uniform_location(program, "clusterWords")
     s.light_space = gl_uniform_location(program, "lightSpaceMatrix")
@@ -1958,7 +1970,6 @@ slots_for(r: *GLRenderer, program: int) -> *ProgramSlots {
     s.frame_exposure = gl_uniform_location(program, "frameExposure")
     s.caustics_time = gl_uniform_location(program, "causticsTime")
     s.shadow_direction = gl_uniform_location(program, "shadowDirection")
-    s.shadow_texel_world = gl_uniform_location(program, "shadowTexelWorld")
     s.enable_shadows = gl_uniform_location(program, "enableShadows")
     s.shadow_intensity = gl_uniform_location(program, "shadowIntensity")
     s.shadow_softness = gl_uniform_location(program, "shadowSoftness")
@@ -2689,7 +2700,7 @@ renderer_set_shadows(r: *GLRenderer, on: bool) {
     if !on || !r.initialized || r.shadow_fbo != 0 { return }
 
     r.shadow_fbo = gl_fbo_create()
-    r.shadow_map = gl_fbo_attach_shadow_map(r.shadow_fbo, SHADOW_SIZE)
+    r.shadow_map = gl_fbo_attach_shadow_map(r.shadow_fbo, cascades.ATLAS)
     bind_output(r)
     if r.shadow_map == 0 { r.shadow_enabled = false }
 }
@@ -2709,88 +2720,37 @@ renderer_set_shadow_distance(r: *GLRenderer, metres: float) {
 
 renderer_shadow_distance(r: *GLRenderer) -> float { return r.shadow_distance }
 
-// The light's box has to cover what the camera can see, so it is centred on the
-// scene and sized to it rather than to the light.
-light_space_matrix(r: *GLRenderer, light: *Light, cam: *Camera) -> Mat4 {
-    centre = core.vec3(0.0, 0.0, 0.0)
-    radius = 1.0
-    shown = 0
-
-    count = list.size(r.models)
-    i = 0
-    while i < count {
-        m = list.get_raw(r.models, i) as *Model
-        if m != null && m.visible {
-            centre = core.v3_add(centre, m.bounding_center)
-            shown = shown + 1
-        }
-        i = i + 1
+// The key light's shadow for this frame, in cascades (ae3d.cascades,
+// #469): fitted to the camera's view out to the shadow distance -- or, with
+// none set, as far as the scene reaches -- so a moving camera moves no
+// shadow, and lit along the key light.
+fit_cascades(r: *GLRenderer, light: *Light, cam: *Camera) {
+    if r.cascades == null { r.cascades = cascades.cascades_new() as ptr }
+    c = r.cascades as *Cascades
+    sphere = cascades.scene_sphere(r.models)
+    centre = core.vec3(sphere.x, sphere.y, sphere.z)
+    travel = cascades.travel_of(light, centre)
+    r.shadow_direction = travel
+    range = r.shadow_distance
+    if range <= 0.0 {
+        range = core.v3_len(core.v3_sub(centre, cam.position)) + sphere.w
+        if range > cam.far { range = cam.far }
     }
-    if shown > 0 { centre = core.v3_mul(centre, 1.0 / (shown * 1.0)) }
-
-    // A map fitted to the whole world is a map with nothing left for the things
-    // in it: a ground plane ninety metres across pushes the box out until the
-    // depth range swallows a figure two metres tall, and the shadow disappears
-    // with no error anywhere. A shadow distance fits the box to what the camera
-    // can see instead, so how sharp a shadow is stops depending on how big the
-    // world is.
-    if r.shadow_distance > 0.0 && cam != null {
-        centre = core.v3_add(cam.position,
-                             core.v3_mul(cam.front, r.shadow_distance * 0.5))
-        // Snap the box centre to the shadow map's world-texel grid, so the map
-        // covers the same texels frame to frame and only ever shifts by whole
-        // texels. Without it the box slides continuously with the camera and the
-        // shadow edges crawl and shimmer as you move -- the classic swim. The
-        // moon is near enough to straight down that snapping on the world axes
-        // stands in for snapping on the light's own.
-        texel = r.shadow_distance * 2.0 / (SHADOW_SIZE * 1.0)
-        centre = core.vec3(snap_to(centre.x, texel), snap_to(centre.y, texel),
-                           snap_to(centre.z, texel))
-        return light_box(r, light, centre, r.shadow_distance)
-    }
-
-    i = 0
-    while i < count {
-        m = list.get_raw(r.models, i) as *Model
-        if m != null && m.visible {
-            span = core.v3_len(core.v3_sub(m.bounding_center, centre)) + m.bounding_radius
-            if span > radius { radius = span }
-        }
-        i = i + 1
-    }
-
-    return light_box(r, light, centre, radius)
+    cascades.fit(c, cam, travel, range, centre, sphere.w)
+    r.shadow_space = cascades.matrix(c, 0)
 }
 
-// Round a coordinate to the nearest multiple of `t`, for either sign.
-snap_to(v: float, t: float) -> float {
-    if t <= 0.0 { return v }
-    n = v / t
-    k = 0
-    if n >= 0.0 { k = (n + 0.5) as int } else { k = (n - 0.5) as int }
-    return (k as float) * t
-}
-
-// A light's direction points at the light, the way the shading does it, so the
-// way the light travels is the other way about. A point light travels from
-// where it is towards what it lights.
-light_box(r: *GLRenderer, light: *Light, centre: Vec3, radius: float) -> Mat4 {
-    direction = core.v3_mul(core.v3_normalize(light.direction), 0.0 - 1.0)
-    if light.mode != core.MODE_DIRECTIONAL {
-        direction = core.v3_normalize(core.v3_sub(centre, light.position))
-    }
-    if core.v3_len(direction) < 0.001 { direction = core.vec3(0.0, 0.0 - 1.0, 0.0) }
-    r.shadow_direction = direction
-    r.shadow_texel_world = radius * 2.0 / (SHADOW_SIZE * 1.0)
-
-    eye = core.v3_sub(centre, core.v3_mul(direction, radius * 2.0))
-    up = core.vec3(0.0, 1.0, 0.0)
-    if core.abs_of(direction.y) > 0.99 { up = core.vec3(0.0, 0.0, 1.0) }
-
-    view = core.mat4_look_at(eye, centre, up)
-    projection = core.mat4_ortho(0.0 - radius, radius, 0.0 - radius, radius,
-                                 0.01, radius * 4.0)
-    return core.mat4_mul(projection, view)
+// Whether a caster's bounds reach cascade `k`'s map: its sphere, projected
+// by the cascade's matrix, against the map's square and its far plane.
+// Nearer the light than the map there is no limit: whatever stands there
+// casts into it.
+in_cascade(c: *Cascades, k: int, m: *Model) -> bool {
+    space = cascades.matrix(c, k)
+    p = core.mat4_mul_v4(space, Vec4 { x: m.bounding_center.x, y: m.bounding_center.y, z: m.bounding_center.z, w: 1.0 })
+    reach = m.bounding_radius / cascades.radius_of(c, k)
+    if p.x > 1.0 + reach || p.x < 0.0 - 1.0 - reach { return false }
+    if p.y > 1.0 + reach || p.y < 0.0 - 1.0 - reach { return false }
+    return p.z < 1.0 + reach
 }
 
 render_shadow_pass(r: *GLRenderer, light: *Light, cam: *Camera) {
@@ -2798,10 +2758,11 @@ render_shadow_pass(r: *GLRenderer, light: *Light, cam: *Camera) {
         return
     }
 
-    r.shadow_space = light_space_matrix(r, light, cam)
+    fit_cascades(r, light, cam)
+    c = r.cascades as *Cascades
 
     gl_fbo_bind(r.shadow_fbo)
-    gl_viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE)
+    gl_viewport(0, 0, cascades.ATLAS, cascades.ATLAS)
 
     // The post pass and the skybox both turn depth writes off, so the state they
     // leave behind would let this pass clear the map and then write nothing.
@@ -2809,25 +2770,15 @@ render_shadow_pass(r: *GLRenderer, light: *Light, cam: *Camera) {
     gl_set_depth_mask(1)
     set_blend(r, false)
     set_face_culling(r, false)
-    // Depth only: the map has no colour attachment, and depth clears to the far
-    // value the lit pass reads as "nothing between here and the light".
+    // Depth only: the atlas has no colour attachment, and depth clears to the
+    // far value the lit pass reads as "nothing between here and the light".
     gl_clear(0, 1)
 
-    use_program(r, r.shadow_program)
-    space = gl_uniform_location(r.shadow_program, "lightSpaceMatrix")
-    model_slot = gl_uniform_location(r.shadow_program, "model")
-    instanced_slot = gl_uniform_location(r.shadow_program, "isInstanced")
-    points_slot = gl_uniform_location(r.shadow_program, "instancePoints")
-    billboard_slot = gl_uniform_location(r.shadow_program, "instanceBillboard")
-    view_pos_slot = gl_uniform_location(r.shadow_program, "viewPos")
-    gl_uniform_vec3(view_pos_slot, cam.position.x, cam.position.y, cam.position.z)
-    skinned_slot = gl_uniform_location(r.shadow_program, "isSkinned")
-    bones_slot = gl_uniform_location(r.shadow_program, "bones")
-    gl_uniform_mat4(space, &r.shadow_space)
-
+    // What casts, gathered once: the models that merge into batches by
+    // their mesh, and the rest, drawn one by one into each cascade.
+    if r.shadow_singles == null { r.shadow_singles = list.new() }
+    list.clear(r.shadow_singles)
     r.shadow_batch_count = 0
-    identity = core.mat4_ident()
-
     count = list.size(r.models)
     i = 0
     while i < count {
@@ -2857,6 +2808,42 @@ render_shadow_pass(r: *GLRenderer, light: *Light, cam: *Camera) {
             if moved { b.stale = true }
             b.count = b.count + 1
         } else {
+            list.add_raw(r.shadow_singles, m as ptr)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < r.shadow_batch_count {
+        b = list.get_raw(r.shadow_batches, i) as *GLBatch
+        if b.count != list.size(b.members) { b.stale = true }
+        if b.stale { fill_batch(r, b) }
+        i = i + 1
+    }
+
+    identity = core.mat4_ident()
+    k = 0
+    while k < cascades.COUNT {
+        // Cascade k's tile of the atlas, two by two.
+        gl_viewport((k % 2) * cascades.SIZE, (k / 2) * cascades.SIZE, cascades.SIZE, cascades.SIZE)
+        r.shadow_space = cascades.matrix(c, k)
+
+        use_program(r, r.shadow_program)
+        space = gl_uniform_location(r.shadow_program, "lightSpaceMatrix")
+        model_slot = gl_uniform_location(r.shadow_program, "model")
+        instanced_slot = gl_uniform_location(r.shadow_program, "isInstanced")
+        points_slot = gl_uniform_location(r.shadow_program, "instancePoints")
+        billboard_slot = gl_uniform_location(r.shadow_program, "instanceBillboard")
+        view_pos_slot = gl_uniform_location(r.shadow_program, "viewPos")
+        gl_uniform_vec3(view_pos_slot, cam.position.x, cam.position.y, cam.position.z)
+        skinned_slot = gl_uniform_location(r.shadow_program, "isSkinned")
+        bones_slot = gl_uniform_location(r.shadow_program, "bones")
+        gl_uniform_mat4(space, &r.shadow_space)
+
+        i = 0
+        while i < list.size(r.shadow_singles) {
+            m = list.get_raw(r.shadow_singles, i) as *Model
+            i = i + 1
+            if !in_cascade(c, k, m) { continue }
             instanced = 0
             if m.is_instanced && core.model_instance_count(m) > 0 { instanced = 1 }
             gl_uniform_int(instanced_slot, instanced)
@@ -2882,36 +2869,38 @@ render_shadow_pass(r: *GLRenderer, light: *Light, cam: *Camera) {
             gl_vao_bind(depth_vao(m))
             draw_depth(r, m, instanced)
         }
-        i = i + 1
-    }
 
-    i = 0
-    while i < r.shadow_batch_count {
-        b = list.get_raw(r.shadow_batches, i) as *GLBatch
-        if b.count != list.size(b.members) { b.stale = true }
-        if b.stale { fill_batch(r, b) }
-        first = b.first as *Model
-        if b.count == 1 {
-            gl_uniform_int(instanced_slot, 0)
-            gl_uniform_int(points_slot, 0)
-            gl_uniform_mat4(model_slot, &first.model_matrix)
-            pose_depth(skinned_slot, bones_slot, first)
-            gl_vao_bind(first.vao)
-            draw_depth(r, first, 0)
-        } else if b.count > 1 {
-            gl_uniform_int(instanced_slot, 1)
-            gl_uniform_int(points_slot, 0)
-            gl_uniform_int(skinned_slot, 0)
-            gl_uniform_mat4(model_slot, &identity)
-            gl_vao_bind(b.vao)
-            gl_batch_upload(b.vao, b as ptr, b.instances, b.stale)
-            b.stale = false
-            gl_draw_elements_instanced(core.mesh_index_count(first.mesh), 0, b.count)
-            r.last_draw_calls = r.last_draw_calls + 1
+        i = 0
+        while i < r.shadow_batch_count {
+            b = list.get_raw(r.shadow_batches, i) as *GLBatch
+            first = b.first as *Model
+            if b.count == 1 {
+                if in_cascade(c, k, first) {
+                    gl_uniform_int(instanced_slot, 0)
+                    gl_uniform_int(points_slot, 0)
+                    gl_uniform_mat4(model_slot, &first.model_matrix)
+                    pose_depth(skinned_slot, bones_slot, first)
+                    gl_vao_bind(first.vao)
+                    draw_depth(r, first, 0)
+                }
+            } else if b.count > 1 {
+                gl_uniform_int(instanced_slot, 1)
+                gl_uniform_int(points_slot, 0)
+                gl_uniform_int(skinned_slot, 0)
+                gl_uniform_mat4(model_slot, &identity)
+                gl_vao_bind(b.vao)
+                gl_batch_upload(b.vao, b as ptr, b.instances, b.stale)
+                b.stale = false
+                gl_draw_elements_instanced(core.mesh_index_count(first.mesh), 0, b.count)
+                r.last_draw_calls = r.last_draw_calls + 1
+            }
+            i = i + 1
         }
-        i = i + 1
+        render_crowd_shadows(r)
+        k = k + 1
     }
-    render_crowd_shadows(r)
+    // The lit pass's vertex stage reads the nearest cascade's matrix.
+    r.shadow_space = cascades.matrix(c, 0)
 
     gl_vao_bind(0)
     bind_output(r)
@@ -4017,6 +4006,10 @@ set_frame_uniforms(r: *GLRenderer, slots: *ProgramSlots, view_projection: *Mat4,
 
     upload_lights(slots, lights, light)
     cluster_uniforms(r, slots)
+    // The view's depth plane: what the lamps' clusters and the shadow's
+    // cascades both find a pixel by, the frame's whatever else is on.
+    forward = core.v3_normalize(cam.front)
+    gl_uniform_vec4(slots.view_depth, forward.x, forward.y, forward.z, 0.0 - core.v3_dot(forward, cam.position))
 
     gl_uniform_vec3(slots.view_pos, cam.position.x, cam.position.y, cam.position.z)
     gl_uniform_float(slots.view_distance, core.camera_far(cam))
@@ -4148,7 +4141,6 @@ cluster_uniforms(r: *GLRenderer, slots: *ProgramSlots) {
     gl_uniform_vec4(slots.cluster_dims, g.columns as float, g.rows as float, g.slices as float, cells as float)
     gl_uniform_vec4(slots.cluster_depth, g.near, g.far, g.depth_scale, g.depth_bias)
     gl_uniform_mat4(slots.cluster_view_projection, &g.view_projection)
-    gl_uniform_vec4(slots.cluster_forward, g.forward.x, g.forward.y, g.forward.z, g.forward_w)
     gl_uniform_int(slots.cluster_lights, CLUSTER_LIGHT_UNIT)
     gl_uniform_int(slots.cluster_words, CLUSTER_WORD_UNIT)
 }
@@ -4216,7 +4208,7 @@ bind_shadow_map(r: *GLRenderer, slots: *ProgramSlots) {
     gl_uniform_mat4(slots.light_space, &r.shadow_space)
     gl_uniform_vec3(slots.shadow_direction, r.shadow_direction.x,
                          r.shadow_direction.y, r.shadow_direction.z)
-    gl_uniform_float(slots.shadow_texel_world, r.shadow_texel_world)
+    cascade_uniforms(r, slots)
     gl_texture_bind(1, r.shadow_map)
     gl_uniform_int(slots.shadow_map, 1)
     // Leaves unit zero on the default texture, so the cache that decides
@@ -4225,6 +4217,37 @@ bind_shadow_map(r: *GLRenderer, slots: *ProgramSlots) {
     // cache believed the texture was still there and skipped the bind.
     gl_texture_bind(0, r.default_texture)
     r.bound_texture = r.default_texture
+}
+
+// The cascades the lit pass picks a pixel's shadow from: their matrices,
+// where each ends along the view and a texel's width in each.
+cascade_uniforms(r: *GLRenderer, slots: *ProgramSlots) {
+    if r.cascades == null { return }
+    c = r.cascades as *Cascades
+    // The array's four matrices in one call through its first element, the
+    // one way GL promises reaches every element of an array uniform.
+    if slots.cascade_matrices >= 0 {
+        values = calloc(16 * cascades.COUNT, 4)
+        to = values as f32[]
+        k = 0
+        while k < cascades.COUNT {
+            m = cascades.matrix(c, k)
+            from = (&m) as ptr as float[]
+            j = 0
+            while j < 16 {
+                to[k * 16 + j] = from[j] as f32
+                j = j + 1
+            }
+            k = k + 1
+        }
+        glapi.glUniformMatrix4fv(slots.cascade_matrices, cascades.COUNT, glapi.FALSE, values)
+        free(values)
+    }
+    gl_uniform_vec4(slots.cascade_splits, cascades.split(c, 0), cascades.split(c, 1),
+                    cascades.split(c, 2), cascades.split(c, 3))
+    gl_uniform_vec4(slots.cascade_texel_world, cascades.texel_world(c, 0), cascades.texel_world(c, 1),
+                    cascades.texel_world(c, 2), cascades.texel_world(c, 3))
+    gl_uniform_int(slots.cascade_count, cascades.COUNT)
 }
 
 // CRITICAL: an instanced model's transform is already in every instance.

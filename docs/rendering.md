@@ -43,7 +43,8 @@ The feature list in full, with the reasoning behind each. The [README](../README
   direction, whole within an inner angle and gone at an outer with a smooth
   fall-off between, which is what a headlight is -- normal mapping, baked per-vertex occlusion and
   screen-space ambient occlusion from the scene's depth (`engine_set_ssao`,
-  both backends), shadow mapping with a texel-snapped light box (both
+  both backends), the key light's shadow in four cascades that a moving camera does not
+  move ([Shadows](#shadows), both
   backends), volumetric clouds and their shadows, a sky drawn from the sun by
   the hour or a painted one, fog applied after tone mapping, MSAA, FXAA and
   bloom. Screen-space reflections on wet surfaces on
@@ -490,6 +491,48 @@ Held to numbers:
   - OpenGL and Vulkan agree there exactly;
   - the scene pass costs about 0.02–0.03 ms with 64 lamps and about
     0.08 ms with 256.
+
+## Shadows
+
+The key light's shadow is drawn in cascades (`ae3d.cascades`, #469). One
+shadow map fitted around the camera and snapped on the world's axes slid by
+fractions of a texel whenever the camera moved, so every edge crawled, and
+past its distance there were no shadows at all.
+
+- **The splits.** The view is cut in depth into four slices, out to the
+  shadow distance (`engine_set_shadow_distance`), or as far as the scene
+  reaches when none is set. The cuts are three-quarters logarithmic and a
+  quarter uniform, so the near slice is short and sharp and the far one
+  long.
+- **One map each.** Every slice gets a 2048-texel map in one 4096-texel
+  depth atlas, two by two.
+- **The fit.** Each map is fitted to the smallest sphere around its slice
+  of the view. The view's angle does not change a sphere's size, so a texel
+  stays the same size as the camera turns.
+- **The grid.** Each map's origin is kept on its own texel grid: the
+  world's origin, projected into the map, is moved to the nearest whole
+  texel. As the camera moves the map moves by whole texels, and a shadow
+  edge lands on the same texels whatever the camera does.
+- **The casters.** A map's depth runs back toward the light as far as the
+  scene reaches, so what stands between the light and a slice still casts
+  into it. A caster whose bounds miss a cascade is not drawn into it.
+- **The seams.** The scene shader picks a pixel's cascade by its depth
+  along the view and blends the next one in over the last tenth of each, so
+  no seam shows where the texels change size.
+
+Held to numbers:
+- `tests/test_shadow_cascades.ae` puts a 6 m post under a slanting sun,
+  with an 80 m shadow distance, on both renderers:
+  - the shadow's edges, read in world metres from 1280×720 frames, stay
+    within 1.5–2.3 cm over twelve camera poses moved in 13 cm steps and
+    turned (a texel there is 1 cm). The previous renderer's edges wandered
+    by 13 cm;
+  - a post 59 m away still casts;
+  - OpenGL and Vulkan put the edges in the same place;
+  - the four cascades cost about 0.08 ms on OpenGL and 0.11 ms on Vulkan.
+- `tests/test_engine_shadows.ae`: through the engine, a floating box's
+  shadow darkens the ground under it by 42%, and lit ground beside it does
+  not move.
 
 ## How it is put together
 
