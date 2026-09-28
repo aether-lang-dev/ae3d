@@ -17,6 +17,7 @@ import ae3d.core
 import ae3d.png
 import ae3d.platform
 import ae3d.rendering
+import ae3d.lightgrid
 import ae3d.shaders
 import ae3d.skin
 import ae3d.posing
@@ -769,6 +770,10 @@ gl_uniform_vec3(loc: int, x: float, y: float, z: float) {
     if loc >= 0 { glapi.glUniform3f(loc, x as f32, y as f32, z as f32) }
 }
 
+gl_uniform_vec4(loc: int, x: float, y: float, z: float, w: float) {
+    if loc >= 0 { glapi.glUniform4f(loc, x as f32, y as f32, z as f32, w as f32) }
+}
+
 // Sixteen doubles, column-major, as sixteen floats.
 gl_uniform_mat4(loc: int, m: ptr) {
     if loc < 0 || m == null { return }
@@ -1462,6 +1467,14 @@ const LIGHT_SLOTS = 12
 struct ProgramSlots {
     program: int
     frame_stamp: int
+    // The clustered lamps (#468): the grid's shape and the matrices a
+    // pixel finds its cell by, and the two textures' samplers.
+    cluster_dims: int
+    cluster_depth: int
+    cluster_view_projection: int
+    cluster_forward: int
+    cluster_lights: int
+    cluster_words: int
     view_projection: int
     model: int
     // Last frame's, for the motion vectors, with the frame's nudge and the
@@ -1558,6 +1571,16 @@ struct GLBatch {
 }
 
 struct GLRenderer {
+    // The scene's lamps, cut into the view's clusters every frame
+    // (ae3d.lightgrid, #468), and the two textures they are read from:
+    // RGBA32F, CLUSTER_LIGHT_ROW texels a row, five a lamp; R32F,
+    // CLUSTER_WORD_ROW texels a row, the cells' offsets and counts and
+    // then their lists. Rows grow as a scene needs them.
+    light_grid: ptr
+    cluster_light_texture: int
+    cluster_light_rows: int
+    cluster_word_texture: int
+    cluster_word_rows: int
     models: ptr
     lights: ptr
     programs: ptr
@@ -1881,6 +1904,12 @@ slots_for(r: *GLRenderer, program: int) -> *ProgramSlots {
         n = n + 1
     }
     s.light_count = gl_uniform_location(program, "lightCount")
+    s.cluster_dims = gl_uniform_location(program, "clusterDims")
+    s.cluster_depth = gl_uniform_location(program, "clusterDepth")
+    s.cluster_view_projection = gl_uniform_location(program, "clusterViewProjection")
+    s.cluster_forward = gl_uniform_location(program, "clusterForward")
+    s.cluster_lights = gl_uniform_location(program, "clusterLights")
+    s.cluster_words = gl_uniform_location(program, "clusterWords")
     s.light_space = gl_uniform_location(program, "lightSpaceMatrix")
     s.shadow_map = gl_uniform_location(program, "shadowMap")
     s.has_shadow_map = gl_uniform_location(program, "hasShadowMap")
@@ -3387,6 +3416,7 @@ renderer_render(r: *GLRenderer, cam: *Camera, light: *Light) {
     r.bound_instance_color = 0 - 1
 
     active_light = key_light(r.lights, light)
+    prepare_clusters(r, active_light, cam)
 
     // What a pass costs is what the GPU spends on it. The wall time around a
     // submit is the driver taking the work, not doing it, so a pass that
@@ -3985,7 +4015,8 @@ set_frame_uniforms(r: *GLRenderer, slots: *ProgramSlots, view_projection: *Mat4,
     gl_uniform_float(slots.wetness, r.wetness)
     gl_uniform_float(slots.frame_exposure, r.frame_exposure)
 
-    upload_lights(slots, lights, light, cam.position)
+    upload_lights(slots, lights, light)
+    cluster_uniforms(r, slots)
 
     gl_uniform_vec3(slots.view_pos, cam.position.x, cam.position.y, cam.position.z)
     gl_uniform_float(slots.view_distance, core.camera_far(cam))
@@ -4010,43 +4041,116 @@ set_frame_uniforms(r: *GLRenderer, slots: *ProgramSlots, view_projection: *Mat4,
     gl_uniform_float(slots.fog_intensity, r.fog.intensity)
 }
 
-// Every light the scene holds, capped at what the shader declares.
-//
-// The key light goes in slot zero and the registered ones fill what is left.
-// It is the one the scene is shadowed by and the one the ambient term comes
-// from, so a program that named a key light and then registered a few lamps
-// used to lose its key light entirely: the sun went out the moment a street
-// lamp was added.
-// The key light first, then the registered lights nearest the camera
-// until the slots are full: a scene may hold more lights than a frame
-// takes, and the ones a pixel can see are the ones near it.
-upload_lights(slots: *ProgramSlots, lights: ptr, key: *Light, eye: Vec3) {
+// The lights that reach every pixel: the key light in slot zero -- the one
+// the scene is shadowed by and the ambient comes from -- then any other
+// directional light, to what the shader declares. The scene's point and
+// spot lights are not here: they are clustered (prepare_clusters), so every
+// one of them lights what it reaches, wherever the camera is.
+upload_lights(slots: *ProgramSlots, lights: ptr, key: *Light) {
     if slots.light_slots == null { return }
     slots_of = slots.light_slots as int[]
-
     count = 0
-    if key != null {
-        upload_light(slots_of, 0, key)
+    first = key_light(lights, key)
+    if first != null {
+        upload_light(slots_of, 0, first)
         count = 1
     }
-
-    taken = core.nearest_lights(lights, key, eye, MAX_LIGHTS - count)
-    i = 0
-    while i < list.size(taken) && count < MAX_LIGHTS {
-        upload_light(slots_of, count, list.get_raw(taken, i) as *Light)
-        count = count + 1
-        i = i + 1
+    if lights != null {
+        i = 0
+        while i < list.size(lights) && count < MAX_LIGHTS {
+            l = list.get_raw(lights, i) as *Light
+            if l != first && l.mode == core.MODE_DIRECTIONAL {
+                upload_light(slots_of, count, l)
+                count = count + 1
+            }
+            i = i + 1
+        }
     }
-    list.free(taken)
     gl_uniform_int(slots.light_count, count)
 
-    first = key_light(lights, key)
     if first != null {
         gl_uniform_vec3(slots.compat_light_pos, first.position.x, first.position.y, first.position.z)
         gl_uniform_vec3(slots.compat_light_color, first.color.x, first.color.y, first.color.z)
         gl_uniform_float(slots.compat_light_intensity, first.intensity)
         gl_uniform_vec3(slots.compat_light_direction, first.direction.x, first.direction.y, first.direction.z)
     }
+}
+
+// The lamps' clusters for this frame: the grid cut for the camera, and its
+// two arrays into their textures, bound on units CLUSTER_LIGHT_UNIT and
+// CLUSTER_WORD_UNIT for every lit draw of the frame.
+prepare_clusters(r: *GLRenderer, key: *Light, cam: *Camera) {
+    if r.light_grid == null { r.light_grid = lightgrid.grid_new() as ptr }
+    g = r.light_grid as *LightGrid
+    lightgrid.build(g, r.lights, key, cam)
+    lights_texels = lightgrid.light_count(g) * 5
+    light_texture, light_rows = upload_rows(r.cluster_light_texture, r.cluster_light_rows,
+                                            CLUSTER_LIGHT_ROW, RGBA32F, glapi.RGBA,
+                                            lightgrid.light_data(g), lights_texels, 4)
+    r.cluster_light_texture = light_texture
+    r.cluster_light_rows = light_rows
+    word_texture, word_rows = upload_rows(r.cluster_word_texture, r.cluster_word_rows,
+                                          CLUSTER_WORD_ROW, glapi.R32F, glapi.RED,
+                                          lightgrid.word_data(g), lightgrid.word_count(g), 1)
+    r.cluster_word_texture = word_texture
+    r.cluster_word_rows = word_rows
+    gl_texture_bind(CLUSTER_LIGHT_UNIT, r.cluster_light_texture)
+    gl_texture_bind(CLUSTER_WORD_UNIT, r.cluster_word_texture)
+    glapi.glActiveTexture(glapi.TEXTURE0 as uint32)
+}
+
+const CLUSTER_LIGHT_ROW = 1024
+const CLUSTER_WORD_ROW = 4096
+const CLUSTER_LIGHT_UNIT = 6
+const CLUSTER_WORD_UNIT = 7
+
+// `texels` float texels of `channels` floats each, from `data`, into a
+// texture `row` texels wide: made (or remade taller) when it has too few
+// rows, then written whole rows first and the last, partial row on its own,
+// so nothing past the data is read. The texture, and the rows it holds.
+upload_rows(texture: int, held_rows: int, row: int, internal: int, format: int,
+            data: ptr, texels: int, channels: int) -> (int, int) {
+    rows = (texels + row - 1) / row
+    if rows < 1 { rows = 1 }
+    if texture == 0 || rows > held_rows {
+        if texture != 0 { gl_texture_delete(texture) }
+        held = 1
+        while held < rows { held = held * 2 }
+        texture = new_texture(glapi.TEXTURE_2D)
+        glapi.glTexImage2D(glapi.TEXTURE_2D as uint32, 0, internal, row, held, 0, format as uint32,
+                           glapi.FLOAT as uint32, null)
+        texture_params(glapi.TEXTURE_2D, glapi.CLAMP_TO_EDGE, false, glapi.NEAREST, glapi.NEAREST)
+        held_rows = held
+    } else {
+        glapi.glBindTexture(glapi.TEXTURE_2D as uint32, texture as uint32)
+    }
+    whole = texels / row
+    if whole > 0 {
+        glapi.glTexSubImage2D(glapi.TEXTURE_2D as uint32, 0, 0, 0, row, whole, format as uint32,
+                              glapi.FLOAT as uint32, data)
+    }
+    rest = texels - whole * row
+    if rest > 0 {
+        glapi.glTexSubImage2D(glapi.TEXTURE_2D as uint32, 0, 0, whole, rest, 1, format as uint32,
+                              glapi.FLOAT as uint32, data + whole * row * channels * 4)
+    }
+    glapi.glBindTexture(glapi.TEXTURE_2D as uint32, 0)
+    return texture, held_rows
+}
+
+// The grid's shape, the matrices a pixel finds its cell by, and the units
+// the lamps are read from.
+cluster_uniforms(r: *GLRenderer, slots: *ProgramSlots) {
+    if r.light_grid == null { return }
+    g = r.light_grid as *LightGrid
+    cells = lightgrid.cell_count(g)
+    if lightgrid.light_count(g) == 0 { cells = 0 }
+    gl_uniform_vec4(slots.cluster_dims, g.columns as float, g.rows as float, g.slices as float, cells as float)
+    gl_uniform_vec4(slots.cluster_depth, g.near, g.far, g.depth_scale, g.depth_bias)
+    gl_uniform_mat4(slots.cluster_view_projection, &g.view_projection)
+    gl_uniform_vec4(slots.cluster_forward, g.forward.x, g.forward.y, g.forward.z, g.forward_w)
+    gl_uniform_int(slots.cluster_lights, CLUSTER_LIGHT_UNIT)
+    gl_uniform_int(slots.cluster_words, CLUSTER_WORD_UNIT)
 }
 
 // Whichever light the scene is shadowed and shaded by: the one the caller
@@ -4577,6 +4681,17 @@ renderer_cleanup(r: *GLRenderer) {
     if r.pass_timer != null {
         gl_passtimer_destroy(r.pass_timer)
         r.pass_timer = null
+    }
+    // The lamps' cluster textures, for the same reason, and their grid.
+    gl_texture_delete(r.cluster_light_texture)
+    gl_texture_delete(r.cluster_word_texture)
+    r.cluster_light_texture = 0
+    r.cluster_word_texture = 0
+    r.cluster_light_rows = 0
+    r.cluster_word_rows = 0
+    if r.light_grid != null {
+        lightgrid.grid_free(r.light_grid as *LightGrid)
+        r.light_grid = null
     }
     // The clouds' textures, for the same reason.
     if r.cloud_shape_texture != 0 {

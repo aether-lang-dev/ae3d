@@ -35,11 +35,10 @@ The feature list in full, with the reasoning behind each. The [README](../README
   in dense columns a system walks in one pass, a crowd rendering straight from
   the position column's buffer. The crowd step, separation grid and
   distance bucketing are `ae3d.horde`, over those columns and the job pool.
-- **Physically based shading**: metallic/roughness materials, sixteen
-  directional, point or spot lights a frame -- the key light and, of every
-  light the scene registers, the fifteen nearest the camera, picked each
-  frame (`core.nearest_lights`), a point light past its fall-off and a spot
-  light outside its cone skipped before they are shaded; a spot light
+- **Physically based shading**: metallic/roughness materials; the key light
+  and any directional light reach every pixel, and every point and spot
+  light the scene registers, however many, lights what it reaches through
+  clustered shading (`ae3d.lightgrid`, [Lamps](#lamps)); a spot light
   (`core.light_spot`) is a point light confined to a cone about its
   direction, whole within an inner angle and gone at an outer with a smooth
   fall-off between, which is what a headlight is -- normal mapping, baked per-vertex occlusion and
@@ -451,6 +450,46 @@ frame's multisampled depth is resolved into a one-sample target between
 the two halves the scene pass is drawn in, the nearest of the samples a
 pixel. Both are the depth of what was drawn -- the near figure's real
 silhouette, the picture of a far one -- and neither draws anything twice.
+
+## Lamps
+
+Every point and spot light a scene registers lights what it reaches, and
+nothing else, wherever the camera is. The renderers used to light a frame
+with the sixteen lights nearest the camera, so a street's lamps lit their
+pools while the camera stood near them and went out as it walked away.
+
+It works by clustered shading (`ae3d.lightgrid`, #468).
+- **The grid.** Every frame the view is cut into 16 columns × 9 rows ×
+  24 depth slices. The slices are logarithmic, so a cell is about as deep
+  as it is wide at any distance.
+- **The lists.** Each lamp is listed in every cell its sphere of reach
+  overlaps: the distance from the lamp's view-space centre to the cell's
+  box against its reach, taken axis by axis. A pixel shades with its own
+  cell's list, so its cost is the lamps near it, not the lamps in the scene.
+- **The reach.** A lamp reaches where its attenuation falls to 1/64 of its
+  value at the lamp, the fall-off the shader used to cut at, and its light
+  fades to nothing over the last quarter of that distance, so a pool ends
+  in a gradient.
+- **The layout.** The lamps (five vec4s each) and the cells' lists are
+  built once on the CPU in one layout. Vulkan reads them as storage buffers
+  at bindings 6 and 7. OpenGL 4.1, which has no storage buffers, reads the
+  same floats from two textures.
+- **The rest.** The key light and any directional light reach every pixel
+  and stay in the shader's small uniform array.
+
+Held to numbers:
+- `tests/test_light_grid.ae`, headless:
+  - 20,000 points through the view, each checked against a street of 256
+    lamps by brute force: of the roughly 800,000 lamp-point pairs in reach,
+    none is missing from its cell's list, from either of two cameras;
+  - a cell lists about 45 lamps where about 40 reach its points;
+  - a build takes about 1.3 ms for 256 lamps set 4 m apart.
+- `tests/test_lamp_clusters.ae`, 64 lamps down a street on both renderers:
+  - the ground under a lamp reads the same from 25 m and from 120 m on one
+    line to it, within 1.3 of 255 (on the old renderer it lost 58);
+  - OpenGL and Vulkan agree there exactly;
+  - the scene pass costs about 0.02–0.03 ms with 64 lamps and about
+    0.08 ms with 256.
 
 ## How it is put together
 

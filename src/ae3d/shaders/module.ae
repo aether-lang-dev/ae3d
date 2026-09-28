@@ -365,11 +365,9 @@ in float Occlusion;
 uniform sampler2D textureSampler;
 uniform sampler2D shadowMap;
 uniform sampler2D normalMap;
-// Sixteen a frame: the key light and the fifteen point lights nearest the
-// camera, which the renderer picks out of every light the scene registers
-// -- a street lit by a lamp a block, a room by its fittings. A point light
-// past its fall-off is skipped before it is shaded, so the frame pays for
-// the lamps that reach a pixel and not for the count.
+// The lights that reach everywhere: the key light and any directional
+// light. The scene's lamps -- its point and spot lights, however many --
+// are not here but in the clusters below.
 #define MAX_LIGHTS 16
 
 struct Light {
@@ -393,6 +391,78 @@ struct Light {
 
 uniform Light lights[MAX_LIGHTS];
 uniform int lightCount;
+
+// The scene's point and spot lights, clustered (ae3d.lightgrid, #468): the
+// view is cut into clusterDims.x columns by .y rows by .z depth slices, and
+// each cell lists the lamps whose reach overlaps it, so a pixel shades with
+// the lamps that reach it, whichever and however many they are, and a lamp
+// lights its ground wherever the camera stands. A lamp is five vec4s
+// (position and reach; colour and intensity; direction and kind; the three
+// attenuation terms and the colour temperature; the spot's cone), and the
+// words are each cell's first index and count, then the lists. The cell of a
+// point is read by clusterViewProjection and clusterForward, the matrices
+// the grid was cut with, so this lookup and the CPU's cannot disagree.
+uniform vec4 clusterDims;           // columns, rows, slices, cells: whole numbers
+uniform vec4 clusterDepth;          // near, far, log scale, log bias
+uniform mat4 clusterViewProjection;
+uniform vec4 clusterForward;        // depth = dot(.xyz, p) + .w
+#ifdef VULKAN
+layout(std430, set = 0, binding = 6) readonly buffer ClusterLightBlock { vec4 clusterLightData[]; };
+layout(std430, set = 0, binding = 7) readonly buffer ClusterWordBlock { float clusterWordData[]; };
+vec4 cluster_light(int i) { return clusterLightData[i]; }
+float cluster_word(int i) { return clusterWordData[i]; }
+#else
+// OpenGL 4.1 has no storage buffers: the same floats, as textures a row of
+// CLUSTER_LIGHT_ROW (RGBA) and CLUSTER_WORD_ROW (R) texels.
+uniform sampler2D clusterLights;
+uniform sampler2D clusterWords;
+#define CLUSTER_LIGHT_ROW 1024
+#define CLUSTER_WORD_ROW 4096
+vec4 cluster_light(int i) { return texelFetch(clusterLights, ivec2(i % CLUSTER_LIGHT_ROW, i / CLUSTER_LIGHT_ROW), 0); }
+float cluster_word(int i) { return texelFetch(clusterWords, ivec2(i % CLUSTER_WORD_ROW, i / CLUSTER_WORD_ROW), 0).r; }
+#endif
+// The last quarter of a lamp's reach fades its light to nothing, so a pool
+// ends in a gradient (ae3d.lightgrid's FADE_START).
+#define CLUSTER_FADE_START 0.75
+
+int cluster_of(vec3 p) {
+    vec4 clip = clusterViewProjection * vec4(p, 1.0);
+    float w = clip.w != 0.0 ? clip.w : 1.0;
+    vec2 ndc = clip.xy / w;
+    float depth = dot(clusterForward.xyz, p) + clusterForward.w;
+    ivec3 dims = ivec3(clusterDims.xyz + 0.5);
+    int x = clamp(int(floor((ndc.x * 0.5 + 0.5) * float(dims.x))), 0, dims.x - 1);
+    int y = clamp(int(floor((ndc.y * 0.5 + 0.5) * float(dims.y))), 0, dims.y - 1);
+    int z = 0;
+    if (depth > clusterDepth.x) {
+        z = clamp(int(floor(log(depth) * clusterDepth.z + clusterDepth.w)), 0, dims.z - 1);
+    }
+    return (z * dims.y + y) * dims.x + x;
+}
+
+// Lamp `i` of the clusters, as the Light the shading takes, and its reach.
+Light clustered_light(int i, out float reach) {
+    vec4 a = cluster_light(i * 5);
+    vec4 b = cluster_light(i * 5 + 1);
+    vec4 c = cluster_light(i * 5 + 2);
+    vec4 d = cluster_light(i * 5 + 3);
+    vec4 e = cluster_light(i * 5 + 4);
+    Light L;
+    L.position = a.xyz;
+    reach = a.w;
+    L.color = b.rgb;
+    L.intensity = b.a;
+    L.direction = c.xyz;
+    L.isDirectional = int(c.w + 0.5);
+    L.constantAtten = d.x;
+    L.linearAtten = d.y;
+    L.quadraticAtten = d.z;
+    L.temperature = d.w;
+    L.spotCosOuter = e.x;
+    L.spotCosInner = e.y;
+    L.ambientStrength = 0.0;
+    return L;
+}
 // The crowd's far tier as pictures (see VERTEX_CROWD): a picture is cut out
 // by its alpha, and its colour is the figure's albedo and its normal map
 // the figure's own normals, so it is lit below by the scene's lights the
@@ -1466,8 +1536,8 @@ void main() {
         wetMirror = 0.0;
     }
 
-    // Every light in the scene contributes; the loop stops at lightCount, so a
-    // scene with one light costs what it did before there could be four.
+    // The lights that reach everywhere, then the lamps of this pixel's
+    // cluster.
     // A shadow takes the direct light and leaves the sky's fill alone:
     // multiplied over the whole colour, ambient included, as it was, a
     // shadow went to a third of black and the shadowed side of a hill at
@@ -1490,25 +1560,42 @@ void main() {
             break;
         }
         if (lights[i].isDirectional != 1) {
-            // Past the lamp's reach it gives this pixel less than a
-            // hundredth of its light: not worth the shading, nor a ray.
+            // A key light that is a lamp: past its fall-off it gives this
+            // pixel less than a hundredth of its light, and outside a spot's
+            // cone none.
             vec3 gap = lights[i].position - FragPos;
             if (dot(gap, gap) * lights[i].quadraticAtten > 64.0) continue;
-            // Nor outside a spot light's cone.
             if (lights[i].isDirectional == 2 &&
                 dot(normalize(-gap), normalize(lights[i].direction)) < lights[i].spotCosOuter) continue;
         }
         vec3 lit = direct_light(lights[i], norm, viewDir, albedo, F0, NdotV, adjustedRoughness);
-        float shade = shaded;
+        Lo += (i == 0 ? lit * sunlit : lit) * shaded;
+    }
+    if (clusterDims.w > 0.5) {
+        int cell = cluster_of(FragPos);
+        int first = int(cluster_word(cell * 2) + 0.5);
+        int count = int(cluster_word(cell * 2 + 1) + 0.5);
+        for (int k = 0; k < count; k++) {
+            float reach;
+            Light L = clustered_light(int(cluster_word(first + k) + 0.5), reach);
+            vec3 gap = L.position - FragPos;
+            float far2 = dot(gap, gap);
+            if (far2 >= reach * reach) continue;
+            if (L.isDirectional == 2 &&
+                dot(normalize(-gap), normalize(L.direction)) < L.spotCosOuter) continue;
+            float fade = 1.0 - smoothstep(CLUSTER_FADE_START * reach, reach, sqrt(far2));
+            vec3 lit = direct_light(L, norm, viewDir, albedo, F0, NdotV, adjustedRoughness) * fade;
+            float shade = shaded;
 #ifdef AE3D_RAY_QUERY
-        // By ray a lamp throws its own shadow, where it reaches: past the
-        // lamp's fall-off there is no light to shadow and no ray is cast.
-        if (i > 0 && traced && enableShadows && lights[i].isDirectional != 1) {
-            if (dot(lit, vec3(0.333)) > 0.002) shade = ray_lamp_factor(lights[i].position, rayLampRadius);
-            else shade = 1.0;
-        }
+            // By ray a lamp throws its own shadow, where it reaches: past the
+            // lamp's fall-off there is no light to shadow and no ray is cast.
+            if (traced && enableShadows) {
+                if (dot(lit, vec3(0.333)) > 0.002) shade = ray_lamp_factor(L.position, rayLampRadius);
+                else shade = 1.0;
+            }
 #endif
-        Lo += (i == 0 ? lit * sunlit : lit) * shade;
+            Lo += lit * shade;
+        }
     }
 
     // Ambient belongs to the scene rather than to each light, so it comes from

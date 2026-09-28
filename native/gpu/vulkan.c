@@ -332,6 +332,23 @@ typedef struct {
     unsigned used;
 } ae3d_vk_uniform_ring;
 
+/* The scene's clustered lamps for one frame slot (#468): the lamps and the
+   cells' lists ae3d.lightgrid builds, written by ae3d.vulkan into mapped,
+   coherent memory before the slot's draws, and read by the scene fragment
+   shader as storage buffers at bindings 6 and 7. Grown in place when a
+   scene needs more, once the slot's fence has passed. */
+typedef struct {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    void *mapped;
+    VkDeviceSize size;
+} ae3d_vk_cluster_buffer;
+
+/* What a slot's buffers start at: enough for a street of lamps without a
+   regrow, a few kilobytes against the scene's megabytes. */
+#define AE3D_VK_CLUSTER_LIGHT_BYTES (256 * 5 * 16)
+#define AE3D_VK_CLUSTER_WORD_BYTES (65536 * 4)
+
 static struct {
     VkInstance instance;
     VkSurfaceKHR surface;
@@ -596,6 +613,8 @@ static struct {
     VkCommandPool command_pool;
 
     ae3d_vk_uniform_ring uniforms[AE3D_VK_FRAMES];
+    ae3d_vk_cluster_buffer cluster_lights[AE3D_VK_FRAMES];
+    ae3d_vk_cluster_buffer cluster_words[AE3D_VK_FRAMES];
     VkDescriptorSet sets[AE3D_VK_FRAMES][AE3D_VK_MAX_TEXTURES];
     int set_texture[AE3D_VK_FRAMES][AE3D_VK_MAX_TEXTURES];
     int set_normal[AE3D_VK_FRAMES][AE3D_VK_MAX_TEXTURES];
@@ -2961,10 +2980,12 @@ void ae3d_vk_texture_destroy(int handle) {
     memset(texture, 0, sizeof(*texture));
 }
 
+static int ae3d_vk_cluster_make(ae3d_vk_cluster_buffer *b, VkDeviceSize size);
+
 static int ae3d_vk_create_descriptors(void) {
-    VkDescriptorSetLayoutBinding bindings[6];
+    VkDescriptorSetLayoutBinding bindings[8];
     VkDescriptorSetLayoutCreateInfo layout;
-    VkDescriptorPoolSize sizes[3];
+    VkDescriptorPoolSize sizes[4];
     VkDescriptorPoolCreateInfo pool;
     VkPhysicalDeviceProperties properties;
     unsigned alignment, stride;
@@ -3003,17 +3024,29 @@ static int ae3d_vk_create_descriptors(void) {
     bindings[4].descriptorCount = 1;
     bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    // The scene's acceleration structure, for the rays the fragment
-    // traces; only where the device traces, since a layout naming a
-    // descriptor type the device has no extension for is refused.
-    bindings[5].binding = 5;
-    bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    // The clustered lamps (#468): the lamps at 6 and the cells' lists at 7,
+    // storage buffers the scene fragment shader indexes.
+    bindings[5].binding = 6;
+    bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[5].descriptorCount = 1;
     bindings[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[6].binding = 7;
+    bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[6].descriptorCount = 1;
+    bindings[6].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    // The scene's acceleration structure at 5, for the rays the fragment
+    // traces; only where the device traces, since a layout naming a
+    // descriptor type the device has no extension for is refused -- so it
+    // is last in the list, and left off it where there are no rays.
+    bindings[7].binding = 5;
+    bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    bindings[7].descriptorCount = 1;
+    bindings[7].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     memset(&layout, 0, sizeof(layout));
     layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout.bindingCount = vk.ray_query ? 6 : 5;
+    layout.bindingCount = vk.ray_query ? 8 : 7;
     layout.pBindings = bindings;
     if (ae3d_vkCreateDescriptorSetLayout(vk.device, &layout, NULL, &vk.set_layout) != VK_SUCCESS) {
         return ae3d_vk_fail("vkCreateDescriptorSetLayout failed");
@@ -3024,13 +3057,15 @@ static int ae3d_vk_create_descriptors(void) {
     sizes[0].descriptorCount = AE3D_VK_FRAMES * AE3D_VK_MAX_TEXTURES;
     sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[1].descriptorCount = AE3D_VK_FRAMES * AE3D_VK_MAX_TEXTURES * 4;
-    sizes[2].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-    sizes[2].descriptorCount = AE3D_VK_FRAMES * AE3D_VK_MAX_TEXTURES;
+    sizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    sizes[2].descriptorCount = AE3D_VK_FRAMES * AE3D_VK_MAX_TEXTURES * 2;
+    sizes[3].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    sizes[3].descriptorCount = AE3D_VK_FRAMES * AE3D_VK_MAX_TEXTURES;
 
     memset(&pool, 0, sizeof(pool));
     pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pool.maxSets = AE3D_VK_FRAMES * AE3D_VK_MAX_TEXTURES;
-    pool.poolSizeCount = vk.ray_query ? 3 : 2;
+    pool.poolSizeCount = vk.ray_query ? 4 : 3;
     pool.pPoolSizes = sizes;
     if (ae3d_vkCreateDescriptorPool(vk.device, &pool, NULL, &vk.descriptor_pool) != VK_SUCCESS) {
         return ae3d_vk_fail("vkCreateDescriptorPool failed");
@@ -3058,9 +3093,98 @@ static int ae3d_vk_create_descriptors(void) {
             return ae3d_vk_fail("uniform vkMapMemory failed");
         }
         ring->mapped = (unsigned char *)mapped;
+        if (!ae3d_vk_cluster_make(&vk.cluster_lights[frame], AE3D_VK_CLUSTER_LIGHT_BYTES) ||
+            !ae3d_vk_cluster_make(&vk.cluster_words[frame], AE3D_VK_CLUSTER_WORD_BYTES)) {
+            return 0;
+        }
     }
     return 1;
 }
+
+/* A cluster buffer `size` bytes long, host-visible, coherent and mapped,
+   zeroed so a slot drawn before its first write lists no lamps. */
+static int ae3d_vk_cluster_make(ae3d_vk_cluster_buffer *b, VkDeviceSize size) {
+    void *mapped = NULL;
+    if (!ae3d_vk_create_buffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                               &b->buffer, &b->memory)) {
+        return 0;
+    }
+    if (ae3d_vkMapMemory(vk.device, b->memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+        return ae3d_vk_fail("cluster vkMapMemory failed");
+    }
+    memset(mapped, 0, (size_t)size);
+    b->mapped = mapped;
+    b->size = size;
+    return 1;
+}
+
+static void ae3d_vk_cluster_destroy(ae3d_vk_cluster_buffer *b) {
+    if (b->mapped) ae3d_vkUnmapMemory(vk.device, b->memory);
+    if (b->buffer) ae3d_vkDestroyBuffer(vk.device, b->buffer, NULL);
+    if (b->memory) ae3d_vkFreeMemory(vk.device, b->memory, NULL);
+    memset(b, 0, sizeof(*b));
+}
+
+/* The two cluster buffers of `frame` into a set's bindings 6 and 7. */
+static void ae3d_vk_write_clusters(VkDescriptorSet set, int frame) {
+    VkDescriptorBufferInfo infos[2];
+    VkWriteDescriptorSet writes[2];
+    memset(infos, 0, sizeof(infos));
+    infos[0].buffer = vk.cluster_lights[frame].buffer;
+    infos[0].range = VK_WHOLE_SIZE;
+    infos[1].buffer = vk.cluster_words[frame].buffer;
+    infos[1].range = VK_WHOLE_SIZE;
+    memset(writes, 0, sizeof(writes));
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = set;
+    writes[0].dstBinding = 6;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[0].pBufferInfo = &infos[0];
+    writes[1] = writes[0];
+    writes[1].dstBinding = 7;
+    writes[1].pBufferInfo = &infos[1];
+    ae3d_vkUpdateDescriptorSets(vk.device, 2, writes, 0, NULL);
+}
+
+/* This frame slot's cluster buffers, grown to hold `light_bytes` and
+   `word_bytes` when they do not. Called by ae3d.vulkan after
+   ae3d_vk_frame_begin, when the slot's last submission has finished, so a
+   buffer can be remade under it; every set of the slot is then pointed at
+   the new one. 0 when a buffer could not be made. */
+int ae3d_vk_clusters_reserve(long light_bytes, long word_bytes) {
+    int frame = (int)vk.frame;
+    int grew = 0;
+    int index;
+    ae3d_vk_cluster_buffer *lights = &vk.cluster_lights[frame];
+    ae3d_vk_cluster_buffer *words = &vk.cluster_words[frame];
+    if (!vk.ready) return 0;
+    if ((VkDeviceSize)light_bytes > lights->size) {
+        VkDeviceSize size = lights->size ? lights->size : AE3D_VK_CLUSTER_LIGHT_BYTES;
+        while (size < (VkDeviceSize)light_bytes) size *= 2;
+        ae3d_vk_cluster_destroy(lights);
+        if (!ae3d_vk_cluster_make(lights, size)) return 0;
+        grew = 1;
+    }
+    if ((VkDeviceSize)word_bytes > words->size) {
+        VkDeviceSize size = words->size ? words->size : AE3D_VK_CLUSTER_WORD_BYTES;
+        while (size < (VkDeviceSize)word_bytes) size *= 2;
+        ae3d_vk_cluster_destroy(words);
+        if (!ae3d_vk_cluster_make(words, size)) return 0;
+        grew = 1;
+    }
+    if (grew) {
+        for (index = 0; index < vk.set_count[frame]; index++) {
+            ae3d_vk_write_clusters(vk.sets[frame][index], frame);
+        }
+    }
+    return 1;
+}
+
+/* Where this frame slot's lamps and lists are written. */
+void *ae3d_vk_clusters_lights(void) { return vk.cluster_lights[vk.frame].mapped; }
+void *ae3d_vk_clusters_words(void) { return vk.cluster_words[vk.frame].mapped; }
 
 /* A set is keyed on the pair of images it binds, not on the colour alone: two
    materials can share a colour and differ in their normal map, and keying on
@@ -3215,6 +3339,7 @@ static VkDescriptorSet ae3d_vk_set_for(int frame, int texture_handle, int normal
         write_count = 6;
     }
     ae3d_vkUpdateDescriptorSets(vk.device, write_count, writes, 0, NULL);
+    ae3d_vk_write_clusters(set, frame);
 
     index = reuse >= 0 ? reuse : vk.set_count[frame]++;
     vk.sets[frame][index] = set;
@@ -6937,6 +7062,8 @@ void ae3d_vk_shutdown(void) {
         if (ring->buffer) ae3d_vkDestroyBuffer(vk.device, ring->buffer, NULL);
         if (ring->memory) ae3d_vkFreeMemory(vk.device, ring->memory, NULL);
         memset(ring, 0, sizeof(*ring));
+        ae3d_vk_cluster_destroy(&vk.cluster_lights[i]);
+        ae3d_vk_cluster_destroy(&vk.cluster_words[i]);
     }
 
     if (vk.identity_instance) ae3d_vkDestroyBuffer(vk.device, vk.identity_instance, NULL);

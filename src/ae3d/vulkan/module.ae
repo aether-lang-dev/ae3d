@@ -24,6 +24,7 @@ import ae3d.vktexture
 import ae3d.posing
 import ae3d.geometry
 import ae3d.picture
+import ae3d.lightgrid
 
 exports (
     VKRenderer,
@@ -60,6 +61,12 @@ extern ae3d_vk_scene_set_float(offset: int, value: float)
 extern ae3d_vk_scene_set_int(offset: int, value: int)
 extern ae3d_vk_scene_set_vec3(offset: int, x: float, y: float, z: float)
 extern ae3d_vk_scene_set_mat4(offset: int, m: ptr)
+// The clustered lamps' storage buffers for this frame slot (#468): grown to
+// hold what the frame needs, then written through their mapped memory.
+extern ae3d_vk_clusters_reserve(light_bytes: long, word_bytes: long) -> int
+extern ae3d_vk_clusters_lights() -> ptr
+extern ae3d_vk_clusters_words() -> ptr
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
 extern ae3d_vk_scene_set_mat4v(offset: int, count: int, values: ptr)
 extern ae3d_vk_set_normal_map(handle: int)
 extern ae3d_vk_scene_set_clip_mat4(offset: int, m: ptr)
@@ -177,6 +184,10 @@ struct VKBatch {
 }
 
 struct VKRenderer {
+    // The scene's lamps, cut into the view's clusters every frame
+    // (ae3d.lightgrid, #468), written into this frame slot's storage
+    // buffers at bindings 6 and 7.
+    light_grid: ptr
     models: ptr
     lights: ptr
     // Counts the frames, so a crowd two models draw tiers of is sorted once a frame.
@@ -365,6 +376,7 @@ renderer_free(r: *VKRenderer) {
     // an engine that opened no window, still has both.
     free_batches(r.batches)
     free_batches(r.shadow_batches)
+    if r.light_grid != null { lightgrid.grid_free(r.light_grid as *LightGrid) }
     if r.models != null { list.free(r.models) }
     if r.lights != null { list.free(r.lights) }
     if r.textures != null {
@@ -1513,7 +1525,7 @@ set_frame_uniforms(r: *VKRenderer, light: *Light, cam: *Camera) {
 write_frame_uniforms(r: *VKRenderer, light: *Light, cam: *Camera) {
     ae3d_vk_scene_set_vec3(vkscene.OFF_VIEWPOS, cam.position.x, cam.position.y, cam.position.z)
     ae3d_vk_scene_set_float(vkscene.OFF_VIEWDISTANCE, core.camera_far(cam))
-    upload_lights(r, light, cam.position)
+    upload_lights(r, key_light(r, light))
     ae3d_vk_scene_set_clip_mat4(vkscene.OFF_LIGHTSPACEMATRIX, &r.shadow_space)
     ae3d_vk_scene_set_vec3(vkscene.OFF_SHADOWDIRECTION, r.shadow_direction.x,
                            r.shadow_direction.y, r.shadow_direction.z)
@@ -1735,22 +1747,65 @@ active_program(m: *Model) -> int {
 // The key light first, then the registered lights nearest the camera
 // until the slots are full: a scene may hold more lights than a frame
 // takes, and the ones a pixel can see are the ones near it.
-upload_lights(r: *VKRenderer, key: *Light, eye: Vec3) {
+// The lights that reach every pixel: the key light in slot zero, then any
+// other directional light. The scene's point and spot lights are clustered
+// (prepare_clusters) rather than picked here, so each lights what it reaches
+// wherever the camera is.
+upload_lights(r: *VKRenderer, key: *Light) {
     count = 0
     if key != null {
         upload_light(0, key)
         count = 1
     }
-
-    taken = core.nearest_lights(r.lights, key, eye, vkscene.MAX_LIGHTS - count)
     i = 0
-    while i < list.size(taken) && count < vkscene.MAX_LIGHTS {
-        upload_light(count, list.get_raw(taken, i) as *Light)
-        count = count + 1
+    while i < list.size(r.lights) && count < vkscene.MAX_LIGHTS {
+        l = list.get_raw(r.lights, i) as *Light
+        if l != key && l.mode == core.MODE_DIRECTIONAL {
+            upload_light(count, l)
+            count = count + 1
+        }
         i = i + 1
     }
-    list.free(taken)
     ae3d_vk_scene_set_int(vkscene.OFF_LIGHTCOUNT, count)
+    cluster_uniforms(r)
+}
+
+// The lamps' clusters for this frame, into this frame slot's buffers. After
+// ae3d_vk_frame_begin, when the slot's last frame is done with them.
+prepare_clusters(r: *VKRenderer, key: *Light, cam: *Camera) {
+    if r.light_grid == null { r.light_grid = lightgrid.grid_new() as ptr }
+    g = r.light_grid as *LightGrid
+    lightgrid.build(g, r.lights, key, cam)
+    light_bytes = lightgrid.light_count(g) * lightgrid.LIGHT_FLOATS * 4
+    word_bytes = lightgrid.word_count(g) * 4
+    if ae3d_vk_clusters_reserve(light_bytes as long, word_bytes as long) != 1 {
+        // Without its buffers the frame lists no lamps rather than read
+        // past what was made.
+        g.light_total = 0
+        return
+    }
+    if light_bytes > 0 { memcpy(ae3d_vk_clusters_lights(), lightgrid.light_data(g), light_bytes as long) }
+    memcpy(ae3d_vk_clusters_words(), lightgrid.word_data(g), word_bytes as long)
+}
+
+// The grid's shape and the matrices a pixel finds its cell by.
+cluster_uniforms(r: *VKRenderer) {
+    cells = 0
+    if r.light_grid != null {
+        g = r.light_grid as *LightGrid
+        if lightgrid.light_count(g) > 0 { cells = lightgrid.cell_count(g) }
+        ae3d_vk_scene_set_float(vkscene.OFF_CLUSTERDIMS, g.columns as float)
+        ae3d_vk_scene_set_float(vkscene.OFF_CLUSTERDIMS + 4, g.rows as float)
+        ae3d_vk_scene_set_float(vkscene.OFF_CLUSTERDIMS + 8, g.slices as float)
+        ae3d_vk_scene_set_float(vkscene.OFF_CLUSTERDEPTH, g.near)
+        ae3d_vk_scene_set_float(vkscene.OFF_CLUSTERDEPTH + 4, g.far)
+        ae3d_vk_scene_set_float(vkscene.OFF_CLUSTERDEPTH + 8, g.depth_scale)
+        ae3d_vk_scene_set_float(vkscene.OFF_CLUSTERDEPTH + 12, g.depth_bias)
+        ae3d_vk_scene_set_mat4(vkscene.OFF_CLUSTERVIEWPROJECTION, (&g.view_projection) as ptr)
+        ae3d_vk_scene_set_vec3(vkscene.OFF_CLUSTERFORWARD, g.forward.x, g.forward.y, g.forward.z)
+        ae3d_vk_scene_set_float(vkscene.OFF_CLUSTERFORWARD + 12, g.forward_w)
+    }
+    ae3d_vk_scene_set_float(vkscene.OFF_CLUSTERDIMS + 12, cells as float)
 }
 
 key_light(r: *VKRenderer, key: *Light) -> *Light {
@@ -1853,6 +1908,7 @@ renderer_render(r: *VKRenderer, cam: *Camera, light: *Light) {
         report_failed_frame(r)
         return
     }
+    prepare_clusters(r, active_light, cam)
     // The engine's own CPU cost is the command building and submission below,
     // not the fence-and-acquire wait frame_begin just blocked on -- that wait
     // is the display pacing the frame, and folding it into "the CPU frame"
