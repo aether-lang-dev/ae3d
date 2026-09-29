@@ -462,8 +462,10 @@ step "the street, played by sixteen"
 # and 2% lost, ten seconds of play after they have all joined. What the
 # multiplayer layer is held to at the scale #413 asked for: every client
 # under 20 KB a second down and 4 up in every second of it, every client's
-# horde the host's at every tick it reaches, and every seal's hash the
-# host's. A number missing from the report fails rather than reads as zero.
+# horde the host's at every tick it reaches, every seal's hash the host's,
+# the two cars two of the players drive with their fields the host's, and
+# every client's own player where it predicted it. A number missing from
+# the report fails rather than reads as zero.
 street_number() {   # street_number <key>
     street_value="$(sed -n "s/^net_street $1 //p" /tmp/ae3d_net_street.log)"
     echo "${street_value:-999999999}"
@@ -482,10 +484,18 @@ if built_ok net_street && have_display; then
          [ "$(street_number seals_checked)" -lt 100 ] || [ "$(street_number seals_diverged)" != "0" ]; then
         fail "net_street (hordes: $(street_number checksums_different) of $(street_number checksums_compared) ticks off the host's, $(street_number seals_diverged) of $(street_number seals_checked) seals diverged)"
         sed 's/^/        /' /tmp/ae3d_net_street.log | tail -12
-    elif [ "$(street_number car_fields_right)" != "15" ]; then
-        # The cars' fields of their script's state (#486): the driver's name
-        # and the speed, on every client as the host has them.
-        fail "net_street (the cars' fields right on $(street_number car_fields_right) of 15 clients)"
+    elif [ "$(street_number car_fields_compared)" -lt 100 ] || [ "$(street_number car_fields_different)" != "0" ] ||          [ "$(street_number drivers_named)" != "15" ] || [ "$(street_number car_slowest_mmps)" -lt 3000 ]; then
+        # Two of the players drive the cars: their speed and horn, fields of
+        # the car's script state (#486), on every client as the host has
+        # them at each snapshot's tick, bit for bit; their driver's name on
+        # all fifteen; and both cars going round, 3 m/s on average at the
+        # least, a turn and the pull away from it among the ten seconds.
+        fail "net_street (the cars: fields off at $(street_number car_fields_different) of $(street_number car_fields_compared) snapshots, drivers named on $(street_number drivers_named) of 15 clients, the slowest car $(street_number car_slowest_mmps) mm/s)"
+        sed 's/^/        /' /tmp/ae3d_net_street.log | tail -12
+    elif [ "$(street_number prediction_worst_um)" != "0" ]; then
+        # A client's player and the host's take the same steps from the
+        # same state (#413): no reconciliation ever moves one.
+        fail "net_street (a reconciliation moved a client's own player $(street_number prediction_worst_um) um)"
         sed 's/^/        /' /tmp/ae3d_net_street.log | tail -12
     else
         pass "net_street (sixteen players)"
