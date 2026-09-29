@@ -206,14 +206,14 @@ honking over loopback UDP at 20 ms each way (the totals cut):
     {"sessions": [{"session": 0, "role": "host", "transport": "udp", "client_id": 0, "connected": true,
       "tick": 81, "objects": 2, "players": 2, "fields": 0,
       "link": {"latency_us": 20000, "jitter_us": 0, "loss_ppm": 0},
-      "peers": [{"peer": 1, "open": true, "round_trip_us": 55658, "jitter_us": 2019, "loss_ppm": 0,
-        "pings": {"sent": 25, "answered": 24, "lost": 0}, "window_us": 1000006,
+      "peers": [{"peer": 1, "open": true, "round_trip_us": 56052, "jitter_us": 2471, "loss_ppm": 0,
+        "pings": {"sent": 25, "answered": 24, "lost": 0}, "window_us": 1000129,
         "sent": {"snapshots": 1019, "events": 0, "inputs": 0, "acks": 0, "link": 56,
-                 "headers": 949, "resent": 0, "all": 2026},
-        "received": {"snapshots": 0, "events": 23, "inputs": 1705, "acks": 95, "link": 53,
-                     "headers": 1952, "resent": 0, "all": 3832},
+                 "headers": 891, "resent": 0, "all": 1968},
+        "received": {"snapshots": 0, "events": 23, "inputs": 1330, "acks": 0, "link": 53,
+                     "headers": 1496, "resent": 0, "all": 2905},
         "sent_bytes": {...}, "received_bytes": {...},
-        "budget": 400, "largest_snapshot": 45, "snapshots": 76, "whole_snapshots": 2, "delta_snapshots": 74,
+        "budget": 400, "largest_snapshot": 45, "snapshots": 76, "whole_snapshots": 3, "delta_snapshots": 73,
         "worst_wait": 0, "view": false, "worst_wait_by_sight": {"seen": 0, "out": 0, "hidden": 0},
         "view_bytes": 0, "hidden_bytes": 0, "rays": 0}]}]}
 
@@ -236,13 +236,14 @@ What each figure is:
   in all, and in a row in each sight (seen, out of its view, occluded) --
   the record bytes spent on what it could see and on what it could not, and
   the rays cast to judge it.
-- **A client:** `snapshots_received`, `stale_snapshots`, and `prediction`:
-  the last and the worst correction a reconciliation made to its player, in
-  micrometres.
+- **A client:** `snapshots_received`, `stale_snapshots`, `commands_asked`
+  (the times its host said it lacked a command every message carrying it
+  had lost, and it sent it again), and `prediction`: the last and the worst
+  correction a reconciliation made to its player, in micrometres.
 
 Every figure is a whole number in the unit its name says, the number
 `ae3d.net` measures: `tests/test_agent_net.ae` asks a host and a client over
-the channel, each held still by `frame.pause`, and compares all 114 figures
+the channel, each held still by `frame.pause`, and compares all 115 figures
 of the two sessions with the sessions' own, twice: none differs.
 
 `net.set_link` sets the simulated link as the editor's play sliders do:
