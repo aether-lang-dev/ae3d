@@ -456,6 +456,64 @@ for example in examples/*.ae; do
     fi
 done
 
+step "the street, played by sixteen"
+# examples/net_street.ae's bounded run (#489): the zombie street with a host
+# and fifteen bot clients over loopback UDP, every side's link 50 ms each way
+# and 2% lost, ten seconds of play after they have all joined. What the
+# multiplayer layer is held to at the scale #413 asked for: every client
+# under 20 KB a second down and 4 up in every second of it, every client's
+# horde the host's at every tick it reaches, every seal's hash the host's,
+# the two cars two of the players drive with their fields the host's, and
+# every client's own player where it predicted it. A number missing from
+# the report fails rather than reads as zero.
+#
+# The play runs on a clock of its own, in fixed steps, as many a frame as
+# the wall clock has gone: a software renderer drawing a frame in two
+# seconds (llvmpipe on the Linux runner) plays the same ten seconds, and the
+# same figures, as a GPU drawing a hundred and forty frames a second. When
+# a frame was a step, the Linux runner's 22 frames were 22 steps of every
+# session: the bots were made, and the ten seconds ran out before the host
+# had welcomed one. Now the run is its twenty-odd seconds of play and
+# startup there as here.
+street_number() {   # street_number <key>
+    street_value="$(sed -n "s/^net_street $1 //p" /tmp/ae3d_net_street.log)"
+    echo "${street_value:-999999999}"
+}
+if built_ok net_street && have_display; then
+    AE3D_FRAMES=1000000 AE3D_NET_SECONDS=10 bounded "$RUN_LIMIT" ./build/net_street >/tmp/ae3d_net_street.log 2>&1
+    if ! grep -q "^net_street players" /tmp/ae3d_net_street.log && grep -q "could not create window\|failed to initialise\|no Vulkan driver" /tmp/ae3d_net_street.log; then
+        skip "net_street (sixteen players)" "the scene could not open a window here"
+    elif [ "$(street_number players)" != "16" ]; then
+        fail "net_street (sixteen players: $(street_number players) played)"
+        sed 's/^/        /' /tmp/ae3d_net_street.log | tail -12
+    elif [ "$(street_number down_most_bps)" -ge 20480 ] || [ "$(street_number up_most_bps)" -ge 4096 ]; then
+        fail "net_street (a client took $(street_number down_most_bps) bytes a second, or sent $(street_number up_most_bps))"
+        sed 's/^/        /' /tmp/ae3d_net_street.log | tail -12
+    elif [ "$(street_number checksums_compared)" -lt 100 ] || [ "$(street_number checksums_different)" != "0" ] || \
+         [ "$(street_number seals_checked)" -lt 100 ] || [ "$(street_number seals_diverged)" != "0" ]; then
+        fail "net_street (hordes: $(street_number checksums_different) of $(street_number checksums_compared) ticks off the host's, $(street_number seals_diverged) of $(street_number seals_checked) seals diverged)"
+        sed 's/^/        /' /tmp/ae3d_net_street.log | tail -12
+    elif [ "$(street_number car_fields_compared)" -lt 100 ] || [ "$(street_number car_fields_different)" != "0" ] ||          [ "$(street_number drivers_named)" != "15" ] || [ "$(street_number car_slowest_mmps)" -lt 3000 ]; then
+        # Two of the players drive the cars: their speed and horn, fields of
+        # the car's script state (#486), on every client as the host has
+        # them at each snapshot's tick, bit for bit; their driver's name on
+        # all fifteen; and both cars going round, 3 m/s on average at the
+        # least, a turn and the pull away from it among the ten seconds.
+        fail "net_street (the cars: fields off at $(street_number car_fields_different) of $(street_number car_fields_compared) snapshots, drivers named on $(street_number drivers_named) of 15 clients, the slowest car $(street_number car_slowest_mmps) mm/s)"
+        sed 's/^/        /' /tmp/ae3d_net_street.log | tail -12
+    elif [ "$(street_number prediction_worst_um)" != "0" ]; then
+        # A client's player and the host's take the same steps from the
+        # same state (#413): no reconciliation ever moves one.
+        fail "net_street (a reconciliation moved a client's own player $(street_number prediction_worst_um) um)"
+        sed 's/^/        /' /tmp/ae3d_net_street.log | tail -12
+    else
+        pass "net_street (sixteen players)"
+        grep -E "^net_street:|^  the host's frame|^net_street " /tmp/ae3d_net_street.log | sed 's/^/        /'
+    fi
+else
+    skip "net_street (sixteen players)" "no display or no build"
+fi
+
 step "a character wanders the street"
 # The on-foot character walks, runs and jumps 10,000 random moves through
 # street_drive's street, pushing the props it meets, and after every move is
