@@ -86,7 +86,7 @@ exports (
     SIGHT_NONE, SIGHT_SEEN, SIGHT_OUT, SIGHT_HIDDEN, view_bytes, hidden_bytes, worst_wait_sight,
     TRAFFIC_LINK, TRAFFIC_ALL, SENT, RECEIVED, rate, link_bytes, window_us, round_trip_us, jitter, jitter_us,
     loss, loss_ppm, pings, budget_of, worst_wait_any, last_correction, correction_um,
-    set_link, link_latency, link_jitter, link_loss, set_smoothing, release,
+    set_link, link_latency, link_jitter, link_loss, set_smoothing, set_extrapolation, release,
     transport_name, session_count, session_at, session_index,
     net_free, alive, last_error
 )
@@ -255,6 +255,8 @@ const EVENT_MESSAGE = 3
 const HISTORY = 32                   // samples an object keeps: a second at 30 a second
 const SMOOTHING = 0.1                // seconds a remote object's drawing error takes to fall to a third
 const TELEPORT = 4.0                 // metres: an error past this is the object moved, taken at once
+const EXTRAPOLATION = 0.1            // seconds a moving object is carried on past the newest snapshot, by default
+const CARRIED_SPAN = 0.25            // seconds its last two samples may be apart for their motion to be carried on
 const KEPT = 33                      // snapshots each side keeps to delta against: the 32 newest, and the one being built
 const STATE = 4                      // numbers an object's quantised state: x y z in steps, the rotation's 48 bits
 const OWN = 5                        // numbers the client's own player: x y z, vy, grounded
@@ -712,11 +714,18 @@ struct NetObject {
     body_driven: bool
     // Client: where it was drawn last, and the error it is drawn off where
     // its samples put it by, decaying: the view that ran past the newest
-    // sample held it there, and the samples that came after put it
-    // elsewhere -- corrected over the smoothing's time, never at once.
+    // sample carried it on or held it there, and the samples that came
+    // after put it elsewhere -- corrected over the smoothing's time, never
+    // at once. What it was last drawn from while the view was past its
+    // samples: the two samples' slots in its history and their times.
     drawn: Vec3
     drawn_known: bool
     held: bool
+    carried: bool
+    from_a: int
+    from_c: int
+    from_a_time: float
+    from_c_time: float
     error: Vec3
     // The sphere a client's view is judged against (#487): its centre from
     // the object's place, on the world's axes, and its radius.
@@ -909,6 +918,8 @@ struct Net {
     sighted: bool
     last_correction: float           // client: what the newest reconciliation moved its player, metres
     smoothing: float                 // client: seconds a remote object's error takes to fall to a third (0: at once)
+    extrapolation: float             // client: seconds a moving object is carried on past the newest snapshot (0: held)
+    newest_time: float               // client: the host's time of its newest snapshot
     last_draw: float                 // client: when the objects were last drawn; below 0 never
 }
 
@@ -944,6 +955,7 @@ net_new(role: int, kind: int) -> *Net {
     n.sighted = true
     n.view_sent_at = 0.0 - 1.0
     n.smoothing = SMOOTHING
+    n.extrapolation = EXTRAPOLATION
     n.last_draw = 0.0 - 1.0
     g_alive = g_alive + 1
     if g_sessions == null { g_sessions = list.new() }
@@ -3317,6 +3329,7 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
         return
     }
     n.newest_tick = tick
+    n.newest_time = host_time
     if wanted > 0 && wanted != n.wanted { n.asked = n.asked + 1 }
     n.wanted = wanted
     if !n.ack_due { n.ack_since = now }
@@ -3432,8 +3445,10 @@ view_time(n: *Net, now: float) -> float {
 }
 
 // Each networked object drawn where the host had it `interpolation_delay`
-// ago in the host's time: between the two samples around that moment, or
-// held at the newest when the snapshots have stopped coming.
+// ago in the host's time: between the two samples around that moment; or,
+// where the snapshots have stopped coming (a run of them lost, longer than
+// the delay), one that was moving carried on along its last motion for up
+// to `extrapolation`, and one that was not held where it stands.
 interpolate(n: *Net, now: float) {
     if !n.offset_known { return }
     at = view_time(n, now)
@@ -3446,7 +3461,7 @@ interpolate(n: *Net, now: float) {
     i = 0
     while i < list.size(n.objects) {
         no = list.get_raw(n.objects, i) as *NetObject
-        if no != null && no.count > 0 { place_interpolated(no, at, keep) }
+        if no != null && no.count > 0 { place_interpolated(no, at, keep, n.newest_time, n.extrapolation) }
         i = i + 1
     }
 }
@@ -3461,14 +3476,35 @@ set_smoothing(n: *Net, seconds: float) {
     if seconds >= 0.0 { n.smoothing = seconds }
 }
 
+// Client: how long past the newest snapshot it holds an object that was
+// moving in it is carried on along its last motion (0.1 s by default; 0
+// holds it where it was). A run of snapshots lost, longer than the view is
+// behind, runs the view past them all: held, an object at 10 m/s stood 667
+// mm behind where the host had it after four lost at 100 ms behind, and
+// was corrected over the smoothing's time; carried on along the chord of
+// its last interval it is off only by its path's curve, 34 mm on a circle
+// of 10 m at a radian a second (tests/test_net.ae). One the newest snapshot
+// left out stood still (or waited for the budget) and stands: only a gap in
+// the snapshots themselves is guessed across.
+set_extrapolation(n: *Net, seconds: float) {
+    if seconds >= 0.0 { n.extrapolation = seconds }
+}
+
 // An object at its interpolated place and turn: its model's, or its game
-// object's when it has none (a remote player, a ragdoll's bone). Where
-// the view had run past its newest sample, it stood at that sample; the
-// frame the samples take it on again, where it was drawn and where they
-// put it differ by the error, which the object is drawn off them by and
-// which falls away over the smoothing's time: corrected, never snapped.
-// An error past TELEPORT is not one: the object was moved, and is.
-place_interpolated(no: *NetObject, at: float, keep: float) {
+// object's when it has none (a remote player, a ragdoll's bone). Where the
+// view has run past its newest sample: carried on along its last two
+// samples' motion, up to `reach` past it, where that sample is the newest
+// snapshot's (`newest_time`) -- the snapshots have stopped coming, and it
+// was moving in the last of them -- or held at it where the newest
+// snapshot left it out (it stood still, or waited for the budget). Each
+// time what it is drawn from changes while the view is past its samples
+// -- the samples come again, a new one arrives with the view still past
+// it, the carrying stops -- the place the old ones put it at now and the
+// place the new ones do differ by an error, which the object is drawn off
+// them by and which falls away over the smoothing's time: corrected, never
+// snapped, and never stopped for a frame. An error past TELEPORT is not
+// one: the object was moved, and is.
+place_interpolated(no: *NetObject, at: float, keep: float, newest_time: float, reach: float) {
     h = no.history as float[]
     after = 0 - 1
     before = 0 - 1
@@ -3485,29 +3521,81 @@ place_interpolated(no: *NetObject, at: float, keep: float) {
     }
     if before < 0 { before = after }
     if after < 0 { after = before }
-    a = before * SAMPLE
-    c = after * SAMPLE
-    t = 0.0
-    if h[c] > h[a] { t = (at - h[a]) / (h[c] - h[a]) }
-    if t < 0.0 { t = 0.0 }
-    if t > 1.0 { t = 1.0 }
-    target = core.vec3(h[a + 1] + (h[c + 1] - h[a + 1]) * t,
-                       h[a + 2] + (h[c + 2] - h[a + 2]) * t,
-                       h[a + 3] + (h[c + 3] - h[a + 3]) * t)
-    held = at > h[no.newest * SAMPLE]
-    if no.drawn_known && no.held && !held {
-        // Back on its samples after the view ran past them: from where it
-        // was drawn.
-        no.error = core.v3_sub(no.drawn, target)
+    anchor = h[no.newest * SAMPLE]
+    held = at > anchor
+    carried = false
+    if held && reach > 0.0 && !no.leaving && no.count >= 2 && anchor == newest_time {
+        last = (no.newest - 1 + HISTORY) % HISTORY
+        if can_carry(h, last, no.newest) {
+            before = last
+            after = no.newest
+            carried = true
+        }
+    }
+    t = sample_share(h, before, after, carried, at, reach)
+    target = sample_place(h, before, after, t)
+    if no.drawn_known && no.held && (!held || carried != no.carried || anchor != no.from_c_time) {
+        // What it is drawn from has changed while the view was past its
+        // samples: where the old ones put it now, less where the new ones
+        // do, is the error it goes on from -- its path unbroken.
+        was = no.drawn
+        if h[no.from_a * SAMPLE] == no.from_a_time && h[no.from_c * SAMPLE] == no.from_c_time {
+            was = core.v3_add(sample_place(h, no.from_a, no.from_c, sample_share(h, no.from_a, no.from_c, no.carried, at, reach)),
+                              core.v3_mul(no.error, keep))
+        }
+        no.error = core.v3_sub(was, target)
         if core.v3_len(no.error) > TELEPORT { no.error = core.vec3(0.0, 0.0, 0.0) }
     } else {
         no.error = core.v3_mul(no.error, keep)
     }
     no.held = held
+    no.carried = carried
+    no.from_a = before
+    no.from_c = after
+    no.from_a_time = h[before * SAMPLE]
+    no.from_c_time = h[after * SAMPLE]
     drawn = core.v3_add(target, no.error)
     no.drawn = drawn
     no.drawn_known = true
-    set_transform(no.object, drawn, nlerp(h, a + 4, c + 4, t))
+    set_transform(no.object, drawn, nlerp(h, before * SAMPLE + 4, after * SAMPLE + 4, t))
+}
+
+// Whether an object's motion from sample slot `a` to slot `c` (its newest)
+// can be carried on: the two close enough in time for their motion to be
+// its motion now, and apart by less than a teleport.
+can_carry(h: float[], a: int, c: int) -> bool {
+    span = h[c * SAMPLE] - h[a * SAMPLE]
+    dx = h[c * SAMPLE + 1] - h[a * SAMPLE + 1]
+    dy = h[c * SAMPLE + 2] - h[a * SAMPLE + 2]
+    dz = h[c * SAMPLE + 3] - h[a * SAMPLE + 3]
+    return span > 0.0 && span <= CARRIED_SPAN && dx * dx + dy * dy + dz * dz <= TELEPORT * TELEPORT
+}
+
+// How far from sample slot `a` toward slot `c` an object is at `at`: between
+// them, 0 to 1; carried on past `c`, one more for each span of theirs it has
+// gone past it, up to `reach` past it.
+sample_share(h: float[], a: int, c: int, carried: bool, at: float, reach: float) -> float {
+    ta = h[a * SAMPLE]
+    tc = h[c * SAMPLE]
+    if carried {
+        lead = at - tc
+        if lead > reach { lead = reach }
+        if lead < 0.0 { lead = 0.0 }
+        return 1.0 + lead / (tc - ta)
+    }
+    if tc <= ta { return 0.0 }
+    t = (at - ta) / (tc - ta)
+    if t < 0.0 { return 0.0 }
+    if t > 1.0 { return 1.0 }
+    return t
+}
+
+sample_place(h: float[], a: int, c: int, t: float) -> Vec3 {
+    x = a * SAMPLE
+    y = c * SAMPLE
+    return core.vec3(h[x + 1] + (h[y + 1] - h[x + 1]) * t,
+                     h[x + 2] + (h[y + 2] - h[x + 2]) * t,
+                     h[x + 3] + (h[y + 3] - h[x + 3]) * t)
 }
 
 // Between two rotations (four floats of `h` at `a` and at `c`) the short way
