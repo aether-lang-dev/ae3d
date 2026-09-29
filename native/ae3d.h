@@ -40,7 +40,14 @@ void   ae3d_vk_shutdown(void);
 void   ae3d_vk_resize(int width, int height);
 int    ae3d_vk_frame_begin(double r, double g, double b, double a);
 int    ae3d_vk_frame_end(void);
-int    ae3d_vk_upload_mesh(void *mesh);
+int    ae3d_vk_mesh_adopt(void *vertex_buffer, void *vertex_memory, void *index_buffer, void *index_memory,
+                          void *skin_buffer, void *skin_memory, int vertex_count, int index_count);
+int    ae3d_vk_mesh_usage(void);
+int    ae3d_vk_mesh_count(void);
+void  *ae3d_vk_batch_commands(void);
+void   ae3d_vk_batch_keep(void *buffer, void *memory);
+int    ae3d_vk_batch_serial(void);
+void   ae3d_vk_set_error(const char *message);
 int    ae3d_vk_upload_instances(void *instances);
 void   ae3d_vk_free_mesh(int handle);
 int    ae3d_vk_texture_adopt(void *image, void *memory, void *view, int width, int height, int mip_levels, int kind);
@@ -74,7 +81,6 @@ void   ae3d_vk_shadow_end(void);
 void   ae3d_vk_set_post(int fxaa, int bloom, double threshold, double intensity);
 int    ae3d_vk_post_active(void);
 int    ae3d_vk_draw_calls(void);
-int    ae3d_vk_mesh_shared(int handle);
 /* GPU time per pass -- 0 shadow, 1 scene, 2 post -- from the frame whose
    fence was last waited on, and what that frame cost in changes of mind. */
 double ae3d_vk_pass_ms(int pass);

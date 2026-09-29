@@ -1,0 +1,340 @@
+// ae3d.vkmesh -- meshes uploaded on the Vulkan backend (#402): the fourth
+// of native/gpu/vulkan.c to move into Aether, on contrib.vulkan.vk.
+//
+// A mesh's vertices, its indices and, for a skinned one, its joints and
+// weights go into device-local buffers (ae3d.vkhost's), each filled by a
+// copy from host-visible staging. The copies are recorded into the
+// backend's upload batch rather than submitted one by one: the batch runs
+// once, before the next frame begins or before the frame being recorded
+// is submitted, so a scene of hundreds of meshes waits on the queue once
+// rather than once a buffer. The staging is taken in chunks of sixteen
+// megabytes, handed to the backend to free once the batch that reads it
+// has run.
+//
+// The backend adopts the buffers into the mesh table its draws read
+// (ae3d_vk_mesh_adopt), and builds the mesh's bottom-level structure for
+// the rays there, into the same batch: the acceleration-structure commands
+// are not in contrib.vulkan.vk yet (aether-lang-dev/aether#2203).
+//
+// Geometry that appears many times is uploaded once, so the models using
+// it can be merged into a single instanced draw: this module keeps the
+// bytes each mesh was built from and compares them exactly -- a hash could
+// collide and hand back the wrong mesh -- and counts the models drawing
+// each. A mesh is freed when the last of them lets go of it.
+
+import contrib.vulkan.vk
+import ae3d.vkhost
+import ae3d.geometry
+
+exports (
+    mesh_upload, mesh_free, mesh_shared, mesh_forget, uploads, shares, live, slots
+)
+
+extern ae3d_vk_mesh_adopt(vertex_buffer: ptr, vertex_memory: ptr, index_buffer: ptr, index_memory: ptr,
+                          skin_buffer: ptr, skin_memory: ptr, vertex_count: int, index_count: int) -> int
+extern ae3d_vk_mesh_usage() -> int
+extern ae3d_vk_mesh_count() -> int
+extern ae3d_vk_free_mesh(handle: int)
+extern ae3d_vk_batch_commands() -> ptr
+extern ae3d_vk_batch_keep(buffer: ptr, memory: ptr)
+extern ae3d_vk_batch_serial() -> int
+extern ae3d_vk_flush_uploads()
+extern ae3d_vk_set_error(reason: string)
+extern calloc(count: int, size: int) -> ptr
+extern malloc(size: long) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+extern memcmp(a: ptr, b: ptr, n: long) -> int
+
+// A vertex is nine floats -- position, normal, texture coordinate -- and
+// a skinned one's joints and weights eight more, in a stream of their own.
+const STRIDE = 36
+const SKIN_STRIDE = 32
+// The staging a chunk holds, or the upload's size when that is larger.
+const CHUNK = 16777216
+
+// What was uploaded under a handle: how much, a copy of the bytes it was
+// built from (null for a skinned mesh, which never shares, or where the
+// copy could not be had), and how many models draw it.
+struct VKMeshShape {
+    vertices: ptr
+    indices: ptr
+    vertex_count: int
+    index_count: int                 // as uploaded: a mesh without indices is numbered
+    refs: int
+}
+
+var g_shapes: ptr = null             // by handle, what the backend's table holds a mesh in
+var g_capacity = 0
+var g_device: ptr = null             // the device they were uploaded to
+
+// The staging chunk being filled, and the flush that frees it.
+var g_stage_buffer: ptr = null
+var g_stage_mapped: ptr = null
+var g_stage_size = 0
+var g_stage_used = 0
+var g_stage_serial = 0
+
+var g_uploads = 0
+var g_shares = 0
+
+// Meshes whose buffers were made, and uploads answered by a mesh already
+// made, since the process started: what tests/test_vk_mesh counts.
+uploads() -> int { return g_uploads }
+shares() -> int { return g_shares }
+
+// Meshes held now, and the backend's mesh table's slots in use (meshes and
+// instance streams).
+live() -> int {
+    count = 0
+    h = 1
+    while h < g_capacity {
+        if shape_at(h) != null { count = count + 1 }
+        h = h + 1
+    }
+    return count
+}
+
+slots() -> int { return ae3d_vk_mesh_count() }
+
+shape_at(handle: int) -> *VKMeshShape {
+    if handle <= 0 || handle >= g_capacity { return null }
+    return (g_shapes as ptr[])[handle] as *VKMeshShape
+}
+
+put(handle: int, shape: *VKMeshShape) {
+    if handle >= g_capacity {
+        grown = g_capacity * 2
+        if grown < 64 { grown = 64 }
+        while grown <= handle { grown = grown * 2 }
+        fresh = calloc(grown, 8)
+        if g_shapes != null {
+            memcpy(fresh, g_shapes, (g_capacity * 8) as long)
+            free(g_shapes)
+        }
+        g_shapes = fresh
+        g_capacity = grown
+    }
+    (g_shapes as ptr[])[handle] = shape as ptr
+}
+
+drop(handle: int) {
+    shape = shape_at(handle)
+    if shape == null { return }
+    if shape.vertices != null { free(shape.vertices) }
+    if shape.indices != null { free(shape.indices) }
+    free(shape as ptr)
+    (g_shapes as ptr[])[handle] = null
+}
+
+// The mesh already uploaded from these bytes, or 0.
+find(vertices: ptr, indices: ptr, vertex_count: int, index_count: int) -> int {
+    h = 1
+    while h < g_capacity {
+        shape = shape_at(h)
+        if shape != null && shape.vertices != null && shape.refs > 0 && shape.vertex_count == vertex_count && shape.index_count == index_count {
+            if memcmp(shape.vertices, vertices, (vertex_count * STRIDE) as long) == 0 {
+                if indices == null || index_count <= 0 { return h }
+                if memcmp(shape.indices, indices, (index_count * 4) as long) == 0 { return h }
+            }
+        }
+        h = h + 1
+    }
+    return 0
+}
+
+// `bytes` bytes from `source` staged and their copy into `target`
+// recorded into the batch. False when no staging could be had.
+stage(commands: ptr, source: ptr, bytes: int, target: ptr) -> bool {
+    // A chunk taken before the last flush was freed by it.
+    if g_stage_buffer != null && g_stage_serial != ae3d_vk_batch_serial() { g_stage_buffer = null }
+    at = (g_stage_used + 15) / 16 * 16
+    if g_stage_buffer == null || at + bytes > g_stage_size {
+        size = CHUNK
+        if bytes > size { size = bytes }
+        chunk = vkhost.upload_buffer(size)
+        if chunk == null { return false }
+        if chunk.mapped == null {
+            vkhost.host_buffer_free(chunk)
+            return false
+        }
+        ae3d_vk_batch_keep(chunk.buffer, chunk.memory)
+        g_stage_buffer = chunk.buffer
+        g_stage_mapped = chunk.mapped
+        g_stage_size = size
+        g_stage_serial = ae3d_vk_batch_serial()
+        // The chunk is the backend's to free now; only its record goes.
+        free(chunk as ptr)
+        at = 0
+    }
+    memcpy(g_stage_mapped + at, source, bytes as long)
+    region = calloc(1, sizeof(VkBufferCopy)) as *VkBufferCopy
+    region.srcOffset = at
+    region.size = bytes
+    vk.vkCmdCopyBuffer(commands, g_stage_buffer, target, 1, region as ptr)
+    free(region as ptr)
+    g_stage_used = at + bytes
+    return true
+}
+
+// The buffers of a mesh made, filled and adopted: its handle, or 0.
+upload_new(mesh: ptr, vertices: ptr, indices: ptr, vertex_count: int, index_count: int, skinned: bool) -> int {
+    rays = ae3d_vk_mesh_usage()
+    vertex_bytes = vertex_count * STRIDE
+    index_bytes = index_count * 4
+    skin_bytes = vertex_count * SKIN_STRIDE
+    filled = vk.BUFFER_USAGE_TRANSFER_DST_BIT
+    vb = vkhost.device_buffer(vertex_bytes, vk.BUFFER_USAGE_VERTEX_BUFFER_BIT | filled | rays)
+    ib = vkhost.device_buffer(index_bytes, vk.BUFFER_USAGE_INDEX_BUFFER_BIT | filled | rays)
+    sb = vkhost.DeviceBuffer { buffer: null, memory: null }
+    if skinned { sb = vkhost.device_buffer(skin_bytes, vk.BUFFER_USAGE_VERTEX_BUFFER_BIT | filled) }
+    if vb.buffer == null || ib.buffer == null || (skinned && sb.buffer == null) {
+        vkhost.device_buffer_free(vb)
+        vkhost.device_buffer_free(ib)
+        vkhost.device_buffer_free(sb)
+        ae3d_vk_set_error("a mesh's buffers could not be made")
+        return 0
+    }
+
+    commands = ae3d_vk_batch_commands()
+    ok = commands != null
+    if ok { ok = stage(commands, vertices, vertex_bytes, vb.buffer) }
+    if ok && skinned { ok = stage(commands, geometry.mesh_skin_data(mesh), skin_bytes, sb.buffer) }
+    if ok { ok = stage(commands, indices, index_bytes, ib.buffer) }
+    if !ok {
+        // The batch may name the buffers already; it runs before they go.
+        ae3d_vk_flush_uploads()
+        vkhost.device_buffer_free(vb)
+        vkhost.device_buffer_free(ib)
+        vkhost.device_buffer_free(sb)
+        ae3d_vk_set_error("a mesh's upload could not be staged")
+        return 0
+    }
+    return ae3d_vk_mesh_adopt(vb.buffer, vb.memory, ib.buffer, ib.memory, sb.buffer, sb.memory,
+                              vertex_count, index_count)
+}
+
+// A mesh on the device: the handle the backend draws it by, the one
+// already made when its bytes are one's already uploaded, or 0 with the
+// reason in the backend's last error.
+mesh_upload(mesh: ptr) -> int {
+    d = vkhost.device()
+    if d == null {
+        ae3d_vk_set_error("vulkan not initialised")
+        return 0
+    }
+    // Handles from another device name nothing on this one.
+    if d != g_device {
+        mesh_forget()
+        g_device = d
+    }
+    vertices = geometry.mesh_vertex_data(mesh)
+    indices = geometry.mesh_index_data(mesh)
+    vertex_count = geometry.mesh_vertex_count(mesh)
+    index_count = geometry.mesh_index_count(mesh)
+    // Two meshes alike in their vertices can differ in their skins, and the
+    // comparison cannot see that, so a skinned mesh is never shared and
+    // never shares.
+    skinned = geometry.mesh_is_skinned(mesh) == 1
+    if !skinned {
+        found = find(vertices, indices, vertex_count, index_count)
+        if found != 0 {
+            shape = shape_at(found)
+            shape.refs = shape.refs + 1
+            g_shares = g_shares + 1
+            return found
+        }
+    }
+    if vertices == null || vertex_count <= 0 {
+        ae3d_vk_set_error("mesh has no geometry")
+        return 0
+    }
+
+    // A mesh built for glDrawArrays carries no index buffer. Numbering its
+    // vertices costs one small upload and keeps a single indexed draw path
+    // instead of a second pipeline and a second command sequence.
+    numbered = null
+    if indices == null || index_count <= 0 {
+        numbered = calloc(vertex_count, 4)
+        if numbered == null {
+            ae3d_vk_set_error("out of memory")
+            return 0
+        }
+        numbers = numbered as int[]
+        i = 0
+        while i < vertex_count {
+            numbers[i] = i
+            i = i + 1
+        }
+        indices = numbered
+        index_count = vertex_count
+    }
+
+    handle = upload_new(mesh, vertices, indices, vertex_count, index_count, skinned)
+    if handle != 0 {
+        g_uploads = g_uploads + 1
+        shape = calloc(1, sizeof(VKMeshShape)) as *VKMeshShape
+        shape.vertex_count = vertex_count
+        shape.index_count = index_count
+        shape.refs = 1
+        if !skinned {
+            shape.vertices = malloc((vertex_count * STRIDE) as long)
+            shape.indices = malloc((index_count * 4) as long)
+            if shape.vertices != null && shape.indices != null {
+                memcpy(shape.vertices, vertices, (vertex_count * STRIDE) as long)
+                memcpy(shape.indices, indices, (index_count * 4) as long)
+            } else {
+                if shape.vertices != null { free(shape.vertices) }
+                if shape.indices != null { free(shape.indices) }
+                shape.vertices = null
+                shape.indices = null
+            }
+        }
+        // A slot the backend hands out again was let go of through here.
+        drop(handle)
+        put(handle, shape)
+    }
+    if numbered != null { free(numbered) }
+    return handle
+}
+
+// A model lets go of its mesh, or of an instance stream: the buffers go
+// with the last model drawing them.
+mesh_free(handle: int) {
+    if handle <= 0 { return }
+    shape = shape_at(handle)
+    if shape != null {
+        shape.refs = shape.refs - 1
+        if shape.refs > 0 { return }
+        drop(handle)
+    }
+    ae3d_vk_free_mesh(handle)
+}
+
+// Whether more than one model draws this mesh. The upload hands the same
+// handle to every model built from the same bytes, and a depth pass can
+// draw all of them in one instanced call if it knows.
+mesh_shared(handle: int) -> bool {
+    shape = shape_at(handle)
+    if shape == null { return false }
+    return shape.vertices != null && shape.refs > 1
+}
+
+// Everything forgotten, when the backend has shut down (its table went
+// with it) or the device changed: the copies freed, and the staging, which
+// the backend freed at its last flush, let go of.
+mesh_forget() {
+    h = 1
+    while h < g_capacity {
+        drop(h)
+        h = h + 1
+    }
+    if g_shapes != null { free(g_shapes) }
+    g_shapes = null
+    g_capacity = 0
+    g_device = null
+    g_stage_buffer = null
+    g_stage_mapped = null
+    g_stage_size = 0
+    g_stage_used = 0
+}
