@@ -36,7 +36,7 @@ kernels; what remains in C is there for one stated reason each
 | **An engine you can ask** | `AE3D_AGENT=port` opens a JSON channel: read and change the scene, hold a frame, read its pixels, trace a model from its Blender object to the pixels it landed on. |
 | **Natural motion** | `ae3d.motion`, an active ragdoll on any dressed figure: the animation played by joint motors within an adult's torque budget, a blow that knocks it off its pose and back or down, a struck limb that goes weak and recovers, a fall with the hands out and the head tucked, and getting up again face up or face down, handed back to the animation with nothing to jump ([docs/motion.md](docs/motion.md)). |
 | **Multiplayer in the engine** | `ae3d.net`: host or join over UDP -- a handshake, acknowledgements, a reliable ordered channel of its own and fragments on the one socket -- TCP, or an in-process loopback, any of them with simulated latency, jitter and loss; networked objects replicated and interpolated, held to within a millimetre and a half of the host over a perfect link; players that walk the instant their client asks, predicted and reconciled against the host; snapshots quantised to a tenth of a millimetre and sent as changes against the last one each client acknowledged, a still scene 510 bytes a second where whole snapshots cost 24 KB; only what is near each client, within its budget of bytes, the most urgent first; a horde every peer simulates, its struck zombies handed to ragdolls the host simulates and every client draws; and the editor playing a scene as a host and its clients ([docs/networking.md](docs/networking.md)). |
-| **Input as a game names it** | Actions and axes bound once to keys, mouse and gamepad, read by name from any script, injectable from a test or an agent. |
+| **Input as a game names it** | Actions and axes bound once to keys, mouse and gamepad, read by name from any script, injectable from a test or an agent. The camera they fly keeps out of the scene -- swept and slid, never through a wall or under the ground -- and one call frames a model of any size. |
 | **An editor** | Hierarchy, inspector, gizmos, terrain sculpting, physics bodies and a Simulate button, Play as a host and up to four clients over a simulated link, each world shown in turn and its player walked from the keys, undo, scene files; opens any program's scene (`AE3D_SCENE_OUT`); one dark theme on every platform. |
 
 Each row is a page in [docs/](docs/README.md) with the reasoning and the
@@ -127,7 +127,7 @@ together: [docs/architecture.md](docs/architecture.md).
 | | |
 |---|---|
 | ![The city at night, its horde under the lamps](docs/images/zombie-city.png) | ![The seabed under the swell, caustics on the sand](docs/images/caustics.png) |
-| `zombie_city` -- the city and its horde, three tiers by distance, `AE3D_HUNT=1` and it closes on the camera over the flow field | `caustics` -- the seabed under a Gerstner swell, the light refracted through the surface every frame |
+| `zombie_city` -- the street in a city of streets, its horde closing on the camera over the flow field, three tiers by distance | `caustics` -- the seabed under a Gerstner swell, the light refracted through the surface every frame |
 | ![A pyramid of crates scattered by a cannonball](docs/images/physics-pyramid.png) | ![A hundred thousand survivors from a CC0 glTF](docs/images/gltf-crowd.png) |
 | `physics` -- four of the physics engine's reference scenes, every body a game object | `gltf_crowd` -- a public glTF figure, its walk baked, a hundred thousand of it sorted on the device |
 | ![Rain, a storm, dust and snow over an island](docs/images/weather.png) | ![A million grains of sand](docs/images/sand.png) |
@@ -140,9 +140,9 @@ together: [docs/architecture.md](docs/architecture.md).
 | `street_drive.ae` | The street driven, and walked: mesh and hull colliders, a car on wheel joints, skinned figures worn by sprung ragdolls, hit events; E gets out of the car and walks the street first-person on a character controller; the bystanders are active ragdolls the car knocks back or down, and they get up again ([docs/physics.md](docs/physics.md)) |
 | `physics.ae` | `AE3D_PHYSICS_SCENE=pyramid\|pile\|ragdolls\|cloth`, the reference's scenes |
 | `net_walk.ae`, `net_cars.ae` | Multiplayer: `./build/net_walk` hosts, `AE3D_NET=join:127.0.0.1 ./build/net_walk` joins; players walk a plaza, predicted, or eight cars round a ring, interpolated ([docs/networking.md](docs/networking.md)) |
-| `zombie_city.ae` | The city and its horde; `AE3D_CROWD` sets the count, `AE3D_WEATHER` the weather, `AE3D_HUNT=1` the hunt |
-| `gltf_crowd.ae` | Any glTF figure as a horde: `AE3D_CROWD=100000 ./build/gltf_crowd figure.glb Walk` |
-| `gltf_viewer.ae` | Any glTF on a floor under a sun, playing one of its animations |
+| `zombie_city.ae` | The street in a city -- the block instanced around it to the horizon -- and its horde hunting the camera; `AE3D_CROWD` sets the count, `AE3D_WEATHER` the weather, `AE3D_HUNT=0` lets the horde wander |
+| `gltf_crowd.ae` | Any glTF figure as a horde, laid out in the figure's own measure and framed from a raised three-quarter view: `AE3D_CROWD=100000 ./build/gltf_crowd figure.glb Walk` |
+| `gltf_viewer.ae` | Any glTF on a floor under a sun, playing one of its animations, framed whatever its size |
 | `caustics.ae`, `smooth_terrain.ae`, `voxel_world.ae`, `sand.ae` | Water, terrain, voxels, a million point instances |
 | `black_hole.ae` | Kerr geodesics per pixel ([docs/black-hole.md](docs/black-hole.md)) |
 | `lights.ae`, `models.ae`, `blender_pipeline.ae`, `backend_switch.ae`, `spinning_cube.ae` | Materials and lights, OBJ, the Blender export, the two renderers, the smallest program |

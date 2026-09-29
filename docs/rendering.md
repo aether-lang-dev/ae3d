@@ -23,7 +23,13 @@ The feature list in full, with the reasoning behind each. The [README](../README
   -- a position, a scale, a colour and a phase in eight floats, with the
   model's own rotation and scale applied to all of them in the shader. A
   million grains of sand that all move in a frame are a 32 MB stream
-  instead of an 80 MB one built matrix by matrix, on both backends.
+  instead of an 80 MB one built matrix by matrix, on both backends. An
+  instanced model is its instances, however many: it can be added with none
+  and filled later (`model_set_instance_draw_count` up and down its
+  capacity, a city streamed around the camera), and with none it draws and
+  casts nothing, not its mesh where it stands (`tests/test_instance_streams.ae`
+  holds the two backends to the same frames as the count, the places and
+  the colours change).
 - **Skinned crowds in one draw.** A figure's walk is baked once into a pose
   bank (a texture of bone palettes); every instance carries its own phase and
   is posed from the bank in the vertex shader. A crowd of the real 26,636-
@@ -35,16 +41,16 @@ The feature list in full, with the reasoning behind each. The [README](../README
   in dense columns a system walks in one pass, a crowd rendering straight from
   the position column's buffer. The crowd step, separation grid and
   distance bucketing are `ae3d.horde`, over those columns and the job pool.
-- **Physically based shading**: metallic/roughness materials, sixteen
-  directional, point or spot lights a frame -- the key light and, of every
-  light the scene registers, the fifteen nearest the camera, picked each
-  frame (`core.nearest_lights`), a point light past its fall-off and a spot
-  light outside its cone skipped before they are shaded; a spot light
+- **Physically based shading**: metallic/roughness materials; the key light
+  and any directional light reach every pixel, and every point and spot
+  light the scene registers, however many, lights what it reaches through
+  clustered shading (`ae3d.lightgrid`, [Lamps](#lamps)); a spot light
   (`core.light_spot`) is a point light confined to a cone about its
   direction, whole within an inner angle and gone at an outer with a smooth
   fall-off between, which is what a headlight is -- normal mapping, baked per-vertex occlusion and
   screen-space ambient occlusion from the scene's depth (`engine_set_ssao`,
-  both backends), shadow mapping with a texel-snapped light box (both
+  both backends), the key light's shadow in four cascades that a moving camera does not
+  move ([Shadows](#shadows), both
   backends), volumetric clouds and their shadows, a sky drawn from the sun by
   the hour or a painted one, fog applied after tone mapping, MSAA, FXAA and
   bloom. Screen-space reflections on wet surfaces on
@@ -125,6 +131,12 @@ The feature list in full, with the reasoning behind each. The [README](../README
   voxel palette, an island's albedo baked from its own height and slope: made
   by the engine from its own noise, registered under a name any texture path
   can use, nothing downloaded and nothing written to disk that need not be.
+- **A camera that keeps out of the scene, and frames what it is shown.** The
+  camera the engine flies is a sphere the static geometry keeps out: swept
+  and slid, never inside a wall or under the ground, at 200 m/s as at a
+  walk. One call places a camera where a model or a group fills a share of
+  the frame from a chosen angle, its near and far planes fitted to it,
+  whatever its size ([The camera](#the-camera)).
 - **Also:** Perlin terrain, an OBJ/MTL loader, ray casting, keyframe animation
   in glTF's shape (step, linear, cubic), scenes that save and load with
   everything attached to them, a scene editor, and `AE3D_API=vulkan` to run
@@ -310,10 +322,9 @@ ground and the wall's top do not, and off again the screen-space pass is
 back. In the city at 720p the opaque pass goes from 1.23 to 1.81 ms
 (best of five) and the 0.11 ms screen-space pass is skipped.
 
-Every lamp throws its own shadow by ray: a point light has no shadow
-map, and on the map path the key light's shadow stands in for every
-lamp's -- which on a night street is a figure lit from above by three
-lamps and shadowing nothing, floating on the road. With the rays on, each
+Every lamp throws its own shadow. On the map path each lamp the budget
+holds has a cube of maps of its own ([The lamps' own
+shadows](#the-lamps-own-shadows)); by ray, each
 point light that reaches a pixel casts one ray from the surface to a spot
 on the lamp's face (`engine_set_lamp_size`, the face's width in metres,
 twelve centimetres unless set), stopped sixty centimetres short of the
@@ -322,9 +333,9 @@ shadow the whole street with a grain. The spot turns by the golden angle
 every frame (`rayFrame`; the projection's jitter was tried for this and is
 a fraction of a pixel, which turned nothing), so the temporal pass folds
 the frames into the lamp's penumbra. `tests/test_ray_shadows` puts the sun
-out and a lamp over the ground beside the ball: on the map path the ground
-past the ball is lit as the ground under the lamp; by ray it goes dark
-(598 to 403) and the ground under the lamp stays. The city runs with the
+out and a lamp over the ground beside the ball: the ground past the ball
+goes from 598 with the ball casting nothing to 403, on the map path and by
+ray alike, and the ground under the lamp stays lit on both. The city runs with the
 rays on where the device traces, a light under every lamp head its tiles
 place (twenty-one lamps; the nearest fifteen light a frame), the wet road's
 reflection (`engine_set_ssr`), the occlusion by ray and the temporal pass:
@@ -443,6 +454,82 @@ grazing angle, so the lamps smear down a wet road; walls, which water
 runs off, hardly change. The weather sets it with the rain and the storm
 and takes it back with the clear.
 
+### The camera
+
+**It keeps out of the scene** (#470). The camera the engine flies by the
+input (`engine_set_camera_input`, on by default) is a sphere around the eye,
+0.2 m unless the near plane's corners reach further (they widen it), that
+the scene's static geometry keeps out. A move is swept and slid the way the
+character controller walks -- Box3D's mover in aephysics: the sphere cast
+along what is left of the move, the planes it then touches gathered and
+solved out of, the rest of the move clipped against them, five times -- so
+the eye slides along a wall at the speed its move has along the wall,
+stops in a corner a radius from both faces, and does not pass through a
+0.5 m wall at 200 m/s, three metres a frame. It never goes under the
+ground: a move is held to a radius over the lowest surface of the static
+world as it is swept, so past the ground's edge the eye cannot drop below
+the street and look up at it. `engine_set_camera_collision(e, false)`
+turns it off; the editor flies its own camera, which passes through
+everything, over `engine_over`, which starts with it off.
+
+What it collides with is `ae3d.viewpoint`'s. With physics attached
+(`physics.attach` lends its world), the physics world's static bodies --
+what the scene says stands still; not a crate, a car or a figure. Without,
+a world of its own made from the scene's static models: every model the
+renderer draws that nothing moves -- not skinned, not a crowd or its
+picture, not a particle, not driven by a clip or hung off something that
+is, and not instanced unless `core.model_set_solid(m, true)` says its
+instances stand still (a city's buildings drawn a part at a time) -- as
+its own triangles, both sides of each (a pane an export wound the wrong
+way round let the eye into the hollow building behind it), at its own
+transform or each instance's. The scene is read once a frame the camera
+moves, a couple of milliseconds the first time for a street of 1,500
+models and then only what moved; a model's collision mesh is built the
+first time the eye comes near it (`engine_camera_prepare` builds a large
+one as the scene loads instead), and its body is let go when the eye has
+been away for a while, so a city streamed around the camera never fills
+the world. A move through the street costs 0.15 ms on average.
+
+A camera a script places each frame -- `street_drive`'s chase camera --
+asks `engine_camera_boom(e, pivot, wanted)`: the sphere cast from over
+what it follows toward where it wants to be, so a wall that comes between
+them brings the camera in front of the wall rather than through it.
+
+`tests/test_camera_collision` flies the camera by injected keys into a
+road, a wall and a corner at 60 and 200 m/s, and holds it, every frame,
+to at least its radius from every box measured from the boxes themselves
+(0.205 m, the radius and the solver's slop); at 45 degrees into the wall it
+slides at 14.14 m/s of the 14.14 its move has along it; with physics it
+keeps out of the static body and passes the kinematic crate; a pane
+facing away stops it; an instanced model stops it only when marked solid;
+a sweep costs 2.4 us. `AE3D_CAMERA_WANDER=n` flies the camera at random
+through any scene for n frames by the same injected keys and measures every
+move against the drawn triangles themselves, closest point by closest
+point, with a ray's crossings for whether it is inside anything: thousands
+of frames through `zombie_street` and `zombie_city`, up to 20 m/s, come
+no nearer anything than 0.205 m, never inside, never under the ground.
+
+**It frames what it is shown** (#471). `engine_frame(e, models, share,
+yaw, pitch)` puts the camera where the models -- every vertex where it is
+drawn: through its transform, its skin's pose, each instance, a crowd's
+figures at their phases -- fill `share` of the frame's height seen along
+yaw and pitch, centred, further back where they would be wider than the
+frame, never inside the sphere about them, with the near plane at half the
+nearest point's depth and the far at four times the furthest's.
+`engine_frame_bounds` frames a box, and `engine_frame_points` points a
+program gathered (`viewpoint.points_add_*`), eased over a time so a
+framing that follows something moving does not cut. `gltf_viewer` frames
+whatever file it is given over its whole clip; `gltf_crowd` frames its
+horde from a raised three-quarter view and follows it. `tests/test_framing`
+frames every glTF file in the repository -- the box man, the fox a hundred
+units long, the arm as `.glb` and `.gltf` -- and the box man a hundred
+times over and a hundredth: each spans 55% of the frame's height by its
+projected vertices, the camera outside every model's bounds, nothing
+behind the near plane; drawn through OpenGL and Vulkan off the screen, each
+lands on the rows the numbers give, within a pixel; a crowd of foxes at
+their own poses the same; a walking group followed stays 55-62% of the
+height and never moves the camera further in a frame than it moved.
+
 ### The scene's depth
 
 The occlusion, the reflection and the water read the scene's depth. On
@@ -451,6 +538,167 @@ frame's multisampled depth is resolved into a one-sample target between
 the two halves the scene pass is drawn in, the nearest of the samples a
 pixel. Both are the depth of what was drawn -- the near figure's real
 silhouette, the picture of a far one -- and neither draws anything twice.
+
+## Lamps
+
+Every point and spot light a scene registers lights what it reaches, and
+nothing else, wherever the camera is. The renderers used to light a frame
+with the sixteen lights nearest the camera, so a street's lamps lit their
+pools while the camera stood near them and went out as it walked away.
+
+It works by clustered shading (`ae3d.lightgrid`, #468).
+- **The grid.** Every frame the view is cut into 16 columns × 9 rows ×
+  24 depth slices. The slices are logarithmic, so a cell is about as deep
+  as it is wide at any distance.
+- **The lists.** Each lamp is listed in every cell its sphere of reach
+  overlaps: the distance from the lamp's view-space centre to the cell's
+  box against its reach, taken axis by axis. A pixel shades with its own
+  cell's list, so its cost is the lamps near it, not the lamps in the scene.
+- **The reach.** A lamp reaches where its attenuation falls to 1/64 of its
+  value at the lamp, the fall-off the shader used to cut at, and its light
+  fades to nothing over the last quarter of that distance, so a pool ends
+  in a gradient.
+- **The layout.** The lamps (five vec4s each) and the cells' lists are
+  built once on the CPU in one layout. Vulkan reads them as storage buffers
+  at bindings 6 and 7. OpenGL 4.1, which has no storage buffers, reads the
+  same floats from two textures.
+- **The rest.** The key light and any directional light reach every pixel
+  and stay in the shader's small uniform array.
+- **The shadow.** A lamp's record carries the slot of its own shadow, or
+  -1 where it has none ([The lamps' own shadows](#the-lamps-own-shadows)),
+  and the slots' data follows the lamps in the same buffer.
+
+Held to numbers:
+- `tests/test_light_grid.ae`, headless:
+  - 20,000 points through the view, each checked against a street of 256
+    lamps by brute force: of the roughly 800,000 lamp-point pairs in reach,
+    none is missing from its cell's list, from either of two cameras;
+  - a cell lists about 45 lamps where about 40 reach its points;
+  - a build takes about 1.3 ms for 256 lamps set 4 m apart.
+- `tests/test_lamp_clusters.ae`, 64 lamps down a street on both renderers:
+  - the ground under a lamp reads the same from 25 m and from 120 m on one
+    line to it, within 1.3 of 255 (on the old renderer it lost 58);
+  - OpenGL and Vulkan agree there exactly;
+  - the scene pass costs about 0.02–0.03 ms with 64 lamps and about
+    0.08 ms with 256.
+
+## Shadows
+
+A light is shadowed by its own map and by no other light's. The key light,
+when it is the sun or the moon, is shadowed in cascades; every lamp the
+budget holds, the key light too when it is one, by a cube of its own
+([The lamps' own shadows](#the-lamps-own-shadows)); the other directional
+lights, the fills, not at all.
+
+The key light's shadow is drawn in cascades (`ae3d.cascades`, #469). One
+shadow map fitted around the camera and snapped on the world's axes slid by
+fractions of a texel whenever the camera moved, so every edge crawled, and
+past its distance there were no shadows at all.
+
+- **The splits.** The view is cut in depth into four slices, out to the
+  shadow distance (`engine_set_shadow_distance`), or as far as the scene
+  reaches when none is set. The cuts are three-quarters logarithmic and a
+  quarter uniform, so the near slice is short and sharp and the far one
+  long.
+- **One map each.** Every slice gets a 2048-texel map in one 4096-texel
+  depth atlas, two by two.
+- **The fit.** Each map is fitted to the smallest sphere around its slice
+  of the view. The view's angle does not change a sphere's size, so a texel
+  stays the same size as the camera turns.
+- **The grid.** Each map's origin is kept on its own texel grid: the
+  world's origin, projected into the map, is moved to the nearest whole
+  texel. As the camera moves the map moves by whole texels, and a shadow
+  edge lands on the same texels whatever the camera does.
+- **The casters.** A map's depth runs back toward the light as far as the
+  scene reaches, so what stands between the light and a slice still casts
+  into it. A caster is drawn into a cascade only where its shadow can land
+  on what that cascade shades: its slice of the view and the band of the
+  slice before that blends it in, put through the cascade's matrix and
+  widened by as far as the shader reads from a receiver (the normal
+  offset, up to 33.5 texels, and the filter's taps). Tested against the
+  sphere's whole square instead, a street's casters went into three and
+  four cascades each: `zombie_street`, its shadow reaching 18 m and its key
+  lamp still drawn in cascades then, drew 339 calls where one map drew 255,
+  and 250 with the test. Vulkan draws the casters kind by kind -- plain and batched,
+  skinned, crowds, point streams -- each into every cascade in turn, so each
+  pipeline is bound once.
+- **The seams.** The scene shader picks a pixel's cascade by its depth
+  along the view and blends the next one in over the last tenth of each, so
+  no seam shows where the texels change size.
+
+Held to numbers:
+- `tests/test_shadow_cascades.ae` puts a 6 m post under a slanting sun,
+  with an 80 m shadow distance, on both renderers:
+  - the shadow's edges, read in world metres from 1280×720 frames, stay
+    within 1.5–2.3 cm over twelve camera poses moved in 13 cm steps and
+    turned (a texel there is 1 cm). The previous renderer's edges wandered
+    by 13 cm;
+  - a post 59 m away still casts;
+  - OpenGL and Vulkan put the edges in the same place;
+  - the four cascades cost about 0.08 ms on OpenGL and 0.11 ms on Vulkan.
+- `tests/test_engine_shadows.ae`: through the engine, a floating box's
+  shadow darkens the ground under it by 42%, and lit ground beside it does
+  not move.
+
+### The lamps' own shadows
+
+A lamp had no shadow map, and the shader multiplied every lamp's light by
+the key light's shadow instead (#490). A wall in the moon's shadow went dark
+under the lamp beside it; a figure lit by three lamps threw no shadow from
+any of them; and a street whose key light was a lamp -- `zombie_street`'s --
+was shadowed along one direction from the lamp to wherever the camera
+looked, so every shadow swung as the camera moved.
+
+Now each lamp the budget holds has a map of its own (`ae3d.lampshadows`):
+- **The cube.** A lamp shines every way, so its map is the six faces of a
+  cube around it, 90-degree perspective views of 512 texels, from 0.6 m out
+  (the fitting the lamp hangs in casts nothing, as the rays stop the same
+  distance short) to the lamp's reach.
+- **The atlas.** The faces share one 4096-texel depth atlas, eight by eight:
+  ten lamps a frame.
+- **The budget.** The key light when it is a lamp, always; then the lamps
+  whose light reaches into the view, nearest the camera first, within 50 m
+  of it (or the shadow distance, where that is further). A lamp keeps its
+  slot while it stays chosen. A lamp past the budget is not shadowed at
+  all -- never shadowed by another light -- and the last fifth of the range
+  fades a lamp's shadow out, so one leaving the budget does not pop. Where
+  the device traces, a lamp whose light lies wholly inside the rays' reach
+  is left to the rays.
+- **Two layers.** A face's static casters -- plain models, whose world
+  stamp says when they move -- are drawn into a static atlas only when what
+  stands still in the face changes. The atlas the shader reads is that
+  layer copied up a tile at a time, with what moves on its own -- a skinned
+  figure, a crowd, an instance stream -- drawn over the copy every frame it
+  is there. A lamp over a walking figure costs a copy and a draw a face, not
+  its street again: `zombie_street` draws 87 calls a frame on OpenGL and 88
+  on Vulkan, where the one map it had drew 255.
+- **The lookup.** Each clustered lamp carries its slot; the slots' data --
+  where the lamp stands, its reach, its shadow's strength and the six
+  faces' matrices -- follows the lamps in the lights' buffer. The shader
+  picks the face a point lies in from the lamp, moves the sample off the
+  surface along its normal by a face texel at that distance (and more on a
+  surface the lamp grazes), and compares depths in metres from the lamp,
+  since a perspective map's depth crowds toward its far plane.
+
+Held to numbers: `tests/test_lamp_shadows.ae`, offscreen on both renderers.
+- A lamp that is the key light, over a box: the box's shadow ends at
+  4.934-4.938 m from four camera poses, where the ray from the lamp past the
+  box's top edge meets the ground at 5 m, less 1.25 cm for every centimetre
+  the sample is lifted (4.945 m). The poses move it by 0.3 cm, under a
+  texel (1.95 cm), and OpenGL and Vulkan end it in the same place.
+- A lamp over ground in the moon's shadow gives it 91.75, as the same lamp
+  gives open ground 91.75; the moon alone, the wall's shadow reads 41 there
+  against 110 in the open.
+- Of twelve lamps down a street, the ten nearest have a shadow; past the
+  nearest lamp's post the ground reads 30 against 83 with the post casting
+  nothing, past the farthest's (outside the budget) 73 against 73.
+- A frame in which nothing moved draws no static layer; a post moved under
+  a lamp draws two; a cube as an instance stream hung under a lamp darkens
+  the ground behind it to 29 (77 without it) with no static layer drawn,
+  and moved away leaves 77.04 against 77.04.
+- `tests/test_ray_shadows`: the map path and the rays shadow the ground
+  past the ball from a lamp alike (403 each, 598 with the ball casting
+  nothing).
 
 ## How it is put together
 

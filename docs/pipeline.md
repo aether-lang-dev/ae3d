@@ -69,6 +69,15 @@ What makes the pipeline usable by a program rather than a person:
   reads the exported scene back with its transforms and reports any pair of
   faces sharing a plane, which is what z-fighting is; `ci.sh` runs it on every
   exported scene.
+- **A window pane faces the street.** A pane is one sheet drawn from its
+  front, so one facing into its building is culled and the window is a hole
+  onto the hollow shell behind it. `make_zombie_street.py` winds each pane
+  to face out and keeps that winding (`_finish(wound=True)`: the normals
+  recalculated over a set of loose sheets in one plane faced 222 of 346
+  pane triangles in, #478); `tools/check_panes.ae` reads an export back and
+  counts the pane triangles facing into their building, 0 wanted. The
+  committed street predates the fix until it is rebuilt in Blender and
+  exported.
 
 - **The crowd's pictures are baked by the engine.** `./build/bake_impostor
   <manifest> <figure>` draws the figure the way the crowd draws it -- its
@@ -156,7 +165,10 @@ Images embedded in a `.glb` are decoded and registered under
 sparse accessors, `data:` URIs, morph targets -- is named in the scene's
 warnings, and the rest of the file loads. The palette holds ninety-six
 bones, which is a Mixamo rig with its fingers. `examples/gltf_viewer.ae`
-frames any file on a floor and plays one of its animations;
+frames any file on a floor -- every vertex, skinned, over sixteen points of
+the clip it plays, filling 55% of the frame's height from a three-quarter
+view (`engine_frame_points`), a hundred-unit fox and a centimetre arm alike
+-- and plays one of its animations;
 `tests/test_gltf` holds the loader to a two-bone arm it can do the
 arithmetic for, and to the Khronos Fox.
 
@@ -173,7 +185,10 @@ crowd's -- and the file's facing (+Z for glTF, +X for the pipeline) is
 added to the crowd's headings when they are uploaded.
 `examples/gltf_crowd.ae` walks any figure over a field in the zombie's
 three tiers (`AE3D_CROWD`, `AE3D_ANIM`, `AE3D_FACING`, `AE3D_NEAR`,
-`AE3D_IMPOSTOR`): the file's meshes near, the same decimated by
+`AE3D_IMPOSTOR`), laid out in the figure's own measure -- its size read off
+every vertex of every pose of its bank, the field, the spacing, the pace
+and the bands scaled to it -- and framed from a raised three-quarter view
+that follows the horde as it walks: the file's meshes near, the same decimated by
 `mesh_decimate` past the near band, and past the impostor band the
 picture `tools/bake_impostor --gltf figure.glb Walk` writes beside the
 file from the file alone, the figure turned to face +X so the atlas's

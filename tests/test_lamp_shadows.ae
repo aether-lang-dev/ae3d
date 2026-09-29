@@ -1,0 +1,508 @@
+// The lamps' own shadows (#490). Offscreen, on both renderers.
+//
+// A lamp had no shadow map. Every lamp's light was multiplied by the key
+// light's shadow, so a lamp that was itself the key light -- zombie_street's
+// -- was shadowed by one orthographic map aimed from it at wherever the
+// camera looked, and a lamp beside a wall in the moon's shadow gave that
+// wall nothing. Now every lamp the budget holds has a cube of its own, and
+// no light is shadowed by another's map:
+//
+//   - a lamp that is the key light, over a box: the box's shadow on the
+//     ground ends where the ray from the lamp past the box's top edge meets
+//     it (5 m out, and 1.25 cm nearer for every centimetre the sample is
+//     lifted off the ground), from four camera poses that do not move it by
+//     a texel, and OpenGL and Vulkan put it in the same place;
+//   - a lamp over ground in the moon's shadow lights that ground as much as
+//     the same lamp lights open ground, to three percent;
+//   - of twelve lamps down a street, the ten nearest the camera have a
+//     shadow, and the two past the budget are unshadowed -- lit as if no
+//     caster stood there, never shadowed by another light;
+//   - a frame in which nothing moved draws no face's static layer; a post
+//     moved under one lamp draws that lamp's faces it stands in, and no
+//     other; something that moves on its own (an instance stream) under a
+//     lamp throws its shadow every frame without drawing a static layer
+//     again, and takes it with it when it goes;
+//   - what the lamps' faces cost.
+import std.mem
+import ae3d.core
+import ae3d.loader
+import ae3d.gl
+import ae3d.vulkan
+import ae3d.offscreen
+import ae3d.lampshadows
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+const WIDTH = 1280
+const HEIGHT = 720
+const POSES = 4
+const LAMP_HEIGHT = 4.0
+const STREET_LAMPS = 12
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+grey_at(pixels: ptr, x: int, y: int) -> float {
+    if x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT { return 0.0 - 1.0 }
+    at = (y * WIDTH + x) * 4
+    return ((mem.get_uint8(pixels, at) + mem.get_uint8(pixels, at + 1) + mem.get_uint8(pixels, at + 2)) as float) / 3.0
+}
+
+// The grey of world point `p` in `cam`'s frame, read bilinearly at the
+// sub-pixel place it projects to.
+grey_of(pixels: ptr, cam: *Camera, p: Vec3) -> float {
+    s = core.camera_world_to_screen(cam, p, WIDTH, HEIGHT)
+    if s.w < 0.0001 { return 0.0 - 1.0 }
+    fx = s.x - 0.5
+    fy = s.y - 0.5
+    x0 = fx as int
+    y0 = fy as int
+    tx = fx - (x0 as float)
+    ty = fy - (y0 as float)
+    a = grey_at(pixels, x0, y0)
+    b = grey_at(pixels, x0 + 1, y0)
+    c = grey_at(pixels, x0, y0 + 1)
+    d = grey_at(pixels, x0 + 1, y0 + 1)
+    return (a * (1.0 - tx) + b * tx) * (1.0 - ty) + (c * (1.0 - tx) + d * tx) * ty
+}
+
+// Two renderers side by side, or OpenGL alone where there is no Vulkan.
+struct Pair {
+    gl_renderer: *GLRenderer
+    gl_pass: Backend
+    target: ptr
+    vk_renderer: *VKRenderer
+    vk_pass: Backend
+    have_vulkan: bool
+}
+
+render(p: *Pair, vulkan_side: bool, cam: *Camera, key: *Light) -> ptr {
+    if vulkan_side {
+        core.backend_render(&p.vk_pass, cam, key)
+        return vulkan.offscreen_pixels()
+    }
+    core.backend_render(&p.gl_pass, cam, key)
+    return offscreen.target_pixels(p.target)
+}
+
+pass_of(p: *Pair, vulkan_side: bool) -> *Backend {
+    if vulkan_side { return &p.vk_pass }
+    return &p.gl_pass
+}
+
+ground(pass: *Backend) -> *Model {
+    g = loader.cube(1.0)
+    core.model_set_position(g, 0.0, 0.0 - 0.1, 0.0)
+    core.model_set_scale(g, 400.0, 0.2, 400.0)
+    core.model_matte(g, 0.7, 0.7, 0.7)
+    core.backend_add_model(pass, g)
+    return g
+}
+
+block(pass: *Backend, x: float, y: float, z: float, sx: float, sy: float, sz: float) -> *Model {
+    m = loader.cube(1.0)
+    core.model_set_position(m, x, y, z)
+    core.model_set_scale(m, sx, sy, sz)
+    core.model_matte(m, 0.6, 0.3, 0.2)
+    core.backend_add_model(pass, m)
+    return m
+}
+
+lamp(x: float, z: float) -> *Light {
+    return core.light_point(core.vec3(x, LAMP_HEIGHT, z), core.vec3(1.0, 0.85, 0.65), 3.0, 2.5)
+}
+
+// Where along the line z = 0, going out from the box, the ground leaves the
+// box's shadow: the grey with the box casting against the grey with it cast
+// nothing (the same frame but for the shadow), the lamp's own fall-off
+// divided out, crossing halfway between the shadow's share and 1.
+shadow_end(p: *Pair, vulkan_side: bool, cam: *Camera, key: *Light, box: *Model) -> float {
+    pixels = render(p, vulkan_side, cam, key)
+    bytes = WIDTH * HEIGHT * 4
+    shaded = calloc(bytes, 1)
+    mem.copy_at(shaded, 0, pixels, 0, bytes as long)
+    core.model_set_casts_shadow(box, false)
+    open = render(p, vulkan_side, cam, key)
+    core.model_set_casts_shadow(box, true)
+
+    floor_ratio = 0.0
+    n = 0
+    x = 3.2
+    while x <= 4.2 {
+        floor_ratio = floor_ratio + grey_of(shaded, cam, core.vec3(x, 0.0, 0.0)) / grey_of(open, cam, core.vec3(x, 0.0, 0.0))
+        n = n + 1
+        x = x + 0.05
+    }
+    floor_ratio = floor_ratio / (n as float)
+    half = (floor_ratio + 1.0) * 0.5
+    step = 0.001
+    prev = floor_ratio
+    found = 0.0
+    x = 4.2
+    while x < 6.5 {
+        r = grey_of(shaded, cam, core.vec3(x, 0.0, 0.0)) / grey_of(open, cam, core.vec3(x, 0.0, 0.0))
+        if r >= half {
+            found = x - step * (r - half) / (r - prev)
+            break
+        }
+        prev = r
+        x = x + step
+    }
+    free(shaded)
+    return found
+}
+
+// The camera's four poses over the box's shadow: moved and turned.
+pose(cam: *Camera, k: int) {
+    core.camera_set_position(cam, core.vec3(3.0 + (k as float) * 0.37, 5.0 + ((k % 2) as float) * 0.6, 0.0 - 8.0 + (k as float) * 0.23))
+    core.camera_look_at(cam, core.vec3(4.2 + ((k % 3) as float - 1.0) * 0.4, 0.0, 0.0))
+}
+
+// The key light a lamp over a box.
+key_lamp(p: *Pair, cam: *Camera) {
+    println("")
+    println("== a lamp that is the key light, over a box ==")
+    sides = 1
+    if p.have_vulkan { sides = 2 }
+    ends = calloc(2 * POSES, 8)
+    at = ends as float[]
+    side = 0
+    while side < sides {
+        vulkan_side = side == 1
+        pass = pass_of(p, vulkan_side)
+        floor_model = ground(pass)
+        box = block(pass, 2.0, 1.0, 0.0, 1.0, 2.0, 1.0)
+        key = lamp(0.0, 0.0)
+        key.ambient_strength = 0.05
+        k = 0
+        while k < POSES {
+            pose(cam, k)
+            at[side * POSES + k] = shadow_end(p, vulkan_side, cam, key, box)
+            k = k + 1
+        }
+        core.backend_remove_model(pass, box)
+        core.backend_remove_model(pass, floor_model)
+        core.model_free(box)
+        core.model_free(floor_model)
+        core.light_free(key)
+        side = side + 1
+    }
+    // A face's texel where the shadow ends, 5 m along the face's axis.
+    texel = 2.0 * 5.0 / (lampshadows.FACE as float)
+    lo = 1000.0
+    hi = 0.0 - 1000.0
+    k = 0
+    while k < POSES {
+        if at[k] < lo { lo = at[k] }
+        if at[k] > hi { hi = at[k] }
+        k = k + 1
+    }
+    println("  OpenGL: the shadow ends at ${lo}..${hi} m over ${POSES} poses (5 m where the ray past the box's edge meets the ground; a texel there is ${texel} m)")
+    check("the lamp's shadow ends where the ray from the lamp past the box meets the ground",
+          lo > 5.0 - texel * 5.0 && hi < 5.0 + texel * 2.0)
+    check("and no pose of the camera moves it by a texel", hi - lo <= texel)
+    if p.have_vulkan {
+        worst = 0.0
+        k = 0
+        while k < POSES {
+            gap = at[POSES + k] - at[k]
+            if gap < 0.0 { gap = 0.0 - gap }
+            if gap > worst { worst = gap }
+            k = k + 1
+        }
+        println("  Vulkan against OpenGL: at most ${worst} m apart")
+        check("OpenGL and Vulkan end it in the same place, to a texel", worst <= texel)
+    }
+    free(ends)
+}
+
+// A lamp over ground in the moon's shadow, and the same lamp over open
+// ground. First that the moon's shadow is there: the moon alone, the lamps
+// out, darkens the one against the other. Then the moon's light put out --
+// it is still the key light, and its cascades are still drawn -- and the
+// lamps lit: each gives its ground the same light, the moon's shadow taking
+// none of it. Lamp light shadowed by the moon's map, as it was, went to
+// the shadow's share of it there.
+moon_and_lamp(p: *Pair, cam: *Camera) {
+    println("")
+    println("== a lamp over ground the moon's shadow covers ==")
+    sides = 1
+    if p.have_vulkan { sides = 2 }
+    side = 0
+    while side < sides {
+        vulkan_side = side == 1
+        name = "OpenGL"
+        if vulkan_side { name = "Vulkan" }
+        pass = pass_of(p, vulkan_side)
+        floor_model = ground(pass)
+        // An eight-metre wall on the moon's side: its shadow runs 6 m out
+        // over the ground past it.
+        wall = block(pass, 0.0 - 3.0, 4.0, 0.0, 2.0, 8.0, 8.0)
+        moon = core.light_directional(core.vec3(0.0 - 0.6, 0.8, 0.0), core.vec3(0.7, 0.75, 0.9), 0.8)
+        moon.ambient_strength = 0.05
+        shaded_lamp = lamp(1.0, 0.0)
+        open_lamp = lamp(21.0, 0.0)
+        core.backend_add_light(pass, shaded_lamp)
+        core.backend_add_light(pass, open_lamp)
+        core.camera_set_position(cam, core.vec3(11.0, 9.0, 0.0 - 14.0))
+        core.camera_look_at(cam, core.vec3(11.0, 0.0, 0.0))
+        shaded_spot = core.vec3(1.0, 0.0, 1.0)
+        open_spot = core.vec3(21.0, 0.0, 1.0)
+
+        shaded_lamp.intensity = 0.0
+        open_lamp.intensity = 0.0
+        pixels = render(p, vulkan_side, cam, moon)
+        moon_shaded = grey_of(pixels, cam, shaded_spot)
+        moon_open = grey_of(pixels, cam, open_spot)
+        println("  ${name}: the moon alone: ${moon_shaded} in the wall's shadow, ${moon_open} in the open")
+        check("${name}: the wall shadows the ground under the first lamp from the moon", moon_shaded < moon_open * 0.7)
+
+        shaded_lamp.intensity = 3.0
+        open_lamp.intensity = 3.0
+        moon.intensity = 0.0
+        pixels = render(p, vulkan_side, cam, moon)
+        lamp_shaded = grey_of(pixels, cam, shaded_spot)
+        lamp_open = grey_of(pixels, cam, open_spot)
+        println("  ${name}: the lamps alone: ${lamp_shaded} under the lamp in the moon's shadow, ${lamp_open} under the one in the open")
+        check("${name}: a lamp lights ground in the moon's shadow as it lights open ground",
+              lamp_open > 40.0 && lamp_shaded > lamp_open * 0.97 && lamp_shaded < lamp_open * 1.03)
+
+        core.backend_remove_light(pass, shaded_lamp)
+        core.backend_remove_light(pass, open_lamp)
+        core.backend_remove_model(pass, wall)
+        core.backend_remove_model(pass, floor_model)
+        core.model_free(wall)
+        core.model_free(floor_model)
+        core.light_free(shaded_lamp)
+        core.light_free(open_lamp)
+        core.light_free(moon)
+        side = side + 1
+    }
+}
+
+// Twelve lamps down a street, a post beside each: the budget, the lamps
+// past it, and the faces a frame draws.
+street(p: *Pair, cam: *Camera) {
+    println("")
+    println("== twelve lamps down a street ==")
+    sides = 1
+    if p.have_vulkan { sides = 2 }
+    side = 0
+    while side < sides {
+        vulkan_side = side == 1
+        name = "OpenGL"
+        if vulkan_side { name = "Vulkan" }
+        pass = pass_of(p, vulkan_side)
+        // A shadow distance past the street's far end, so every lamp is in
+        // the lamps' range and it is the budget that chooses.
+        core.backend_set_shadow_distance(pass, 200.0)
+        floor_model = ground(pass)
+        moon = core.light_directional(core.vec3(0.0, 1.0, 0.0), core.vec3(0.2, 0.2, 0.25), 0.05)
+        moon.ambient_strength = 0.05
+        lamps_block = calloc(STREET_LAMPS, 8)
+        lamps = lamps_block as ptr[]
+        posts_block = calloc(STREET_LAMPS, 8)
+        posts = posts_block as ptr[]
+        i = 0
+        while i < STREET_LAMPS {
+            x = (i as float) * 12.0
+            lamps[i] = lamp(x, 0.0) as ptr
+            core.backend_add_light(pass, lamps[i] as *Light)
+            // Beside its lamp, across the street from the line of lamps:
+            // the ground past it from its own lamp is behind it, and no
+            // other lamp's light crosses it on the way there.
+            posts[i] = block(pass, x, 0.75, 1.0, 0.3, 1.5, 0.3) as ptr
+            i = i + 1
+        }
+        core.camera_set_position(cam, core.vec3(0.0 - 14.0, 6.0, 0.0 - 10.0))
+        core.camera_look_at(cam, core.vec3(40.0, 0.0, 0.0))
+        render(p, vulkan_side, cam, moon)
+        render(p, vulkan_side, cam, moon)
+
+        ls = p.gl_renderer.lamp_shadows as *LampShadows
+        if vulkan_side { ls = p.vk_renderer.lamp_shadows as *LampShadows }
+        held = 0
+        nearest_held = true
+        i = 0
+        while i < STREET_LAMPS {
+            slot = lampshadows.slot_of(ls, lamps[i] as *Light)
+            if slot >= 0 { held = held + 1 }
+            if i < lampshadows.SLOTS && slot < 0 { nearest_held = false }
+            i = i + 1
+        }
+        println("  ${name}: ${held} of ${STREET_LAMPS} lamps have a shadow; the ten nearest all do: ${nearest_held}")
+        check("${name}: the budget's ten nearest lamps have a shadow and the others do not",
+              held == lampshadows.SLOTS && nearest_held)
+
+        // The ground just past each post from its lamp, with the post
+        // casting and without: the first lamp's shadow falls there, the last
+        // lamp's -- past the budget -- does not, and no other light's does.
+        near_spot = core.vec3(0.0, 0.0, 1.4)
+        far_x = ((STREET_LAMPS - 1) as float) * 12.0
+        far_spot = core.vec3(far_x, 0.0, 1.4)
+        pixels = render(p, vulkan_side, cam, moon)
+        near_shaded = grey_of(pixels, cam, near_spot)
+        far_shaded = grey_of(pixels, cam, far_spot)
+        core.model_set_casts_shadow(posts[0] as *Model, false)
+        core.model_set_casts_shadow(posts[STREET_LAMPS - 1] as *Model, false)
+        pixels = render(p, vulkan_side, cam, moon)
+        near_open = grey_of(pixels, cam, near_spot)
+        far_open = grey_of(pixels, cam, far_spot)
+        core.model_set_casts_shadow(posts[0] as *Model, true)
+        core.model_set_casts_shadow(posts[STREET_LAMPS - 1] as *Model, true)
+        println("  ${name}: past the nearest lamp's post ${near_shaded} against ${near_open} with no shadow; past the farthest's ${far_shaded} against ${far_open}")
+        check("${name}: a lamp with a shadow is shadowed by what stands in its light", near_shaded < near_open * 0.6)
+        check("${name}: a lamp past the budget is not shadowed, by its own map or any other",
+              far_open > 0.0 && far_shaded > far_open * 0.97)
+
+        // Nothing moved: no face is drawn. A post moved under the first lamp:
+        // only the faces it stands in, of the lamps whose light it is in.
+        render(p, vulkan_side, cam, moon)
+        render(p, vulkan_side, cam, moon)
+        still = lampshadows.statics_drawn(ls)
+        core.model_set_position(posts[0] as *Model, 0.4, 0.75, 1.3)
+        render(p, vulkan_side, cam, moon)
+        moved = lampshadows.statics_drawn(ls)
+        println("  ${name}: a frame in which nothing moved draws ${still} faces; one after a post moved ${moved}")
+        check("${name}: a still frame draws no lamp face", still == 0)
+        check("${name}: a moved post draws only the faces it stands in", moved >= 1 && moved <= 6)
+        core.model_set_position(posts[0] as *Model, 0.0, 0.75, 1.0)
+
+        // Something that moves on its own: a cube as an instance stream,
+        // hung between the first lamp and the ground at z -2 m. It is drawn
+        // over the faces' static layers, which are not drawn again for it;
+        // moved away, the copy of the static layer takes its shadow out.
+        walker = loader.cube(1.0)
+        core.model_matte(walker, 0.4, 0.4, 0.5)
+        core.model_enable_instancing(walker, 1)
+        core.model_set_instance_position(walker, 0, core.vec3(0.0, 1.0, 0.0 - 1.0))
+        core.model_set_instance_draw_count(walker, 1)
+        core.model_recalculate_bounds(walker)
+        core.backend_add_model(pass, walker)
+        behind = core.vec3(0.0, 0.0, 0.0 - 2.0)
+        render(p, vulkan_side, cam, moon)
+        pixels = render(p, vulkan_side, cam, moon)
+        walker_statics = lampshadows.statics_drawn(ls)
+        under_walker = grey_of(pixels, cam, behind)
+        core.model_set_instance_position(walker, 0, core.vec3(0.0, 1.0, 6.0))
+        core.model_recalculate_bounds(walker)
+        pixels = render(p, vulkan_side, cam, moon)
+        after_walker = grey_of(pixels, cam, behind)
+        core.backend_remove_model(pass, walker)
+        pixels = render(p, vulkan_side, cam, moon)
+        without_walker = grey_of(pixels, cam, behind)
+        core.model_free(walker)
+        println("  ${name}: under the moving cube ${under_walker}, drawing ${walker_statics} static layers; after it went ${after_walker}, against ${without_walker} with no cube")
+        check("${name}: something moving throws its lamp shadow with no static layer drawn again",
+              walker_statics == 0 && under_walker < without_walker * 0.6)
+        check("${name}: and its shadow goes with it", after_walker > without_walker * 0.99 && after_walker < without_walker * 1.01)
+
+        // What the faces cost: every lamp's six drawn, against a still frame.
+        ms_all = 0.0
+        ms_still = 0.0
+        frames = 10
+        f = 0
+        while f < frames {
+            core.model_set_position(posts[0] as *Model, 0.001 * ((f % 2) as float), 0.75, 1.0)
+            i = 0
+            while i < STREET_LAMPS {
+                // A lamp moved a millimetre has every face to draw again.
+                l = lamps[i] as *Light
+                l.position = core.vec3((i as float) * 12.0, LAMP_HEIGHT + 0.001 * ((f % 2) as float), 0.0)
+                i = i + 1
+            }
+            render(p, vulkan_side, cam, moon)
+            if vulkan_side { ms_all = ms_all + vulkan.renderer_shadow_ms(p.vk_renderer) } else { ms_all = ms_all + gl.renderer_shadow_ms(p.gl_renderer) }
+            f = f + 1
+        }
+        f = 0
+        while f < frames {
+            render(p, vulkan_side, cam, moon)
+            if vulkan_side { ms_still = ms_still + vulkan.renderer_shadow_ms(p.vk_renderer) } else { ms_still = ms_still + gl.renderer_shadow_ms(p.gl_renderer) }
+            f = f + 1
+        }
+        println("  ${name}: the shadow pass with all ${lampshadows.SLOTS * lampshadows.FACES} faces drawn ${ms_all / (frames as float)} ms; with none ${ms_still / (frames as float)} ms")
+
+        i = 0
+        while i < STREET_LAMPS {
+            core.backend_remove_light(pass, lamps[i] as *Light)
+            core.backend_remove_model(pass, posts[i] as *Model)
+            core.model_free(posts[i] as *Model)
+            core.light_free(lamps[i] as *Light)
+            i = i + 1
+        }
+        free(lamps_block)
+        free(posts_block)
+        core.backend_remove_model(pass, floor_model)
+        core.model_free(floor_model)
+        core.light_free(moon)
+        core.backend_set_shadow_distance(pass, 40.0)
+        side = side + 1
+    }
+}
+
+main() {
+    context = offscreen.context_create(WIDTH, HEIGHT)
+    if context == null {
+        println("lamp shadows: SKIP no OpenGL context")
+        return
+    }
+    p = calloc(1, sizeof(Pair)) as *Pair
+    p.gl_renderer = gl.renderer_new()
+    p.gl_pass = gl.backend(p.gl_renderer)
+    if !core.backend_init(&p.gl_pass, context, WIDTH, HEIGHT) {
+        println("lamp shadows: SKIP the OpenGL backend would not initialise")
+        return
+    }
+    p.target = offscreen.target_create(WIDTH, HEIGHT)
+    gl.renderer_set_target(p.gl_renderer, p.target)
+    core.backend_set_shadows(&p.gl_pass, true)
+    core.backend_set_shadow_distance(&p.gl_pass, 40.0)
+
+    p.vk_renderer = vulkan.renderer_new()
+    p.vk_pass = vulkan.backend(p.vk_renderer)
+    p.have_vulkan = core.backend_init(&p.vk_pass, null, WIDTH, HEIGHT)
+    if p.have_vulkan {
+        core.backend_set_shadows(&p.vk_pass, true)
+        core.backend_set_shadow_distance(&p.vk_pass, 40.0)
+        // The map path: where the device traces, the rays would shade these
+        // lamps instead, and it is the maps this holds to numbers.
+        vulkan.renderer_set_ray_shadows(p.vk_renderer, false)
+    } else {
+        println("  no Vulkan here (${vulkan.last_error()}): OpenGL only")
+    }
+
+    cam = core.camera_new(WIDTH, HEIGHT)
+    core.camera_set_near(cam, 0.1)
+    core.camera_set_far(cam, 400.0)
+
+    key_lamp(p, cam)
+    moon_and_lamp(p, cam)
+    street(p, cam)
+
+    core.backend_cleanup(&p.gl_pass)
+    offscreen.target_destroy(p.target)
+    gl.renderer_free(p.gl_renderer)
+    offscreen.context_destroy(context)
+    if p.have_vulkan { core.backend_cleanup(&p.vk_pass) }
+    vulkan.renderer_free(p.vk_renderer)
+    core.camera_free(cam)
+    free(p as ptr)
+
+    if g_failures == 0 {
+        println("lamp shadows: all checks passed (${g_checks})")
+        return
+    }
+    println("lamp shadows: ${g_failures} failure(s) of ${g_checks}")
+}

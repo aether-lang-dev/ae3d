@@ -33,6 +33,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec2 jitter;
     vec2 screenSize;
     int lightCount;
+    vec4 clusterDims;
+    vec4 clusterDepth;
+    mat4 clusterViewProjection;
+    vec4 viewDepth;
     bool impostor;
     int captureChannel;
     float viewDistance;
@@ -83,7 +87,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float shadowIntensity;
     float shadowSoftness;
     vec3 shadowDirection;
-    float shadowTexelWorld;
+    mat4 cascadeMatrices[4];
+    vec4 cascadeSplits;
+    vec4 cascadeTexelWorld;
+    int cascadeCount;
     int rayShadows;
     float sunAngle;
     float rayOcclusion;
@@ -102,6 +109,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float causticsWaterLevel;
     float causticsDepth;
     float causticsTime;
+    int lampShadowBase;
+    int keyLampSlot;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -182,14 +191,89 @@ layout(location = 5) in float Occlusion;
 
 
 
-// Sixteen a frame: the key light and the fifteen point lights nearest the
-// camera, which the renderer picks out of every light the scene registers
-// -- a street lit by a lamp a block, a room by its fittings. A point light
-// past its fall-off is skipped before it is shaded, so the frame pays for
-// the lamps that reach a pixel and not for the count.
+// The lights that reach everywhere: the key light and any directional
+// light. The scene's lamps -- its point and spot lights, however many --
+// are not here but in the clusters below.
 
 
 
+
+// The scene's point and spot lights, clustered (ae3d.lightgrid, #468): the
+// view is cut into clusterDims.x columns by .y rows by .z depth slices, and
+// each cell lists the lamps whose reach overlaps it, so a pixel shades with
+// the lamps that reach it, whichever and however many they are, and a lamp
+// lights its ground wherever the camera stands. A lamp is five vec4s
+// (position and reach; colour and intensity; direction and kind; the three
+// attenuation terms and the colour temperature; the spot's cone), and the
+// words are each cell's first index and count, then the lists. The cell of a
+// point is read by clusterViewProjection and viewDepth, the matrices
+// the grid was cut with, so this lookup and the CPU's cannot disagree.
+
+
+
+// The view's depth plane: a point's depth along the view is dot(.xyz, p) +
+// .w. What the clusters and the shadow's cascades find a pixel by.
+
+#ifdef VULKAN
+layout(std430, set = 0, binding = 6) readonly buffer ClusterLightBlock { vec4 clusterLightData[]; };
+layout(std430, set = 0, binding = 7) readonly buffer ClusterWordBlock { float clusterWordData[]; };
+vec4 cluster_light(int i) { return clusterLightData[i]; }
+float cluster_word(int i) { return clusterWordData[i]; }
+#else
+// OpenGL 4.1 has no storage buffers: the same floats, as textures a row of
+// CLUSTER_LIGHT_ROW (RGBA) and CLUSTER_WORD_ROW (R) texels.
+
+
+#define CLUSTER_LIGHT_ROW 1024
+#define CLUSTER_WORD_ROW 4096
+vec4 cluster_light(int i) { return texelFetch(clusterLights, ivec2(i % CLUSTER_LIGHT_ROW, i / CLUSTER_LIGHT_ROW), 0); }
+float cluster_word(int i) { return texelFetch(clusterWords, ivec2(i % CLUSTER_WORD_ROW, i / CLUSTER_WORD_ROW), 0).r; }
+#endif
+// The last quarter of a lamp's reach fades its light to nothing, so a pool
+// ends in a gradient (ae3d.lightgrid's FADE_START).
+#define CLUSTER_FADE_START 0.75
+
+int cluster_of(vec3 p) {
+    vec4 clip = clusterViewProjection * vec4(p, 1.0);
+    float w = clip.w != 0.0 ? clip.w : 1.0;
+    vec2 ndc = clip.xy / w;
+    float depth = dot(viewDepth.xyz, p) + viewDepth.w;
+    ivec3 dims = ivec3(clusterDims.xyz + 0.5);
+    int x = clamp(int(floor((ndc.x * 0.5 + 0.5) * float(dims.x))), 0, dims.x - 1);
+    int y = clamp(int(floor((ndc.y * 0.5 + 0.5) * float(dims.y))), 0, dims.y - 1);
+    int z = 0;
+    if (depth > clusterDepth.x) {
+        z = clamp(int(floor(log(depth) * clusterDepth.z + clusterDepth.w)), 0, dims.z - 1);
+    }
+    return (z * dims.y + y) * dims.x + x;
+}
+
+// Lamp `i` of the clusters, as the Light the shading takes, and its reach.
+Light clustered_light(int i, out float reach, out int shadowSlot) {
+    vec4 a = cluster_light(i * 5);
+    vec4 b = cluster_light(i * 5 + 1);
+    vec4 c = cluster_light(i * 5 + 2);
+    vec4 d = cluster_light(i * 5 + 3);
+    vec4 e = cluster_light(i * 5 + 4);
+    Light L;
+    L.position = a.xyz;
+    reach = a.w;
+    L.color = b.rgb;
+    L.intensity = b.a;
+    L.direction = c.xyz;
+    L.isDirectional = int(c.w + 0.5);
+    L.constantAtten = d.x;
+    L.linearAtten = d.y;
+    L.quadraticAtten = d.z;
+    L.temperature = d.w;
+    L.spotCosOuter = e.x;
+    L.spotCosInner = e.y;
+    L.ambientStrength = 0.0;
+    // The lamp's own shadow's slot (ae3d.lampshadows), or -1: -1.0 read
+    // back rounds toward zero, so it is rounded from below.
+    shadowSlot = int(floor(e.z + 0.5));
+    return L;
+}
 // The crowd's far tier as pictures (see VERTEX_CROWD): a picture is cut out
 // by its alpha, and its colour is the figure's albedo and its normal map
 // the figure's own normals, so it is lit below by the scene's lights the
@@ -297,9 +381,18 @@ layout(location = 5) in float Occlusion;
 // the angle it makes with the map, and using the wrong one of the two striped
 // every wall the map happened to graze.
 
-// How much of the world one shadow-map texel covers. Everything about the map
-// scales with the box it was fitted to, and this is the number that says by how
-// much.
+// The key light's shadow in cascades (ae3d.cascades, #469): the view cut in
+// depth into cascadeCount slices, each with a map of its own in one atlas,
+// two by two, cascade i in the tile (i % 2, i / 2). cascadeSplits is the
+// view depth each cascade ends at, cascadeTexelWorld how much of the world
+// one texel of its map covers -- what a surface's offset scales by -- and
+// cascadeMatrices the matrices its map was drawn with. Each is fitted so a
+// moving camera moves no shadow: a sphere around its slice, whose size the
+// view's angle does not change, on its own texel grid.
+#define MAX_CASCADES 4
+
+
+
 
 // Shadows by ray: where the Vulkan device has ray queries and the renderer
 // has built the scene's acceleration structure, a ray from the surface
@@ -362,6 +455,56 @@ float light_depth(float clipZ) {
     return clipZ;
 }
 
+// How lit a point is in cascade `c`: 1 lit, 0 shadowed, between at an
+// edge. The sample is moved off the surface along its normal by a texel of
+// this cascade and more the more the surface grazes the light -- sideways
+// rather than deeper into the map, since a depth bias large enough to stop
+// a grazing wall striping itself lifts every shadow off the ground with
+// it -- and the 3x3 taps stay inside the cascade's tile, where a tap across
+// its edge would read the next cascade's depths.
+float cascade_lit(int c, vec3 surface, float slope) {
+    vec4 lightSpace = cascadeMatrices[c] *
+        vec4(FragPos + surface * cascadeTexelWorld[c] * (1.0 + slope), 1.0);
+    vec3 projected = lightSpace.xyz / lightSpace.w;
+    projected.xy = projected.xy * 0.5 + 0.5;
+    projected.z = light_depth(projected.z);
+    if (projected.z > 1.0) {
+        return 1.0;
+    }
+    // Outside the cascade's map sideways is outside its box, where nothing
+    // was drawn: lit, not the edge texel's depth compared against whatever
+    // lies there.
+    if (projected.x < 0.0 || projected.x > 1.0 || projected.y < 0.0 || projected.y > 1.0) {
+        return 1.0;
+    }
+
+    vec2 texel = 1.0 / vec2(textureSize(shadowMap, 0));
+    // At least one texel between taps. Below that the nine samples of the
+    // 3x3 land on the same texel and cost nine lookups to produce what one
+    // would, and the edge is as hard as no filtering at all.
+    float radius = max(shadowSoftness, 1.0);
+    vec2 tile = vec2(float(c % 2), float(c / 2)) * 0.5;
+    vec2 centre = tile + projected.xy * 0.5;
+    vec2 lo = tile + texel * (radius + 0.5);
+    vec2 hi = tile + vec2(0.5) - texel * (radius + 0.5);
+
+    // The depth a texel of the cascade spans is the same fraction of its
+    // box however large the box: a bias in texels of the cascade's own map
+    // (half the atlas a side) fits every cascade alike. The offset above
+    // has already taken the slope out of it.
+    float bias = radius / (float(textureSize(shadowMap, 0).x) * 0.5);
+
+    float lit = 0.0;
+    for (int sx = -1; sx <= 1; sx++) {
+        for (int sy = -1; sy <= 1; sy++) {
+            vec2 at = clamp(centre + vec2(float(sx), float(sy)) * texel * radius, lo, hi);
+            float closest = texture(shadowMap, at).r;
+            lit += projected.z - bias > closest ? 0.0 : 1.0;
+        }
+    }
+    return lit / 9.0;
+}
+
 float shadow_factor() {
     vec3 surface = normalize(Normal);
     vec3 toLight = normalize(-shadowDirection);
@@ -373,56 +516,122 @@ float shadow_factor() {
     float facing = max(dot(surface, toLight), 0.0);
     float slope = min(sqrt(1.0 - facing * facing) / max(facing, 0.02), 32.0);
 
-    // Offset along the surface rather than into the depth. Pushing the
-    // comparison deeper is what a depth bias does, and enough of it to stop a
-    // grazing wall striping itself is enough to lift every shadow off the
-    // ground with it. Moving the sample sideways by the width of a texel costs
-    // the same and detaches nothing.
-    vec4 lightSpace = lightSpaceMatrix *
-        vec4(FragPos + surface * shadowTexelWorld * (1.0 + slope), 1.0);
+    // The pixel's cascade by its depth along the view; past the last one,
+    // the shadow's range, it is lit.
+    float depth = dot(viewDepth.xyz, FragPos) + viewDepth.w;
+    int c = -1;
+    for (int i = 0; i < MAX_CASCADES; i++) {
+        if (i < cascadeCount && depth <= cascadeSplits[i]) {
+            c = i;
+            break;
+        }
+    }
+    if (c < 0) {
+        return 1.0;
+    }
+    float lit = cascade_lit(c, surface, slope);
+    // Over the last tenth of a cascade the next one blends in, so where the
+    // shadow's texels change size there is a gradient and no seam.
+    if (c + 1 < cascadeCount) {
+        float start = c == 0 ? 0.0 : cascadeSplits[c - 1];
+        float band = (cascadeSplits[c] - start) * 0.1;
+        float into = (cascadeSplits[c] - depth) / max(band, 0.0001);
+        if (into < 1.0) {
+            lit = mix(cascade_lit(c + 1, surface, slope), lit, into);
+        }
+    }
+    return mix(shadowIntensity, 1.0, lit);
+}
+
+// The lamps' own shadows (ae3d.lampshadows, #490). A lamp is shadowed by its
+// own map and by no other light's: a lamp given a slot has the six faces of
+// a cube drawn around it, 90-degree views LAMP_FACE texels square, in one
+// atlas LAMP_ACROSS tiles a side, slot s's face f the tile s * 6 + f. The
+// slots follow the lamps in the lights' data from lampShadowBase on,
+// LAMP_SLOT_VEC4S vec4s each: position and far plane; strength and near
+// plane; the six faces' matrices. keyLampSlot is the key light's slot when
+// the key light is a lamp -- its cascades are for the sun and the moon --
+// and -1 otherwise, as lampShadowBase is where no lamp has a map.
+#define LAMP_ACROSS 8
+#define LAMP_FACE 512.0
+#define LAMP_SLOT_VEC4S 26
+
+
+#ifdef VULKAN
+layout(set = 0, binding = 8) uniform sampler2D lampShadowMap;
+#else
+
+#endif
+
+// A depth a lamp's face stores, 0 at its near plane and 1 at its far one,
+// as the distance along the face's axis it stands for.
+float lamp_distance(float depth, float near, float far) {
+    return near * far / (far - depth * (far - near));
+}
+
+// How much of lamp slot `slot`'s light reaches this point past what stands
+// in its way: 1 lit, the shadow's share of the light behind a caster, and
+// the lamp's strength -- its shadow fading out where the budget of lamps
+// runs out -- between. The face is the one the point lies in from the lamp.
+// As with the cascades, the sample moves off the surface along its normal
+// by a texel of the face at that distance, and more on a surface the lamp
+// grazes; the depths are compared in metres from the lamp, since a
+// perspective map's depth crowds toward its far plane.
+float lamp_shadow(int slot, vec3 surface) {
+    int base = lampShadowBase + slot * LAMP_SLOT_VEC4S;
+    vec4 head = cluster_light(base);
+    vec4 more = cluster_light(base + 1);
+    vec3 v = FragPos - head.xyz;
+    float far = head.w;
+    float strength = more.x;
+    float near = more.y;
+    vec3 a = abs(v);
+    int face;
+    float along;
+    if (a.x >= a.y && a.x >= a.z) {
+        face = v.x > 0.0 ? 0 : 1;
+        along = a.x;
+    } else if (a.y >= a.z) {
+        face = v.y > 0.0 ? 2 : 3;
+        along = a.y;
+    } else {
+        face = v.z > 0.0 ? 4 : 5;
+        along = a.z;
+    }
+    if (strength <= 0.0 || along >= far || along <= near) {
+        return 1.0;
+    }
+    vec3 toLamp = -v / max(length(v), 0.0001);
+    float facing = max(dot(surface, toLamp), 0.0);
+    float slope = min(sqrt(1.0 - facing * facing) / max(facing, 0.02), 32.0);
+    float texelWorld = 2.0 * along / LAMP_FACE;
+    int m = base + 2 + face * 4;
+    mat4 faceMatrix = mat4(cluster_light(m), cluster_light(m + 1), cluster_light(m + 2), cluster_light(m + 3));
+    vec4 lightSpace = faceMatrix * vec4(FragPos + surface * texelWorld * (1.0 + slope), 1.0);
     vec3 projected = lightSpace.xyz / lightSpace.w;
-    projected.xy = projected.xy * 0.5 + 0.5;
-    projected.z = light_depth(projected.z);
-    if (projected.z > 1.0) {
-        return 1.0;
-    }
-    // Outside the map sideways is outside the light box, where nothing was
-    // drawn into the map: lit, not the edge texel's depth compared against
-    // whatever happens to lie there. A floor running past the box was shaded
-    // by the box's border, a dark band with a straight edge across it.
-    if (projected.x < 0.0 || projected.x > 1.0 || projected.y < 0.0 || projected.y > 1.0) {
-        return 1.0;
-    }
+    // A sample moved off the surface near a face's edge can leave the face;
+    // it is read at the edge of the one the point lies in.
+    projected.xy = clamp(projected.xy * 0.5 + 0.5, 0.0, 1.0);
+    float mine = lamp_distance(light_depth(projected.z), near, far);
 
-    vec2 texel = 1.0 / vec2(textureSize(shadowMap, 0));
-    // At least one texel between taps. Below that the nine samples of the 3x3
-    // land on the same texel and cost nine lookups to produce what one would,
-    // and the edge is as hard as no filtering at all.
+    int tile = slot * 6 + face;
+    float share = 1.0 / float(LAMP_ACROSS);
+    vec2 origin = vec2(float(tile % LAMP_ACROSS), float(tile / LAMP_ACROSS)) * share;
+    vec2 texel = 1.0 / vec2(textureSize(lampShadowMap, 0));
     float radius = max(shadowSoftness, 1.0);
-
-    // The offset a surface needs in order not to shadow itself is the depth one
-    // shadow texel spans, and a texel is worth the same fraction of the light
-    // box however large the box is: the texel and the depth range scale
-    // together. A constant in normalised depth does not, so it was sized for
-    // one scene and swallowed whole figures in a larger one -- a street ninety
-    // metres long left nothing standing in it casting anything at all. A
-    // surface nearly edge-on to the light spans more depth across that texel,
-    // which is what the slope term is for.
-    // What is left for the depth comparison is the texel the sample landed in,
-    // which the offset above has already taken the slope out of.
-    float bias = 2.0 * radius / (2.0 * float(textureSize(shadowMap, 0).x));
-
+    vec2 centre = origin + projected.xy * share;
+    vec2 lo = origin + texel * (radius + 0.5);
+    vec2 hi = origin + vec2(share) - texel * (radius + 0.5);
+    float bias = texelWorld * 1.5;
     float lit = 0.0;
     for (int sx = -1; sx <= 1; sx++) {
         for (int sy = -1; sy <= 1; sy++) {
-            vec2 at = projected.xy + vec2(float(sx), float(sy)) * texel * radius;
-            float closest = texture(shadowMap, at).r;
-            lit += projected.z - bias > closest ? 0.0 : 1.0;
+            vec2 at = clamp(centre + vec2(float(sx), float(sy)) * texel * radius, lo, hi);
+            float closest = lamp_distance(texture(lampShadowMap, at).r, near, far);
+            lit += mine - bias > closest ? 0.0 : 1.0;
         }
     }
-    lit = lit / 9.0;
-
-    return mix(shadowIntensity, 1.0, lit);
+    return mix(1.0, mix(shadowIntensity, 1.0, lit / 9.0), strength);
 }
 
 #ifdef AE3D_RAY_QUERY
@@ -1263,19 +1472,21 @@ void main() {
         wetMirror = 0.0;
     }
 
-    // Every light in the scene contributes; the loop stops at lightCount, so a
-    // scene with one light costs what it did before there could be four.
+    // The lights that reach everywhere, then the lamps of this pixel's
+    // cluster.
     // A shadow takes the direct light and leaves the sky's fill alone:
     // multiplied over the whole colour, ambient included, as it was, a
     // shadow went to a third of black and the shadowed side of a hill at
-    // dusk was a hole in the picture. The one shadow map is the key
-    // light's, and it is applied to every light's direct term all the
-    // same: a lamp has no map of its own, and what stands in the key
-    // light's shadow is what stands in the way of the lamp too, near
-    // enough that a figure on a lamp-lit road keeps a shadow under it.
-    // The clouds' shadow is the key light's alone.
+    // dusk was a hole in the picture. And a light is shadowed by its own
+    // map and no other's (#490): the key light by its cascades when it is
+    // the sun or the moon and by its own cube when it is a lamp; a lamp of
+    // the clusters by its own cube where it has one, and not at all where
+    // it has none; the other directional lights, the fills, not at all. A
+    // lamp shadowed by the moon's map put out the wall beside it wherever
+    // the moon did not reach. The clouds' shadow is the key light's alone.
     float shaded = 1.0;
     if (hasShadowMap && enableShadows) shaded = shadow_factor();
+    if (keyLampSlot >= 0 && lampShadowBase >= 0 && enableShadows) shaded = lamp_shadow(keyLampSlot, normalize(Normal));
 #ifdef AE3D_RAY_QUERY
     bool traced = rayShadows == 1 && (rayReach <= 0.0 || distance(FragPos, viewPos) < rayReach);
     if (traced && enableShadows) shaded = min(shaded, ray_shadow_factor());
@@ -1287,25 +1498,46 @@ void main() {
             break;
         }
         if (lights[i].isDirectional != 1) {
-            // Past the lamp's reach it gives this pixel less than a
-            // hundredth of its light: not worth the shading, nor a ray.
+            // A key light that is a lamp: past its fall-off it gives this
+            // pixel less than a hundredth of its light, and outside a spot's
+            // cone none.
             vec3 gap = lights[i].position - FragPos;
             if (dot(gap, gap) * lights[i].quadraticAtten > 64.0) continue;
-            // Nor outside a spot light's cone.
             if (lights[i].isDirectional == 2 &&
                 dot(normalize(-gap), normalize(lights[i].direction)) < lights[i].spotCosOuter) continue;
         }
         vec3 lit = direct_light(lights[i], norm, viewDir, albedo, F0, NdotV, adjustedRoughness);
-        float shade = shaded;
+        Lo += i == 0 ? lit * sunlit * shaded : lit;
+    }
+    if (clusterDims.w > 0.5) {
+        int cell = cluster_of(FragPos);
+        int first = int(cluster_word(cell * 2) + 0.5);
+        int count = int(cluster_word(cell * 2 + 1) + 0.5);
+        for (int k = 0; k < count; k++) {
+            float reach;
+            int lampSlot;
+            Light L = clustered_light(int(cluster_word(first + k) + 0.5), reach, lampSlot);
+            vec3 gap = L.position - FragPos;
+            float far2 = dot(gap, gap);
+            if (far2 >= reach * reach) continue;
+            if (L.isDirectional == 2 &&
+                dot(normalize(-gap), normalize(L.direction)) < L.spotCosOuter) continue;
+            float fade = 1.0 - smoothstep(CLUSTER_FADE_START * reach, reach, sqrt(far2));
+            vec3 lit = direct_light(L, norm, viewDir, albedo, F0, NdotV, adjustedRoughness) * fade;
+            float shade = 1.0;
+            if (lampSlot >= 0 && lampShadowBase >= 0 && enableShadows && dot(lit, vec3(0.333)) > 0.002) {
+                shade = lamp_shadow(lampSlot, normalize(Normal));
+            }
 #ifdef AE3D_RAY_QUERY
-        // By ray a lamp throws its own shadow, where it reaches: past the
-        // lamp's fall-off there is no light to shadow and no ray is cast.
-        if (i > 0 && traced && enableShadows && lights[i].isDirectional != 1) {
-            if (dot(lit, vec3(0.333)) > 0.002) shade = ray_lamp_factor(lights[i].position, rayLampRadius);
-            else shade = 1.0;
-        }
+            // By ray a lamp throws its own shadow, where it reaches: past the
+            // lamp's fall-off there is no light to shadow and no ray is cast.
+            if (traced && enableShadows) {
+                if (dot(lit, vec3(0.333)) > 0.002) shade = ray_lamp_factor(L.position, rayLampRadius);
+                else shade = 1.0;
+            }
 #endif
-        Lo += (i == 0 ? lit * sunlit : lit) * shade;
+            Lo += lit * shade;
+        }
     }
 
     // Ambient belongs to the scene rather than to each light, so it comes from
