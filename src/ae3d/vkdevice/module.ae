@@ -1,0 +1,481 @@
+// ae3d.vkdevice -- the Vulkan backend's device (#402): the loader, the
+// instance, the window's surface, the physical device picked and the
+// logical one made on it with its queues, on contrib.vulkan.vk.
+//
+// The loader is contrib.vulkan's, opened at run time, so a program built
+// with this backend still starts where no driver exists: available() says
+// false and why. Everything goes through that one loader, or through
+// NVIDIA Streamline's interposer in its place when DLSS is asked for before
+// the device is made (request_dlss): the instance and the device made
+// through the interposer carry what DLSS needs.
+//
+// An offscreen device -- no window, the frame read back rather than
+// presented -- asks for no surface extension, so a machine with no window
+// system still renders. A window's surface comes from its native handle:
+// the HWND on Windows, the CAMetalLayer native/platform/metal_surface.m
+// puts in the window on macOS, the X11 window elsewhere.
+//
+// The rest of the backend (native/gpu/vulkan.c, until it has moved too)
+// adopts what is made here: ae3d_vk_adopt_device loads its dispatch through
+// the same vkGetInstanceProcAddr, reads the device's limits and takes the
+// queues. What is made here is destroyed here (close), after the backend
+// has let go of it.
+
+import std.string
+import std.fs
+import contrib.vulkan.vk
+
+exports (
+    available, request_dlss, open, close,
+    instance, surface, physical, device, name, ray_query, dlss_loaded,
+    graphics_family, present_family
+)
+
+extern ae3d_vk_adopt_device(gipa: ptr, instance: ptr, surface: ptr, physical: ptr, device: ptr,
+                            graphics_family: int, present_family: int, ray_query: int, dlss_loaded: int) -> int
+extern ae3d_vk_set_error(reason: string)
+extern ae3d_dlss_built() -> int
+extern ae3d_dlss_load(directory: string) -> int
+extern ae3d_dlss_instance_proc_addr() -> ptr
+extern ae3d_dlss_last_error() -> string
+// The loader's own vkGetInstanceProcAddr, as contrib.vulkan opened it.
+extern aevk_ae_loader_proc(name: string) -> ptr
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern getenv(name: string) -> string
+
+// The window's native handle, by platform. Declared for every platform and
+// called only on its own (a `when` at the call): a `when` around the
+// declarations themselves is not seen from a module that imports this one
+// (aether-lang-dev/aether#2275).
+extern glfwGetWin32Window(window: ptr) -> ptr
+extern ae3d_vk_native_layer(window: ptr) -> ptr
+extern glfwGetX11Display() -> ptr
+extern glfwGetX11Window(window: ptr) -> ptr
+extern setenv(name: string, value: string, overwrite: int) -> int
+
+// contrib.vulkan's window kinds (vk.surface_create).
+const WINDOW_WIN32 = 1
+const WINDOW_X11 = 3
+const WINDOW_METAL_LAYER = 5
+
+var g_probed = false
+var g_available = false
+var g_gipa: ptr = null               // Streamline's vkGetInstanceProcAddr, when DLSS was asked for
+var g_dlss = false
+var g_instance: ptr = null
+var g_surface: ptr = null
+var g_physical: ptr = null
+var g_device: ptr = null
+var g_graphics = 0
+var g_present = 0
+var g_ray = false
+var g_name = ""
+
+instance() -> ptr { return g_instance }
+surface() -> ptr { return g_surface }
+physical() -> ptr { return g_physical }
+device() -> ptr { return g_device }
+name() -> string { return g_name }
+ray_query() -> bool { return g_ray }
+dlss_loaded() -> bool { return g_dlss }
+graphics_family() -> int { return g_graphics }
+present_family() -> int { return g_present }
+
+// Homebrew installs the MoltenVK manifest under etc/, which the loader does
+// not scan. Pointing it at the manifest that can be found is what makes a
+// stock `brew install molten-vk vulkan-loader` work with no setup; the
+// Windows loader finds its drivers in the registry and Linux's in the
+// places it scans.
+hint_icd() {
+    when target.os == "darwin" {
+        if getenv("VK_ICD_FILENAMES") != null || getenv("VK_DRIVER_FILES") != null { return }
+        if hint_at("/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json") { return }
+        if hint_at("/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json") { return }
+        hint_at("/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json")
+    }
+}
+
+// The loader pointed at the manifest at `path`, if one is there.
+hint_at(path: string) -> bool {
+    when target.os == "darwin" {
+        if fs.exists(path) != 1 { return false }
+        setenv("VK_ICD_FILENAMES", path, 0)
+        return true
+    } else {
+        return false
+    }
+}
+
+// Whether a Vulkan loader opens here: asked once, and the answer kept.
+available() -> bool {
+    if g_probed { return g_available }
+    g_probed = true
+    hint_icd()
+    g_available = vk.loader_available() == 1
+    if g_available {
+        ae3d_vk_set_error("")
+    } else {
+        ae3d_vk_set_error("no Vulkan loader found")
+    }
+    return g_available
+}
+
+// DLSS asked for, before Vulkan is up: Streamline's runtime is loaded from
+// `directory` and its interposer becomes the loader the instance and the
+// device are made through. False, with the reason in the backend's last
+// error, leaves Vulkan as it was.
+request_dlss(directory: string) -> bool {
+    if g_dlss { return true }
+    if g_instance != null {
+        ae3d_vk_set_error("DLSS has to be asked for before Vulkan starts")
+        return false
+    }
+    if ae3d_dlss_built() != 1 || ae3d_dlss_load(directory) != 1 {
+        ae3d_vk_set_error(ae3d_dlss_last_error())
+        return false
+    }
+    g_gipa = ae3d_dlss_instance_proc_addr()
+    if g_gipa == null {
+        ae3d_vk_set_error("the Streamline interposer has no vkGetInstanceProcAddr")
+        return false
+    }
+    g_dlss = true
+    return true
+}
+
+// 1 when `name` is among the `count` extension properties at `props`.
+lists(props: ptr, count: int, name: string) -> bool {
+    i = 0
+    while i < count {
+        e = (props + i * sizeof(VkExtensionProperties)) as *VkExtensionProperties
+        if string.equals(e.extensionName, name) == 1 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// A cell one handle wide, for the commands that write one out, and what it
+// holds, the cell freed.
+cell() -> ptr { return calloc(1, 8) }
+taken(c: ptr) -> ptr {
+    h = (c as ptr[])[0]
+    free(c)
+    return h
+}
+
+// The window kind this platform's surfaces are made from.
+window_kind() -> int {
+    when target.os == "windows" {
+        return WINDOW_WIN32
+    } else when target.os == "darwin" {
+        return WINDOW_METAL_LAYER
+    } else {
+        return WINDOW_X11
+    }
+}
+
+// The instance: the surface extensions for a window (none offscreen),
+// portability enumeration where the loader has it, Vulkan 1.2 where the
+// loader has that -- what the ray-query shaders (SPIR-V 1.4) and buffer
+// device addresses need -- and 1.1 otherwise.
+make_instance(windowed: bool) -> bool {
+    app = calloc(1, sizeof(VkApplicationInfo)) as *VkApplicationInfo
+    app.sType = vk.STRUCTURE_TYPE_APPLICATION_INFO
+    app.pApplicationName = "ae3d"
+    app.applicationVersion = 1 << 22
+    app.pEngineName = "ae3d"
+    app.engineVersion = 1 << 22
+    app.apiVersion = (1 << 22) | (1 << 12)
+    version = calloc(1, 4)
+    if vk.vkEnumerateInstanceVersion(version) == vk.SUCCESS && (version as uint32[])[0] as int >= ((1 << 22) | (2 << 12)) {
+        app.apiVersion = (1 << 22) | (2 << 12)
+    }
+    free(version)
+
+    names = calloc(4, 8)
+    count = 0
+    if windowed {
+        (names as string[])[0] = vk.KHR_SURFACE_EXTENSION_NAME
+        (names as string[])[1] = vk.surface_extension(window_kind())
+        count = 2
+    }
+    ci = calloc(1, sizeof(VkInstanceCreateInfo)) as *VkInstanceCreateInfo
+    ci.sType = vk.STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+    ci.pApplicationInfo = app as ptr
+    exts, n, _r = vk.vkEnumerateInstanceExtensionProperties_all(null)
+    if lists(exts, n, vk.KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) {
+        (names as string[])[count] = vk.KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME
+        count = count + 1
+        ci.flags = vk.INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+    }
+    vk.array_free(exts)
+    ci.enabledExtensionCount = count
+    ci.ppEnabledExtensionNames = names
+    out = cell()
+    r = vk.vkCreateInstance(ci as ptr, null, out)
+    g_instance = taken(out)
+    free(ci as ptr)
+    free(names)
+    free(app as ptr)
+    if r != vk.SUCCESS {
+        g_instance = null
+        ae3d_vk_set_error("vkCreateInstance failed (VkResult ${r})")
+        return false
+    }
+    vk.load_instance_with(g_gipa, g_instance)
+    return true
+}
+
+// The window's surface, from its native handle.
+make_surface(window: ptr) -> bool {
+    handle = null
+    display = null
+    when target.os == "windows" {
+        handle = glfwGetWin32Window(window)
+    } else when target.os == "darwin" {
+        handle = ae3d_vk_native_layer(window)
+        if handle == null {
+            ae3d_vk_set_error("could not attach a CAMetalLayer to the window")
+            return false
+        }
+    } else {
+        display = glfwGetX11Display()
+        handle = glfwGetX11Window(window)
+    }
+    g_surface = vk.surface_create(g_instance, window_kind(), display, handle)
+    if g_surface == null {
+        ae3d_vk_set_error("surface creation failed (${vk.last_error()})")
+        return false
+    }
+    return true
+}
+
+// The first device with a graphics queue and, for a window, a queue that
+// presents to its surface: the one the frame is drawn on.
+pick(windowed: bool) -> bool {
+    devices, count, _r = vk.vkEnumeratePhysicalDevices_all(g_instance)
+    if count == 0 {
+        vk.array_free(devices)
+        ae3d_vk_set_error("no Vulkan physical device")
+        return false
+    }
+    supported = calloc(1, 4)
+    i = 0
+    while i < count && g_physical == null {
+        candidate = (devices as ptr[])[i]
+        families, family_count = vk.vkGetPhysicalDeviceQueueFamilyProperties_all(candidate)
+        graphics = 0 - 1
+        present = 0 - 1
+        q = 0
+        while q < family_count {
+            family = (families + q * sizeof(VkQueueFamilyProperties)) as *VkQueueFamilyProperties
+            if graphics < 0 && ((family.queueFlags) as int & vk.QUEUE_GRAPHICS_BIT) != 0 { graphics = q }
+            if !windowed {
+                if present < 0 && graphics >= 0 { present = graphics }
+            } else {
+                (supported as uint32[])[0] = 0
+                vk.vkGetPhysicalDeviceSurfaceSupportKHR(candidate, q, g_surface, supported)
+                if present < 0 && (supported as uint32[])[0] as int == 1 { present = q }
+            }
+            q = q + 1
+        }
+        vk.array_free(families)
+        if graphics >= 0 && present >= 0 {
+            g_physical = candidate
+            g_graphics = graphics
+            g_present = present
+        }
+        i = i + 1
+    }
+    free(supported)
+    vk.array_free(devices)
+    if g_physical == null {
+        ae3d_vk_set_error("no device with both graphics and present queues")
+        return false
+    }
+    props = calloc(1, sizeof(VkPhysicalDeviceProperties)) as *VkPhysicalDeviceProperties
+    vk.vkGetPhysicalDeviceProperties(g_physical, props as ptr)
+    g_name = string.copy(props.deviceName)
+    free(props as ptr)
+    return true
+}
+
+// Whether the device takes ray queries: the instance and the device are
+// 1.2 (the features below are 1.2's), it has the four extensions and the
+// three features they need, and AE3D_NO_RAYS is not set.
+rays_offered(exts: ptr, n: int) -> bool {
+    if getenv("AE3D_NO_RAYS") != null { return false }
+    props = calloc(1, sizeof(VkPhysicalDeviceProperties)) as *VkPhysicalDeviceProperties
+    vk.vkGetPhysicalDeviceProperties(g_physical, props as ptr)
+    version = (props.apiVersion) as int
+    free(props as ptr)
+    if version < ((1 << 22) | (2 << 12)) { return false }
+    if !lists(exts, n, vk.KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) { return false }
+    if !lists(exts, n, vk.KHR_RAY_QUERY_EXTENSION_NAME) { return false }
+    if !lists(exts, n, vk.KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) { return false }
+    if !lists(exts, n, "VK_KHR_buffer_device_address") { return false }
+    rq = calloc(1, sizeof(VkPhysicalDeviceRayQueryFeaturesKHR)) as *VkPhysicalDeviceRayQueryFeaturesKHR
+    rq.sType = vk.STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR
+    asf = calloc(1, sizeof(VkPhysicalDeviceAccelerationStructureFeaturesKHR)) as *VkPhysicalDeviceAccelerationStructureFeaturesKHR
+    asf.sType = vk.STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR
+    bda = calloc(1, sizeof(VkPhysicalDeviceBufferDeviceAddressFeatures)) as *VkPhysicalDeviceBufferDeviceAddressFeatures
+    bda.sType = vk.STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES
+    asf.pNext = bda as ptr
+    rq.pNext = asf as ptr
+    f2 = calloc(1, sizeof(VkPhysicalDeviceFeatures2)) as *VkPhysicalDeviceFeatures2
+    f2.sType = vk.STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2
+    f2.pNext = rq as ptr
+    vk.vkGetPhysicalDeviceFeatures2(g_physical, f2 as ptr)
+    offered = (rq.rayQuery) as int != 0 && (asf.accelerationStructure) as int != 0 && (bda.bufferDeviceAddress) as int != 0
+    free(f2 as ptr)
+    free(bda as ptr)
+    free(asf as ptr)
+    free(rq as ptr)
+    return offered
+}
+
+// The logical device: a graphics queue and, where another family presents,
+// a present queue; the swapchain for a window; portability subset where the
+// device has it; the rays where it offers them; and independent blending,
+// which the scene's pipelines use -- they blend the colour and leave the
+// motion vectors as written, two attachments blended two ways, which the
+// device is otherwise not asked to honour (#405). Every desktop device has
+// it; where one does not, it stays off.
+make_device(windowed: bool) -> bool {
+    priority = calloc(1, 4)
+    (priority as f32[])[0] = 1.0
+    queues = calloc(2, sizeof(VkDeviceQueueCreateInfo))
+    first = queues as *VkDeviceQueueCreateInfo
+    first.sType = vk.STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+    first.queueFamilyIndex = g_graphics
+    first.queueCount = 1
+    first.pQueuePriorities = priority
+    queue_count = 1
+    if g_present != g_graphics {
+        second = (queues + sizeof(VkDeviceQueueCreateInfo)) as *VkDeviceQueueCreateInfo
+        second.sType = vk.STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+        second.queueFamilyIndex = g_present
+        second.queueCount = 1
+        second.pQueuePriorities = priority
+        queue_count = 2
+    }
+
+    names = calloc(8, 8)
+    count = 0
+    if windowed {
+        (names as string[])[count] = vk.KHR_SWAPCHAIN_EXTENSION_NAME
+        count = count + 1
+    }
+    exts, n, _r = vk.vkEnumerateDeviceExtensionProperties_all(g_physical, null)
+    if lists(exts, n, "VK_KHR_portability_subset") {
+        (names as string[])[count] = "VK_KHR_portability_subset"
+        count = count + 1
+    }
+    rays = rays_offered(exts, n)
+    vk.array_free(exts)
+    if rays {
+        (names as string[])[count] = vk.KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME
+        (names as string[])[count + 1] = vk.KHR_RAY_QUERY_EXTENSION_NAME
+        (names as string[])[count + 2] = vk.KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME
+        (names as string[])[count + 3] = "VK_KHR_buffer_device_address"
+        count = count + 4
+    }
+
+    base = calloc(1, sizeof(VkPhysicalDeviceFeatures2)) as *VkPhysicalDeviceFeatures2
+    base.sType = vk.STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2
+    vk.vkGetPhysicalDeviceFeatures2(g_physical, base as ptr)
+    enabled = calloc(1, sizeof(VkPhysicalDeviceFeatures)) as *VkPhysicalDeviceFeatures
+    enabled.independentBlend = base.features.independentBlend
+    free(base as ptr)
+
+    // Only the three features the rays take; the rest stay off.
+    rq = calloc(1, sizeof(VkPhysicalDeviceRayQueryFeaturesKHR)) as *VkPhysicalDeviceRayQueryFeaturesKHR
+    asf = calloc(1, sizeof(VkPhysicalDeviceAccelerationStructureFeaturesKHR)) as *VkPhysicalDeviceAccelerationStructureFeaturesKHR
+    bda = calloc(1, sizeof(VkPhysicalDeviceBufferDeviceAddressFeatures)) as *VkPhysicalDeviceBufferDeviceAddressFeatures
+    rq.sType = vk.STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR
+    rq.rayQuery = 1
+    rq.pNext = asf as ptr
+    asf.sType = vk.STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR
+    asf.accelerationStructure = 1
+    asf.pNext = bda as ptr
+    bda.sType = vk.STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES
+    bda.bufferDeviceAddress = 1
+
+    ci = calloc(1, sizeof(VkDeviceCreateInfo)) as *VkDeviceCreateInfo
+    ci.sType = vk.STRUCTURE_TYPE_DEVICE_CREATE_INFO
+    ci.queueCreateInfoCount = queue_count
+    ci.pQueueCreateInfos = queues
+    ci.enabledExtensionCount = count
+    ci.ppEnabledExtensionNames = names
+    ci.pEnabledFeatures = enabled as ptr
+    if rays { ci.pNext = rq as ptr }
+    out = cell()
+    r = vk.vkCreateDevice(g_physical, ci as ptr, null, out)
+    g_device = taken(out)
+    free(ci as ptr)
+    free(rq as ptr)
+    free(asf as ptr)
+    free(bda as ptr)
+    free(enabled as ptr)
+    free(names)
+    free(queues)
+    free(priority)
+    if r != vk.SUCCESS {
+        g_device = null
+        ae3d_vk_set_error("vkCreateDevice failed (VkResult ${r})")
+        return false
+    }
+    g_ray = rays
+    vk.load_device(g_device)
+    return true
+}
+
+// The device for `window` (null: offscreen), made and handed to the
+// backend. False, with the reason in the backend's last error, leaves
+// nothing made.
+open(window: ptr) -> bool {
+    if g_device != null { return true }
+    if !available() { return false }
+    windowed = window != null
+    // Streamline's interposer, when DLSS was asked for, from the instance
+    // itself on: its vkCreateInstance is the one that adds what DLSS needs.
+    if g_gipa != null { vk.load_instance_with(g_gipa, null) }
+    ok = make_instance(windowed)
+    if ok && windowed { ok = make_surface(window) }
+    if ok { ok = pick(windowed) }
+    if ok { ok = make_device(windowed) }
+    if ok {
+        gipa = g_gipa
+        if gipa == null { gipa = aevk_ae_loader_proc("vkGetInstanceProcAddr") }
+        ray = 0
+        if g_ray { ray = 1 }
+        dlss = 0
+        if g_dlss { dlss = 1 }
+        ok = ae3d_vk_adopt_device(gipa, g_instance, g_surface, g_physical, g_device,
+                                  g_graphics, g_present, ray, dlss) == 1
+    }
+    if !ok { close() }
+    return ok
+}
+
+// What open made, destroyed, after the backend has let go of it: the
+// device, the surface, the instance, and the commands pointed back at the
+// loader's own entry points.
+close() {
+    if g_device != null {
+        vk.vkDestroyDevice(g_device, null)
+        g_device = null
+    }
+    if g_surface != null {
+        vk.vkDestroySurfaceKHR(g_instance, g_surface, null)
+        g_surface = null
+    }
+    if g_instance != null {
+        vk.vkDestroyInstance(g_instance, null)
+        g_instance = null
+    }
+    g_physical = null
+    g_ray = false
+    vk.load_instance(null)
+}

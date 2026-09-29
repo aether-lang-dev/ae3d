@@ -9,37 +9,7 @@
 #include <string.h>
 #include <math.h>
 
-#if defined(_WIN32)
-#  define VK_USE_PLATFORM_WIN32_KHR
-#elif defined(__APPLE__)
-#  define VK_USE_PLATFORM_METAL_EXT
-#else
-#  define VK_USE_PLATFORM_XLIB_KHR
-#endif
-
-#define GLFW_INCLUDE_VULKAN
-#include <GLFW/glfw3.h>
-
-#if defined(_WIN32)
-#  include <windows.h>
-#  define GLFW_EXPOSE_NATIVE_WIN32
-#else
-#  include <dlfcn.h>
-#  if defined(__APPLE__)
-#    define GLFW_EXPOSE_NATIVE_COCOA
-#  else
-#    define GLFW_EXPOSE_NATIVE_X11
-#  endif
-#endif
-#include <GLFW/glfw3native.h>
-
-#if defined(_WIN32)
-#  define AE3D_VK_PLATFORM_SURFACE_EXTENSION VK_KHR_WIN32_SURFACE_EXTENSION_NAME
-#elif defined(__APPLE__)
-#  define AE3D_VK_PLATFORM_SURFACE_EXTENSION VK_EXT_METAL_SURFACE_EXTENSION_NAME
-#else
-#  define AE3D_VK_PLATFORM_SURFACE_EXTENSION VK_KHR_XLIB_SURFACE_EXTENSION_NAME
-#endif
+#include <vulkan/vulkan.h>
 
 #define AE3D_VK_FRAMES 2
 /* Asked for at binding 4 in place of a texture handle: the camera depth. */
@@ -61,10 +31,6 @@
 #define AE3D_VK_MAX_TEXTURES 256
 #define AE3D_VK_SKIN_STRIDE (8 * (unsigned)sizeof(float))
 #define AE3D_VK_STRIDE (9 * (int)sizeof(float))
-
-#define AE3D_VK_GLOBAL_FUNCS(X) \
-    X(vkCreateInstance) \
-    X(vkEnumerateInstanceExtensionProperties)
 
 /* An Aether module's part of the frame (#402), and when in the frame's
    end it records: what measures the scene, then what draws over it, then
@@ -91,31 +57,25 @@ typedef struct {
     X(vkCmdBuildAccelerationStructuresKHR) \
     X(vkGetAccelerationStructureDeviceAddressKHR)
 
+/* The instance, the surface and the device are ae3d.vkdevice's; what the
+   backend calls on them it loads through the same vkGetInstanceProcAddr
+   when it adopts them. */
 #define AE3D_VK_INSTANCE_FUNCS(X) \
-    X(vkDestroyInstance) \
-    X(vkEnumeratePhysicalDevices) \
     X(vkGetPhysicalDeviceProperties) \
     X(vkGetPhysicalDeviceQueueFamilyProperties) \
     X(vkGetPhysicalDeviceMemoryProperties) \
-    X(vkGetPhysicalDeviceFormatProperties) \
-    X(vkEnumerateDeviceExtensionProperties) \
-    X(vkCreateDevice) \
     X(vkGetDeviceProcAddr) \
-    X(vkGetPhysicalDeviceProperties2) \
-    X(vkGetPhysicalDeviceFeatures2)
+    X(vkGetPhysicalDeviceProperties2)
 
 // Only present when a surface extension was enabled. An offscreen device asks
 // for none, so these are loaded but never required.
 #define AE3D_VK_SURFACE_FUNCS(X) \
-    X(vkGetPhysicalDeviceSurfaceSupportKHR) \
     X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
     X(vkGetPhysicalDeviceSurfaceFormatsKHR) \
-    X(vkGetPhysicalDeviceSurfacePresentModesKHR) \
-    X(vkDestroySurfaceKHR)
+    X(vkGetPhysicalDeviceSurfacePresentModesKHR)
 
 #define AE3D_VK_DEVICE_FUNCS(X) \
     X(vkGetDeviceQueue) \
-    X(vkDestroyDevice) \
     X(vkDeviceWaitIdle) \
     X(vkQueueWaitIdle) \
     X(vkCreateImage) \
@@ -201,7 +161,6 @@ typedef struct {
     X(vkQueuePresentKHR)
 
 #define AE3D_VK_DECLARE(name) static PFN_##name ae3d_##name;
-AE3D_VK_GLOBAL_FUNCS(AE3D_VK_DECLARE)
 AE3D_VK_INSTANCE_FUNCS(AE3D_VK_DECLARE)
 AE3D_VK_SURFACE_FUNCS(AE3D_VK_DECLARE)
 AE3D_VK_DEVICE_FUNCS(AE3D_VK_DECLARE)
@@ -337,7 +296,6 @@ static struct {
     unsigned graphics_family;
     unsigned present_family;
     VkPhysicalDeviceMemoryProperties memory_properties;
-    char device_name[256];
 
     VkSwapchainKHR swapchain;
     VkFormat color_format;
@@ -654,123 +612,10 @@ static int ae3d_vk_fail_code(const char *message, VkResult result) {
 }
 
 const char *ae3d_vk_last_error(void) { return g_vk_error; }
-const char *ae3d_vk_device_name(void) { return vk.device_name; }
 
-// The loader is opened by absolute path rather than by leaf name: on macOS the
-// Homebrew loader lives outside dyld's default search path, so a leaf-name
-// dlopen fails and GLFW caches that failure at glfwInit time. Opening it here
-// keeps Vulkan an optional runtime dependency with no link-time coupling and no
-// environment variables for the user to set.
+/* The vkGetInstanceProcAddr the device was made through: the loader's,
+   or Streamline's interposer when DLSS was asked for (ae3d.vkdevice). */
 static PFN_vkGetInstanceProcAddr g_gipa;
-
-static const char *const ae3d_vk_loader_paths[] = {
-#if defined(_WIN32)
-    "vulkan-1.dll",
-#elif defined(__APPLE__)
-    "libvulkan.1.dylib",
-    "/opt/homebrew/lib/libvulkan.1.dylib",
-    "/usr/local/lib/libvulkan.1.dylib",
-    "libMoltenVK.dylib",
-    "/opt/homebrew/lib/libMoltenVK.dylib",
-    "/usr/local/lib/libMoltenVK.dylib",
-#else
-    "libvulkan.so.1",
-    "libvulkan.so",
-#endif
-    NULL
-};
-
-/* Guarded to match its only reader, ae3d_vk_hint_icd() below, which is itself
- * `#if !defined(_WIN32)`: the Windows loader finds its ICDs through the
- * registry and needs no hint. Without this the array is defined and never used
- * on Windows, which -Werror rejects:
- *
- *   error: 'ae3d_vk_icd_paths' defined but not used
- *          [-Werror=unused-const-variable=] */
-#if !defined(_WIN32)
-static const char *const ae3d_vk_icd_paths[] = {
-#if defined(__APPLE__)
-    "/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json",
-    "/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json",
-    "/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json",
-#endif
-    NULL
-};
-#endif
-
-#if defined(_WIN32)
-static void *ae3d_vk_dlopen(const char *path) { return (void *)LoadLibraryA(path); }
-static void *ae3d_vk_dlsym(void *handle, const char *name) {
-    return (void *)GetProcAddress((HMODULE)handle, name);
-}
-#else
-static void *ae3d_vk_dlopen(const char *path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
-static void *ae3d_vk_dlsym(void *handle, const char *name) { return dlsym(handle, name); }
-#endif
-
-// Homebrew installs the MoltenVK manifest under etc/, which the loader does not
-// scan. Pointing it at the manifest we can actually find is what makes a stock
-// `brew install molten-vk vulkan-loader` work with no user setup.
-static void ae3d_vk_hint_icd(void) {
-#if !defined(_WIN32)
-    int i;
-    if (getenv("VK_ICD_FILENAMES") || getenv("VK_DRIVER_FILES")) return;
-    for (i = 0; ae3d_vk_icd_paths[i]; i++) {
-        FILE *probe = fopen(ae3d_vk_icd_paths[i], "r");
-        if (probe) {
-            fclose(probe);
-            setenv("VK_ICD_FILENAMES", ae3d_vk_icd_paths[i], 0);
-            return;
-        }
-    }
-#endif
-}
-
-/* The global entry points through whatever vkGetInstanceProcAddr is in
-   force: the loader's, or the Streamline interposer's. */
-static int ae3d_vk_bind_globals(void) {
-#define AE3D_VK_LOAD_GLOBAL(name) \
-    ae3d_##name = (PFN_##name)g_gipa(NULL, #name); \
-    if (!ae3d_##name) return ae3d_vk_fail("missing " #name);
-    AE3D_VK_GLOBAL_FUNCS(AE3D_VK_LOAD_GLOBAL)
-#undef AE3D_VK_LOAD_GLOBAL
-    return 1;
-}
-
-/* DLSS asked for, before Vulkan is up: Streamline's runtime is loaded and
-   its interposer becomes the Vulkan loader, so the instance and the device
-   made through it carry what DLSS needs. Returns 1 when the runtime loaded;
-   0, with the reason in ae3d_vk_last_error, leaves Vulkan as it was. */
-int ae3d_vk_request_dlss(const char *directory) {
-    if (vk.dlss_loaded) return 1;
-    if (vk.instance) return ae3d_vk_fail("DLSS has to be asked for before Vulkan starts");
-    if (!ae3d_dlss_built()) return ae3d_vk_fail(ae3d_dlss_last_error());
-    if (!ae3d_dlss_load(directory)) return ae3d_vk_fail(ae3d_dlss_last_error());
-    g_gipa = (PFN_vkGetInstanceProcAddr)ae3d_dlss_instance_proc_addr();
-    if (!g_gipa) return ae3d_vk_fail("the Streamline interposer has no vkGetInstanceProcAddr");
-    vk.dlss_loaded = 1;
-    /* The globals again, through the interposer: its vkCreateInstance is
-       the one that adds what DLSS needs. */
-    return ae3d_vk_bind_globals();
-}
-
-static int ae3d_vk_load_global(void) {
-    void *library = NULL;
-    int i;
-
-    if (g_gipa) return 1;
-
-    ae3d_vk_hint_icd();
-
-    for (i = 0; ae3d_vk_loader_paths[i] && !library; i++) {
-        library = ae3d_vk_dlopen(ae3d_vk_loader_paths[i]);
-    }
-    if (!library) return ae3d_vk_fail("no Vulkan loader found");
-
-    g_gipa = (PFN_vkGetInstanceProcAddr)ae3d_vk_dlsym(library, "vkGetInstanceProcAddr");
-    if (!g_gipa) return ae3d_vk_fail("vkGetInstanceProcAddr missing from the loader");
-    return ae3d_vk_bind_globals();
-}
 
 static int ae3d_vk_load_instance(void) {
     PFN_vkGetInstanceProcAddr gipa = g_gipa;
@@ -833,294 +678,69 @@ static int ae3d_vk_load_device(void) {
     return 1;
 }
 
-int ae3d_vk_available(void) {
-    static int probed;
-    static int result;
+/* The device ae3d.vkdevice made for the frame, adopted: the instance,
+   the window's surface (null offscreen), the physical device, the logical
+   one and its two queue families, whether it traces rays and whether DLSS
+   was loaded for it. The backend's entry points are loaded through `gipa`,
+   the one the device was made through, and what it reads of the device --
+   its limits, its memory kinds, whether its graphics queue keeps time --
+   is read here. The settings a program made before the device (shadows,
+   the post chain, the render scale) and the Aether modules' frame hooks
+   are kept; the rest of the backend's state starts empty. The device is
+   ae3d.vkdevice's to destroy, after ae3d_vk_shutdown. */
+int ae3d_vk_adopt_device(void *gipa, void *instance, void *surface, void *physical, void *device,
+                         int graphics_family, int present_family, int ray_query, int dlss_loaded) {
+    int shadows = vk.shadow_enabled;
+    int fxaa = vk.fxaa, bloom = vk.bloom;
+    float bloom_threshold = vk.bloom_threshold, bloom_intensity = vk.bloom_intensity;
+    double render_scale = vk.render_scale;
+    ae3d_vk_hooks hooks[AE3D_VK_HOOKS];
+    int hook_count = vk.hook_count;
+    VkPhysicalDeviceProperties properties;
+    VkQueueFamilyProperties *families;
+    unsigned family_count = 0;
 
-    if (probed) return result;
-    probed = 1;
-    result = ae3d_vk_load_global();
-    if (result) snprintf(g_vk_error, sizeof(g_vk_error), "%s", "");
-    return result;
-}
+    if (vk.ready) return ae3d_vk_fail("the backend already has a device");
+    if (!gipa || !instance || !physical || !device) return ae3d_vk_fail("no device to adopt");
+    memcpy(hooks, vk.hooks, sizeof(hooks));
+    memset(&vk, 0, sizeof(vk));
+    memcpy(vk.hooks, hooks, sizeof(hooks));
+    vk.hook_count = hook_count;
+    vk.shadow_enabled = shadows;
+    vk.render_scale = render_scale;
+    vk.fxaa = fxaa;
+    vk.bloom = bloom;
+    vk.bloom_threshold = bloom_threshold;
+    vk.bloom_intensity = bloom_intensity;
 
-static int ae3d_vk_has_extension(const VkExtensionProperties *list, unsigned count, const char *name) {
-    unsigned i;
-    for (i = 0; i < count; i++) {
-        if (strcmp(list[i].extensionName, name) == 0) return 1;
-    }
-    return 0;
-}
-
-static int ae3d_vk_create_instance(void) {
-    VkApplicationInfo app;
-    VkInstanceCreateInfo info;
-    const char *extensions[8];
-    unsigned extension_count = 0, available_count = 0;
-    VkExtensionProperties *available = NULL;
-    VkResult result;
-    int portability = 0;
-
-    // An offscreen device needs no surface at all, so the platform surface
-    // extension is not requested and a machine with no window system can still
-    // render.
-    if (!vk.offscreen) {
-        extensions[extension_count++] = VK_KHR_SURFACE_EXTENSION_NAME;
-        extensions[extension_count++] = AE3D_VK_PLATFORM_SURFACE_EXTENSION;
-    }
-
-    ae3d_vkEnumerateInstanceExtensionProperties(NULL, &available_count, NULL);
-    if (available_count > 0) {
-        available = (VkExtensionProperties *)calloc(available_count, sizeof(VkExtensionProperties));
-        if (!available) return ae3d_vk_fail("out of memory");
-        ae3d_vkEnumerateInstanceExtensionProperties(NULL, &available_count, available);
-        portability = ae3d_vk_has_extension(available, available_count,
-                                            VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-    }
-    if (portability) extensions[extension_count++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
-    free(available);
-
-    memset(&app, 0, sizeof(app));
-    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    app.pApplicationName = "ae3d";
-    app.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
-    app.pEngineName = "ae3d";
-    app.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    app.apiVersion = VK_API_VERSION_1_1;
-    {
-        /* 1.2 where the loader has it: what the ray-query shaders (SPIR-V
-           1.4) and the buffer addresses need; 1.1 is enough for all else. */
-        PFN_vkEnumerateInstanceVersion enumerate_version =
-            (PFN_vkEnumerateInstanceVersion)g_gipa(NULL, "vkEnumerateInstanceVersion");
-        unsigned version = 0;
-        if (enumerate_version && enumerate_version(&version) == VK_SUCCESS && version >= VK_API_VERSION_1_2) {
-            app.apiVersion = VK_API_VERSION_1_2;
-        }
+    g_gipa = (PFN_vkGetInstanceProcAddr)gipa;
+    vk.instance = (VkInstance)instance;
+    vk.surface = (VkSurfaceKHR)surface;
+    vk.offscreen = surface == NULL;
+    vk.physical = (VkPhysicalDevice)physical;
+    vk.device = (VkDevice)device;
+    vk.graphics_family = (unsigned)graphics_family;
+    vk.present_family = (unsigned)present_family;
+    vk.ray_query = ray_query ? 1 : 0;
+    vk.dlss_loaded = dlss_loaded ? 1 : 0;
+    if (!ae3d_vk_load_instance() || !ae3d_vk_load_device()) {
+        vk.device = VK_NULL_HANDLE;
+        return 0;
     }
 
-    memset(&info, 0, sizeof(info));
-    info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    info.pApplicationInfo = &app;
-    info.enabledExtensionCount = extension_count;
-    info.ppEnabledExtensionNames = extensions;
-    if (portability) info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-
-    result = ae3d_vkCreateInstance(&info, NULL, &vk.instance);
-    if (result != VK_SUCCESS) return ae3d_vk_fail_code("vkCreateInstance failed", result);
-    return ae3d_vk_load_instance();
-}
-
-static int ae3d_vk_create_surface(void *win) {
-    VkResult result;
-
-#if defined(_WIN32)
-    VkWin32SurfaceCreateInfoKHR info;
-    PFN_vkCreateWin32SurfaceKHR create =
-        (PFN_vkCreateWin32SurfaceKHR)g_gipa(vk.instance, "vkCreateWin32SurfaceKHR");
-    if (!create) return ae3d_vk_fail("vkCreateWin32SurfaceKHR unavailable");
-    memset(&info, 0, sizeof(info));
-    info.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-    info.hinstance = GetModuleHandleW(NULL);
-    info.hwnd = glfwGetWin32Window((GLFWwindow *)win);
-    result = create(vk.instance, &info, NULL, &vk.surface);
-#elif defined(__APPLE__)
-    VkMetalSurfaceCreateInfoEXT info;
-    void *layer;
-    PFN_vkCreateMetalSurfaceEXT create =
-        (PFN_vkCreateMetalSurfaceEXT)g_gipa(vk.instance, "vkCreateMetalSurfaceEXT");
-    if (!create) return ae3d_vk_fail("vkCreateMetalSurfaceEXT unavailable");
-    layer = ae3d_vk_native_layer(win);
-    if (!layer) return ae3d_vk_fail("could not attach a CAMetalLayer to the window");
-    memset(&info, 0, sizeof(info));
-    info.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
-    info.pLayer = (const CAMetalLayer *)layer;
-    result = create(vk.instance, &info, NULL, &vk.surface);
-#else
-    VkXlibSurfaceCreateInfoKHR info;
-    PFN_vkCreateXlibSurfaceKHR create =
-        (PFN_vkCreateXlibSurfaceKHR)g_gipa(vk.instance, "vkCreateXlibSurfaceKHR");
-    if (!create) return ae3d_vk_fail("vkCreateXlibSurfaceKHR unavailable");
-    memset(&info, 0, sizeof(info));
-    info.sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR;
-    info.dpy = glfwGetX11Display();
-    info.window = glfwGetX11Window((GLFWwindow *)win);
-    result = create(vk.instance, &info, NULL, &vk.surface);
-#endif
-
-    if (result != VK_SUCCESS) return ae3d_vk_fail_code("surface creation failed", result);
-    return 1;
-}
-
-static int ae3d_vk_pick_device(void) {
-    VkPhysicalDevice *devices;
-    unsigned count = 0, i, q;
-    int chosen = -1;
-
-    ae3d_vkEnumeratePhysicalDevices(vk.instance, &count, NULL);
-    if (count == 0) return ae3d_vk_fail("no Vulkan physical device");
-
-    devices = (VkPhysicalDevice *)calloc(count, sizeof(VkPhysicalDevice));
-    if (!devices) return ae3d_vk_fail("out of memory");
-    ae3d_vkEnumeratePhysicalDevices(vk.instance, &count, devices);
-
-    for (i = 0; i < count && chosen < 0; i++) {
-        VkQueueFamilyProperties *families;
-        unsigned family_count = 0;
-        int graphics = -1, present = -1, timestamp_bits = 0;
-
-        ae3d_vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &family_count, NULL);
-        if (family_count == 0) continue;
-        families = (VkQueueFamilyProperties *)calloc(family_count, sizeof(VkQueueFamilyProperties));
-        if (!families) continue;
-        ae3d_vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &family_count, families);
-
-        for (q = 0; q < family_count; q++) {
-            VkBool32 supported = VK_FALSE;
-            if (graphics < 0 && (families[q].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
-                graphics = (int)q;
-                timestamp_bits = (int)families[q].timestampValidBits;
-            }
-            if (vk.offscreen) {
-                if (present < 0 && graphics >= 0) present = graphics;
-                continue;
-            }
-            ae3d_vkGetPhysicalDeviceSurfaceSupportKHR(devices[i], q, vk.surface, &supported);
-            if (present < 0 && supported == VK_TRUE) present = (int)q;
+    ae3d_vkGetPhysicalDeviceProperties(vk.physical, &properties);
+    vk.timestamp_ms = (double)properties.limits.timestampPeriod / 1000000.0;
+    vk.max_image_2d = properties.limits.maxImageDimension2D;
+    ae3d_vkGetPhysicalDeviceMemoryProperties(vk.physical, &vk.memory_properties);
+    ae3d_vkGetPhysicalDeviceQueueFamilyProperties(vk.physical, &family_count, NULL);
+    families = family_count ? (VkQueueFamilyProperties *)calloc(family_count, sizeof(VkQueueFamilyProperties)) : NULL;
+    if (families) {
+        ae3d_vkGetPhysicalDeviceQueueFamilyProperties(vk.physical, &family_count, families);
+        if (vk.graphics_family < family_count) {
+            vk.timestamps_usable = families[vk.graphics_family].timestampValidBits > 0;
         }
         free(families);
-
-        if (graphics >= 0 && present >= 0) {
-            VkPhysicalDeviceProperties properties;
-            vk.physical = devices[i];
-            vk.graphics_family = (unsigned)graphics;
-            vk.present_family = (unsigned)present;
-            ae3d_vkGetPhysicalDeviceProperties(vk.physical, &properties);
-            snprintf(vk.device_name, sizeof(vk.device_name), "%s", properties.deviceName);
-            vk.timestamp_ms = (double)properties.limits.timestampPeriod / 1000000.0;
-            vk.max_image_2d = properties.limits.maxImageDimension2D;
-            vk.timestamps_usable = timestamp_bits > 0;
-            ae3d_vkGetPhysicalDeviceMemoryProperties(vk.physical, &vk.memory_properties);
-            chosen = (int)i;
-        }
     }
-    free(devices);
-
-    if (chosen < 0) return ae3d_vk_fail("no device with both graphics and present queues");
-    return 1;
-}
-
-static int ae3d_vk_create_device(void) {
-    VkDeviceQueueCreateInfo queues[2];
-    VkDeviceCreateInfo info;
-    VkExtensionProperties *available = NULL;
-    const char *extensions[8];
-    unsigned extension_count = 0, available_count = 0, queue_count = 1;
-    float priority = 1.0f;
-    VkResult result;
-    VkPhysicalDeviceBufferDeviceAddressFeatures address_features;
-    VkPhysicalDeviceAccelerationStructureFeaturesKHR as_features;
-    VkPhysicalDeviceRayQueryFeaturesKHR ray_features;
-    VkPhysicalDeviceProperties properties;
-    int ray = 0;
-
-    memset(queues, 0, sizeof(queues));
-    queues[0].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    queues[0].queueFamilyIndex = vk.graphics_family;
-    queues[0].queueCount = 1;
-    queues[0].pQueuePriorities = &priority;
-    if (vk.present_family != vk.graphics_family) {
-        queues[1].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        queues[1].queueFamilyIndex = vk.present_family;
-        queues[1].queueCount = 1;
-        queues[1].pQueuePriorities = &priority;
-        queue_count = 2;
-    }
-
-    if (!vk.offscreen) extensions[extension_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
-
-    ae3d_vkEnumerateDeviceExtensionProperties(vk.physical, NULL, &available_count, NULL);
-    if (available_count > 0) {
-        available = (VkExtensionProperties *)calloc(available_count, sizeof(VkExtensionProperties));
-        if (!available) return ae3d_vk_fail("out of memory");
-        ae3d_vkEnumerateDeviceExtensionProperties(vk.physical, NULL, &available_count, available);
-        if (ae3d_vk_has_extension(available, available_count, "VK_KHR_portability_subset")) {
-            extensions[extension_count++] = "VK_KHR_portability_subset";
-        }
-        /* Ray queries, where the device has all of what they take and the
-           instance is 1.2 (the features below are 1.2's), unless AE3D_NO_RAYS. */
-        ae3d_vkGetPhysicalDeviceProperties(vk.physical, &properties);
-        if (!getenv("AE3D_NO_RAYS") && properties.apiVersion >= VK_API_VERSION_1_2 &&
-            ae3d_vk_has_extension(available, available_count, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
-            ae3d_vk_has_extension(available, available_count, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
-            ae3d_vk_has_extension(available, available_count, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) &&
-            ae3d_vk_has_extension(available, available_count, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)) {
-            VkPhysicalDeviceFeatures2 features2;
-            memset(&address_features, 0, sizeof(address_features));
-            address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
-            memset(&as_features, 0, sizeof(as_features));
-            as_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
-            as_features.pNext = &address_features;
-            memset(&ray_features, 0, sizeof(ray_features));
-            ray_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
-            ray_features.pNext = &as_features;
-            memset(&features2, 0, sizeof(features2));
-            features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-            features2.pNext = &ray_features;
-            ae3d_vkGetPhysicalDeviceFeatures2(vk.physical, &features2);
-            if (ray_features.rayQuery && as_features.accelerationStructure && address_features.bufferDeviceAddress) {
-                extensions[extension_count++] = VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME;
-                extensions[extension_count++] = VK_KHR_RAY_QUERY_EXTENSION_NAME;
-                extensions[extension_count++] = VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
-                extensions[extension_count++] = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
-                ray = 1;
-            }
-        }
-    }
-    free(available);
-
-    memset(&info, 0, sizeof(info));
-    info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    info.queueCreateInfoCount = queue_count;
-    info.pQueueCreateInfos = queues;
-    info.enabledExtensionCount = extension_count;
-    info.ppEnabledExtensionNames = extensions;
-    /* Independent blending: the scene's pipelines blend the colour and leave
-       the motion vectors as written, two attachments blended two ways, which
-       without this feature the device is not asked to honour (#405). Every
-       desktop device has it; where one does not, it stays off. */
-    {
-        static VkPhysicalDeviceFeatures enabled;
-        memset(&enabled, 0, sizeof(enabled));
-        if (ae3d_vkGetPhysicalDeviceFeatures2) {
-            VkPhysicalDeviceFeatures2 base;
-            memset(&base, 0, sizeof(base));
-            base.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-            ae3d_vkGetPhysicalDeviceFeatures2(vk.physical, &base);
-            enabled.independentBlend = base.features.independentBlend;
-        }
-        info.pEnabledFeatures = &enabled;
-    }
-    if (ray) {
-        /* Only the three features the rays take; the rest stay off. */
-        memset(&address_features, 0, sizeof(address_features));
-        address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
-        address_features.bufferDeviceAddress = VK_TRUE;
-        memset(&as_features, 0, sizeof(as_features));
-        as_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
-        as_features.accelerationStructure = VK_TRUE;
-        as_features.pNext = &address_features;
-        memset(&ray_features, 0, sizeof(ray_features));
-        ray_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
-        ray_features.rayQuery = VK_TRUE;
-        ray_features.pNext = &as_features;
-        info.pNext = &ray_features;
-    }
-
-    result = ae3d_vkCreateDevice(vk.physical, &info, NULL, &vk.device);
-    vk.ray_query = ray && result == VK_SUCCESS;
-    if (result != VK_SUCCESS) return ae3d_vk_fail_code("vkCreateDevice failed", result);
-    if (!ae3d_vk_load_device()) return 0;
-
     ae3d_vkGetDeviceQueue(vk.device, vk.graphics_family, 0, &vk.graphics_queue);
     ae3d_vkGetDeviceQueue(vk.device, vk.present_family, 0, &vk.present_queue);
     return 1;
@@ -1476,9 +1096,6 @@ int ae3d_vk_frame_bgr(void) {
     return (vk.color_format == VK_FORMAT_B8G8R8A8_UNORM || vk.color_format == VK_FORMAT_B8G8R8A8_SRGB) ? 1 : 0;
 }
 
-void *ae3d_vk_instance_handle(void) { return (void *)vk.instance; }
-void *ae3d_vk_physical_device_handle(void) { return (void *)vk.physical; }
-void *ae3d_vk_device_handle(void) { return (void *)vk.device; }
 /* The frame being recorded: its command buffer, its slot among the frames
    in flight, how many there are, and the image it finishes in -- the
    offscreen target, or the swapchain image it acquired. */
@@ -3889,45 +3506,14 @@ int ae3d_vk_set_binds(void) { return vk.set_binds; }
 // A null window means offscreen: no surface, no swapchain, and the frame is
 // read back rather than presented. That is what lets the editor host the
 // Vulkan renderer inside a toolkit that owns the real window.
-int ae3d_vk_init(void *win, int width, int height) {
-    // Whether shadows and post-processing are wanted are settings rather than
-    // device state, and a program sets them before the device exists. Clearing
-    // them here discarded the request: the demo asked for FXAA and bloom and
-    // the Vulkan frame drew without either, and nothing said so until the
-    // channel reported which passes had run.
-    int shadows = vk.shadow_enabled;
-    int fxaa = vk.fxaa, bloom = vk.bloom;
-    float bloom_threshold = vk.bloom_threshold, bloom_intensity = vk.bloom_intensity;
-    int dlss_loaded = vk.dlss_loaded;
-    double render_scale = vk.render_scale;
-    /* The frame hooks the Aether modules installed (ae3d.vkmeter switches
-       itself on when the engine asks, which can be before the device is
-       made): kept, as the settings above are. */
-    ae3d_vk_hooks hooks[AE3D_VK_HOOKS];
-    int hook_count = vk.hook_count;
-    memcpy(hooks, vk.hooks, sizeof(hooks));
-
+int ae3d_vk_init(int width, int height) {
     if (vk.ready) return 1;
-    if (!ae3d_vk_available()) return 0;
-
-    memset(&vk, 0, sizeof(vk));
-    memcpy(vk.hooks, hooks, sizeof(hooks));
-    vk.hook_count = hook_count;
-    vk.shadow_enabled = shadows;
-    vk.dlss_loaded = dlss_loaded;
-    vk.render_scale = render_scale;
-    vk.fxaa = fxaa;
-    vk.bloom = bloom;
-    vk.bloom_threshold = bloom_threshold;
-    vk.bloom_intensity = bloom_intensity;
-    vk.offscreen = win == NULL;
-
-    if (!ae3d_vk_create_instance()) return 0;
-
-    if (!vk.offscreen && !ae3d_vk_create_surface(win)) return 0;
-
-    if (!ae3d_vk_pick_device()) return 0;
-    if (!ae3d_vk_create_device()) return 0;
+    /* Whether shadows and post-processing are wanted are settings rather
+       than device state, and a program sets them before the device exists:
+       ae3d_vk_adopt_device keeps them, and the Aether modules' frame hooks
+       (ae3d.vkmeter switches itself on when the engine asks, which can be
+       before the device is made), as it clears the rest. */
+    if (!vk.device) return ae3d_vk_fail("no device (ae3d.vkdevice makes it)");
     vk.samples = ae3d_vk_pick_samples();
     if (!ae3d_vk_choose_surface_format()) return 0;
     if (vk.offscreen) {
@@ -6887,11 +6473,9 @@ void ae3d_vk_shutdown(void) {
     if (vk.camdepth_pass) ae3d_vkDestroyRenderPass(vk.device, vk.camdepth_pass, NULL);
     if (vk.shadow_pipeline) ae3d_vkDestroyPipeline(vk.device, vk.shadow_pipeline, NULL);
     ae3d_vk_destroy_shadow_target();
-    /* Streamline goes before the device it wrapped. */
+    /* Streamline goes before the device it wrapped, which ae3d.vkdevice
+       destroys after this, with the surface and the instance. */
     if (vk.dlss_loaded) { ae3d_dlss_shutdown(); vk.dlss_loaded = 0; vk.dlss_supported = 0; vk.dlss_mode = 0; }
-    if (vk.device) ae3d_vkDestroyDevice(vk.device, NULL);
-    if (vk.surface && ae3d_vkDestroySurfaceKHR) ae3d_vkDestroySurfaceKHR(vk.instance, vk.surface, NULL);
-    if (vk.instance) ae3d_vkDestroyInstance(vk.instance, NULL);
 
     {
         /* The hooks outlive the device: installed once a process, they are

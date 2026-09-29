@@ -32,10 +32,12 @@ void   ae3d_offscreen_context_destroy(void *context);
 
 
 
-int    ae3d_vk_available(void);
-const char *ae3d_vk_device_name(void);
 const char *ae3d_vk_last_error(void);
-int    ae3d_vk_init(void *win, int width, int height);
+/* The device ae3d.vkdevice made, adopted, then the rest of the backend
+   started on it. */
+int    ae3d_vk_adopt_device(void *gipa, void *instance, void *surface, void *physical, void *device,
+                            int graphics_family, int present_family, int ray_query, int dlss_loaded);
+int    ae3d_vk_init(int width, int height);
 void   ae3d_vk_shutdown(void);
 void   ae3d_vk_resize(int width, int height);
 int    ae3d_vk_frame_begin(double r, double g, double b, double a);
@@ -100,7 +102,6 @@ double ae3d_vk_set_render_scale(double scale);
 double ae3d_vk_render_scale(void);
 /* DLSS through Streamline (native/ae3d_dlss.h): asked for before Vulkan
    starts, a mode set once the device is up, the camera given every frame. */
-int    ae3d_vk_request_dlss(const char *directory);
 void   ae3d_vk_set_samples(int samples);
 int    ae3d_vk_dlss_available(void);
 int    ae3d_vk_set_dlss(int mode);
@@ -126,9 +127,6 @@ int    ae3d_vk_add_frame_hooks_at(int stage, void *record, void *collect, void *
 int    ae3d_vk_ready(void);
 void   ae3d_vk_frame_wait(int slot);
 int    ae3d_vk_frame_bgr(void);
-void  *ae3d_vk_instance_handle(void);
-void  *ae3d_vk_physical_device_handle(void);
-void  *ae3d_vk_device_handle(void);
 void  *ae3d_vk_frame_commands(void);
 int    ae3d_vk_frame_slot(void);
 int    ae3d_vk_frames_in_flight(void);
