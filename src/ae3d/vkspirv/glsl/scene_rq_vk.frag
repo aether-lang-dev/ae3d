@@ -1258,7 +1258,13 @@ mat3 cotangent_frame(vec3 normal, vec3 position, vec2 uv) {
     vec3 tangent = perp_y * duvx.x + perp_x * duvy.x;
     vec3 bitangent = perp_y * duvx.y + perp_x * duvy.y;
 
-    float scale = inversesqrt(max(dot(tangent, tangent), dot(bitangent, bitangent)));
+    // The solve's determinant is dropped for the normalisation, but not its
+    // sign: which way the screen's y runs is in it. OpenGL's runs up and
+    // Vulkan's down, and without the sign the same surface got its map's
+    // tangent and bitangent reversed on Vulkan -- every bump a dent, every
+    // ripple on the wet road turned the other way (#494).
+    float handed = dot(dpx, perp_y) < 0.0 ? -1.0 : 1.0;
+    float scale = handed * inversesqrt(max(dot(tangent, tangent), dot(bitangent, bitangent)));
     return mat3(tangent * scale, bitangent * scale, normal);
 }
 

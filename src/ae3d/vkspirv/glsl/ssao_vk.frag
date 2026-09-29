@@ -197,9 +197,9 @@ float scene_depth_clip(float depth) {
     return depth;
 }
 
-// Which way the screen's y runs: up on OpenGL, down on Vulkan, which turns
-// a normal built from the screen's two axes the other way. The generator
-// rewrites this for the Vulkan build.
+// Which way the screen's y runs: up on OpenGL, down on Vulkan, so what is
+// above a pixel and where its grain is counted from are the same on both.
+// The generator rewrites this for the Vulkan build.
 float screen_y_sign() {
     return -1.0; /* screen y down */
 }
@@ -235,11 +235,16 @@ void main() {
     float dl, dr, dd, du;
     vec3 Pl = worldAt(uv - vec2(px.x, 0.0), dl);
     vec3 Pr = worldAt(uv + vec2(px.x, 0.0), dr);
-    vec3 Pd = worldAt(uv - vec2(0.0, px.y), dd);
-    vec3 Pu = worldAt(uv + vec2(0.0, px.y), du);
+    // The neighbours below and above on the screen, whichever way the
+    // screen's y runs: a tie between the two -- a flat run of depth -- then
+    // picks the same neighbour on both backends, where it picked the one
+    // above on OpenGL and the one below on Vulkan (#494).
+    vec2 above = vec2(0.0, px.y * screen_y_sign());
+    vec3 Pd = worldAt(uv - above, dd);
+    vec3 Pu = worldAt(uv + above, du);
     vec3 dx = abs(dl - depth) < abs(dr - depth) ? P - Pl : Pr - P;
     vec3 dy = abs(dd - depth) < abs(du - depth) ? P - Pd : Pu - P;
-    vec3 N = normalize(cross(dx, dy)) * screen_y_sign();
+    vec3 N = normalize(cross(dx, dy));
     float eyeDist = distance(viewPos, P);
 
     vec3 up = abs(N.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
