@@ -82,7 +82,7 @@ exports (
     SIGHT_NONE, SIGHT_SEEN, SIGHT_OUT, SIGHT_HIDDEN, view_bytes, hidden_bytes, worst_wait_sight,
     TRAFFIC_LINK, TRAFFIC_ALL, SENT, RECEIVED, rate, link_bytes, window_us, round_trip_us, jitter, jitter_us,
     loss, loss_ppm, pings, budget_of, worst_wait_any, last_correction, correction_um,
-    set_link, link_latency, link_jitter, link_loss,
+    set_link, link_latency, link_jitter, link_loss, set_smoothing, release,
     transport_name, session_count, session_at, session_index,
     net_free, alive, last_error
 )
@@ -103,6 +103,7 @@ extern tan(x: float) -> float
 extern atan(x: float) -> float
 extern atan2(y: float, x: float) -> float
 extern asin(x: float) -> float
+extern exp(x: float) -> float
 
 const PI = 3.141592653589793
 const ROLE_HOST = 1
@@ -241,6 +242,8 @@ const EVENT_DISCONNECTED = 2
 const EVENT_MESSAGE = 3
 
 const HISTORY = 32                   // samples an object keeps: a second at 30 a second
+const SMOOTHING = 0.1                // seconds a remote object's drawing error takes to fall to a third
+const TELEPORT = 4.0                 // metres: an error past this is the object moved, taken at once
 const KEPT = 33                      // snapshots each side keeps to delta against: the 32 newest, and the one being built
 const STATE = 4                      // numbers an object's quantised state: x y z in steps, the rotation's 48 bits
 const OWN = 5                        // numbers the client's own player: x y z, vy, grounded
@@ -671,6 +674,19 @@ struct NetObject {
     priority: float                  // host: how fast its priority grows while it waits (1 by default)
     captured: bool                   // host: a tick has taken its state, so its fields are fixed
     fields: ptr                      // list of *NetField, its own in their order; null for none
+    // Another peer simulates it (behaviour.object_remote): what the
+    // session set, and whether it made a dynamic body on it kinematic --
+    // both given back when the session lets it go.
+    remote: bool
+    body_driven: bool
+    // Client: where it was drawn last, and the error it is drawn off where
+    // its samples put it by, decaying: the view that ran past the newest
+    // sample held it there, and the samples that came after put it
+    // elsewhere -- corrected over the smoothing's time, never at once.
+    drawn: Vec3
+    drawn_known: bool
+    held: bool
+    error: Vec3
     // The sphere a client's view is judged against (#487): its centre from
     // the object's place, on the world's axes, and its radius.
     bound_centre: Vec3
@@ -826,6 +842,7 @@ struct Net {
     received: ptr                    // client: ptr[KEPT], *Snapshot rebuilt from their deltas
     newest_tick: int                 // client: the newest snapshot it holds
     ack_due: bool                    // client: it holds a snapshot it has not acknowledged
+    ack_since: float                 // client: since when
     relevance: float                 // host: metres around a client's player beyond which it is not sent anything; 0 for all
     objects_sent: long               // host: records written, all clients
     handlers: ptr                    // list of *NetHandler, by event id - 1
@@ -857,6 +874,8 @@ struct Net {
     occluders: *Physics
     sighted: bool
     last_correction: float           // client: what the newest reconciliation moved its player, metres
+    smoothing: float                 // client: seconds a remote object's error takes to fall to a third (0: at once)
+    last_draw: float                 // client: when the objects were last drawn; below 0 never
 }
 
 net_new(role: int, kind: int) -> *Net {
@@ -890,6 +909,8 @@ net_new(role: int, kind: int) -> *Net {
     n.spare_words = list.new()
     n.sighted = true
     n.view_sent_at = 0.0 - 1.0
+    n.smoothing = SMOOTHING
+    n.last_draw = 0.0 - 1.0
     g_alive = g_alive + 1
     if g_sessions == null { g_sessions = list.new() }
     list.add_raw(g_sessions, n as ptr)
@@ -1561,7 +1582,44 @@ networked(n: *Net, o: *GameObject) -> int {
     no = net_object_new(list.size(n.objects) + 1, o)
     list.add_raw(n.objects, no as ptr)
     bind_fields(n, no)
+    if n.role == ROLE_CLIENT { set_remote(no, true) }
     return no.id
+}
+
+// Every networked object given back to this side: simulated here again,
+// its scripts' fixed_update run and a body the session drove dynamic
+// again. For a game that keeps its objects past the session (a client
+// that leaves and plays on alone); net_free does not touch the game's
+// objects, which may be gone by then.
+release(n: *Net) {
+    i = 0
+    while i < list.size(n.objects) {
+        no = list.get_raw(n.objects, i) as *NetObject
+        if no != null { set_remote(no, false) }
+        i = i + 1
+    }
+}
+
+// Whether another peer simulates the object: on a client what the host
+// owns and every other client's player, on the host a client's player.
+// Its scripts' fixed_update, the simulation, is left to that peer
+// (behaviour.object_remote: the engine runs only their update and
+// late_update here), and a dynamic body on it is made kinematic, driven
+// where the session puts it -- it pushes what it meets, and is never
+// simulated against the host's word.
+set_remote(no: *NetObject, remote: bool) {
+    if no.object == null || no.remote == remote { return }
+    no.remote = remote
+    behaviour.object_set_remote(no.object, remote)
+    rb = physics.rigidbody_of(no.object)
+    if remote && rb != null && physics.rigidbody_kind(rb) == physics.DYNAMIC {
+        physics.rigidbody_set_kind(rb, physics.KINEMATIC)
+        no.body_driven = true
+    }
+    if !remote && no.body_driven {
+        if rb != null { physics.rigidbody_set_kind(rb, physics.DYNAMIC) }
+        no.body_driven = false
+    }
 }
 
 net_object_new(id: int, o: *GameObject) -> *NetObject {
@@ -1606,6 +1664,7 @@ networked_at(n: *Net, o: *GameObject, id: int) {
     no = net_object_new(id, o)
     list.set(n.objects, id - 1, no as ptr)
     bind_fields(n, no)
+    if n.role == ROLE_CLIENT { set_remote(no, true) }
 }
 
 // Where a networked object is: its model's place, or for an object with no
@@ -3189,6 +3248,7 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
         return
     }
     n.newest_tick = tick
+    if !n.ack_due { n.ack_since = now }
     n.ack_due = true
     n.snapshots = n.snapshots + 1
     // The host's clock against ours, from the least-delayed snapshot seen: a
@@ -3305,17 +3365,38 @@ view_time(n: *Net, now: float) -> float {
 interpolate(n: *Net, now: float) {
     if !n.offset_known { return }
     at = view_time(n, now)
+    dt = 0.0
+    if n.last_draw >= 0.0 { dt = now - n.last_draw }
+    n.last_draw = now
+    // What an error keeps of itself over this frame: e^(-dt / smoothing).
+    keep = 0.0
+    if n.smoothing > 0.0 { keep = exp(0.0 - dt / n.smoothing) }
     i = 0
     while i < list.size(n.objects) {
         no = list.get_raw(n.objects, i) as *NetObject
-        if no != null && no.count > 0 { place_interpolated(no, at) }
+        if no != null && no.count > 0 { place_interpolated(no, at, keep) }
         i = i + 1
     }
 }
 
+// Client: how long a remote object's drawing error takes to fall to a
+// third (0.1 s by default; 0 corrects it at once). The error is what the
+// samples moved an object by where the view had held it: a burst of
+// losses runs the view past the newest sample, the object stands at it,
+// and the snapshots after it put it on along its path -- drawn from where
+// it stood, never jumped there.
+set_smoothing(n: *Net, seconds: float) {
+    if seconds >= 0.0 { n.smoothing = seconds }
+}
+
 // An object at its interpolated place and turn: its model's, or its game
-// object's when it has none (a remote player, a ragdoll's bone).
-place_interpolated(no: *NetObject, at: float) {
+// object's when it has none (a remote player, a ragdoll's bone). Where
+// the view had run past its newest sample, it stood at that sample; the
+// frame the samples take it on again, where it was drawn and where they
+// put it differ by the error, which the object is drawn off them by and
+// which falls away over the smoothing's time: corrected, never snapped.
+// An error past TELEPORT is not one: the object was moved, and is.
+place_interpolated(no: *NetObject, at: float, keep: float) {
     h = no.history as float[]
     after = 0 - 1
     before = 0 - 1
@@ -3338,10 +3419,23 @@ place_interpolated(no: *NetObject, at: float) {
     if h[c] > h[a] { t = (at - h[a]) / (h[c] - h[a]) }
     if t < 0.0 { t = 0.0 }
     if t > 1.0 { t = 1.0 }
-    set_transform(no.object, core.vec3(h[a + 1] + (h[c + 1] - h[a + 1]) * t,
-                                       h[a + 2] + (h[c + 2] - h[a + 2]) * t,
-                                       h[a + 3] + (h[c + 3] - h[a + 3]) * t),
-                  nlerp(h, a + 4, c + 4, t))
+    target = core.vec3(h[a + 1] + (h[c + 1] - h[a + 1]) * t,
+                       h[a + 2] + (h[c + 2] - h[a + 2]) * t,
+                       h[a + 3] + (h[c + 3] - h[a + 3]) * t)
+    held = at > h[no.newest * SAMPLE]
+    if no.drawn_known && no.held && !held {
+        // Back on its samples after the view ran past them: from where it
+        // was drawn.
+        no.error = core.v3_sub(no.drawn, target)
+        if core.v3_len(no.error) > TELEPORT { no.error = core.vec3(0.0, 0.0, 0.0) }
+    } else {
+        no.error = core.v3_mul(no.error, keep)
+    }
+    no.held = held
+    drawn = core.v3_add(target, no.error)
+    no.drawn = drawn
+    no.drawn_known = true
+    set_transform(no.object, drawn, nlerp(h, a + 4, c + 4, t))
 }
 
 // Between two rotations (four floats of `h` at `a` and at `c`) the short way
@@ -3369,9 +3463,12 @@ step(n: *Net, now: float) {
     delta = 0.0
     if n.last_step >= 0.0 { delta = now - n.last_step }
     n.last_step = now
-    // A client whose newest snapshot no input has acknowledged since the
-    // last step says so on its own.
-    if n.role == ROLE_CLIENT && n.ack_due { send_ack(n, now) }
+    // A client whose newest snapshot no input has acknowledged says so on
+    // its own: at once without a player, and with one only once a fixed
+    // step and a half has gone by without an input to carry it -- a frame
+    // drawn three times between two fixed steps is not three reasons for a
+    // datagram of its own.
+    if n.role == ROLE_CLIENT && n.ack_due && (n.mine == null || now - n.ack_since >= PLAYER_STEP * 1.5) { send_ack(n, now) }
     // What was sent since the last step goes first, then what arrived.
     flush(n, now)
     // Events queued outside a step (a client's connection) are handled in
@@ -3782,6 +3879,11 @@ make_player(n: *Net, client: int, id: int) -> *NetPlayer {
     pl.controller = controller
     list.add_raw(n.players, pl as ptr)
     networked_at(n, controller.object as *GameObject, id)
+    // A player is simulated where its commands are: on the host its own
+    // (client 0), on a client its own; every other copy is remote.
+    remote = client != n.my_id
+    if n.role == ROLE_HOST { remote = client != 0 }
+    set_remote(object_by_id(n, id), remote)
     return pl
 }
 
