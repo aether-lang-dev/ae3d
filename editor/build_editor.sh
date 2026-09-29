@@ -62,6 +62,8 @@ esac
 . "$ROOT/scripts/native.sh"
 ae3d_glfw_flags
 ae3d_vulkan_flags
+# The same floating point as every other program (ae3d_fp_flags).
+FP_FLAGS="$(ae3d_fp_flags)"
 
 . "$ROOT/scripts/platform.sh"
 PIC="$(ae3d_native_pic_flag)"
@@ -134,7 +136,7 @@ for src in $NATIVE_SOURCES; do
     extra="$(ae3d_native_extra_flags "$src")"
     compiler="$(ae3d_native_compiler "$CC" "$src")"
     if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$newest_header" -nt "$obj" ]; then
-        "$compiler" -c $CFLAGS $WARN $PIC -Inative $extra $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o "$obj"
+        "$compiler" -c $CFLAGS $FP_FLAGS $WARN $PIC -Inative $extra $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o "$obj"
     fi
 done
 
@@ -152,7 +154,7 @@ AETHER_SOURCES="$(sed -n 's|^// aether-source: ||p' "$GEN" | tr '\\' '/')"
 # zlib belongs to the engine, which is a library of its own and names it on its
 # own link line; GLFW is named, since the engine's Aether calls it
 # (ae3d.platform). PLATFORM_LIBS here is aether-ui's.
-"$CC" $CFLAGS $VULKAN_CFLAGS $UI_FLAGS "$GEN" $UI_SOURCES $AETHER_SOURCES $(ae3d_native_link_flags) $GLFW_LIBS \
+"$CC" $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $UI_FLAGS "$GEN" $UI_SOURCES $AETHER_SOURCES $(ae3d_native_link_flags) $GLFW_LIBS \
     $AETHER_COMPILE_FLAGS $AETHER_LIBS $PLATFORM_LIBS \
     -o "$OUT"
 

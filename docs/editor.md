@@ -178,6 +178,38 @@ every model is put back exactly where it stood: the simulation is for
 looking at, and what it did to the scene is not kept. Loading a scene
 while one runs stops it first.
 
+**Play** (#476) tries a multiplayer game the way it is played: by several
+players at once. The PLAY section under Edit picks how many clients join
+(one to four, a slider with a notch a count) and the link between them --
+latency, jitter and loss, over `ae3d.net`'s loopback
+([networking.md](networking.md)); a link slider moved while it plays
+changes the link at once, and the count holds until Stop. Play runs the scene as a host
+and each client as an engine of its own, in this process:
+
+- the host is the editor's engine over its scene, simulated as Simulate
+  simulates it, and plays too;
+- a client is an engine over the same renderer, with a physics world of
+  its own holding the scene's static bodies (the rows' own meshes, which
+  never move) and the simulation's floors, a stand-in for every row the
+  host moves -- a body that is not static, or a script -- networked in the
+  same order, and its players;
+- every world's players are capsules, one colour a client, standing at the
+  nearest free places to where the viewport looks: on static ground (a
+  figure or a crate is not ground), with room for a player, no two side by
+  side. Where nothing is under that point, they stand on the grid's plane
+  on a floor laid for the play.
+
+The bar over the viewport shows one world at a time -- Host, Client 1 ...
+-- its players, and every networked row where that client draws it (at
+its view time, interpolated; hidden until it has been told it). The
+camera follows the shown world's player, and the keys go to it: W, A, S
+and D walk along the way the camera looks, space jumps, predicted on a
+client and reconciled against the host. Stop lets every world and session
+go, the players and the floors with them, and puts the scene back as
+Simulate's stop does -- which now also takes a ragdoll's twelve bone
+objects out of the engine and the renderer, where every stop used to
+leave them.
+
 **Console** keeps the last few messages. The status line under the viewport
 carries the newest, and the stats bar beside it says what the last frame
 cost: the rate, then the device's own time for each pass -- the shadow map,
@@ -399,9 +431,37 @@ toolkit checkout and skip it, and so does a machine without one.
 | `AE3D_EDITOR_REPORT=path` | write what the editor built to a text file |
 | `AE3D_EDITOR_SCENE=components` | start with water, voxels, a light and a behaviour |
 | `AE3D_EDITOR_SCENE=roundtrip` | the same, saved and loaded again before the run |
+| `AE3D_EDITOR_PLAY=n` | Play with `n` clients from the first frame, each world shown in turn a frame at a time |
 | `AE3D_SCENE=path` | open this scene file (or pass it as the argument); Save writes it back |
 | `AE3D_EDITOR_DRIVER=1` | serve the widget tree on `127.0.0.1:9222` |
 | `AE3D_EDITOR_BACKEND=opengl` | use the OpenGL renderer; Vulkan is the default where a driver exists |
+
+A report always plays, after the run's frames and before its other
+checks: the play the frames began (or a host and two clients started
+then), every player walking a circle of its own for two and a half
+seconds and standing, on the play's own clock at the fixed step. Then W
+is held half a second in client 2's view, and then Stop. It writes:
+
+| | |
+|---|---|
+| `play_clients` | the clients |
+| `play_views` | the worlds the viewport drew in the run's frames |
+| `play_welcomed` | the clients the host welcomed |
+| `play_prediction_um` | the most a reconciliation moved a client's player, micrometres |
+| `play_own_um` | at rest, the furthest a client's own player is from the host's |
+| `play_remote_um` | at rest, the furthest a client draws another's player from the host's |
+| `play_focus` | 1 when the keys walked client 2's player, and no other |
+| `play_leaked` | sessions and hubs alive, and renderer models and engine objects not given back, after Stop |
+| `play_restored` | 1 when every networked row stands where it stood before Play |
+
+`ci.sh` runs every editor run with `AE3D_EDITOR_PLAY=2` and holds it to
+three worlds drawn, two clients welcomed, a reconciliation under a
+centimetre, a client's own player at rest within a millimetre of the
+host's and the others it draws within a centimetre, the keys' focus, and
+nothing left behind. On this machine: 3 worlds, 2 welcomed, 0 um (a
+reconciliation moves a player under a micrometre), 0 um, 43 um (the
+snapshot's tenth of a millimetre), 1, 0 and 1, on both backends and the
+roundtrip scene.
 
 The driver is how the layout is checked without being able to see it. aether-ui
 cannot rasterize widgets to pixels, so `GET /widgets` and its geometry is the
