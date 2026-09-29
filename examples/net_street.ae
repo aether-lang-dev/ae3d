@@ -23,6 +23,13 @@
 // client's car; the camera follows. The first seconds are the scene alone,
 // for the host's frame to be measured against.
 //
+// The play runs on a clock of its own, in fixed steps of a sixtieth of a
+// second -- every command, every session's and every horde's step, every
+// measurement -- as many steps each frame as the wall clock has gone, so a
+// window drawing four frames a second (a software renderer) plays the same
+// game as one drawing a hundred and forty: the same seconds of it, the same
+// ticks, the same bytes a second. A frame draws what its steps made.
+//
 // Measured as it runs, and said when it ends: every client's bytes a second
 // each way over every second of the run, every client's horde against the
 // host's at each tick it reaches, the cars' fields every client holds
@@ -72,6 +79,8 @@ const LOSS = 0.02
 const ALONE = 4.0                    // seconds of the scene alone before the clients join: the frame measured against
 const SETTLED = 2.0                  // seconds in, the frame is measured from: its first frames build what it draws
 const JOIN_EVERY = 0.1               // seconds between two bots joining
+const STEP = 0.016666666666666666    // the play's fixed step: a command, a session's step
+const CATCH_UP = 5.0                 // the most seconds of play one frame steps; past it the play's clock falls behind
 // The street: its block TILES times along the road, every other one
 // mirrored, as street_drive and zombie_city lay it; the road along x.
 const TILES = 3
@@ -134,6 +143,7 @@ struct Car {
 // the one in this window. Its own world, session, horde and street; the
 // cars' state; its players' bodies.
 struct Side {
+    game: *Game
     world: *Engine
     session: *Net
     horde: *NetHorde
@@ -167,6 +177,8 @@ struct Game {
     bots: ptr                        // list of *Side
     bots_wanted: int
     tiles: ptr                       // list of *Model: the street's models the collision is made from, drawn here
+    lamps: ptr                       // list of *Light: the lamp heads' lights, the program's to free once the engine is gone
+    lent: ptr                        // list of *Model: every model handed to the engine to draw, which borrows it
     bank: ptr                        // the zombie's walk, baked
     walk_length: float
     body: *Model                     // the horde, drawn near: the zombie's skin and its clothes, instanced
@@ -188,15 +200,27 @@ struct Game {
     last_host_tick: int
     target_cell_x: int
     target_cell_z: int
-    // The host's frame: its wall time less the bots' own, and its
-    // session's step, a frame at a time, alone and with its clients.
+    // The play's clock, stepped STEP at a time up to the wall's less `slip`,
+    // how far it has fallen behind where a frame had more than CATCH_UP to
+    // step; its steps, the frames that drew them, and the most in a frame.
+    clock: float
+    slip: float
+    steps: int
+    frames: int
+    most_steps: int
+    finished: bool                   // AE3D_NET_SECONDS of play after the last bot joined
+    // The host's frame: its wall time less the bots' own, alone and with
+    // its clients; its own work in it; and its session's step, a step at a
+    // time.
     last_frame: float
     bots_seconds: float              // this frame's
+    work_seconds: float              // this frame's host work, over its steps
     alone_ms: float
     alone_frames: int
     with_ms: float
     with_frames: int
     net_ms: float
+    net_steps: int
     work_alone_ms: float             // the host's own work a frame: its cars, session, horde and crowd
     work_with_ms: float
     hits: int
@@ -230,6 +254,8 @@ is_fixed(name: string) -> bool {
 // from them, the same on every peer.
 lay_street(g: *Game, e: *Engine, m: *Manifest) {
     g.tiles = list.new()
+    g.lamps = list.new()
+    g.lent = list.new()
     half = (TILES - 1) / 2
     t = 0
     while t < TILES {
@@ -265,7 +291,7 @@ lay_street(g: *Game, e: *Engine, m: *Manifest) {
                 if string.contains(name, "LampHead") == 1 { core.model_set_exposure(model, 16.0) }
                 if string.contains(name, "_Lit") == 1 { core.model_set_exposure(model, 11.0 + next_random() * 5.0) }
             }
-            engine.engine_add_model(e, model)
+            lend(g, e, model)
             i = i + 1
         }
         i = 0
@@ -274,7 +300,9 @@ lay_street(g: *Game, e: *Engine, m: *Manifest) {
             model = list.get_raw(models, i) as *Model
             if model != null && string.contains(name, "LampHead") == 1 {
                 head = core.model_world_position(model)
-                engine.engine_add_light(e, core.light_point(core.vec3(head.x, head.y - 0.2, head.z), core.vec3(1.0, 0.74, 0.42), 1.8, 7.0))
+                lamp = core.light_point(core.vec3(head.x, head.y - 0.2, head.z), core.vec3(1.0, 0.74, 0.42), 1.8, 7.0)
+                engine.engine_add_light(e, lamp)
+                list.add_raw(g.lamps, lamp as ptr)
             }
             i = i + 1
         }
@@ -328,7 +356,6 @@ bake_walk(g: *Game, m: *Manifest, entry: *Entry) -> ptr {
         }
         i = i + 1
     }
-    if clips != null { list.free(clips) }
     if duration <= 0.0 { duration = 1.0 }
     gait = assets.manifest_marker(m, "gait", 0.0)
     gait_end = assets.manifest_marker(m, "gait_end", duration)
@@ -341,6 +368,14 @@ bake_walk(g: *Game, m: *Manifest, entry: *Entry) -> ptr {
     if root < 0 { root = skin.skeleton_find(skel, "Hips") }
     bank = crowd.posebank_bake_in_place(reg, skel, FRAMES, gait, g.walk_length, root)
     anim.registry_free(reg)
+    // The players the registry held are gone; the clips they played are
+    // the loader's, handed to this, and go with them.
+    i = 0
+    while clips != null && i < list.size(clips) {
+        anim.clip_free(list.get_raw(clips, i) as *Clip)
+        i = i + 1
+    }
+    if clips != null { list.free(clips) }
     skin.skeleton_free(skel)
     i = 0
     while i < list.size(bones) {
@@ -394,9 +429,16 @@ upload(model: *Model, t: ptr[], at: int, count: int) {
 
 // --- the cars ------------------------------------------------------------------------------------------------
 
+// A model handed to the engine to draw: the engine borrows it, and never
+// frees it; the program does, once the engine is gone.
+lend(g: *Game, e: *Engine, model: *Model) {
+    engine.engine_add_model(e, model)
+    list.add_raw(g.lent, model as ptr)
+}
+
 // The pipeline's saloon (resources/blender/car), drawn: its body, and every
 // part riding on what the export says it rides on.
-car_model(e: *Engine) -> *Model {
+car_model(g: *Game, e: *Engine) -> *Model {
     cm = assets.manifest_load(CAR_MANIFEST)
     if cm == null { return null }
     models = assets.manifest_load_scene(cm)
@@ -408,7 +450,7 @@ car_model(e: *Engine) -> *Model {
         if model != null {
             if assets.entry_object(assets.manifest_entry(cm, i)) == "Car_Body" { body = model }
             if string.contains(assets.entry_object(assets.manifest_entry(cm, i)), "Lamp") == 1 { core.model_set_exposure(model, 16.0) }
-            engine.engine_add_model(e, model)
+            lend(g, e, model)
         }
         i = i + 1
     }
@@ -537,7 +579,7 @@ face(o: *GameObject, dx: float, dz: float) {
     behaviour.object_set_rotation(o, core.quat_rotate(atan2(0.0 - dx, 0.0 - dz), core.vec3(0.0, 1.0, 0.0)))
 }
 
-// The cars on the host each frame: turned the way they go, their fields
+// The cars on the host each step: turned the way they go, their fields
 // written -- the speed they go at, the horn while a zombie is in the road
 // ahead -- and the zombies at their noses shoved, the horde's own input,
 // the same on every peer at the next tick.
@@ -644,7 +686,7 @@ make_player(context: ptr, client: int) -> *CharacterController {
     if is_car(client) {
         o = engine.object(s.world, "Car ${client}", null)
         if s.drawn {
-            body = car_model(s.world)
+            body = car_model(s.game, s.world)
             if body != null {
                 core.model_set_parent(body, behaviour.object_transform(o))
                 core.model_set_position(body, 0.0, CAR_RIDE, 0.0)
@@ -708,12 +750,9 @@ drive_own(s: *Side, client: int, step: float, now: float) {
     s.heading_z = sin(c.yaw)
 }
 
-// A fixed step: every bot's command and view; this window's player by the
-// keys -- walked, or driven where it is a car -- or by a path of its own
-// when no key has moved it for two seconds.
-commands(state: ptr, e: *Engine, step: float) {
-    g = state as *Game
-    now = platform.time()
+// A step of the play: every bot's command and view.
+bot_commands(g: *Game, now: float) {
+    step = STEP
     k = 0
     while k < list.size(g.bots) {
         s = list.get_raw(g.bots, k) as *Side
@@ -730,6 +769,12 @@ commands(state: ptr, e: *Engine, step: float) {
         }
         k = k + 1
     }
+}
+
+// And this window's player: by the keys -- walked, or driven where it is a
+// car -- or by a path of its own when no key has moved it for two seconds.
+window_commands(g: *Game, e: *Engine, now: float) {
+    step = STEP
     me = g.me
     if me == null || net.my_player(me.session) == null { return }
     keys = engine.engine_input(e)
@@ -803,6 +848,7 @@ drive_keys(g: *Game, me: *Side, client: int, ahead: float, left: float, step: fl
 // fields registered as its driver's player is made).
 side_new(g: *Game, session: *Net, world: *Engine, drawn: bool, bot: int) -> *Side {
     s = calloc(1, sizeof(Side)) as *Side
+    s.game = g
     s.world = world
     s.session = session
     s.drawn = drawn
@@ -863,47 +909,92 @@ bot_free(s: *Side) {
     engine.engine_free(world)
 }
 
-// --- the frame -------------------------------------------------------------------------------------------------
+// --- the frame ---------------------------------------------------------------------------------------------
 
-// A frame: the bots joining one at a time once the scene alone has been
-// measured; the host's cars, its session and its horde; every bot's; and
-// what each measures.
+// A frame: the play stepped up to the wall clock, then drawn -- the crowd's
+// instances, the camera -- and the host's frame measured, alone and with its
+// clients.
 frame(state: ptr, e: *Engine, delta: float) {
     g = state as *Game
-    now = platform.time()
-    t = now - g.began
-    wall = now - g.last_frame
-    g.last_frame = now
+    wall_now = platform.time()
+    wall = wall_now - g.last_frame
+    g.last_frame = wall_now
     // The host's own share of the frame before, the bots' let out.
+    t = g.clock - g.began
     host_ms = (wall - g.bots_seconds) * 1000.0
     if g.host != null && t > SETTLED && t < ALONE {
         g.alone_ms = g.alone_ms + host_ms
         g.alone_frames = g.alone_frames + 1
     }
-    if g.joined_at > 0.0 && now - g.joined_at > 1.0 {
+    if g.joined_at > 0.0 && g.clock - g.joined_at > 1.0 {
         g.with_ms = g.with_ms + host_ms
         g.with_frames = g.with_frames + 1
     }
     g.bots_seconds = 0.0
-    // The bots, one at a time.
+    g.work_seconds = 0.0
+    // The play, a step at a time, up to the wall clock: however long the
+    // frame took to draw, the game in it goes on at its own pace.
+    due = wall_now - g.slip
+    steps = 0
+    while !g.finished && g.clock + STEP <= due {
+        if (steps as float) * STEP >= CATCH_UP {
+            g.slip = wall_now - g.clock
+            break
+        }
+        g.clock = g.clock + STEP
+        play_step(g, e, g.clock)
+        steps = steps + 1
+    }
+    g.steps = g.steps + steps
+    g.frames = g.frames + 1
+    if steps > g.most_steps { g.most_steps = steps }
+    drawn_began = platform.time()
+    draw_horde(g, e)
+    follow(g, e)
+    // The host's own work this frame: its steps' cars, session and horde,
+    // and the crowd's instances -- what grows with its clients, where the
+    // draw is the scene's whoever plays in it.
+    work_ms = (g.work_seconds + platform.time() - drawn_began) * 1000.0
+    t = g.clock - g.began
+    if g.host != null && t > SETTLED && t < ALONE { g.work_alone_ms = g.work_alone_ms + work_ms }
+    if g.joined_at > 0.0 && g.clock - g.joined_at > 1.0 { g.work_with_ms = g.work_with_ms + work_ms }
+    if g.finished {
+        report(g)
+        engine.engine_stop(e)
+    }
+}
+
+// A step of the play at `now`, the play's clock: the bots joining one at a
+// time once the scene alone has been measured; every command; the host's
+// cars, its session and its horde (or this window's client's); every bot's;
+// and what each measures.
+play_step(g: *Game, e: *Engine, now: float) {
+    t = now - g.began
+    bots_began = platform.time()
     if g.host != null && t >= ALONE && list.size(g.bots) < g.bots_wanted && now - g.joining_at >= JOIN_EVERY {
         g.joining_at = now
         bot = bot_new(g, list.size(g.bots) + 1)
         if bot != null { list.add_raw(g.bots, bot as ptr) }
         if list.size(g.bots) == g.bots_wanted { g.joined_at = now }
     }
+    bot_commands(g, now)
+    g.bots_seconds = g.bots_seconds + (platform.time() - bots_began)
     work_began = platform.time()
+    window_commands(g, e, now)
     if g.host != null {
         h = g.host.horde
         if !nethorde.started(h) {
             nethorde.set_target(h, 0.0, 0.0, now)
             nethorde.start(h, SEED, g.crowd, STREET_X0 + 20.0, ROAD_Z0, STREET_X1 - 20.0, ROAD_Z1, now)
         }
-        car_frame(g, now, delta)
+        car_frame(g, now, STEP)
         hunt(g, now)
         stepped = platform.time()
         net.step(g.host.session, now)
-        if g.joined_at > 0.0 && now - g.joined_at > 1.0 { g.net_ms = g.net_ms + (platform.time() - stepped) * 1000.0 }
+        if g.joined_at > 0.0 && now - g.joined_at > 1.0 {
+            g.net_ms = g.net_ms + (platform.time() - stepped) * 1000.0
+            g.net_steps = g.net_steps + 1
+        }
         log_cars(g)
         nethorde.step(h, now)
         tick = nethorde.horde_tick(h)
@@ -916,7 +1007,7 @@ frame(state: ptr, e: *Engine, delta: float) {
         net.step(g.me.session, now)
         nethorde.step(g.me.horde, now)
     }
-    work = platform.time() - work_began
+    g.work_seconds = g.work_seconds + (platform.time() - work_began)
     // Every bot, timed apart: a machine of its own, not the host's frame.
     bots_began = platform.time()
     k = 0
@@ -927,20 +1018,8 @@ frame(state: ptr, e: *Engine, delta: float) {
         measure(g, s)
         k = k + 1
     }
-    g.bots_seconds = platform.time() - bots_began
-    drawn_began = platform.time()
-    draw_horde(g, e)
-    follow(g, e)
-    // The host's own work this frame: its cars, its session, its horde and
-    // the crowd's instances -- what grows with its clients, where the draw
-    // is the scene's whoever plays in it.
-    work_ms = (work + platform.time() - drawn_began) * 1000.0
-    if g.host != null && t > SETTLED && t < ALONE { g.work_alone_ms = g.work_alone_ms + work_ms }
-    if g.joined_at > 0.0 && now - g.joined_at > 1.0 { g.work_with_ms = g.work_with_ms + work_ms }
-    if g.playing_for > 0.0 && g.joined_at > 0.0 && now - g.joined_at >= g.playing_for {
-        report(g)
-        engine.engine_stop(e)
-    }
+    g.bots_seconds = g.bots_seconds + (platform.time() - bots_began)
+    if g.playing_for > 0.0 && g.joined_at > 0.0 && now - g.joined_at >= g.playing_for { g.finished = true }
 }
 
 // The horde hunts the host's player: the field flooded again from it each
@@ -1129,8 +1208,8 @@ report(g: *Game) {
     if g.with_frames > 0 {
         with = g.with_ms / (g.with_frames as float)
         work_with = g.work_with_ms / (g.with_frames as float)
-        net_ms = g.net_ms / (g.with_frames as float)
     }
+    if g.net_steps > 0 { net_ms = g.net_ms / (g.net_steps as float) }
     slowest = 1000000.0
     off_most = 0.0
     client = 1
@@ -1143,7 +1222,8 @@ report(g: *Game) {
         println("  car ${client}: driven ${car.driven} m in ${car.driving} s, ${average} m/s on average, at most ${car.off_most} m from its lane's middle")
         client = client + 1
     }
-    println("  the host's frame: ${alone} ms with the scene alone, ${with} ms with ${list.size(g.bots)} clients; of it the host's own work (its cars, session, horde, crowd) ${work_alone} and ${work_with} ms, its session's step ${net_ms} ms")
+    println("  the host's frame: ${alone} ms with the scene alone, ${with} ms with ${list.size(g.bots)} clients; of it the host's own work (its cars, session, horde, crowd) ${work_alone} and ${work_with} ms; its session's step ${net_ms} ms")
+    println("  the play: ${g.steps} steps of ${STEP * 1000.0} ms over ${g.frames} frames, ${g.most_steps} at most in one; its clock ${g.slip * 1000.0} ms behind the wall's")
     println("net_street players ${players}")
     println("net_street down_most_bps ${down_most}")
     println("net_street up_most_bps ${up_most}")
@@ -1163,6 +1243,10 @@ report(g: *Game) {
     println("net_street host_net_us ${(net_ms * 1000.0) as int}")
     println("net_street host_work_alone_us ${(work_alone * 1000.0) as int}")
     println("net_street host_work_us ${(work_with * 1000.0) as int}")
+    println("net_street play_steps ${g.steps}")
+    println("net_street frames ${g.frames}")
+    println("net_street most_steps_a_frame ${g.most_steps}")
+    println("net_street slip_ms ${(g.slip * 1000.0) as int}")
 }
 
 // Whether a client holds every car's driver as the host names it.
@@ -1228,12 +1312,12 @@ setup(state: ptr, e: *Engine) {
     as_crowd(g, g.body)
     as_crowd(g, g.far)
     core.model_set_depth_proxy(g.body, g.far)
-    engine.engine_add_model(e, g.body)
-    engine.engine_add_model(e, g.far)
+    lend(g, e, g.body)
+    lend(g, e, g.far)
     if g.clothes != null {
         as_crowd(g, g.clothes)
         core.model_set_casts_shadow(g.clothes, false)
-        engine.engine_add_model(e, g.clothes)
+        lend(g, e, g.clothes)
     }
     g.tiered = calloc(8, 8)
     t = g.tiered as ptr[]
@@ -1272,17 +1356,22 @@ setup(state: ptr, e: *Engine) {
     }
 
     g.began = platform.time()
+    g.clock = g.began
     g.last_frame = g.began
 }
 
 main() {
-    mode = core.text(os.getenv("AE3D_NET"))
+    // The environment's values come back on the heap, this program's to free.
+    asked = os.getenv("AE3D_NET")
+    mode = core.text(asked)
     joining = string.starts_with(mode, "join:") == 1
     g = heap.new(Game)
     g.bots = list.new()
     g.crowd = core.env_int("AE3D_CROWD", CROWD)
     g.bots_wanted = core.env_int("AE3D_NET_BOTS", BOTS)
-    if mode == "host" && os.getenv("AE3D_NET_BOTS") == null { g.bots_wanted = 0 }
+    bots = os.getenv("AE3D_NET_BOTS")
+    if mode == "host" && bots == null { g.bots_wanted = 0 }
+    if bots != null { string.free(bots) }
     g.playing_for = core.env_int("AE3D_NET_SECONDS", 0) as float
     g.joined_at = 0.0 - 1.0
     g.checksums = calloc(RING, 8)
@@ -1294,8 +1383,10 @@ main() {
     if joining {
         address = string.substring(mode, 5, string.length(mode))
         session = net.join_udp(address, PORT)
+        string.free(address)
     } else {
-        bind = core.text(os.getenv("AE3D_NET_BIND"))
+        bound = os.getenv("AE3D_NET_BIND")
+        bind = core.text(bound)
         if bind == "" {
             bind = "127.0.0.1"
             if mode == "host" { bind = "0.0.0.0" }
@@ -1304,9 +1395,17 @@ main() {
         // The bots' own run picks its port, so it never finds one taken.
         if mode != "host" { port = 0 }
         session = net.host_udp(bind, port)
+        if bound != null { string.free(bound) }
     }
+    if asked != null { string.free(asked) }
     if session == null {
         println("net_street: ${net.last_error()}")
+        free(g.checksums)
+        free(g.checksum_ticks)
+        free(g.car_log)
+        free(g.car_ticks)
+        list.free(g.bots)
+        heap.free(g)
         return
     }
     g.port = net.udp_port(session)
@@ -1320,7 +1419,6 @@ main() {
     engine.engine_set_face_culling(e, true)
     engine.engine_set_frustum_culling(e, true)
     b = engine.behaviour_new("net street", g as ptr)
-    b.fixed_update = commands
     b.start = setup
     b.update = frame
     engine.engine_add_behaviour(e, b)
@@ -1339,6 +1437,23 @@ main() {
     if g.me != null { side_free(g.me) } else { net.net_free(g.session) }
     engine.engine_free(e)
     if g.tiles != null { list.free(g.tiles) }
+    if g.lent != null {
+        k = 0
+        while k < list.size(g.lent) {
+            core.model_free(list.get_raw(g.lent, k) as *Model)
+            k = k + 1
+        }
+        list.free(g.lent)
+    }
+    if g.bank != null { crowd.posebank_free(g.bank) }
+    if g.lamps != null {
+        k = 0
+        while k < list.size(g.lamps) {
+            core.light_free(list.get_raw(g.lamps, k) as *Light)
+            k = k + 1
+        }
+        list.free(g.lamps)
+    }
     if g.tints != null { free(g.tints) }
     if g.tiered != null {
         k = 0

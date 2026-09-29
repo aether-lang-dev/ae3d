@@ -466,6 +466,15 @@ step "the street, played by sixteen"
 # the two cars two of the players drive with their fields the host's, and
 # every client's own player where it predicted it. A number missing from
 # the report fails rather than reads as zero.
+#
+# The play runs on a clock of its own, in fixed steps, as many a frame as
+# the wall clock has gone: a software renderer drawing a frame in two
+# seconds (llvmpipe on the Linux runner) plays the same ten seconds, and the
+# same figures, as a GPU drawing a hundred and forty frames a second. When
+# a frame was a step, the Linux runner's 22 frames were 22 steps of every
+# session: the bots were made, and the ten seconds ran out before the host
+# had welcomed one. Now the run is its twenty-odd seconds of play and
+# startup there as here.
 street_number() {   # street_number <key>
     street_value="$(sed -n "s/^net_street $1 //p" /tmp/ae3d_net_street.log)"
     echo "${street_value:-999999999}"
