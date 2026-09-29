@@ -423,6 +423,46 @@ for suite in tests/test_*.ae; do
     fi
 done
 
+step "Vulkan under the validation layer, synchronization included"
+# The suites that read frames back, run again with the Khronos layer and its
+# synchronization validation on: a frame copied out while the pass that wrote
+# it was still writing, or overwritten while the copy was still reading it,
+# or a draw through a descriptor naming a destroyed image, renders right on
+# almost every device and run, and only the layer says so (#458). Any error
+# the layer reports fails the suite. The loader names every layer it inserts
+# when asked (VK_LOADER_DEBUG=layer): a run it did not insert the layer into
+# would pass having checked nothing, so that is a skip, never a pass.
+for name in test_fog test_overlay test_backend_parity; do
+    if ! built_ok "$name"; then
+        skip "$name under the layer" "did not build"
+        continue
+    fi
+    if ! have_display; then
+        skip "$name under the layer" "no display"
+        continue
+    fi
+    output="$(VK_LOADER_DEBUG=layer VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+              VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT \
+              AE3D_FRAMES="$FRAMES" bounded "$RUN_LIMIT" ./build/"$name" 2>&1)"
+    layered_status=$?
+    if ! printf '%s' "$output" | grep -q 'Insert instance layer "VK_LAYER_KHRONOS_validation"'; then
+        skip "$name under the layer" "the Khronos validation layer is not installed"
+        continue
+    fi
+    errors="$(printf '%s\n' "$output" | grep -c 'Validation Error' || true)"
+    if [ "$layered_status" -ne 0 ]; then
+        fail "$name under the layer$(died_on "$layered_status")"
+        printf '%s\n' "$output" | grep -v '^\[Vulkan Loader\]' | sed 's/^/        /' | tail -10
+    elif [ "$errors" != 0 ]; then
+        fail "$name under the layer ($errors validation errors)"
+        printf '%s\n' "$output" | grep -o 'VUID-[A-Za-z0-9_-]*\|SYNC-HAZARD-[A-Z_-]*' | sort | uniq -c | sort -rn | head -5 | sed 's/^/        /'
+    elif printf '%s' "$output" | grep -q "all checks passed"; then
+        pass "$name under the layer"
+    else
+        skip "$name under the layer" "$(printf '%s' "$output" | grep -m1 "SKIP" | sed 's/.*SKIP *//')"
+    fi
+done
+
 step "examples build and run"
 # The benchmark is built in the same pass: build_together starts from a clean
 # status directory, so a later call would forget that the examples built.

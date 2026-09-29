@@ -2011,15 +2011,22 @@ static int ae3d_vk_build_render_pass(VkImageLayout present_layout, int part, VkR
     dependencies[0].dstAccessMask |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                                      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
     /* The first half's depth, written here, is read by the resolve's shader
-       (and, the dependencies being the same in all three, the others'). */
+       (and, the dependencies being the same in all three, the others').
+       With no post chain this pass is the frame's last, and what it leaves
+       in the frame's image -- the colour and its final transition -- is
+       copied out by the readback (ae3d.vkreadback): a transfer read, which
+       has to wait for them as the shader's reads do, or the copy races the
+       pass that wrote the frame (#458). */
     dependencies[1].srcSubpass = 0;
     dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
     dependencies[1].srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     dependencies[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                    VK_ACCESS_TRANSFER_READ_BIT;
 
     memset(&info, 0, sizeof(info));
     info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -2946,10 +2953,16 @@ void ae3d_vk_texture_destroy(int handle) {
        to whichever texture is created in this slot next, naming an image view
        that no longer exists. A hardware driver has usually survived reading
        one; lavapipe dereferences it, which is where this was found. The sets
-       go back on the free list and are written again when they are claimed. */
+       go back on the free list and are written again when they are claimed.
+       A set names three images, and is keyed on all three: one whose normal
+       map or pose bank this was is as stale as one whose colour it was, and
+       was handed out as current as soon as another texture took the handle
+       (the validation layer counted 36 draws through a destroyed view and
+       sampler in tests/test_backend_parity). */
     for (frame = 0; frame < AE3D_VK_FRAMES; frame++) {
         for (index = 0; index < vk.set_count[frame]; index++) {
-            if (vk.set_texture[frame][index] == handle) {
+            if (vk.set_texture[frame][index] == handle || vk.set_normal[frame][index] == handle ||
+                vk.set_bank[frame][index] == handle) {
                 vk.set_texture[frame][index] = AE3D_VK_SET_FREE;
             }
         }
