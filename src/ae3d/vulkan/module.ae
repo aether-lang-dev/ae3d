@@ -26,6 +26,7 @@ import ae3d.geometry
 import ae3d.picture
 import ae3d.lightgrid
 import ae3d.cascades
+import ae3d.lampshadows
 
 exports (
     VKRenderer,
@@ -83,6 +84,14 @@ extern ae3d_vk_live_shadow_targets() -> int
 extern ae3d_vk_shadow_begin() -> int
 // A cascade's tile of the shadow atlas, for the draws that follow (#469).
 extern ae3d_vk_shadow_viewport(x: int, y: int, size: int)
+// The lamps' atlas (ae3d.lampshadows): its pass, a face's tile cleared and
+// drawn into, and how many times it has been made.
+extern ae3d_vk_lamp_shadow_begin() -> int
+extern ae3d_vk_lamp_shadow_tile(x: int, y: int, size: int)
+extern ae3d_vk_lamp_shadow_generation() -> int
+// The static layer under it: its pass, and its tiles copied up.
+extern ae3d_vk_lamp_static_begin() -> int
+extern ae3d_vk_lamp_copy(corners: ptr, count: int, size: int)
 extern ae3d_vk_shadow_draw(mesh: int, instances: int, instance_count: int)
 extern ae3d_vk_crowd_set_tier(handle: int, tier: int, part: int, sx: float, sy: float, sz: float, indices: int, shadow_indices: int)
 extern ae3d_vk_crowd_fill(handle: int, pos: ptr, yaw: ptr, phase: ptr, col: ptr, start: int, n: int) -> int
@@ -181,6 +190,9 @@ struct VKBatch {
     handle: int
     count: int
     stale: bool
+    // The sum of the members' world stamps when the instances were last
+    // written: a batch whose members moved has another.
+    stamps: long
 }
 
 struct VKRenderer {
@@ -224,6 +236,13 @@ struct VKRenderer {
     // are keyed on the material as well.
     shadow_batches: ptr
     shadow_batch_count: int
+    // What the lamps' faces draw, where the rays are on: the cascades leave
+    // out what the rays shade, and a lamp's face is read past the rays'
+    // reach, where they shade nothing. Rays off, the lamps draw the
+    // cascades' own casters.
+    lamp_singles: ptr
+    lamp_batches: ptr
+    lamp_batch_count: int
     screen_mesh: ptr
     screen_handle: int
     initialized: bool
@@ -257,6 +276,20 @@ struct VKRenderer {
     // single casters the shadow pass draws into each.
     cascades: ptr
     shadow_singles: ptr
+    // The lamps' own shadows (ae3d.lampshadows, #490): which lamps have one
+    // this frame, whether the key light's shadow is its cascades (it is the
+    // sun or the moon) or its slot's cube (it is a lamp), and which making
+    // of the atlas the faces were drawn into.
+    lamp_shadows: ptr
+    key_cascaded: bool
+    key_lamp_slot: int
+    lamp_generation: int
+    // Per face this frame (lampshadows' SLOTS * FACES): whether its static
+    // layer is copied up, whether something moving is drawn over it, and
+    // the corners of the tiles copied.
+    lamp_copy: ptr
+    lamp_move: ptr
+    lamp_corners: ptr
     scene_start: float
     scene_time: float
     cloud_cover: float
@@ -360,6 +393,9 @@ renderer_new() -> *VKRenderer {
     r.batches = list.new()
     r.shadow_batches = list.new()
     r.shadow_batch_count = 0
+    r.lamp_batches = list.new()
+    r.lamp_batch_count = 0
+    r.key_lamp_slot = 0 - 1
     r.batch_count = 0
     r.fog = core.fog_none()
     r.scene_start = platform.time()
@@ -379,9 +415,15 @@ renderer_free(r: *VKRenderer) {
     // an engine that opened no window, still has both.
     free_batches(r.batches)
     free_batches(r.shadow_batches)
+    free_batches(r.lamp_batches)
     if r.light_grid != null { lightgrid.grid_free(r.light_grid as *LightGrid) }
     if r.cascades != null { cascades.cascades_free(r.cascades as *Cascades) }
     if r.shadow_singles != null { list.free(r.shadow_singles) }
+    if r.lamp_singles != null { list.free(r.lamp_singles) }
+    if r.lamp_shadows != null { lampshadows.lamps_free(r.lamp_shadows as *LampShadows) }
+    if r.lamp_copy != null { free(r.lamp_copy) }
+    if r.lamp_move != null { free(r.lamp_move) }
+    if r.lamp_corners != null { free(r.lamp_corners) }
     if r.models != null { list.free(r.models) }
     if r.lights != null { list.free(r.lights) }
     if r.textures != null {
@@ -920,24 +962,8 @@ shadow_kind(m: *Model) -> int {
     return SHADOW_PLAIN
 }
 
-// Whether a caster can throw a shadow cascade `k` shades with
-// (cascades.casts_into): only there is it drawn into the cascade's map.
-in_cascade(c: *Cascades, k: int, m: *Model) -> bool {
-    return cascades.casts_into(c, k, m.bounding_center, m.bounding_radius)
-}
-
-// Whether any of a batch's members can: the batch is one draw, of all of
-// them or of none.
-batch_in_cascade(c: *Cascades, k: int, b: *VKBatch) -> bool {
-    i = 0
-    while i < b.count {
-        if in_cascade(c, k, list.get_raw(b.members, i) as *Model) { return true }
-        i = i + 1
-    }
-    return false
-}
-
 render_shadow_pass(r: *VKRenderer, light: *Light, cam: *Camera) {
+    r.key_cascaded = false
     if light == null || ae3d_vk_shadows() != 1 { return }
 
     // The depth pass has a block of its own to write into, and which one that
@@ -945,38 +971,82 @@ render_shadow_pass(r: *VKRenderer, light: *Light, cam: *Camera) {
     // frame happened to leave selected.
     ae3d_vk_set_program(core.SHADER_CUSTOM)
 
-    fit_cascades(r, light, cam)
-    c = r.cascades as *Cascades
-    if ae3d_vk_shadow_begin() != 1 { return }
+    gather_casters(r, false)
+    // The key light's cascades when it is the sun or the moon. A lamp that
+    // is the key light has a cube of its own below, like every lamp.
+    if light.mode == core.MODE_DIRECTIONAL {
+        fit_cascades(r, light, cam)
+        c = r.cascades as *Cascades
+        if ae3d_vk_shadow_begin() == 1 {
+            r.key_cascaded = true
+            // The casters by the pipeline that draws them -- the plain ones
+            // and the instanced batches, then the skinned, the crowds and
+            // the point streams (shadow_kind) -- and each kind into every
+            // cascade in turn: taken cascade by cascade, the kinds bound
+            // their pipelines over again in every one.
+            kind = 0
+            while kind < SHADOW_KINDS {
+                k = 0
+                while k < cascades.COUNT {
+                    // Cascade k's tile of the atlas, two by two, and its
+                    // matrix: every draw copies the block as it stands, so
+                    // the draws that follow cast into this cascade.
+                    ae3d_vk_shadow_viewport((k % 2) * cascades.SIZE, (k / 2) * cascades.SIZE, cascades.SIZE)
+                    space = cascades.matrix(c, k)
+                    ae3d_vk_scene_set_clip_mat4(vkscene.OFF_LIGHTSPACEMATRIX, &space)
+                    draw_casters(r, false, kind, 0, k, 0, LAYER_ALL)
+                    k = k + 1
+                }
+                kind = kind + 1
+            }
+            // The lit pass's vertex stage reads the nearest cascade's matrix.
+            r.shadow_space = cascades.matrix(c, 0)
+            ae3d_vk_shadow_end()
+        }
+    }
+    draw_lamp_faces(r)
+    ae3d_vk_scene_set_clip_mat4(vkscene.OFF_LIGHTSPACEMATRIX, &r.shadow_space)
+}
 
-    // What casts, gathered once. Casters that share a mesh are drawn as one
-    // instanced draw, the way the OpenGL backend draws them: one by one, a
-    // street of kerb stones and lamp posts cost this pass four draws more
-    // than the same street on the other renderer, for the same shadow.
-    if r.shadow_singles == null { r.shadow_singles = list.new() }
-    list.clear(r.shadow_singles)
-    r.shadow_batch_count = 0
+// What casts, gathered once a frame: the casters that share a mesh drawn
+// as one instanced draw, the way the OpenGL backend draws them -- one by
+// one, a street of kerb stones and lamp posts cost this pass four draws
+// more than the same street on the other renderer, for the same shadow --
+// and the rest one by one. For the cascades, what the rays shadow this
+// frame is left out: the map is left with the skinned, the points, and a
+// crowd that is not in the rays. For the lamps' faces, where the rays are
+// on, nothing is: a face is read past the rays' reach.
+gather_casters(r: *VKRenderer, lamps: bool) {
+    rays = ae3d_vk_ray_shadows_now() == 1
+    if lamps && !rays { return }
+    if lamps {
+        if r.lamp_singles == null { r.lamp_singles = list.new() }
+        if r.lamp_batches == null { r.lamp_batches = list.new() }
+        list.clear(r.lamp_singles)
+        r.lamp_batch_count = 0
+    } else {
+        if r.shadow_singles == null { r.shadow_singles = list.new() }
+        list.clear(r.shadow_singles)
+        r.shadow_batch_count = 0
+    }
+    singles = caster_singles(r, lamps)
     count = list.size(r.models)
     i = 0
-    rays = ae3d_vk_ray_shadows_now() == 1
     while i < count {
         m = list.get_raw(r.models, i) as *Model
         if m == null || !m.visible || !m.casts_shadow || m.vbo == 0 {
             i = i + 1
             continue
         }
-        // What the rays shadow this frame is not drawn into the map: the
-        // map is left with the skinned, the points, and a crowd that is
-        // not in the rays.
-        if rays && (traced(m) || crowd_traced(m)) {
+        if !lamps && rays && (traced(m) || crowd_traced(m)) {
             i = i + 1
             continue
         }
         core.model_sync_transform(m)
         if shadow_batchable(m) {
             moved = m.shadow_stamp != m.world_stamp
-            m.shadow_stamp = m.world_stamp
-            b = shadow_batch_for(r, m)
+            if !lamps { m.shadow_stamp = m.world_stamp }
+            b = shadow_batch_for(r, lamps, m)
             if b.count >= list.size(b.members) {
                 list.add_raw(b.members, m as ptr)
                 b.stale = true
@@ -987,63 +1057,269 @@ render_shadow_pass(r: *VKRenderer, light: *Light, cam: *Camera) {
             if moved { b.stale = true }
             b.count = b.count + 1
         } else {
-            list.add_raw(r.shadow_singles, m as ptr)
+            list.add_raw(singles, m as ptr)
         }
         i = i + 1
     }
+    batches = caster_batches(r, lamps)
     i = 0
-    while i < r.shadow_batch_count {
-        b = list.get_raw(r.shadow_batches, i) as *VKBatch
+    while i < caster_batch_count(r, lamps) {
+        b = list.get_raw(batches, i) as *VKBatch
         if b.count != list.size(b.members) { b.stale = true }
+        // A member that moved since the instances were written: its own
+        // shadow stamp is the cascades' to keep, so the batch keeps a sum.
+        stamps = 0 as long
+        j = 0
+        while j < b.count {
+            stamps = stamps + ((list.get_raw(b.members, j) as *Model).world_stamp as long)
+            j = j + 1
+        }
+        if stamps != b.stamps { b.stale = true }
+        b.stamps = stamps
         if b.count > 1 { sync_batch_instances(b) }
         i = i + 1
     }
+}
 
-    // The casters by the pipeline that draws them -- the plain ones and the
-    // instanced batches, then the skinned, the crowds and the point
-    // streams (shadow_kind) -- and each kind into every cascade in turn:
-    // taken cascade by cascade, the kinds bound their pipelines over again
-    // in every one.
+// Whether a caster in the sphere at `centre` of `radius` goes into the tile
+// being drawn: cascade `a` (mode 0), or lamp slot `a`'s face `b` (mode 1).
+reaches_tile(r: *VKRenderer, mode: int, a: int, b: int, centre: Vec3, radius: float) -> bool {
+    if mode == 0 { return cascades.casts_into(r.cascades as *Cascades, a, centre, radius) }
+    return lampshadows.casts_onto(r.lamp_shadows as *LampShadows, a, b, centre, radius)
+}
+
+// A caster's sphere as a tile tests it: a crowd posed on the CPU stands
+// where its instances do, and its bounds are one figure's.
+caster_sphere(m: *Model) -> Vec4 {
+    if m.pose_bank != null && m.device_crowd == null && m.is_instanced && core.model_instance_count(m) > 0 {
+        geometry.inst_compute_bounds(m.instances)
+        return Vec4 { x: geometry.inst_bound_x(m.instances) + m.world_position.x,
+                      y: geometry.inst_bound_y(m.instances) + m.world_position.y,
+                      z: geometry.inst_bound_z(m.instances) + m.world_position.z,
+                      w: geometry.inst_bound_radius(m.instances) + 2.0 }
+    }
+    return Vec4 { x: m.bounding_center.x, y: m.bounding_center.y, z: m.bounding_center.z, w: m.bounding_radius }
+}
+
+caster_reaches(r: *VKRenderer, mode: int, a: int, b: int, m: *Model) -> bool {
+    sphere = caster_sphere(m)
+    return reaches_tile(r, mode, a, b, core.vec3(sphere.x, sphere.y, sphere.z), sphere.w)
+}
+
+batch_reaches(r: *VKRenderer, mode: int, a: int, b: int, batch: *VKBatch) -> bool {
+    i = 0
+    while i < batch.count {
+        if caster_reaches(r, mode, a, b, list.get_raw(batch.members, i) as *Model) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Whether a caster moves on its own, where no world stamp says so: a
+// skinned figure, a crowd, an instance stream. A lamp's face draws it over
+// its static layer every frame it is there.
+moves_itself(m: *Model) -> bool {
+    return m.is_instanced || m.skeleton != null || m.pose_bank != null || m.device_crowd != null
+}
+
+// The layers a tile is drawn in: everything (a cascade), a lamp face's
+// static layer, or what moves over it.
+const LAYER_ALL = 0
+const LAYER_STATIC = 1
+const LAYER_MOVING = 2
+
+// The gathered casters of one pipeline's kind and of `layer` that reach
+// the tile, into it: the light's matrix is already in the block.
+draw_casters(r: *VKRenderer, lamps: bool, kind: int, mode: int, a: int, b: int, layer: int) {
+    singles = caster_singles(r, lamps)
+    i = 0
+    while i < list.size(singles) {
+        m = list.get_raw(singles, i) as *Model
+        in_layer = layer == LAYER_ALL || (layer == LAYER_MOVING) == moves_itself(m)
+        if in_layer && shadow_kind(m) == kind && caster_reaches(r, mode, a, b, m) { shadow_draw_model(m) }
+        i = i + 1
+    }
+    if kind != SHADOW_PLAIN || layer == LAYER_MOVING { return }
+    batches = caster_batches(r, lamps)
+    i = 0
+    while i < caster_batch_count(r, lamps) {
+        batch = list.get_raw(batches, i) as *VKBatch
+        if batch.count == 1 {
+            first = batch.first as *Model
+            if caster_reaches(r, mode, a, b, first) { shadow_draw_model(first) }
+        } else if batch.count > 1 && batch.handle != 0 && batch_reaches(r, mode, a, b, batch) {
+            identity = core.mat4_ident()
+            ae3d_vk_scene_set_mat4(vkscene.OFF_MODEL, &identity)
+            ae3d_vk_scene_set_int(vkscene.OFF_ISINSTANCED, 1)
+            ae3d_vk_scene_set_int(vkscene.OFF_INSTANCEPOINTS, 0)
+            ae3d_vk_scene_set_int(vkscene.OFF_ISSKINNED, 0)
+            ae3d_vk_shadow_draw(batch.mesh, batch.handle, batch.count)
+        }
+        i = i + 1
+    }
+}
+
+// The lamps that have a shadow this frame: within the lamps' range of the
+// camera -- the shadow distance where one is set, and never less than
+// LAMP_RANGE -- and, where the device traces, not those whose light lies
+// wholly within the rays' reach, since the rays shade every pixel there.
+const LAMP_RANGE = 50.0
+
+choose_lamps(r: *VKRenderer, key: *Light, cam: *Camera) {
+    r.key_lamp_slot = 0 - 1
+    if r.lamp_shadows == null { r.lamp_shadows = lampshadows.lamps_new() as ptr }
+    ls = r.lamp_shadows as *LampShadows
+    // A new atlas holds none of the faces drawn into the last.
+    generation = ae3d_vk_lamp_shadow_generation()
+    if generation != r.lamp_generation {
+        lampshadows.lamps_free(ls)
+        ls = lampshadows.lamps_new()
+        r.lamp_shadows = ls as ptr
+        r.lamp_generation = generation
+    }
+    if ae3d_vk_shadows() != 1 || generation == 0 {
+        lampshadows.choose(ls, null, null, cam, 0.0, 0.0)
+        return
+    }
+    range = LAMP_RANGE
+    if r.shadow_distance > range { range = r.shadow_distance }
+    inner = 0.0
+    if ae3d_vk_ray_shadows_now() == 1 {
+        inner = r.shadow_distance
+        // With no reach set the rays shade every pixel: no lamp needs a map.
+        if inner <= 0.0 { inner = cam.far * 4.0 }
+    }
+    lampshadows.choose(ls, r.lights, key, cam, range, inner)
+    if key != null && key.mode != core.MODE_DIRECTIONAL { r.key_lamp_slot = lampshadows.slot_of(ls, key) }
+}
+
+// Each chosen lamp's six faces, in two layers (ae3d.lampshadows): the
+// static layer drawn where what stands still in the face changed since it
+// was, every face whose static layer was drawn or that has or had
+// something moving in it copied up into the atlas the shader reads, and
+// what moves drawn over the copy -- kind by kind across the faces, so each
+// pipeline is bound once.
+draw_lamp_faces(r: *VKRenderer) {
+    if r.lamp_shadows == null { return }
+    ls = r.lamp_shadows as *LampShadows
+    if lampshadows.slot_count(ls) == 0 { return }
+    gather_casters(r, true)
+    faces = lampshadows.SLOTS * lampshadows.FACES
+    if r.lamp_copy == null {
+        r.lamp_copy = calloc(faces, 4)
+        r.lamp_move = calloc(faces, 4)
+        r.lamp_corners = calloc(faces * 2, 4)
+    }
+    copy = r.lamp_copy as int[]
+    move = r.lamp_move as int[]
+    corners = r.lamp_corners as int[]
+
+    opened = false
+    moving_faces = 0
+    slot = 0
+    while slot < lampshadows.SLOTS {
+        f = 0
+        while f < lampshadows.FACES {
+            tile = lampshadows.face_tile(slot, f)
+            copy[tile] = 0
+            move[tile] = 0
+            if lampshadows.lamp_of(ls, slot) != null {
+                sig, moving = face_contents(r, ls, slot, f)
+                if lampshadows.static_stale(ls, slot, f, sig) {
+                    if !opened {
+                        if ae3d_vk_lamp_static_begin() != 1 { return }
+                        opened = true
+                    }
+                    ae3d_vk_lamp_shadow_tile((tile % lampshadows.ACROSS) * lampshadows.FACE,
+                                             (tile / lampshadows.ACROSS) * lampshadows.FACE, lampshadows.FACE)
+                    space = lampshadows.face_matrix(ls, slot, f)
+                    ae3d_vk_scene_set_clip_mat4(vkscene.OFF_LIGHTSPACEMATRIX, &space)
+                    draw_casters(r, true, SHADOW_PLAIN, 1, slot, f, LAYER_STATIC)
+                    lampshadows.static_drawn(ls, slot, f, sig)
+                    copy[tile] = 1
+                }
+                // A face that had something moving over it last frame is
+                // copied too: the copy is what takes it back out.
+                if moving || lampshadows.moving_was(ls, slot, f) { copy[tile] = 1 }
+                if moving {
+                    move[tile] = 1
+                    moving_faces = moving_faces + 1
+                }
+                lampshadows.set_moving(ls, slot, f, moving)
+            }
+            f = f + 1
+        }
+        slot = slot + 1
+    }
+    if opened { ae3d_vk_shadow_end() }
+
+    count = 0
+    tile = 0
+    while tile < faces {
+        if copy[tile] == 1 {
+            corners[count * 2] = (tile % lampshadows.ACROSS) * lampshadows.FACE
+            corners[count * 2 + 1] = (tile / lampshadows.ACROSS) * lampshadows.FACE
+            count = count + 1
+        }
+        tile = tile + 1
+    }
+    if count > 0 { ae3d_vk_lamp_copy(r.lamp_corners, count, lampshadows.FACE) }
+
+    if moving_faces == 0 || ae3d_vk_lamp_shadow_begin() != 1 { return }
     kind = 0
     while kind < SHADOW_KINDS {
-        k = 0
-        while k < cascades.COUNT {
-            // Cascade k's tile of the atlas, two by two, and its matrix:
-            // every draw copies the block as it stands, so the draws that
-            // follow cast into this cascade.
-            ae3d_vk_shadow_viewport((k % 2) * cascades.SIZE, (k / 2) * cascades.SIZE, cascades.SIZE)
-            space = cascades.matrix(c, k)
-            ae3d_vk_scene_set_clip_mat4(vkscene.OFF_LIGHTSPACEMATRIX, &space)
-            i = 0
-            while i < list.size(r.shadow_singles) {
-                m = list.get_raw(r.shadow_singles, i) as *Model
-                if shadow_kind(m) == kind && in_cascade(c, k, m) { shadow_draw_model(m) }
-                i = i + 1
+        tile = 0
+        while tile < faces {
+            if move[tile] == 1 {
+                slot = tile / lampshadows.FACES
+                f = tile % lampshadows.FACES
+                ae3d_vk_shadow_viewport((tile % lampshadows.ACROSS) * lampshadows.FACE,
+                                        (tile / lampshadows.ACROSS) * lampshadows.FACE, lampshadows.FACE)
+                space = lampshadows.face_matrix(ls, slot, f)
+                ae3d_vk_scene_set_clip_mat4(vkscene.OFF_LIGHTSPACEMATRIX, &space)
+                draw_casters(r, true, kind, 1, slot, f, LAYER_MOVING)
             }
-            i = 0
-            while kind == SHADOW_PLAIN && i < r.shadow_batch_count {
-                b = list.get_raw(r.shadow_batches, i) as *VKBatch
-                if b.count == 1 {
-                    first = b.first as *Model
-                    if in_cascade(c, k, first) { shadow_draw_model(first) }
-                } else if b.count > 1 && b.handle != 0 && batch_in_cascade(c, k, b) {
-                    identity = core.mat4_ident()
-                    ae3d_vk_scene_set_mat4(vkscene.OFF_MODEL, &identity)
-                    ae3d_vk_scene_set_int(vkscene.OFF_ISINSTANCED, 1)
-                    ae3d_vk_scene_set_int(vkscene.OFF_INSTANCEPOINTS, 0)
-                    ae3d_vk_scene_set_int(vkscene.OFF_ISSKINNED, 0)
-                    ae3d_vk_shadow_draw(b.mesh, b.handle, b.count)
-                }
-                i = i + 1
-            }
-            k = k + 1
+            tile = tile + 1
         }
         kind = kind + 1
     }
-    // The lit pass's vertex stage reads the nearest cascade's matrix.
-    r.shadow_space = cascades.matrix(c, 0)
-    ae3d_vk_scene_set_clip_mat4(vkscene.OFF_LIGHTSPACEMATRIX, &r.shadow_space)
     ae3d_vk_shadow_end()
+}
+
+// What stands in a lamp's face: a signature of what stands still in it
+// and how often each has moved, and whether anything that moves on its own
+// is there.
+face_contents(r: *VKRenderer, ls: *LampShadows, slot: int, f: int) -> (long, bool) {
+    sig = 0 as long
+    moving = false
+    singles = caster_singles(r, true)
+    i = 0
+    while i < list.size(singles) {
+        m = list.get_raw(singles, i) as *Model
+        if caster_reaches(r, 1, slot, f, m) {
+            if moves_itself(m) {
+                moving = true
+            } else {
+                sig = lampshadows.face_signature(sig, m.serial as long, m.world_stamp as long)
+            }
+        }
+        i = i + 1
+    }
+    batches = caster_batches(r, true)
+    i = 0
+    while i < caster_batch_count(r, true) {
+        batch = list.get_raw(batches, i) as *VKBatch
+        j = 0
+        while j < batch.count {
+            m = list.get_raw(batch.members, j) as *Model
+            if caster_reaches(r, 1, slot, f, m) {
+                sig = lampshadows.face_signature(sig, m.serial as long, m.world_stamp as long)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return sig, moving
 }
 
 // The crowds sorted on the device, once a frame each, before any pass
@@ -1160,15 +1436,17 @@ shadow_batchable(m: *Model) -> bool {
     return !m.is_instanced
 }
 
-shadow_batch_for(r: *VKRenderer, m: *Model) -> *VKBatch {
+shadow_batch_for(r: *VKRenderer, lamps: bool, m: *Model) -> *VKBatch {
+    batches = caster_batches(r, lamps)
+    count = caster_batch_count(r, lamps)
     i = 0
-    while i < r.shadow_batch_count {
-        b = list.get_raw(r.shadow_batches, i) as *VKBatch
+    while i < count {
+        b = list.get_raw(batches, i) as *VKBatch
         if b.mesh == m.vbo { return b }
         i = i + 1
     }
 
-    if r.shadow_batch_count >= list.size(r.shadow_batches) {
+    if count >= list.size(batches) {
         fresh = heap.new(VKBatch)
         fresh.instances = geometry.inst_create()
         fresh.members = list.new()
@@ -1177,16 +1455,31 @@ shadow_batch_for(r: *VKRenderer, m: *Model) -> *VKBatch {
         fresh.mesh = 0
         fresh.material = null
         fresh.stale = true
-        list.add_raw(r.shadow_batches, fresh)
+        list.add_raw(batches, fresh)
     }
-    b = list.get_raw(r.shadow_batches, r.shadow_batch_count) as *VKBatch
+    b = list.get_raw(batches, count) as *VKBatch
     if b.mesh != m.vbo { b.stale = true }
     b.mesh = m.vbo
     b.material = null
     b.first = m as ptr
     b.count = 0
-    r.shadow_batch_count = r.shadow_batch_count + 1
+    if lamps { r.lamp_batch_count = count + 1 } else { r.shadow_batch_count = count + 1 }
     return b
+}
+
+// The cascades' casters, or the lamps' own where the rays are on.
+lamp_set(r: *VKRenderer, lamps: bool) -> bool { return lamps && ae3d_vk_ray_shadows_now() == 1 }
+caster_singles(r: *VKRenderer, lamps: bool) -> ptr {
+    if lamp_set(r, lamps) { return r.lamp_singles }
+    return r.shadow_singles
+}
+caster_batches(r: *VKRenderer, lamps: bool) -> ptr {
+    if lamp_set(r, lamps) { return r.lamp_batches }
+    return r.shadow_batches
+}
+caster_batch_count(r: *VKRenderer, lamps: bool) -> int {
+    if lamp_set(r, lamps) { return r.lamp_batch_count }
+    return r.shadow_batch_count
 }
 
 renderer_set_post(r: *VKRenderer, fxaa: int, bloom: int, threshold: float, intensity: float) {
@@ -1537,7 +1830,21 @@ write_frame_uniforms(r: *VKRenderer, light: *Light, cam: *Camera) {
     ae3d_vk_scene_set_vec3(vkscene.OFF_SHADOWDIRECTION, r.shadow_direction.x,
                            r.shadow_direction.y, r.shadow_direction.z)
     cascade_uniforms(r)
-    ae3d_vk_scene_set_int(vkscene.OFF_HASSHADOWMAP, ae3d_vk_shadows())
+    // The cascades are the key light's shadow only when it is the sun or
+    // the moon; a lamp that is the key light is shadowed by its own cube.
+    has_cascades = 0
+    if ae3d_vk_shadows() == 1 && r.key_cascaded { has_cascades = 1 }
+    ae3d_vk_scene_set_int(vkscene.OFF_HASSHADOWMAP, has_cascades)
+    lamp_base = 0 - 1
+    key_slot = 0 - 1
+    if ae3d_vk_shadows() == 1 && r.lamp_shadows != null && r.light_grid != null {
+        if lampshadows.slot_count(r.lamp_shadows as *LampShadows) > 0 {
+            lamp_base = lightgrid.light_count(r.light_grid as *LightGrid) * 5
+            key_slot = r.key_lamp_slot
+        }
+    }
+    ae3d_vk_scene_set_int(vkscene.OFF_LAMPSHADOWBASE, lamp_base)
+    ae3d_vk_scene_set_int(vkscene.OFF_KEYLAMPSLOT, key_slot)
     ae3d_vk_scene_set_float(vkscene.OFF_CAUSTICSTIME, r.scene_time)
     // The clouds, for the sky that draws them and the ground they shadow.
     ae3d_vk_scene_set_float(vkscene.OFF_CLOUDCOVER, r.cloud_cover)
@@ -1798,8 +2105,18 @@ cascade_uniforms(r: *VKRenderer) {
 prepare_clusters(r: *VKRenderer, key: *Light, cam: *Camera) {
     if r.light_grid == null { r.light_grid = lightgrid.grid_new() as ptr }
     g = r.light_grid as *LightGrid
+    lightgrid.set_tail(g, lampshadows.SLOTS * lampshadows.SLOT_VEC4S * 4)
     lightgrid.build(g, r.lights, key, cam)
-    light_bytes = lightgrid.light_count(g) * lightgrid.LIGHT_FLOATS * 4
+    ls = r.lamp_shadows as *LampShadows
+    i = 0
+    while i < lightgrid.light_count(g) {
+        lightgrid.set_shadow_slot(g, i, lampshadows.slot_of(ls, lightgrid.placed_light(g, i)))
+        i = i + 1
+    }
+    // What the shader reads of the lamps' shadows, after the lamps, in
+    // Vulkan's clip space.
+    lampshadows.write_slots(ls, lightgrid.tail_data(g), true)
+    light_bytes = lightgrid.data_floats(g) * 4
     word_bytes = lightgrid.word_count(g) * 4
     if ae3d_vk_clusters_reserve(light_bytes as long, word_bytes as long) != 1 {
         // Without its buffers the frame lists no lamps rather than read
@@ -1929,6 +2246,9 @@ renderer_render(r: *VKRenderer, cam: *Camera, light: *Light) {
         report_failed_frame(r)
         return
     }
+    // Which lamps have a shadow of their own this frame, before the clusters
+    // are cut: each clustered lamp carries its slot.
+    choose_lamps(r, active_light, cam)
     prepare_clusters(r, active_light, cam)
     // The engine's own CPU cost is the command building and submission below,
     // not the fence-and-acquire wait frame_begin just blocked on -- that wait
@@ -2345,10 +2665,13 @@ free_batches(batches: ptr) {
 renderer_cleanup(r: *VKRenderer) {
     free_batches(r.batches)
     free_batches(r.shadow_batches)
+    free_batches(r.lamp_batches)
     r.batches = null
     r.shadow_batches = null
+    r.lamp_batches = null
     r.batch_count = 0
     r.shadow_batch_count = 0
+    r.lamp_batch_count = 0
 
     if r == null || !r.initialized { return }
     if r.skybox != null { skybox_free(r, r.skybox as *Skybox) ; r.skybox = null }

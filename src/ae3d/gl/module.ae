@@ -19,6 +19,7 @@ import ae3d.platform
 import ae3d.rendering
 import ae3d.lightgrid
 import ae3d.cascades
+import ae3d.lampshadows
 import ae3d.shaders
 import ae3d.skin
 import ae3d.posing
@@ -1506,6 +1507,9 @@ struct ProgramSlots {
     cascade_splits: int
     cascade_texel_world: int
     cascade_count: int
+    lamp_shadow_base: int
+    key_lamp_slot: int
+    lamp_shadow_map: int
     cluster_lights: int
     cluster_words: int
     view_projection: int
@@ -1689,6 +1693,22 @@ struct GLRenderer {
     // single casters the shadow pass draws into each.
     cascades: ptr
     shadow_singles: ptr
+    // The lamps' own shadows (ae3d.lampshadows, #490): which lamps have one
+    // this frame, and their atlas. key_cascaded is whether the key light's
+    // shadow is its cascades this frame -- it is the sun or the moon -- and
+    // key_lamp_slot its slot when it is a lamp.
+    lamp_shadows: ptr
+    lamp_fbo: int
+    lamp_map: int
+    // The static layer under it, copied up a face at a time, and per face
+    // this frame whether it is copied and whether something moving is
+    // drawn over it (lampshadows' SLOTS * FACES).
+    lamp_static_fbo: int
+    lamp_static_map: int
+    lamp_copy: ptr
+    lamp_move: ptr
+    key_cascaded: bool
+    key_lamp_slot: int
     fog: Fog
 
     clear_r: float
@@ -1831,6 +1851,9 @@ renderer_free(r: *GLRenderer) {
     gl_geometry_shutdown()
     if r.cascades != null { cascades.cascades_free(r.cascades as *Cascades) }
     if r.shadow_singles != null { list.free(r.shadow_singles) }
+    if r.lamp_shadows != null { lampshadows.lamps_free(r.lamp_shadows as *LampShadows) }
+    if r.lamp_copy != null { free(r.lamp_copy) }
+    if r.lamp_move != null { free(r.lamp_move) }
     if r.models != null { list.free(r.models) }
     if r.lights != null { list.free(r.lights) }
     if r.programs != null {
@@ -1949,6 +1972,9 @@ slots_for(r: *GLRenderer, program: int) -> *ProgramSlots {
     s.cascade_splits = gl_uniform_location(program, "cascadeSplits")
     s.cascade_texel_world = gl_uniform_location(program, "cascadeTexelWorld")
     s.cascade_count = gl_uniform_location(program, "cascadeCount")
+    s.lamp_shadow_base = gl_uniform_location(program, "lampShadowBase")
+    s.key_lamp_slot = gl_uniform_location(program, "keyLampSlot")
+    s.lamp_shadow_map = gl_uniform_location(program, "lampShadowMap")
     s.cluster_lights = gl_uniform_location(program, "clusterLights")
     s.cluster_words = gl_uniform_location(program, "clusterWords")
     s.light_space = gl_uniform_location(program, "lightSpaceMatrix")
@@ -2742,6 +2768,19 @@ renderer_set_shadows(r: *GLRenderer, on: bool) {
 
     r.shadow_fbo = gl_fbo_create()
     r.shadow_map = gl_fbo_attach_shadow_map(r.shadow_fbo, cascades.ATLAS)
+    // The lamps' atlas beside it (ae3d.lampshadows): its faces are drawn
+    // only when what stands in them changes, so it is cleared once here,
+    // whole, and after that a tile at a time.
+    r.lamp_fbo = gl_fbo_create()
+    r.lamp_map = gl_fbo_attach_shadow_map(r.lamp_fbo, lampshadows.ATLAS)
+    gl_fbo_bind(r.lamp_fbo)
+    gl_viewport(0, 0, lampshadows.ATLAS, lampshadows.ATLAS)
+    gl_set_depth_mask(1)
+    gl_clear(0, 1)
+    r.lamp_static_fbo = gl_fbo_create()
+    r.lamp_static_map = gl_fbo_attach_shadow_map(r.lamp_static_fbo, lampshadows.ATLAS)
+    gl_fbo_bind(r.lamp_static_fbo)
+    gl_clear(0, 1)
     bind_output(r)
     if r.shadow_map == 0 { r.shadow_enabled = false }
 }
@@ -2781,33 +2820,12 @@ fit_cascades(r: *GLRenderer, light: *Light, cam: *Camera) {
     r.shadow_space = cascades.matrix(c, 0)
 }
 
-// Whether a caster can throw a shadow cascade `k` shades with
-// (cascades.casts_into): only there is it drawn into the cascade's map.
-in_cascade(c: *Cascades, k: int, m: *Model) -> bool {
-    return cascades.casts_into(c, k, m.bounding_center, m.bounding_radius)
-}
-
-// Whether any of a batch's members can: the batch is one draw, of all of
-// them or of none.
-batch_in_cascade(c: *Cascades, k: int, b: *GLBatch) -> bool {
-    i = 0
-    while i < b.count {
-        if in_cascade(c, k, list.get_raw(b.members, i) as *Model) { return true }
-        i = i + 1
-    }
-    return false
-}
-
 render_shadow_pass(r: *GLRenderer, light: *Light, cam: *Camera) {
+    r.key_cascaded = false
     if !r.shadow_enabled || r.shadow_fbo == 0 || r.shadow_program == 0 || light == null {
         return
     }
-
-    fit_cascades(r, light, cam)
-    c = r.cascades as *Cascades
-
-    gl_fbo_bind(r.shadow_fbo)
-    gl_viewport(0, 0, cascades.ATLAS, cascades.ATLAS)
+    gather_casters(r)
 
     // The post pass and the skybox both turn depth writes off, so the state they
     // leave behind would let this pass clear the map and then write nothing.
@@ -2815,12 +2833,41 @@ render_shadow_pass(r: *GLRenderer, light: *Light, cam: *Camera) {
     gl_set_depth_mask(1)
     set_blend(r, false)
     set_face_culling(r, false)
-    // Depth only: the atlas has no colour attachment, and depth clears to the
-    // far value the lit pass reads as "nothing between here and the light".
-    gl_clear(0, 1)
 
-    // What casts, gathered once: the models that merge into batches by
-    // their mesh, and the rest, drawn one by one into each cascade.
+    // The key light's cascades when it is the sun or the moon. A lamp that
+    // is the key light has a cube of its own below, like every lamp.
+    if light.mode == core.MODE_DIRECTIONAL {
+        r.key_cascaded = true
+        fit_cascades(r, light, cam)
+        c = r.cascades as *Cascades
+        gl_fbo_bind(r.shadow_fbo)
+        gl_viewport(0, 0, cascades.ATLAS, cascades.ATLAS)
+        // Depth only: the atlas has no colour attachment, and depth clears
+        // to the far value the lit pass reads as "nothing between here and
+        // the light".
+        gl_clear(0, 1)
+        k = 0
+        while k < cascades.COUNT {
+            // Cascade k's tile of the atlas, two by two.
+            gl_viewport((k % 2) * cascades.SIZE, (k / 2) * cascades.SIZE, cascades.SIZE, cascades.SIZE)
+            space = cascades.matrix(c, k)
+            draw_casters(r, cam, &space, 0, k, 0, LAYER_ALL)
+            k = k + 1
+        }
+        // The lit pass's vertex stage reads the nearest cascade's matrix.
+        r.shadow_space = cascades.matrix(c, 0)
+    }
+    draw_lamp_faces(r, cam)
+
+    gl_vao_bind(0)
+    bind_output(r)
+    gl_viewport(0, 0, r.viewport_width, r.viewport_height)
+}
+
+// What casts this frame, gathered once for the cascades and the lamps: the
+// models that merge into batches by their mesh, and the rest, drawn one by
+// one. The crowds are drawn by render_crowd_shadows.
+gather_casters(r: *GLRenderer) {
     if r.shadow_singles == null { r.shadow_singles = list.new() }
     list.clear(r.shadow_singles)
     r.shadow_batch_count = 0
@@ -2833,7 +2880,7 @@ render_shadow_pass(r: *GLRenderer, light: *Light, cam: *Camera) {
             continue
         }
         // The crowd is posed from the pose bank, not a bones palette, so it is
-        // drawn in its own sub-pass below with the crowd depth program.
+        // drawn in its own sub-pass with the crowd depth program.
         if core.model_pose_bank(m) != null {
             i = i + 1
             continue
@@ -2864,102 +2911,288 @@ render_shadow_pass(r: *GLRenderer, light: *Light, cam: *Camera) {
         if b.stale { fill_batch(r, b) }
         i = i + 1
     }
+}
 
-    identity = core.mat4_ident()
-    k = 0
-    while k < cascades.COUNT {
-        // Cascade k's tile of the atlas, two by two.
-        gl_viewport((k % 2) * cascades.SIZE, (k / 2) * cascades.SIZE, cascades.SIZE, cascades.SIZE)
-        r.shadow_space = cascades.matrix(c, k)
+// Whether a caster in the sphere at `centre` of `radius` goes into the tile
+// being drawn: cascade `a` (mode 0), or lamp slot `a`'s face `b` (mode 1).
+reaches_tile(r: *GLRenderer, mode: int, a: int, b: int, centre: Vec3, radius: float) -> bool {
+    if mode == 0 { return cascades.casts_into(r.cascades as *Cascades, a, centre, radius) }
+    return lampshadows.casts_onto(r.lamp_shadows as *LampShadows, a, b, centre, radius)
+}
 
-        use_program(r, r.shadow_program)
-        space = gl_uniform_location(r.shadow_program, "lightSpaceMatrix")
-        model_slot = gl_uniform_location(r.shadow_program, "model")
-        instanced_slot = gl_uniform_location(r.shadow_program, "isInstanced")
-        points_slot = gl_uniform_location(r.shadow_program, "instancePoints")
-        billboard_slot = gl_uniform_location(r.shadow_program, "instanceBillboard")
-        view_pos_slot = gl_uniform_location(r.shadow_program, "viewPos")
-        gl_uniform_vec3(view_pos_slot, cam.position.x, cam.position.y, cam.position.z)
-        skinned_slot = gl_uniform_location(r.shadow_program, "isSkinned")
-        bones_slot = gl_uniform_location(r.shadow_program, "bones")
-        gl_uniform_mat4(space, &r.shadow_space)
-
-        i = 0
-        while i < list.size(r.shadow_singles) {
-            m = list.get_raw(r.shadow_singles, i) as *Model
-            i = i + 1
-            if !in_cascade(c, k, m) { continue }
-            // An instanced model with no instances casts nothing, and one
-            // with instances casts them as they are now: the shadow pass
-            // runs before the lit pass that used to be the only one to send
-            // a changed stream, so a stream filled since the last frame --
-            // or since the model was added with none -- was drawn from a
-            // buffer that did not hold it yet.
-            if m.is_instanced && core.model_instance_count(m) <= 0 { continue }
-            instanced = 0
-            if m.is_instanced {
-                instanced = 1
-                sync_instances(m)
-            }
-            gl_uniform_int(instanced_slot, instanced)
-            points = 0
-            if instanced == 1 && geometry.inst_is_points(m.instances) == 1 { points = 1 }
-            gl_uniform_int(points_slot, points)
-            gl_uniform_int(billboard_slot, points * m.billboard)
-            // The same rule as set_model_matrix: an instanced model's
-            // transform is already in every instance, so the model matrix
-            // goes as the identity or the scale and the rotation are
-            // applied twice. Sent as the model's own, every instanced
-            // caster threw the shadow of a copy scaled by itself again.
-            // A point stream has the model's frame here instead.
-            if points == 1 {
-                placed = point_frame(m)
-                gl_uniform_mat4(model_slot, &placed)
-            } else if instanced == 1 {
-                gl_uniform_mat4(model_slot, &identity)
-            } else {
-                gl_uniform_mat4(model_slot, &m.model_matrix)
-            }
-            pose_depth(skinned_slot, bones_slot, m)
-            gl_vao_bind(depth_vao(m))
-            draw_depth(r, m, instanced)
-        }
-
-        i = 0
-        while i < r.shadow_batch_count {
-            b = list.get_raw(r.shadow_batches, i) as *GLBatch
-            first = b.first as *Model
-            if b.count == 1 {
-                if in_cascade(c, k, first) {
-                    gl_uniform_int(instanced_slot, 0)
-                    gl_uniform_int(points_slot, 0)
-                    gl_uniform_mat4(model_slot, &first.model_matrix)
-                    pose_depth(skinned_slot, bones_slot, first)
-                    gl_vao_bind(first.vao)
-                    draw_depth(r, first, 0)
-                }
-            } else if b.count > 1 && batch_in_cascade(c, k, b) {
-                gl_uniform_int(instanced_slot, 1)
-                gl_uniform_int(points_slot, 0)
-                gl_uniform_int(skinned_slot, 0)
-                gl_uniform_mat4(model_slot, &identity)
-                gl_vao_bind(b.vao)
-                gl_batch_upload(b.vao, b as ptr, b.instances, b.stale)
-                b.stale = false
-                gl_draw_elements_instanced(core.mesh_index_count(first.mesh), 0, b.count)
-                r.last_draw_calls = r.last_draw_calls + 1
-            }
-            i = i + 1
-        }
-        render_crowd_shadows(r)
-        k = k + 1
+batch_reaches_tile(r: *GLRenderer, mode: int, a: int, b: int, batch: *GLBatch) -> bool {
+    i = 0
+    while i < batch.count {
+        m = list.get_raw(batch.members, i) as *Model
+        if reaches_tile(r, mode, a, b, m.bounding_center, m.bounding_radius) { return true }
+        i = i + 1
     }
-    // The lit pass's vertex stage reads the nearest cascade's matrix.
-    r.shadow_space = cascades.matrix(c, 0)
+    return false
+}
 
-    gl_vao_bind(0)
-    bind_output(r)
-    gl_viewport(0, 0, r.viewport_width, r.viewport_height)
+// The sphere a crowd's figures stand in, from their instances: its bounds
+// are one figure's, and a lamp's face asks where all of them are. xyz the
+// centre, w the radius, with a figure's height to spare.
+crowd_sphere(m: *Model) -> Vec4 {
+    geometry.inst_compute_bounds(m.instances)
+    return Vec4 { x: geometry.inst_bound_x(m.instances) + m.world_position.x,
+                  y: geometry.inst_bound_y(m.instances) + m.world_position.y,
+                  z: geometry.inst_bound_z(m.instances) + m.world_position.z,
+                  w: geometry.inst_bound_radius(m.instances) + 2.0 }
+}
+
+// Whether a caster moves on its own, where no world stamp says so: a
+// skinned figure, an instance stream (the crowds are drawn by their own
+// sub-pass, and always move). A lamp's face draws it over its static
+// layer every frame it is there.
+moves_itself(m: *Model) -> bool { return m.is_instanced || m.skeleton != null }
+
+// The layers a tile is drawn in: everything (a cascade), a lamp face's
+// static layer, or what moves over it.
+const LAYER_ALL = 0
+const LAYER_STATIC = 1
+const LAYER_MOVING = 2
+
+// Every gathered caster of `layer` that reaches the tile (reaches_tile),
+// drawn with `space` as the light's matrix, and the crowds but in a static
+// layer.
+draw_casters(r: *GLRenderer, cam: *Camera, space: *Mat4, mode: int, a: int, b: int, layer: int) {
+    identity = core.mat4_ident()
+    use_program(r, r.shadow_program)
+    space_slot = gl_uniform_location(r.shadow_program, "lightSpaceMatrix")
+    model_slot = gl_uniform_location(r.shadow_program, "model")
+    instanced_slot = gl_uniform_location(r.shadow_program, "isInstanced")
+    points_slot = gl_uniform_location(r.shadow_program, "instancePoints")
+    billboard_slot = gl_uniform_location(r.shadow_program, "instanceBillboard")
+    view_pos_slot = gl_uniform_location(r.shadow_program, "viewPos")
+    gl_uniform_vec3(view_pos_slot, cam.position.x, cam.position.y, cam.position.z)
+    skinned_slot = gl_uniform_location(r.shadow_program, "isSkinned")
+    bones_slot = gl_uniform_location(r.shadow_program, "bones")
+    gl_uniform_mat4(space_slot, space)
+
+    i = 0
+    while i < list.size(r.shadow_singles) {
+        m = list.get_raw(r.shadow_singles, i) as *Model
+        i = i + 1
+        if layer != LAYER_ALL && (layer == LAYER_MOVING) != moves_itself(m) { continue }
+        if !reaches_tile(r, mode, a, b, m.bounding_center, m.bounding_radius) { continue }
+        // An instanced model with no instances casts nothing, and one
+        // with instances casts them as they are now: the shadow pass
+        // runs before the lit pass that used to be the only one to send
+        // a changed stream, so a stream filled since the last frame --
+        // or since the model was added with none -- was drawn from a
+        // buffer that did not hold it yet.
+        if m.is_instanced && core.model_instance_count(m) <= 0 { continue }
+        instanced = 0
+        if m.is_instanced {
+            instanced = 1
+            sync_instances(m)
+        }
+        gl_uniform_int(instanced_slot, instanced)
+        points = 0
+        if instanced == 1 && geometry.inst_is_points(m.instances) == 1 { points = 1 }
+        gl_uniform_int(points_slot, points)
+        gl_uniform_int(billboard_slot, points * m.billboard)
+        // The same rule as set_model_matrix: an instanced model's
+        // transform is already in every instance, so the model matrix
+        // goes as the identity or the scale and the rotation are
+        // applied twice. Sent as the model's own, every instanced
+        // caster threw the shadow of a copy scaled by itself again.
+        // A point stream has the model's frame here instead.
+        if points == 1 {
+            placed = point_frame(m)
+            gl_uniform_mat4(model_slot, &placed)
+        } else if instanced == 1 {
+            gl_uniform_mat4(model_slot, &identity)
+        } else {
+            gl_uniform_mat4(model_slot, &m.model_matrix)
+        }
+        pose_depth(skinned_slot, bones_slot, m)
+        gl_vao_bind(depth_vao(m))
+        draw_depth(r, m, instanced)
+    }
+
+    i = 0
+    while layer != LAYER_MOVING && i < r.shadow_batch_count {
+        batch = list.get_raw(r.shadow_batches, i) as *GLBatch
+        first = batch.first as *Model
+        if batch.count == 1 {
+            if reaches_tile(r, mode, a, b, first.bounding_center, first.bounding_radius) {
+                gl_uniform_int(instanced_slot, 0)
+                gl_uniform_int(points_slot, 0)
+                gl_uniform_mat4(model_slot, &first.model_matrix)
+                pose_depth(skinned_slot, bones_slot, first)
+                gl_vao_bind(first.vao)
+                draw_depth(r, first, 0)
+            }
+        } else if batch.count > 1 && batch_reaches_tile(r, mode, a, b, batch) {
+            gl_uniform_int(instanced_slot, 1)
+            gl_uniform_int(points_slot, 0)
+            gl_uniform_int(skinned_slot, 0)
+            gl_uniform_mat4(model_slot, &identity)
+            gl_vao_bind(batch.vao)
+            gl_batch_upload(batch.vao, batch as ptr, batch.instances, batch.stale)
+            batch.stale = false
+            gl_draw_elements_instanced(core.mesh_index_count(first.mesh), 0, batch.count)
+            r.last_draw_calls = r.last_draw_calls + 1
+        }
+        i = i + 1
+    }
+    if layer != LAYER_STATIC { render_crowd_shadows(r, space, mode, a, b) }
+}
+
+// The lamps that have a shadow this frame, and how far from the camera a
+// lamp still gets one: the shadow distance where one is set, and never
+// less than LAMP_RANGE.
+const LAMP_RANGE = 50.0
+
+choose_lamps(r: *GLRenderer, key: *Light, cam: *Camera) {
+    r.key_lamp_slot = 0 - 1
+    if r.lamp_shadows == null { r.lamp_shadows = lampshadows.lamps_new() as ptr }
+    ls = r.lamp_shadows as *LampShadows
+    if !r.shadow_enabled || r.lamp_map == 0 {
+        lampshadows.choose(ls, null, null, cam, 0.0, 0.0)
+        return
+    }
+    range = LAMP_RANGE
+    if r.shadow_distance > range { range = r.shadow_distance }
+    lampshadows.choose(ls, r.lights, key, cam, range, 0.0)
+    if key != null && key.mode != core.MODE_DIRECTIONAL { r.key_lamp_slot = lampshadows.slot_of(ls, key) }
+}
+
+// Each chosen lamp's six faces, in two layers (ae3d.lampshadows): the
+// static layer drawn where what stands still in the face changed since it
+// was, every face whose static layer was drawn or that has or had
+// something moving in it copied up into the atlas the shader reads, and
+// what moves drawn over the copy.
+draw_lamp_faces(r: *GLRenderer, cam: *Camera) {
+    if r.lamp_shadows == null || r.lamp_fbo == 0 || r.lamp_static_fbo == 0 { return }
+    ls = r.lamp_shadows as *LampShadows
+    if lampshadows.slot_count(ls) == 0 { return }
+    faces = lampshadows.SLOTS * lampshadows.FACES
+    if r.lamp_copy == null {
+        r.lamp_copy = calloc(faces, 4)
+        r.lamp_move = calloc(faces, 4)
+    }
+    copy = r.lamp_copy as int[]
+    move = r.lamp_move as int[]
+    size = lampshadows.FACE
+
+    bound = false
+    moving_faces = 0
+    copies = 0
+    slot = 0
+    while slot < lampshadows.SLOTS {
+        f = 0
+        while f < lampshadows.FACES {
+            tile = lampshadows.face_tile(slot, f)
+            copy[tile] = 0
+            move[tile] = 0
+            if lampshadows.lamp_of(ls, slot) != null {
+                sig, moving = face_contents(r, ls, slot, f)
+                if lampshadows.static_stale(ls, slot, f, sig) {
+                    if !bound {
+                        gl_fbo_bind(r.lamp_static_fbo)
+                        glapi.glEnable(glapi.SCISSOR_TEST as uint32)
+                        bound = true
+                    }
+                    x = (tile % lampshadows.ACROSS) * size
+                    y = (tile / lampshadows.ACROSS) * size
+                    gl_viewport(x, y, size, size)
+                    glapi.glScissor(x, y, size, size)
+                    gl_clear(0, 1)
+                    space = lampshadows.face_matrix(ls, slot, f)
+                    draw_casters(r, cam, &space, 1, slot, f, LAYER_STATIC)
+                    lampshadows.static_drawn(ls, slot, f, sig)
+                    copy[tile] = 1
+                }
+                // A face that had something moving over it last frame is
+                // copied too: the copy is what takes it back out.
+                if moving || lampshadows.moving_was(ls, slot, f) { copy[tile] = 1 }
+                if moving {
+                    move[tile] = 1
+                    moving_faces = moving_faces + 1
+                }
+                if copy[tile] == 1 { copies = copies + 1 }
+                lampshadows.set_moving(ls, slot, f, moving)
+            }
+            f = f + 1
+        }
+        slot = slot + 1
+    }
+    if bound { glapi.glDisable(glapi.SCISSOR_TEST as uint32) }
+
+    // The copies, depth to depth, tile to tile: a blit, which the scissor
+    // would clip, so it is off.
+    if copies > 0 {
+        glapi.glBindFramebuffer(glapi.READ_FRAMEBUFFER as uint32, r.lamp_static_fbo as uint32)
+        glapi.glBindFramebuffer(glapi.DRAW_FRAMEBUFFER as uint32, r.lamp_fbo as uint32)
+        tile = 0
+        while tile < faces {
+            if copy[tile] == 1 {
+                x = (tile % lampshadows.ACROSS) * size
+                y = (tile / lampshadows.ACROSS) * size
+                glapi.glBlitFramebuffer(x, y, x + size, y + size, x, y, x + size, y + size,
+                                        glapi.DEPTH_BUFFER_BIT as uint32, glapi.NEAREST as uint32)
+            }
+            tile = tile + 1
+        }
+    }
+
+    if moving_faces == 0 { return }
+    gl_fbo_bind(r.lamp_fbo)
+    tile = 0
+    while tile < faces {
+        if move[tile] == 1 {
+            gl_viewport((tile % lampshadows.ACROSS) * size, (tile / lampshadows.ACROSS) * size, size, size)
+            space = lampshadows.face_matrix(ls, tile / lampshadows.FACES, tile % lampshadows.FACES)
+            draw_casters(r, cam, &space, 1, tile / lampshadows.FACES, tile % lampshadows.FACES, LAYER_MOVING)
+        }
+        tile = tile + 1
+    }
+}
+
+// What stands in a lamp's face: a signature of what stands still in it
+// and how often each has moved, and whether anything that moves on its own
+// -- a skinned figure, an instance stream, a crowd -- is there.
+face_contents(r: *GLRenderer, ls: *LampShadows, slot: int, f: int) -> (long, bool) {
+    sig = 0 as long
+    moving = false
+    i = 0
+    while i < list.size(r.shadow_singles) {
+        m = list.get_raw(r.shadow_singles, i) as *Model
+        if lampshadows.casts_onto(ls, slot, f, m.bounding_center, m.bounding_radius) {
+            if moves_itself(m) {
+                moving = true
+            } else {
+                sig = lampshadows.face_signature(sig, m.serial as long, m.world_stamp as long)
+            }
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < r.shadow_batch_count {
+        batch = list.get_raw(r.shadow_batches, i) as *GLBatch
+        j = 0
+        while j < batch.count {
+            m = list.get_raw(batch.members, j) as *Model
+            if lampshadows.casts_onto(ls, slot, f, m.bounding_center, m.bounding_radius) {
+                sig = lampshadows.face_signature(sig, m.serial as long, m.world_stamp as long)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < list.size(r.models) {
+        m = list.get_raw(r.models, i) as *Model
+        i = i + 1
+        if m == null || !m.visible || !m.casts_shadow || core.model_pose_bank(m) == null { continue }
+        if !m.is_instanced || core.model_instance_count(m) <= 0 { continue }
+        sphere = crowd_sphere(m)
+        if lampshadows.casts_onto(ls, slot, f, core.vec3(sphere.x, sphere.y, sphere.z), sphere.w) { moving = true }
+    }
+    return sig, moving
 }
 
 // The crowd's shadow sub-pass: every pose-bank model, posed by its instances'
@@ -2967,7 +3200,7 @@ render_shadow_pass(r: *GLRenderer, light: *Light, cam: *Camera) {
 // instance and phase buffers are brought current here (the shadow pass runs
 // before the lit pass would upload them) and their dirty flags cleared, so the
 // lit pass reuses the same upload. Depth only, so no colour or lighting.
-render_crowd_shadows(r: *GLRenderer) {
+render_crowd_shadows(r: *GLRenderer, space: *Mat4, mode: int, a: int, b: int) {
     if r.crowd_shadow_program == 0 { return }
     bound = 0
     space_loc = 0
@@ -2982,13 +3215,19 @@ render_crowd_shadows(r: *GLRenderer) {
         if m == null || !m.visible || !m.casts_shadow { continue }
         if core.model_pose_bank(m) == null { continue }
         if !m.is_instanced || core.model_instance_count(m) <= 0 { continue }
+        // A lamp's face draws a crowd only where its figures stand in it;
+        // a cascade takes every crowd, as it did.
+        if mode == 1 {
+            sphere = crowd_sphere(m)
+            if !reaches_tile(r, mode, a, b, core.vec3(sphere.x, sphere.y, sphere.z), sphere.w) { continue }
+        }
         if bound == 0 {
             use_program(r, r.crowd_shadow_program)
             space_loc = gl_uniform_location(r.crowd_shadow_program, "lightSpaceMatrix")
             model_loc = gl_uniform_location(r.crowd_shadow_program, "model")
             bank_loc = gl_uniform_location(r.crowd_shadow_program, "poseBank")
             frames_loc = gl_uniform_location(r.crowd_shadow_program, "poseBankFrames")
-            gl_uniform_mat4(space_loc, &r.shadow_space)
+            gl_uniform_mat4(space_loc, space)
             bound = 1
         }
         core.model_sync_transform(m)
@@ -3452,6 +3691,9 @@ renderer_render(r: *GLRenderer, cam: *Camera, light: *Light) {
     r.bound_instance_color = 0 - 1
 
     active_light = key_light(r.lights, light)
+    // Which lamps have a shadow of their own this frame, before the clusters
+    // are cut: each clustered lamp carries its slot.
+    choose_lamps(r, active_light, cam)
     prepare_clusters(r, active_light, cam)
 
     // What a pass costs is what the GPU spends on it. The wall time around a
@@ -4112,8 +4354,16 @@ upload_lights(slots: *ProgramSlots, lights: ptr, key: *Light) {
 prepare_clusters(r: *GLRenderer, key: *Light, cam: *Camera) {
     if r.light_grid == null { r.light_grid = lightgrid.grid_new() as ptr }
     g = r.light_grid as *LightGrid
+    lightgrid.set_tail(g, lampshadows.SLOTS * lampshadows.SLOT_VEC4S * 4)
     lightgrid.build(g, r.lights, key, cam)
-    lights_texels = lightgrid.light_count(g) * 5
+    ls = r.lamp_shadows as *LampShadows
+    i = 0
+    while i < lightgrid.light_count(g) {
+        lightgrid.set_shadow_slot(g, i, lampshadows.slot_of(ls, lightgrid.placed_light(g, i)))
+        i = i + 1
+    }
+    lampshadows.write_slots(ls, lightgrid.tail_data(g), false)
+    lights_texels = lightgrid.data_floats(g) / 4
     light_texture, light_rows = upload_rows(r.cluster_light_texture, r.cluster_light_rows,
                                             CLUSTER_LIGHT_ROW, RGBA32F, glapi.RGBA,
                                             lightgrid.light_data(g), lights_texels, 4)
@@ -4224,11 +4474,14 @@ upload_light(slots_of: int[], index: int, l: *Light) {
 // one drawn. Vulkan rewrites the binding to its white texture on the way off,
 // so this is also what keeps the two backends showing the same scene.
 bind_shadow_map(r: *GLRenderer, slots: *ProgramSlots) {
+    lamp_uniforms(r, slots)
     if !r.shadow_enabled || r.shadow_map == 0 {
         gl_uniform_int(slots.has_shadow_map, 0)
         return
     }
-    gl_uniform_int(slots.has_shadow_map, 1)
+    // The cascades are the key light's shadow only when it is the sun or
+    // the moon; a lamp that is the key light is shadowed by its own cube.
+    if r.key_cascaded { gl_uniform_int(slots.has_shadow_map, 1) } else { gl_uniform_int(slots.has_shadow_map, 0) }
     // Turn the shadow term on with the map. The fragment shader gates it behind
     // enableShadows, and only the rendering.Config path and the water module
     // ever set that -- so an engine-API scene (its models made straight from
@@ -4255,6 +4508,29 @@ bind_shadow_map(r: *GLRenderer, slots: *ProgramSlots) {
     gl_texture_bind(0, r.default_texture)
     r.bound_texture = r.default_texture
 }
+
+// The lamps' shadows for the lit pass: the atlas on LAMP_UNIT, where their
+// slots start in the lights' data (after the clustered lamps), and the key
+// light's slot when it is a lamp; -1 for both where no lamp has one.
+lamp_uniforms(r: *GLRenderer, slots: *ProgramSlots) {
+    base = 0 - 1
+    key_slot = 0 - 1
+    if r.shadow_enabled && r.lamp_map != 0 && r.lamp_shadows != null && r.light_grid != null {
+        if lampshadows.slot_count(r.lamp_shadows as *LampShadows) > 0 {
+            base = lightgrid.light_count(r.light_grid as *LightGrid) * 5
+            key_slot = r.key_lamp_slot
+        }
+    }
+    gl_uniform_int(slots.lamp_shadow_base, base)
+    gl_uniform_int(slots.key_lamp_slot, key_slot)
+    if base >= 0 {
+        gl_texture_bind(LAMP_UNIT, r.lamp_map)
+        gl_uniform_int(slots.lamp_shadow_map, LAMP_UNIT)
+        glapi.glActiveTexture(glapi.TEXTURE0 as uint32)
+    }
+}
+
+const LAMP_UNIT = 8
 
 // The cascades the lit pass picks a pixel's shadow from: their matrices,
 // where each ends along the view and a texel's width in each.
@@ -4835,6 +5111,10 @@ renderer_cleanup(r: *GLRenderer) {
     if r.taa_program != 0 { gl_program_delete(r.taa_program) ; r.taa_program = 0 }
     if r.shadow_map != 0 { gl_texture_delete(r.shadow_map) ; r.shadow_map = 0 }
     if r.shadow_fbo != 0 { gl_fbo_delete(r.shadow_fbo) ; r.shadow_fbo = 0 }
+    if r.lamp_map != 0 { gl_texture_delete(r.lamp_map) ; r.lamp_map = 0 }
+    if r.lamp_fbo != 0 { gl_fbo_delete(r.lamp_fbo) ; r.lamp_fbo = 0 }
+    if r.lamp_static_map != 0 { gl_texture_delete(r.lamp_static_map) ; r.lamp_static_map = 0 }
+    if r.lamp_static_fbo != 0 { gl_fbo_delete(r.lamp_static_fbo) ; r.lamp_static_fbo = 0 }
 
     if r.default_program != 0 { gl_program_delete(r.default_program) ; r.default_program = 0 }
     if r.shadow_program != 0 { gl_program_delete(r.shadow_program) ; r.shadow_program = 0 }

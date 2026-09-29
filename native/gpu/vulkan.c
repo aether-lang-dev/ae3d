@@ -56,6 +56,9 @@
 /* The shadow atlas: four cascades of 2048 texels, two by two
    (ae3d.cascades' ATLAS and SIZE, #469). */
 #define AE3D_VK_SHADOW_SIZE 4096
+/* The lamps' atlas: eight by eight faces of 512 texels
+   (ae3d.lampshadows' ATLAS, FACE and ACROSS). */
+#define AE3D_VK_LAMP_SHADOW_SIZE 4096
 #define AE3D_VK_PROGRAM_SCENE 0
 #define AE3D_VK_PROGRAM_WATER 1
 #define AE3D_VK_PROGRAM_COUNT 2
@@ -165,6 +168,8 @@ typedef struct {
     X(vkCmdPushConstants) \
     X(vkCmdSetViewport) \
     X(vkCmdSetScissor) \
+    X(vkCmdClearAttachments) \
+    X(vkCmdClearDepthStencilImage) \
     X(vkCmdCopyBuffer) \
     X(vkCreateDescriptorSetLayout) \
     X(vkDestroyDescriptorSetLayout) \
@@ -180,6 +185,7 @@ typedef struct {
     X(vkCmdCopyBufferToImage) \
     X(vkCmdCopyImageToBuffer) \
     X(vkCmdBlitImage) \
+    X(vkCmdCopyImage) \
     X(vkCreateSemaphore) \
     X(vkDestroySemaphore) \
     X(vkCreateFence) \
@@ -461,6 +467,28 @@ static struct {
     VkRenderPass scene_pass;
     VkRenderPass post_pass;
     VkRenderPass shadow_pass;
+    /* The lamps' own shadows (ae3d.lampshadows, #490): one depth atlas of
+       their cube faces, kept from frame to frame -- a face is drawn again
+       only when what stands in it changes, so the pass loads the atlas and
+       clears just the tiles it draws. It outlives the swapchain. */
+    VkRenderPass lamp_pass;
+    VkImage lamp_image;
+    VkDeviceMemory lamp_memory;
+    VkImageView lamp_view;
+    VkSampler lamp_sampler;
+    VkFramebuffer lamp_framebuffer;
+    /* And the static layer under it: what stands still, drawn when it
+       changes and copied into the atlas above tile by tile, with what
+       moves drawn over the copy (ae3d.lampshadows). */
+    VkImage lamp_static_image;
+    VkDeviceMemory lamp_static_memory;
+    VkImageView lamp_static_view;
+    VkFramebuffer lamp_static_framebuffer;
+    int lamp_generation;
+    /* Whether the cascades' atlas has been through its pass since it was
+       made: until then it is in no layout the lit pass may sample, and a
+       frame whose key light is a lamp draws no cascade. */
+    int shadow_ready;
     VkFramebuffer shadow_framebuffer;
     VkImage shadow_image;
     VkDeviceMemory shadow_memory;
@@ -2136,6 +2164,51 @@ static int ae3d_vk_build_shadow_pass(void) {
     return 1;
 }
 
+/* The lamps' atlas pass: the shadow pass's depth attachment, but loaded
+   rather than cleared -- the tiles not drawn this frame keep what they
+   hold -- and readable on the way in as on the way out. Compatible with the
+   shadow pass, so the shadow pipelines draw in both. */
+static int ae3d_vk_build_lamp_pass(void) {
+    VkAttachmentDescription attachment;
+    VkAttachmentReference depth_ref;
+    VkSubpassDescription subpass;
+    VkSubpassDependency dependencies[2];
+    VkRenderPassCreateInfo info;
+
+    memset(&attachment, 0, sizeof(attachment));
+    attachment.format = vk.depth_format;
+    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    attachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    memset(&depth_ref, 0, sizeof(depth_ref));
+    depth_ref.attachment = 0;
+    depth_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    memset(&subpass, 0, sizeof(subpass));
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.pDepthStencilAttachment = &depth_ref;
+
+    ae3d_vk_depth_pass_dependencies(dependencies);
+
+    memset(&info, 0, sizeof(info));
+    info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    info.attachmentCount = 1;
+    info.pAttachments = &attachment;
+    info.subpassCount = 1;
+    info.pSubpasses = &subpass;
+    info.dependencyCount = 2;
+    info.pDependencies = dependencies;
+    if (ae3d_vkCreateRenderPass(vk.device, &info, NULL, &vk.lamp_pass) != VK_SUCCESS) {
+        return ae3d_vk_fail("lamp shadow vkCreateRenderPass failed");
+    }
+    return 1;
+}
+
 // The camera-space depth prepass, for screen-space reflection. The same
 // depth-only pass the shadow map uses -- a single-sample depth attachment
 // cleared, stored, and left readable -- but rendered from the camera rather
@@ -2504,6 +2577,7 @@ static int ae3d_vk_create_render_pass(void) {
     if (!ae3d_vk_build_render_pass(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1, &vk.scene_pass_first)) return 0;
     if (!ae3d_vk_build_render_pass(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 2, &vk.scene_pass_rest)) return 0;
     if (!ae3d_vk_build_shadow_pass()) return 0;
+    if (!ae3d_vk_build_lamp_pass()) return 0;
     if (!ae3d_vk_build_camdepth_pass()) return 0;
     // The reflective composite writes into an off-screen colour target the
     // final composite then samples, so its pass ends in sampler-read layout;
@@ -2590,7 +2664,125 @@ static int ae3d_vk_create_shadow_target(void) {
     if (ae3d_vkCreateFramebuffer(vk.device, &info, NULL, &vk.shadow_framebuffer) != VK_SUCCESS) {
         return ae3d_vk_fail("shadow vkCreateFramebuffer failed");
     }
+    vk.shadow_ready = 0;
     g_shadow_targets++;
+    return 1;
+}
+
+static VkCommandBuffer ae3d_vk_begin_once(void);
+static void ae3d_vk_end_once(VkCommandBuffer command);
+
+static void ae3d_vk_destroy_lamp_image(VkImage *image, VkDeviceMemory *memory, VkImageView *view,
+                                       VkFramebuffer *framebuffer) {
+    if (*framebuffer) ae3d_vkDestroyFramebuffer(vk.device, *framebuffer, NULL);
+    if (*view) ae3d_vkDestroyImageView(vk.device, *view, NULL);
+    if (*image) ae3d_vkDestroyImage(vk.device, *image, NULL);
+    if (*memory) ae3d_vkFreeMemory(vk.device, *memory, NULL);
+    *framebuffer = VK_NULL_HANDLE;
+    *view = VK_NULL_HANDLE;
+    *image = VK_NULL_HANDLE;
+    *memory = VK_NULL_HANDLE;
+}
+
+static void ae3d_vk_destroy_lamp_target(void) {
+    ae3d_vk_destroy_lamp_image(&vk.lamp_image, &vk.lamp_memory, &vk.lamp_view, &vk.lamp_framebuffer);
+    ae3d_vk_destroy_lamp_image(&vk.lamp_static_image, &vk.lamp_static_memory, &vk.lamp_static_view,
+                               &vk.lamp_static_framebuffer);
+    if (vk.lamp_sampler) ae3d_vkDestroySampler(vk.device, vk.lamp_sampler, NULL);
+    vk.lamp_sampler = VK_NULL_HANDLE;
+}
+
+/* One of the lamps' two atlases: its image, drawn into by the lamps' pass
+   and copied from and to a tile at a time, and its framebuffer; cleared to
+   the far plane and left readable, the layout the pass takes it in and
+   leaves it in. */
+static int ae3d_vk_make_lamp_image(VkImage *image, VkDeviceMemory *memory, VkImageView *view,
+                                   VkFramebuffer *framebuffer) {
+    VkFramebufferCreateInfo info;
+    VkImageMemoryBarrier barrier;
+    VkClearDepthStencilValue cleared;
+    VkImageSubresourceRange range;
+    VkCommandBuffer once;
+
+    if (!ae3d_vk_create_image(AE3D_VK_LAMP_SHADOW_SIZE, AE3D_VK_LAMP_SHADOW_SIZE, 1,
+                              vk.depth_format, VK_SAMPLE_COUNT_1_BIT,
+                              VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_TILING_OPTIMAL,
+                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, image, memory, view)) {
+        return 0;
+    }
+
+    memset(&info, 0, sizeof(info));
+    info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    info.renderPass = vk.lamp_pass;
+    info.attachmentCount = 1;
+    info.pAttachments = view;
+    info.width = AE3D_VK_LAMP_SHADOW_SIZE;
+    info.height = AE3D_VK_LAMP_SHADOW_SIZE;
+    info.layers = 1;
+    if (ae3d_vkCreateFramebuffer(vk.device, &info, NULL, framebuffer) != VK_SUCCESS) {
+        return ae3d_vk_fail("lamp shadow vkCreateFramebuffer failed");
+    }
+
+    memset(&range, 0, sizeof(range));
+    range.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    range.levelCount = 1;
+    range.layerCount = 1;
+    once = ae3d_vk_begin_once();
+    if (!once) return ae3d_vk_fail("lamp shadow: no command buffer to clear it with");
+    memset(&barrier, 0, sizeof(barrier));
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = *image;
+    barrier.subresourceRange = range;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    ae3d_vkCmdPipelineBarrier(once, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              0, 0, NULL, 0, NULL, 1, &barrier);
+    cleared.depth = 1.0f;
+    cleared.stencil = 0;
+    ae3d_vkCmdClearDepthStencilImage(once, *image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cleared, 1, &range);
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    ae3d_vkCmdPipelineBarrier(once, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              0, 0, NULL, 0, NULL, 1, &barrier);
+    ae3d_vk_end_once(once);
+    return 1;
+}
+
+/* The lamps' atlases, made once when the backend starts and kept: their
+   size is their own, not the window's. Every time they are made the
+   generation moves on, so what remembers which faces they hold
+   (ae3d.vulkan) forgets them. */
+static int ae3d_vk_create_lamp_target(void) {
+    VkSamplerCreateInfo sampler;
+
+    if (!ae3d_vk_make_lamp_image(&vk.lamp_image, &vk.lamp_memory, &vk.lamp_view, &vk.lamp_framebuffer)) return 0;
+    if (!ae3d_vk_make_lamp_image(&vk.lamp_static_image, &vk.lamp_static_memory, &vk.lamp_static_view,
+                                 &vk.lamp_static_framebuffer)) {
+        return 0;
+    }
+    memset(&sampler, 0, sizeof(sampler));
+    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sampler.magFilter = VK_FILTER_NEAREST;
+    sampler.minFilter = VK_FILTER_NEAREST;
+    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sampler.maxLod = 1.0f;
+    if (ae3d_vkCreateSampler(vk.device, &sampler, NULL, &vk.lamp_sampler) != VK_SUCCESS) {
+        return ae3d_vk_fail("lamp shadow vkCreateSampler failed");
+    }
+    vk.lamp_generation++;
     return 1;
 }
 
@@ -2985,7 +3177,7 @@ void ae3d_vk_texture_destroy(int handle) {
 static int ae3d_vk_cluster_make(ae3d_vk_cluster_buffer *b, VkDeviceSize size);
 
 static int ae3d_vk_create_descriptors(void) {
-    VkDescriptorSetLayoutBinding bindings[8];
+    VkDescriptorSetLayoutBinding bindings[9];
     VkDescriptorSetLayoutCreateInfo layout;
     VkDescriptorPoolSize sizes[4];
     VkDescriptorPoolCreateInfo pool;
@@ -3037,18 +3229,24 @@ static int ae3d_vk_create_descriptors(void) {
     bindings[6].descriptorCount = 1;
     bindings[6].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+    // The lamps' shadow atlas (#490), which the scene fragment shader
+    // samples for every lamp with a cube of its own.
+    bindings[7].binding = 8;
+    bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[7].descriptorCount = 1;
+    bindings[7].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     // The scene's acceleration structure at 5, for the rays the fragment
     // traces; only where the device traces, since a layout naming a
     // descriptor type the device has no extension for is refused -- so it
     // is last in the list, and left off it where there are no rays.
-    bindings[7].binding = 5;
-    bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-    bindings[7].descriptorCount = 1;
-    bindings[7].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[8].binding = 5;
+    bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    bindings[8].descriptorCount = 1;
+    bindings[8].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     memset(&layout, 0, sizeof(layout));
     layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout.bindingCount = vk.ray_query ? 8 : 7;
+    layout.bindingCount = vk.ray_query ? 9 : 8;
     layout.pBindings = bindings;
     if (ae3d_vkCreateDescriptorSetLayout(vk.device, &layout, NULL, &vk.set_layout) != VK_SUCCESS) {
         return ae3d_vk_fail("vkCreateDescriptorSetLayout failed");
@@ -3058,7 +3256,7 @@ static int ae3d_vk_create_descriptors(void) {
     sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[0].descriptorCount = AE3D_VK_FRAMES * AE3D_VK_MAX_TEXTURES;
     sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[1].descriptorCount = AE3D_VK_FRAMES * AE3D_VK_MAX_TEXTURES * 4;
+    sizes[1].descriptorCount = AE3D_VK_FRAMES * AE3D_VK_MAX_TEXTURES * 5;
     sizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[2].descriptorCount = AE3D_VK_FRAMES * AE3D_VK_MAX_TEXTURES * 2;
     sizes[3].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -3200,7 +3398,8 @@ static VkDescriptorSet ae3d_vk_set_for(int frame, int texture_handle, int normal
     VkDescriptorImageInfo shadow;
     VkDescriptorImageInfo bumps;
     VkDescriptorImageInfo bank;
-    VkWriteDescriptorSet writes[6];
+    VkDescriptorImageInfo lamps;
+    VkWriteDescriptorSet writes[7];
     VkWriteDescriptorSetAccelerationStructureKHR structure;
     unsigned write_count = 5;
     ae3d_vk_texture *texture;
@@ -3340,6 +3539,24 @@ static VkDescriptorSet ae3d_vk_set_for(int frame, int texture_handle, int normal
         writes[5].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         write_count = 6;
     }
+    /* Binding 8 is the lamps' shadow atlas, or the default texture before
+       it is made; the shader reads it only where a lamp has a slot. */
+    memset(&lamps, 0, sizeof(lamps));
+    lamps.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    if (vk.lamp_view) {
+        lamps.imageView = vk.lamp_view;
+        lamps.sampler = vk.lamp_sampler;
+    } else {
+        lamps.imageView = vk.textures[vk.default_texture - 1].view;
+        lamps.sampler = vk.textures[vk.default_texture - 1].sampler;
+    }
+    writes[write_count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[write_count].dstSet = set;
+    writes[write_count].dstBinding = 8;
+    writes[write_count].descriptorCount = 1;
+    writes[write_count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[write_count].pImageInfo = &lamps;
+    write_count++;
     ae3d_vkUpdateDescriptorSets(vk.device, write_count, writes, 0, NULL);
     ae3d_vk_write_clusters(set, frame);
 
@@ -4109,6 +4326,10 @@ int ae3d_vk_init(void *win, int width, int height) {
     if (!ae3d_vk_create_render_pass()) return 0;
     if (!ae3d_vk_create_framebuffers()) return 0;
     if (!ae3d_vk_create_commands()) return 0;
+    /* The lamps' atlas is cleared through a one-off command buffer, so it
+       is made once there is a pool to take one from, and before any set
+       is written: every scene set names it. */
+    if (!ae3d_vk_create_lamp_target()) return 0;
     if (!ae3d_vk_create_descriptors()) return 0;
     if (!ae3d_vk_create_defaults()) return 0;
     if (!ae3d_vk_create_pipeline()) return 0;
@@ -4186,6 +4407,12 @@ static void ae3d_vk_open_scene_pass(void) {
     VkRect2D scissor;
 
     if (vk.pass_open) return;
+    /* A cascades' atlas no pass has run over yet -- the key light has been
+       a lamp since it was made -- is taken through one, empty, so the lit
+       pass samples a cleared map in the layout it reads it in. */
+    if (vk.shadow_enabled && vk.shadow_framebuffer && !vk.shadow_ready && ae3d_vk_shadow_begin()) {
+        ae3d_vk_shadow_end();
+    }
     ae3d_vk_stamp_through(1);
 
     memset(clears, 0, sizeof(clears));
@@ -5843,6 +6070,8 @@ int ae3d_vk_shadow_begin(void) {
     pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     pass.renderPass = vk.shadow_pass;
     pass.framebuffer = vk.shadow_framebuffer;
+    /* The pass leaves the atlas readable, whatever it draws. */
+    vk.shadow_ready = 1;
     pass.renderArea.extent.width = AE3D_VK_SHADOW_SIZE;
     pass.renderArea.extent.height = AE3D_VK_SHADOW_SIZE;
     pass.clearValueCount = 1;
@@ -5863,6 +6092,141 @@ int ae3d_vk_shadow_begin(void) {
     vk.pass_open = 1;
     return 1;
 }
+
+/* The lamps' atlas pass (ae3d.lampshadows): opened on the atlas as it
+   was left, for lamp_shadow_tile to clear and draw a face at a time, and
+   closed by ae3d_vk_shadow_end like the shadow pass. */
+int ae3d_vk_lamp_shadow_begin(void) {
+    VkRenderPassBeginInfo pass;
+
+    if (!vk.recording || !vk.lamp_framebuffer) return 0;
+    if (vk.pass_open) return 0;
+    memset(&pass, 0, sizeof(pass));
+    pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    pass.renderPass = vk.lamp_pass;
+    pass.framebuffer = vk.lamp_framebuffer;
+    pass.renderArea.extent.width = AE3D_VK_LAMP_SHADOW_SIZE;
+    pass.renderArea.extent.height = AE3D_VK_LAMP_SHADOW_SIZE;
+    ae3d_vkCmdBeginRenderPass(vk.command_buffers[vk.frame], &pass, VK_SUBPASS_CONTENTS_INLINE);
+    vk.in_shadow_pass = 1;
+    vk.pass_open = 1;
+    return 1;
+}
+
+/* A face's tile of the lamps' atlas: the draws that follow land in it, and
+   it is cleared to the far plane first, the rest of the atlas left. */
+void ae3d_vk_lamp_shadow_tile(int x, int y, int size) {
+    VkClearAttachment clear;
+    VkClearRect rect;
+    if (!vk.recording || !vk.in_shadow_pass) return;
+    ae3d_vk_shadow_viewport(x, y, size);
+    memset(&clear, 0, sizeof(clear));
+    clear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    clear.clearValue.depthStencil.depth = 1.0f;
+    memset(&rect, 0, sizeof(rect));
+    rect.rect.offset.x = x;
+    rect.rect.offset.y = y;
+    rect.rect.extent.width = (unsigned)size;
+    rect.rect.extent.height = (unsigned)size;
+    rect.layerCount = 1;
+    ae3d_vkCmdClearAttachments(vk.command_buffers[vk.frame], 1, &clear, 1, &rect);
+}
+
+/* The lamps' static layer's pass: as the atlas's, on the layer beneath. */
+int ae3d_vk_lamp_static_begin(void) {
+    VkRenderPassBeginInfo pass;
+
+    if (!vk.recording || !vk.lamp_static_framebuffer) return 0;
+    if (vk.pass_open) return 0;
+    memset(&pass, 0, sizeof(pass));
+    pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    pass.renderPass = vk.lamp_pass;
+    pass.framebuffer = vk.lamp_static_framebuffer;
+    pass.renderArea.extent.width = AE3D_VK_LAMP_SHADOW_SIZE;
+    pass.renderArea.extent.height = AE3D_VK_LAMP_SHADOW_SIZE;
+    ae3d_vkCmdBeginRenderPass(vk.command_buffers[vk.frame], &pass, VK_SUBPASS_CONTENTS_INLINE);
+    vk.in_shadow_pass = 1;
+    vk.pass_open = 1;
+    return 1;
+}
+
+/* `count` tiles of `size` texels, their corners at `corners` (x then y,
+   from the atlas's first row), copied from the static layer into the
+   atlas the shader reads: outside any pass, after the static layer's pass
+   wrote them and before the atlas's pass draws what moves over them. */
+void ae3d_vk_lamp_copy(const int *corners, int count, int size) {
+    VkImageMemoryBarrier barriers[2];
+    VkImageCopy *regions;
+    VkCommandBuffer commands;
+    int i;
+
+    if (!vk.recording || vk.pass_open || count <= 0 || !corners) return;
+    regions = (VkImageCopy *)calloc((size_t)count, sizeof(VkImageCopy));
+    if (!regions) return;
+    for (i = 0; i < count; i++) {
+        regions[i].srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        regions[i].srcSubresource.layerCount = 1;
+        regions[i].dstSubresource = regions[i].srcSubresource;
+        regions[i].srcOffset.x = corners[i * 2];
+        regions[i].srcOffset.y = corners[i * 2 + 1];
+        regions[i].dstOffset = regions[i].srcOffset;
+        regions[i].extent.width = (unsigned)size;
+        regions[i].extent.height = (unsigned)size;
+        regions[i].extent.depth = 1;
+    }
+    commands = vk.command_buffers[vk.frame];
+
+    /* The static layer, written by its pass, is read by the copy; the atlas,
+       read by last frame's lit pass and written by its own pass, is
+       written by it. */
+    memset(barriers, 0, sizeof(barriers));
+    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    barriers[0].subresourceRange.levelCount = 1;
+    barriers[0].subresourceRange.layerCount = 1;
+    barriers[1] = barriers[0];
+    barriers[0].image = vk.lamp_static_image;
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barriers[0].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barriers[1].image = vk.lamp_image;
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    ae3d_vkCmdPipelineBarrier(commands,
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                              VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, barriers);
+    ae3d_vkCmdCopyImage(commands, vk.lamp_static_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        vk.lamp_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (unsigned)count, regions);
+    /* Back to the layout both passes and the lit pass take them in: the
+       atlas's copied depths for the draws over them and the lit pass's
+       reads, the static layer's reads done before its pass writes it
+       again. */
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[0].srcAccessMask = 0;
+    barriers[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barriers[1].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    ae3d_vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                              0, 0, NULL, 0, NULL, 2, barriers);
+    free(regions);
+}
+
+/* How many times the atlas has been made: its faces hold nothing drawn
+   before the last. */
+int ae3d_vk_lamp_shadow_generation(void) { return vk.lamp_generation; }
 
 /* The tile of the atlas the next shadow draws land in: `size` texels a
    side from (x, y), measured from the atlas's first row -- a cascade's
@@ -7154,6 +7518,8 @@ void ae3d_vk_shutdown(void) {
     if (vk.post_pass) ae3d_vkDestroyRenderPass(vk.device, vk.post_pass, NULL);
     if (vk.ssr_pass) ae3d_vkDestroyRenderPass(vk.device, vk.ssr_pass, NULL);
     if (vk.shadow_pass) ae3d_vkDestroyRenderPass(vk.device, vk.shadow_pass, NULL);
+    ae3d_vk_destroy_lamp_target();
+    if (vk.lamp_pass) ae3d_vkDestroyRenderPass(vk.device, vk.lamp_pass, NULL);
     if (vk.camdepth_pass) ae3d_vkDestroyRenderPass(vk.device, vk.camdepth_pass, NULL);
     if (vk.shadow_pipeline) ae3d_vkDestroyPipeline(vk.device, vk.shadow_pipeline, NULL);
     ae3d_vk_destroy_shadow_target();

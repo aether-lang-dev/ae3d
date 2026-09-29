@@ -1,0 +1,486 @@
+// The lamps' own shadows (#490).
+//
+// A lamp had no shadow map. The shader multiplied every lamp's light by the
+// key light's shadow instead: a wall in the moon's shadow went dark under
+// the lamp beside it, a figure lit by three lamps threw no shadow from any
+// of them, and a street whose key light was a lamp -- zombie_street's --
+// was shadowed along one direction from the lamp to wherever the camera
+// looked, so the shadows swung as the camera moved. Now no light is
+// shadowed by another's map: the key light keeps its cascades when it is
+// the sun or the moon, and the lamps chosen here each get a map of their
+// own, drawn from where they stand.
+//
+// A lamp shines every way, so its map is the six faces of a cube around
+// it, each a 90-degree perspective view FACE texels square. They share a
+// depth atlas, ACROSS by ACROSS tiles; lamp slot s's face f is the tile
+// s * FACES + f, at (tile % ACROSS, tile / ACROSS). SLOTS lamps a frame fit
+// in it:
+//
+//   - the key light, when it is a lamp, always;
+//   - then the lamps whose light can reach what the camera sees, the
+//     nearest first, as long as they stand within the range asked for.
+//
+// A lamp past them is not shadowed at all -- never shadowed by another
+// light -- and the last fifth of the range fades a lamp's shadow out, so
+// one leaving the budget does not pop. A lamp keeps its slot from frame to
+// frame while it stays chosen.
+//
+// A street's casters mostly stand still, and a face is drawn in two
+// layers so that what stands still is drawn once. The static casters --
+// plain models, whose world stamp says when they move -- go into a static
+// atlas, and each face remembers what stood in it the last time (a
+// signature of its casters and their stamps): drawn again only when that
+// changes. The shader reads the other atlas, whose tile is the static
+// one copied, with what moves on its own -- a skinned figure, a crowd, an
+// instance stream -- drawn over it every frame it is there. A lamp over a
+// walking figure costs a copy and a draw a face, not its street again.
+//
+// Everything the shader needs per slot goes after the clustered lamps in
+// the lights' data (write_slots), SLOT_VEC4S vec4s a slot:
+//
+//   position.xyz, far       where the lamp stands, and how far its map reaches
+//   strength, near, 0, 0    how much of its shadow shows; the maps' near plane
+//   the six faces' matrices, four columns each
+//
+// The matrices are OpenGL's -- clip z from -1 to 1, y up -- and the Vulkan
+// renderer corrects them as it writes them, as it does every matrix that
+// reaches clip space. The shader's side is lamp_shadow in ae3d.shaders.
+
+import std.list
+import ae3d.core
+import ae3d.lightgrid
+
+exports (
+    LampShadows, lamps_new, lamps_free, choose, slot_count, lamp_of, slot_of,
+    strength_of, far_of, face_matrix, face_tile, casts_onto, face_signature,
+    static_stale, static_drawn, statics_drawn, moving_was, set_moving, write_slots,
+    FACE, ATLAS, ACROSS, SLOTS, FACES, NEAR, SLOT_VEC4S, FADE
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern sqrt(x: float) -> float
+
+const FACE = 512
+const ATLAS = 4096
+const ACROSS = 8
+const SLOTS = 10
+const FACES = 6
+// The maps' near plane, in metres from the lamp. A lamp hangs inside its
+// fitting -- the head, the arm -- and a map that drew it would shadow the
+// whole street with the fitting's grain; the rays stop the same distance
+// short of the light for the same reason (ray_lamp_factor).
+const NEAR = 0.6
+const SLOT_VEC4S = 26
+// The share of the range, at its far end, over which a lamp's shadow fades.
+const FADE = 0.2
+const PI = 3.14159265358979
+
+struct LampShadows {
+    chosen: ptr                  // *Light list, slot order; null where a slot is free
+    positions: ptr               // float[SLOTS * 3]
+    fars: ptr                    // float[SLOTS]: the lamp's reach, its maps' far plane
+    strengths: ptr               // float[SLOTS]
+    matrices: ptr                // Mat4[SLOTS * FACES]
+    // What each face's static layer held the last time it was drawn,
+    // whether it has been drawn at all since its slot was given out, and
+    // whether anything moving was drawn over it last frame.
+    signatures: ptr              // long[SLOTS * FACES]
+    drawn: ptr                   // int[SLOTS * FACES]
+    moving: ptr                  // int[SLOTS * FACES]
+    count: int                   // slots in use this frame
+    drawn_now: int               // static layers drawn this frame
+    // Scratch for the choice: candidates and their distances.
+    candidates: ptr
+    distances: ptr               // float[candidate_capacity]
+    candidate_capacity: int
+}
+
+lamps_new() -> *LampShadows {
+    s = calloc(1, sizeof(LampShadows)) as *LampShadows
+    s.chosen = list.new()
+    i = 0
+    while i < SLOTS {
+        list.add_raw(s.chosen, null)
+        i = i + 1
+    }
+    s.positions = calloc(SLOTS * 3, 8)
+    s.fars = calloc(SLOTS, 8)
+    s.strengths = calloc(SLOTS, 8)
+    s.matrices = calloc(SLOTS * FACES, sizeof(Mat4))
+    s.signatures = calloc(SLOTS * FACES, 8)
+    s.drawn = calloc(SLOTS * FACES, 4)
+    s.moving = calloc(SLOTS * FACES, 4)
+    s.candidates = list.new()
+    s.candidate_capacity = 64
+    s.distances = calloc(s.candidate_capacity, 8)
+    return s
+}
+
+lamps_free(s: *LampShadows) {
+    if s == null { return }
+    list.free(s.chosen)
+    free(s.positions)
+    free(s.fars)
+    free(s.strengths)
+    free(s.matrices)
+    free(s.signatures)
+    free(s.drawn)
+    free(s.moving)
+    list.free(s.candidates)
+    free(s.distances)
+    free(s as ptr)
+}
+
+slot_count(s: *LampShadows) -> int { return s.count }
+lamp_of(s: *LampShadows, slot: int) -> *Light { return list.get_raw(s.chosen, slot) as *Light }
+strength_of(s: *LampShadows, slot: int) -> float { return (s.strengths as float[])[slot] }
+far_of(s: *LampShadows, slot: int) -> float { return (s.fars as float[])[slot] }
+
+// The slot `l` holds this frame, or -1.
+slot_of(s: *LampShadows, l: *Light) -> int {
+    if s == null || l == null { return 0 - 1 }
+    i = 0
+    while i < SLOTS {
+        if list.get_raw(s.chosen, i) == l as ptr { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+face_matrix(s: *LampShadows, slot: int, face: int) -> Mat4 {
+    return (s.matrices as Mat4[])[slot * FACES + face]
+}
+
+// The atlas tile of a slot's face.
+face_tile(slot: int, face: int) -> int { return slot * FACES + face }
+
+// Which way face f looks, and which way is up in it: +x, -x, +y, -y, +z,
+// -z, the cube map's own order and orientation.
+face_direction(face: int) -> Vec3 {
+    if face == 0 { return core.vec3(1.0, 0.0, 0.0) }
+    if face == 1 { return core.vec3(0.0 - 1.0, 0.0, 0.0) }
+    if face == 2 { return core.vec3(0.0, 1.0, 0.0) }
+    if face == 3 { return core.vec3(0.0, 0.0 - 1.0, 0.0) }
+    if face == 4 { return core.vec3(0.0, 0.0, 1.0) }
+    return core.vec3(0.0, 0.0, 0.0 - 1.0)
+}
+
+face_up(face: int) -> Vec3 {
+    if face == 2 { return core.vec3(0.0, 0.0, 1.0) }
+    if face == 3 { return core.vec3(0.0, 0.0, 0.0 - 1.0) }
+    return core.vec3(0.0, 0.0 - 1.0, 0.0)
+}
+
+// This frame's lamps: of `lights`, the key light when it is a lamp, then
+// the lamps whose light reaches into the camera's view, nearest the camera
+// first, while they stand within `range` metres of it (their sphere's
+// nearest point). A lamp whose light lies wholly within `inner` metres of
+// the camera is left out, the key light too: there the rays shade every
+// pixel (a device that traces, out to its ray reach), and a map would be
+// drawn for none. A lamp still chosen keeps last frame's slot.
+choose(s: *LampShadows, lights: ptr, key: *Light, cam: *Camera, range: float, inner: float) {
+    s.drawn_now = 0
+    list.clear(s.candidates)
+    frustum = core.camera_frustum(cam)
+    unbounded = cam.far * 2.0
+    if lights != null {
+        i = 0
+        while i < list.size(lights) {
+            l = list.get_raw(lights, i) as *Light
+            if l != null && l.mode != core.MODE_DIRECTIONAL {
+                reach = lightgrid.reach(l, unbounded)
+                apart = core.v3_len(core.v3_sub(l.position, cam.position))
+                gap = apart - reach
+                if gap < 0.0 { gap = 0.0 }
+                seen = core.frustum_intersects_sphere(&frustum, l.position, reach)
+                traced = inner > 0.0 && apart + reach <= inner
+                if !traced && (l == key || (seen && gap < range)) {
+                    grow(s, list.size(s.candidates) + 1)
+                    (s.distances as float[])[list.size(s.candidates)] = gap
+                    list.add_raw(s.candidates, l as ptr)
+                }
+            }
+            i = i + 1
+        }
+    }
+    // The key light, when it is a lamp, whether or not it is in the list.
+    key_traced = false
+    if key != null && inner > 0.0 {
+        key_traced = core.v3_len(core.v3_sub(key.position, cam.position)) + lightgrid.reach(key, unbounded) <= inner
+    }
+    if key != null && key.mode != core.MODE_DIRECTIONAL && !key_traced &&
+       !among(s.candidates, list.size(s.candidates), key as ptr) {
+        grow(s, list.size(s.candidates) + 1)
+        (s.distances as float[])[list.size(s.candidates)] = 0.0
+        list.add_raw(s.candidates, key as ptr)
+    }
+    // The key first, then by distance: an insertion sort, the lists being a
+    // street's lamps and not thousands.
+    n = list.size(s.candidates)
+    d = s.distances as float[]
+    i = 0
+    while i < n {
+        if list.get_raw(s.candidates, i) == key as ptr { d[i] = 0.0 - 1.0 }
+        i = i + 1
+    }
+    i = 1
+    while i < n {
+        j = i
+        while j > 0 && d[j - 1] > d[j] {
+            t = d[j - 1]
+            d[j - 1] = d[j]
+            d[j] = t
+            a = list.get_raw(s.candidates, j - 1)
+            list.set(s.candidates, j - 1, list.get_raw(s.candidates, j))
+            list.set(s.candidates, j, a)
+            j = j - 1
+        }
+        i = i + 1
+    }
+    if n > SLOTS { n = SLOTS }
+
+    // Slots whose lamp is no longer among the chosen are freed; the rest
+    // keep theirs, and the newly chosen take the free ones.
+    slot = 0
+    while slot < SLOTS {
+        held = list.get_raw(s.chosen, slot)
+        if held != null && !among(s.candidates, n, held) {
+            list.set(s.chosen, slot, null)
+        }
+        slot = slot + 1
+    }
+    i = 0
+    while i < n {
+        l = list.get_raw(s.candidates, i) as *Light
+        if slot_of(s, l) < 0 {
+            free_slot = 0
+            while free_slot < SLOTS && list.get_raw(s.chosen, free_slot) != null { free_slot = free_slot + 1 }
+            list.set(s.chosen, free_slot, l as ptr)
+            forget(s, free_slot)
+        }
+        i = i + 1
+    }
+
+    s.count = 0
+    slot = 0
+    while slot < SLOTS {
+        l = list.get_raw(s.chosen, slot) as *Light
+        if l != null {
+            s.count = s.count + 1
+            place(s, slot, l, unbounded, key, cam, range)
+        }
+        slot = slot + 1
+    }
+}
+
+among(candidates: ptr, n: int, l: ptr) -> bool {
+    i = 0
+    while i < n {
+        if list.get_raw(candidates, i) == l { return true }
+        i = i + 1
+    }
+    return false
+}
+
+grow(s: *LampShadows, n: int) {
+    if n <= s.candidate_capacity { return }
+    old = s.distances
+    capacity = s.candidate_capacity * 2
+    while capacity < n { capacity = capacity * 2 }
+    s.distances = calloc(capacity, 8)
+    i = 0
+    while i < s.candidate_capacity {
+        (s.distances as float[])[i] = (old as float[])[i]
+        i = i + 1
+    }
+    free(old)
+    s.candidate_capacity = capacity
+}
+
+// A slot given to another lamp: none of its faces holds anything yet.
+forget(s: *LampShadows, slot: int) {
+    f = 0
+    while f < FACES {
+        (s.drawn as int[])[slot * FACES + f] = 0
+        (s.moving as int[])[slot * FACES + f] = 0
+        f = f + 1
+    }
+}
+
+// A slot's lamp this frame: where it stands, how far its maps reach, how
+// much of its shadow shows, and its faces' matrices. A lamp that moved or
+// changed its reach has faces to draw again.
+place(s: *LampShadows, slot: int, l: *Light, unbounded: float, key: *Light, cam: *Camera, range: float) {
+    reach = lightgrid.reach(l, unbounded)
+    if reach < NEAR * 2.0 { reach = NEAR * 2.0 }
+    at = s.positions as float[]
+    fars = s.fars as float[]
+    if at[slot * 3] != l.position.x || at[slot * 3 + 1] != l.position.y ||
+       at[slot * 3 + 2] != l.position.z || fars[slot] != reach {
+        forget(s, slot)
+    }
+    at[slot * 3] = l.position.x
+    at[slot * 3 + 1] = l.position.y
+    at[slot * 3 + 2] = l.position.z
+    fars[slot] = reach
+
+    strength = 1.0
+    if l != key && range > 0.0 {
+        gap = core.v3_len(core.v3_sub(l.position, cam.position)) - reach
+        if gap < 0.0 { gap = 0.0 }
+        start = range * (1.0 - FADE)
+        if gap > start { strength = 1.0 - (gap - start) / (range * FADE) }
+        if strength < 0.0 { strength = 0.0 }
+    }
+    (s.strengths as float[])[slot] = strength
+
+    projection = core.mat4_perspective(PI * 0.5, 1.0, NEAR, reach)
+    f = 0
+    while f < FACES {
+        view = core.mat4_look_at(l.position, core.v3_add(l.position, face_direction(f)), face_up(f))
+        (s.matrices as Mat4[])[slot * FACES + f] = core.mat4_mul(projection, view)
+        f = f + 1
+    }
+}
+
+// Whether a caster standing in the sphere at `centre` of `radius` can be
+// in slot's face f: inside the lamp's reach, past its near plane, and
+// within the face's four 90-degree sides.
+casts_onto(s: *LampShadows, slot: int, face: int, centre: Vec3, radius: float) -> bool {
+    at = s.positions as float[]
+    v = core.v3_sub(centre, core.vec3(at[slot * 3], at[slot * 3 + 1], at[slot * 3 + 2]))
+    far = (s.fars as float[])[slot]
+    if core.v3_len(v) - radius > far { return false }
+    look = face_direction(face)
+    up = face_up(face)
+    side = core.v3_cross(look, up)
+    along = core.v3_dot(v, look)
+    if along + radius < NEAR { return false }
+    // A side of the face is the plane where |across| = along; the sphere is
+    // outside it when it lies more than its radius beyond, measured along
+    // the plane's normal (a 45-degree plane: a factor of the square root
+    // of two).
+    reach = radius * 1.41421356
+    across = core.v3_dot(v, side)
+    if across - along > reach || 0.0 - across - along > reach { return false }
+    upward = core.v3_dot(v, up)
+    if upward - along > reach || 0.0 - upward - along > reach { return false }
+    return true
+}
+
+// A face's signature from what stands in it: each caster's serial and
+// how many times it has moved, folded in order into a polynomial hash
+// modulo the prime 2^31 - 1 -- every product stays under 2^51, so nothing
+// overflows. Callers fold every caster the face draws through this,
+// starting from 0.
+const HASH_PRIME = 2147483647
+const HASH_BASE = 1000003
+
+face_signature(sig: long, identity: long, stamp: long) -> long {
+    x = identity % HASH_PRIME
+    if x < 0 { x = x + HASH_PRIME }
+    y = stamp % HASH_PRIME
+    if y < 0 { y = y + HASH_PRIME }
+    h = (sig * HASH_BASE + x) % HASH_PRIME
+    return (h * HASH_BASE + y) % HASH_PRIME
+}
+
+// Whether a face's static layer has to be drawn this frame: never drawn
+// since its slot was given out or its lamp moved, or what stands still in
+// it is not what stood there when it was.
+static_stale(s: *LampShadows, slot: int, face: int, sig: long) -> bool {
+    at = slot * FACES + face
+    if (s.drawn as int[])[at] == 0 { return true }
+    return (s.signatures as long[])[at] != sig
+}
+
+// That a face's static layer was drawn with what stood in it.
+static_drawn(s: *LampShadows, slot: int, face: int, sig: long) {
+    s.drawn_now = s.drawn_now + 1
+    at = slot * FACES + face
+    (s.drawn as int[])[at] = 1
+    (s.signatures as long[])[at] = sig
+}
+
+// How many static layers were drawn this frame: none, in a scene where
+// nothing that stands still moved since the last.
+statics_drawn(s: *LampShadows) -> int { return s.drawn_now }
+
+// Whether something moving was drawn over a face last frame -- its tile
+// holds it until the static layer is copied back -- and that this frame's
+// was, or was not.
+moving_was(s: *LampShadows, slot: int, face: int) -> bool {
+    return (s.moving as int[])[slot * FACES + face] == 1
+}
+
+set_moving(s: *LampShadows, slot: int, face: int, on: bool) {
+    v = 0
+    if on { v = 1 }
+    (s.moving as int[])[slot * FACES + face] = v
+}
+
+// The slots, as the shader reads them, into `out` (f32, SLOT_VEC4S vec4s a
+// slot, SLOTS slots, unused ones left as they were). `clip` corrects each
+// matrix for Vulkan's clip space: y down and z from 0 to 1.
+write_slots(s: *LampShadows, out: ptr, clip: bool) {
+    o = out as f32[]
+    at = s.positions as float[]
+    slot = 0
+    while slot < SLOTS {
+        if list.get_raw(s.chosen, slot) != null {
+            base = slot * SLOT_VEC4S * 4
+            o[base] = at[slot * 3] as f32
+            o[base + 1] = at[slot * 3 + 1] as f32
+            o[base + 2] = at[slot * 3 + 2] as f32
+            o[base + 3] = (s.fars as float[])[slot] as f32
+            o[base + 4] = (s.strengths as float[])[slot] as f32
+            o[base + 5] = NEAR as f32
+            o[base + 6] = 0.0 as f32
+            o[base + 7] = 0.0 as f32
+            f = 0
+            while f < FACES {
+                m = face_matrix(s, slot, f)
+                if clip { m = clip_corrected(m) }
+                write_matrix(o, base + 8 + f * 16, m)
+                f = f + 1
+            }
+        }
+        slot = slot + 1
+    }
+}
+
+// The Vulkan clip correction, as ae3d_vk_scene_set_clip_mat4 makes it:
+// every column's y negated and its z taken halfway to its w.
+clip_corrected(m: Mat4) -> Mat4 {
+    c = m
+    c.m1 = 0.0 - m.m1
+    c.m5 = 0.0 - m.m5
+    c.m9 = 0.0 - m.m9
+    c.m13 = 0.0 - m.m13
+    c.m2 = 0.5 * (m.m2 + m.m3)
+    c.m6 = 0.5 * (m.m6 + m.m7)
+    c.m10 = 0.5 * (m.m10 + m.m11)
+    c.m14 = 0.5 * (m.m14 + m.m15)
+    return c
+}
+
+// Column-major, as the shader builds a mat4 from four vec4 columns.
+write_matrix(o: f32[], at: int, m: Mat4) {
+    o[at] = m.m0 as f32
+    o[at + 1] = m.m1 as f32
+    o[at + 2] = m.m2 as f32
+    o[at + 3] = m.m3 as f32
+    o[at + 4] = m.m4 as f32
+    o[at + 5] = m.m5 as f32
+    o[at + 6] = m.m6 as f32
+    o[at + 7] = m.m7 as f32
+    o[at + 8] = m.m8 as f32
+    o[at + 9] = m.m9 as f32
+    o[at + 10] = m.m10 as f32
+    o[at + 11] = m.m11 as f32
+    o[at + 12] = m.m12 as f32
+    o[at + 13] = m.m13 as f32
+    o[at + 14] = m.m14 as f32
+    o[at + 15] = m.m15 as f32
+}

@@ -112,6 +112,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float causticsWaterLevel;
     float causticsDepth;
     float causticsTime;
+    int lampShadowBase;
+    int keyLampSlot;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -250,7 +252,7 @@ int cluster_of(vec3 p) {
 }
 
 // Lamp `i` of the clusters, as the Light the shading takes, and its reach.
-Light clustered_light(int i, out float reach) {
+Light clustered_light(int i, out float reach, out int shadowSlot) {
     vec4 a = cluster_light(i * 5);
     vec4 b = cluster_light(i * 5 + 1);
     vec4 c = cluster_light(i * 5 + 2);
@@ -270,6 +272,9 @@ Light clustered_light(int i, out float reach) {
     L.spotCosOuter = e.x;
     L.spotCosInner = e.y;
     L.ambientStrength = 0.0;
+    // The lamp's own shadow's slot (ae3d.lampshadows), or -1: -1.0 read
+    // back rounds toward zero, so it is rounded from below.
+    shadowSlot = int(floor(e.z + 0.5));
     return L;
 }
 // The crowd's far tier as pictures (see VERTEX_CROWD): a picture is cut out
@@ -539,6 +544,97 @@ float shadow_factor() {
         }
     }
     return mix(shadowIntensity, 1.0, lit);
+}
+
+// The lamps' own shadows (ae3d.lampshadows, #490). A lamp is shadowed by its
+// own map and by no other light's: a lamp given a slot has the six faces of
+// a cube drawn around it, 90-degree views LAMP_FACE texels square, in one
+// atlas LAMP_ACROSS tiles a side, slot s's face f the tile s * 6 + f. The
+// slots follow the lamps in the lights' data from lampShadowBase on,
+// LAMP_SLOT_VEC4S vec4s each: position and far plane; strength and near
+// plane; the six faces' matrices. keyLampSlot is the key light's slot when
+// the key light is a lamp -- its cascades are for the sun and the moon --
+// and -1 otherwise, as lampShadowBase is where no lamp has a map.
+#define LAMP_ACROSS 8
+#define LAMP_FACE 512.0
+#define LAMP_SLOT_VEC4S 26
+
+
+#ifdef VULKAN
+layout(set = 0, binding = 8) uniform sampler2D lampShadowMap;
+#else
+
+#endif
+
+// A depth a lamp's face stores, 0 at its near plane and 1 at its far one,
+// as the distance along the face's axis it stands for.
+float lamp_distance(float depth, float near, float far) {
+    return near * far / (far - depth * (far - near));
+}
+
+// How much of lamp slot `slot`'s light reaches this point past what stands
+// in its way: 1 lit, the shadow's share of the light behind a caster, and
+// the lamp's strength -- its shadow fading out where the budget of lamps
+// runs out -- between. The face is the one the point lies in from the lamp.
+// As with the cascades, the sample moves off the surface along its normal
+// by a texel of the face at that distance, and more on a surface the lamp
+// grazes; the depths are compared in metres from the lamp, since a
+// perspective map's depth crowds toward its far plane.
+float lamp_shadow(int slot, vec3 surface) {
+    int base = lampShadowBase + slot * LAMP_SLOT_VEC4S;
+    vec4 head = cluster_light(base);
+    vec4 more = cluster_light(base + 1);
+    vec3 v = FragPos - head.xyz;
+    float far = head.w;
+    float strength = more.x;
+    float near = more.y;
+    vec3 a = abs(v);
+    int face;
+    float along;
+    if (a.x >= a.y && a.x >= a.z) {
+        face = v.x > 0.0 ? 0 : 1;
+        along = a.x;
+    } else if (a.y >= a.z) {
+        face = v.y > 0.0 ? 2 : 3;
+        along = a.y;
+    } else {
+        face = v.z > 0.0 ? 4 : 5;
+        along = a.z;
+    }
+    if (strength <= 0.0 || along >= far || along <= near) {
+        return 1.0;
+    }
+    vec3 toLamp = -v / max(length(v), 0.0001);
+    float facing = max(dot(surface, toLamp), 0.0);
+    float slope = min(sqrt(1.0 - facing * facing) / max(facing, 0.02), 32.0);
+    float texelWorld = 2.0 * along / LAMP_FACE;
+    int m = base + 2 + face * 4;
+    mat4 faceMatrix = mat4(cluster_light(m), cluster_light(m + 1), cluster_light(m + 2), cluster_light(m + 3));
+    vec4 lightSpace = faceMatrix * vec4(FragPos + surface * texelWorld * (1.0 + slope), 1.0);
+    vec3 projected = lightSpace.xyz / lightSpace.w;
+    // A sample moved off the surface near a face's edge can leave the face;
+    // it is read at the edge of the one the point lies in.
+    projected.xy = clamp(projected.xy * 0.5 + 0.5, 0.0, 1.0);
+    float mine = lamp_distance(light_depth(projected.z), near, far);
+
+    int tile = slot * 6 + face;
+    float share = 1.0 / float(LAMP_ACROSS);
+    vec2 origin = vec2(float(tile % LAMP_ACROSS), float(tile / LAMP_ACROSS)) * share;
+    vec2 texel = 1.0 / vec2(textureSize(lampShadowMap, 0));
+    float radius = max(shadowSoftness, 1.0);
+    vec2 centre = origin + projected.xy * share;
+    vec2 lo = origin + texel * (radius + 0.5);
+    vec2 hi = origin + vec2(share) - texel * (radius + 0.5);
+    float bias = texelWorld * 1.5;
+    float lit = 0.0;
+    for (int sx = -1; sx <= 1; sx++) {
+        for (int sy = -1; sy <= 1; sy++) {
+            vec2 at = clamp(centre + vec2(float(sx), float(sy)) * texel * radius, lo, hi);
+            float closest = lamp_distance(texture(lampShadowMap, at).r, near, far);
+            lit += mine - bias > closest ? 0.0 : 1.0;
+        }
+    }
+    return mix(1.0, mix(shadowIntensity, 1.0, lit / 9.0), strength);
 }
 
 #ifdef AE3D_RAY_QUERY
@@ -1384,14 +1480,16 @@ void main() {
     // A shadow takes the direct light and leaves the sky's fill alone:
     // multiplied over the whole colour, ambient included, as it was, a
     // shadow went to a third of black and the shadowed side of a hill at
-    // dusk was a hole in the picture. The one shadow map is the key
-    // light's, and it is applied to every light's direct term all the
-    // same: a lamp has no map of its own, and what stands in the key
-    // light's shadow is what stands in the way of the lamp too, near
-    // enough that a figure on a lamp-lit road keeps a shadow under it.
-    // The clouds' shadow is the key light's alone.
+    // dusk was a hole in the picture. And a light is shadowed by its own
+    // map and no other's (#490): the key light by its cascades when it is
+    // the sun or the moon and by its own cube when it is a lamp; a lamp of
+    // the clusters by its own cube where it has one, and not at all where
+    // it has none; the other directional lights, the fills, not at all. A
+    // lamp shadowed by the moon's map put out the wall beside it wherever
+    // the moon did not reach. The clouds' shadow is the key light's alone.
     float shaded = 1.0;
     if (hasShadowMap && enableShadows) shaded = shadow_factor();
+    if (keyLampSlot >= 0 && lampShadowBase >= 0 && enableShadows) shaded = lamp_shadow(keyLampSlot, normalize(Normal));
 #ifdef AE3D_RAY_QUERY
     bool traced = rayShadows == 1 && (rayReach <= 0.0 || distance(FragPos, viewPos) < rayReach);
     if (traced && enableShadows) shaded = min(shaded, ray_shadow_factor());
@@ -1412,7 +1510,7 @@ void main() {
                 dot(normalize(-gap), normalize(lights[i].direction)) < lights[i].spotCosOuter) continue;
         }
         vec3 lit = direct_light(lights[i], norm, viewDir, albedo, F0, NdotV, adjustedRoughness);
-        Lo += (i == 0 ? lit * sunlit : lit) * shaded;
+        Lo += i == 0 ? lit * sunlit * shaded : lit;
     }
     if (clusterDims.w > 0.5) {
         int cell = cluster_of(FragPos);
@@ -1420,7 +1518,8 @@ void main() {
         int count = int(cluster_word(cell * 2 + 1) + 0.5);
         for (int k = 0; k < count; k++) {
             float reach;
-            Light L = clustered_light(int(cluster_word(first + k) + 0.5), reach);
+            int lampSlot;
+            Light L = clustered_light(int(cluster_word(first + k) + 0.5), reach, lampSlot);
             vec3 gap = L.position - FragPos;
             float far2 = dot(gap, gap);
             if (far2 >= reach * reach) continue;
@@ -1428,7 +1527,10 @@ void main() {
                 dot(normalize(-gap), normalize(L.direction)) < L.spotCosOuter) continue;
             float fade = 1.0 - smoothstep(CLUSTER_FADE_START * reach, reach, sqrt(far2));
             vec3 lit = direct_light(L, norm, viewDir, albedo, F0, NdotV, adjustedRoughness) * fade;
-            float shade = shaded;
+            float shade = 1.0;
+            if (lampSlot >= 0 && lampShadowBase >= 0 && enableShadows && dot(lit, vec3(0.333)) > 0.002) {
+                shade = lamp_shadow(lampSlot, normalize(Normal));
+            }
 #ifdef AE3D_RAY_QUERY
             // By ray a lamp throws its own shadow, where it reaches: past the
             // lamp's fall-off there is no light to shadow and no ray is cast.

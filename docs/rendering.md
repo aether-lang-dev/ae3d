@@ -322,10 +322,9 @@ ground and the wall's top do not, and off again the screen-space pass is
 back. In the city at 720p the opaque pass goes from 1.23 to 1.81 ms
 (best of five) and the 0.11 ms screen-space pass is skipped.
 
-Every lamp throws its own shadow by ray: a point light has no shadow
-map, and on the map path the key light's shadow stands in for every
-lamp's -- which on a night street is a figure lit from above by three
-lamps and shadowing nothing, floating on the road. With the rays on, each
+Every lamp throws its own shadow. On the map path each lamp the budget
+holds has a cube of maps of its own ([The lamps' own
+shadows](#the-lamps-own-shadows)); by ray, each
 point light that reaches a pixel casts one ray from the surface to a spot
 on the lamp's face (`engine_set_lamp_size`, the face's width in metres,
 twelve centimetres unless set), stopped sixty centimetres short of the
@@ -334,9 +333,9 @@ shadow the whole street with a grain. The spot turns by the golden angle
 every frame (`rayFrame`; the projection's jitter was tried for this and is
 a fraction of a pixel, which turned nothing), so the temporal pass folds
 the frames into the lamp's penumbra. `tests/test_ray_shadows` puts the sun
-out and a lamp over the ground beside the ball: on the map path the ground
-past the ball is lit as the ground under the lamp; by ray it goes dark
-(598 to 403) and the ground under the lamp stays. The city runs with the
+out and a lamp over the ground beside the ball: the ground past the ball
+goes from 598 with the ball casting nothing to 403, on the map path and by
+ray alike, and the ground under the lamp stays lit on both. The city runs with the
 rays on where the device traces, a light under every lamp head its tiles
 place (twenty-one lamps; the nearest fifteen light a frame), the wet road's
 reflection (`engine_set_ssr`), the occlusion by ray and the temporal pass:
@@ -565,6 +564,9 @@ It works by clustered shading (`ae3d.lightgrid`, #468).
   same floats from two textures.
 - **The rest.** The key light and any directional light reach every pixel
   and stay in the shader's small uniform array.
+- **The shadow.** A lamp's record carries the slot of its own shadow, or
+  -1 where it has none ([The lamps' own shadows](#the-lamps-own-shadows)),
+  and the slots' data follows the lamps in the same buffer.
 
 Held to numbers:
 - `tests/test_light_grid.ae`, headless:
@@ -581,6 +583,12 @@ Held to numbers:
     0.08 ms with 256.
 
 ## Shadows
+
+A light is shadowed by its own map and by no other light's. The key light,
+when it is the sun or the moon, is shadowed in cascades; every lamp the
+budget holds, the key light too when it is one, by a cube of its own
+([The lamps' own shadows](#the-lamps-own-shadows)); the other directional
+lights, the fills, not at all.
 
 The key light's shadow is drawn in cascades (`ae3d.cascades`, #469). One
 shadow map fitted around the camera and snapped on the world's axes slid by
@@ -603,7 +611,17 @@ past its distance there were no shadows at all.
   edge lands on the same texels whatever the camera does.
 - **The casters.** A map's depth runs back toward the light as far as the
   scene reaches, so what stands between the light and a slice still casts
-  into it. A caster whose bounds miss a cascade is not drawn into it.
+  into it. A caster is drawn into a cascade only where its shadow can land
+  on what that cascade shades: its slice of the view and the band of the
+  slice before that blends it in, put through the cascade's matrix and
+  widened by as far as the shader reads from a receiver (the normal
+  offset, up to 33.5 texels, and the filter's taps). Tested against the
+  sphere's whole square instead, a street's casters went into three and
+  four cascades each: `zombie_street`, its shadow reaching 18 m and its key
+  lamp still drawn in cascades then, drew 339 calls where one map drew 255,
+  and 250 with the test. Vulkan draws the casters kind by kind -- plain and batched,
+  skinned, crowds, point streams -- each into every cascade in turn, so each
+  pipeline is bound once.
 - **The seams.** The scene shader picks a pixel's cascade by its depth
   along the view and blends the next one in over the last tenth of each, so
   no seam shows where the texels change size.
@@ -621,6 +639,66 @@ Held to numbers:
 - `tests/test_engine_shadows.ae`: through the engine, a floating box's
   shadow darkens the ground under it by 42%, and lit ground beside it does
   not move.
+
+### The lamps' own shadows
+
+A lamp had no shadow map, and the shader multiplied every lamp's light by
+the key light's shadow instead (#490). A wall in the moon's shadow went dark
+under the lamp beside it; a figure lit by three lamps threw no shadow from
+any of them; and a street whose key light was a lamp -- `zombie_street`'s --
+was shadowed along one direction from the lamp to wherever the camera
+looked, so every shadow swung as the camera moved.
+
+Now each lamp the budget holds has a map of its own (`ae3d.lampshadows`):
+- **The cube.** A lamp shines every way, so its map is the six faces of a
+  cube around it, 90-degree perspective views of 512 texels, from 0.6 m out
+  (the fitting the lamp hangs in casts nothing, as the rays stop the same
+  distance short) to the lamp's reach.
+- **The atlas.** The faces share one 4096-texel depth atlas, eight by eight:
+  ten lamps a frame.
+- **The budget.** The key light when it is a lamp, always; then the lamps
+  whose light reaches into the view, nearest the camera first, within 50 m
+  of it (or the shadow distance, where that is further). A lamp keeps its
+  slot while it stays chosen. A lamp past the budget is not shadowed at
+  all -- never shadowed by another light -- and the last fifth of the range
+  fades a lamp's shadow out, so one leaving the budget does not pop. Where
+  the device traces, a lamp whose light lies wholly inside the rays' reach
+  is left to the rays.
+- **Two layers.** A face's static casters -- plain models, whose world
+  stamp says when they move -- are drawn into a static atlas only when what
+  stands still in the face changes. The atlas the shader reads is that
+  layer copied up a tile at a time, with what moves on its own -- a skinned
+  figure, a crowd, an instance stream -- drawn over the copy every frame it
+  is there. A lamp over a walking figure costs a copy and a draw a face, not
+  its street again: `zombie_street` draws 87 calls a frame on OpenGL and 88
+  on Vulkan, where the one map it had drew 255.
+- **The lookup.** Each clustered lamp carries its slot; the slots' data --
+  where the lamp stands, its reach, its shadow's strength and the six
+  faces' matrices -- follows the lamps in the lights' buffer. The shader
+  picks the face a point lies in from the lamp, moves the sample off the
+  surface along its normal by a face texel at that distance (and more on a
+  surface the lamp grazes), and compares depths in metres from the lamp,
+  since a perspective map's depth crowds toward its far plane.
+
+Held to numbers: `tests/test_lamp_shadows.ae`, offscreen on both renderers.
+- A lamp that is the key light, over a box: the box's shadow ends at
+  4.934-4.938 m from four camera poses, where the ray from the lamp past the
+  box's top edge meets the ground at 5 m, less 1.25 cm for every centimetre
+  the sample is lifted (4.945 m). The poses move it by 0.3 cm, under a
+  texel (1.95 cm), and OpenGL and Vulkan end it in the same place.
+- A lamp over ground in the moon's shadow gives it 91.75, as the same lamp
+  gives open ground 91.75; the moon alone, the wall's shadow reads 41 there
+  against 110 in the open.
+- Of twelve lamps down a street, the ten nearest have a shadow; past the
+  nearest lamp's post the ground reads 30 against 83 with the post casting
+  nothing, past the farthest's (outside the budget) 73 against 73.
+- A frame in which nothing moved draws no static layer; a post moved under
+  a lamp draws two; a cube as an instance stream hung under a lamp darkens
+  the ground behind it to 29 (77 without it) with no static layer drawn,
+  and moved away leaves 77.04 against 77.04.
+- `tests/test_ray_shadows`: the map path and the rays shadow the ground
+  past the ball from a lamp alike (403 each, 598 with the ball casting
+  nothing).
 
 ## How it is put together
 

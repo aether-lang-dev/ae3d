@@ -108,6 +108,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float causticsWaterLevel;
     float causticsDepth;
     float causticsTime;
+    int lampShadowBase;
+    int keyLampSlot;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
