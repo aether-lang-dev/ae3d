@@ -77,9 +77,9 @@ builds the editor against, and each bump carries a line saying why.
 ## The shaders
 
 `src/ae3d/shaders/module.ae` holds the GLSL, written once for OpenGL.
-`tools/generate_shaders.ae` derives the Vulkan versions -- the SPIR-V
-in `src/ae3d/vkspirv` and the uniform block's offsets in
-`src/ae3d/vkscene` --
+`tools/generate_shaders.ae` derives the Vulkan versions -- the GLSL in
+`src/ae3d/vkspirv/glsl`, the SPIR-V in `src/ae3d/vkspirv` and the uniform
+block's offsets in `src/ae3d/vkscene` --
 asks `glslangValidator` (the Vulkan SDK, on `PATH`) for its own std140
 offsets and stops on the first disagreement:
 

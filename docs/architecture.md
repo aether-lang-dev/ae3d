@@ -121,19 +121,22 @@ says what it is for and why it is shaped as it is.
 
 ## What is still C, and why
 
-The engine is written in Aether. `native/` holds the C that remains, by
-role, and each folder is there for one reason, stated in
-[native/README.md](../native/README.md):
+The engine is written in Aether. `native/` holds the C that remains --
+the platform's and DLSS's -- and each folder is there for one reason,
+stated in [native/README.md](../native/README.md):
 
 | Folder | Why |
 |---|---|
-| `gpu/` | the OpenGL resolver and contexts, which are the platform's; both renderers are Aether (#398, #402). The stores they draw from are already Aether's (`ae3d.geometry`), read in place through `gpu/stores.h`, whose layout `tests/test_geometry` holds to the Aether structs. Aether's 32-bit float ([aether#2134](https://github.com/aether-lang-dev/aether/issues/2134)) is what made that possible. |
 | `platform/` | the crash handler (a signal handler may call only what is async-signal-safe, and it is installed when the library loads), and the Objective-C surface MoltenVK draws into on macOS |
 | `dlss/` | the Streamline SDK's interface is C++ |
 
-What was C for any other reason has moved to Aether on this branch, each
-port measured against the C it replaced in the same run on the same
-machine: the crowd's kernels (`ae3d.horde`: half a million separated in
+What was C for any other reason has moved to Aether, each port measured
+against the C it replaced in the same run on the same machine: both
+renderers -- OpenGL's calls, its GL entry points and its offscreen
+context, and Vulkan whole, on contrib.vulkan.vk, every step drawing the
+same numbers in `tests/test_backend_parity` channel for channel (#398,
+#402) -- the mesh and instance stores and the door their loops reach the
+job pool through, the crowd's kernels (`ae3d.horde`: half a million separated in
 51.4 ms against the C's 51.5), the flow field (`ae3d.nav`: the flood 8.2 ms
 against 8.3), the weather's particles, the clouds' noise (the weather map
 byte for byte the same, the shape within one count in 22 texels of a
@@ -145,10 +148,10 @@ repository and 87 fixtures the same bytes stb_image gave; a 2048 x 2048
 PNG in 62 ms against 63, a 2048 x 2048 JPEG in 34 ms against stb's SSE2
 path's 20, as fast as its scalar one's 37).
 
-`native/ae3d.h` is the C API the Aether modules bind through `extern`;
-`native/internal.h` is what the C files share with each other. Every C
-file compiles under `-Wall -Wextra -Werror` on all three platforms, and
-`ci.sh` compiles each one alone to prove it.
+There is no C API left to declare: the Aether modules bind the few entry
+points in `native/` by `extern` directly. Every C file compiles under
+`-Wall -Wextra -Werror` on all three platforms, and `ci.sh` compiles each
+one alone to prove it.
 
 ## Dependencies
 

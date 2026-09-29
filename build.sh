@@ -52,8 +52,6 @@ fi
 AETHERC="${AETHERC:-aetherc}"
 CFLAGS="${CFLAGS:--O2}"
 WARN="-Wall -Wextra"
-# The natives include the shared headers at native/ by name from their folders.
-NATIVE_INCLUDE="-Inative"
 
 if ! command -v "$AETHERC" >/dev/null 2>&1; then
     echo "ae3d: '$AETHERC' not found; install the Aether toolchain first" >&2
@@ -145,7 +143,7 @@ for src in $NATIVE_SOURCES; do
     extra="$(ae3d_native_extra_flags "$src")"
     compiler="$(ae3d_native_compiler "$CC" "$src")"
     if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$newest_header" -nt "$obj" ]; then
-        "$compiler" -c $CFLAGS $FP_FLAGS $WARN $PIC $NATIVE_INCLUDE $extra $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o "$obj"
+        "$compiler" -c $CFLAGS $FP_FLAGS $WARN $PIC $extra $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o "$obj"
     fi
 done
 
