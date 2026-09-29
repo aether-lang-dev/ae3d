@@ -1,0 +1,375 @@
+// Snapshots as deltas against what each client acknowledged (#475). Held
+// to numbers:
+//
+//   - over UDP with 10% of datagrams lost (50 +- 20 ms each way), a host
+//     and two clients, fifty objects moving, fifty still and three
+//     players: every snapshot a client takes, rebuilt from its base and
+//     its records, is the host's state at that tick, every object, to the
+//     bit of its quantised values;
+//   - the acknowledgements ride on the clients' inputs: a client with a
+//     player sends none on its own;
+//   - the bytes a second of snapshots, against whole ones (every object
+//     every tick) and against the floats the protocol sent before it was
+//     quantised (31 bytes an object), for a still scene, a walking player
+//     and fifty moving objects, over the loopback with the same loss;
+//   - a snapshot whose base the host no longer keeps (the client
+//     acknowledged nothing for a second and more) is sent whole, and the
+//     client's world is still the host's after it.
+
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.loader
+import ae3d.physics
+import ae3d.platform
+import ae3d.net
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern cos(x: float) -> float
+extern sin(x: float) -> float
+
+const MOVING = 50
+const STILL = 50
+const STEP = 0.016666666666666666
+const TICKS = 512                    // the host's states kept, a ring by tick
+const OBJECTS = 128                  // ids kept a tick: the scene and its players
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+struct Side {
+    world: *Engine
+    session: *Net
+    moving: ptr                      // *GameObject[MOVING]
+    still: ptr                       // *GameObject[STILL]
+    last_tick: int
+    compared: int                    // snapshots compared with the host at their tick
+    objects: int                     // object states compared
+    different: int                   // of them, not the host's
+}
+
+make_player(context: ptr, client: int) -> *CharacterController {
+    e = context as *Engine
+    o = engine.object(e, "Player ${client}", null)
+    behaviour.object_set_position(o, core.vec3(((client - 1) * 4) as float, 0.0, 0.0 - 5.0))
+    return physics.character_controller(o, 0.3, 1.8)
+}
+
+side_new(session: *Net, moving: int) -> *Side {
+    s = calloc(1, sizeof(Side)) as *Side
+    s.world = engine.engine_new()
+    physics.attach(s.world)
+    ground = engine.object(s.world, "Ground", loader.cube(1.0))
+    behaviour.object_set_position(ground, core.vec3(0.0, 0.0 - 0.5, 0.0))
+    physics.box_collider(ground, core.vec3(60.0, 0.5, 60.0), physics.material(0.8, 0.0))
+    s.session = session
+    s.moving = calloc(MOVING, 8)
+    s.still = calloc(STILL, 8)
+    i = 0
+    while i < moving {
+        o = behaviour.object_new("mover")
+        net.networked(session, o)
+        (s.moving as ptr[])[i] = o as ptr
+        i = i + 1
+    }
+    k = 0
+    while k < STILL {
+        c = behaviour.object_new("crate")
+        behaviour.object_set_position(c, core.vec3(((k % 10) as float) * 3.1 - 14.0, 0.25 * ((k % 3) as float), 20.0 + ((k / 10) as float) * 2.7))
+        behaviour.object_set_rotation(c, core.quat_rotate((k as float) * 0.37, core.vec3(0.0, 1.0, 0.0)))
+        net.networked(session, c)
+        (s.still as ptr[])[k] = c as ptr
+        k = k + 1
+    }
+    net.set_player_maker(session, make_player, s.world as ptr)
+    return s
+}
+
+side_free(s: *Side, moving: int) {
+    c = 0
+    while c <= 3 {
+        pl = net.player_of(s.session, c)
+        if pl != null { physics.character_free(pl.controller) }
+        c = c + 1
+    }
+    net.net_free(s.session)
+    i = 0
+    while i < moving {
+        behaviour.object_free((s.moving as ptr[])[i] as *GameObject)
+        i = i + 1
+    }
+    k = 0
+    while k < STILL {
+        behaviour.object_free((s.still as ptr[])[k] as *GameObject)
+        k = k + 1
+    }
+    free(s.moving)
+    free(s.still)
+    engine.engine_free(s.world)
+    free(s as ptr)
+}
+
+// Mover i at time t: round a circle of 8 m at a radian a second, each a
+// radian further on, turned along it.
+move_host(s: *Side, moving: int, t: float) {
+    i = 0
+    while i < moving {
+        o = (s.moving as ptr[])[i] as *GameObject
+        behaviour.object_set_position(o, core.vec3(8.0 * cos(t + (i as float)), 0.1 * (i as float), 8.0 * sin(t + (i as float))))
+        behaviour.object_set_rotation(o, core.quat_rotate(t + (i as float), core.vec3(0.0, 1.0, 0.0)))
+        i = i + 1
+    }
+}
+
+// The host's quantised states at every tick it reached, a ring: what
+// every client is compared against.
+struct HostStates {
+    ticks: ptr                       // int[TICKS]: the tick in each slot
+    states: ptr                      // float[TICKS * OBJECTS * 8]: known, then 7 values
+    last: int
+}
+
+record(h: *HostStates, host: *Net) {
+    tick = net.host_tick(host)
+    if tick == h.last || tick < 1 { return }
+    h.last = tick
+    slot = tick % TICKS
+    (h.ticks as int[])[slot] = tick
+    s = h.states as float[]
+    values = calloc(7, 8)
+    v = values as float[]
+    id = 1
+    while id < OBJECTS {
+        at = (slot * OBJECTS + id) * 8
+        s[at] = 0.0
+        if net.state_at(host, id, values) {
+            s[at] = 1.0
+            k = 0
+            while k < 7 {
+                s[at + 1 + k] = v[k]
+                k = k + 1
+            }
+        }
+        id = id + 1
+    }
+    free(values)
+}
+
+// A client's newest snapshot, if it is new, against the host at its tick:
+// every object it knows, value for value.
+compare(h: *HostStates, c: *Side) {
+    tick = net.snapshot_tick(c.session)
+    if tick == c.last_tick || tick < 1 { return }
+    c.last_tick = tick
+    slot = tick % TICKS
+    if (h.ticks as int[])[slot] != tick { return }
+    s = h.states as float[]
+    values = calloc(7, 8)
+    v = values as float[]
+    c.compared = c.compared + 1
+    id = 1
+    while id < OBJECTS && id <= net.networked_count(c.session) {
+        at = (slot * OBJECTS + id) * 8
+        if net.state_at(c.session, id, values) {
+            c.objects = c.objects + 1
+            same = s[at] == 1.0
+            k = 0
+            while k < 7 && same {
+                if v[k] != s[at + 1 + k] { same = false }
+                k = k + 1
+            }
+            if !same { c.different = c.different + 1 }
+        }
+        id = id + 1
+    }
+    free(values)
+}
+
+states_new() -> *HostStates {
+    h = calloc(1, sizeof(HostStates)) as *HostStates
+    h.ticks = calloc(TICKS, 4)
+    h.states = calloc(TICKS * OBJECTS * 8, 8)
+    return h
+}
+
+states_free(h: *HostStates) {
+    free(h.ticks)
+    free(h.states)
+    free(h as ptr)
+}
+
+pace(start: float, frame: int) {
+    due = start + (frame as float) * STEP
+    while platform.time() < due { sleep(0) }
+}
+
+walk_of(client: int, t: float) -> Vec3 {
+    if t < 0.8 { return core.vec3(0.0, 0.0, 0.0) }
+    if client == 1 { return core.vec3(2.0 * cos(t), 0.0, 2.0 * sin(t)) }
+    return core.vec3(0.0 - 1.0, 0.0, 1.5)
+}
+
+// --- every client's world is the host's, over UDP --------------------------------------------------
+
+udp_run() {
+    host_session = net.host_udp("127.0.0.1", 0)
+    if host_session == null {
+        println("  udp: SKIP ${net.last_error()}")
+        return
+    }
+    port = net.udp_port(host_session)
+    net.set_conditions(host_session, 0.03, 0.04, 0.1)
+    host = side_new(host_session, MOVING)
+    net.host_play(host.session, 0.0)
+    one = side_new(net.join_udp("127.0.0.1", port), MOVING)
+    net.set_conditions(one.session, 0.03, 0.04, 0.1)
+    two = side_new(net.join_udp("127.0.0.1", port), MOVING)
+    net.set_conditions(two.session, 0.03, 0.04, 0.1)
+    h = states_new()
+    start = platform.time()
+    frame = 0
+    while frame < 300 {
+        frame = frame + 1
+        pace(start, frame)
+        now = platform.time() - start
+        move_host(host, MOVING, now)
+        if net.my_player(one.session) != null { net.player_input(one.session, walk_of(1, now), 0.0, now) }
+        if net.my_player(two.session) != null { net.player_input(two.session, walk_of(2, now), 0.0, now) }
+        net.player_input(host.session, core.vec3(1.0, 0.0, 0.0), 0.0, now)
+        net.step(host.session, now)
+        record(h, host.session)
+        net.step(one.session, now)
+        net.step(two.session, now)
+        compare(h, one)
+        compare(h, two)
+    }
+    println("udp: a host and two clients, ${MOVING} objects moving, ${STILL} still, three players walking; 50 +- 20 ms, 10% lost")
+    println("  client 1: ${one.compared} snapshots against the host's tick, ${one.objects} object states, ${one.different} different; client 2: ${two.compared}, ${two.objects}, ${two.different}")
+    println("  whole snapshots: ${net.whole_snapshots(host.session, net.client_id(one.session))} to client 1, ${net.whole_snapshots(host.session, net.client_id(two.session))} to client 2; late ones dropped ${net.stale_snapshots(one.session)} and ${net.stale_snapshots(two.session)}")
+    check("every snapshot a client takes is the host's state at its tick, every object to the bit", one.compared > 100 && two.compared > 100 && one.objects > 10000 && one.different == 0 && two.different == 0)
+    acks_alone = net.traffic(one.session, net.TRAFFIC_ACKS) + net.traffic(two.session, net.TRAFFIC_ACKS)
+    inputs = net.traffic(one.session, net.TRAFFIC_INPUTS)
+    println("  acknowledgements: ${acks_alone} bytes sent on their own by the two clients, the rest riding on ${inputs} bytes of client 1's inputs")
+    check("a client with a player acknowledges on its inputs, next to nothing on its own", acks_alone < 60)
+    states_free(h)
+    side_free(one, MOVING)
+    side_free(two, MOVING)
+    side_free(host, MOVING)
+}
+
+// --- what the deltas save ---------------------------------------------------------------------------
+
+// A host and a client over the lossy loopback for three seconds: `moving`
+// objects moving, the still ones, and the host's own player walking when
+// `walker`. Snapshot bytes a second to the client, whole or deltas, over
+// the last two seconds: once the client has the scene.
+bytes_run(moving: int, walker: bool, deltas: bool) -> float {
+    hub = net.hub_new()
+    net.hub_set_conditions(hub, 0.03, 0.04, 0.1)
+    host = side_new(net.host_loopback(hub), moving)
+    net.set_deltas(host.session, deltas)
+    if walker { net.host_play(host.session, 0.0) }
+    client = side_new(net.join_loopback(hub), moving)
+    h = states_new()
+    first = 0 as long
+    step = 0
+    while step < 180 {
+        now = (step as float) * STEP
+        if step == 60 { first = net.snapshot_bytes(host.session, 1) }
+        move_host(host, moving, now)
+        if walker { net.player_input(host.session, walk_of(1, now), 0.0, now) }
+        net.step(host.session, now)
+        record(h, host.session)
+        net.step(client.session, now)
+        compare(h, client)
+        step = step + 1
+    }
+    per_second = ((net.snapshot_bytes(host.session, 1) - first) as float) / (120.0 * STEP)
+    if client.different > 0 || client.compared < 60 { per_second = 0.0 - 1.0 }
+    states_free(h)
+    side_free(client, moving)
+    side_free(host, moving)
+    net.hub_free(hub)
+    return per_second
+}
+
+bytes_runs() {
+    println("bytes: a host and a client over the loopback, 50 +- 20 ms and 10% of snapshots lost, the two seconds after the first; ${STILL} crates in every scene")
+    still_whole = bytes_run(0, false, false)
+    still_delta = bytes_run(0, false, true)
+    walk_whole = bytes_run(0, true, false)
+    walk_delta = bytes_run(0, true, true)
+    move_whole = bytes_run(MOVING, false, false)
+    move_delta = bytes_run(MOVING, false, true)
+    // The floats the protocol sent before (protocol 4): 21 bytes of header
+    // and 31 an object, every object every snapshot, 30 a second.
+    still_floats = ((21 + STILL * 31) * 30) as float
+    walk_floats = ((21 + (STILL + 1) * 31) * 30) as float
+    move_floats = ((21 + (STILL + MOVING) * 31) * 30) as float
+    println("  a still scene: ${still_delta} bytes a second as deltas, ${still_whole / 1024.0} KB whole, ${still_floats / 1024.0} KB as floats")
+    println("  a walking player: ${walk_delta / 1024.0} KB a second as deltas, ${walk_whole / 1024.0} KB whole, ${walk_floats / 1024.0} KB as floats")
+    println("  ${MOVING} moving objects: ${move_delta / 1024.0} KB a second as deltas, ${move_whole / 1024.0} KB whole, ${move_floats / 1024.0} KB as floats")
+    check("every run's client holds the host's state at every tick, whole or deltas", still_whole > 0.0 && still_delta > 0.0 && walk_whole > 0.0 && walk_delta > 0.0 && move_whole > 0.0 && move_delta > 0.0)
+    check("a still scene costs a twentieth of its whole snapshots, once the client has it", still_delta * 20.0 < still_whole)
+    check("a walking player among still crates, a tenth", walk_delta * 10.0 < walk_whole)
+    check("fifty moving objects, less than the whole snapshots, and a fraction of the floats", move_delta < move_whole && move_delta * 2.0 < move_floats)
+}
+
+// --- a base the host no longer keeps -------------------------------------------------------------------
+
+// A client that acknowledges nothing for 1.5 s (its link to the host
+// drops everything), then again: the host's ring of 32 no longer has its
+// last base, the next snapshot is whole, and the client's world is the
+// host's after it.
+gap_run() {
+    hub = net.hub_new()
+    host = side_new(net.host_loopback(hub), MOVING)
+    client = side_new(net.join_loopback(hub), MOVING)
+    h = states_new()
+    wholes_before = 0
+    step = 0
+    while step < 300 {
+        now = (step as float) * STEP
+        if step == 90 {
+            wholes_before = net.whole_snapshots(host.session, 1)
+            net.hub_set_conditions(hub, 0.0, 0.0, 1.0)
+        }
+        if step == 180 { net.hub_set_conditions(hub, 0.0, 0.0, 0.0) }
+        move_host(host, MOVING, now)
+        net.step(host.session, now)
+        record(h, host.session)
+        net.step(client.session, now)
+        if step > 180 { compare(h, client) }
+        step = step + 1
+    }
+    wholes = net.whole_snapshots(host.session, 1)
+    println("gap: 1.5 s with nothing through; whole snapshots before it ${wholes_before}, after it ${wholes - wholes_before}; then ${client.compared} snapshots compared, ${client.different} of ${client.objects} states different")
+    check("past the ring, a whole snapshot, and the client's world is the host's after it", wholes - wholes_before >= 1 && client.compared > 50 && client.different == 0)
+    states_free(h)
+    side_free(client, MOVING)
+    side_free(host, MOVING)
+    net.hub_free(hub)
+}
+
+main() {
+    udp_run()
+    bytes_runs()
+    gap_run()
+    check("every session made is let go", net.alive() == 0)
+    if g_failures == 0 {
+        println("delta: all checks passed (${g_checks})")
+    } else {
+        println("delta: ${g_failures} failure(s) of ${g_checks}")
+    }
+}

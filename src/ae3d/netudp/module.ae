@@ -1,0 +1,1511 @@
+// ae3d.netudp -- a connection over UDP, what ae3d.net's UDP transport is
+// built on (#473).
+//
+// A game's state wants datagrams. A snapshot that arrives late is worth
+// less than none, and TCP holds every newer one behind a lost segment; a
+// datagram that is lost is simply gone, and the next snapshot supersedes
+// it. What a game also sends -- a handshake, an event, an object created --
+// has to arrive, once and in order, so this module builds that on the
+// same socket, the way Quake 3's netchan and Glenn Fiedler's "Networking
+// for Game Programmers" do:
+//
+//   - Packets. Every datagram carries a sequence number, the newest
+//     sequence this side has received from the other, and a bitfield of
+//     the 32 before it. So every packet acknowledges up to 33, redundantly:
+//     an ack lost with its packet is carried again by the next. A packet a
+//     sender learns was received is how it knows the reliable messages in
+//     it arrived, and when it did, which is its round trip time.
+//   - A reliable, ordered channel. A reliable message gets an id and stays
+//     in a window of 1,024 until a packet carrying it is acknowledged. It
+//     goes in the next packet, and again whenever a round trip timeout
+//     (RFC 6298's smoothed round trip and its variance, four of them) has
+//     passed without an acknowledgement, the timeout growing by half with
+//     every resend, to a second at most. TCP doubles it, which is for a
+//     link that congestion has filled; a game's few kilobytes a second do
+//     not fill one, and a message lost three times in a row then arrives
+//     half a second sooner. The receiver keeps what arrives out of order
+//     and hands them over by id, each exactly once. A message larger than
+//     a packet goes as slices, each a reliable message of its own, and is
+//     handed over whole once its last slice is in.
+//   - Unreliable channels, sequenced by default. A message on one is sent
+//     once. Each channel numbers its messages, and on a sequenced one a
+//     message older than the newest already handed over is dropped: a late
+//     snapshot never takes a newer one's place. A channel set unsequenced
+//     (set_sequenced) hands over whatever arrives, late or not: a
+//     client's inputs, whose every message carries the last few commands
+//     and whose late one may still carry one no other did. A message
+//     larger than a packet goes as up to 255 fragments of one sequence
+//     number, and is handed over when all of them are in; a newer one on
+//     the channel drops what is left of an older one.
+//   - A handshake. A client sends a request with a random salt of its own,
+//     padded to 64 bytes; the host answers with a challenge carrying a
+//     salt of its own, 9 bytes; the client answers with the two combined,
+//     and the host opens the connection. Every packet after carries the
+//     combined salt, and one that does not is dropped: a datagram from an
+//     old connection, or from anyone who did not see the challenge, is not
+//     taken for this one, and a forged request makes the host send
+//     something smaller than it, so it cannot be used to flood a third
+//     party.
+//   - A timeout and a disconnect. A connection that hears nothing for
+//     `set_timeout` seconds (5 by default) is closed; a side with nothing
+//     to send sends an empty packet every tenth of a second so the other
+//     knows it is there, and to carry its acknowledgements. A disconnect
+//     is said three times and the connection closed at once.
+//   - The link's conditions, for tests: `set_conditions` delays every
+//     datagram this side sends by a latency and up to a jitter more, and
+//     drops a share of them, from a generator of its own, so the same
+//     conditions lose the same datagrams.
+//
+// Datagrams are at most MTU (1,200) bytes, under what every IPv4 and IPv6
+// path carries without fragmenting (IPv6's minimum is 1,280 with its
+// headers). Time is passed in, as ae3d.net passes it.
+
+import std.heap
+import std.list
+import std.mem
+import std.os
+import std.udp
+
+exports (
+    UdpEndpoint, UdpEvent,
+    UDP_CONNECTED, UDP_DISCONNECTED, UDP_MESSAGE, RELIABLE, CHANNELS, MTU, HEADER,
+    listen, connect, port, set_conditions, set_timeout, set_max_clients, set_sequenced,
+    post, update, flush, event_count, event_at, clear_events,
+    disconnect, close, endpoint_free, last_error,
+    is_open, conn_count, rtt, rto,
+    datagrams_sent, datagrams_received, bytes_sent, bytes_received,
+    header_bytes, reliable_bytes, resent_bytes, channel_bytes, ack_bytes, handshake_bytes,
+    dropped, largest, resends, stale, oversized, timeouts
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern malloc(size: long) -> ptr
+extern realloc(p: ptr, size: long) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+
+const UDP_CONNECTED = 1
+const UDP_DISCONNECTED = 2
+const UDP_MESSAGE = 3
+
+const RELIABLE = 0                   // the reliable, ordered channel; 1 to CHANNELS - 1 are unreliable and sequenced
+const CHANNELS = 16
+
+const MTU = 1200                     // a datagram's bytes at most
+const HEADER = 13                    // a payload packet's: [u8 kind][u32 salt][u16 seq][u16 ack][u32 ack bits]
+const VERSION = 1                    // the packet format's, in the high four bits of every datagram's first byte
+const HAS_ACK = 8                    // a payload packet's first byte: its ack names a packet (none has been received yet without it)
+const MAGIC = 1144210753             // "AE3D", little-endian: the first word of a request
+const REQUEST_BYTES = 64             // a request, padded: more than the challenge it asks for
+
+const PACKET_REQUEST = 1             // client -> host: [u8][u32 magic][u32 version][u32 client salt], padded
+const PACKET_CHALLENGE = 2           // host -> client: [u8][u32 client salt][u32 server salt]
+const PACKET_RESPONSE = 3            // client -> host: [u8][u32 client salt ^ server salt]
+const PACKET_PAYLOAD = 4             // either way: the header, then chunks
+const PACKET_DISCONNECT = 5          // either way: [u8][u32 salt]
+const PACKET_DENIED = 6              // host -> client: [u8][u32 client salt]; no room
+
+const CHUNK_RELIABLE = 1             // [u8][u16 id][u16 length][bytes]: a reliable message, or a sliced one's last slice
+const CHUNK_RELIABLE_MORE = 2        // the same, a slice with more after it
+const CHUNK_UNRELIABLE = 3           // [u8][u8 channel][u16 seq][u16 length][bytes]
+const CHUNK_FRAGMENT = 4             // [u8][u8 channel][u16 seq][u8 index][u8 count][u16 length][bytes]
+
+const SLICE = 1024                   // a reliable slice's bytes at most
+const FRAGMENT_BYTES = 1179          // an unreliable fragment's: MTU less the header and the fragment's own 8
+const WHOLE_BYTES = 1181             // an unreliable message sent whole at most: MTU less the header and its own 6
+const MAX_FRAGMENTS = 255
+const SEND_WINDOW = 1024             // reliable messages in flight
+const RECV_WINDOW = 1024             // reliable messages held for their turn
+const SENT_RING = 1024               // packets remembered until acknowledged
+const RECEIVED_RING = 1024           // packets received remembered, to acknowledge a late one with its neighbours
+const IDS_PER_PACKET = 240           // reliable messages one packet can carry: MTU / 5
+const PACKETS_PER_FLUSH = 64         // a connection's datagrams a flush sends at most
+const RELIABLE_PER_FLUSH = 32        // of them, the ones reliable messages may fill: a large one never crowds out a snapshot
+const ACK_EVERY = 16                 // packets received before an acknowledgement goes back at once, whatever the flush
+const BACKOFF = 1.5                  // the timeout's growth with every resend of one message
+const MIN_RTO = 0.05                 // seconds: a resend waits at least this
+const MAX_RTO = 1.0
+const FIRST_RTO = 0.2                // before any round trip is measured
+const HANDSHAKE_EVERY = 0.1          // seconds between a handshake's resends
+const KEEPALIVE = 0.1                // seconds a connection sends nothing before it sends an empty packet
+const PENDING_FOR = 10.0             // seconds a host keeps a handshake it has not seen answered
+
+const CONN_REQUESTING = 1            // client: the request sent, the challenge awaited
+const CONN_RESPONDING = 2            // client: the response sent, the first payload awaited
+const CONN_OPEN = 3
+const CONN_CLOSED = 4
+
+var g_error = ""
+var g_endpoints = 0                  // endpoints made in this process: each simulated link draws from a generator of its own
+
+last_error() -> string { return g_error }
+
+// Something that happened on a connection, for the owner to take in
+// update's order: it opened, it closed, or a message arrived (the
+// endpoint's bytes until clear_events).
+struct UdpEvent {
+    kind: int
+    conn: int
+    data: ptr
+    length: int
+}
+
+// A datagram on the simulated link, until its time comes.
+struct UdpDelayed {
+    due: float
+    address: ptr
+    data: ptr
+    length: int
+}
+
+// Host: a handshake a client has begun and not finished.
+struct UdpPending {
+    address: ptr
+    client_salt: long
+    server_salt: long
+    since: float                     // when the last challenge went
+    challenges: int                  // how many went
+}
+
+// A message queued: a reliable one in the send window until it is
+// acknowledged, an unreliable one until the next flush.
+struct UdpMessage {
+    id: int
+    channel: int
+    data: ptr
+    length: int
+    more: bool                       // a reliable slice with more after it
+    sent_at: float                   // when it last went; below 0, never
+    resends: int
+    acked: bool
+}
+
+struct UdpConn {
+    id: int
+    address: ptr
+    state: int
+    client_salt: long
+    server_salt: long
+    salt: long                       // in every payload packet: the two combined
+    started: float                   // client: when the handshake began
+    heard: float                     // when the other side was last heard from
+    sent: float                      // when this side last sent it a packet
+    handshake_at: float              // client: when the request or the response last went
+    requests: int                    // client: requests sent
+    // Packets.
+    next_seq: int                    // the next packet's sequence, counted up; the low 16 bits go on the wire
+    newest: int                      // the newest packet received; -1 none
+    received: ptr                    // int[RECEIVED_RING]: the packet in each slot, received; -1 none
+    ack_owed: bool                   // a packet with reliable messages came, and none has gone back since
+    unacked: int                     // packets received since one went back
+    packet_seq: ptr                  // int[SENT_RING]: the packet in each slot
+    packet_time: ptr                 // float[SENT_RING]: when it went
+    packet_acked: ptr                // int[SENT_RING]
+    packet_count: ptr                // int[SENT_RING]: the reliable messages it carried
+    packet_ids: ptr                  // int[SENT_RING * IDS_PER_PACKET]: which
+    // The reliable channel, sending.
+    window: ptr                      // ptr[SEND_WINDOW]: *UdpMessage by id % SEND_WINDOW
+    oldest: int                      // the oldest id not yet acknowledged
+    next_id: int
+    backlog: ptr                     // list of *UdpMessage waiting for room in the window
+    // The reliable channel, receiving.
+    held: ptr                        // ptr[RECV_WINDOW]: *UdpMessage arrived ahead of its turn
+    expected: int                    // the next id to hand over
+    assembly: ptr                    // a sliced message's bytes so far
+    assembled: int
+    assembly_capacity: int
+    // The unreliable channels.
+    queued: ptr                      // list of *UdpMessage for the next flush
+    out_seq: ptr                     // int[CHANNELS]: the next sequence each
+    in_newest: ptr                   // int[CHANNELS]: the newest handed over; -1 none
+    frag_seq: ptr                    // int[CHANNELS]: the message being put together; -1 none
+    frag_count: ptr                  // int[CHANNELS]
+    frag_got: ptr                    // int[CHANNELS]
+    frag_length: ptr                 // int[CHANNELS]: its bytes, once its last fragment is in
+    frag_present: ptr                // int[CHANNELS * MAX_FRAGMENTS]
+    frag_data: ptr                   // ptr[CHANNELS]: MAX_FRAGMENTS * FRAGMENT_BYTES each, made when first wanted
+    // The round trip.
+    srtt: float
+    rttvar: float
+    rtt_known: bool
+}
+
+struct UdpEndpoint {
+    socket: ptr
+    hosting: bool
+    port: int
+    conns: ptr                       // list of *UdpConn
+    next_conn: int
+    pending: ptr                     // host: list of *UdpPending
+    events: ptr                      // list of *UdpEvent
+    max_clients: int
+    timeout: float
+    // The simulated link.
+    latency: float
+    jitter: float
+    loss: float
+    seed: long
+    delayed: ptr                     // list of *UdpDelayed
+    salts: long                      // the generator the salts come from
+    buffer: ptr                      // a datagram received
+    packet: ptr                      // a datagram being built
+    packet_length: int
+    packet_ids: ptr                  // int[IDS_PER_PACKET]: the reliable messages in it
+    packet_id_count: int
+    from: ptr                        // the address a datagram came from
+    // What went over the socket.
+    datagrams_sent: long
+    datagrams_received: long
+    bytes_sent: long
+    bytes_received: long
+    header_bytes: long               // the payload packets' headers, which carry the acknowledgements
+    reliable_bytes: long             // reliable chunks the first time they went, their own headers included
+    resent_bytes: long               // and again
+    channel_bytes: ptr               // long[CHANNELS]: unreliable chunks and fragments, a channel each
+    unsequenced: ptr                 // int[CHANNELS]: 1 for a channel that hands over late messages too
+    ack_bytes: long                  // packets that carried nothing but acknowledgements, whole
+    handshake_bytes: long
+    dropped: long                    // datagrams the simulated link lost
+    largest: int                     // the largest datagram sent
+    resends: long                    // reliable messages sent again
+    stale: long                      // unreliable messages dropped for being older than one handed over
+    oversized: long                  // unreliable messages too large for 255 fragments, never sent
+    timeouts: int                    // connections closed for hearing nothing
+}
+
+// --- the endpoint ---------------------------------------------------------------------------------
+
+endpoint_new(socket: ptr, hosting: bool) -> *UdpEndpoint {
+    ep = heap.new(UdpEndpoint)
+    ep.socket = socket
+    ep.hosting = hosting
+    ep.port = udp.local_port(socket)
+    ep.conns = list.new()
+    ep.pending = list.new()
+    ep.events = list.new()
+    ep.delayed = list.new()
+    ep.next_conn = 1
+    ep.max_clients = 64
+    ep.timeout = 5.0
+    // Each endpoint's simulated link loses its own datagrams: seeded by the
+    // order it was made, so a run is the same run again, and two sides do
+    // not lose the same ones.
+    g_endpoints = g_endpoints + 1
+    ep.seed = (12345 + g_endpoints * 1000003) as long
+    ep.salts = os.now_monotonic_ns() * 2862933555777941757 + ((ep.port as long) * 3037000493)
+    ep.buffer = malloc((MTU * 2) as long)
+    ep.packet = malloc(MTU as long)
+    ep.packet_ids = calloc(IDS_PER_PACKET, 4)
+    ep.from = udp.addr_new()
+    ep.channel_bytes = calloc(CHANNELS, 8)
+    ep.unsequenced = calloc(CHANNELS, 4)
+    // A server fanning snapshots out to many clients, and a client taking
+    // a large state in one go, both want more than the default buffers.
+    udp.set_buffer_sizes(socket, 1048576, 1048576)
+    return ep
+}
+
+// A host's endpoint, bound to `address` ("0.0.0.0" for every interface,
+// "127.0.0.1" for this machine only) and `port` (0: one the system picks;
+// `port` says which). Null, with last_error, when it cannot bind.
+listen(address: string, port: int) -> *UdpEndpoint {
+    socket, err = udp.bind(address, port)
+    if err != "" {
+        g_error = "cannot bind ${address}:${port}: ${err}"
+        return null
+    }
+    return endpoint_new(socket, true)
+}
+
+// A client's endpoint and its one connection, to host:port, the handshake
+// begun at the first flush. UDP_CONNECTED comes when the host has
+// answered, and UDP_DISCONNECTED if it has not within the timeout.
+connect(host: string, port: int) -> *UdpEndpoint {
+    address, rerr = udp.resolve(host, port)
+    if rerr != "" {
+        g_error = "cannot resolve ${host}: ${rerr}"
+        return null
+    }
+    // Loopback reaches only loopback: a host on this machine is spoken to
+    // from 127.0.0.1, anything else from every interface.
+    local = "0.0.0.0"
+    if host == "127.0.0.1" || host == "localhost" { local = "127.0.0.1" }
+    socket, err = udp.bind(local, 0)
+    if err != "" {
+        udp.addr_free(address)
+        g_error = "cannot bind a socket: ${err}"
+        return null
+    }
+    ep = endpoint_new(socket, false)
+    c = conn_new(ep, address)
+    c.state = CONN_REQUESTING
+    c.client_salt = next_salt(ep)
+    c.started = 0.0 - 1.0
+    c.handshake_at = 0.0 - 1.0
+    return ep
+}
+
+port(ep: *UdpEndpoint) -> int { return ep.port }
+
+// The link every datagram this side sends crosses: `latency` seconds and
+// up to `jitter` more, and a share `loss` (0..1) of them never arriving.
+set_conditions(ep: *UdpEndpoint, latency: float, jitter: float, loss: float) {
+    ep.latency = latency
+    ep.jitter = jitter
+    ep.loss = loss
+}
+
+// Seconds a connection hears nothing before it is closed (5 by default);
+// also how long a client's handshake is tried.
+set_timeout(ep: *UdpEndpoint, seconds: float) {
+    if seconds > 0.0 { ep.timeout = seconds }
+}
+
+// Whether an unreliable channel drops a message that arrives after a newer
+// one (true, the default: a snapshot), or hands it over anyway (false: a
+// message whose older copies may carry something the newer did not).
+// Both sides set it: it is the receiver that drops.
+set_sequenced(ep: *UdpEndpoint, channel: int, sequenced: bool) {
+    if channel < 1 || channel >= CHANNELS { return }
+    flag = 1
+    if sequenced { flag = 0 }
+    (ep.unsequenced as int[])[channel] = flag
+}
+
+// Host: the connections it keeps at most (64 by default); a request past
+// them is denied.
+set_max_clients(ep: *UdpEndpoint, count: int) {
+    if count > 0 { ep.max_clients = count }
+}
+
+next_salt(ep: *UdpEndpoint) -> long {
+    ep.salts = ep.salts * 6364136223846793005 + 1442695040888963407
+    s = (ep.salts / 4294967296) % 4294967296
+    if s < 0 { s = 0 - s }
+    if s == 0 { s = 1 }
+    return s
+}
+
+// A uniform number in [0, 1) from the link's own generator.
+link_random(ep: *UdpEndpoint) -> float {
+    ep.seed = ep.seed * 6364136223846793005 + 1442695040888963407
+    bits = (ep.seed / 4294967296) % 16777216
+    if bits < 0 { bits = 0 - bits }
+    return (bits as float) / 16777216.0
+}
+
+conn_new(ep: *UdpEndpoint, address: ptr) -> *UdpConn {
+    c = heap.new(UdpConn)
+    c.id = ep.next_conn
+    ep.next_conn = ep.next_conn + 1
+    c.address = address
+    c.newest = 0 - 1
+    c.sent = 0.0 - 1.0
+    c.packet_seq = calloc(SENT_RING, 4)
+    seqs = c.packet_seq as int[]
+    k = 0
+    while k < SENT_RING {
+        seqs[k] = 0 - 1
+        k = k + 1
+    }
+    c.received = calloc(RECEIVED_RING, 4)
+    got = c.received as int[]
+    k = 0
+    while k < RECEIVED_RING {
+        got[k] = 0 - 1
+        k = k + 1
+    }
+    c.packet_time = calloc(SENT_RING, 8)
+    c.packet_acked = calloc(SENT_RING, 4)
+    c.packet_count = calloc(SENT_RING, 4)
+    c.packet_ids = calloc(SENT_RING * IDS_PER_PACKET, 4)
+    c.window = calloc(SEND_WINDOW, 8)
+    c.backlog = list.new()
+    c.held = calloc(RECV_WINDOW, 8)
+    c.queued = list.new()
+    c.out_seq = calloc(CHANNELS, 4)
+    c.in_newest = calloc(CHANNELS, 4)
+    c.frag_seq = calloc(CHANNELS, 4)
+    c.frag_count = calloc(CHANNELS, 4)
+    c.frag_got = calloc(CHANNELS, 4)
+    c.frag_length = calloc(CHANNELS, 4)
+    c.frag_present = calloc(CHANNELS * MAX_FRAGMENTS, 4)
+    c.frag_data = calloc(CHANNELS, 8)
+    newest = c.in_newest as int[]
+    frag = c.frag_seq as int[]
+    k = 0
+    while k < CHANNELS {
+        newest[k] = 0 - 1
+        frag[k] = 0 - 1
+        k = k + 1
+    }
+    list.add_raw(ep.conns, c as ptr)
+    return c
+}
+
+message_free(m: *UdpMessage) {
+    if m == null { return }
+    if m.data != null { free(m.data) }
+    heap.free(m)
+}
+
+conn_free(c: *UdpConn) {
+    k = 0
+    while k < SEND_WINDOW {
+        message_free((c.window as ptr[])[k] as *UdpMessage)
+        message_free((c.held as ptr[])[k] as *UdpMessage)
+        k = k + 1
+    }
+    k = 0
+    while k < list.size(c.backlog) {
+        message_free(list.get_raw(c.backlog, k) as *UdpMessage)
+        k = k + 1
+    }
+    list.free(c.backlog)
+    k = 0
+    while k < list.size(c.queued) {
+        message_free(list.get_raw(c.queued, k) as *UdpMessage)
+        k = k + 1
+    }
+    list.free(c.queued)
+    k = 0
+    while k < CHANNELS {
+        block = (c.frag_data as ptr[])[k]
+        if block != null { free(block) }
+        k = k + 1
+    }
+    free(c.window)
+    free(c.held)
+    free(c.packet_seq)
+    free(c.received)
+    free(c.packet_time)
+    free(c.packet_acked)
+    free(c.packet_count)
+    free(c.packet_ids)
+    free(c.out_seq)
+    free(c.in_newest)
+    free(c.frag_seq)
+    free(c.frag_count)
+    free(c.frag_got)
+    free(c.frag_length)
+    free(c.frag_present)
+    free(c.frag_data)
+    if c.assembly != null { free(c.assembly) }
+    if c.address != null { udp.addr_free(c.address) }
+    heap.free(c)
+}
+
+conn_by_id(ep: *UdpEndpoint, id: int) -> *UdpConn {
+    k = 0
+    while k < list.size(ep.conns) {
+        c = list.get_raw(ep.conns, k) as *UdpConn
+        if c.id == id { return c }
+        k = k + 1
+    }
+    return null
+}
+
+conn_by_address(ep: *UdpEndpoint, address: ptr) -> *UdpConn {
+    k = 0
+    while k < list.size(ep.conns) {
+        c = list.get_raw(ep.conns, k) as *UdpConn
+        if c.state != CONN_CLOSED && udp.addr_equal(c.address, address) { return c }
+        k = k + 1
+    }
+    return null
+}
+
+// Whether connection `conn` is open: its handshake done, not closed.
+is_open(ep: *UdpEndpoint, conn: int) -> bool {
+    c = conn_by_id(ep, conn)
+    return c != null && c.state == CONN_OPEN
+}
+
+// The open connections.
+conn_count(ep: *UdpEndpoint) -> int {
+    n = 0
+    k = 0
+    while k < list.size(ep.conns) {
+        if (list.get_raw(ep.conns, k) as *UdpConn).state == CONN_OPEN { n = n + 1 }
+        k = k + 1
+    }
+    return n
+}
+
+// A connection's smoothed round trip, seconds; 0 before one is measured.
+rtt(ep: *UdpEndpoint, conn: int) -> float {
+    c = conn_by_id(ep, conn)
+    if c == null || !c.rtt_known { return 0.0 }
+    return c.srtt
+}
+
+// The timeout a first resend of a reliable message waits, seconds.
+rto(ep: *UdpEndpoint, conn: int) -> float {
+    c = conn_by_id(ep, conn)
+    if c == null { return 0.0 }
+    return resend_timeout(c)
+}
+
+push_event(ep: *UdpEndpoint, kind: int, conn: int, data: ptr, length: int) {
+    ev = heap.new(UdpEvent)
+    ev.kind = kind
+    ev.conn = conn
+    if length > 0 {
+        ev.data = malloc(length as long)
+        memcpy(ev.data, data, length as long)
+    }
+    ev.length = length
+    list.add_raw(ep.events, ev as ptr)
+}
+
+// What update found, in order.
+event_count(ep: *UdpEndpoint) -> int { return list.size(ep.events) }
+event_at(ep: *UdpEndpoint, index: int) -> *UdpEvent { return list.get_raw(ep.events, index) as *UdpEvent }
+
+clear_events(ep: *UdpEndpoint) {
+    k = 0
+    while k < list.size(ep.events) {
+        ev = list.get_raw(ep.events, k) as *UdpEvent
+        if ev.data != null { free(ev.data) }
+        heap.free(ev)
+        k = k + 1
+    }
+    list.clear(ep.events)
+}
+
+// --- sending ----------------------------------------------------------------------------------------
+
+// A message to connection `conn` on `channel`: RELIABLE for one that has
+// to arrive, once and in order with the rest of that channel; 1 to
+// CHANNELS - 1 for one that is only worth having if it is the newest of
+// its channel. Queued until the next flush, so the messages of one step
+// share datagrams. False for no such open connection, or a channel out of
+// range.
+post(ep: *UdpEndpoint, conn: int, channel: int, data: ptr, length: int) -> bool {
+    c = conn_by_id(ep, conn)
+    if c == null || c.state != CONN_OPEN || channel < 0 || channel >= CHANNELS || length < 0 { return false }
+    if channel == RELIABLE {
+        // Sliced to fit a packet, each slice a message of its own.
+        at = 0
+        while true {
+            part = length - at
+            if part > SLICE { part = SLICE }
+            m = heap.new(UdpMessage)
+            m.channel = RELIABLE
+            m.length = part
+            if part > 0 {
+                m.data = malloc(part as long)
+                memcpy(m.data, data + at, part as long)
+            }
+            at = at + part
+            m.more = at < length
+            m.sent_at = 0.0 - 1.0
+            enqueue_reliable(c, m)
+            if at >= length { break }
+        }
+        return true
+    }
+    m = heap.new(UdpMessage)
+    m.channel = channel
+    m.length = length
+    if length > 0 {
+        m.data = malloc(length as long)
+        memcpy(m.data, data, length as long)
+    }
+    list.add_raw(c.queued, m as ptr)
+    return true
+}
+
+// Into the window when there is room, else behind it.
+enqueue_reliable(c: *UdpConn, m: *UdpMessage) {
+    if c.next_id - c.oldest < SEND_WINDOW && list.size(c.backlog) == 0 {
+        m.id = c.next_id
+        (c.window as ptr[])[m.id % SEND_WINDOW] = m as ptr
+        c.next_id = c.next_id + 1
+    } else {
+        list.add_raw(c.backlog, m as ptr)
+    }
+}
+
+// The backlog into the window as acknowledgements make room.
+promote(c: *UdpConn) {
+    while list.size(c.backlog) > 0 && c.next_id - c.oldest < SEND_WINDOW {
+        m = list.get_raw(c.backlog, 0) as *UdpMessage
+        list.remove(c.backlog, 0)
+        m.id = c.next_id
+        (c.window as ptr[])[m.id % SEND_WINDOW] = m as ptr
+        c.next_id = c.next_id + 1
+    }
+}
+
+// How long a reliable message waits for its acknowledgement before it
+// goes again: the smoothed round trip and four of its variance (RFC
+// 6298), or half the round trip again where that is more, kept between
+// MIN_RTO and MAX_RTO. The half is for what the variance cannot see: a
+// packet is acknowledged by whichever of the other side's next packets
+// arrives first, so the samples are the quickest of several and vary
+// less than any one packet's acknowledgement can take -- behind a burst
+// of a large message most of all, where a timeout of the variance alone
+// sent a third of it twice.
+resend_timeout(c: *UdpConn) -> float {
+    if !c.rtt_known { return FIRST_RTO }
+    spread = 4.0 * c.rttvar
+    if spread < c.srtt * 0.5 { spread = c.srtt * 0.5 }
+    t = c.srtt + spread
+    if t < MIN_RTO { t = MIN_RTO }
+    if t > MAX_RTO { t = MAX_RTO }
+    return t
+}
+
+// Whether a reliable message is due: never sent, or its timeout, grown by
+// BACKOFF for every time it has already gone again, has passed.
+due(c: *UdpConn, m: *UdpMessage, now: float) -> bool {
+    if m.acked { return false }
+    if m.sent_at < 0.0 { return true }
+    wait = resend_timeout(c)
+    k = 0
+    while k < m.resends && wait < MAX_RTO {
+        wait = wait * BACKOFF
+        k = k + 1
+    }
+    if wait > MAX_RTO { wait = MAX_RTO }
+    return now - m.sent_at >= wait
+}
+
+// A datagram out, across the simulated link when there is one.
+put_datagram(ep: *UdpEndpoint, address: ptr, data: ptr, length: int, now: float) {
+    ep.datagrams_sent = ep.datagrams_sent + 1
+    ep.bytes_sent = ep.bytes_sent + (length as long)
+    if length > ep.largest { ep.largest = length }
+    if ep.loss > 0.0 && link_random(ep) < ep.loss {
+        ep.dropped = ep.dropped + 1
+        return
+    }
+    if ep.latency <= 0.0 && ep.jitter <= 0.0 {
+        udp.send_to_addr(ep.socket, address, data, length)
+        return
+    }
+    d = heap.new(UdpDelayed)
+    d.due = now + ep.latency
+    if ep.jitter > 0.0 { d.due = d.due + ep.jitter * link_random(ep) }
+    d.address = udp.addr_clone(address)
+    d.data = malloc(length as long)
+    memcpy(d.data, data, length as long)
+    d.length = length
+    list.add_raw(ep.delayed, d as ptr)
+}
+
+// The datagrams whose time on the simulated link is up, sent.
+release_delayed(ep: *UdpEndpoint, now: float) {
+    k = 0
+    while k < list.size(ep.delayed) {
+        d = list.get_raw(ep.delayed, k) as *UdpDelayed
+        if d.due <= now {
+            udp.send_to_addr(ep.socket, d.address, d.data, d.length)
+            udp.addr_free(d.address)
+            free(d.data)
+            heap.free(d)
+            list.remove(ep.delayed, k)
+        } else {
+            k = k + 1
+        }
+    }
+}
+
+// A packet begun: the header, with this side's acknowledgements of the
+// newest packet it has received and the 32 before it.
+begin_packet(ep: *UdpEndpoint, c: *UdpConn) {
+    begin_acking(ep, c, c.newest)
+}
+
+// The same, acknowledging packet `ack` and the 32 before it: the newest,
+// or one that arrived too late for the newest's bits.
+begin_acking(ep: *UdpEndpoint, c: *UdpConn, ack: int) {
+    p = ep.packet
+    flags = 0
+    if ack >= 0 { flags = HAS_ACK }
+    mem.set_byte(p, 0, PACKET_PAYLOAD | flags | (VERSION << 4))
+    mem.set_u32_le(p, 1, c.salt)
+    mem.set_u16_le(p, 5, c.next_seq & 65535)
+    wire = 0
+    bits = 0 as long
+    if ack >= 0 {
+        wire = ack & 65535
+        got = c.received as int[]
+        k = 1
+        while k <= 32 {
+            seq = ack - k
+            if seq >= 0 && got[seq % RECEIVED_RING] == seq { bits = bits | ((1 as long) << (k - 1)) }
+            k = k + 1
+        }
+    }
+    mem.set_u16_le(p, 7, wire)
+    mem.set_u32_le(p, 9, bits)
+    ep.packet_length = HEADER
+    ep.packet_id_count = 0
+}
+
+// The packet built so far, sent and remembered by its sequence, with the
+// reliable messages it carries.
+end_packet(ep: *UdpEndpoint, c: *UdpConn, now: float) {
+    slot = c.next_seq % SENT_RING
+    (c.packet_seq as int[])[slot] = c.next_seq
+    (c.packet_time as float[])[slot] = now
+    (c.packet_acked as int[])[slot] = 0
+    (c.packet_count as int[])[slot] = ep.packet_id_count
+    ids = c.packet_ids as int[]
+    carried = ep.packet_ids as int[]
+    k = 0
+    while k < ep.packet_id_count {
+        ids[slot * IDS_PER_PACKET + k] = carried[k]
+        k = k + 1
+    }
+    c.next_seq = c.next_seq + 1
+    ep.header_bytes = ep.header_bytes + (HEADER as long)
+    if ep.packet_length == HEADER { ep.ack_bytes = ep.ack_bytes + (HEADER as long) }
+    put_datagram(ep, c.address, ep.packet, ep.packet_length, now)
+    c.sent = now
+    c.ack_owed = false
+    c.unacked = 0
+}
+
+// Every open connection's queued messages into datagrams and out, and a
+// packet of acknowledgements where one is owed or the connection has been
+// quiet a keepalive's length; the client's handshake, where it is under
+// way; and the simulated link's due datagrams. A connection sends at most
+// PACKETS_PER_FLUSH datagrams a flush: reliable messages past that wait
+// for the next, unreliable ones are dropped (the next supersedes them).
+flush(ep: *UdpEndpoint, now: float) {
+    if ep == null { return }
+    k = 0
+    while k < list.size(ep.conns) {
+        c = list.get_raw(ep.conns, k) as *UdpConn
+        if c.state == CONN_OPEN {
+            flush_conn(ep, c, now)
+        } else if c.state == CONN_REQUESTING || c.state == CONN_RESPONDING {
+            handshake(ep, c, now)
+        }
+        k = k + 1
+    }
+    release_delayed(ep, now)
+}
+
+flush_conn(ep: *UdpEndpoint, c: *UdpConn, now: float) {
+    promote(c)
+    packets = 0
+    begin_packet(ep, c)
+    // The unreliable messages first, whole where they fit and in
+    // fragments where they do not: what is only worth having now.
+    q = 0
+    while q < list.size(c.queued) {
+        m = list.get_raw(c.queued, q) as *UdpMessage
+        if packets < PACKETS_PER_FLUSH {
+            packets = put_unreliable(ep, c, m, packets, now)
+        }
+        message_free(m)
+        q = q + 1
+    }
+    list.clear(c.queued)
+    if packets >= PACKETS_PER_FLUSH { return }
+    // Then the reliable messages due, oldest first, in packets of their
+    // own past the unreliable ones' and at most RELIABLE_PER_FLUSH of
+    // them: a large message goes over several flushes rather than all at
+    // once, and acknowledgements keep up with it.
+    limit = packets + RELIABLE_PER_FLUSH
+    if limit > PACKETS_PER_FLUSH { limit = PACKETS_PER_FLUSH }
+    window = c.window as ptr[]
+    id = c.oldest
+    while id < c.next_id && packets < limit {
+        m = window[id % SEND_WINDOW] as *UdpMessage
+        if m != null && due(c, m, now) {
+            size = 5 + m.length
+            if ep.packet_length + size > MTU || ep.packet_id_count >= IDS_PER_PACKET {
+                end_packet(ep, c, now)
+                packets = packets + 1
+                if packets >= limit { break }
+                begin_packet(ep, c)
+            }
+            p = ep.packet
+            at = ep.packet_length
+            kind = CHUNK_RELIABLE
+            if m.more { kind = CHUNK_RELIABLE_MORE }
+            mem.set_byte(p, at, kind)
+            mem.set_u16_le(p, at + 1, m.id & 65535)
+            mem.set_u16_le(p, at + 3, m.length)
+            if m.length > 0 { memcpy(p + at + 5, m.data, m.length as long) }
+            ep.packet_length = at + size
+            (ep.packet_ids as int[])[ep.packet_id_count] = m.id
+            ep.packet_id_count = ep.packet_id_count + 1
+            if m.sent_at < 0.0 {
+                ep.reliable_bytes = ep.reliable_bytes + (size as long)
+            } else {
+                m.resends = m.resends + 1
+                ep.resends = ep.resends + 1
+                ep.resent_bytes = ep.resent_bytes + (size as long)
+            }
+            m.sent_at = now
+        }
+        id = id + 1
+    }
+    if packets >= limit { return }
+    if ep.packet_length > HEADER || c.ack_owed || c.sent < 0.0 || now - c.sent >= KEEPALIVE {
+        end_packet(ep, c, now)
+    }
+}
+
+// One unreliable message into the packet being built, or into packets of
+// its own; the packets sent so far.
+put_unreliable(ep: *UdpEndpoint, c: *UdpConn, m: *UdpMessage, sent: int, now: float) -> int {
+    packets = sent
+    seqs = c.out_seq as int[]
+    seq = seqs[m.channel]
+    seqs[m.channel] = seq + 1
+    if m.length <= WHOLE_BYTES {
+        size = 6 + m.length
+        if ep.packet_length + size > MTU {
+            end_packet(ep, c, now)
+            packets = packets + 1
+            if packets >= PACKETS_PER_FLUSH { return packets }
+            begin_packet(ep, c)
+        }
+        p = ep.packet
+        at = ep.packet_length
+        mem.set_byte(p, at, CHUNK_UNRELIABLE)
+        mem.set_byte(p, at + 1, m.channel)
+        mem.set_u16_le(p, at + 2, seq & 65535)
+        mem.set_u16_le(p, at + 4, m.length)
+        if m.length > 0 { memcpy(p + at + 6, m.data, m.length as long) }
+        ep.packet_length = at + size
+        add_channel_bytes(ep, m.channel, size)
+        return packets
+    }
+    count = (m.length + FRAGMENT_BYTES - 1) / FRAGMENT_BYTES
+    if count > MAX_FRAGMENTS {
+        ep.oversized = ep.oversized + 1
+        return packets
+    }
+    index = 0
+    while index < count {
+        part = m.length - index * FRAGMENT_BYTES
+        if part > FRAGMENT_BYTES { part = FRAGMENT_BYTES }
+        size = 8 + part
+        if ep.packet_length + size > MTU {
+            end_packet(ep, c, now)
+            packets = packets + 1
+            if packets >= PACKETS_PER_FLUSH { return packets }
+            begin_packet(ep, c)
+        }
+        p = ep.packet
+        at = ep.packet_length
+        mem.set_byte(p, at, CHUNK_FRAGMENT)
+        mem.set_byte(p, at + 1, m.channel)
+        mem.set_u16_le(p, at + 2, seq & 65535)
+        mem.set_byte(p, at + 4, index)
+        mem.set_byte(p, at + 5, count)
+        mem.set_u16_le(p, at + 6, part)
+        memcpy(p + at + 8, m.data + index * FRAGMENT_BYTES, part as long)
+        ep.packet_length = at + size
+        add_channel_bytes(ep, m.channel, size)
+        index = index + 1
+    }
+    return packets
+}
+
+add_channel_bytes(ep: *UdpEndpoint, channel: int, size: int) {
+    counts = ep.channel_bytes as long[]
+    counts[channel] = counts[channel] + (size as long)
+}
+
+// A client's handshake: the request until the challenge comes, the
+// response until the first payload does, each every HANDSHAKE_EVERY; and
+// given up after the timeout.
+handshake(ep: *UdpEndpoint, c: *UdpConn, now: float) {
+    if c.started < 0.0 {
+        c.started = now
+        c.heard = now
+    }
+    if now - c.started > ep.timeout {
+        close_conn(ep, c, true)
+        ep.timeouts = ep.timeouts + 1
+        return
+    }
+    if c.handshake_at >= 0.0 && now - c.handshake_at < HANDSHAKE_EVERY { return }
+    c.handshake_at = now
+    p = ep.packet
+    if c.state == CONN_REQUESTING {
+        mem.set(p, 0, REQUEST_BYTES as long)
+        mem.set_byte(p, 0, PACKET_REQUEST | (VERSION << 4))
+        mem.set_u32_le(p, 1, MAGIC as long)
+        mem.set_u32_le(p, 5, VERSION as long)
+        mem.set_u32_le(p, 9, c.client_salt)
+        ep.handshake_bytes = ep.handshake_bytes + (REQUEST_BYTES as long)
+        c.requests = c.requests + 1
+        put_datagram(ep, c.address, p, REQUEST_BYTES, now)
+    } else {
+        mem.set_byte(p, 0, PACKET_RESPONSE | (VERSION << 4))
+        mem.set_u32_le(p, 1, c.client_salt ^ c.server_salt)
+        ep.handshake_bytes = ep.handshake_bytes + 5
+        put_datagram(ep, c.address, p, 5, now)
+    }
+}
+
+// A small control packet straight to an address: [u8 kind][u32 value],
+// and a second value for a challenge.
+control(ep: *UdpEndpoint, address: ptr, kind: int, value: long, second: long, now: float) {
+    p = ep.packet
+    mem.set_byte(p, 0, kind | (VERSION << 4))
+    mem.set_u32_le(p, 1, value)
+    length = 5
+    if kind == PACKET_CHALLENGE {
+        mem.set_u32_le(p, 5, second)
+        length = 9
+    }
+    ep.handshake_bytes = ep.handshake_bytes + (length as long)
+    put_datagram(ep, address, p, length, now)
+}
+
+// The connections closed before this update let go: their closing was
+// told in the events the owner has taken since, and nothing is sent to
+// them or read from them again.
+sweep(ep: *UdpEndpoint) {
+    k = 0
+    while k < list.size(ep.conns) {
+        c = list.get_raw(ep.conns, k) as *UdpConn
+        if c.state == CONN_CLOSED {
+            conn_free(c)
+            list.remove(ep.conns, k)
+        } else {
+            k = k + 1
+        }
+    }
+}
+
+// A connection closed: the owner told when it was open (or a client's
+// handshake failed). Its record goes at the next update (sweep); its id
+// is never given again.
+close_conn(ep: *UdpEndpoint, c: *UdpConn, tell: bool) {
+    if c.state == CONN_CLOSED { return }
+    c.state = CONN_CLOSED
+    if tell { push_event(ep, UDP_DISCONNECTED, c.id, null, 0) }
+}
+
+// Connection `conn` closed from this side: a disconnect said three times,
+// at once and past the simulated link, and no event here.
+disconnect(ep: *UdpEndpoint, conn: int, now: float) {
+    c = conn_by_id(ep, conn)
+    if c == null || c.state == CONN_CLOSED { return }
+    if c.state == CONN_OPEN {
+        p = ep.packet
+        mem.set_byte(p, 0, PACKET_DISCONNECT | (VERSION << 4))
+        mem.set_u32_le(p, 1, c.salt)
+        k = 0
+        while k < 3 {
+            udp.send_to_addr(ep.socket, c.address, p, 5)
+            ep.datagrams_sent = ep.datagrams_sent + 1
+            ep.bytes_sent = ep.bytes_sent + 5
+            ep.handshake_bytes = ep.handshake_bytes + 5
+            k = k + 1
+        }
+    }
+    close_conn(ep, c, false)
+}
+
+// Every connection closed from this side.
+close(ep: *UdpEndpoint, now: float) {
+    if ep == null { return }
+    k = 0
+    while k < list.size(ep.conns) {
+        disconnect(ep, (list.get_raw(ep.conns, k) as *UdpConn).id, now)
+        k = k + 1
+    }
+}
+
+endpoint_free(ep: *UdpEndpoint) {
+    if ep == null { return }
+    clear_events(ep)
+    list.free(ep.events)
+    k = 0
+    while k < list.size(ep.conns) {
+        conn_free(list.get_raw(ep.conns, k) as *UdpConn)
+        k = k + 1
+    }
+    list.free(ep.conns)
+    k = 0
+    while k < list.size(ep.pending) {
+        pd = list.get_raw(ep.pending, k) as *UdpPending
+        udp.addr_free(pd.address)
+        heap.free(pd)
+        k = k + 1
+    }
+    list.free(ep.pending)
+    k = 0
+    while k < list.size(ep.delayed) {
+        d = list.get_raw(ep.delayed, k) as *UdpDelayed
+        udp.addr_free(d.address)
+        free(d.data)
+        heap.free(d)
+        k = k + 1
+    }
+    list.free(ep.delayed)
+    udp.addr_free(ep.from)
+    free(ep.buffer)
+    free(ep.packet)
+    free(ep.packet_ids)
+    free(ep.channel_bytes)
+    free(ep.unsequenced)
+    udp.close(ep.socket)
+    heap.free(ep)
+}
+
+// --- receiving --------------------------------------------------------------------------------------
+
+// What has arrived, taken in: the handshakes answered, the packets'
+// acknowledgements applied, their messages handed over as events in
+// order; connections heard from nothing past the timeout closed; and the
+// simulated link's due datagrams sent.
+update(ep: *UdpEndpoint, now: float) {
+    if ep == null { return }
+    sweep(ep)
+    release_delayed(ep, now)
+    // Drained without waiting, bounded so a flood cannot hold the step.
+    // A failed receive is not the end of what is waiting: Windows reports
+    // a port that refused an earlier datagram on the next receive, and
+    // the datagrams behind it are still there.
+    reads = 0
+    failures = 0
+    while reads < 4096 && failures < 64 {
+        got, err = udp.recv_from_into(ep.socket, ep.buffer, MTU * 2, ep.from)
+        if err == "would block" { break }
+        if err != "" {
+            failures = failures + 1
+            continue
+        }
+        reads = reads + 1
+        ep.datagrams_received = ep.datagrams_received + 1
+        ep.bytes_received = ep.bytes_received + (got as long)
+        take_datagram(ep, ep.buffer, got, ep.from, now)
+    }
+    // Timeouts.
+    k = 0
+    while k < list.size(ep.conns) {
+        c = list.get_raw(ep.conns, k) as *UdpConn
+        if c.state == CONN_OPEN && now - c.heard > ep.timeout {
+            close_conn(ep, c, true)
+            ep.timeouts = ep.timeouts + 1
+        }
+        k = k + 1
+    }
+    k = 0
+    while k < list.size(ep.pending) {
+        pd = list.get_raw(ep.pending, k) as *UdpPending
+        if now - pd.since > PENDING_FOR {
+            udp.addr_free(pd.address)
+            heap.free(pd)
+            list.remove(ep.pending, k)
+        } else {
+            k = k + 1
+        }
+    }
+}
+
+take_datagram(ep: *UdpEndpoint, data: ptr, length: int, from: ptr, now: float) {
+    if length < 5 { return }
+    first = mem.get_byte(data, 0)
+    if (first >> 4) != VERSION { return }
+    kind = first & 7
+    if ep.hosting {
+        if kind == PACKET_REQUEST {
+            take_request(ep, data, length, from, now)
+            return
+        }
+        if kind == PACKET_RESPONSE {
+            take_response(ep, (mem.get_u32_le(data, 1)) as long, from, now)
+            return
+        }
+    } else {
+        c = conn_by_address(ep, from)
+        if c == null { return }
+        if kind == PACKET_CHALLENGE && c.state == CONN_REQUESTING && length >= 9 {
+            if (mem.get_u32_le(data, 1)) as long != c.client_salt { return }
+            c.server_salt = (mem.get_u32_le(data, 5)) as long
+            c.salt = c.client_salt ^ c.server_salt
+            // One request, one challenge: its round trip is the connection's
+            // first measure (a challenge after a resent request could answer
+            // either, and is not taken).
+            if c.requests == 1 { seed_rtt(c, now - c.handshake_at) }
+            c.state = CONN_RESPONDING
+            c.handshake_at = 0.0 - 1.0
+            handshake(ep, c, now)
+            return
+        }
+        if kind == PACKET_DENIED && c.state != CONN_OPEN {
+            if (mem.get_u32_le(data, 1)) as long == c.client_salt { close_conn(ep, c, true) }
+            return
+        }
+    }
+    c = conn_by_address(ep, from)
+    if c == null { return }
+    salt = (mem.get_u32_le(data, 1)) as long
+    if kind == PACKET_DISCONNECT {
+        if (c.state == CONN_OPEN || c.state == CONN_RESPONDING) && salt == c.salt { close_conn(ep, c, true) }
+        return
+    }
+    if kind != PACKET_PAYLOAD || length < HEADER || salt != c.salt { return }
+    if c.state == CONN_RESPONDING {
+        // The host's first payload: the handshake is done.
+        c.state = CONN_OPEN
+        push_event(ep, UDP_CONNECTED, c.id, null, 0)
+    }
+    if c.state != CONN_OPEN { return }
+    take_payload(ep, c, data, length, (first & HAS_ACK) != 0, now)
+}
+
+// Host: a request. Answered with a challenge (the same one again for a
+// request resent), or denied when there is no room.
+take_request(ep: *UdpEndpoint, data: ptr, length: int, from: ptr, now: float) {
+    if length < REQUEST_BYTES { return }
+    if (mem.get_u32_le(data, 1)) as long != (MAGIC as long) || (mem.get_u32_le(data, 5)) as int != VERSION { return }
+    client_salt = (mem.get_u32_le(data, 9)) as long
+    if conn_by_address(ep, from) != null { return }
+    if conn_count(ep) >= ep.max_clients {
+        control(ep, from, PACKET_DENIED, client_salt, 0 as long, now)
+        return
+    }
+    pd = null as *UdpPending
+    k = 0
+    while k < list.size(ep.pending) {
+        candidate = list.get_raw(ep.pending, k) as *UdpPending
+        if udp.addr_equal(candidate.address, from) { pd = candidate }
+        k = k + 1
+    }
+    if pd == null {
+        pd = heap.new(UdpPending)
+        pd.address = udp.addr_clone(from)
+        list.add_raw(ep.pending, pd as ptr)
+    }
+    if pd.client_salt != client_salt {
+        pd.client_salt = client_salt
+        pd.server_salt = next_salt(ep)
+        pd.challenges = 0
+    }
+    pd.since = now
+    pd.challenges = pd.challenges + 1
+    control(ep, from, PACKET_CHALLENGE, pd.client_salt, pd.server_salt, now)
+}
+
+// Host: a response. The two salts combined, from the address that was
+// challenged: the connection is open.
+take_response(ep: *UdpEndpoint, salt: long, from: ptr, now: float) {
+    open = conn_by_address(ep, from)
+    if open != null {
+        // A response resent before our first payload reached the client.
+        if open.salt == salt { open.ack_owed = true }
+        return
+    }
+    k = 0
+    while k < list.size(ep.pending) {
+        pd = list.get_raw(ep.pending, k) as *UdpPending
+        if udp.addr_equal(pd.address, from) {
+            if (pd.client_salt ^ pd.server_salt) != salt { return }
+            c = conn_new(ep, pd.address)
+            c.state = CONN_OPEN
+            c.client_salt = pd.client_salt
+            c.server_salt = pd.server_salt
+            c.salt = salt
+            c.heard = now
+            c.ack_owed = true
+            if pd.challenges == 1 { seed_rtt(c, now - pd.since) }
+            heap.free(pd)
+            list.remove(ep.pending, k)
+            push_event(ep, UDP_CONNECTED, c.id, null, 0)
+            return
+        }
+        k = k + 1
+    }
+}
+
+// The round trip's first measure, from the handshake: so the first
+// reliable messages (the hello, the welcome) are resent on the link's own
+// timeout rather than FIRST_RTO's guess.
+seed_rtt(c: *UdpConn, sample: float) {
+    if c.rtt_known || sample < 0.0 { return }
+    c.srtt = sample
+    c.rttvar = sample * 0.5
+    c.rtt_known = true
+}
+
+// A sequence number off the wire, its low 16 bits, put back beside
+// `near`: the nearest full number with those bits.
+unwrap(wire: int, near: int) -> int {
+    diff = ((wire - (near & 65535)) + 32768) & 65535
+    return near + diff - 32768
+}
+
+take_payload(ep: *UdpEndpoint, c: *UdpConn, data: ptr, length: int, has_ack: bool, now: float) {
+    c.heard = now
+    c.unacked = c.unacked + 1
+    seq = mem.get_u16_le(data, 5)
+    ack = mem.get_u16_le(data, 7)
+    ack_bits = (mem.get_u32_le(data, 9)) as long
+    // This packet among the received. One more than 32 behind the newest
+    // is past what the newest's bits reach -- the link reordered it
+    // behind a burst -- and is acknowledged on its own below, with its
+    // own 32 neighbours, rather than never.
+    full = seq
+    if c.newest >= 0 { full = unwrap(seq, c.newest) }
+    late = false
+    if full >= 0 {
+        (c.received as int[])[full % RECEIVED_RING] = full
+        if c.newest < 0 || full > c.newest {
+            c.newest = full
+        } else if c.newest - full > 32 {
+            late = true
+        }
+    }
+    if has_ack { take_acks(c, ack, ack_bits, now) }
+    // The chunks.
+    at = HEADER
+    reliable = false
+    while at < length {
+        kind = mem.get_byte(data, at)
+        if kind == CHUNK_RELIABLE || kind == CHUNK_RELIABLE_MORE {
+            if at + 5 > length { break }
+            id = unwrap(mem.get_u16_le(data, at + 1), c.expected)
+            size = mem.get_u16_le(data, at + 3)
+            if at + 5 + size > length { break }
+            reliable = true
+            if id >= c.expected && id < c.expected + RECV_WINDOW {
+                slot = id % RECV_WINDOW
+                held = c.held as ptr[]
+                if held[slot] == null {
+                    m = heap.new(UdpMessage)
+                    m.id = id
+                    m.length = size
+                    m.more = kind == CHUNK_RELIABLE_MORE
+                    if size > 0 {
+                        m.data = malloc(size as long)
+                        memcpy(m.data, data + at + 5, size as long)
+                    }
+                    held[slot] = m as ptr
+                }
+            }
+            at = at + 5 + size
+        } else if kind == CHUNK_UNRELIABLE {
+            if at + 6 > length { break }
+            channel = mem.get_byte(data, at + 1)
+            size = mem.get_u16_le(data, at + 4)
+            if at + 6 + size > length || channel < 1 || channel >= CHANNELS { break }
+            take_unreliable(ep, c, channel, mem.get_u16_le(data, at + 2), data + at + 6, size)
+            at = at + 6 + size
+        } else if kind == CHUNK_FRAGMENT {
+            if at + 8 > length { break }
+            channel = mem.get_byte(data, at + 1)
+            size = mem.get_u16_le(data, at + 6)
+            if at + 8 + size > length || channel < 1 || channel >= CHANNELS { break }
+            take_fragment(ep, c, channel, mem.get_u16_le(data, at + 2), mem.get_byte(data, at + 4),
+                          mem.get_byte(data, at + 5), data + at + 8, size)
+            at = at + 8 + size
+        } else {
+            break
+        }
+    }
+    if reliable { c.ack_owed = true }
+    hand_over_reliable(ep, c)
+    // A packet acknowledges the newest and the 32 before it, so a burst of
+    // more than that between two of this side's flushes -- a large message
+    // arriving -- would leave its oldest packets never acknowledged, and
+    // sent again for nothing. Every ACK_EVERY received, one goes back now;
+    // and one for a late packet, acknowledging it and its neighbours.
+    if late {
+        begin_acking(ep, c, full)
+        end_packet(ep, c, now)
+    } else if c.unacked >= ACK_EVERY {
+        begin_packet(ep, c)
+        end_packet(ep, c, now)
+    }
+}
+
+// The acknowledgements a packet carries: `ack` and the 32 before it by
+// its bits. A packet acknowledged the first time gives a round trip, and
+// every reliable message it carried is done with.
+take_acks(c: *UdpConn, ack: int, ack_bits: long, now: float) {
+    if c.next_seq == 0 { return }
+    newest = c.next_seq - 1 - (((c.next_seq - 1) - ack) & 65535)
+    k = 0
+    while k <= 32 {
+        acked = k == 0
+        if k > 0 { acked = ((ack_bits >> (k - 1)) & (1 as long)) == (1 as long) }
+        seq = newest - k
+        if acked && seq >= 0 { acknowledge(c, seq, now) }
+        k = k + 1
+    }
+    // What the acknowledgements finished, off the window's front.
+    window = c.window as ptr[]
+    while c.oldest < c.next_id {
+        m = window[c.oldest % SEND_WINDOW] as *UdpMessage
+        if m != null && !m.acked { break }
+        if m != null {
+            message_free(m)
+            window[c.oldest % SEND_WINDOW] = null
+        }
+        c.oldest = c.oldest + 1
+    }
+    promote(c)
+}
+
+acknowledge(c: *UdpConn, seq: int, now: float) {
+    slot = seq % SENT_RING
+    seqs = c.packet_seq as int[]
+    acked = c.packet_acked as int[]
+    if seqs[slot] != seq || acked[slot] == 1 { return }
+    acked[slot] = 1
+    sample = now - (c.packet_time as float[])[slot]
+    if sample >= 0.0 {
+        if !c.rtt_known {
+            c.srtt = sample
+            c.rttvar = sample * 0.5
+            c.rtt_known = true
+        } else {
+            gap = c.srtt - sample
+            if gap < 0.0 { gap = 0.0 - gap }
+            c.rttvar = c.rttvar * 0.75 + gap * 0.25
+            c.srtt = c.srtt * 0.875 + sample * 0.125
+        }
+    }
+    count = (c.packet_count as int[])[slot]
+    ids = c.packet_ids as int[]
+    window = c.window as ptr[]
+    k = 0
+    while k < count {
+        id = ids[slot * IDS_PER_PACKET + k]
+        if id >= c.oldest && id < c.next_id {
+            m = window[id % SEND_WINDOW] as *UdpMessage
+            if m != null && m.id == id { m.acked = true }
+        }
+        k = k + 1
+    }
+}
+
+// The reliable messages whose turn has come, handed over in id order: a
+// sliced one's slices gathered, and handed over whole with its last.
+hand_over_reliable(ep: *UdpEndpoint, c: *UdpConn) {
+    held = c.held as ptr[]
+    while true {
+        slot = c.expected % RECV_WINDOW
+        m = held[slot] as *UdpMessage
+        if m == null || m.id != c.expected { break }
+        held[slot] = null
+        c.expected = c.expected + 1
+        if m.more || c.assembled > 0 {
+            grow_assembly(c, m.length)
+            if m.length > 0 { memcpy(c.assembly + c.assembled, m.data, m.length as long) }
+            c.assembled = c.assembled + m.length
+            if !m.more {
+                push_event(ep, UDP_MESSAGE, c.id, c.assembly, c.assembled)
+                c.assembled = 0
+            }
+        } else {
+            push_event(ep, UDP_MESSAGE, c.id, m.data, m.length)
+        }
+        message_free(m)
+    }
+}
+
+grow_assembly(c: *UdpConn, more: int) {
+    if c.assembled + more <= c.assembly_capacity { return }
+    wanted = c.assembly_capacity * 2
+    if wanted < 4096 { wanted = 4096 }
+    while wanted < c.assembled + more { wanted = wanted * 2 }
+    c.assembly = realloc(c.assembly, wanted as long)
+    c.assembly_capacity = wanted
+}
+
+// An unreliable message: handed over if it is the newest of its channel,
+// dropped if a newer one already was.
+take_unreliable(ep: *UdpEndpoint, c: *UdpConn, channel: int, wire: int, data: ptr, size: int) {
+    newest = c.in_newest as int[]
+    seq = wire
+    if newest[channel] >= 0 { seq = unwrap(wire, newest[channel]) }
+    if newest[channel] >= 0 && seq <= newest[channel] {
+        if (ep.unsequenced as int[])[channel] == 1 {
+            push_event(ep, UDP_MESSAGE, c.id, data, size)
+            return
+        }
+        ep.stale = ep.stale + 1
+        return
+    }
+    newest[channel] = seq
+    push_event(ep, UDP_MESSAGE, c.id, data, size)
+}
+
+// A fragment: put in its place in the message its sequence number is
+// being put together as, which is handed over when its last one is in. A
+// fragment of a newer message starts that one and drops what was being
+// put together; one of an older message is dropped.
+take_fragment(ep: *UdpEndpoint, c: *UdpConn, channel: int, wire: int, index: int, count: int, data: ptr, size: int) {
+    if count < 1 || index >= count || size > FRAGMENT_BYTES { return }
+    if index < count - 1 && size != FRAGMENT_BYTES { return }
+    newest = c.in_newest as int[]
+    building = c.frag_seq as int[]
+    near = building[channel]
+    if near < 0 { near = newest[channel] }
+    seq = wire
+    if near >= 0 { seq = unwrap(wire, near) }
+    if newest[channel] >= 0 && seq <= newest[channel] {
+        ep.stale = ep.stale + 1
+        return
+    }
+    counts = c.frag_count as int[]
+    got = c.frag_got as int[]
+    present = c.frag_present as int[]
+    lengths = c.frag_length as int[]
+    blocks = c.frag_data as ptr[]
+    if building[channel] >= 0 && seq < building[channel] {
+        ep.stale = ep.stale + 1
+        return
+    }
+    if building[channel] != seq {
+        building[channel] = seq
+        counts[channel] = count
+        got[channel] = 0
+        lengths[channel] = 0
+        k = 0
+        while k < MAX_FRAGMENTS {
+            present[channel * MAX_FRAGMENTS + k] = 0
+            k = k + 1
+        }
+    }
+    if counts[channel] != count || present[channel * MAX_FRAGMENTS + index] == 1 { return }
+    if blocks[channel] == null { blocks[channel] = malloc((MAX_FRAGMENTS * FRAGMENT_BYTES) as long) }
+    memcpy(blocks[channel] + index * FRAGMENT_BYTES, data, size as long)
+    present[channel * MAX_FRAGMENTS + index] = 1
+    got[channel] = got[channel] + 1
+    if index == count - 1 { lengths[channel] = index * FRAGMENT_BYTES + size }
+    if got[channel] == count {
+        newest[channel] = seq
+        building[channel] = 0 - 1
+        push_event(ep, UDP_MESSAGE, c.id, blocks[channel], lengths[channel])
+    }
+}
+
+// --- what went over the socket ------------------------------------------------------------------------
+
+datagrams_sent(ep: *UdpEndpoint) -> long { return ep.datagrams_sent }
+datagrams_received(ep: *UdpEndpoint) -> long { return ep.datagrams_received }
+bytes_sent(ep: *UdpEndpoint) -> long { return ep.bytes_sent }
+bytes_received(ep: *UdpEndpoint) -> long { return ep.bytes_received }
+header_bytes(ep: *UdpEndpoint) -> long { return ep.header_bytes }
+reliable_bytes(ep: *UdpEndpoint) -> long { return ep.reliable_bytes }
+resent_bytes(ep: *UdpEndpoint) -> long { return ep.resent_bytes }
+channel_bytes(ep: *UdpEndpoint, channel: int) -> long {
+    if channel < 0 || channel >= CHANNELS { return 0 as long }
+    return (ep.channel_bytes as long[])[channel]
+}
+ack_bytes(ep: *UdpEndpoint) -> long { return ep.ack_bytes }
+handshake_bytes(ep: *UdpEndpoint) -> long { return ep.handshake_bytes }
+dropped(ep: *UdpEndpoint) -> long { return ep.dropped }
+largest(ep: *UdpEndpoint) -> int { return ep.largest }
+resends(ep: *UdpEndpoint) -> long { return ep.resends }
+stale(ep: *UdpEndpoint) -> long { return ep.stale }
+oversized(ep: *UdpEndpoint) -> long { return ep.oversized }
+timeouts(ep: *UdpEndpoint) -> int { return ep.timeouts }

@@ -1,0 +1,380 @@
+// A networked horde's struck zombies handed to active ragdolls on every
+// peer (#466): ae3d.nethorde's handover and rejoin inputs and its out
+// flags, and ae3d.nethandover over ae3d.handover's pool. A host, a client
+// from the start and a third that joins mid-handover, each a world of its
+// own with a ground, a horde of 48 and a pool of four of the box man, over
+// a link of 100 ms, 20 ms of jitter and 2% loss, on the test's clock. The
+// host strikes the last zombie hard (it falls, gets up and goes back),
+// shoves another (it staggers and goes back), kills a third (it lies and
+// is despawned), and kills the first zombie in the horde, so the one it
+// struck hard moves to its index while handed over. Held to numbers:
+//
+//   - every peer takes a zombie out at the same tick, and puts it back at
+//     the same tick, the out flags in the hash: every client's horde is
+//     the host's at every tick it reaches, before, during and after;
+//   - the client that joins mid-handover has the out flags from its first
+//     tick, and draws the ragdolls alive when it came;
+//   - the host simulates the ragdoll, and a client draws it from its
+//     bones' snapshots: its pelvis against where the host had it at the
+//     client's view time;
+//   - on a client the zombie leaves its horde and its figure appears in
+//     the same frame, and the other way round: never both drawn, never
+//     neither;
+//   - a zombie killed while handed over stays out until its figure is
+//     despawned, and is then compacted away on every peer at one tick;
+//   - one handed over that a kill moves to another index keeps its figure;
+//   - what a ragdoll costs a client a second.
+
+import std.list
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.loader
+import ae3d.physics
+import ae3d.figure
+import ae3d.motion
+import ae3d.handover
+import ae3d.net
+import ae3d.nethorde
+import ae3d.nethandover
+import aephysics.human
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern cos(x: float) -> float
+extern sin(x: float) -> float
+extern sqrt(x: float) -> float
+
+const PATH = "tests/fixtures/gltf/humanoid.glb"
+const CLIP = "Idle"
+const ZOMBIES = 48
+const POOL = 4
+const SEED = 466
+const STEP = 0.016666666666666666
+const FACING = 0.0 - 1.5707963267948966
+const EDGE = 20.0
+const BEGIN = 30                     // the horde starts: 0.5 s
+const STRIKE = 60                    // the last zombie struck hard: 1 s
+const SHOVE = 90                     // another shoved: 1.5 s
+const KILL = 120                     // a third killed: 2 s
+const LATE = 150                     // the third client joins: 2.5 s
+const MOVE = 180                     // the first zombie killed in the horde, the struck one moved: 3 s
+const STEPS = 720                    // 12 s
+const SETTLE = 60
+const TICKS = 1024
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+// One side: a world, its session, its horde, its pool and the glue.
+struct Side {
+    world: *Engine
+    session: *Net
+    horde: *NetHorde
+    pool: *Handover
+    glue: *NetHandover
+    joined: bool
+    frames: int                      // frames compared with the host at its tick
+    wrong: int                       // of them, a different hash
+    outs_wrong: int                  // of them, a different count of zombies out
+    first_out: int                   // the tick its horde first had a zombie out
+    last_tick: int
+    started_out: int                 // the late one: zombies out at the first tick it stepped from its state
+    from_tick: int                   // the tick its last state put it at: compared after it
+    states: int                      // states it has taken
+    both: int                        // frames the struck zombie was drawn in the horde and as a figure
+    neither: int                     // frames it was drawn as neither
+    watched: int                     // frames it was watched
+    drawn_frames: int                // frames its puppet was drawn
+    pelvis_worst: float
+    pelvis_close: int
+    pelvis_frames: int
+}
+
+side_new(session: *Net) -> *Side {
+    s = calloc(1, sizeof(Side)) as *Side
+    s.session = session
+    s.first_out = 0 - 1
+    s.started_out = 0 - 1
+    e = engine.engine_new()
+    engine.engine_set_fixed_step(e, STEP)
+    physics.attach(e)
+    ground = engine.object(e, "Ground", loader.cube(1.0))
+    behaviour.object_set_position(ground, core.vec3(0.0, 0.0 - 0.5, 0.0))
+    physics.box_collider(ground, core.vec3(40.0, 0.5, 40.0), physics.material(0.8, 0.0))
+    s.world = e
+    s.horde = nethorde.horde_new(session, null)
+    nethorde.set_checks(s.horde, 1)
+    nethorde.set_height(s.horde, 0.02)
+    s.pool = handover.pool_new(e, PATH, CLIP, POOL)
+    if s.pool != null {
+        handover.set_facing(s.pool, FACING)
+        handover.set_get_up(s.pool, 0.8)
+        handover.set_settle(s.pool, 0.5)
+        handover.set_despawn(s.pool, 2.0)
+        s.glue = nethandover.handover_new(s.horde, s.pool)
+    }
+    return s
+}
+
+side_free(s: *Side) {
+    if s == null { return }
+    e = s.world
+    net.net_free(s.session)
+    nethandover.handover_free(s.glue)
+    nethorde.horde_free(s.horde)
+    physics.physics_free(physics.of(e))
+    engine.engine_free(e)
+    motion.motions_free(e)
+    figure.figures_free(e)
+    if s.pool != null { handover.pool_free(s.pool) }
+    free(s as ptr)
+}
+
+// The host's hash and its count of zombies out at every tick it reached.
+var g_hashes: ptr = null             // long[TICKS]
+var g_outs: ptr = null               // int[TICKS]
+var g_known: ptr = null              // int[TICKS]
+var g_host_first_out = 0 - 1
+
+record(host: *Side) {
+    tick = nethorde.horde_tick(host.horde)
+    if tick < 1 || tick >= TICKS || (g_known as int[])[tick] == 1 { return }
+    (g_hashes as long[])[tick] = nethorde.checksum(host.horde)
+    (g_outs as int[])[tick] = nethorde.out_count(host.horde)
+    (g_known as int[])[tick] = 1
+    if g_host_first_out < 0 && nethorde.out_count(host.horde) > 0 { g_host_first_out = tick }
+}
+
+// A client against the host at the tick it is at, every frame.
+compare(s: *Side) {
+    if s == null || !nethorde.started(s.horde) { return }
+    tick = nethorde.horde_tick(s.horde)
+    // A state puts a side at tick T with the inputs for T + 1 (the snap
+    // among them) already in it, which the others hold only as they step
+    // T + 1: it is compared from the first tick it steps.
+    if nethorde.resyncs(s.horde) + 1 != s.states {
+        s.states = nethorde.resyncs(s.horde) + 1
+        s.from_tick = tick
+    }
+    if tick <= s.from_tick || tick < 1 || tick >= TICKS || (g_known as int[])[tick] == 0 { return }
+    if s.started_out < 0 { s.started_out = nethorde.out_count(s.horde) }
+    if s.first_out < 0 && nethorde.out_count(s.horde) > 0 { s.first_out = tick }
+    s.frames = s.frames + 1
+    if nethorde.checksum(s.horde) != (g_hashes as long[])[tick] { s.wrong = s.wrong + 1 }
+    if nethorde.out_count(s.horde) != (g_outs as int[])[tick] { s.outs_wrong = s.outs_wrong + 1 }
+}
+
+// Where the host's struck figure's pelvis was, a step at a time.
+var g_pelvis: ptr = null             // float[STEPS * 4]: the host's time, x y z
+var g_pelvis_count = 0
+
+record_pelvis(host: *Side, zombie: int, now: float) {
+    slot = handover.handed(host.pool, zombie)
+    if slot < 0 || g_pelvis_count >= STEPS { return }
+    m = handover.slot_motion(host.pool, slot)
+    at = behaviour.object_position(physics.ragdoll_bone(m.ragdoll, human.BONE_PELVIS))
+    p = g_pelvis as float[]
+    k = g_pelvis_count * 4
+    p[k] = now
+    p[k + 1] = at.x
+    p[k + 2] = at.y
+    p[k + 3] = at.z
+    g_pelvis_count = g_pelvis_count + 1
+}
+
+// The host's pelvis at host time t, between the two steps around it.
+pelvis_at(t: float) -> Vec3 {
+    p = g_pelvis as float[]
+    k = 1
+    while k < g_pelvis_count {
+        if p[k * 4] >= t {
+            a = (k - 1) * 4
+            c = k * 4
+            u = 0.0
+            if p[c] > p[a] { u = (t - p[a]) / (p[c] - p[a]) }
+            return core.vec3(p[a + 1] + (p[c + 1] - p[a + 1]) * u, p[a + 2] + (p[c + 2] - p[a + 2]) * u, p[a + 3] + (p[c + 3] - p[a + 3]) * u)
+        }
+        k = k + 1
+    }
+    return core.vec3(0.0, 0.0 - 1000.0, 0.0)
+}
+
+// On a client, the struck zombie: drawn in its horde (not out) or as its
+// figure, one and only one, once it has been handed over; and its figure's
+// pelvis against the host's at the view time.
+watch(s: *Side, zombie: int, now: float) {
+    if s == null || !nethorde.started(s.horde) || s.glue == null { return }
+    in_horde = !nethorde.is_out(s.horde, zombie)
+    as_figure = nethandover.drawn(s.glue, zombie)
+    if as_figure { s.drawn_frames = s.drawn_frames + 1 }
+    if s.drawn_frames > 0 || nethorde.is_out(s.horde, zombie) {
+        s.watched = s.watched + 1
+        if in_horde && as_figure { s.both = s.both + 1 }
+        if !in_horde && !as_figure { s.neither = s.neither + 1 }
+    }
+    if as_figure {
+        id = nethandover.pelvis_id(s.glue, zombie)
+        o = net.object_of(s.session, id)
+        view = net.view_time(s.session, now)
+        if o != null && view > 0.0 && g_pelvis_count > 1 && view <= (g_pelvis as float[])[(g_pelvis_count - 1) * 4] {
+            d = core.v3_len(core.v3_sub(behaviour.object_position(o), pelvis_at(view)))
+            s.pelvis_frames = s.pelvis_frames + 1
+            if d <= 0.02 { s.pelvis_close = s.pelvis_close + 1 }
+            if d > s.pelvis_worst { s.pelvis_worst = d }
+        }
+    }
+}
+
+// The host's strike: at the zombie's chest as its horde draws it, along
+// `heading` over the ground.
+strike(host: *Side, zombie: int, impulse: float, heading: float, killed: bool, now: float) -> int {
+    pos = nethorde.positions(host.horde) as float[]
+    point = core.vec3(pos[zombie * 3], pos[zombie * 3 + 1] + 1.35, pos[zombie * 3 + 2])
+    blow = core.vec3(cos(heading) * impulse, 0.0, 0.0 - sin(heading) * impulse)
+    if killed { return nethandover.kill(host.glue, zombie, point, blow, now) }
+    return nethandover.strike(host.glue, zombie, point, blow, now)
+}
+
+step_side(s: *Side, now: float) {
+    if s == null { return }
+    net.step(s.session, now)
+    nethorde.step(s.horde, now)
+    engine.engine_update(s.world, STEP)
+    nethandover.step(s.glue, now)
+}
+
+main() {
+    g_hashes = calloc(TICKS, 8)
+    g_outs = calloc(TICKS, 4)
+    g_known = calloc(TICKS, 4)
+    g_pelvis = calloc(STEPS * 4, 8)
+    hub = net.hub_new()
+    net.hub_set_conditions(hub, 0.1, 0.02, 0.02)
+    host = side_new(net.host_loopback(hub))
+    one = side_new(net.join_loopback(hub))
+    late = null as *Side
+    if host.pool == null || one.pool == null {
+        println("net handover: FAIL the pool of ${PATH} could not be made")
+        side_free(one)
+        side_free(host)
+        net.hub_free(hub)
+        return
+    }
+    hard = ZOMBIES - 1               // struck hard: the last, so the kill at MOVE moves it
+    shoved = 5
+    killed = 20
+    hard_slot = 0 - 1
+    shove_slot = 0 - 1
+    kill_slot = 0 - 1
+    count_before_despawn = 0
+    compact_tick = 0 - 1
+    moved_ok = false
+    ragdoll_frames = 0
+    ragdoll_steps = 0                // ragdolls out, summed over the steps
+    step = 0
+    while step < STEPS + SETTLE {
+        now = (step as float) * STEP
+        running = step < STEPS
+        if step == BEGIN { nethorde.start(host.horde, SEED, ZOMBIES, 0.0 - EDGE, 0.0 - EDGE, EDGE, EDGE, now) }
+        if step == STRIKE { hard_slot = strike(host, hard, 400.0, 0.3, false, now) }
+        if step == SHOVE { shove_slot = strike(host, shoved, 40.0, 1.9, false, now) }
+        if step == KILL { kill_slot = strike(host, killed, 300.0, 3.4, true, now) }
+        if step == LATE { late = side_new(net.join_loopback(hub)) }
+        if step == MOVE {
+            // The first zombie killed in the horde: the last (struck hard,
+            // its figure falling) takes its index, on every peer at the
+            // next tick.
+            nethorde.kill(host.horde, 0, now)
+            hard = 0
+            moved_ok = handover.handed(host.pool, 0) == hard_slot && nethorde.is_out(host.horde, 0)
+        }
+        if step == KILL + 1 { count_before_despawn = nethorde.horde_count(host.horde) }
+        if running {
+            // The session reads the ragdoll where the last fixed step left
+            // it and stamps it now, and the horde's tick is its state: both
+            // recorded as the session and the horde have them, before the
+            // world steps on and the glue compacts what it despawned.
+            net.step(host.session, now)
+            record_pelvis(host, hard, now)
+            nethorde.step(host.horde, now)
+            record(host)
+            engine.engine_update(host.world, STEP)
+            nethandover.step(host.glue, now)
+            if nethandover.ragdolls(host.glue) > 0 { ragdoll_frames = ragdoll_frames + 1 }
+            ragdoll_steps = ragdoll_steps + nethandover.ragdolls(host.glue)
+            if compact_tick < 0 && step > KILL && nethorde.horde_count(host.horde) < count_before_despawn - 1 { compact_tick = nethorde.horde_tick(host.horde) }
+        } else {
+            net.step(host.session, now)
+        }
+        step_side(one, now)
+        step_side(late, now)
+        compare(one)
+        compare(late)
+        watch(one, hard, now)
+        step = step + 1
+    }
+
+    last = nethorde.horde_tick(host.horde)
+    println("net handover: a horde of ${ZOMBIES}, a pool of ${POOL} a side; a host, a client, and one from ${(LATE as float) * STEP} s; 100 ms, 20 ms jitter, 2% loss")
+    println("  the host: ${last} ticks; struck the last zombie into slot ${hard_slot}, shoved one into ${shove_slot}, killed one into ${kill_slot}; ${handover.returned(host.pool)} given back, ${handover.despawned(host.pool)} despawned, ${nethorde.horde_count(host.horde)} zombies left, ${nethorde.out_count(host.horde)} out")
+    check("the host's pool took all three", hard_slot >= 0 && shove_slot >= 0 && kill_slot >= 0)
+    println("  the first zombie out at tick ${g_host_first_out} on the host, ${one.first_out} on the client")
+    check("every peer takes a zombie out at the same tick", g_host_first_out > 0 && one.first_out == g_host_first_out)
+    println("  client 1: ${one.frames} frames against the host's hash, ${one.wrong} different, ${one.outs_wrong} with a different count out; seals checked ${nethorde.checks(one.horde)}, ${nethorde.divergences(one.horde)} diverged")
+    check("the client holds the host's horde at every tick, handed over and given back, the out flags in the hash",
+          one.frames > 500 && one.wrong == 0 && one.outs_wrong == 0 && nethorde.divergences(one.horde) == 0 && handover.returned(host.pool) >= 2)
+    println("  the late client: ${late.started_out} out at its first tick; ${late.frames} frames, ${late.wrong} different; seals ${nethorde.checks(late.horde)}, ${nethorde.divergences(late.horde)} diverged; ${nethandover.ragdolls(late.glue)} ragdolls at the end")
+    check("the client that joins mid-handover has the out flags from its first tick, and the host's horde from then on",
+          late.started_out >= 2 && late.frames > 300 && late.wrong == 0 && late.outs_wrong == 0 && nethorde.divergences(late.horde) == 0)
+    println("  the struck zombie on client 1: watched ${one.watched} frames, its figure drawn ${one.drawn_frames}; both drawn ${one.both}, neither ${one.neither}")
+    check("on a client the zombie leaves its horde as its figure appears, and comes back as it goes: never both, never neither",
+          one.drawn_frames > 60 && one.both == 0 && one.neither == 0)
+    println("  its figure's pelvis against the host's at the view time: within 2 cm on ${one.pelvis_close} of ${one.pelvis_frames} frames, at most ${one.pelvis_worst * 1000.0} mm")
+    check("the client draws the host's ragdoll: its pelvis within 2 cm on 95% of frames", one.pelvis_frames > 60 && (one.pelvis_close as float) >= 0.95 * (one.pelvis_frames as float))
+    println("  the kill: compacted at tick ${compact_tick}; the struck zombie moved to index 0 with its figure: ${moved_ok}")
+    check("a zombie killed while handed over is compacted away when its figure is despawned, on every peer at one tick",
+          handover.despawned(host.pool) == 1 && compact_tick > 0 && nethorde.horde_count(host.horde) == ZOMBIES - 2 &&
+          nethorde.horde_count(one.horde) == ZOMBIES - 2 && nethorde.out_count(one.horde) == 0)
+    check("one handed over that a kill moves keeps its figure, and is given back at its new index", moved_ok && handover.returned(host.pool) == 2 && nethorde.out_count(host.horde) == 0)
+    seconds = ((STEPS + SETTLE) as float) * STEP
+    per_second = (net.bytes_received(one.session) as float) / seconds
+    // The session carries nothing but the ragdolls' bones here: every
+    // snapshot byte beyond the headers is theirs.
+    out_seconds = (ragdoll_frames as float) * STEP
+    first_client = net.client_id(one.session)
+    bone_bytes = (net.snapshot_bytes(host.session, first_client) - (net.snapshots_sent(host.session, first_client) * 17) as long) as float
+    bones_per_second = bone_bytes / out_seconds
+    per_ragdoll = bone_bytes / ((ragdoll_steps as float) * STEP)
+    println("  client 1 received ${per_second / 1024.0} KB a second over the run, the horde's ${nethorde.horde_bytes(one.horde)} bytes of it; the ragdolls' bones ${bones_per_second / 1024.0} KB a second over the ${out_seconds} s one or more was out, ${per_ragdoll / 1024.0} KB a ragdoll a second")
+    // A bone's record is at most 17 bytes (its index, its fields, three
+    // changes of a few steps each, its rotation), twelve of them 30 times
+    // a second: 6.1 KB for a ragdoll that moves every bone every tick. One
+    // lying still costs nothing.
+    check("a ragdoll costs a client under 6 KB a second: twelve bones, quantised, as deltas", per_ragdoll > 0.0 && per_ragdoll < 6.0 * 1024.0)
+
+    side_free(late)
+    side_free(one)
+    side_free(host)
+    net.hub_free(hub)
+    check("every session made is let go", net.alive() == 0)
+    free(g_hashes)
+    free(g_outs)
+    free(g_known)
+    free(g_pelvis)
+    if g_failures == 0 {
+        println("net handover: all checks passed (${g_checks})")
+    } else {
+        println("net handover: ${g_failures} failure(s) of ${g_checks}")
+    }
+}

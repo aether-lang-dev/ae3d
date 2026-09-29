@@ -101,6 +101,8 @@ esac
 . "$ROOT/scripts/native.sh"
 ae3d_glfw_flags
 ae3d_vulkan_flags
+# No multiply and add fused into one rounding, anywhere: see ae3d_fp_flags.
+FP_FLAGS="$(ae3d_fp_flags)"
 
 . "$ROOT/scripts/platform.sh"
 PLATFORM_LIBS="$(ae3d_platform_libs "$(uname -s)")"
@@ -144,7 +146,7 @@ for src in $NATIVE_SOURCES; do
     extra="$(ae3d_native_extra_flags "$src")"
     compiler="$(ae3d_native_compiler "$CC" "$src")"
     if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$newest_header" -nt "$obj" ]; then
-        "$compiler" -c $CFLAGS $WARN $PIC $NATIVE_INCLUDE $extra $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o "$obj"
+        "$compiler" -c $CFLAGS $FP_FLAGS $WARN $PIC $NATIVE_INCLUDE $extra $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o "$obj"
     fi
 done
 
@@ -189,7 +191,7 @@ AETHER_SOURCES="$(sed -n 's|^// aether-source: ||p' "$GEN" | tr '\\' '/')"
 # toolchain is built against zlib its --libs already carries -lz, Apple's ld
 # warns about a duplicate library, and ci.sh reads a warning in a build log as
 # a failure. GLFW is named: the program's own Aether calls it (ae3d.platform).
-"$CC" $CFLAGS $VULKAN_CFLAGS "$GEN" $AETHER_SOURCES $(ae3d_native_link_flags) $GLFW_LIBS $AETHER_COMPILE_FLAGS $AETHER_LIBS $PLATFORM_LIBS -o "$OUT"
+"$CC" $CFLAGS $FP_FLAGS $VULKAN_CFLAGS "$GEN" $AETHER_SOURCES $(ae3d_native_link_flags) $GLFW_LIBS $AETHER_COMPILE_FLAGS $AETHER_LIBS $PLATFORM_LIBS -o "$OUT"
 
 # MinGW gcc appends .exe to an output name that has no extension, so the file
 # is not at the path this asked for. Name the one that exists.

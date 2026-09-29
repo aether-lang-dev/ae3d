@@ -248,7 +248,7 @@ The limits it holds are 2 mm at the hand-over, 10 mm at the giving back, 12 s to
 
 `examples/horde_strike.ae` is a field of 300 of any humanoid glTF (the box man by default), with a pool of twelve. A left click strikes the zombie under the cursor, and a right click kills it. With no one clicking, a timer strikes the zombie in the middle of the view every second and a half, and every third blow kills.
 
-The networked horde (`ae3d.nethorde`) keeps its own columns and hands nothing over yet.
+A networked horde hands over too, on every peer (`ae3d.nethandover`, #466; [networking.md](networking.md#struck-zombies-handed-to-ragdolls-on-every-peer)): the strike and the giving back are the horde's inputs, so every peer takes the same zombie out at the same tick and puts it back to the same bits; the host's pool simulates the ragdoll, and every client poses a figure of its own pool from the ragdoll's bones as it draws them (`puppet`, `puppet_pose`, `puppet_end`). `renumber` follows a zombie the horde's compaction moves, and `set_on_despawn` says when a killed one's figure is parked.
 
 ## What it is held to
 
@@ -277,5 +277,4 @@ As #414 lays out:
 - stagger and writhe;
 - get-up clips from the pipeline in place of the keyed ways up, once a figure has them;
 - the inspector's section, with a Hit button in the viewport;
-- handing over from the networked horde: the strike and the giving back as horde inputs, so every peer takes the same zombie out at the same tick;
 - drawing a powered figure's bodies each frame rather than each step, for an animation that plays on while its muscles track it.

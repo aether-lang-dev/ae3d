@@ -35,9 +35,9 @@ kernels; what remains in C is there for one stated reason each
 | **Voxels and terrain** | Voxel worlds as only the faces that show; surface nets over a distance field for smooth terrain. |
 | **An engine you can ask** | `AE3D_AGENT=port` opens a JSON channel: read and change the scene, hold a frame, read its pixels, trace a model from its Blender object to the pixels it landed on. |
 | **Natural motion** | `ae3d.motion`, an active ragdoll on any dressed figure: the animation played by joint motors within an adult's torque budget, a blow that knocks it off its pose and back or down, a struck limb that goes weak and recovers, a fall with the hands out and the head tucked, and getting up again face up or face down, handed back to the animation with nothing to jump ([docs/motion.md](docs/motion.md)). |
-| **Multiplayer in the engine** | `ae3d.net`: host or join over TCP or an in-process loopback with simulated latency, jitter and loss; networked objects replicated and interpolated, held to within a millimetre and a half of the host over a perfect link; players that walk the instant their client asks, predicted and reconciled against the host; snapshots sent as changes against the last one each client acknowledged, and only what is near it ([docs/networking.md](docs/networking.md)). |
+| **Multiplayer in the engine** | `ae3d.net`: host or join over UDP -- a handshake, acknowledgements, a reliable ordered channel of its own and fragments on the one socket -- TCP, or an in-process loopback, any of them with simulated latency, jitter and loss; networked objects replicated and interpolated, held to within a millimetre and a half of the host over a perfect link; players that walk the instant their client asks, predicted and reconciled against the host; snapshots quantised to a tenth of a millimetre and sent as changes against the last one each client acknowledged, a still scene 510 bytes a second where whole snapshots cost 24 KB; only what is near each client, within its budget of bytes, the most urgent first; a horde every peer simulates, its struck zombies handed to ragdolls the host simulates and every client draws; and the editor playing a scene as a host and its clients ([docs/networking.md](docs/networking.md)). |
 | **Input as a game names it** | Actions and axes bound once to keys, mouse and gamepad, read by name from any script, injectable from a test or an agent. The camera they fly keeps out of the scene -- swept and slid, never through a wall or under the ground -- and one call frames a model of any size. |
-| **An editor** | Hierarchy, inspector, gizmos, terrain sculpting, physics bodies and a Simulate button, undo, scene files; opens any program's scene (`AE3D_SCENE_OUT`); one dark theme on every platform. |
+| **An editor** | Hierarchy, inspector, gizmos, terrain sculpting, physics bodies and a Simulate button, Play as a host and up to four clients over a simulated link, each world shown in turn and its player walked from the keys, undo, scene files; opens any program's scene (`AE3D_SCENE_OUT`); one dark theme on every platform. |
 
 Each row is a page in [docs/](docs/README.md) with the reasoning and the
 measurement behind it.
@@ -223,8 +223,12 @@ request. Done on that map:
 - a character controller;
 - natural motion: active ragdolls that fall the way a person does and get
   up ([#414](https://github.com/nicolas-maman/ae3d/issues/414));
-- multiplayer in the engine: snapshots as deltas, relevance, predicted
-  players, events and objects made mid-game
+- multiplayer in the engine: UDP with a reliable channel of its own,
+  snapshots quantised and as deltas against what each client
+  acknowledged, relevance and a budget a client, predicted players, events
+  and objects made mid-game, a horde simulated on every peer with its
+  struck zombies handed to ragdolls, and the editor playing a scene as a
+  host and its clients
   ([#413](https://github.com/nicolas-maman/ae3d/issues/413));
 - animated figures in scenes and the editor
   ([#439](https://github.com/nicolas-maman/ae3d/issues/439));
@@ -234,9 +238,6 @@ request. Done on that map:
 Next:
 - the rest of the Vulkan renderer in Aether, a part at a time on Aether's
   own bindings ([#402](https://github.com/nicolas-maman/ae3d/issues/402));
-- multiplayer on datagrams once Aether has them
-  ([aether#2201](https://github.com/aether-lang-dev/aether/issues/2201)),
-  and a horde simulated on every peer;
 - the prompt-to-scene pipeline through the engine
   ([#416](https://github.com/nicolas-maman/ae3d/issues/416));
 - audio ([#415](https://github.com/nicolas-maman/ae3d/issues/415)),
