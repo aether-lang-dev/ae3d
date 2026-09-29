@@ -1,0 +1,522 @@
+// The multiplayer sessions on the agent channel (#488): a host and a client
+// over real datagrams on this machine's loopback interface, both stepped by
+// one engine, and that engine's channel asked about them over a socket of
+// its own, the way an agent asks. Held to numbers:
+//
+//   - net.stats answers for both sessions, the host and its client: every
+//     figure -- the round trip, its jitter and the loss each way, the pings,
+//     the bytes a second and in all by kind each way, the budget, the
+//     snapshots whole and as deltas, the waits, the prediction's
+//     corrections -- is the number ae3d.net measures, to the unit: the
+//     sessions are held still (frame.pause) while it is asked, and every
+//     figure is compared with the session's own at that frame;
+//   - the figures hang together: each side's traffic by kind adds up to
+//     its whole, what the host sends is what the client takes, and the
+//     round trip is the link's latency both ways and the frames on either
+//     side of it;
+//   - net.set_link sets both sessions' simulated link, as the editor's
+//     play sliders set it, and the round trip net.stats reports moves by
+//     what it added, within 10%.
+//
+// Driven from late_update, which runs on a held frame: one request a frame,
+// its answer read on a later one, since the engine answers at the end of
+// the frame on this same thread.
+
+import std.os
+import std.tcp
+import std.json
+import std.string
+import std.mem
+import std.bytes
+import ae3d.core
+import ae3d.platform
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.loader
+import ae3d.physics
+import ae3d.agent
+import ae3d.net
+
+extern malloc(size: long) -> ptr
+extern realloc(p: ptr, size: long) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+extern floor(x: float) -> float
+
+const LATENCY = 0.02                 // seconds each way, before net.set_link
+const LATER = 0.1                    // and after it
+const WARM = 2.5                     // seconds of play after the welcome before the first question: pings answered, windows ended
+const SETTLE = 4.0                   // seconds after net.set_link before the round trip is read again
+const CHUNK = 4096
+
+var g_sock: ptr = null
+var g_pending: ptr = null
+var g_used = 0
+var g_capacity = 0
+var g_chunk: ptr = null
+var g_stage = 0
+var g_checks = 0
+var g_failures = 0
+var g_host: ptr = null
+var g_client: ptr = null
+var g_connected_at = 0.0             // when the client was welcomed: the play is measured from there
+var g_resumed = 0.0
+var g_steps = 0
+var g_honks = 0
+var g_rtt_before = 0                 // the host's round trip to the client, and the client's to the host, microseconds
+var g_rtt_before_client = 0
+var g_figures = 0                    // figures compared, over both questions
+var g_different = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+// --- the channel, asked a line at a time -------------------------------------------------------
+
+ask_send(line: string) {
+    if g_sock == null { return }
+    tcp.tcp_send_raw(g_sock, string.concat(line, "\n"))
+}
+
+// One whole answer, parsed, or null while its line has not all arrived.
+// Polled, never blocked: the engine answers at the end of this same
+// frame, on this same thread.
+ask_receive() -> ptr {
+    if g_sock == null { return null }
+    while tcp.tcp_poll_raw(g_sock, 0) > 0 {
+        if g_used + CHUNK > g_capacity {
+            wanted = g_capacity * 2
+            if wanted < 16384 { wanted = 16384 }
+            while wanted < g_used + CHUNK { wanted = wanted * 2 }
+            g_pending = realloc(g_pending, wanted as long)
+            g_capacity = wanted
+        }
+        text, got, err = tcp.tcp_receive_n_raw(g_sock, CHUNK)
+        if err != "" || text == null || got <= 0 { break }
+        if g_chunk == null { g_chunk = bytes.new(CHUNK) }
+        bytes.copy_from_string(g_chunk, 0, text, got)
+        memcpy(g_pending + g_used, bytes.data(g_chunk), got as long)
+        g_used = g_used + got
+    }
+    i = 0
+    while i < g_used {
+        if mem.get_uint8(g_pending, i) == 10 {
+            line = bytes.string_from_ptr(g_pending, i)
+            mem.copy(g_pending, g_pending + i + 1, (g_used - i - 1) as long)
+            g_used = g_used - i - 1
+            return json.parse_raw(line)
+        }
+        i = i + 1
+    }
+    return null
+}
+
+ok_of(doc: ptr) -> bool {
+    if doc == null { return false }
+    node = json.object_get_raw(doc, "ok")
+    return node != null && json.get_bool(node) == 1
+}
+
+result_of(doc: ptr) -> ptr {
+    if doc == null { return null }
+    return json.object_get_raw(doc, "result")
+}
+
+figure(node: ptr, name: string) -> long {
+    if node == null { return (0 as long) - (999999 as long) }
+    found = json.object_get_raw(node, name)
+    if found == null { return (0 as long) - (999999 as long) }
+    return json.get_long(found)
+}
+
+// One figure the channel answered against the session's own.
+same(what: string, answered: long, measured: long) {
+    g_figures = g_figures + 1
+    if answered != measured {
+        g_different = g_different + 1
+        if g_different <= 6 { println("  (${what}: the channel said ${answered}, ae3d.net ${measured})") }
+    }
+}
+
+micros(seconds: float) -> long { return floor(seconds * 1000000.0 + 0.5) as long }
+
+// A peer's traffic by kind, a rate or a total, against the session's.
+same_kinds(what: string, node: ptr, n: *Net, client: int, direction: int, rates: bool) {
+    k = 0
+    while k < 8 {
+        name = kind_name(k)
+        measured = net.link_bytes(n, client, direction, kind_at(k))
+        if rates { measured = net.rate(n, client, direction, kind_at(k)) }
+        same("${what}.${name}", figure(node, name), measured)
+        k = k + 1
+    }
+}
+
+kind_at(k: int) -> int {
+    if k == 0 { return net.TRAFFIC_SNAPSHOTS }
+    if k == 1 { return net.TRAFFIC_EVENTS }
+    if k == 2 { return net.TRAFFIC_INPUTS }
+    if k == 3 { return net.TRAFFIC_ACKS }
+    if k == 4 { return net.TRAFFIC_LINK }
+    if k == 5 { return net.TRAFFIC_HEADERS }
+    if k == 6 { return net.TRAFFIC_RESENT }
+    return net.TRAFFIC_ALL
+}
+
+kind_name(k: int) -> string {
+    if k == 0 { return "snapshots" }
+    if k == 1 { return "events" }
+    if k == 2 { return "inputs" }
+    if k == 3 { return "acks" }
+    if k == 4 { return "link" }
+    if k == 5 { return "headers" }
+    if k == 6 { return "resent" }
+    return "all"
+}
+
+// Every figure net.stats answered for a session, against the session.
+compare_session(node: ptr, n: *Net) {
+    role = "client"
+    if net.hosting(n) { role = "host" }
+    same("role", bool_long(string.equals(json.get_string_raw(json.object_get_raw(node, "role")), role) == 1), 1 as long)
+    same("transport", bool_long(string.equals(json.get_string_raw(json.object_get_raw(node, "transport")), net.transport_name(n)) == 1), 1 as long)
+    same("client_id", figure(node, "client_id"), net.client_id(n) as long)
+    tick = net.snapshot_tick(n)
+    if net.hosting(n) { tick = net.host_tick(n) }
+    same("tick", figure(node, "tick"), tick as long)
+    same("objects", figure(node, "objects"), net.networked_count(n) as long)
+    same("players", figure(node, "players"), net.player_count(n) as long)
+    link = json.object_get_raw(node, "link")
+    same("link.latency_us", figure(link, "latency_us"), micros(net.link_latency(n)))
+    same("link.jitter_us", figure(link, "jitter_us"), micros(net.link_jitter(n)))
+    same("link.loss_ppm", figure(link, "loss_ppm"), micros(net.link_loss(n)))
+    if !net.hosting(n) {
+        same("snapshots_received", figure(node, "snapshots_received"), net.snapshots_received(n) as long)
+        same("stale_snapshots", figure(node, "stale_snapshots"), net.stale_snapshots(n) as long)
+        prediction = json.object_get_raw(node, "prediction")
+        same("prediction.last_um", figure(prediction, "last_um"), net.correction_um(n, false))
+        same("prediction.worst_um", figure(prediction, "worst_um"), net.correction_um(n, true))
+    }
+    peers = json.object_get_raw(node, "peers")
+    same("peers", json.array_size(peers) as long, 1 as long)
+    if json.array_size(peers) < 1 { return }
+    peer = json.array_get_raw(peers, 0)
+    client = (figure(peer, "peer")) as int
+    same("round_trip_us", figure(peer, "round_trip_us"), net.round_trip_us(n, client) as long)
+    same("jitter_us", figure(peer, "jitter_us"), net.jitter_us(n, client) as long)
+    same("loss_ppm", figure(peer, "loss_ppm"), net.loss_ppm(n, client) as long)
+    pinged = json.object_get_raw(peer, "pings")
+    same("pings.sent", figure(pinged, "sent"), net.pings(n, client, 1) as long)
+    same("pings.answered", figure(pinged, "answered"), net.pings(n, client, 2) as long)
+    same("pings.lost", figure(pinged, "lost"), net.pings(n, client, 3) as long)
+    same("window_us", figure(peer, "window_us"), net.window_us(n, client))
+    same_kinds("sent", json.object_get_raw(peer, "sent"), n, client, net.SENT, true)
+    same_kinds("received", json.object_get_raw(peer, "received"), n, client, net.RECEIVED, true)
+    same_kinds("sent_bytes", json.object_get_raw(peer, "sent_bytes"), n, client, net.SENT, false)
+    same_kinds("received_bytes", json.object_get_raw(peer, "received_bytes"), n, client, net.RECEIVED, false)
+    if net.hosting(n) {
+        same("budget", figure(peer, "budget"), net.budget_of(n, client) as long)
+        same("largest_snapshot", figure(peer, "largest_snapshot"), net.largest_snapshot(n, client) as long)
+        same("snapshots", figure(peer, "snapshots"), net.snapshots_sent(n, client) as long)
+        same("whole_snapshots", figure(peer, "whole_snapshots"), net.whole_snapshots(n, client) as long)
+        same("delta_snapshots", figure(peer, "delta_snapshots"), (net.snapshots_sent(n, client) - net.whole_snapshots(n, client)) as long)
+        same("worst_wait", figure(peer, "worst_wait"), net.worst_wait_any(n, client) as long)
+        waited = json.object_get_raw(peer, "worst_wait_by_sight")
+        same("worst_wait_by_sight.seen", figure(waited, "seen"), net.worst_wait_sight(n, client, net.SIGHT_SEEN) as long)
+        same("worst_wait_by_sight.out", figure(waited, "out"), net.worst_wait_sight(n, client, net.SIGHT_OUT) as long)
+        same("worst_wait_by_sight.hidden", figure(waited, "hidden"), net.worst_wait_sight(n, client, net.SIGHT_HIDDEN) as long)
+        same("view_bytes", figure(peer, "view_bytes"), net.view_bytes(n, client))
+        same("hidden_bytes", figure(peer, "hidden_bytes"), net.hidden_bytes(n, client))
+        same("rays", figure(peer, "rays"), net.rays_cast(n, client))
+    }
+}
+
+bool_long(b: bool) -> long {
+    if b { return 1 as long }
+    return 0 as long
+}
+
+// The session net.stats answered at place `index`, or null.
+session_node(result: ptr, index: int) -> ptr {
+    if result == null { return null }
+    sessions = json.object_get_raw(result, "sessions")
+    k = 0
+    while k < json.array_size(sessions) {
+        node = json.array_get_raw(sessions, k)
+        if figure(node, "session") == (index as long) { return node }
+        k = k + 1
+    }
+    return null
+}
+
+// Both sessions against what net.stats answered, and the figures'
+// sums: each side's kinds add up to its whole (each rate a whole number
+// of its own, so within a byte a kind), and the round trip is more than
+// the link's latency both ways.
+compare_all(result: ptr) {
+    host = g_host as *Net
+    client = g_client as *Net
+    hn = session_node(result, net.session_index(host))
+    cn = session_node(result, net.session_index(client))
+    check("net.stats answers for both sessions, as the host and as a client", hn != null && cn != null &&
+          json.array_size(json.object_get_raw(result, "sessions")) == net.session_count())
+    if hn == null || cn == null { return }
+    compare_session(hn, host)
+    compare_session(cn, client)
+}
+
+// --- the play: a host, a client with a player walking, honks ----------------------------------------
+
+make_player(context: ptr, client: int) -> *CharacterController {
+    e = context as *Engine
+    o = engine.object(e, "Player ${client}", null)
+    behaviour.object_set_position(o, core.vec3((client as float) * 3.0, 0.0, 0.0))
+    return physics.character_controller(o, 0.3, 1.8)
+}
+
+honked(context: ptr, call: *NetCall) { }
+
+walk(state: ptr, e: *Engine, step: float) {
+    client = g_client as *Net
+    g_steps = g_steps + 1
+    if net.my_player(client) == null { return }
+    turn = (g_steps as float) * step
+    net.player_input(client, core.vec3(core.cos_of(turn) * 2.0, 0.0, core.sin_of(turn) * 2.0), 0.0, platform.time())
+    if g_steps % 20 == 0 && net.connected(client) {
+        g_honks = g_honks + 1
+        net.send_event(client, "honk", net.HOST, platform.time(), g_honks as float)
+    }
+}
+
+on_render(state: ptr, e: *Engine, delta: float) {
+    now = platform.time()
+    if g_stage == 0 {
+        if g_connected_at <= 0.0 && net.connected(g_client as *Net) { g_connected_at = now }
+        if g_connected_at <= 0.0 || now - g_connected_at < WARM { return }
+        sock, _err = tcp.connect("127.0.0.1", agent.port())
+        check("an agent connects to the channel", sock != null)
+        g_sock = sock
+        if sock == null {
+            engine.engine_stop(e)
+            return
+        }
+        ask_send("{\"id\":1,\"op\":\"frame.pause\"}")
+        g_stage = 1
+        return
+    }
+    if g_stage == 1 {
+        doc = ask_receive()
+        if doc == null { return }
+        check("the sessions are held still", ok_of(doc))
+        json.free(doc)
+        ask_send("{\"id\":2,\"op\":\"net.stats\"}")
+        g_stage = 2
+        return
+    }
+    if g_stage == 2 {
+        doc = ask_receive()
+        if doc == null { return }
+        r = result_of(doc)
+        check("net.stats answers", ok_of(doc))
+        compare_all(r)
+        host = g_host as *Net
+        client = g_client as *Net
+        g_rtt_before = net.round_trip_us(host, 1)
+        g_rtt_before_client = net.round_trip_us(client, 0)
+        sums(host, 1)
+        sums(client, 0)
+        println("  before: the host's round trip to its client ${g_rtt_before} us, jitter ${net.jitter_us(host, 1)} us, loss ${net.loss_ppm(host, 1)} ppm over ${net.pings(host, 1, 1)} pings; the client's to the host ${g_rtt_before_client} us")
+        println("  the host sends its client ${net.rate(host, 1, net.SENT, net.TRAFFIC_ALL)} bytes a second (snapshots ${net.rate(host, 1, net.SENT, net.TRAFFIC_SNAPSHOTS)}, headers ${net.rate(host, 1, net.SENT, net.TRAFFIC_HEADERS)}, pings ${net.rate(host, 1, net.SENT, net.TRAFFIC_LINK)}); the client ${net.rate(client, 0, net.SENT, net.TRAFFIC_ALL)} (inputs ${net.rate(client, 0, net.SENT, net.TRAFFIC_INPUTS)}, honks ${net.rate(client, 0, net.SENT, net.TRAFFIC_EVENTS)})")
+        check("the round trip is the link's latency both ways, and the frames either side of it",
+              g_rtt_before >= 40000 && g_rtt_before < 120000 && g_rtt_before_client >= 40000 && g_rtt_before_client < 120000)
+        json.free(doc)
+        ask_send("{\"id\":3,\"op\":\"net.set_link\",\"latency\":0.1,\"jitter\":0,\"loss\":0}")
+        g_stage = 3
+        return
+    }
+    if g_stage == 3 {
+        doc = ask_receive()
+        if doc == null { return }
+        r = result_of(doc)
+        sessions = null as ptr
+        if r != null { sessions = json.object_get_raw(r, "sessions") }
+        set_both = sessions != null && json.array_size(sessions) == 2
+        k = 0
+        while set_both && k < 2 {
+            if figure(json.object_get_raw(json.array_get_raw(sessions, k), "link"), "latency_us") != (100000 as long) { set_both = false }
+            k = k + 1
+        }
+        check("net.set_link sets both sessions' link, and says so",
+              ok_of(doc) && set_both && net.link_latency(g_host as *Net) == LATER && net.link_latency(g_client as *Net) == LATER)
+        json.free(doc)
+        ask_send("{\"id\":4,\"op\":\"frame.resume\"}")
+        g_stage = 4
+        return
+    }
+    if g_stage == 4 {
+        doc = ask_receive()
+        if doc == null { return }
+        check("and the sessions run on", ok_of(doc))
+        json.free(doc)
+        g_resumed = now
+        g_stage = 5
+        return
+    }
+    if g_stage == 5 {
+        if now - g_resumed < SETTLE { return }
+        ask_send("{\"id\":5,\"op\":\"frame.pause\"}")
+        g_stage = 6
+        return
+    }
+    if g_stage == 6 {
+        doc = ask_receive()
+        if doc == null { return }
+        json.free(doc)
+        ask_send("{\"id\":6,\"op\":\"net.stats\"}")
+        g_stage = 7
+        return
+    }
+    if g_stage == 7 {
+        doc = ask_receive()
+        if doc == null { return }
+        r = result_of(doc)
+        compare_all(r)
+        println("  every figure net.stats answered, twice, against ae3d.net's own: ${g_figures} compared, ${g_different} different")
+        check("every figure net.stats answers is the one ae3d.net measures", g_figures > 150 && g_different == 0)
+        host_node = session_node(r, net.session_index(g_host as *Net))
+        client_node = session_node(r, net.session_index(g_client as *Net))
+        after = 0 as long
+        after_client = 0 as long
+        if host_node != null { after = figure(json.array_get_raw(json.object_get_raw(host_node, "peers"), 0), "round_trip_us") }
+        if client_node != null { after_client = figure(json.array_get_raw(json.object_get_raw(client_node, "peers"), 0), "round_trip_us") }
+        added = micros(2.0 * (LATER - LATENCY))
+        moved = after - (g_rtt_before as long)
+        moved_client = after_client - (g_rtt_before_client as long)
+        println("  after net.set_link: the host's round trip ${after} us, moved ${moved}; the client's ${after_client}, moved ${moved_client}; the link added ${added} both ways")
+        check("net.set_link moves the round trip net.stats reports by what it added, within 10%",
+              abs_long(moved - added) * (10 as long) <= added && abs_long(moved_client - added) * (10 as long) <= added)
+        json.free(doc)
+        ask_send("{\"id\":7,\"op\":\"net.stats\",\"session\":99}")
+        g_stage = 8
+        return
+    }
+    if g_stage == 8 {
+        doc = ask_receive()
+        if doc == null { return }
+        check("a session that is not there is refused, and says why", !ok_of(doc) && json.object_get_raw(doc, "error") != null)
+        json.free(doc)
+        ask_send("{\"id\":8,\"op\":\"frame.resume\"}")
+        g_stage = 9
+        return
+    }
+    if g_stage == 9 {
+        doc = ask_receive()
+        if doc == null { return }
+        json.free(doc)
+        tcp.tcp_close(g_sock)
+        g_sock = null
+        g_stage = 10
+        engine.engine_stop(e)
+    }
+}
+
+abs_long(v: long) -> long {
+    if v < (0 as long) { return (0 as long) - v }
+    return v
+}
+
+// A side's kinds against its whole, both ways, and the host's sending
+// against the client's taking: the same messages, counted at either end.
+sums(n: *Net, client: int) {
+    d = 0
+    while d < 2 {
+        whole = net.rate(n, client, (d + 1), net.TRAFFIC_ALL)
+        parts = 0 as long
+        k = 0
+        while k < 7 {
+            parts = parts + net.rate(n, client, d + 1, kind_at(k))
+            k = k + 1
+        }
+        check("a side's traffic by kind adds up to its whole (${net.transport_name(n)}, ${net.hosting(n)}, way ${(d + 1)})",
+              whole > (0 as long) && whole - parts >= (0 as long) && whole - parts <= (7 as long))
+        d = d + 1
+    }
+}
+
+main() {
+    os.setenv("AE3D_AGENT", "auto")
+    println("agent_net: a host and a client over loopback UDP, ${LATENCY * 1000.0} ms each way, stepped by one engine and asked about over its channel")
+    e = engine.engine_new()
+    engine.engine_set_size(e, 320, 240)
+    engine.engine_set_title(e, "ae3d agent net test")
+    engine.engine_set_camera_input(e, false)
+    engine.engine_set_frame_limit(e, 100000)
+    engine.engine_set_fixed_step(e, 1.0 / 60.0)
+    physics.attach(e)
+    ground = engine.object(e, "Ground", null)
+    behaviour.object_set_position(ground, core.vec3(0.0, 0.0 - 0.5, 0.0))
+    physics.box_collider(ground, core.vec3(40.0, 0.5, 40.0), physics.material(0.8, 0.0))
+
+    host = net.host_udp("127.0.0.1", 0)
+    if host == null {
+        println("  SKIP ${net.last_error()}")
+        engine.engine_free(e)
+        return
+    }
+    net.set_conditions(host, LATENCY, 0.0, 0.0)
+    net.set_budget(host, 400)
+    net.set_player_maker(host, make_player, e as ptr)
+    net.on_event(host, "honk", honked, null)
+    client = net.join_udp("127.0.0.1", net.udp_port(host))
+    net.set_conditions(client, LATENCY, 0.0, 0.0)
+    net.set_player_maker(client, make_player, e as ptr)
+    net.on_event(client, "honk", honked, null)
+    g_host = host as ptr
+    g_client = client as ptr
+    net.host_play(host, platform.time())
+    net.attach(e, host)
+    net.attach(e, client)
+
+    program = engine.behaviour_new("agent net test", null)
+    program.fixed_update = walk
+    program.late_update = on_render
+    engine.engine_add_behaviour(e, program)
+
+    if !engine.engine_run(e) {
+        println("SKIP no window")
+        net.net_free(client)
+        net.net_free(host)
+        engine.engine_free(e)
+        return
+    }
+    k = 0
+    while k <= 1 {
+        pl = net.player_of(host, k)
+        if pl != null { physics.character_free(pl.controller) }
+        pl = net.player_of(client, k)
+        if pl != null { physics.character_free(pl.controller) }
+        k = k + 1
+    }
+    net.net_free(client)
+    net.net_free(host)
+    engine.engine_free(e)
+    if g_pending != null { free(g_pending) }
+    if g_chunk != null { bytes.free(g_chunk) }
+    if g_stage < 10 {
+        println("  FAIL the exchange did not finish (stopped at stage ${g_stage})")
+        g_failures = g_failures + 1
+    }
+    check("every session made is let go", net.alive() == 0)
+    if g_failures == 0 {
+        println("agent_net: all checks passed (${g_checks})")
+        return
+    }
+    println("agent_net: ${g_failures} failure(s) of ${g_checks}")
+}

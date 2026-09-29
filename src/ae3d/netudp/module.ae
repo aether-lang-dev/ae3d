@@ -72,7 +72,7 @@ exports (
     listen, connect, port, set_conditions, set_timeout, set_max_clients, set_sequenced, heard,
     post, update, flush, event_count, event_at, clear_events,
     disconnect, close, endpoint_free, last_error,
-    is_open, conn_count, rtt, rto,
+    is_open, conn_count, rtt, rto, conn_headers, conn_resent, conditions_latency, conditions_jitter, conditions_loss,
     datagrams_sent, datagrams_received, bytes_sent, bytes_received,
     header_bytes, reliable_bytes, resent_bytes, channel_bytes, ack_bytes, handshake_bytes,
     dropped, largest, resends, stale, oversized, timeouts
@@ -228,6 +228,15 @@ struct UdpConn {
     srtt: float
     rttvar: float
     rtt_known: bool
+    // What this connection costs, apart from the messages themselves:
+    // the packets' headers and the chunks' own (each message's kind, id or
+    // sequence, and length), sent and received; the reliable chunks sent
+    // again, whole; and the ones that arrived again after they were
+    // already here -- a resend whose first went through after all.
+    sent_headers: long
+    sent_resent: long
+    received_headers: long
+    received_again: long
 }
 
 struct UdpEndpoint {
@@ -354,6 +363,10 @@ set_conditions(ep: *UdpEndpoint, latency: float, jitter: float, loss: float) {
     ep.jitter = jitter
     ep.loss = loss
 }
+
+conditions_latency(ep: *UdpEndpoint) -> float { return ep.latency }
+conditions_jitter(ep: *UdpEndpoint) -> float { return ep.jitter }
+conditions_loss(ep: *UdpEndpoint) -> float { return ep.loss }
 
 // Seconds a connection hears nothing before it is closed (5 by default);
 // also how long a client's handshake is tried.
@@ -546,6 +559,24 @@ heard(ep: *UdpEndpoint, conn: int) -> float {
     c = conn_by_id(ep, conn)
     if c == null { return 0.0 - 1.0 }
     return c.heard
+}
+
+// A connection's header bytes -- the packets' and the chunks' own -- sent
+// (`sent`) or received; -1 for a connection that is not there.
+conn_headers(ep: *UdpEndpoint, conn: int, sent: bool) -> long {
+    c = conn_by_id(ep, conn)
+    if c == null { return (0 as long) - (1 as long) }
+    if sent { return c.sent_headers }
+    return c.received_headers
+}
+
+// A connection's reliable chunks sent again (`sent`), or received again
+// after they were already here, bytes whole; -1 for none.
+conn_resent(ep: *UdpEndpoint, conn: int, sent: bool) -> long {
+    c = conn_by_id(ep, conn)
+    if c == null { return (0 as long) - (1 as long) }
+    if sent { return c.sent_resent }
+    return c.received_again
 }
 
 // The timeout a first resend of a reliable message waits, seconds.
@@ -771,6 +802,7 @@ end_packet(ep: *UdpEndpoint, c: *UdpConn, now: float) {
     }
     c.next_seq = c.next_seq + 1
     ep.header_bytes = ep.header_bytes + (HEADER as long)
+    c.sent_headers = c.sent_headers + (HEADER as long)
     if ep.packet_length == HEADER { ep.ack_bytes = ep.ack_bytes + (HEADER as long) }
     put_datagram(ep, c.address, ep.packet, ep.packet_length, now)
     c.sent = now
@@ -847,10 +879,12 @@ flush_conn(ep: *UdpEndpoint, c: *UdpConn, now: float) {
             ep.packet_id_count = ep.packet_id_count + 1
             if m.sent_at < 0.0 {
                 ep.reliable_bytes = ep.reliable_bytes + (size as long)
+                c.sent_headers = c.sent_headers + 5
             } else {
                 m.resends = m.resends + 1
                 ep.resends = ep.resends + 1
                 ep.resent_bytes = ep.resent_bytes + (size as long)
+                c.sent_resent = c.sent_resent + (size as long)
             }
             m.sent_at = now
         }
@@ -886,6 +920,7 @@ put_unreliable(ep: *UdpEndpoint, c: *UdpConn, m: *UdpMessage, sent: int, now: fl
         if m.length > 0 { memcpy(p + at + 6, m.data, m.length as long) }
         ep.packet_length = at + size
         add_channel_bytes(ep, m.channel, size)
+        c.sent_headers = c.sent_headers + 6
         return packets
     }
     count = (m.length + FRAGMENT_BYTES - 1) / FRAGMENT_BYTES
@@ -915,6 +950,7 @@ put_unreliable(ep: *UdpEndpoint, c: *UdpConn, m: *UdpMessage, sent: int, now: fl
         memcpy(p + at + 8, m.data + index * FRAGMENT_BYTES, part as long)
         ep.packet_length = at + size
         add_channel_bytes(ep, m.channel, size)
+        c.sent_headers = c.sent_headers + 8
         index = index + 1
     }
     return packets
@@ -1253,6 +1289,7 @@ unwrap(wire: int, near: int) -> int {
 take_payload(ep: *UdpEndpoint, c: *UdpConn, data: ptr, length: int, has_ack: bool, now: float) {
     c.heard = now
     c.unacked = c.unacked + 1
+    c.received_headers = c.received_headers + (HEADER as long)
     seq = mem.get_u16_le(data, 5)
     ack = mem.get_u16_le(data, 7)
     ack_bits = (mem.get_u32_le(data, 9)) as long
@@ -1283,6 +1320,7 @@ take_payload(ep: *UdpEndpoint, c: *UdpConn, data: ptr, length: int, has_ack: boo
             size = mem.get_u16_le(data, at + 3)
             if at + 5 + size > length { break }
             reliable = true
+            again = true
             if id >= c.expected && id < c.expected + RECV_WINDOW {
                 slot = id % RECV_WINDOW
                 held = c.held as ptr[]
@@ -1296,7 +1334,13 @@ take_payload(ep: *UdpEndpoint, c: *UdpConn, data: ptr, length: int, has_ack: boo
                         memcpy(m.data, data + at + 5, size as long)
                     }
                     held[slot] = m as ptr
+                    again = false
                 }
+            }
+            if again {
+                c.received_again = c.received_again + ((5 + size) as long)
+            } else {
+                c.received_headers = c.received_headers + 5
             }
             at = at + 5 + size
         } else if kind == CHUNK_UNRELIABLE {
@@ -1305,6 +1349,7 @@ take_payload(ep: *UdpEndpoint, c: *UdpConn, data: ptr, length: int, has_ack: boo
             size = mem.get_u16_le(data, at + 4)
             if at + 6 + size > length || channel < 1 || channel >= CHANNELS { break }
             take_unreliable(ep, c, channel, mem.get_u16_le(data, at + 2), data + at + 6, size)
+            c.received_headers = c.received_headers + 6
             at = at + 6 + size
         } else if kind == CHUNK_FRAGMENT {
             if at + 8 > length { break }
@@ -1313,6 +1358,7 @@ take_payload(ep: *UdpEndpoint, c: *UdpConn, data: ptr, length: int, has_ack: boo
             if at + 8 + size > length || channel < 1 || channel >= CHANNELS { break }
             take_fragment(ep, c, channel, mem.get_u16_le(data, at + 2), mem.get_byte(data, at + 4),
                           mem.get_byte(data, at + 5), data + at + 8, size)
+            c.received_headers = c.received_headers + 8
             at = at + 8 + size
         } else {
             break

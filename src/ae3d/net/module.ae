@@ -30,7 +30,15 @@
 //     last 32 it sent each client, and one older than that is sent whole);
 //     only what is relevant to it (near its player, or always, never); and
 //     within its budget of bytes a tick, the most urgent first, by a
-//     priority that grows while an object waits unsent.
+//     priority that grows while an object waits unsent -- faster for what
+//     the client can see (its view, sent with its inputs, and a ray from
+//     its eye against the host's static world), slower for what it can't;
+//   - fields of a script's state replicated beside an object's transform
+//     (health, a speed, a flag, a place, a short text): in the same record,
+//     as a delta against what the client has, only when they change;
+//   - the link measured on every transport, both ways (a ping ten times a
+//     second: the round trip, its jitter, what is lost) and every byte
+//     counted by peer and kind, which the agent channel reads (net.stats).
 //
 // Time is passed in (seconds, any origin): the engine passes its clock, a
 // test a clock of its own, so a run under simulated conditions is the same
@@ -38,11 +46,13 @@
 
 import std.bytes
 import std.heap
+import std.json
 import std.list
 import std.mem
 import std.string
 import std.tcp
 import ae3d.core
+import ae3d.agent
 import ae3d.behaviour
 import ae3d.engine
 import ae3d.netudp
@@ -66,6 +76,14 @@ exports (
     NetPlayer, set_player_maker, host_play, player_input, my_player, player_of, player_count, prediction_error, input_sent,
     NetCall, HOST, EVERYONE, on_event, send_event, send_event_bytes, on_join, on_leave,
     object_kind, create_object, destroy_object, object_of, id_of,
+    NetChange, REPLICATE_INT, REPLICATE_FLOAT, REPLICATE_BOOL, REPLICATE_VEC3, REPLICATE_TEXT, TEXT_BYTES,
+    replicate, on_changed, set_text, text, field_count, fields_known,
+    set_view, set_camera_view, has_view, view_tick, set_occluders, set_visibility, set_bounds, sight, last_sent, rays_cast,
+    SIGHT_NONE, SIGHT_SEEN, SIGHT_OUT, SIGHT_HIDDEN, view_bytes, hidden_bytes, worst_wait_sight,
+    TRAFFIC_LINK, TRAFFIC_ALL, SENT, RECEIVED, rate, link_bytes, window_us, round_trip_us, jitter, jitter_us,
+    loss, loss_ppm, pings, budget_of, worst_wait_any, last_correction, correction_um,
+    set_link, link_latency, link_jitter, link_loss,
+    transport_name, session_count, session_at, session_index,
     net_free, alive, last_error
 )
 
@@ -77,7 +95,16 @@ extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
 extern memmove(dst: ptr, src: ptr, n: long) -> ptr
 extern sqrt(x: float) -> float
 extern floor(x: float) -> float
+// A client's view, judged on the host, is not state every peer has to hold
+// to the bit (the horde is, and keeps to sqrt and floor): libm's own do.
+extern sin(x: float) -> float
+extern cos(x: float) -> float
+extern tan(x: float) -> float
+extern atan(x: float) -> float
+extern atan2(y: float, x: float) -> float
+extern asin(x: float) -> float
 
+const PI = 3.141592653589793
 const ROLE_HOST = 1
 const ROLE_CLIENT = 2
 
@@ -100,29 +127,43 @@ const TRAFFIC_HEADERS = 5            // UDP: every datagram's header (which carr
 const TRAFFIC_ACK_PACKETS = 6        // UDP: datagrams with nothing but acknowledgements, whole (a part of the headers)
 const TRAFFIC_RESENT = 7             // UDP: reliable messages sent again
 const TRAFFIC_HANDSHAKE = 8          // UDP: the connection's handshake and its disconnects
+const TRAFFIC_LINK = 9               // the link's pings and their answers
+const TRAFFIC_ALL = 0                // a peer's: every kind at once
+
+// A peer's traffic, one way or the other.
+const SENT = 1
+const RECEIVED = 2
 
 // 2: snapshots are deltas against an acknowledged one; 3: events, objects
 // created mid-game; 4: events carrying bytes; 5: quantised, prioritised
 // snapshots, acknowledgements riding on inputs, every unacknowledged
-// command in each input (a repeated one a bit), the welcome's precision.
-const PROTOCOL = 5
+// command in each input (a repeated one a bit), the welcome's precision;
+// 6: fields of a script's state in the records, the client's view on its
+// inputs and acknowledgements, the link's pings.
+const PROTOCOL = 6
 const MSG_HELLO = 1                  // client -> host: [u8][u32 protocol]
 const MSG_WELCOME = 2                // host -> client: [u8][u32 client id][u32 tick rate][f64 precision]
 // host -> client, unreliable: [u8][u32 tick][f32 time][u32 ack][u8 base gap][varint objects][varint records]
 // [u8 flags]; with flag 1 the client's player at full precision, [f32 x y z][f32 vy][u8 grounded]; with
 // flag 2 the previous tick's time, [f32]; then a record each: [varint index gap][u8 fields], and the
 // fields it names -- x, y, z as zigzag varints of their change in steps of the precision (the value
-// itself when the base does not have the object), the rotation as 48 bits. An object with no record is
-// as it was in the base (gap 0: none).
+// itself when the base does not have the object), the rotation as 48 bits; then, with FIELD_STATE, its
+// replicated fields: with FIELD_STATE_WHOLE [varint count], a [u8 kind] each (and [f64 precision] for a
+// quantised one) and every value; without, [varint mask] of the ones that changed and their changes. An
+// object with no record is as it was in the base (gap 0: none).
 const MSG_SNAPSHOT = 3
-// client -> host, unreliable: [u8][u16 newest snapshot][u32 first seq][u8 count][(count + 7) / 8 bytes,
-// bit k of byte k / 8 set where command k is sent], then each command sent: [f32 walk x z][f32 jump]; one
-// not sent is the one before it again (the first is always sent). The snapshot is the client's
-// acknowledgement, riding on its commands: its tick's low 16 bits, which the host puts back beside its
-// own tick.
+// client -> host, unreliable: [u8][u16 newest snapshot][u8 flags], with flag 1 the view (VIEW_BYTES);
+// [u32 first seq][u8 count][(count + 7) / 8 bytes, bit k of byte k / 8 set where command k is sent],
+// then each command sent: its walk's x and z in millimetres a second, each a zigzag varint of its change
+// from the command sent before it in the message (from 0 for the first), and its jump in 64ths of a
+// metre a second, a varint; one not sent is the one before it again (the first is always sent). The
+// snapshot is the client's acknowledgement, riding on its commands: its tick's low 16 bits, which the
+// host puts back beside its own tick.
 const MSG_INPUT = 4
 const MSG_SPAWN = 5                  // host -> client, reliable: [u8][u32 net id][u32 owner]
-const MSG_ACK = 6                    // client -> host, unreliable: [u8][u16 tick], a snapshot it has, when no input carried it
+// client -> host, unreliable: [u8][u16 tick][u8 flags], with flag 1 the view: a snapshot it has, when
+// no input carried it.
+const MSG_ACK = 6
 const MSG_EVENT = 7                  // either way, reliable: [u8][u16 event][u8 count], then count f32 values
 // host -> client, reliable: [u8][u32 net id][u16 kind][f32 host time][f32 x y z][f32 qx qy qz qw],
 // an object the host created, where it has it now.
@@ -131,6 +172,11 @@ const MSG_CREATE = 8
 // object gone, and where it was last.
 const MSG_DESTROY = 9
 const MSG_EVENT_BYTES = 10           // either way, reliable: [u8][u16 event][u32 length], then length bytes
+// Either way, unreliable, unsequenced: [u8][u16 ping], ten a second; the other side answers each at
+// once with a pong, [u8][u16 ping]. What the round trip, its jitter and the loss are measured by, the
+// same on every transport.
+const MSG_PING = 11
+const MSG_PONG = 12
 
 // A snapshot's flags.
 const SNAP_OWN = 1                   // the client's own player follows
@@ -143,6 +189,48 @@ const FIELD_Z = 4
 const FIELD_ROTATION = 8
 const FIELD_WHOLE = 16               // the base does not have it: every field, as its value
 const FIELD_HELD = 32                // the base's state was still its state at the previous tick
+const FIELD_STATE = 64               // its replicated fields follow: the ones that changed
+const FIELD_STATE_WHOLE = 128        // and the base has none of them: their kinds, and every value
+
+// A field of a script's state, by kind (#486). A float and a Vec3 go in
+// whole steps of a precision, or as their 64 bits where it is 0; an int as
+// a zigzag varint; a text up to TEXT_BYTES bytes.
+const REPLICATE_INT = 1
+const REPLICATE_FLOAT = 2
+const REPLICATE_BOOL = 3
+const REPLICATE_VEC3 = 4
+const REPLICATE_TEXT = 5
+const KIND_STEPPED = 8               // on the wire, a kind's bit: its values are steps of the precision that follows
+const TEXT_BYTES = 31                // a text field's bytes at most
+const TEXT_WORDS = 4                 // the words a text takes in a snapshot: its length, then its bytes
+const FIELDS_MOST = 32               // the fields one object replicates at most: a record's mask is a varint of 32 bits
+
+// What a client can see of an object, by the view it sent (#487).
+const SIGHT_NONE = 0                 // no view to judge by: distance alone
+const SIGHT_SEEN = 1                 // in the view's frustum, and a ray from the eye reaches it
+const SIGHT_OUT = 2                  // outside the frustum: behind the camera, or off to the side
+const SIGHT_HIDDEN = 3               // in the frustum, and the static world is in the way
+const SIGHT_BOOST = 4.0              // what seeing an object multiplies the priority it gathers by
+const SIGHT_CUT = 4.0                // and not seeing it divides it by
+// The view's frustum is widened by this much each way, radians: a view is
+// sent only once it has turned a degree (VIEW_TURN), so the host's may be
+// that far behind the camera's.
+const SIGHT_MARGIN = 0.035
+const SIGHT_EVERY = 6                // ticks between the rays for an object that stays in view (a fifth of a second)
+const OVERDUE = 1000000000.0         // what a seen object that has waited a tick is sorted ahead by: past any priority gathered
+const SIGHT_STALE = 45               // ticks an unseen object waits at most before it goes ahead too (a second and a half)
+const VIEW_BYTES = 18                // [f32 x y z][u16 yaw][u16 pitch][u8 degrees of vertical view][u8 aspect * 32]
+const VIEW_MOVE = 0.25               // metres the eye moves before the view is sent again
+const VIEW_TURN = 0.0175             // radians it turns (a degree), or its view widens
+const VIEW_REFRESH = 0.5             // seconds after which the view is sent again anyway: a lost one is not kept for long
+
+// The link's measure (#488).
+const PING_EVERY = 0.1               // seconds between pings, each way
+const PINGS = 64                     // pings kept in flight, by their number
+const PING_LOST = 1.0                // seconds after which an unanswered ping is lost
+const LOSS_PINGS = 50                // the pings the loss is judged over: the last five seconds
+const LINK_KINDS = 10                // a peer's traffic counters, by TRAFFIC_*: [0] unused, 1..9
+const WINDOW = 1.0                   // seconds a rate is taken over
 
 const KIND_LOOP = 1
 const KIND_TCP = 2
@@ -163,6 +251,8 @@ const COMMANDS = 128                 // a client's commands kept until the host 
 const COMMAND = 4                    // floats a command: seq, walk x, walk z, jump
 const INPUTS_MOST = 64               // the unacknowledged commands an input message carries at most, the oldest: a second of them
 const PLAYER_STEP = 0.016666666666666666   // a command's step, seconds: the fixed step's
+const WALK_STEPS = 1000.0            // a command's walk in steps of a millimetre a second
+const JUMP_STEPS = 64.0              // its jump in steps of a 64th of a metre a second
 const QUEUE_DEPTH = 3                // host: the commands a client's queue holds before it catches up
 const EVENT_VALUES = 4               // the numbers an event carries at most
 const HALF_ROOT_TWO = 0.7071067811865476   // a unit quaternion's second largest component is at most this
@@ -172,6 +262,11 @@ const NEAR_WEIGHT = 10.0             // metres: an object this close to a client
 var g_error = ""
 var g_alive = 0                      // sessions made and not yet freed
 var g_hubs = 0
+// Every session made and not yet freed, in the order they were made: what
+// the agent channel's net.* ops answer about (net.stats names a session by
+// its place here), a program's host and its clients alike.
+var g_sessions: ptr = null
+var g_answering = false              // net.* ops handed to the agent channel
 
 last_error() -> string { return g_error }
 
@@ -461,6 +556,58 @@ struct Peer {
     snapshot_bytes: long
     snapshots: int
     wholes: int                      // of them, whole: no base the client was known to hold
+    worst_any: int                   // the most any object waited
+    // Host: what the client can see (#487), by the newest view it sent:
+    // its eye, the way it looks and the frustum's axes across it, and the
+    // cosines and sines of the frustum's half angles, widened by
+    // SIGHT_MARGIN; and what that made of each object -- its sight
+    // (SIGHT_*), the tick a ray was last cast to it, and how many ticks in
+    // a row it has waited unsent in the sight it has now.
+    view_known: bool
+    view_tick: int                   // the first tick judged by the newest view
+    eye: Vec3
+    forward: Vec3
+    right: Vec3
+    upward: Vec3
+    cos_side: float
+    sin_side: float
+    cos_up: float
+    sin_up: float
+    sights: ptr                      // int[capacity]
+    sighted: ptr                     // int[capacity]
+    sight_waits: ptr                 // int[capacity]
+    worst_sight: ptr                 // int[4]: the most an object waited in a row in each sight
+    view_bytes: long                 // record bytes of objects it could see when they went
+    hidden_bytes: long               // and of the ones it could not (outside the view, or occluded)
+    rays: long                       // rays cast for it
+    // The link, measured the same on every transport (#488): a ping ten
+    // times a second, each answered at once, gives the round trip, its
+    // variance -- integer microseconds, smoothed as RFC 6298 (and TCP)
+    // smooths them, in the units the channel reports exactly -- and, over
+    // the last LOSS_PINGS judged, the share lost. And every byte to the
+    // peer and from it, by kind, with each kind's rate over the last
+    // window of a second.
+    ping_times: ptr                  // float[PINGS]: when each went, by its number
+    ping_states: ptr                 // int[PINGS]: 0 none, 1 in flight, 2 answered, 3 lost
+    next_ping: int
+    ping_at: float                   // when the last went; below 0 never
+    srtt_us: int
+    rttvar_us: int
+    rtt_known: bool
+    outcomes: ptr                    // int[LOSS_PINGS]: 1 lost, 0 answered, a ring
+    outcome_count: int
+    outcome_next: int
+    pings_sent: int
+    pings_answered: int
+    pings_lost: int
+    sent_bytes: ptr                  // long[LINK_KINDS], by TRAFFIC_*
+    recv_bytes: ptr                  // long[LINK_KINDS]
+    window_sent: ptr                 // long[LINK_KINDS]: the counts when the window began
+    window_recv: ptr
+    rate_sent: ptr                   // long[LINK_KINDS]: whole bytes a second over the last window
+    rate_recv: ptr
+    window_start: float              // below 0: not begun
+    window_us: long                  // the last window's length, microseconds
 }
 
 // A snapshot as one side keeps it: every object's quantised state at a
@@ -478,6 +625,19 @@ struct Snapshot {
     own: ptr                         // float[OWN]
     own_known: bool
     used: bool
+    // The replicated fields: every object's as words (NetLayout.at), a
+    // number a word -- an int, a float's steps or bits, a bool, a text's
+    // length and bytes -- and whether an object's are known, apart from
+    // its transform (a client's own player has fields told it, never its
+    // transform).
+    fvalues: ptr                     // long[fcapacity]
+    fcapacity: int
+    fknown: ptr                      // int[capacity]
+    // Client: the tick of the record that last brought an object's fields.
+    // A snapshot cannot say an object is gone, so after the host destroys
+    // one its fields are the base's again, older than the ones applied:
+    // only what is at least as new as those is written.
+    fticks: ptr                      // int[capacity]
 }
 
 struct NetEvent {
@@ -509,6 +669,59 @@ struct NetObject {
     leaves: float                    // the host's time it was destroyed
     relevance: int                   // host: RELEVANT_NEAR, _ALWAYS or _NEVER
     priority: float                  // host: how fast its priority grows while it waits (1 by default)
+    captured: bool                   // host: a tick has taken its state, so its fields are fixed
+    fields: ptr                      // list of *NetField, its own in their order; null for none
+    // The sphere a client's view is judged against (#487): its centre from
+    // the object's place, on the world's axes, and its radius.
+    bound_centre: Vec3
+    bound_radius: float
+}
+
+// A field of a script's state, replicated (#486): which object's, its
+// order among that object's fields, what it is, and where the game keeps
+// it. The host reads it every tick; a client writes it from every
+// snapshot and calls the hook when that changes it. A text is the
+// session's to keep (`text`): a string field of the game's own has an
+// owner already, the setter that assigned it.
+struct NetField {
+    object: *GameObject
+    id: int                          // its object's net id; 0 until the object is networked
+    order: int
+    name: string
+    kind: int
+    precision: float                 // a float's, a Vec3's: a step; 0, its 64 bits
+    field: ptr                       // the game's int, float, bool or Vec3; null for a text
+    value: string                    // a text's, the session's
+    packed: ptr                      // a text's as a snapshot holds it: TEXT_WORDS words
+    applied_tick: int                // client: the tick of the record its value was last written from
+    hook: fn(ptr, *NetChange)
+    context: ptr
+}
+
+// What a field is on the wire, an object's at a time: learned from its
+// registrations on the host, and from the first whole record on a client
+// (which may come before the object is made there: a snapshot is not held
+// up behind the reliable word that makes it). Where its words start in
+// every snapshot's block, and each field's kind, precision and words.
+struct NetLayout {
+    count: int
+    at: int
+    words: int
+    kinds: ptr                       // int[FIELDS_MOST]
+    offsets: ptr                     // int[FIELDS_MOST]: words from `at`
+    precisions: ptr                  // float[FIELDS_MOST]
+}
+
+// What a field's hook is told: the object, the field (its name and its
+// order among the object's), the snapshot's tick that changed it, and this
+// side's time in the step it arrived.
+struct NetChange {
+    object: *GameObject
+    id: int
+    name: string
+    order: int
+    tick: int
+    now: float
 }
 
 // What an event brings its handler: which event it is, who sent it (a
@@ -587,6 +800,7 @@ struct Net {
     current: *Snapshot
     previous: *Snapshot
     candidates: ptr                  // host: int[scratch_capacity]
+    urgency: ptr                     // host: float[scratch_capacity], what the candidates are sorted by
     records: ptr                     // client: int[scratch_capacity], the indices a snapshot carried
     fields: ptr                      // client: int[scratch_capacity], their fields
     scratch_capacity: int
@@ -618,6 +832,31 @@ struct Net {
     kinds: ptr                       // list of *NetKind, by kind id - 1
     joins: ptr                       // host: list of *NetJoinHook
     leaves: ptr                      // host: list of *NetJoinHook
+    // Replicated fields (#486): every one registered, in order; each
+    // object's layout on the wire, by id - 1; the words a snapshot's block
+    // takes for them all.
+    replicated: ptr                  // list of *NetField
+    layouts: ptr                     // list of *NetLayout, null where an object has none
+    field_words: int
+    spare_words: ptr                 // list of *NetLayout let go, whose words a new one of their size takes
+    // Client: the view it sends (#487), what it last sent, and when.
+    view_set: bool
+    view_eye: Vec3
+    view_dir: Vec3
+    view_fov: float                  // radians, vertical
+    view_aspect: float
+    view_sent: bool
+    sent_eye: Vec3
+    sent_dir: Vec3
+    sent_fov: float
+    sent_aspect: float
+    view_sent_at: float
+    // Host: the static world a client's view is occluded by, and whether
+    // what a client sees weighs on its priority (by default, once it sends
+    // a view).
+    occluders: *Physics
+    sighted: bool
+    last_correction: float           // client: what the newest reconciliation moved its player, metres
 }
 
 net_new(role: int, kind: int) -> *Net {
@@ -637,7 +876,7 @@ net_new(role: int, kind: int) -> *Net {
     n.deltas = true
     n.current = snapshot_new()
     n.previous = snapshot_new()
-    n.traffic = calloc(9, 8)
+    n.traffic = calloc(LINK_KINDS, 8)
     n.players = list.new()
     n.commands = calloc(COMMANDS * COMMAND, 8)
     n.next_seq = 1
@@ -646,7 +885,20 @@ net_new(role: int, kind: int) -> *Net {
     n.kinds = list.new()
     n.joins = list.new()
     n.leaves = list.new()
+    n.replicated = list.new()
+    n.layouts = list.new()
+    n.spare_words = list.new()
+    n.sighted = true
+    n.view_sent_at = 0.0 - 1.0
     g_alive = g_alive + 1
+    if g_sessions == null { g_sessions = list.new() }
+    list.add_raw(g_sessions, n as ptr)
+    // The agent channel asks every session there is (net.stats): handed
+    // the net.* ops once, by the first session a program makes.
+    if !g_answering {
+        agent.provide("net.", answer_op, null)
+        g_answering = true
+    }
     return n
 }
 
@@ -666,26 +918,44 @@ snapshot_free(shot: *Snapshot) {
     if shot == null { return }
     if shot.states != null { free(shot.states) }
     if shot.known != null { free(shot.known) }
+    if shot.fknown != null { free(shot.fknown) }
+    if shot.fticks != null { free(shot.fticks) }
+    if shot.fvalues != null { free(shot.fvalues) }
     free(shot.own)
     free(shot as ptr)
 }
 
-// A snapshot made ready for `count` objects at a tick, nothing known.
-snapshot_reset(shot: *Snapshot, tick: int, time: float, count: int) {
+// A snapshot made ready for `count` objects and `words` of their fields at
+// a tick, nothing known.
+snapshot_reset(shot: *Snapshot, tick: int, time: float, count: int, words: int) {
     if count > shot.capacity || shot.states == null {
         wanted = shot.capacity * 2
         if wanted < 16 { wanted = 16 }
         while wanted < count { wanted = wanted * 2 }
         if shot.states != null { free(shot.states) }
         if shot.known != null { free(shot.known) }
+        if shot.fknown != null { free(shot.fknown) }
+        if shot.fticks != null { free(shot.fticks) }
         shot.states = calloc(wanted * STATE, 8)
         shot.known = calloc(wanted, 4)
+        shot.fknown = calloc(wanted, 4)
+        shot.fticks = calloc(wanted, 4)
         shot.capacity = wanted
+    }
+    if words > shot.fcapacity || shot.fvalues == null {
+        wanted = shot.fcapacity * 2
+        if wanted < 16 { wanted = 16 }
+        while wanted < words { wanted = wanted * 2 }
+        if shot.fvalues != null { free(shot.fvalues) }
+        shot.fvalues = calloc(wanted, 8)
+        shot.fcapacity = wanted
     }
     shot.tick = tick
     shot.time = time
     shot.count = count
     mem.set(shot.known, 0, (count * 4) as long)
+    mem.set(shot.fknown, 0, (count * 4) as long)
+    mem.set(shot.fticks, 0, (count * 4) as long)
     shot.own_known = false
     shot.used = true
 }
@@ -790,6 +1060,18 @@ peer_new(id: int) -> *Peer {
     p.id = id
     p.open = true
     p.ring = calloc(KEPT, 8)
+    p.worst_sight = calloc(4, 4)
+    p.ping_times = calloc(PINGS, 8)
+    p.ping_states = calloc(PINGS, 4)
+    p.ping_at = 0.0 - 1.0
+    p.outcomes = calloc(LOSS_PINGS, 4)
+    p.sent_bytes = calloc(LINK_KINDS, 8)
+    p.recv_bytes = calloc(LINK_KINDS, 8)
+    p.window_sent = calloc(LINK_KINDS, 8)
+    p.window_recv = calloc(LINK_KINDS, 8)
+    p.rate_sent = calloc(LINK_KINDS, 8)
+    p.rate_recv = calloc(LINK_KINDS, 8)
+    p.window_start = 0.0 - 1.0
     return p
 }
 
@@ -802,34 +1084,47 @@ peer_free(p: *Peer) {
     if p.waits != null { free(p.waits) }
     if p.worst != null { free(p.worst) }
     if p.marked != null { free(p.marked) }
+    if p.sights != null { free(p.sights) }
+    if p.sighted != null { free(p.sighted) }
+    if p.sight_waits != null { free(p.sight_waits) }
+    free(p.worst_sight)
+    free(p.ping_times)
+    free(p.ping_states)
+    free(p.outcomes)
+    free(p.sent_bytes)
+    free(p.recv_bytes)
+    free(p.window_sent)
+    free(p.window_recv)
+    free(p.rate_sent)
+    free(p.rate_recv)
     free(p as ptr)
 }
 
-// A peer's priority entries grown to `count` objects, the new ones empty.
+// A peer's per-object entries grown to `count` objects, the new ones empty.
 peer_grow(p: *Peer, count: int) {
     if count <= p.capacity { return }
     wanted = p.capacity * 2
     if wanted < 64 { wanted = 64 }
     while wanted < count { wanted = wanted * 2 }
-    accum = calloc(wanted, 8)
-    waits = calloc(wanted, 4)
-    worst = calloc(wanted, 4)
-    marked = calloc(wanted, 4)
-    if p.capacity > 0 {
-        memcpy(accum, p.accum, (p.capacity * 8) as long)
-        memcpy(waits, p.waits, (p.capacity * 4) as long)
-        memcpy(worst, p.worst, (p.capacity * 4) as long)
-        memcpy(marked, p.marked, (p.capacity * 4) as long)
-        free(p.accum)
-        free(p.waits)
-        free(p.worst)
-        free(p.marked)
-    }
-    p.accum = accum
-    p.waits = waits
-    p.worst = worst
-    p.marked = marked
+    p.accum = grown(p.accum, p.capacity, wanted, 8)
+    p.waits = grown(p.waits, p.capacity, wanted, 4)
+    p.worst = grown(p.worst, p.capacity, wanted, 4)
+    p.marked = grown(p.marked, p.capacity, wanted, 4)
+    p.sights = grown(p.sights, p.capacity, wanted, 4)
+    p.sighted = grown(p.sighted, p.capacity, wanted, 4)
+    p.sight_waits = grown(p.sight_waits, p.capacity, wanted, 4)
     p.capacity = wanted
+}
+
+// An array of `had` entries of `size` bytes as one of `wanted`, the new
+// ones zero; the old one let go.
+grown(old: ptr, had: int, wanted: int, size: int) -> ptr {
+    fresh = calloc(wanted, size)
+    if old != null {
+        if had > 0 { memcpy(fresh, old, (had * size) as long) }
+        free(old)
+    }
+    return fresh
 }
 
 peer_by_id(n: *Net, id: int) -> *Peer {
@@ -851,9 +1146,11 @@ scratch_grow(n: *Net, count: int) {
     if n.candidates != null { free(n.candidates) }
     if n.records != null { free(n.records) }
     if n.fields != null { free(n.fields) }
+    if n.urgency != null { free(n.urgency) }
     n.candidates = calloc(wanted, 4)
     n.records = calloc(wanted, 4)
     n.fields = calloc(wanted, 4)
+    n.urgency = calloc(wanted, 8)
     n.scratch_capacity = wanted
 }
 
@@ -944,10 +1241,13 @@ host_udp(address: string, port: int) -> *Net {
 // A client's inputs are handed over late or not: each carries every
 // command the host had not acknowledged when it was sent, so an older one
 // the link reordered behind a newer holds nothing the newer did not, and
-// the host keeps only the ones it has not queued. Snapshots and
-// acknowledgements stay sequenced.
+// the host keeps only the ones it has not queued. A ping and its answer
+// likewise: one the link reordered is still a round trip, and dropping it
+// would count it lost. Snapshots and acknowledgements stay sequenced.
 unsequenced_inputs(ep: *UdpEndpoint) {
     netudp.set_sequenced(ep, MSG_INPUT, false)
+    netudp.set_sequenced(ep, MSG_PING, false)
+    netudp.set_sequenced(ep, MSG_PONG, false)
 }
 
 // Join a session hosted over UDP. The handshake starts at the first step;
@@ -1006,24 +1306,31 @@ clear_events(n: *Net) {
     list.clear(n.events)
 }
 
-// The traffic a message is counted as.
-count_traffic(n: *Net, reliable: bool, data: ptr, length: int) {
-    counts = n.traffic as long[]
-    kind = TRAFFIC_EVENTS
-    if !reliable {
-        what = mem.get_byte(data, 0)
-        kind = TRAFFIC_ACKS
-        if what == MSG_SNAPSHOT { kind = TRAFFIC_SNAPSHOTS }
-        if what == MSG_INPUT { kind = TRAFFIC_INPUTS }
-    }
-    counts[kind] = counts[kind] + (length as long)
+// The traffic a message is counted as: every reliable one an event (the
+// handshake's, spawns, objects created); an unreliable one by what it is.
+// The receiver counts the same way by the message alone: only these kinds
+// go unreliably.
+traffic_kind(reliable: bool, what: int) -> int {
+    if reliable { return TRAFFIC_EVENTS }
+    if what == MSG_SNAPSHOT { return TRAFFIC_SNAPSHOTS }
+    if what == MSG_INPUT { return TRAFFIC_INPUTS }
+    if what == MSG_PING || what == MSG_PONG { return TRAFFIC_LINK }
+    return TRAFFIC_ACKS
+}
+
+received_kind(what: int) -> int {
+    return traffic_kind(what != MSG_SNAPSHOT && what != MSG_INPUT && what != MSG_ACK && what != MSG_PING && what != MSG_PONG, what)
 }
 
 // A message to one peer.
 deliver(n: *Net, p: *Peer, reliable: bool, data: ptr, length: int, now: float) {
     if p == null || !p.open { return }
     n.sent = n.sent + (length as long)
-    count_traffic(n, reliable, data, length)
+    kind = traffic_kind(reliable, mem.get_byte(data, 0))
+    counts = n.traffic as long[]
+    counts[kind] = counts[kind] + (length as long)
+    mine = p.sent_bytes as long[]
+    mine[kind] = mine[kind] + (length as long)
     if n.kind == KIND_LOOP {
         hub_post(n.hub, n.endpoint, p.endpoint, reliable, data, length, now)
         return
@@ -1039,8 +1346,8 @@ deliver(n: *Net, p: *Peer, reliable: bool, data: ptr, length: int, now: float) {
     }
     // TCP: the length, then the message, in one write. The stream keeps the
     // order and loses nothing, so reliable or not is the same here.
-    counts = n.traffic as long[]
     counts[TRAFFIC_HEADERS] = counts[TRAFFIC_HEADERS] + 4
+    mine[TRAFFIC_HEADERS] = mine[TRAFFIC_HEADERS] + 4
     total = length + 4
     frame = malloc(total as long)
     mem.set_u32_le(frame, 0, length as long)
@@ -1221,10 +1528,12 @@ read_peer(n: *Net, p: *Peer) {
     }
     // Whole messages off the front.
     at = 0
+    heard = p.recv_bytes as long[]
     while p.pending_length - at >= 4 {
         length = (mem.get_u32_le(p.pending, at)) as int
         if p.pending_length - at - 4 < length { break }
         push_event(n, EVENT_MESSAGE, p.id, p.pending + at + 4, length)
+        heard[TRAFFIC_HEADERS] = heard[TRAFFIC_HEADERS] + 4
         at = at + 4 + length
     }
     if at > 0 {
@@ -1251,6 +1560,7 @@ close_peer(n: *Net, p: *Peer) {
 networked(n: *Net, o: *GameObject) -> int {
     no = net_object_new(list.size(n.objects) + 1, o)
     list.add_raw(n.objects, no as ptr)
+    bind_fields(n, no)
     return no.id
 }
 
@@ -1260,7 +1570,14 @@ net_object_new(id: int, o: *GameObject) -> *NetObject {
     no.object = o
     no.history = calloc(HISTORY * SAMPLE, 8)
     no.priority = 1.0
+    no.bound_radius = 0.5
     return no
+}
+
+net_object_free(no: *NetObject) {
+    if no.fields != null { list.free(no.fields) }
+    free(no.history)
+    free(no as ptr)
 }
 
 networked_count(n: *Net) -> int { return list.size(n.objects) }
@@ -1286,7 +1603,9 @@ net_object_of(n: *Net, o: *GameObject) -> *NetObject {
 networked_at(n: *Net, o: *GameObject, id: int) {
     while list.size(n.objects) < id { list.add_raw(n.objects, null) }
     if list.get_raw(n.objects, id - 1) != null { return }
-    list.set(n.objects, id - 1, net_object_new(id, o) as ptr)
+    no = net_object_new(id, o)
+    list.set(n.objects, id - 1, no as ptr)
+    bind_fields(n, no)
 }
 
 // Where a networked object is: its model's place, or for an object with no
@@ -1314,6 +1633,628 @@ set_transform(o: *GameObject, where: Vec3, turn: Quat) {
         behaviour.object_set_position(o, where)
         behaviour.object_set_rotation(o, turn)
     }
+}
+
+// --- fields of a script's state (#486) ---------------------------------------------------------
+//
+// A field is the host's: its game writes it, and every tick the session
+// reads it as a snapshot holds it -- an int as it is, a float as whole
+// steps of its precision (or its 64 bits, where the precision is 0), a
+// bool as 0 or 1, a Vec3 as three floats, a text as its length and bytes.
+// It goes in its object's record, against what the client acknowledged,
+// only when it differs, so an unchanged field costs nothing, and a field
+// and the transform it goes with arrive in the same snapshot, since the
+// budget takes or leaves a record whole. A client writes every field from
+// every snapshot it takes, in the tick order it takes them (never
+// backwards), and calls the field's hook when that changes the value.
+// A field is state, not an event: two changes between the snapshots a
+// client takes are one change there, the newer. What must be seen every
+// time is an event (send_event).
+
+// The 8-byte words a field of `kind` takes in a snapshot.
+kind_words(kind: int) -> int {
+    if kind == REPLICATE_VEC3 { return 3 }
+    if kind == REPLICATE_TEXT { return TEXT_WORDS }
+    return 1
+}
+
+// A field of an object's script state, replicated: `kind` is
+// REPLICATE_INT, _FLOAT, _BOOL, _VEC3 or _TEXT, `field` where the game
+// keeps the value (`&state.health`), or null for a text, which the session
+// keeps (set_text, text). A float and a Vec3 go in whole steps of
+// `precision`, or as their 64 bits exactly where it is 0. Both sides
+// register the same fields on the same objects in the same order, as they
+// mark objects networked; the object may be networked after it (a kind's
+// maker registers its object's fields before the session numbers it). On
+// the host an object's fields are fixed once a tick has taken its state.
+// False, with last_error, for a field that cannot be.
+replicate(n: *Net, o: *GameObject, name: string, field: ptr, kind: int, precision: float = 0.0) -> bool {
+    if n == null || o == null { return false }
+    if kind < REPLICATE_INT || kind > REPLICATE_TEXT {
+        g_error = "no field kind ${kind}"
+        return false
+    }
+    if kind == REPLICATE_TEXT && field != null {
+        g_error = "a text field is the session's: pass null, and set it with set_text"
+        return false
+    }
+    if kind != REPLICATE_TEXT && field == null {
+        g_error = "field ${name} has nowhere to be kept"
+        return false
+    }
+    if precision < 0.0 {
+        g_error = "field ${name}: a precision is a step, never below 0"
+        return false
+    }
+    order = 0
+    i = 0
+    while i < list.size(n.replicated) {
+        f = list.get_raw(n.replicated, i) as *NetField
+        if f.object == o {
+            if string.equals(f.name, name) == 1 {
+                g_error = "the object already replicates a field named ${name}"
+                return false
+            }
+            order = order + 1
+        }
+        i = i + 1
+    }
+    if order >= FIELDS_MOST {
+        g_error = "an object replicates ${FIELDS_MOST} fields at most"
+        return false
+    }
+    no = net_object_of(n, o)
+    if no != null && no.captured {
+        g_error = "field ${name}: the object's fields were fixed at the first tick that took its state"
+        return false
+    }
+    f = calloc(1, sizeof(NetField)) as *NetField
+    f.object = o
+    f.order = order
+    f.name = core.set_owned(f.name, name)
+    f.kind = kind
+    f.precision = 0.0
+    if kind == REPLICATE_FLOAT || kind == REPLICATE_VEC3 { f.precision = precision }
+    f.field = field
+    if kind == REPLICATE_TEXT {
+        f.value = core.set_owned(f.value, "")
+        f.packed = calloc(TEXT_WORDS, 8)
+    }
+    list.add_raw(n.replicated, f as ptr)
+    if no != null { bind_field(n, no, f) }
+    return true
+}
+
+// The fields registered for an object before it was networked, bound to
+// it now it has its id, and on a client given what the newest snapshot
+// already holds of it (a snapshot is not held up behind the reliable word
+// that makes an object, so it may have come first).
+bind_fields(n: *Net, no: *NetObject) {
+    bound = false
+    i = 0
+    while i < list.size(n.replicated) {
+        f = list.get_raw(n.replicated, i) as *NetField
+        if f.id == 0 && f.object == no.object {
+            bind_field(n, no, f)
+            bound = true
+        }
+        i = i + 1
+    }
+    if bound && n.role == ROLE_CLIENT {
+        shot = ring_find(n.received, n.newest_tick)
+        if shot != null { apply_object_fields(n, no, shot, n.last_step) }
+    }
+}
+
+bind_field(n: *Net, no: *NetObject, f: *NetField) {
+    f.id = no.id
+    if no.fields == null { no.fields = list.new() }
+    list.add_raw(no.fields, f as ptr)
+    // The host's layout is its registrations; a client's is what the wire
+    // says (the host's), learned from the first whole record.
+    if n.role == ROLE_HOST {
+        lay = layout_for(n, no.id)
+        at = lay.count
+        (lay.kinds as int[])[at] = f.kind
+        (lay.precisions as float[])[at] = f.precision
+        (lay.offsets as int[])[at] = lay.words
+        lay.words = lay.words + kind_words(f.kind)
+        lay.count = at + 1
+    }
+}
+
+// Object `id`'s layout, or null.
+layout_at(n: *Net, id: int) -> *NetLayout {
+    if id < 1 || id > list.size(n.layouts) { return null }
+    return list.get_raw(n.layouts, id - 1) as *NetLayout
+}
+
+// Object `id`'s layout, made (with no fields, and no place yet) where it
+// has none.
+layout_for(n: *Net, id: int) -> *NetLayout {
+    while list.size(n.layouts) < id { list.add_raw(n.layouts, null) }
+    lay = list.get_raw(n.layouts, id - 1) as *NetLayout
+    if lay != null { return lay }
+    lay = calloc(1, sizeof(NetLayout)) as *NetLayout
+    lay.at = 0 - 1
+    lay.kinds = calloc(FIELDS_MOST, 4)
+    lay.offsets = calloc(FIELDS_MOST, 4)
+    lay.precisions = calloc(FIELDS_MOST, 8)
+    list.set(n.layouts, id - 1, lay as ptr)
+    return lay
+}
+
+layout_free(lay: *NetLayout) {
+    free(lay.kinds)
+    free(lay.offsets)
+    free(lay.precisions)
+    free(lay as ptr)
+}
+
+// A layout given its words in every snapshot's block: those of one let
+// go with the same number of words, or new ones at the block's end.
+place_layout(n: *Net, lay: *NetLayout) {
+    k = 0
+    while k < list.size(n.spare_words) {
+        spare = list.get_raw(n.spare_words, k) as *NetLayout
+        if spare.words == lay.words {
+            lay.at = spare.at
+            list.remove(n.spare_words, k)
+            free(spare as ptr)
+            return
+        }
+        k = k + 1
+    }
+    lay.at = n.field_words
+    n.field_words = n.field_words + lay.words
+}
+
+// An object gone for good (its id is never given again): its fields let
+// go, and its words kept for the next layout of their size. A snapshot
+// that still has them marks them known under the old id, which nothing
+// asks again; the new object's are unknown in it until told.
+drop_fields(n: *Net, id: int) {
+    i = 0
+    while i < list.size(n.replicated) {
+        f = list.get_raw(n.replicated, i) as *NetField
+        if f.id == id {
+            field_free(f)
+            list.remove(n.replicated, i)
+        } else {
+            i = i + 1
+        }
+    }
+    lay = layout_at(n, id)
+    if lay == null { return }
+    if lay.at >= 0 && lay.words > 0 {
+        spare = calloc(1, sizeof(NetLayout)) as *NetLayout
+        spare.at = lay.at
+        spare.words = lay.words
+        list.add_raw(n.spare_words, spare as ptr)
+    }
+    layout_free(lay)
+    list.set(n.layouts, id - 1, null)
+}
+
+field_free(f: *NetField) {
+    string.free(f.name)
+    if f.value != null { string.free(f.value) }
+    if f.packed != null { free(f.packed) }
+    free(f as ptr)
+}
+
+field_named(n: *Net, o: *GameObject, name: string) -> *NetField {
+    i = 0
+    while i < list.size(n.replicated) {
+        f = list.get_raw(n.replicated, i) as *NetField
+        if f.object == o && string.equals(f.name, name) == 1 { return f }
+        i = i + 1
+    }
+    return null
+}
+
+// `hook(context, change)` is called on a client whenever a snapshot
+// changes this field, after the value is written: once a change, in the
+// order of the ticks the snapshots were taken at, and in the order the
+// object's fields were registered within one.
+on_changed(n: *Net, o: *GameObject, name: string, hook: fn(ptr, *NetChange), context: ptr) -> bool {
+    f = field_named(n, o, name)
+    if f == null {
+        g_error = "no field named ${name} on that object"
+        return false
+    }
+    f.hook = hook
+    f.context = context
+    return true
+}
+
+// A text field's value, on the host, up to TEXT_BYTES bytes: sent from the
+// next tick, as any field's change is. False for a longer text, a field
+// that is not a text, or a client (whose texts are the host's).
+set_text(n: *Net, o: *GameObject, name: string, value: string) -> bool {
+    f = field_named(n, o, name)
+    if f == null || f.kind != REPLICATE_TEXT {
+        g_error = "no text field named ${name} on that object"
+        return false
+    }
+    if n.role != ROLE_HOST {
+        g_error = "a field is the host's to write"
+        return false
+    }
+    length = string.length(value)
+    if length > TEXT_BYTES {
+        g_error = "a text field holds ${TEXT_BYTES} bytes at most; ${name} was given ${length}"
+        return false
+    }
+    f.value = core.set_owned(f.value, value)
+    pack_text(f.packed, 0, value, length)
+    return true
+}
+
+// A text field's value: the host's own, or on a client the newest a
+// snapshot brought; "" for none. The session's, until it changes.
+text(n: *Net, o: *GameObject, name: string) -> string {
+    f = field_named(n, o, name)
+    if f == null || f.kind != REPLICATE_TEXT { return "" }
+    return f.value
+}
+
+// The fields registered on an object.
+field_count(n: *Net, o: *GameObject) -> int {
+    count = 0
+    i = 0
+    while i < list.size(n.replicated) {
+        if (list.get_raw(n.replicated, i) as *NetField).object == o { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+// A text into TEXT_WORDS words of `words` from word `at`: its length in the
+// first byte, its bytes after, the rest zero, so two of the same text are
+// the same words.
+pack_text(words: ptr, at: int, value: string, length: int) {
+    base = at * 8
+    mem.set(words + base, 0, (TEXT_WORDS * 8) as long)
+    mem.set_byte(words, base, length)
+    if length > 0 {
+        block = bytes.new(length)
+        bytes.copy_from_string(block, 0, value, length)
+        memcpy(words + base + 1, bytes.data(block), length as long)
+        bytes.free(block)
+    }
+}
+
+// A float as a snapshot holds it: whole steps of the precision, or its 64
+// bits where that is 0. Steps are held to 2^53, what a double counts
+// exactly.
+float_word(v: float, precision: float) -> long {
+    if precision <= 0.0 { return mem.bits_of_float(v) }
+    s = floor(v / precision + 0.5)
+    if s > 9007199254740992.0 { s = 9007199254740992.0 }
+    if s < 0.0 - 9007199254740992.0 { s = 0.0 - 9007199254740992.0 }
+    return s as long
+}
+
+word_float(w: long, precision: float) -> float {
+    if precision <= 0.0 { return mem.float_from_bits(w) }
+    return (w as float) * precision
+}
+
+// Host: an object's fields now, as words into `shot`.
+read_fields(n: *Net, no: *NetObject, lay: *NetLayout, shot: *Snapshot) {
+    words = shot.fvalues as long[]
+    k = 0
+    while k < list.size(no.fields) {
+        f = list.get_raw(no.fields, k) as *NetField
+        at = lay.at + (lay.offsets as int[])[f.order]
+        if f.kind == REPLICATE_INT {
+            words[at] = (mem.get_int(f.field, 0)) as long
+        } else if f.kind == REPLICATE_BOOL {
+            words[at] = 0 as long
+            if mem.get_int(f.field, 0) != 0 { words[at] = 1 as long }
+        } else if f.kind == REPLICATE_FLOAT {
+            words[at] = float_word(mem.get_float64(f.field, 0), f.precision)
+        } else if f.kind == REPLICATE_VEC3 {
+            words[at] = float_word(mem.get_float64(f.field, 0), f.precision)
+            words[at + 1] = float_word(mem.get_float64(f.field, 8), f.precision)
+            words[at + 2] = float_word(mem.get_float64(f.field, 16), f.precision)
+        } else {
+            memcpy(shot.fvalues + at * 8, f.packed, (TEXT_WORDS * 8) as long)
+        }
+        k = k + 1
+    }
+}
+
+// Whether object `index`'s fields differ between two snapshots' words:
+// field `k` of `lay`, or with k below 0 any of them.
+field_differs(lay: *NetLayout, a: ptr, b: ptr, k: int) -> bool {
+    first = 0
+    last = lay.count - 1
+    if k >= 0 {
+        first = k
+        last = k
+    }
+    wa = a as long[]
+    wb = b as long[]
+    j = first
+    while j <= last {
+        at = lay.at + (lay.offsets as int[])[j]
+        w = kind_words((lay.kinds as int[])[j])
+        m = 0
+        while m < w {
+            if wa[at + m] != wb[at + m] { return true }
+            m = m + 1
+        }
+        j = j + 1
+    }
+    return false
+}
+
+// A float's value or change onto the wire: steps as a zigzag varint of the
+// change (the value itself, whole), or the 64 bits as they are.
+put_float_word(b: *NetBuf, w: long, was: long, whole: bool, precision: float) {
+    if precision <= 0.0 {
+        put_u32(b, (w & (4294967295 as long)) as int)
+        put_u32(b, ((w >> 32) & (4294967295 as long)) as int)
+        return
+    }
+    if whole { put_varint(b, zigzag(w)) } else { put_varint(b, zigzag(w - was)) }
+}
+
+get_float_word(r: *NetReader, was: long, whole: bool, precision: float) -> long {
+    if precision <= 0.0 {
+        low = (get_u32(r) as long) & (4294967295 as long)
+        high = (get_u32(r) as long) & (4294967295 as long)
+        return low | (high << 32)
+    }
+    change = unzigzag(get_varint(r))
+    if whole { return change }
+    return was + change
+}
+
+// Object `index`'s fields onto the wire, from the words of `cur` against
+// those of `base`: whole -- how many, each one's kind (and precision), and
+// every value -- or the mask of the ones that changed, and their changes.
+write_fields(b: *NetBuf, lay: *NetLayout, cur: ptr, base: ptr, whole: bool) {
+    words = cur as long[]
+    was = base as long[]
+    if whole {
+        put_varint(b, lay.count as long)
+        k = 0
+        while k < lay.count {
+            kind = (lay.kinds as int[])[k]
+            precision = (lay.precisions as float[])[k]
+            if (kind == REPLICATE_FLOAT || kind == REPLICATE_VEC3) && precision > 0.0 {
+                put_u8(b, kind | KIND_STEPPED)
+                put_f64(b, precision)
+            } else {
+                put_u8(b, kind)
+            }
+            k = k + 1
+        }
+    } else {
+        mask = 0 as long
+        k = 0
+        while k < lay.count {
+            if field_differs(lay, cur, base, k) { mask = mask | ((1 as long) << k) }
+            k = k + 1
+        }
+        put_varint(b, mask)
+    }
+    k = 0
+    while k < lay.count {
+        if whole || field_differs(lay, cur, base, k) {
+            kind = (lay.kinds as int[])[k]
+            precision = (lay.precisions as float[])[k]
+            at = lay.at + (lay.offsets as int[])[k]
+            if kind == REPLICATE_INT {
+                if whole { put_varint(b, zigzag(words[at])) } else { put_varint(b, zigzag(words[at] - was[at])) }
+            } else if kind == REPLICATE_BOOL {
+                put_u8(b, (words[at]) as int)
+            } else if kind == REPLICATE_FLOAT {
+                put_float_word(b, words[at], was[at], whole, precision)
+            } else if kind == REPLICATE_VEC3 {
+                m = 0
+                while m < 3 {
+                    put_float_word(b, words[at + m], was[at + m], whole, precision)
+                    m = m + 1
+                }
+            } else {
+                length = mem.get_byte(cur, at * 8)
+                put_u8(b, length)
+                j = 0
+                while j < length {
+                    put_u8(b, mem.get_byte(cur, at * 8 + 1 + j))
+                    j = j + 1
+                }
+            }
+        }
+        k = k + 1
+    }
+}
+
+// Client: object `index`'s fields off the wire into `shot`, whose words
+// hold the base's: a whole block teaches the object's layout where this
+// side has none (and must agree where it has one), a changed one needs
+// it. False for what cannot be read.
+read_fields_wire(n: *Net, r: *NetReader, shot: *Snapshot, index: int, whole: bool) -> bool {
+    lay = layout_at(n, index + 1)
+    if whole {
+        count = (get_varint(r)) as int
+        if !r.ok || count < 0 || count > FIELDS_MOST { return false }
+        kinds = calloc(FIELDS_MOST, 4)
+        precisions = calloc(FIELDS_MOST, 8)
+        ks = kinds as int[]
+        ps = precisions as float[]
+        k = 0
+        while k < count && r.ok {
+            code = get_u8(r)
+            ks[k] = code & 7
+            if (code & KIND_STEPPED) != 0 { ps[k] = get_f64(r) }
+            if ks[k] < REPLICATE_INT || ks[k] > REPLICATE_TEXT { r.ok = false }
+            k = k + 1
+        }
+        same = r.ok
+        if same && lay != null && lay.at >= 0 {
+            same = lay.count == count
+            k = 0
+            while same && k < count {
+                if (lay.kinds as int[])[k] != ks[k] || (lay.precisions as float[])[k] != ps[k] { same = false }
+                k = k + 1
+            }
+            if !same { r.ok = false }
+        } else if same {
+            lay = layout_for(n, index + 1)
+            k = 0
+            while k < count {
+                (lay.kinds as int[])[k] = ks[k]
+                (lay.precisions as float[])[k] = ps[k]
+                (lay.offsets as int[])[k] = lay.words
+                lay.words = lay.words + kind_words(ks[k])
+                k = k + 1
+            }
+            lay.count = count
+            place_layout(n, lay)
+        }
+        free(kinds)
+        free(precisions)
+        if !r.ok { return false }
+        snapshot_fit_words(shot, n.field_words)
+    } else if lay == null || lay.at < 0 {
+        return false
+    }
+    mask = 0 as long
+    if !whole {
+        mask = get_varint(r)
+        if !r.ok { return false }
+    }
+    words = shot.fvalues as long[]
+    k = 0
+    while k < lay.count && r.ok {
+        if whole || ((mask >> k) & (1 as long)) == (1 as long) {
+            kind = (lay.kinds as int[])[k]
+            precision = (lay.precisions as float[])[k]
+            at = lay.at + (lay.offsets as int[])[k]
+            if kind == REPLICATE_INT {
+                change = unzigzag(get_varint(r))
+                if whole { words[at] = change } else { words[at] = words[at] + change }
+            } else if kind == REPLICATE_BOOL {
+                words[at] = (get_u8(r)) as long
+            } else if kind == REPLICATE_FLOAT {
+                words[at] = get_float_word(r, words[at], whole, precision)
+            } else if kind == REPLICATE_VEC3 {
+                m = 0
+                while m < 3 {
+                    words[at + m] = get_float_word(r, words[at + m], whole, precision)
+                    m = m + 1
+                }
+            } else {
+                length = get_u8(r)
+                if length > TEXT_BYTES || r.at + length > r.length {
+                    r.ok = false
+                } else {
+                    mem.set(shot.fvalues + at * 8, 0, (TEXT_WORDS * 8) as long)
+                    mem.set_byte(shot.fvalues, at * 8, length)
+                    if length > 0 { memcpy(shot.fvalues + at * 8 + 1, r.data + r.at, length as long) }
+                    r.at = r.at + length
+                }
+            }
+        }
+        k = k + 1
+    }
+    if !r.ok { return false }
+    (shot.fknown as int[])[index] = 1
+    return true
+}
+
+// A snapshot's field block grown to `words`, what it holds kept.
+snapshot_fit_words(shot: *Snapshot, words: int) {
+    if words <= shot.fcapacity { return }
+    wanted = shot.fcapacity * 2
+    if wanted < 16 { wanted = 16 }
+    while wanted < words { wanted = wanted * 2 }
+    shot.fvalues = grown(shot.fvalues, shot.fcapacity, wanted, 8)
+    shot.fcapacity = wanted
+}
+
+// Client: every field registered here whose object `shot` has fields for,
+// written where the game keeps it, and its hook called where that changed
+// it -- in the order the fields were registered. Called for every
+// snapshot taken, in the order they are taken, so the fields are always
+// the newest snapshot's.
+apply_fields(n: *Net, shot: *Snapshot, now: float) {
+    i = 0
+    while i < list.size(n.replicated) {
+        f = list.get_raw(n.replicated, i) as *NetField
+        if f.id > 0 { apply_field(n, f, shot, now) }
+        i = i + 1
+    }
+}
+
+apply_object_fields(n: *Net, no: *NetObject, shot: *Snapshot, now: float) {
+    if no.fields == null { return }
+    k = 0
+    while k < list.size(no.fields) {
+        apply_field(n, list.get_raw(no.fields, k) as *NetField, shot, now)
+        k = k + 1
+    }
+}
+
+apply_field(n: *Net, f: *NetField, shot: *Snapshot, now: float) {
+    index = f.id - 1
+    if index >= shot.count || (shot.fknown as int[])[index] != 1 { return }
+    // Nothing older than what was applied: a snapshot after the host let
+    // an object go carries its base's fields, not the newest.
+    brought = (shot.fticks as int[])[index]
+    if brought < f.applied_tick { return }
+    f.applied_tick = brought
+    lay = layout_at(n, f.id)
+    if lay == null || lay.at < 0 || f.order >= lay.count || (lay.kinds as int[])[f.order] != f.kind { return }
+    words = shot.fvalues as long[]
+    at = lay.at + (lay.offsets as int[])[f.order]
+    precision = (lay.precisions as float[])[f.order]
+    changed = false
+    if f.kind == REPLICATE_INT {
+        v = (words[at]) as int
+        changed = mem.get_int(f.field, 0) != v
+        mem.set_int(f.field, 0, v)
+    } else if f.kind == REPLICATE_BOOL {
+        v = 0
+        if words[at] != (0 as long) { v = 1 }
+        was = 0
+        if mem.get_int(f.field, 0) != 0 { was = 1 }
+        changed = was != v
+        mem.set_int(f.field, 0, v)
+    } else if f.kind == REPLICATE_FLOAT {
+        changed = set_float_field(f.field, 0, word_float(words[at], precision))
+    } else if f.kind == REPLICATE_VEC3 {
+        cx = set_float_field(f.field, 0, word_float(words[at], precision))
+        cy = set_float_field(f.field, 8, word_float(words[at + 1], precision))
+        cz = set_float_field(f.field, 16, word_float(words[at + 2], precision))
+        changed = cx || cy || cz
+    } else {
+        if mem.compare(f.packed, shot.fvalues + at * 8, (TEXT_WORDS * 8) as long) != 0 {
+            memcpy(f.packed, shot.fvalues + at * 8, (TEXT_WORDS * 8) as long)
+            length = mem.get_byte(f.packed, 0)
+            fresh = bytes.string_from_ptr(f.packed + 1, length)
+            f.value = core.set_owned(f.value, fresh)
+            string.free(fresh)
+            changed = true
+        }
+    }
+    if changed && f.hook != null {
+        change = NetChange { object: f.object, id: f.id, name: f.name, order: f.order, tick: shot.tick, now: now }
+        hook = f.hook
+        hook(f.context, &change)
+    }
+}
+
+// A float written where the game keeps it; whether that changed its bits.
+set_float_field(field: ptr, offset: int, value: float) -> bool {
+    changed = mem.bits_of_float(mem.get_float64(field, offset)) != mem.bits_of_float(value)
+    mem.set_float64(field, offset, value)
+    return changed
 }
 
 // --- the quantised state ----------------------------------------------------------------------
@@ -1400,13 +2341,26 @@ abs_of(v: float) -> float {
     return v
 }
 
-// Every networked object's state now, quantised, into `shot`; and whether
-// there is an object at that id at all (a destroyed one's id has none).
+// Every networked object's state now, quantised, into `shot`, and its
+// fields; and whether there is an object at that id at all (a destroyed
+// one's id has none). An object's fields take their place in the block at
+// the first tick that takes its state, and are fixed from then on.
 current_states(n: *Net, shot: *Snapshot, now: float) {
     count = list.size(n.objects)
-    snapshot_reset(shot, n.tick, now, count)
+    i = 0
+    while i < count {
+        no = list.get_raw(n.objects, i) as *NetObject
+        if no != null && !no.captured {
+            no.captured = true
+            lay = layout_at(n, i + 1)
+            if lay != null && lay.at < 0 { place_layout(n, lay) }
+        }
+        i = i + 1
+    }
+    snapshot_reset(shot, n.tick, now, count, n.field_words)
     states = shot.states as float[]
     known = shot.known as int[]
+    fknown = shot.fknown as int[]
     i = 0
     while i < count {
         no = list.get_raw(n.objects, i) as *NetObject
@@ -1418,6 +2372,11 @@ current_states(n: *Net, shot: *Snapshot, now: float) {
             states[at + 2] = quantise(n, where.z)
             states[at + 3] = pack_rotation(rotation_of(no.object))
             known[i] = 1
+            lay = layout_at(n, i + 1)
+            if lay != null && lay.count > 0 && lay.at >= 0 {
+                read_fields(n, no, lay, shot)
+                fknown[i] = 1
+            }
         }
         i = i + 1
     }
@@ -1464,26 +2423,33 @@ send_snapshot(n: *Net, now: float) {
 }
 
 // Whether object `index` is relevant to this client: by its own setting,
-// else within the relevance radius of the client's player (everything is
-// when there is no radius or no player to measure from).
+// else within the relevance radius of the client's player, or of its eye
+// where it has sent a view and has no player (everything is when there is
+// no radius, or nothing to measure from).
 relevant(n: *Net, p: *Peer, index: int) -> bool {
     no = list.get_raw(n.objects, index) as *NetObject
     if no == null { return false }
     if no.relevance == RELEVANT_NEVER { return false }
     if no.relevance == RELEVANT_ALWAYS { return true }
-    if n.relevance <= 0.0 || p.player == null { return true }
-    d = distance_to_player(n, p, index)
+    if n.relevance <= 0.0 || (p.player == null && !p.view_known) { return true }
+    d = distance_to_client(n, p, index)
     return d <= n.relevance
 }
 
-// Metres from this client's player to object `index`, now; 0 without a
-// player.
-distance_to_player(n: *Net, p: *Peer, index: int) -> float {
-    if p.player == null { return 0.0 }
-    pl = p.player as *NetPlayer
+// Metres from this client to object `index`, now: from its player, or
+// from its eye where it has no player; 0 with neither.
+distance_to_client(n: *Net, p: *Peer, index: int) -> float {
     s = n.current.states as float[]
-    at = (pl.net_id - 1) * STATE
     here = index * STATE
+    if p.player == null {
+        if !p.view_known { return 0.0 }
+        ex = s[here] * n.unit - p.eye.x
+        ey = s[here + 1] * n.unit - p.eye.y
+        ez = s[here + 2] * n.unit - p.eye.z
+        return sqrt(ex * ex + ey * ey + ez * ez)
+    }
+    pl = p.player as *NetPlayer
+    at = (pl.net_id - 1) * STATE
     dx = (s[here] - s[at]) * n.unit
     dy = (s[here + 1] - s[at + 1]) * n.unit
     dz = (s[here + 2] - s[at + 2]) * n.unit
@@ -1491,16 +2457,247 @@ distance_to_player(n: *Net, p: *Peer, index: int) -> float {
 }
 
 // How fast an object's priority grows for this client while it waits: its
-// own priority, and more the nearer it is to the client's player --
-// 1 + NEAR_WEIGHT / d, so one at a metre gathers eleven times what a far
-// one does and is never left waiting behind the far ones for long.
-weight(n: *Net, p: *Peer, index: int) -> float {
+// own priority, and more the nearer it is to the client -- 1 +
+// NEAR_WEIGHT / d, so one at a metre gathers eleven times what a far one
+// does and is never left waiting behind the far ones for long -- and by
+// what the client can see: SIGHT_BOOST times as fast for an object in its
+// view that a ray from its eye reaches, SIGHT_CUT times slower for one
+// outside the view or behind the static world. Slower, never stopped: an
+// object behind the player still arrives, so turning round never shows a
+// stale world.
+weight(n: *Net, p: *Peer, index: int, looks: int) -> float {
     no = list.get_raw(n.objects, index) as *NetObject
     w = no.priority
-    if p.player == null { return w }
-    d = distance_to_player(n, p, index)
-    if d < 1.0 { d = 1.0 }
-    return w * (1.0 + NEAR_WEIGHT / d)
+    if p.player != null || p.view_known {
+        d = distance_to_client(n, p, index)
+        if d < 1.0 { d = 1.0 }
+        w = w * (1.0 + NEAR_WEIGHT / d)
+    }
+    if n.sighted {
+        if looks == SIGHT_SEEN { w = w * SIGHT_BOOST }
+        if looks == SIGHT_OUT || looks == SIGHT_HIDDEN { w = w / SIGHT_CUT }
+    }
+    return w
+}
+
+// --- what each client can see (#487) -------------------------------------------------------------
+//
+// A client sends its view with its inputs (or its acknowledgements, with
+// no player): where its eye is, the way it looks, how wide. The host
+// judges every object it would send against it: outside the frustum it is
+// out of sight; inside, a ray from the eye to the object's sphere -- its
+// centre, and where that is blocked its top -- against the static world
+// the host has as physics statics (set_occluders) says whether anything is
+// in the way. A ray is cast when an object comes into the frustum, and
+// every SIGHT_EVERY ticks while it stays, staggered by its index, so a
+// view full of objects costs a sixth of its rays a tick; between, the
+// object keeps what the last ray found.
+
+// Client: what it sees -- its eye, the way it looks (a direction, any
+// length), the vertical field of view in radians and the width over the
+// height -- sent to the host with its inputs, or with its acknowledgements
+// where it has no player: each time it moves VIEW_MOVE or turns VIEW_TURN,
+// at most once a tick, and every VIEW_REFRESH seconds whatever it does.
+set_view(n: *Net, eye: Vec3, direction: Vec3, fov: float, aspect: float) {
+    length = sqrt(direction.x * direction.x + direction.y * direction.y + direction.z * direction.z)
+    if length < 0.000001 || fov <= 0.0 || aspect <= 0.0 { return }
+    n.view_eye = eye
+    n.view_dir = core.vec3(direction.x / length, direction.y / length, direction.z / length)
+    n.view_fov = fov
+    n.view_aspect = aspect
+    n.view_set = true
+}
+
+// Client: a camera's view, as set_view takes it.
+set_camera_view(n: *Net, cam: *Camera) {
+    if cam == null { return }
+    core.camera_update_vectors(cam)
+    set_view(n, cam.position, cam.front, core.deg_to_rad(cam.fov), cam.aspect)
+}
+
+// Host: whether client `client` has sent a view to judge by.
+has_view(n: *Net, client: int) -> bool {
+    p = peer_by_id(n, client)
+    return p != null && p.view_known
+}
+
+// Host: the first tick judged by the newest view client `client` sent; 0
+// before one.
+view_tick(n: *Net, client: int) -> int {
+    p = peer_by_id(n, client)
+    if p == null { return 0 }
+    return p.view_tick
+}
+
+// Host: the static world a client's view is occluded by: the physics
+// world's static bodies, the ground and the buildings. Without it, only
+// the frustum counts.
+set_occluders(n: *Net, world: *Physics) { n.occluders = world }
+
+// Host: whether what a client can see weighs on the priority its objects
+// gather (true, the default); false weighs by distance alone, what the
+// sight is measured against. Sight is judged either way, for what it is
+// measured by (sight, view_bytes).
+set_visibility(n: *Net, on: bool) { n.sighted = on }
+
+// The sphere an object is seen by: its centre from the object's place,
+// on the world's axes, and its radius (0.5 m round its place by default).
+set_bounds(n: *Net, o: *GameObject, centre: Vec3, radius: float) {
+    no = net_object_of(n, o)
+    if no == null || radius <= 0.0 { return }
+    no.bound_centre = centre
+    no.bound_radius = radius
+}
+
+// Host: what client `client` saw of object `id` at the last tick it was
+// judged (SIGHT_*).
+sight(n: *Net, client: int, id: int) -> int {
+    p = peer_by_id(n, client)
+    if p == null || id < 1 || id > p.capacity || p.sights == null { return SIGHT_NONE }
+    return (p.sights as int[])[id - 1]
+}
+
+// Whether the client's view has changed enough since it was last sent to
+// send it again, and it is its turn.
+view_due(n: *Net, now: float) -> bool {
+    if !n.view_set { return false }
+    if !n.view_sent { return true }
+    since = now - n.view_sent_at
+    if since >= VIEW_REFRESH { return true }
+    if since < 0.999 / n.tick_rate { return false }
+    moved = core.v3_len(core.v3_sub(n.view_eye, n.sent_eye)) > VIEW_MOVE
+    along = n.view_dir.x * n.sent_dir.x + n.view_dir.y * n.sent_dir.y + n.view_dir.z * n.sent_dir.z
+    turned = along < cos(VIEW_TURN)
+    widened = abs_of(n.view_fov - n.sent_fov) > VIEW_TURN || abs_of(n.view_aspect - n.sent_aspect) > 0.02
+    return moved || turned || widened
+}
+
+// The view onto the wire, VIEW_BYTES: the eye as floats, the direction as
+// a heading and a pitch in 16 bits each, the vertical view in whole
+// degrees and the aspect in 32nds.
+put_view(n: *Net, b: *NetBuf, now: float) {
+    d = n.view_dir
+    heading = atan2(d.x, 0.0 - d.z)
+    if heading < 0.0 { heading = heading + 2.0 * PI }
+    pitch = asin(clamp_unit(d.y))
+    put_f32(b, n.view_eye.x)
+    put_f32(b, n.view_eye.y)
+    put_f32(b, n.view_eye.z)
+    put_u16(b, (floor(heading / (2.0 * PI) * 65536.0 + 0.5) as int) % 65536)
+    put_u16(b, clamp_int((floor((pitch + PI * 0.5) / PI * 65535.0 + 0.5)) as int, 0, 65535))
+    put_u8(b, clamp_int((floor(n.view_fov * 180.0 / PI + 0.5)) as int, 1, 179))
+    put_u8(b, clamp_int((floor(n.view_aspect * 32.0 + 0.5)) as int, 1, 255))
+    n.view_sent = true
+    n.view_sent_at = now
+    n.sent_eye = n.view_eye
+    n.sent_dir = n.view_dir
+    n.sent_fov = n.view_fov
+    n.sent_aspect = n.view_aspect
+}
+
+// Host: a client's view off the wire, and its frustum made ready.
+take_view(n: *Net, p: *Peer, r: *NetReader) {
+    x = get_f32(r)
+    y = get_f32(r)
+    z = get_f32(r)
+    heading = (get_u16(r) as float) / 65536.0 * 2.0 * PI
+    pitch = (get_u16(r) as float) / 65535.0 * PI - PI * 0.5
+    degrees = get_u8(r)
+    aspect = (get_u8(r) as float) / 32.0
+    if !r.ok || degrees < 1 || aspect <= 0.0 { return }
+    p.eye = core.vec3(x, y, z)
+    p.forward = core.vec3(sin(heading) * cos(pitch), sin(pitch), 0.0 - cos(heading) * cos(pitch))
+    // Across the view: right is level (the forward crossed with up), and
+    // the view's up is square to both. Looking straight up or down, any
+    // level right will do.
+    rx = 0.0 - p.forward.z
+    rz = p.forward.x
+    level = sqrt(rx * rx + rz * rz)
+    if level < 0.000001 {
+        rx = 1.0
+        rz = 0.0
+        level = 1.0
+    }
+    p.right = core.vec3(rx / level, 0.0, rz / level)
+    f = p.forward
+    rt = p.right
+    p.upward = core.vec3(rt.y * f.z - rt.z * f.y, rt.z * f.x - rt.x * f.z, rt.x * f.y - rt.y * f.x)
+    half_up = (degrees as float) * PI / 180.0 * 0.5
+    half_side = atan(tan(half_up) * aspect)
+    half_up = half_up + SIGHT_MARGIN
+    half_side = half_side + SIGHT_MARGIN
+    if half_up > 1.55 { half_up = 1.55 }
+    if half_side > 1.55 { half_side = 1.55 }
+    p.cos_up = cos(half_up)
+    p.sin_up = sin(half_up)
+    p.cos_side = cos(half_side)
+    p.sin_side = sin(half_side)
+    p.view_known = true
+    p.view_tick = n.tick + 1
+}
+
+// Host: what client `p` sees of object `index` now: out of sight outside
+// its frustum; in it, seen or hidden by the last ray, and a new ray when
+// the object has just come into the frustum or its turn has come.
+sight_now(n: *Net, p: *Peer, index: int) -> int {
+    if !p.view_known { return SIGHT_NONE }
+    no = list.get_raw(n.objects, index) as *NetObject
+    s = n.current.states as float[]
+    at = index * STATE
+    cx = s[at] * n.unit + no.bound_centre.x
+    cy = s[at + 1] * n.unit + no.bound_centre.y
+    cz = s[at + 2] * n.unit + no.bound_centre.z
+    radius = no.bound_radius
+    vx = cx - p.eye.x
+    vy = cy - p.eye.y
+    vz = cz - p.eye.z
+    ahead = vx * p.forward.x + vy * p.forward.y + vz * p.forward.z
+    across = abs_of(vx * p.right.x + vy * p.right.y + vz * p.right.z)
+    up = abs_of(vx * p.upward.x + vy * p.upward.y + vz * p.upward.z)
+    // The sphere against each side plane of the frustum: a plane through
+    // the eye tilted out by the half angle, its distance from the centre
+    // the across and the ahead turned by that angle.
+    sights = p.sights as int[]
+    was = sights[index]
+    if across * p.cos_side - ahead * p.sin_side > radius || up * p.cos_up - ahead * p.sin_up > radius {
+        sights[index] = SIGHT_OUT
+        return SIGHT_OUT
+    }
+    sighted = p.sighted as int[]
+    fresh = was != SIGHT_SEEN && was != SIGHT_HIDDEN
+    if !fresh && sighted[index] > 0 && (n.tick + index) % SIGHT_EVERY != 0 { return was }
+    sighted[index] = n.tick
+    looks = SIGHT_SEEN
+    if n.occluders != null {
+        if blocked(n, p, cx, cy, cz, radius) && blocked(n, p, cx, cy + radius, cz, 0.0) { looks = SIGHT_HIDDEN }
+    }
+    sights[index] = looks
+    return looks
+}
+
+// Whether the static world stands between the client's eye and a point,
+// short of the sphere of `radius` round it.
+blocked(n: *Net, p: *Peer, x: float, y: float, z: float, radius: float) -> bool {
+    dx = x - p.eye.x
+    dy = y - p.eye.y
+    dz = z - p.eye.z
+    d = sqrt(dx * dx + dy * dy + dz * dz)
+    reach = d - radius
+    if reach <= 0.0 { return false }
+    p.rays = p.rays + 1
+    return physics.ray_static_hits(n.occluders, p.eye, core.vec3(dx / d, dy / d, dz / d), reach)
+}
+
+clamp_unit(v: float) -> float {
+    if v > 1.0 { return 1.0 }
+    if v < 0.0 - 1.0 { return 0.0 - 1.0 }
+    return v
+}
+
+clamp_int(v: int, low: int, high: int) -> int {
+    if v < low { return low }
+    if v > high { return high }
+    return v
 }
 
 // The candidates, most urgent first: by priority gathered, and by index
@@ -1544,36 +2741,74 @@ sift(order: int[], key: float[], root: int, count: int) {
     }
 }
 
+// The room a budget leaves for records, past the header (its records'
+// count taken at its largest).
+budget_room(n: *Net, budget: int, count: int) -> int {
+    return budget - (1 + 4 + 4 + 4 + 1 + varint_size(count as long) + varint_size(count as long) + 1)
+}
+
+// Whether the base already holds object `index` as it is now: its
+// transform (never asked of the client's own player, which goes apart)
+// and its fields.
+unchanged(n: *Net, base: *Snapshot, index: int, own: bool) -> bool {
+    cur = n.current
+    fields = (cur.fknown as int[])[index] == 1
+    if base == null || index >= base.count { return own && !fields }
+    if !own {
+        if (base.known as int[])[index] != 1 { return false }
+        if !same_state(cur.states as float[], base.states as float[], index) { return false }
+    }
+    if !fields { return true }
+    if (base.fknown as int[])[index] != 1 { return false }
+    return !field_differs(layout_at(n, index + 1), cur.fvalues, base.fvalues, 0 - 1)
+}
+
 // Object `index`'s fields against the base: what changed, all of it when
 // the base does not have it, and whether it was still as the base has it
 // at the tick before this one -- the client then holds it there until
 // that moment, so an object that starts to move after standing still is
 // not drawn sliding from wherever it stood, over all the time it stood.
-record_fields(n: *Net, base: *Snapshot, index: int) -> int {
-    s = n.current.states as float[]
-    at = index * STATE
-    if base == null || index >= base.count || (base.known as int[])[index] != 1 {
-        return FIELD_WHOLE | FIELD_X | FIELD_Y | FIELD_Z | FIELD_ROTATION
-    }
-    bs = base.states as float[]
+//
+// Its replicated fields likewise: FIELD_STATE where any differs from the
+// base's, with FIELD_STATE_WHOLE where the base has none of them. The
+// client's own player (`own`) is reconciled from a block of its own and
+// never drawn from a record, so its record carries its fields alone.
+record_fields(n: *Net, base: *Snapshot, index: int, own: bool) -> int {
     fields = 0
-    if s[at] != bs[at] { fields = fields | FIELD_X }
-    if s[at + 1] != bs[at + 1] { fields = fields | FIELD_Y }
-    if s[at + 2] != bs[at + 2] { fields = fields | FIELD_Z }
-    if s[at + 3] != bs[at + 3] { fields = fields | FIELD_ROTATION }
-    prev = n.previous
-    if prev.used && index < prev.count && (prev.known as int[])[index] == 1 && same_state(prev.states as float[], bs, index) {
-        fields = fields | FIELD_HELD
+    if !own {
+        s = n.current.states as float[]
+        at = index * STATE
+        if base == null || index >= base.count || (base.known as int[])[index] != 1 {
+            fields = FIELD_WHOLE | FIELD_X | FIELD_Y | FIELD_Z | FIELD_ROTATION
+        } else {
+            bs = base.states as float[]
+            if s[at] != bs[at] { fields = fields | FIELD_X }
+            if s[at + 1] != bs[at + 1] { fields = fields | FIELD_Y }
+            if s[at + 2] != bs[at + 2] { fields = fields | FIELD_Z }
+            if s[at + 3] != bs[at + 3] { fields = fields | FIELD_ROTATION }
+            prev = n.previous
+            if prev.used && index < prev.count && (prev.known as int[])[index] == 1 && same_state(prev.states as float[], bs, index) {
+                fields = fields | FIELD_HELD
+            }
+        }
+    }
+    if (n.current.fknown as int[])[index] == 1 {
+        lay = layout_at(n, index + 1)
+        if base == null || index >= base.count || (base.fknown as int[])[index] != 1 {
+            fields = fields | FIELD_STATE | FIELD_STATE_WHOLE
+        } else if field_differs(lay, n.current.fvalues, base.fvalues, 0 - 1) {
+            fields = fields | FIELD_STATE
+        }
     }
     return fields
 }
 
 // Object `index`'s record against the base into `b`: its fields, and the
 // fields' values or changes.
-write_record(n: *Net, b: *NetBuf, base: *Snapshot, index: int) {
+write_record(n: *Net, b: *NetBuf, base: *Snapshot, index: int, own: bool) {
     s = n.current.states as float[]
     at = index * STATE
-    fields = record_fields(n, base, index)
+    fields = record_fields(n, base, index, own)
     whole = (fields & FIELD_WHOLE) != 0
     put_u8(b, fields)
     k = 0
@@ -1589,6 +2824,12 @@ write_record(n: *Net, b: *NetBuf, base: *Snapshot, index: int) {
         bits = (s[at + 3]) as long
         put_u16(b, (bits % (65536 as long)) as int)
         put_u32(b, (bits / (65536 as long)) as int)
+    }
+    if (fields & FIELD_STATE) != 0 {
+        fresh = (fields & FIELD_STATE_WHOLE) != 0
+        was = n.current.fvalues
+        if !fresh { was = base.fvalues }
+        write_fields(b, layout_at(n, index + 1), n.current.fvalues, was, fresh)
     }
 }
 
@@ -1631,16 +2872,20 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
     if n.deltas { base = ring_find(p.ring, p.acked_tick) }
     if base != null && n.tick - base.tick >= KEPT - 1 { base = null }
     told = ring_take(p.ring, base)
-    snapshot_reset(told, n.tick, now, count)
+    snapshot_reset(told, n.tick, now, count, n.field_words)
     cur_states = cur.states as float[]
     cur_known = cur.known as int[]
+    cur_fknown = cur.fknown as int[]
     accum = p.accum as float[]
     waits = p.waits as int[]
     worst = p.worst as int[]
     marked = p.marked as int[]
+    sights = p.sights as int[]
+    sight_waits = p.sight_waits as int[]
+    worst_sight = p.worst_sight as int[]
     order = n.candidates as int[]
     // The client's own player: reconciled from its own block, never drawn
-    // from a record.
+    // from a record; a record of its own carries its fields alone.
     own_index = 0 - 1
     if p.player != null {
         pl = p.player as *NetPlayer
@@ -1649,26 +2894,38 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
     }
     send_own = told.own_known && (base == null || !same_own(told, base))
     // The candidates: relevant, and not what the base already has. Every
-    // one gathers priority for waiting; one that is not a candidate has
-    // nothing to wait for.
+    // one gathers priority for waiting, by what the client can see of it;
+    // one that is not a candidate has nothing to wait for. They go most
+    // urgent first: by the priority gathered, except that one the client
+    // can see and has already waited a tick for goes ahead of the rest --
+    // a priority alone would let a hidden object that gathered for a
+    // second outrank it, and what a client can see is never two ticks
+    // old while the budget holds what it sees -- and so does one that has
+    // waited SIGHT_STALE ticks, whatever it is: a view full of changes the
+    // budget cannot hold every other tick would otherwise keep what is
+    // behind the camera from ever going.
+    urgency = n.urgency as float[]
     candidates = 0
     i = 0
     while i < count {
-        wanted = cur_known[i] == 1 && i != own_index && relevant(n, p, i)
-        if wanted && base != null && i < base.count && (base.known as int[])[i] == 1 && same_state(cur_states, base.states as float[], i) {
-            wanted = false
-        }
+        wanted = cur_known[i] == 1 && relevant(n, p, i) && !unchanged(n, base, i, i == own_index)
         if wanted {
-            accum[i] = accum[i] + weight(n, p, i)
+            was = sights[i]
+            looks = sight_now(n, p, i)
+            if looks != was { sight_waits[i] = 0 }
+            accum[i] = accum[i] + weight(n, p, i, looks)
+            urgency[i] = accum[i]
+            if n.sighted && ((looks == SIGHT_SEEN && sight_waits[i] >= 1) || waits[i] >= SIGHT_STALE) { urgency[i] = accum[i] + OVERDUE }
             order[candidates] = i
             candidates = candidates + 1
         } else {
             accum[i] = 0.0
             waits[i] = 0
+            sight_waits[i] = 0
         }
         i = i + 1
     }
-    sort_urgent(order, accum, candidates)
+    sort_urgent(order, urgency, candidates)
     // The most urgent first, while the budget lasts; one that does not fit
     // leaves room for a smaller one after it. The header's size is known
     // but for the records' count, which is taken at its largest; a
@@ -1681,7 +2938,7 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
     send_previous = base != null && base.tick < n.tick - 1 && n.previous.used
     room = 0
     if budget > 0 {
-        room = budget - (1 + 4 + 4 + 4 + 1 + varint_size(count as long) + varint_size(count as long) + 1)
+        room = budget_room(n, budget, count)
         if send_own { room = room - 17 }
         if send_previous { room = room - 4 }
     }
@@ -1693,31 +2950,51 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
         take = true
         if budget > 0 {
             rec.length = 0
-            write_record(n, rec, base, i)
+            write_record(n, rec, base, i, i == own_index)
             size = rec.length + varint_size((i + 1) as long)
-            if size > room { take = false } else { room = room - size }
+            if size <= room {
+                room = room - size
+            } else if chosen == 0 && size > budget_room(n, budget, count) {
+                // A record no snapshot's room could ever hold -- an object
+                // whole with its fields, over a budget smaller than that --
+                // goes alone when it comes first, or it would wait for
+                // ever: the one way a snapshot is over its budget.
+                room = 0
+            } else {
+                take = false
+            }
         }
         if take {
             marked[i] = n.tick
             if waits[i] > worst[i] { worst[i] = waits[i] }
+            if worst[i] > p.worst_any { p.worst_any = worst[i] }
             waits[i] = 0
+            sight_waits[i] = 0
             accum[i] = 0.0
             chosen = chosen + 1
         } else {
             waits[i] = waits[i] + 1
+            sight_waits[i] = sight_waits[i] + 1
+            if sight_waits[i] > worst_sight[sights[i]] { worst_sight[sights[i]] = sight_waits[i] }
         }
         k = k + 1
     }
     // What the client will hold once it has this snapshot: the chosen as
-    // they are now, the rest as the base had them (or unknown). And
-    // whether any chosen one is held.
+    // they are now, the rest as the base had them (or unknown); their
+    // fields likewise. And whether any chosen one is held.
     held = false
     told_states = told.states as float[]
     told_known = told.known as int[]
+    told_fknown = told.fknown as int[]
+    if base != null && n.field_words > 0 {
+        words = base.fcapacity
+        if words > told.fcapacity { words = told.fcapacity }
+        memcpy(told.fvalues, base.fvalues, (words * 8) as long)
+    }
     i = 0
     while i < count {
         if send_previous && !held && i != own_index && marked[i] == n.tick && cur_known[i] == 1 {
-            held = (record_fields(n, base, i) & FIELD_HELD) != 0
+            held = (record_fields(n, base, i, false) & FIELD_HELD) != 0
         }
         at = i * STATE
         if i != own_index && marked[i] == n.tick && cur_known[i] == 1 {
@@ -1733,6 +3010,15 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
             told_states[at + 2] = bs[at + 2]
             told_states[at + 3] = bs[at + 3]
             told_known[i] = 1
+        }
+        if cur_fknown[i] == 1 {
+            if marked[i] == n.tick {
+                lay = layout_at(n, i + 1)
+                memcpy(told.fvalues + lay.at * 8, cur.fvalues + lay.at * 8, (lay.words * 8) as long)
+                told_fknown[i] = 1
+            } else if base != null && i < base.count && (base.fknown as int[])[i] == 1 {
+                told_fknown[i] = 1
+            }
         }
         i = i + 1
     }
@@ -1762,10 +3048,15 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
     previous = 0 - 1
     i = 0
     while i < count {
-        if i != own_index && marked[i] == n.tick && cur_known[i] == 1 {
+        if marked[i] == n.tick && cur_known[i] == 1 {
+            before = b.length
             put_varint(b, (i - previous - 1) as long)
             previous = i
-            write_record(n, b, base, i)
+            write_record(n, b, base, i, i == own_index)
+            // What the budget went on, by what the client could see.
+            spent = (b.length - before) as long
+            if sights[i] == SIGHT_SEEN { p.view_bytes = p.view_bytes + spent }
+            if sights[i] == SIGHT_OUT || sights[i] == SIGHT_HIDDEN { p.hidden_bytes = p.hidden_bytes + spent }
         }
         i = i + 1
     }
@@ -1803,12 +3094,16 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
         if base == null { return }
     }
     shot = ring_take(n.received, base)
-    snapshot_reset(shot, tick, host_time, count)
+    snapshot_reset(shot, tick, host_time, count, n.field_words)
     states = shot.states as float[]
     known = shot.known as int[]
+    fknown = shot.fknown as int[]
+    fticks = shot.fticks as int[]
     if base != null {
         bs = base.states as float[]
         bk = base.known as int[]
+        bf = base.fknown as int[]
+        bt = base.fticks as int[]
         i = 0
         while i < count && i < base.count {
             if bk[i] == 1 {
@@ -1819,8 +3114,13 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
                 states[at + 3] = bs[at + 3]
                 known[i] = 1
             }
+            fknown[i] = bf[i]
+            fticks[i] = bt[i]
             i = i + 1
         }
+        words = base.fcapacity
+        if words > shot.fcapacity { words = shot.fcapacity }
+        if words > 0 { memcpy(shot.fvalues, base.fvalues, (words * 8) as long) }
     }
     own = shot.own as float[]
     if (flags & SNAP_OWN) != 0 {
@@ -1857,7 +3157,8 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
         fields = get_u8(r)
         if !r.ok || index >= count { r.ok = false ; break }
         whole = (fields & FIELD_WHOLE) != 0
-        if !whole && known[index] != 1 { r.ok = false ; break }
+        moved = (fields & (FIELD_X | FIELD_Y | FIELD_Z | FIELD_ROTATION | FIELD_WHOLE)) != 0
+        if moved && !whole && known[index] != 1 { r.ok = false ; break }
         at = index * STATE
         k = 0
         while k < 3 {
@@ -1872,7 +3173,13 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
             high = get_u32(r)
             states[at + 3] = (high as float) * 65536.0 + (low as float)
         }
-        known[index] = 1
+        if (fields & FIELD_STATE) != 0 && r.ok {
+            if !read_fields_wire(n, r, shot, index, (fields & FIELD_STATE_WHOLE) != 0) { r.ok = false ; break }
+            fticks[index] = tick
+        }
+        // A record of fields alone (the client's own player's) says
+        // nothing of where the object is.
+        if moved { known[index] = 1 }
         carried[j] = index
         carried_fields[j] = fields
         j = j + 1
@@ -1901,7 +3208,8 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
         index = carried[j]
         id = index + 1
         no = object_by_id(n, id)
-        if no != null && !no.leaving && (mine == null || id != mine.net_id) {
+        moved = (carried_fields[j] & (FIELD_X | FIELD_Y | FIELD_Z | FIELD_ROTATION | FIELD_WHOLE)) != 0
+        if moved && no != null && !no.leaving && (mine == null || id != mine.net_id) {
             if (carried_fields[j] & FIELD_HELD) != 0 && base != null && held_at >= 0.0 {
                 state_values(n, base, index, v, 7)
                 add_sample(no, held_at, v, 7)
@@ -1915,6 +3223,10 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
     if mine != null && shot.own_known {
         reconcile(n, core.vec3(own[0], own[1], own[2]), own[3], own[4] > 0.5, ack)
     }
+    // Every field as this snapshot has it, and the hooks of those it
+    // changed: in the order the snapshots are taken, which is never
+    // backwards, so in tick order.
+    apply_fields(n, shot, now)
 }
 
 // An object made on this side after the snapshots began -- a player told
@@ -1939,8 +3251,20 @@ send_ack(n: *Net, now: float) {
     b.length = 0
     put_u8(b, MSG_ACK)
     put_u16(b, n.newest_tick & 65535)
+    put_view_flag(n, b, now)
     deliver(n, peer_by_id(n, 0), false, b.data, b.length, now)
     n.ack_due = false
+}
+
+// An input's or an acknowledgement's flags, and the view after them when
+// it is due.
+put_view_flag(n: *Net, b: *NetBuf, now: float) {
+    if view_due(n, now) {
+        put_u8(b, 1)
+        put_view(n, b, now)
+    } else {
+        put_u8(b, 0)
+    }
 }
 
 // A snapshot the client holds, its tick's low 16 bits: the next is a
@@ -2077,10 +3401,172 @@ step(n: *Net, now: float) {
     } else {
         interpolate(n, now)
         let_go(n, now)
-        // Without a player there is no input to carry the acknowledgement.
-        if n.ack_due && n.mine == null { send_ack(n, now) }
+        // Without a player there is no input to carry the acknowledgement,
+        // or the view.
+        if n.mine == null && (n.ack_due || (n.my_id > 0 && view_due(n, now))) { send_ack(n, now) }
     }
+    link_step(n, now)
     flush(n, now)
+}
+
+// --- the link, measured (#488) ----------------------------------------------------------------
+//
+// Every transport measured the same way, from the session itself, both
+// ways: ten pings a second to every peer it has welcomed (a client, to
+// its host once welcomed), each answered at once. A pong gives a round
+// trip, as the game has it -- a frame on either side included -- smoothed
+// as RFC 6298 smooths one (and TCP does), in integer microseconds; a ping
+// unanswered after PING_LOST is lost, and the loss is the share of the
+// last LOSS_PINGS judged. Every byte to a peer and from it is counted by
+// kind, and each kind's rate taken over windows of a second.
+
+link_step(n: *Net, now: float) {
+    i = 0
+    while i < list.size(n.peers) {
+        p = list.get_raw(n.peers, i) as *Peer
+        linked = p.open && p.welcomed
+        if n.role == ROLE_CLIENT { linked = p.open && n.my_id > 0 && !n.closed }
+        if linked {
+            judge_pings(p, now)
+            if p.ping_at < 0.0 || now - p.ping_at >= PING_EVERY * 0.999 { send_ping(n, p, now) }
+            roll_window(n, p, now)
+        }
+        i = i + 1
+    }
+}
+
+send_ping(n: *Net, p: *Peer, now: float) {
+    id = p.next_ping & 65535
+    slot = id % PINGS
+    (p.ping_times as float[])[slot] = now
+    (p.ping_states as int[])[slot] = 1
+    p.next_ping = p.next_ping + 1
+    p.ping_at = now
+    p.pings_sent = p.pings_sent + 1
+    b = n.out
+    b.length = 0
+    put_u8(b, MSG_PING)
+    put_u16(b, id)
+    deliver(n, p, false, b.data, b.length, now)
+}
+
+// A ping answered at once; a pong is a round trip, if its ping is still
+// in flight (one answered after PING_LOST was judged lost, and stays so).
+take_ping(n: *Net, p: *Peer, kind: int, r: *NetReader, now: float) {
+    id = get_u16(r)
+    if p == null || !r.ok { return }
+    if kind == MSG_PING {
+        b = n.out
+        b.length = 0
+        put_u8(b, MSG_PONG)
+        put_u16(b, id)
+        deliver(n, p, false, b.data, b.length, now)
+        return
+    }
+    slot = id % PINGS
+    states = p.ping_states as int[]
+    // The slot is this ping's while no newer one has taken it: 64 pings,
+    // over six seconds, and a ping is judged in one.
+    if states[slot] != 1 || ((p.next_ping - 1 - id) & 65535) >= PINGS { return }
+    states[slot] = 2
+    p.pings_answered = p.pings_answered + 1
+    judged(p, 0)
+    sample = ((now - (p.ping_times as float[])[slot]) * 1000000.0 + 0.5) as int
+    if sample < 0 { sample = 0 }
+    if !p.rtt_known {
+        p.srtt_us = sample
+        p.rttvar_us = sample / 2
+        p.rtt_known = true
+    } else {
+        gap = p.srtt_us - sample
+        if gap < 0 { gap = 0 - gap }
+        p.rttvar_us = (p.rttvar_us * 3 + gap) / 4
+        p.srtt_us = (p.srtt_us * 7 + sample) / 8
+    }
+}
+
+// The pings in flight past PING_LOST, lost.
+judge_pings(p: *Peer, now: float) {
+    states = p.ping_states as int[]
+    times = p.ping_times as float[]
+    k = 0
+    while k < PINGS {
+        if states[k] == 1 && now - times[k] > PING_LOST {
+            states[k] = 3
+            p.pings_lost = p.pings_lost + 1
+            judged(p, 1)
+        }
+        k = k + 1
+    }
+}
+
+// A ping's outcome into the ring the loss is judged over: 1 lost, 0 answered.
+judged(p: *Peer, lost: int) {
+    (p.outcomes as int[])[p.outcome_next] = lost
+    p.outcome_next = (p.outcome_next + 1) % LOSS_PINGS
+    if p.outcome_count < LOSS_PINGS { p.outcome_count = p.outcome_count + 1 }
+}
+
+// What the transport adds for a peer, read into its counts: UDP's headers
+// (the packets' and the chunks' own) and its resends each way. TCP's
+// frames are counted as they go and come; the loopback adds nothing.
+sync_transport(n: *Net, p: *Peer) {
+    if n.udp == null { return }
+    sent = p.sent_bytes as long[]
+    got = p.recv_bytes as long[]
+    headers = netudp.conn_headers(n.udp, p.conn, true)
+    if headers >= (0 as long) {
+        sent[TRAFFIC_HEADERS] = headers
+        got[TRAFFIC_HEADERS] = netudp.conn_headers(n.udp, p.conn, false)
+        sent[TRAFFIC_RESENT] = netudp.conn_resent(n.udp, p.conn, true)
+        got[TRAFFIC_RESENT] = netudp.conn_resent(n.udp, p.conn, false)
+    }
+}
+
+// Every rate taken over the window just ended, when a second has passed:
+// whole bytes a second, from the counts' change over the window's
+// microseconds.
+roll_window(n: *Net, p: *Peer, now: float) {
+    if p.window_start >= 0.0 && now - p.window_start < WINDOW * 0.999 { return }
+    sync_transport(n, p)
+    sent = p.sent_bytes as long[]
+    got = p.recv_bytes as long[]
+    was_sent = p.window_sent as long[]
+    was_got = p.window_recv as long[]
+    if p.window_start >= 0.0 {
+        us = ((now - p.window_start) * 1000000.0 + 0.5) as long
+        rate_sent = p.rate_sent as long[]
+        rate_got = p.rate_recv as long[]
+        all_sent = 0 as long
+        all_got = 0 as long
+        k = 1
+        while k < LINK_KINDS {
+            rate_sent[k] = (sent[k] - was_sent[k]) * (1000000 as long) / us
+            rate_got[k] = (got[k] - was_got[k]) * (1000000 as long) / us
+            if counted_kind(k) {
+                all_sent = all_sent + (sent[k] - was_sent[k])
+                all_got = all_got + (got[k] - was_got[k])
+            }
+            k = k + 1
+        }
+        rate_sent[TRAFFIC_ALL] = all_sent * (1000000 as long) / us
+        rate_got[TRAFFIC_ALL] = all_got * (1000000 as long) / us
+        p.window_us = us
+    }
+    k = 0
+    while k < LINK_KINDS {
+        was_sent[k] = sent[k]
+        was_got[k] = got[k]
+        k = k + 1
+    }
+    p.window_start = now
+}
+
+// The kinds a peer's traffic is counted in, which add up to all of it:
+// the messages by what they are, the transport's headers, its resends.
+counted_kind(k: int) -> bool {
+    return k == TRAFFIC_SNAPSHOTS || k == TRAFFIC_EVENTS || k == TRAFFIC_INPUTS || k == TRAFFIC_ACKS ||
+           k == TRAFFIC_HEADERS || k == TRAFFIC_RESENT || k == TRAFFIC_LINK
 }
 
 handle(n: *Net, ev: *NetEvent, now: float) {
@@ -2105,6 +3591,16 @@ handle(n: *Net, ev: *NetEvent, now: float) {
     r = NetReader { data: ev.data, length: ev.length, at: 0, ok: true }
     kind = get_u8(&r)
     if !r.ok { return }
+    from = peer_by_id(n, ev.peer)
+    if from != null {
+        heard = from.recv_bytes as long[]
+        k = received_kind(kind)
+        heard[k] = heard[k] + (ev.length as long)
+    }
+    if kind == MSG_PING || kind == MSG_PONG {
+        take_ping(n, from, kind, &r, now)
+        return
+    }
     if n.role == ROLE_HOST && kind == MSG_HELLO {
         if get_u32(&r) != PROTOCOL { return }
         p = peer_by_id(n, ev.peer)
@@ -2152,6 +3648,9 @@ handle(n: *Net, ev: *NetEvent, now: float) {
         p = peer_by_id(n, ev.peer)
         if p == null { return }
         tick = get_u16(&r)
+        flags = get_u8(&r)
+        if !r.ok { return }
+        if (flags & 1) != 0 { take_view(n, p, &r) }
         if !r.ok { return }
         take_ack(n, p, tick)
         if p.player != null { apply_inputs(n, p, &r) }
@@ -2160,7 +3659,10 @@ handle(n: *Net, ev: *NetEvent, now: float) {
     if n.role == ROLE_HOST && kind == MSG_ACK {
         p = peer_by_id(n, ev.peer)
         tick = get_u16(&r)
-        if p != null && r.ok { take_ack(n, p, tick) }
+        flags = get_u8(&r)
+        if p == null || !r.ok { return }
+        if (flags & 1) != 0 { take_view(n, p, &r) }
+        if r.ok { take_ack(n, p, tick) }
         return
     }
     if n.role == ROLE_CLIENT && kind == MSG_SPAWN {
@@ -2338,20 +3840,22 @@ apply_inputs(n: *Net, p: *Peer, r: *NetReader) {
     mask_at = r.at
     r.at = r.at + (count + 7) / 8
     if count == 0 || r.at > r.length { return }
-    wx = 0.0
-    wz = 0.0
+    sx = 0 as long
+    sz = 0 as long
     jump = 0.0
     i = 0
     while i < count {
         seq = first + i
         if (mem.get_byte(r.data, mask_at + i / 8) & (1 << (i % 8))) != 0 {
-            wx = get_f32(r)
-            wz = get_f32(r)
-            jump = get_f32(r)
+            sx = sx + unzigzag(get_varint(r))
+            sz = sz + unzigzag(get_varint(r))
+            jump = ((get_varint(r)) as float) / JUMP_STEPS
         } else if i == 0 {
             return
         }
         if !r.ok { return }
+        wx = (sx as float) / WALK_STEPS
+        wz = (sz as float) / WALK_STEPS
         // Not yet applied, and within the ring: kept at its place by
         // sequence, whatever came before it.
         if seq > p.last_input && seq <= p.last_input + COMMANDS {
@@ -2443,22 +3947,28 @@ player_input(n: *Net, walk: Vec3, jump: float, now: float) {
     n.next_seq = n.next_seq + 1
     cmds = n.commands as float[]
     slot = ((n.command_first + n.command_count) % COMMANDS) * COMMAND
+    // The command as the wire carries it -- a millimetre a second of walk,
+    // a 64th of a metre a second of jump -- and predicted as that: the host
+    // applies the same numbers, so the two worlds take the same step.
     cmds[slot] = (seq) as float
-    cmds[slot + 1] = walk.x
-    cmds[slot + 2] = walk.z
-    cmds[slot + 3] = jump
+    cmds[slot + 1] = (walk_steps(walk.x) as float) / WALK_STEPS
+    cmds[slot + 2] = (walk_steps(walk.z) as float) / WALK_STEPS
+    cmds[slot + 3] = (jump_steps(jump) as float) / JUMP_STEPS
     n.command_count = n.command_count + 1
-    physics.character_move(mine.controller, core.vec3(walk.x, 0.0, walk.z), jump, PLAYER_STEP)
+    physics.character_move(mine.controller, core.vec3(cmds[slot + 1], 0.0, cmds[slot + 2]), cmds[slot + 3], PLAYER_STEP)
     // Every command the host has not acknowledged, the oldest first, up to
     // INPUTS_MOST: whichever of these messages the host takes, it has every
     // command after the last it applied, so neither loss nor reordering
     // ever costs a correction, only the wait for one message to get
-    // through. A command is sent where it differs from the one before it;
-    // a key held is the same command step after step, a bit each.
+    // through. A command is sent where it differs from the one before it,
+    // as its change from that one -- a walk turning steers a few
+    // millimetres a second a step, a byte an axis; a key held is the same
+    // command step after step, a bit each.
     b = n.out
     b.length = 0
     put_u8(b, MSG_INPUT)
     put_u16(b, n.newest_tick & 65535)
+    put_view_flag(n, b, now)
     count = n.command_count
     if count > INPUTS_MOST { count = INPUTS_MOST }
     put_u32(b, (cmds[n.command_first * COMMAND]) as int)
@@ -2473,13 +3983,19 @@ player_input(n: *Net, walk: Vec3, jump: float, now: float) {
         }
         k = k + 1
     }
+    sx = 0 as long
+    sz = 0 as long
     k = 0
     while k < count {
         if command_differs(n, k) {
             at = ((n.command_first + k) % COMMANDS) * COMMAND
-            put_f32(b, cmds[at + 1])
-            put_f32(b, cmds[at + 2])
-            put_f32(b, cmds[at + 3])
+            x = walk_steps(cmds[at + 1])
+            z = walk_steps(cmds[at + 2])
+            put_varint(b, zigzag(x - sx))
+            put_varint(b, zigzag(z - sz))
+            put_varint(b, jump_steps(cmds[at + 3]))
+            sx = x
+            sz = z
         }
         k = k + 1
     }
@@ -2488,8 +4004,17 @@ player_input(n: *Net, walk: Vec3, jump: float, now: float) {
     n.inputs_sent = n.inputs_sent + 1
 }
 
-// Whether the client's unacknowledged command `k` is sent in full: the
-// first always, another where it is not the one before it again.
+// A walk in whole millimetres a second, a jump in 64ths of a metre a
+// second (none below 0): what a command is on the wire.
+walk_steps(v: float) -> long { return floor(v * WALK_STEPS + 0.5) as long }
+
+jump_steps(v: float) -> long {
+    if v <= 0.0 { return 0 as long }
+    return floor(v * JUMP_STEPS + 0.5) as long
+}
+
+// Whether the client's unacknowledged command `k` is sent: the first
+// always, another where it is not the one before it again.
 command_differs(n: *Net, k: int) -> bool {
     if k == 0 { return true }
     cmds = n.commands as float[]
@@ -2525,6 +4050,7 @@ reconcile(n: *Net, at: Vec3, vy: float, grounded: bool, ack: int) {
         k = k + 1
     }
     moved = core.v3_len(core.v3_sub(behaviour.object_position(o), had))
+    n.last_correction = moved
     if moved > n.worst_correction { n.worst_correction = moved }
 }
 
@@ -2939,14 +4465,14 @@ let_go(n: *Net, now: float) {
 }
 
 // A created object let go: its kind's unmaker called (which can still
-// ask its id), and its id left empty for good.
+// ask its id), its fields with it, and its id left empty for good.
 forget(n: *Net, no: *NetObject) {
     k = list.get_raw(n.kinds, no.kind - 1) as *NetKind
     unmaker = k.unmaker
     if unmaker != null { unmaker(k.context, no.object) }
+    drop_fields(n, no.id)
     list.set(n.objects, no.id - 1, null)
-    free(no.history)
-    free(no as ptr)
+    net_object_free(no)
 }
 
 // --- what it costs --------------------------------------------------------------------------------
@@ -2994,11 +4520,399 @@ largest_datagram(n: *Net) -> int {
 }
 
 round_trip(n: *Net, client: int) -> float {
-    if n.udp == null { return 0.0 }
+    us = round_trip_us(n, client)
+    if us < 0 { return 0.0 }
+    return (us as float) / 1000000.0
+}
+
+// The peer a link's figures are about: a host's client `client`, or a
+// client's host whatever `client` says.
+link_peer(n: *Net, client: int) -> *Peer {
+    if n == null { return null }
+    if n.role == ROLE_CLIENT { return peer_by_id(n, 0) }
+    return peer_by_id(n, client)
+}
+
+// The link's smoothed round trip to a peer, microseconds, from its pings
+// (every transport alike); -1 before one is answered.
+round_trip_us(n: *Net, client: int) -> int {
+    p = link_peer(n, client)
+    if p == null || !p.rtt_known { return 0 - 1 }
+    return p.srtt_us
+}
+
+// Its jitter: the round trip's smoothed variance (RFC 6298's), seconds
+// and microseconds.
+jitter(n: *Net, client: int) -> float {
+    us = jitter_us(n, client)
+    if us < 0 { return 0.0 }
+    return (us as float) / 1000000.0
+}
+
+jitter_us(n: *Net, client: int) -> int {
+    p = link_peer(n, client)
+    if p == null || !p.rtt_known { return 0 - 1 }
+    return p.rttvar_us
+}
+
+// The share of the last LOSS_PINGS pings judged that were lost (0..1),
+// and the same in parts per million.
+loss(n: *Net, client: int) -> float {
+    ppm = loss_ppm(n, client)
+    if ppm < 0 { return 0.0 }
+    return (ppm as float) / 1000000.0
+}
+
+loss_ppm(n: *Net, client: int) -> int {
+    p = link_peer(n, client)
+    if p == null || p.outcome_count == 0 { return 0 - 1 }
+    lost = 0
+    ring = p.outcomes as int[]
+    k = 0
+    while k < p.outcome_count {
+        lost = lost + ring[k]
+        k = k + 1
+    }
+    return ((lost as long) * (1000000 as long) / (p.outcome_count as long)) as int
+}
+
+// The pings to a peer: 1 sent, 2 answered, 3 lost.
+pings(n: *Net, client: int, what: int) -> int {
+    p = link_peer(n, client)
+    if p == null { return 0 }
+    if what == 1 { return p.pings_sent }
+    if what == 2 { return p.pings_answered }
+    if what == 3 { return p.pings_lost }
+    return 0
+}
+
+// A peer's traffic of one kind (TRAFFIC_*, or TRAFFIC_ALL for every kind
+// it is counted in), SENT to it or RECEIVED from it, whole bytes a second
+// over the last window of a second; 0 before a window has ended.
+rate(n: *Net, client: int, direction: int, kind: int) -> long {
+    p = link_peer(n, client)
+    if p == null || kind < 0 || kind >= LINK_KINDS { return 0 as long }
+    if direction == SENT { return (p.rate_sent as long[])[kind] }
+    return (p.rate_recv as long[])[kind]
+}
+
+// The same, every byte since the link began.
+link_bytes(n: *Net, client: int, direction: int, kind: int) -> long {
+    p = link_peer(n, client)
+    if p == null || kind < 0 || kind >= LINK_KINDS { return 0 as long }
+    counts = p.recv_bytes as long[]
+    if direction == SENT { counts = p.sent_bytes as long[] }
+    if kind != TRAFFIC_ALL { return counts[kind] }
+    all = 0 as long
+    k = 1
+    while k < LINK_KINDS {
+        if counted_kind(k) { all = all + counts[k] }
+        k = k + 1
+    }
+    return all
+}
+
+// The last window's length, microseconds: what the rates are over.
+window_us(n: *Net, client: int) -> long {
+    p = link_peer(n, client)
+    if p == null { return 0 as long }
+    return p.window_us
+}
+
+// Host: the bytes a snapshot to client `client` may take: its own budget,
+// or the session's; 0 for no limit.
+budget_of(n: *Net, client: int) -> int {
     p = peer_by_id(n, client)
-    if n.role == ROLE_CLIENT { p = peer_by_id(n, 0) }
-    if p == null { return 0.0 }
-    return netudp.rtt(n.udp, p.conn)
+    if p == null { return 0 }
+    if p.budget > 0 { return p.budget }
+    return n.budget
+}
+
+// Host: the most ticks any object waited for client `client`, changed and
+// relevant but past its budget.
+worst_wait_any(n: *Net, client: int) -> int {
+    p = peer_by_id(n, client)
+    if p == null { return 0 }
+    return p.worst_any
+}
+
+// Host: the most ticks in a row an object waited for client `client`
+// while it had one sight (SIGHT_SEEN, _OUT, _HIDDEN; _NONE before a view).
+worst_wait_sight(n: *Net, client: int, sight: int) -> int {
+    p = peer_by_id(n, client)
+    if p == null || sight < 0 || sight > 3 { return 0 }
+    return (p.worst_sight as int[])[sight]
+}
+
+// Host: the record bytes client `client` was sent of objects it could see
+// when they went, and of ones it could not; and the rays cast for it.
+view_bytes(n: *Net, client: int) -> long {
+    p = peer_by_id(n, client)
+    if p == null { return 0 as long }
+    return p.view_bytes
+}
+
+hidden_bytes(n: *Net, client: int) -> long {
+    p = peer_by_id(n, client)
+    if p == null { return 0 as long }
+    return p.hidden_bytes
+}
+
+rays_cast(n: *Net, client: int) -> long {
+    p = peer_by_id(n, client)
+    if p == null { return 0 as long }
+    return p.rays
+}
+
+// Host: the tick object `id` was last sent to client `client`; 0 never.
+last_sent(n: *Net, client: int, id: int) -> int {
+    p = peer_by_id(n, client)
+    if p == null || id < 1 || id > p.capacity || p.marked == null { return 0 }
+    return (p.marked as int[])[id - 1]
+}
+
+// Client: what the newest reconciliation moved its player, metres.
+last_correction(n: *Net) -> float { return n.last_correction }
+
+// Client: a correction in whole micrometres, the channel's unit: the last
+// (worst false) or the worst.
+correction_um(n: *Net, worst: bool) -> long {
+    metres = n.last_correction
+    if worst { metres = n.worst_correction }
+    return floor(metres * 1000000.0 + 0.5) as long
+}
+
+// The link's simulated conditions: a UDP session's on what it sends, a
+// loopback session's on its hub (every session on it). False for TCP,
+// which has none.
+set_link(n: *Net, latency: float, jitter_s: float, loss_share: float) -> bool {
+    if n == null || latency < 0.0 || jitter_s < 0.0 || loss_share < 0.0 || loss_share > 1.0 { return false }
+    if n.udp != null {
+        netudp.set_conditions(n.udp, latency, jitter_s, loss_share)
+        return true
+    }
+    if n.hub != null {
+        hub_set_conditions(n.hub, latency, jitter_s, loss_share)
+        return true
+    }
+    g_error = "TCP has no simulated link"
+    return false
+}
+
+link_latency(n: *Net) -> float {
+    if n.udp != null { return netudp.conditions_latency(n.udp) }
+    if n.hub != null { return n.hub.latency }
+    return 0.0
+}
+
+link_jitter(n: *Net) -> float {
+    if n.udp != null { return netudp.conditions_jitter(n.udp) }
+    if n.hub != null { return n.hub.jitter }
+    return 0.0
+}
+
+link_loss(n: *Net) -> float {
+    if n.udp != null { return netudp.conditions_loss(n.udp) }
+    if n.hub != null { return n.hub.loss }
+    return 0.0
+}
+
+transport_name(n: *Net) -> string {
+    if n.kind == KIND_UDP { return "udp" }
+    if n.kind == KIND_TCP { return "tcp" }
+    return "loopback"
+}
+
+// Every session made and not yet freed, in the order they were made.
+session_count() -> int {
+    if g_sessions == null { return 0 }
+    return list.size(g_sessions)
+}
+
+session_at(index: int) -> *Net {
+    if g_sessions == null || index < 0 || index >= list.size(g_sessions) { return null }
+    return list.get_raw(g_sessions, index) as *Net
+}
+
+session_index(n: *Net) -> int {
+    k = 0
+    while k < session_count() {
+        if session_at(k) == n { return k }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+// --- on the agent channel (#488) -------------------------------------------------------------------
+//
+// net.stats answers with every session in the program and every figure
+// above, each a whole number in the unit its name says (microseconds,
+// parts per million, bytes, bytes a second, ticks, micrometres): the
+// numbers ae3d.net measures, to the unit. net.set_link sets the link's
+// simulated conditions as the editor's play sliders do.
+
+answer_op(context: ptr, op: string, request: ptr) -> ptr {
+    only = 0 - 1
+    node = json.object_get_raw(request, "session")
+    if node != null {
+        only = json.get_int(node)
+        if session_at(only) == null { return json.str("no session ${only}: there are ${session_count()}") }
+    }
+    if op == "net.stats" {
+        out = json.obj()
+        sessions = json.arr()
+        k = 0
+        while k < session_count() {
+            if only < 0 || only == k { json.array_add_raw(sessions, session_json(session_at(k), k)) }
+            k = k + 1
+        }
+        json.object_set_raw(out, "sessions", sessions)
+        return out
+    }
+    if op == "net.set_link" {
+        latency = number_arg(request, "latency")
+        jitter_s = number_arg(request, "jitter")
+        loss_share = number_arg(request, "loss")
+        if latency < 0.0 || jitter_s < 0.0 || loss_share < 0.0 || loss_share > 1.0 {
+            return json.str("net.set_link wants latency and jitter in seconds, and loss between 0 and 1")
+        }
+        out = json.obj()
+        sessions = json.arr()
+        changed = 0
+        k = 0
+        while k < session_count() {
+            n = session_at(k)
+            if (only < 0 || only == k) && n.kind != KIND_TCP {
+                set_link(n, latency, jitter_s, loss_share)
+                entry = json.obj()
+                json.object_set_raw(entry, "session", json.from_int(k as long))
+                json.object_set_raw(entry, "link", link_json(n))
+                json.array_add_raw(sessions, entry)
+                changed = changed + 1
+            }
+            k = k + 1
+        }
+        if changed == 0 {
+            json.free(out)
+            json.free(sessions)
+            return json.str("no session with a simulated link (TCP has none)")
+        }
+        json.object_set_raw(out, "sessions", sessions)
+        return out
+    }
+    return json.str("unknown op ${op}; net.stats and net.set_link are ae3d.net's")
+}
+
+// A number argument, or -1 when it is not there.
+number_arg(request: ptr, name: string) -> float {
+    node = json.object_get_raw(request, name)
+    if node == null { return 0.0 - 1.0 }
+    return json.get_number(node)
+}
+
+json_whole(x: long) -> ptr { return json.from_int(x) }
+
+micros(seconds: float) -> long { return floor(seconds * 1000000.0 + 0.5) as long }
+
+link_json(n: *Net) -> ptr {
+    out = json.obj()
+    json.object_set_raw(out, "latency_us", json_whole(micros(link_latency(n))))
+    json.object_set_raw(out, "jitter_us", json_whole(micros(link_jitter(n))))
+    json.object_set_raw(out, "loss_ppm", json_whole(micros(link_loss(n))))
+    return out
+}
+
+session_json(n: *Net, index: int) -> ptr {
+    out = json.obj()
+    json.object_set_raw(out, "session", json_whole(index as long))
+    role = "client"
+    if n.role == ROLE_HOST { role = "host" }
+    json.object_set_raw(out, "role", json.str(role))
+    json.object_set_raw(out, "transport", json.str(transport_name(n)))
+    json.object_set_raw(out, "client_id", json_whole(n.my_id as long))
+    json.object_set_raw(out, "connected", json.boolean(connected(n)))
+    tick = n.newest_tick
+    if n.role == ROLE_HOST { tick = n.tick }
+    json.object_set_raw(out, "tick", json_whole(tick as long))
+    json.object_set_raw(out, "objects", json_whole(networked_count(n) as long))
+    json.object_set_raw(out, "players", json_whole(player_count(n) as long))
+    json.object_set_raw(out, "fields", json_whole(list.size(n.replicated) as long))
+    if n.kind != KIND_TCP { json.object_set_raw(out, "link", link_json(n)) }
+    if n.role == ROLE_CLIENT {
+        json.object_set_raw(out, "snapshots_received", json_whole(n.snapshots as long))
+        json.object_set_raw(out, "stale_snapshots", json_whole(n.stale as long))
+        prediction = json.obj()
+        json.object_set_raw(prediction, "last_um", json_whole(correction_um(n, false)))
+        json.object_set_raw(prediction, "worst_um", json_whole(correction_um(n, true)))
+        json.object_set_raw(out, "prediction", prediction)
+    }
+    peers = json.arr()
+    i = 0
+    while i < list.size(n.peers) {
+        p = list.get_raw(n.peers, i) as *Peer
+        if n.role == ROLE_CLIENT || p.welcomed { json.array_add_raw(peers, peer_json(n, p)) }
+        i = i + 1
+    }
+    json.object_set_raw(out, "peers", peers)
+    return out
+}
+
+// A peer's traffic by kind, a rate or a total.
+kinds_json(n: *Net, client: int, direction: int, rates: bool) -> ptr {
+    out = json.obj()
+    json.object_set_raw(out, "snapshots", json_whole(traffic_figure(n, client, direction, TRAFFIC_SNAPSHOTS, rates)))
+    json.object_set_raw(out, "events", json_whole(traffic_figure(n, client, direction, TRAFFIC_EVENTS, rates)))
+    json.object_set_raw(out, "inputs", json_whole(traffic_figure(n, client, direction, TRAFFIC_INPUTS, rates)))
+    json.object_set_raw(out, "acks", json_whole(traffic_figure(n, client, direction, TRAFFIC_ACKS, rates)))
+    json.object_set_raw(out, "link", json_whole(traffic_figure(n, client, direction, TRAFFIC_LINK, rates)))
+    json.object_set_raw(out, "headers", json_whole(traffic_figure(n, client, direction, TRAFFIC_HEADERS, rates)))
+    json.object_set_raw(out, "resent", json_whole(traffic_figure(n, client, direction, TRAFFIC_RESENT, rates)))
+    json.object_set_raw(out, "all", json_whole(traffic_figure(n, client, direction, TRAFFIC_ALL, rates)))
+    return out
+}
+
+traffic_figure(n: *Net, client: int, direction: int, kind: int, rates: bool) -> long {
+    if rates { return rate(n, client, direction, kind) }
+    return link_bytes(n, client, direction, kind)
+}
+
+peer_json(n: *Net, p: *Peer) -> ptr {
+    sync_transport(n, p)
+    client = p.id
+    out = json.obj()
+    json.object_set_raw(out, "peer", json_whole(p.id as long))
+    json.object_set_raw(out, "open", json.boolean(p.open))
+    json.object_set_raw(out, "round_trip_us", json_whole(round_trip_us(n, client) as long))
+    json.object_set_raw(out, "jitter_us", json_whole(jitter_us(n, client) as long))
+    json.object_set_raw(out, "loss_ppm", json_whole(loss_ppm(n, client) as long))
+    pinged = json.obj()
+    json.object_set_raw(pinged, "sent", json_whole(pings(n, client, 1) as long))
+    json.object_set_raw(pinged, "answered", json_whole(pings(n, client, 2) as long))
+    json.object_set_raw(pinged, "lost", json_whole(pings(n, client, 3) as long))
+    json.object_set_raw(out, "pings", pinged)
+    json.object_set_raw(out, "window_us", json_whole(window_us(n, client)))
+    json.object_set_raw(out, "sent", kinds_json(n, client, SENT, true))
+    json.object_set_raw(out, "received", kinds_json(n, client, RECEIVED, true))
+    json.object_set_raw(out, "sent_bytes", kinds_json(n, client, SENT, false))
+    json.object_set_raw(out, "received_bytes", kinds_json(n, client, RECEIVED, false))
+    if n.role == ROLE_HOST {
+        json.object_set_raw(out, "budget", json_whole(budget_of(n, client) as long))
+        json.object_set_raw(out, "largest_snapshot", json_whole(p.largest as long))
+        json.object_set_raw(out, "snapshots", json_whole(p.snapshots as long))
+        json.object_set_raw(out, "whole_snapshots", json_whole(p.wholes as long))
+        json.object_set_raw(out, "delta_snapshots", json_whole((p.snapshots - p.wholes) as long))
+        json.object_set_raw(out, "worst_wait", json_whole(p.worst_any as long))
+        json.object_set_raw(out, "view", json.boolean(p.view_known))
+        waited = json.obj()
+        json.object_set_raw(waited, "seen", json_whole(worst_wait_sight(n, client, SIGHT_SEEN) as long))
+        json.object_set_raw(waited, "out", json_whole(worst_wait_sight(n, client, SIGHT_OUT) as long))
+        json.object_set_raw(waited, "hidden", json_whole(worst_wait_sight(n, client, SIGHT_HIDDEN) as long))
+        json.object_set_raw(out, "worst_wait_by_sight", waited)
+        json.object_set_raw(out, "view_bytes", json_whole(p.view_bytes))
+        json.object_set_raw(out, "hidden_bytes", json_whole(p.hidden_bytes))
+        json.object_set_raw(out, "rays", json_whole(p.rays))
+    }
+    return out
 }
 
 // When a link last heard from the other side, in the time `step` is given,
@@ -3062,6 +4976,16 @@ known(n: *Net, id: int) -> bool {
     return (shot.known as int[])[id - 1] == 1
 }
 
+// Whether object `id`'s replicated fields are known: on a client, whether
+// its newest snapshot has them (a player told of before any snapshot
+// carried it holds what its maker gave it); on the host, whether the last
+// tick took them.
+fields_known(n: *Net, id: int) -> bool {
+    shot = newest_states(n)
+    if shot == null || id < 1 || id > shot.count { return false }
+    return (shot.fknown as int[])[id - 1] == 1
+}
+
 // Object `id`'s state as the wire carries it, quantised, into `out` (7
 // floats: x y z, qx qy qz qw): on a client, its newest snapshot's; on the
 // host, its state at the last tick. False when it is not known.
@@ -3116,12 +5040,38 @@ net_free(n: *Net) {
         if no != null && no.kind > 0 {
             forget(n, no)
         } else if no != null {
-            free(no.history)
-            free(no as ptr)
+            net_object_free(no)
         }
         i = i + 1
     }
     list.free(n.objects)
+    i = 0
+    while i < list.size(n.replicated) {
+        field_free(list.get_raw(n.replicated, i) as *NetField)
+        i = i + 1
+    }
+    list.free(n.replicated)
+    i = 0
+    while i < list.size(n.layouts) {
+        lay = list.get_raw(n.layouts, i) as *NetLayout
+        if lay != null { layout_free(lay) }
+        i = i + 1
+    }
+    list.free(n.layouts)
+    i = 0
+    while i < list.size(n.spare_words) {
+        free(list.get_raw(n.spare_words, i))
+        i = i + 1
+    }
+    list.free(n.spare_words)
+    i = 0
+    while i < list.size(g_sessions) {
+        if list.get_raw(g_sessions, i) == n as ptr {
+            list.remove(g_sessions, i)
+            break
+        }
+        i = i + 1
+    }
     i = 0
     while i < list.size(n.handlers) {
         heap.free(list.get_raw(n.handlers, i) as *NetHandler)
@@ -3159,6 +5109,7 @@ net_free(n: *Net) {
     if n.candidates != null { free(n.candidates) }
     if n.records != null { free(n.records) }
     if n.fields != null { free(n.fields) }
+    if n.urgency != null { free(n.urgency) }
     free(n.traffic)
     free(n.scratch)
     if n.server != null { tcp.tcp_server_close(n.server) }
