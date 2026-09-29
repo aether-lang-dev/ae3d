@@ -122,17 +122,16 @@ fi
 NATIVE_SOURCES="$(ae3d_native_sources "$OBJ_DIR" "$AEPHYSICS")"
 
 # The Vulkan shaders are generated from the GLSL in src/ae3d/shaders and
-# compiled into the native library; an edit to the GLSL without the generator
-# run after it leaves Vulkan on the previous shaders, which then fail parity
-# in ways that look like real bugs. Said here, once, at every build, since
+# compiled into ae3d.vkspirv; an edit to the GLSL without the generator run
+# after it leaves Vulkan on the previous shaders, which then fail parity in
+# ways that look like real bugs. Said here, once, at every build, since
 # CI's --check only says so after the push.
-if [ -f native/gpu/vulkan_shaders.h ] && [ src/ae3d/shaders/module.ae -nt native/gpu/vulkan_shaders.h ]; then
+if [ -f src/ae3d/vkspirv/module.ae ] && [ src/ae3d/shaders/module.ae -nt src/ae3d/vkspirv/module.ae ]; then
     echo "build: src/ae3d/shaders/module.ae is newer than the generated Vulkan shaders; run ./build.sh tools/generate_shaders.ae && ./build/generate_shaders" >&2
 fi
 
-# Every header, not a list of three. The generated ones carry the shaders and
-# the uniform offsets, so leaving them out meant regenerating the shaders and
-# linking the previous ones, with nothing to say so.
+# Every header, not a list of three: a header changed recompiles every
+# source that could include it.
 newest_header=""
 for header in native/*.h native/*/*.h; do
     if [ -z "$newest_header" ] || [ "$header" -nt "$newest_header" ]; then

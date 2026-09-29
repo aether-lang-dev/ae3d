@@ -1,20 +1,21 @@
-// ae3d.vkmesh -- meshes uploaded on the Vulkan backend (#402): the fourth
-// of native/gpu/vulkan.c to move into Aether, on contrib.vulkan.vk.
+// ae3d.vkmesh -- meshes on the Vulkan backend (#402), on contrib.vulkan.vk:
+// uploaded, and the table the frame's draws read them from by handle.
 //
 // A mesh's vertices, its indices and, for a skinned one, its joints and
 // weights go into device-local buffers (ae3d.vkhost's), each filled by a
 // copy from host-visible staging. The copies are recorded into the
-// backend's upload batch rather than submitted one by one: the batch runs
+// upload batch (ae3d.vkhost's) rather than submitted one by one: the batch runs
 // once, before the next frame begins or before the frame being recorded
 // is submitted, so a scene of hundreds of meshes waits on the queue once
 // rather than once a buffer. The staging is taken in chunks of sixteen
-// megabytes, handed to the backend to free once the batch that reads it
-// has run.
+// megabytes, handed to the batch to free once it has run.
 //
 // Where the device traces rays, the mesh's bottom-level structure is built
 // into the same batch, after the copies (ae3d.vkrays), and kept with the
-// mesh. The backend adopts the buffers into the mesh table its draws read
-// (ae3d_vk_mesh_adopt).
+// mesh. The buffers go into the table the frame's draws read (vkframe), and
+// the instance streams with them: a model's matrices and colours, packed
+// over every core, written in place each frame into a ring of host-visible
+// buffers once they move.
 //
 // Geometry that appears many times is uploaded once, so the models using
 // it can be merged into a single instanced draw: this module keeps the
@@ -24,27 +25,23 @@
 
 import contrib.vulkan.vk
 import ae3d.vkhost
+import ae3d.vkdevice
 import ae3d.vkrays
 import ae3d.geometry
+import ae3d.jobs
 
 exports (
-    mesh_upload, mesh_free, mesh_shared, mesh_forget, blas_address, uploads, shares, live, slots
+    mesh_upload, mesh_free, mesh_shared, blas_address, uploads, shares, live, slots,
+    in_range, drawable, vertex_buffer, index_buffer, index_count, skin_buffer, skinned, points,
+    upload_instances, update_instances, clear
 )
 
-extern ae3d_vk_mesh_adopt(vertex_buffer: ptr, vertex_memory: ptr, index_buffer: ptr, index_memory: ptr,
-                          skin_buffer: ptr, skin_memory: ptr, index_count: int) -> int
-extern ae3d_vk_mesh_count() -> int
-extern ae3d_vk_free_mesh(handle: int)
-extern ae3d_vk_batch_commands() -> ptr
-extern ae3d_vk_batch_keep(buffer: ptr, memory: ptr)
-extern ae3d_vk_batch_serial() -> int
-extern ae3d_vk_flush_uploads()
-extern ae3d_vk_set_error(reason: string)
 extern calloc(count: int, size: int) -> ptr
 extern malloc(size: long) -> ptr
 extern free(p: ptr)
 extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
 extern memcmp(a: ptr, b: ptr, n: long) -> int
+extern memset(p: ptr, value: int, n: long) -> ptr
 
 // A vertex is nine floats -- position, normal, texture coordinate -- and
 // a skinned one's joints and weights eight more, in a stream of their own.
@@ -70,7 +67,7 @@ struct VKMeshShape {
     blas_address: long
 }
 
-var g_shapes: ptr = null             // by handle, what the backend's table holds a mesh in
+var g_shapes: ptr = null             // a mesh's record, by the handle of its slot in the table
 var g_capacity = 0
 var g_device: ptr = null             // the device they were uploaded to
 
@@ -89,8 +86,7 @@ var g_shares = 0
 uploads() -> int { return g_uploads }
 shares() -> int { return g_shares }
 
-// Meshes held now, and the backend's mesh table's slots in use (meshes and
-// instance streams).
+// Meshes held now.
 live() -> int {
     count = 0
     h = 1
@@ -101,7 +97,6 @@ live() -> int {
     return count
 }
 
-slots() -> int { return ae3d_vk_mesh_count() }
 
 shape_at(handle: int) -> *VKMeshShape {
     if handle <= 0 || handle >= g_capacity { return null }
@@ -168,7 +163,7 @@ find(vertices: ptr, indices: ptr, vertex_count: int, index_count: int) -> int {
 // recorded into the batch. False when no staging could be had.
 stage(commands: ptr, source: ptr, bytes: int, target: ptr) -> bool {
     // A chunk taken before the last flush was freed by it.
-    if g_stage_buffer != null && g_stage_serial != ae3d_vk_batch_serial() { g_stage_buffer = null }
+    if g_stage_buffer != null && g_stage_serial != vkhost.batch_serial() { g_stage_buffer = null }
     at = (g_stage_used + 15) / 16 * 16
     if g_stage_buffer == null || at + bytes > g_stage_size {
         size = CHUNK
@@ -179,12 +174,12 @@ stage(commands: ptr, source: ptr, bytes: int, target: ptr) -> bool {
             vkhost.host_buffer_free(chunk)
             return false
         }
-        ae3d_vk_batch_keep(chunk.buffer, chunk.memory)
+        vkhost.batch_keep(chunk.buffer, chunk.memory)
         g_stage_buffer = chunk.buffer
         g_stage_mapped = chunk.mapped
         g_stage_size = size
-        g_stage_serial = ae3d_vk_batch_serial()
-        // The chunk is the backend's to free now; only its record goes.
+        g_stage_serial = vkhost.batch_serial()
+        // The chunk is the batch's to free now; only its record goes.
         free(chunk as ptr)
         at = 0
     }
@@ -215,22 +210,22 @@ upload_new(mesh: ptr, vertices: ptr, indices: ptr, vertex_count: int, index_coun
         vkhost.device_buffer_free(vb)
         vkhost.device_buffer_free(ib)
         vkhost.device_buffer_free(sb)
-        ae3d_vk_set_error("a mesh's buffers could not be made")
+        vkdevice.fail("a mesh's buffers could not be made")
         return 0
     }
 
-    commands = ae3d_vk_batch_commands()
+    commands = vkhost.batch_commands()
     ok = commands != null
     if ok { ok = stage(commands, vertices, vertex_bytes, vb.buffer) }
     if ok && skinned { ok = stage(commands, geometry.mesh_skin_data(mesh), skin_bytes, sb.buffer) }
     if ok { ok = stage(commands, indices, index_bytes, ib.buffer) }
     if !ok {
         // The batch may name the buffers already; it runs before they go.
-        ae3d_vk_flush_uploads()
+        vkhost.flush()
         vkhost.device_buffer_free(vb)
         vkhost.device_buffer_free(ib)
         vkhost.device_buffer_free(sb)
-        ae3d_vk_set_error("a mesh's upload could not be staged")
+        vkdevice.fail("a mesh's upload could not be staged")
         return 0
     }
     // Its structure for the rays, a skinned mesh's pose not being in its
@@ -242,20 +237,20 @@ upload_new(mesh: ptr, vertices: ptr, indices: ptr, vertex_count: int, index_coun
         shape.blas_memory = b.memory
         shape.blas_address = b.address
     }
-    handle = ae3d_vk_mesh_adopt(vb.buffer, vb.memory, ib.buffer, ib.memory, sb.buffer, sb.memory, index_count)
-    // Refused, the backend ran the batch before destroying the buffers: the
+    handle = adopt(vb, ib, sb, index_count)
+    // Refused, the batch ran before the buffers were destroyed: the
     // structure built from them goes after them.
     if handle == 0 { vkrays.blas_free(structure_of(shape)) }
     return handle
 }
 
-// A mesh on the device: the handle the backend draws it by, the one
+// A mesh on the device: the handle the frame draws it by, the one
 // already made when its bytes are one's already uploaded, or 0 with the
 // reason in the backend's last error.
 mesh_upload(mesh: ptr) -> int {
     d = vkhost.device()
     if d == null {
-        ae3d_vk_set_error("vulkan not initialised")
+        vkdevice.fail("vulkan not initialised")
         return 0
     }
     // Handles from another device name nothing on this one.
@@ -281,7 +276,7 @@ mesh_upload(mesh: ptr) -> int {
         }
     }
     if vertices == null || vertex_count <= 0 {
-        ae3d_vk_set_error("mesh has no geometry")
+        vkdevice.fail("mesh has no geometry")
         return 0
     }
 
@@ -292,7 +287,7 @@ mesh_upload(mesh: ptr) -> int {
     if indices == null || index_count <= 0 {
         numbered = calloc(vertex_count, 4)
         if numbered == null {
-            ae3d_vk_set_error("out of memory")
+            vkdevice.fail("out of memory")
             return 0
         }
         numbers = numbered as int[]
@@ -326,7 +321,7 @@ mesh_upload(mesh: ptr) -> int {
                 shape.indices = null
             }
         }
-        // A slot the backend hands out again was let go of through here.
+        // A slot the table hands out again was let go of through here.
         drop(handle, true)
         put(handle, shape)
     }
@@ -340,16 +335,16 @@ mesh_free(handle: int) {
     if handle <= 0 { return }
     shape = shape_at(handle)
     if shape == null {
-        ae3d_vk_free_mesh(handle)
+        release_slot(handle)
         return
     }
     shape.refs = shape.refs - 1
     if shape.refs > 0 { return }
-    // The structure after the buffers: the backend waits for the device
+    // The structure after the buffers: their release waits for the device
     // before it frees them, and the frames in flight may trace it.
     structure = structure_of(shape)
     drop(handle, false)
-    ae3d_vk_free_mesh(handle)
+    release_slot(handle)
     vkrays.blas_free(structure)
 }
 
@@ -362,14 +357,10 @@ mesh_shared(handle: int) -> bool {
     return shape.vertices != null && shape.refs > 1
 }
 
-// Everything forgotten when the backend has shut down (its table went
-// with it): the copies freed, the structures destroyed on the device that
-// is still up, and the staging, which the backend freed at its last flush,
-// let go of.
-mesh_forget() { forget(true) }
-
-// The same, `with_structures` or not: a device that changed took them
-// with it.
+// Every record forgotten: the copies freed, the structures destroyed with
+// them (`with_structures`, on a device that is still up; a device that
+// changed took them with it), and the staging, which the batch freed at
+// its last flush, let go of.
 forget(with_structures: bool) {
     h = 1
     while h < g_capacity {
@@ -384,4 +375,358 @@ forget(with_structures: bool) {
     g_stage_mapped = null
     g_stage_size = 0
     g_stage_used = 0
+}
+
+// --- the table the draws read ------------------------------------------------------------------------------------
+
+// A mesh or an instance stream on the device, by handle, slot + 1: its
+// vertex buffer (an instance stream's instances), its index buffer and
+// index count, and a skinned mesh's joints and weights. A mesh without a
+// skin allocates nothing there and is drawn by a pipeline whose vertex
+// input strides zero through the frame's one unused element.
+//
+// An instance stream that moves every frame is written in place into a
+// ring of host-visible buffers, one per frame in flight, and the frame's
+// draws bind that frame's. Nothing is waited for and nothing destroyed:
+// the slot a frame writes was last read by the frame whose fence the
+// frame's start already waited on. Made on the first update, sized to the
+// largest stream seen. A stream of points is eight floats an instance,
+// drawn through the point pipelines, whose second binding strides by that.
+struct VKMeshSlot {
+    vertex_buffer: ptr
+    vertex_memory: ptr
+    index_buffer: ptr
+    index_memory: ptr
+    skin_buffer: ptr
+    skin_memory: ptr
+    skinned: bool
+    index_count: int
+    in_use: bool
+    ring: ptr                        // VkBuffer[FRAMES]
+    ring_memory: ptr                 // VkDeviceMemory[FRAMES]
+    ring_mapped: ptr                 // void*[FRAMES]
+    ring_size: int
+    streaming: bool
+    points: bool
+}
+
+const FRAMES = 2
+
+var g_slots: ptr = null            // VKMeshSlot[g_slot_capacity]
+var g_slot_capacity = 0
+
+slot_at(handle: int) -> *VKMeshSlot { return (g_slots + (handle - 1) * sizeof(VKMeshSlot)) as *VKMeshSlot }
+
+// Whether `handle` is one the table has room for, and one it holds.
+in_range(handle: int) -> bool { return handle > 0 && handle <= g_slot_capacity }
+drawable(handle: int) -> bool { return in_range(handle) && slot_at(handle).in_use }
+
+// What a draw binds of the mesh or stream under `handle`.
+vertex_buffer(handle: int) -> ptr { return slot_at(handle).vertex_buffer }
+index_buffer(handle: int) -> ptr { return slot_at(handle).index_buffer }
+index_count(handle: int) -> int { return slot_at(handle).index_count }
+// Its skin's buffer, null for a mesh with none.
+skin_buffer(handle: int) -> ptr {
+    s = slot_at(handle)
+    if s.skinned { return s.skin_buffer }
+    return null
+}
+skinned(handle: int) -> bool { return in_range(handle) && slot_at(handle).skinned }
+points(handle: int) -> bool { return slot_at(handle).points }
+
+// A free slot of the table, which grows when every one is taken: its
+// handle, or 0 when it could not grow.
+free_slot() -> int {
+    h = 1
+    while h <= g_slot_capacity {
+        if !slot_at(h).in_use { return h }
+        h = h + 1
+    }
+    grown = g_slot_capacity * 2
+    if grown == 0 { grown = 16 }
+    fresh = calloc(grown, sizeof(VKMeshSlot))
+    if fresh == null {
+        vkdevice.fail("out of memory")
+        return 0
+    }
+    if g_slots != null {
+        memcpy(fresh, g_slots, (g_slot_capacity * sizeof(VKMeshSlot)) as long)
+        free(g_slots)
+    }
+    g_slots = fresh
+    handle = g_slot_capacity + 1
+    g_slot_capacity = grown
+    return handle
+}
+
+// A mesh's buffers into the table: the handle, or 0 when the table could
+// not grow, the buffers then destroyed once the batch that names them has
+// run.
+adopt(vb: vkhost.DeviceBuffer, ib: vkhost.DeviceBuffer, sb: vkhost.DeviceBuffer, index_count: int) -> int {
+    handle = free_slot()
+    if handle == 0 {
+        vkhost.flush()
+        vkhost.device_buffer_free(vb)
+        vkhost.device_buffer_free(ib)
+        vkhost.device_buffer_free(sb)
+        return 0
+    }
+    s = slot_at(handle)
+    memset(s as ptr, 0, sizeof(VKMeshSlot) as long)
+    s.vertex_buffer = vb.buffer
+    s.vertex_memory = vb.memory
+    s.index_buffer = ib.buffer
+    s.index_memory = ib.memory
+    s.skin_buffer = sb.buffer
+    s.skin_memory = sb.memory
+    s.skinned = sb.buffer != null
+    s.index_count = index_count
+    s.in_use = true
+    return handle
+}
+
+// The table's slots in use, meshes and instance streams: what
+// tests/test_vk_mesh counts a release by.
+slots() -> int {
+    live_now = 0
+    h = 1
+    while h <= g_slot_capacity {
+        if slot_at(h).in_use { live_now = live_now + 1 }
+        h = h + 1
+    }
+    return live_now
+}
+
+free_ring(s: *VKMeshSlot) {
+    d = vkhost.device()
+    if s.ring != null {
+        i = 0
+        while i < FRAMES {
+            mapped = (s.ring_mapped as ptr[])[i]
+            memory = (s.ring_memory as ptr[])[i]
+            buffer = (s.ring as ptr[])[i]
+            if mapped != null { vk.vkUnmapMemory(d, memory) }
+            if buffer != null { vk.vkDestroyBuffer(d, buffer, null) }
+            if memory != null { vk.vkFreeMemory(d, memory, null) }
+            i = i + 1
+        }
+        free(s.ring)
+        free(s.ring_memory)
+        free(s.ring_mapped)
+    }
+    s.ring = null
+    s.ring_memory = null
+    s.ring_mapped = null
+    s.ring_size = 0
+    s.streaming = false
+}
+
+// A slot's buffers destroyed and the slot emptied; the device idle.
+free_slot_buffers(s: *VKMeshSlot) {
+    d = vkhost.device()
+    if s.streaming {
+        // The bound buffer is one of the ring's; the ring frees it.
+        s.vertex_buffer = null
+        s.vertex_memory = null
+        free_ring(s)
+    }
+    if s.vertex_buffer != null { vk.vkDestroyBuffer(d, s.vertex_buffer, null) }
+    if s.vertex_memory != null { vk.vkFreeMemory(d, s.vertex_memory, null) }
+    if s.index_buffer != null { vk.vkDestroyBuffer(d, s.index_buffer, null) }
+    if s.index_memory != null { vk.vkFreeMemory(d, s.index_memory, null) }
+    if s.skin_buffer != null { vk.vkDestroyBuffer(d, s.skin_buffer, null) }
+    if s.skin_memory != null { vk.vkFreeMemory(d, s.skin_memory, null) }
+    memset(s as ptr, 0, sizeof(VKMeshSlot) as long)
+}
+
+// Whether the backend is up: its command pool made, and not yet gone.
+started() -> bool { return vkhost.command_pool() != null }
+
+// The slot under `handle` freed: the batch run first (it may name its
+// buffers), the device waited for (the frames in flight may draw them).
+release_slot(handle: int) {
+    if !started() || !drawable(handle) { return }
+    vkhost.flush()
+    vk.vkDeviceWaitIdle(vkhost.device())
+    free_slot_buffers(slot_at(handle))
+}
+
+// Every slot freed and the table with it, the device idle: at shutdown;
+// and every record forgotten, the structures destroyed on the device that
+// is still up.
+clear() {
+    h = 1
+    while h <= g_slot_capacity {
+        s = slot_at(h)
+        if s.in_use { free_slot_buffers(s) }
+        h = h + 1
+    }
+    if g_slots != null { free(g_slots) }
+    g_slots = null
+    g_slot_capacity = 0
+    forget(true)
+}
+
+// --- instance streams --------------------------------------------------------------------------------------------
+
+// A pack's job: the stream's instances into `packed`, twenty floats each
+// -- the matrix, the colour, the phase -- as the pipelines' second binding
+// reads them.
+struct InstancePack {
+    packed: ptr
+    matrices: ptr
+    colours: ptr
+    phases: ptr
+    has_colours: bool
+}
+
+pack_block(begin: int, end: int, worker: int, context: ptr) {
+    job = context as *InstancePack
+    out = job.packed as f32[]
+    ph = job.phases as f32[]
+    coloured = job.has_colours && job.colours != null
+    i = begin
+    while i < end {
+        o = i * 20
+        memcpy(job.packed + o * 4, job.matrices + i * 64, 64 as long)
+        if coloured {
+            memcpy(job.packed + (o + 16) * 4, job.colours + i * 12, 12 as long)
+        } else {
+            out[o + 16] = 1.0
+            out[o + 17] = 1.0
+            out[o + 18] = 1.0
+        }
+        // The phase rides in the float after the colour; the crowd vertex
+        // shader reads it, nothing else does.
+        out[o + 19] = 0.0
+        if job.phases != null { out[o + 19] = ph[i] }
+        i = i + 1
+    }
+}
+
+// Eighty bytes an instance into `packed`: forty megabytes a frame for half
+// a million figures, which is a memory copy worth every core.
+pack_into(packed: ptr, instances: ptr, count: int) {
+    job = InstancePack { packed: packed, matrices: geometry.inst_matrix_data(instances),
+                         colours: geometry.inst_color_data(instances), phases: null,
+                         has_colours: geometry.inst_has_colors(instances) == 1 }
+    if geometry.inst_has_phases(instances) == 1 { job.phases = geometry.inst_phase_data(instances) }
+    jobs.parallel_for(pack_block, count, 8192, (&job) as ptr)
+}
+
+// An instance stream on the device, its first upload: a device-local
+// buffer of its packed instances (or of its points as they are). The
+// handle, or 0.
+upload_instances(instances: ptr) -> int {
+    count = geometry.inst_count(instances)
+    is_points = geometry.inst_is_points(instances) == 1
+    data = geometry.inst_matrix_data(instances)
+    if is_points { data = geometry.inst_point_data(instances) }
+    if vkhost.device() == null || data == null || count <= 0 {
+        vkdevice.fail("no instances")
+        return 0
+    }
+    handle = free_slot()
+    if handle == 0 { return 0 }
+    s = slot_at(handle)
+    made = vkhost.DeviceBuffer { buffer: null, memory: null }
+    if is_points {
+        made = vkhost.upload(data, count * 32, vk.BUFFER_USAGE_VERTEX_BUFFER_BIT)
+    } else {
+        packed = calloc(count * 20, 4)
+        if packed == null {
+            vkdevice.fail("out of memory")
+            return 0
+        }
+        pack_into(packed, instances, count)
+        made = vkhost.upload(packed, count * 80, vk.BUFFER_USAGE_VERTEX_BUFFER_BIT)
+        free(packed)
+    }
+    if made.buffer == null { return 0 }
+    memset(s as ptr, 0, sizeof(VKMeshSlot) as long)
+    s.vertex_buffer = made.buffer
+    s.vertex_memory = made.memory
+    s.points = is_points
+    s.index_count = 0
+    s.in_use = true
+    return handle
+}
+
+// The ring for a stream of `bytes`, made or regrown. Growing waits for the
+// device once, since every slot of the old ring may be in flight; a stream
+// that keeps its size never waits again.
+ensure_ring(s: *VKMeshSlot, bytes: int) -> bool {
+    if s.streaming && s.ring_size >= bytes { return true }
+    d = vkhost.device()
+    vk.vkDeviceWaitIdle(d)
+    if s.streaming {
+        // Regrowing: the bound buffer is one of the ring's, which the ring
+        // frees. Destroying it here as well destroyed it twice, and the
+        // driver fell over on the second when a stream grew.
+        s.vertex_buffer = null
+        s.vertex_memory = null
+    }
+    free_ring(s)
+    // The device-local buffer the first upload made is not read again.
+    if s.vertex_buffer != null { vk.vkDestroyBuffer(d, s.vertex_buffer, null) }
+    if s.vertex_memory != null { vk.vkFreeMemory(d, s.vertex_memory, null) }
+    s.vertex_buffer = null
+    s.vertex_memory = null
+    s.ring = calloc(FRAMES, 8)
+    s.ring_memory = calloc(FRAMES, 8)
+    s.ring_mapped = calloc(FRAMES, 8)
+    host = vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT
+    cell = calloc(1, 8)
+    i = 0
+    while i < FRAMES {
+        made = vkhost.buffer_of(bytes, vk.BUFFER_USAGE_VERTEX_BUFFER_BIT, host)
+        (s.ring as ptr[])[i] = made.buffer
+        (s.ring_memory as ptr[])[i] = made.memory
+        if made.buffer == null {
+            free(cell)
+            free_ring(s)
+            return false
+        }
+        if vk.vkMapMemory(d, made.memory, 0, bytes, 0, cell) != vk.SUCCESS {
+            free(cell)
+            free_ring(s)
+            vkdevice.fail("vkMapMemory failed for an instance ring")
+            return false
+        }
+        (s.ring_mapped as ptr[])[i] = (cell as ptr[])[0]
+        i = i + 1
+    }
+    free(cell)
+    s.ring_size = bytes
+    s.streaming = true
+    return true
+}
+
+// An instance stream that has moved or changed colour since it was
+// uploaded: packed straight into this frame's slot of the ring, which this
+// frame's draws then bind. The first update turns the stream over from the
+// device-local buffer of the upload to the ring; from then on an update is
+// one pass over the instances into mapped memory, where it used to be a
+// wait for the whole device, a destroy and a staged upload of a fresh
+// buffer every frame. A point stream is already the bytes the binding
+// reads: one copy, no packing. False when it could not be written.
+update_instances(handle: int, instances: ptr, frame: int) -> bool {
+    count = geometry.inst_count(instances)
+    if !started() || !in_range(handle) || count <= 0 { return false }
+    s = slot_at(handle)
+    if !s.in_use { return false }
+    if geometry.inst_is_points(instances) == 1 {
+        points_data = geometry.inst_point_data(instances)
+        if points_data == null { return false }
+        bytes = count * 32
+        if !ensure_ring(s, bytes) { return false }
+        memcpy((s.ring_mapped as ptr[])[frame], points_data, bytes as long)
+        s.vertex_buffer = (s.ring as ptr[])[frame]
+        s.points = true
+        return true
+    }
+    if !ensure_ring(s, count * 80) { return false }
+    pack_into((s.ring_mapped as ptr[])[frame], instances, count)
+    s.vertex_buffer = (s.ring as ptr[])[frame]
+    return true
 }

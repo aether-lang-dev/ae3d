@@ -222,7 +222,7 @@ uniform budget over); a skinned model's motion is its model's and the
 camera's. Capture channel 3 (`engine_set_capture_channel(e, 3)`,
 `AE3D_CAPTURE=3`) draws the vector in pixels, a hundred either way across
 the byte and 128 for still, and `tests/test_velocity` holds it against the
-camera's own projection to the pixel. On Vulkan `ae3d_vk_velocity_texture`
+camera's own projection to the pixel. On Vulkan `vkframe.velocity_texture`
 is the resolved target, which is what an upscaler is handed (#324).
 
 ### Render scale

@@ -203,7 +203,7 @@ field sampled, and blended across one screen pixel of it at the outline
   window or the offscreen target: the atlas as an `R8` texture, the
   vertices into one buffer each frame.
 - **Vulkan.** `ae3d.vkoverlay` records it from Aether on contrib.vulkan.vk
-  through `vulkan.c`'s frame hooks, at their draw stage: after the meter
+  through `ae3d.vkframe`'s hooks, at their draw stage: after the meter
   reads the scene's light (a menu does not set the scene's exposure) and
   before the readback copies the frame (a capture is of what is shown).
   Its render pass loads the frame's image and leaves it in the layout it

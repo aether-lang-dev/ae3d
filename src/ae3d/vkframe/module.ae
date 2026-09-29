@@ -1,0 +1,1952 @@
+// ae3d.vkframe -- the Vulkan frame (#402), on contrib.vulkan.vk: begun,
+// its passes opened and closed, its draws recorded, its post chain run,
+// submitted and presented or read back. With the device (ae3d.vkdevice),
+// the targets (ae3d.vktargets), the pipelines (ae3d.vkpipes), the blocks
+// and sets (ae3d.vkdesc), the textures (ae3d.vktexture), the meshes
+// (ae3d.vkmesh), the rays (ae3d.vkrays) and the crowds (ae3d.vkcrowd), this
+// is the Vulkan renderer.
+//
+// A frame in flight is two frame slots, each with its command buffer, its
+// semaphores and its fence, and the frame waits on the fence of the slot it
+// takes before it writes anything the slot's last frame read. The scene
+// pass is opened by the first scene draw rather than at the frame's start,
+// so a shadow pass can be recorded into the same command buffer ahead of
+// it: Vulkan forbids nesting render passes, and a shadow map has to be
+// finished before the pass that samples it starts.
+//
+// Four kinds of stamp a frame split its GPU time: the start, the end of
+// the shadow pass, of the camera depth, of the sky, of the opaque draws,
+// of the occlusion, of the transparent draws (the scene pass's end) and of
+// the post chain -- read back when the slot's fence says the GPU has
+// finished with them, which is two frames later and never a wait.
+//
+// The Aether modules that record into the frame after its passes -- the
+// light meter, the overlay, the readback -- register hooks, by stage, that
+// run in the frame's end, when its slot's fence has passed, and when the
+// images they were sized to go.
+
+import contrib.vulkan.vk
+import ae3d.vkhost
+import ae3d.vkdevice
+import ae3d.vkdesc
+import ae3d.vktargets
+import ae3d.vkpipes
+import ae3d.vktexture
+import ae3d.vkmesh
+import ae3d.vkrays
+import ae3d.vkscene
+import std.io
+
+exports (
+    STAGE_MEASURE, STAGE_DRAW, STAGE_READ, FRAMES, STAGES,
+    start, shutdown, ready, resize, frame_begin, frame_end, flush_uploads,
+    add_hooks, frame_wait, frame_bgr, frame_commands, frame_slot, frame_image, frame_view, frame_format,
+    frame_offscreen, frame_copyable, frame_width, frame_height, render_width, render_height, recording, pass_open,
+    offscreen_width, offscreen_height, draw, draw_indirect, draw_sky, set_screen_quad, set_blend, set_normal_map, set_pose_bank,
+    set_face_culling, set_shadows, shadows, shadow_begin, shadow_draw, shadow_end, shadow_viewport,
+    lamp_shadow_begin, lamp_shadow_tile, lamp_static_begin, lamp_copy, lamp_shadow_generation,
+    clusters_reserve, clusters_lights, clusters_words, set_post, post_active,
+    set_bloom_intensity, bloom_intensity, draw_calls, pass_ms, pipeline_binds, set_binds, sample_count,
+    set_samples, set_scene_depth, scene_depth_ready, resolve_scene_depth, velocity_texture, set_render_scale,
+    render_scale, set_taa, taa, taa_history, set_ssr, ssr, set_ssr_params, set_ssao, ssao, ssao_radius,
+    ssao_intensity, draw_ssao, mark_sky_done, mark_opaque_done, set_capture_bypass, default_texture,
+    max_texture_size, texture_destroy, dlss_available, set_dlss, dlss, dlss_failed, dlss_camera, clip_correct
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memset(p: ptr, value: int, n: long) -> ptr
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+extern getenv(name: string) -> string
+// DLSS through NVIDIA Streamline (native/dlss): the C++ SDK's surface.
+extern ae3d_dlss_supported(physical: ptr) -> int
+extern ae3d_dlss_optimal(mode: int, out_w: int, out_h: int, render_w: ptr, render_h: ptr) -> int
+extern ae3d_dlss_set_options(mode: int, out_w: int, out_h: int) -> int
+extern ae3d_dlss_begin_frame(frame_index: int) -> int
+extern ae3d_dlss_set_constants(camera: ptr) -> int
+extern ae3d_dlss_tag(depth: ptr, motion: ptr, colour_in: ptr, colour_out: ptr, command_buffer: ptr) -> int
+extern ae3d_dlss_evaluate(command_buffer: ptr) -> int
+extern ae3d_dlss_last_error() -> string
+extern ae3d_dlss_shutdown()
+
+const FRAMES = 2
+// Timestamps a frame, and the stages they split its time into: 0 shadow, 1
+// scene (all of 3 to 7), 2 post, 3 camera depth, 4 sky, 5 opaque, 6
+// occlusion, 7 transparent.
+const STAMPS = 8
+const STAGES = 8
+// When in the frame's end a hook records: what measures the scene, then
+// what draws over it, then what reads the finished picture.
+const STAGE_MEASURE = 0
+const STAGE_DRAW = 1
+const STAGE_READ = 2
+const MAX_HOOKS = 8
+// ae3d_dlss_camera and ae3d_dlss_image, as native/dlss/streamline.h lays
+// them out: four matrices of sixteen floats, the jitter and the vectors'
+// scale, the camera's position and axes, the lens, and two ints; an image's
+// handle, memory and view, then its layout, size, format and usage.
+const DLSS_CAMERA_BYTES = 344
+const DLSS_IMAGE_BYTES = 48
+
+// --- state -------------------------------------------------------------------------------------------------------
+
+var g_ready = false
+var g_commands: ptr = null         // VkCommandBuffer[FRAMES]
+var g_image_available: ptr = null  // VkSemaphore[FRAMES]
+var g_render_finished: ptr = null  // VkSemaphore[FRAMES]
+var g_in_flight: ptr = null        // VkFence[FRAMES]
+var g_frame = 0
+var g_image_index = 0
+var g_needs_resize = false
+var g_pending_width = 0
+var g_pending_height = 0
+
+// The stamps.
+var g_timestamps: ptr = null
+var g_timestamp_ms = 0.0
+var g_timestamps_usable = false
+var g_stamped: ptr = null          // bool[FRAMES] as int
+var g_stamp_next = 0
+var g_pass_ms: ptr = null          // float[STAGES]
+var g_ticks: ptr = null            // long[STAMPS]
+
+// What a frame costs in changes of mind, the same way the OpenGL backend
+// counts them. A pipeline bound twice in a row is bound once.
+var g_bound_pipeline: ptr = null
+var g_bound_texture = 0
+var g_bound_normal = 0
+var g_pipeline_binds = 0
+var g_set_binds = 0
+var g_draw_calls = 0
+
+// Renderer state a material or a pass sets once and every draw reads.
+var g_blend = false
+var g_cull = 0
+var g_normal_map = 0
+var g_pose_bank = 0
+var g_screen_quad = 0
+var g_default_texture = 0
+var g_identity_buffer: ptr = null  // one identity instance
+var g_identity_memory: ptr = null
+var g_empty_skin_buffer: ptr = null  // one unused joint and weight
+var g_empty_skin_memory: ptr = null
+
+// The passes.
+var g_in_shadow_pass = false
+var g_depth_split = false
+var g_depth_resolved = false
+var g_scene_clear: ptr = null      // f32[4]
+var g_post_active = false
+var g_capture_bypass = false
+
+// Settings a program makes before the device exists as often as after:
+// kept across a start.
+var g_shadow_enabled = false
+var g_fxaa = false
+var g_bloom = false
+var g_bloom_threshold = 0.0
+var g_bloom_intensity = 0.0
+var g_render_scale = 0.0
+var g_samples_wanted = 4
+var g_ssr_enabled = false
+var g_ssr_road_height = 0.0
+var g_ssr_strength = 0.0
+var g_ssao_enabled = false
+var g_ssao_radius = 0.0
+var g_ssao_intensity = 0.0
+var g_taa_enabled = false
+var g_scene_depth_wanted = false
+
+// The post chain's own sets, per frame slot, written every draw, dropped
+// when the camera depth they bind is remade (vktargets.camdepth_serial).
+var g_ssr_sets: ptr = null         // VkDescriptorSet[FRAMES]
+var g_ssao_sets: ptr = null
+var g_resolve_sets: ptr = null
+var g_taa_sets: ptr = null         // VkDescriptorSet[2 * FRAMES]
+var g_show_sets: ptr = null
+var g_sets_serial = 0 - 1
+
+// DLSS: loaded for the device, whether the device runs it, the mode in
+// force, the camera the frame was drawn with and whether it was given,
+// whether its history resets, whether an evaluation was refused, and the
+// frame count it is handed.
+var g_dlss_loaded = false
+var g_dlss_supported = false
+var g_dlss_mode = 0
+var g_dlss_camera: ptr = null
+var g_dlss_camera_set = false
+var g_dlss_reset = false
+var g_dlss_failed = false
+var g_dlss_frame = 0
+var g_dlss_images: ptr = null      // four ae3d_dlss_image
+
+// The hooks.
+struct FrameHook {
+    record: ptr
+    collect: ptr
+    release: ptr
+    context: ptr
+    stage: int
+}
+var g_hooks: ptr = null            // FrameHook[MAX_HOOKS]
+var g_hook_count = 0
+
+// Scratch a draw records through, made once: offsets, buffers, a set, a
+// dynamic offset, a viewport, a scissor, a pass's begin and its clears.
+var g_offsets: ptr = null
+var g_buffers: ptr = null
+var g_set_cell: ptr = null
+var g_dynamic: ptr = null
+var g_viewport: ptr = null
+var g_scissor: ptr = null
+var g_begin: ptr = null
+var g_clears: ptr = null
+var g_cell: ptr = null
+
+scratch() {
+    if g_offsets != null { return }
+    g_offsets = calloc(4, 8)
+    g_buffers = calloc(4, 8)
+    g_set_cell = calloc(1, 8)
+    g_dynamic = calloc(1, 4)
+    g_viewport = calloc(1, sizeof(VkViewport))
+    g_scissor = calloc(1, sizeof(VkRect2D))
+    g_begin = calloc(1, sizeof(VkRenderPassBeginInfo))
+    g_clears = calloc(3, 16)
+    g_cell = calloc(4, 8)
+    g_commands = calloc(FRAMES, 8)
+    g_image_available = calloc(FRAMES, 8)
+    g_render_finished = calloc(FRAMES, 8)
+    g_in_flight = calloc(FRAMES, 8)
+    g_stamped = calloc(FRAMES, 4)
+    g_pass_ms = calloc(STAGES, 8)
+    g_ticks = calloc(STAMPS, 8)
+    g_scene_clear = calloc(4, 4)
+    g_ssr_sets = calloc(FRAMES, 8)
+    g_ssao_sets = calloc(FRAMES, 8)
+    g_resolve_sets = calloc(FRAMES, 8)
+    g_taa_sets = calloc(2 * FRAMES, 8)
+    g_show_sets = calloc(FRAMES, 8)
+    g_dlss_camera = calloc(1, DLSS_CAMERA_BYTES)
+    g_dlss_images = calloc(4, DLSS_IMAGE_BYTES)
+    g_hooks = calloc(MAX_HOOKS, sizeof(FrameHook))
+}
+
+commands_now() -> ptr { return (g_commands as ptr[])[g_frame] }
+
+// The slot the frame is on, and its command buffer, where the modules below
+// the frame read them (ae3d.vkhost).
+publish_slot() { vkhost.set_frame(commands_now(), g_frame) }
+
+// --- the hooks ---------------------------------------------------------------------------------------------------
+
+hook_at(i: int) -> *FrameHook { return (g_hooks + i * sizeof(FrameHook)) as *FrameHook }
+
+// An Aether module's part of the frame: what it records into the frame's
+// end, what it collects once the slot's fence has passed, and what it
+// releases with the images it was sized to -- C-callable functions, each
+// given `context`. Run by their stage, and in the order added within one;
+// false when there is no room for another. Kept across starts: installed
+// once a process, they are the next device's too.
+add_hooks(stage: int, record: ptr, collect: ptr, release_fn: ptr, context: ptr) -> bool {
+    scratch()
+    if g_hook_count >= MAX_HOOKS { return false }
+    at = g_hook_count
+    while at > 0 && hook_at(at - 1).stage > stage {
+        from_hook = hook_at(at - 1)
+        to_hook = hook_at(at)
+        to_hook.record = from_hook.record
+        to_hook.collect = from_hook.collect
+        to_hook.release = from_hook.release
+        to_hook.context = from_hook.context
+        to_hook.stage = from_hook.stage
+        at = at - 1
+    }
+    g_hook_count = g_hook_count + 1
+    h = hook_at(at)
+    h.record = record
+    h.collect = collect
+    h.release = release_fn
+    h.context = context
+    h.stage = stage
+    return true
+}
+
+// Each hook's `which` (0 record, 1 collect, 2 release), in order.
+run_hooks(which: int) {
+    i = 0
+    while i < g_hook_count {
+        h = hook_at(i)
+        f = h.record
+        if which == 1 { f = h.collect }
+        if which == 2 { f = h.release }
+        if f != null {
+            call = f as fn(ptr)
+            call(h.context)
+        }
+        i = i + 1
+    }
+}
+
+// --- what the hooks and the other modules read -------------------------------------------------------------------
+
+// Whether the backend is up, and a frame slot's last submission waited
+// for: what a module that reads a frame back waits on before it reads.
+ready() -> bool { return g_ready }
+frame_wait(slot: int) {
+    if !g_ready || slot < 0 || slot >= FRAMES { return }
+    fences = g_in_flight + slot * 8
+    vk.vkWaitForFences(vkdevice.device(), 1, fences, 1, 0 - 1)
+}
+// Whether the frame's image holds blue before red (a BGRA swapchain).
+frame_bgr() -> bool {
+    f = vktargets.color_format()
+    return f == vk.FORMAT_B8G8R8A8_UNORM || f == vk.FORMAT_B8G8R8A8_SRGB
+}
+// The frame being recorded: its command buffer, its slot among the frames
+// in flight, and the image it finishes in -- the offscreen target, or the
+// swapchain image it acquired -- with its view and format. The image is in
+// the layout the last pass left it: presenting, or transfer-source
+// offscreen.
+frame_commands() -> ptr { return commands_now() }
+frame_slot() -> int { return g_frame }
+frame_image() -> ptr {
+    if vktargets.offscreen() { return vktargets.image(0) }
+    return vktargets.image(g_image_index)
+}
+frame_view() -> ptr {
+    if vktargets.offscreen() { return vktargets.image_view(0) }
+    return vktargets.image_view(g_image_index)
+}
+frame_format() -> int { return vktargets.color_format() }
+// Whether the frame's image can be copied from: an offscreen target always
+// is; a swapchain's only when its usage allowed it.
+frame_offscreen() -> bool { return vktargets.offscreen() }
+frame_copyable() -> bool { return vktargets.offscreen() || vktargets.can_capture() }
+// The size of the frame being drawn, the swapchain's extent; and the size
+// the scene is drawn at, the frame's times the render scale.
+frame_width() -> int { return vktargets.width() }
+frame_height() -> int { return vktargets.height() }
+render_width() -> int { return vktargets.render_width() }
+render_height() -> int { return vktargets.render_height() }
+// Whether a frame is being recorded, and a pass open in it: when the rays'
+// build and the crowds' sorts may record, which go before any pass.
+recording() -> bool { return vkhost.recording() }
+pass_open() -> bool { return vkhost.pass_open() }
+
+// The frame's size while it is offscreen, 0 while it is a window's.
+offscreen_width() -> int {
+    if vktargets.offscreen() { return vktargets.width() }
+    return 0
+}
+offscreen_height() -> int {
+    if vktargets.offscreen() { return vktargets.height() }
+    return 0
+}
+
+// --- the stamps --------------------------------------------------------------------------------------------------
+
+// One timestamp, at the next slot of this frame's eight. Bottom of pipe,
+// so the stamp lands when everything recorded before it has finished.
+stamp() {
+    if g_timestamps == null || g_stamp_next >= STAMPS { return }
+    vk.vkCmdWriteTimestamp(commands_now(), vk.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_timestamps,
+                           g_frame * STAMPS + g_stamp_next)
+    g_stamp_next = g_stamp_next + 1
+}
+
+// Every stamp up to and including this one. A pass that did not run gets
+// two stamps in the same place and costs nothing, rather than being charged
+// for whatever ran instead of it.
+stamp_through(index: int) {
+    while g_stamp_next <= index { stamp() }
+}
+
+span(a: int, b: int) -> float {
+    t = g_ticks as long[]
+    if t[b] >= t[a] { return ((t[b] - t[a]) as float) * g_timestamp_ms }
+    return 0.0
+}
+
+// The stamps this frame slot wrote last time round. Called after the
+// slot's fence has been waited on, so the results exist and nothing here
+// waits for the GPU. The three a frame has always been split into --
+// shadow, scene, post -- and the scene's own split: camera depth, sky,
+// opaque, occlusion, transparent. The scene is the whole of stamps 1 to 6.
+collect_stamps() {
+    if (g_stamped as int[])[g_frame] == 0 { return }
+    (g_stamped as int[])[g_frame] = 0
+    r = vk.vkGetQueryPoolResults(vkdevice.device(), g_timestamps, g_frame * STAMPS, STAMPS, STAMPS * 8, g_ticks, 8,
+                                 vk.QUERY_RESULT_64_BIT)
+    if r != vk.SUCCESS { return }
+    ms = g_pass_ms as float[]
+    ms[0] = span(0, 1)
+    ms[1] = span(1, 6)
+    ms[2] = span(6, 7)
+    ms[3] = span(1, 2)
+    ms[4] = span(2, 3)
+    ms[5] = span(3, 4)
+    ms[6] = span(4, 5)
+    ms[7] = span(5, 6)
+}
+
+// What a stage of the last finished frame cost on the device, in
+// milliseconds.
+pass_ms(pass: int) -> float {
+    if pass < 0 || pass >= STAGES || g_pass_ms == null { return 0.0 }
+    return (g_pass_ms as float[])[pass]
+}
+
+pipeline_binds() -> int { return g_pipeline_binds }
+set_binds() -> int { return g_set_binds }
+draw_calls() -> int { return g_draw_calls }
+sample_count() -> int { return vktargets.samples() }
+default_texture() -> int { return g_default_texture }
+max_texture_size() -> int { return vkdevice.max_image_2d() }
+
+// --- start and shutdown ------------------------------------------------------------------------------------------
+
+// The frame's command buffers, its semaphores and fences, and the query
+// pool its stamps go into, where the graphics queue keeps time.
+create_commands() -> bool {
+    d = vkdevice.device()
+    alloc = calloc(1, sizeof(VkCommandBufferAllocateInfo)) as *VkCommandBufferAllocateInfo
+    alloc.sType = vk.STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+    alloc.commandPool = vkhost.command_pool()
+    alloc.level = vk.COMMAND_BUFFER_LEVEL_PRIMARY
+    alloc.commandBufferCount = FRAMES
+    r = vk.vkAllocateCommandBuffers(d, alloc as ptr, g_commands)
+    free(alloc as ptr)
+    if r != vk.SUCCESS {
+        vkdevice.fail("vkAllocateCommandBuffers failed (VkResult ${r})")
+        return false
+    }
+    semaphore = calloc(1, sizeof(VkSemaphoreCreateInfo)) as *VkSemaphoreCreateInfo
+    semaphore.sType = vk.STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+    fence = calloc(1, sizeof(VkFenceCreateInfo)) as *VkFenceCreateInfo
+    fence.sType = vk.STRUCTURE_TYPE_FENCE_CREATE_INFO
+    fence.flags = vk.FENCE_CREATE_SIGNALED_BIT
+    ok = true
+    i = 0
+    while i < FRAMES && ok {
+        ok = vk.vkCreateSemaphore(d, semaphore as ptr, null, g_image_available + i * 8) == vk.SUCCESS
+        ok = ok && vk.vkCreateSemaphore(d, semaphore as ptr, null, g_render_finished + i * 8) == vk.SUCCESS
+        ok = ok && vk.vkCreateFence(d, fence as ptr, null, g_in_flight + i * 8) == vk.SUCCESS
+        (g_stamped as int[])[i] = 0
+        i = i + 1
+    }
+    free(fence as ptr)
+    free(semaphore as ptr)
+    if !ok {
+        vkdevice.fail("could not create frame synchronisation objects")
+        return false
+    }
+    g_timestamps_usable = vkdevice.timestamps_usable()
+    g_timestamp_ms = vkdevice.timestamp_period() / 1000000.0
+    if g_timestamps_usable {
+        pool = calloc(1, sizeof(VkQueryPoolCreateInfo)) as *VkQueryPoolCreateInfo
+        pool.sType = vk.STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO
+        pool.queryType = vk.QUERY_TYPE_TIMESTAMP
+        pool.queryCount = FRAMES * STAMPS
+        r = vk.vkCreateQueryPool(d, pool as ptr, null, g_cell)
+        free(pool as ptr)
+        // Not fatal: a frame without a timer still draws.
+        if r == vk.SUCCESS { g_timestamps = (g_cell as ptr[])[0] } else {
+            g_timestamps = null
+            g_timestamps_usable = false
+        }
+    }
+    return true
+}
+
+// A white pixel and one identity instance, so a draw with no texture and no
+// instance buffer still has something to bind: the shader always samples
+// and always reads an instance matrix; and one unused joint and weight,
+// for the draws whose pipeline strides zero through it.
+create_defaults() -> bool {
+    white = calloc(1, 4)
+    (white as byte[])[0] = 255
+    (white as byte[])[1] = 255
+    (white as byte[])[2] = 255
+    (white as byte[])[3] = 255
+    g_default_texture = vktexture.texture_create(1, 1, white)
+    free(white)
+    if g_default_texture == 0 {
+        vkdevice.fail("could not create the default texture")
+        return false
+    }
+    identity = calloc(20, 4)
+    m = identity as f32[]
+    m[0] = 1.0
+    m[5] = 1.0
+    m[10] = 1.0
+    m[15] = 1.0
+    m[16] = 1.0
+    m[17] = 1.0
+    m[18] = 1.0
+    made = vkhost.upload(identity, 80, vk.BUFFER_USAGE_VERTEX_BUFFER_BIT)
+    free(identity)
+    if made.buffer == null { return false }
+    g_identity_buffer = made.buffer
+    g_identity_memory = made.memory
+    empty = calloc(8, 4)
+    skin = vkhost.upload(empty, 32, vk.BUFFER_USAGE_VERTEX_BUFFER_BIT)
+    free(empty)
+    if skin.buffer == null { return false }
+    g_empty_skin_buffer = skin.buffer
+    g_empty_skin_memory = skin.memory
+    return true
+}
+
+// The backend on the device ae3d.vkdevice made: the frame at `width` by
+// `height` (the window's surface, or offscreen), its passes and targets,
+// the command pool and the frame's commands, the sets and blocks, the
+// default texture and buffers, the pipelines; DLSS checked where it was
+// loaded. False, with the reason in the last error, when a part would not
+// make.
+start(width: int, height: int) -> bool {
+    if g_ready { return true }
+    scratch()
+    if vkdevice.device() == null {
+        vkdevice.fail("no device (ae3d.vkdevice makes it)")
+        return false
+    }
+    g_frame = 0
+    publish_slot()
+    g_image_index = 0
+    vkhost.set_recording(false)
+    g_needs_resize = false
+    vkhost.set_pass_open(false)
+    g_in_shadow_pass = false
+    g_timestamps = null
+    g_normal_map = 0
+    g_pose_bank = 0
+    g_screen_quad = 0
+    g_blend = false
+    g_cull = 0
+    g_sets_serial = 0 - 1
+    g_dlss_loaded = vkdevice.dlss_loaded()
+    g_dlss_supported = false
+    g_dlss_mode = 0
+    g_dlss_failed = false
+    g_dlss_camera_set = false
+    g_dlss_reset = false
+    g_dlss_frame = 0
+    // A program sets whether it wants shadows, the post chain and the
+    // render scale before the device exists as often as after, and those
+    // are kept; the rest of what a frame does starts off with each device.
+    g_ssr_enabled = false
+    g_ssr_road_height = 0.0
+    g_ssr_strength = 0.0
+    g_ssao_enabled = false
+    g_ssao_radius = 0.0
+    g_ssao_intensity = 0.0
+    g_taa_enabled = false
+    g_scene_depth_wanted = false
+    g_capture_bypass = false
+    memset(g_pass_ms, 0, (STAGES * 8) as long)
+    vktargets.set_render_scale(g_render_scale)
+    vktargets.pick_samples(g_samples_wanted)
+    if !vktargets.choose_formats(vkdevice.surface()) { return false }
+    if !vkhost.start() { return false }
+    if !vktargets.create_frame(vkdevice.surface(), width, height) { return false }
+    if !vktargets.create_passes() { return false }
+    if !vktargets.create_framebuffers() { return false }
+    if !create_commands() { return false }
+    // The lamps' atlas is cleared through a one-off command buffer, so it is
+    // made once there is a pool to take one from, and before any set is
+    // written: every scene set names it.
+    if !vktargets.create_lamp_target() { return false }
+    if !vkdesc.start() { return false }
+    if !create_defaults() { return false }
+    if !vkpipes.create() { return false }
+    if g_dlss_loaded {
+        g_dlss_supported = ae3d_dlss_supported(vkdevice.physical()) == 1
+        if !g_dlss_supported { io.stderr_write("ae3d: DLSS: ${ae3d_dlss_last_error()}\n") }
+    }
+    vkdevice.fail("")
+    g_ready = true
+    return true
+}
+
+// Everything the backend made on the device destroyed, the device idle; the
+// device itself is ae3d.vkdevice's to destroy after. The hooks are kept for
+// the next device (installed once a process, they are its too); the
+// settings are not.
+shutdown() {
+    if !g_ready { return }
+    d = vkdevice.device()
+    vkhost.flush()
+    vk.vkDeviceWaitIdle(d)
+    vkmesh.clear()
+    if g_timestamps != null { vk.vkDestroyQueryPool(d, g_timestamps, null) }
+    g_timestamps = null
+    i = 0
+    while i < FRAMES {
+        if (g_image_available as ptr[])[i] != null { vk.vkDestroySemaphore(d, (g_image_available as ptr[])[i], null) }
+        if (g_render_finished as ptr[])[i] != null { vk.vkDestroySemaphore(d, (g_render_finished as ptr[])[i], null) }
+        if (g_in_flight as ptr[])[i] != null { vk.vkDestroyFence(d, (g_in_flight as ptr[])[i], null) }
+        (g_image_available as ptr[])[i] = null
+        (g_render_finished as ptr[])[i] = null
+        (g_in_flight as ptr[])[i] = null
+        i = i + 1
+    }
+    vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: g_identity_buffer, memory: g_identity_memory })
+    vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: g_empty_skin_buffer, memory: g_empty_skin_memory })
+    g_identity_buffer = null
+    g_identity_memory = null
+    g_empty_skin_buffer = null
+    g_empty_skin_memory = null
+    vkpipes.destroy()
+    // The hooks' images go with the frame they were sized to.
+    run_hooks(2)
+    vktargets.dlss_output_destroy()
+    vktargets.destroy_frame()
+    vktargets.destroy_lamp_target()
+    vktargets.destroy_passes()
+    vktexture.clear()
+    vkdesc.stop()
+    vkhost.stop()
+    // Streamline goes before the device it wrapped, which ae3d.vkdevice
+    // destroys after this, with the surface and the instance.
+    if g_dlss_loaded { ae3d_dlss_shutdown() }
+    g_dlss_loaded = false
+    g_dlss_supported = false
+    g_dlss_mode = 0
+    g_default_texture = 0
+    vkhost.set_recording(false)
+    // The next device starts from nothing a program set for this one.
+    g_shadow_enabled = false
+    g_fxaa = false
+    g_bloom = false
+    g_bloom_threshold = 0.0
+    g_bloom_intensity = 0.0
+    g_render_scale = 0.0
+    vktargets.set_render_scale(0.0)
+    g_ready = false
+}
+
+// --- the frame ---------------------------------------------------------------------------------------------------
+
+// What was uploaded since the last flush, run: before a frame is begun and
+// before one is submitted (the frame reads what the batch wrote).
+flush_uploads() { vkhost.flush() }
+
+// The post chain's sets dropped when the camera depth they bind was remade.
+post_sets_current() {
+    serial = vktargets.camdepth_serial()
+    if serial == g_sets_serial { return }
+    g_sets_serial = serial
+    memset(g_ssr_sets, 0, (FRAMES * 8) as long)
+    memset(g_ssao_sets, 0, (FRAMES * 8) as long)
+    memset(g_resolve_sets, 0, (FRAMES * 8) as long)
+    memset(g_taa_sets, 0, (2 * FRAMES * 8) as long)
+}
+
+// The camera depth made at the scene's size where something reads it and
+// it is not; remade the device idle first.
+ensure_camdepth() {
+    if vktargets.camdepth_fits() { return }
+    vk.vkDeviceWaitIdle(vkdevice.device())
+    vktargets.camdepth_destroy()
+    vktargets.camdepth_create(vktargets.render_width(), vktargets.render_height(), g_taa_enabled)
+}
+
+// The frame remade at `width` by `height`: the sets go with the images
+// they name, the targets are made again at the new size, the scene
+// textures' samplers rebiased for the render scale, and DLSS's render size
+// fitted to the new frame. Offscreen rebuilds the image it renders into
+// rather than a swapchain.
+rebuild(width: int, height: int) -> bool {
+    d = vkdevice.device()
+    vk.vkDeviceWaitIdle(d)
+    // Descriptor sets are cached per texture and the rebuild destroys the
+    // post chain's texture, so a set handed out before the resize would
+    // name an image that no longer exists. The cache goes with the images.
+    vkdesc.reset()
+    // The hooks' images go with the frame they were sized to.
+    run_hooks(2)
+    vktargets.destroy_frame()
+    vktargets.dlss_output_destroy()
+    if !vktargets.create_frame(vkdevice.surface(), width, height) { return false }
+    if !vktargets.create_framebuffers() { return false }
+    rebias()
+    if g_dlss_mode != 0 {
+        // The frame's size may have changed: the mode's render size with it.
+        rw = calloc(1, 4)
+        rh = calloc(1, 4)
+        fw = vktargets.width()
+        fh = vktargets.height()
+        if ae3d_dlss_optimal(g_dlss_mode, fw, fh, rw, rh) == 1 && ae3d_dlss_set_options(g_dlss_mode, fw, fh) == 1 {
+            scale = ((rw as uint32[])[0] as float) / (fw as float)
+            if scale > 1.0 { scale = 1.0 }
+            if scale < 0.25 { scale = 0.25 }
+            if scale != g_render_scale {
+                g_render_scale = scale
+                vktargets.set_render_scale(scale)
+                run_hooks(2)
+                vktargets.destroy_frame()
+                if !vktargets.create_frame(vkdevice.surface(), width, height) {
+                    free(rw)
+                    free(rh)
+                    return false
+                }
+                if !vktargets.create_framebuffers() {
+                    free(rw)
+                    free(rh)
+                    return false
+                }
+                rebias()
+            }
+        }
+        free(rw)
+        free(rh)
+        if !vktargets.dlss_output_create() { return false }
+        g_dlss_reset = true
+    }
+    g_needs_resize = false
+    return true
+}
+
+// The scene textures' samplers remade at the LOD bias the render scale
+// asks for, and the sets that named the old ones let go.
+rebias() {
+    if vktexture.rebias(vktargets.lod_bias_for_scale()) { vkdesc.forget_all() }
+}
+
+// The frame remade at the next frame's start.
+resize(width: int, height: int) {
+    if !g_ready { return }
+    g_needs_resize = true
+    g_pending_width = width
+    g_pending_height = height
+}
+
+// The frame's viewport and scissor: `w` by `h` from the corner.
+viewport(w: int, h: int) {
+    v = g_viewport as *VkViewport
+    v.x = 0.0
+    v.y = 0.0
+    v.width = w as f32
+    v.height = h as f32
+    v.minDepth = 0.0
+    v.maxDepth = 1.0
+    vk.vkCmdSetViewport(commands_now(), 0, 1, g_viewport)
+    s = g_scissor as *VkRect2D
+    s.offset.x = 0
+    s.offset.y = 0
+    s.extent.width = w
+    s.extent.height = h
+    vk.vkCmdSetScissor(commands_now(), 0, 1, g_scissor)
+}
+
+// A tile of what the pass draws into: `w` by `h` from (x, y).
+viewport_at(x: int, y: int, w: int, h: int) {
+    v = g_viewport as *VkViewport
+    v.x = x as f32
+    v.y = y as f32
+    v.width = w as f32
+    v.height = h as f32
+    v.minDepth = 0.0
+    v.maxDepth = 1.0
+    vk.vkCmdSetViewport(commands_now(), 0, 1, g_viewport)
+    s = g_scissor as *VkRect2D
+    s.offset.x = x
+    s.offset.y = y
+    s.extent.width = w
+    s.extent.height = h
+    vk.vkCmdSetScissor(commands_now(), 0, 1, g_scissor)
+}
+
+// A pass begun over `framebuffer`, `w` by `h`, with `clear_count` clears.
+begin_pass(pass: ptr, framebuffer: ptr, w: int, h: int, clear_count: int) {
+    b = g_begin as *VkRenderPassBeginInfo
+    memset(g_begin, 0, sizeof(VkRenderPassBeginInfo) as long)
+    b.sType = vk.STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+    b.renderPass = pass
+    b.framebuffer = framebuffer
+    b.renderArea.extent.width = w
+    b.renderArea.extent.height = h
+    b.clearValueCount = clear_count
+    if clear_count > 0 { b.pClearValues = g_clears }
+    vk.vkCmdBeginRenderPass(commands_now(), g_begin, vk.SUBPASS_CONTENTS_INLINE)
+}
+
+// The scene pass, opened by the first scene draw: the whole of it, or its
+// first half when something reads the scene's depth, or its second after
+// the resolve; into the post chain's texture, or straight into the frame.
+// The third clear is the motion vectors', zero: a pixel nothing draws has
+// not moved.
+open_scene_pass() {
+    if vkhost.pass_open() { return }
+    // A cascades' atlas no pass has run over yet -- the key light has been a
+    // lamp since it was made -- is taken through one, empty, so the lit pass
+    // samples a cleared map in the layout it reads it in.
+    if g_shadow_enabled && vktargets.shadow_framebuffer() != null && !vktargets.shadow_ready() && shadow_begin() {
+        shadow_end()
+    }
+    stamp_through(1)
+    memset(g_clears, 0, 48 as long)
+    c = g_clears as f32[]
+    clear = g_scene_clear as f32[]
+    c[0] = clear[0]
+    c[1] = clear[1]
+    c[2] = clear[2]
+    c[3] = clear[3]
+    c[4] = 1.0
+    pass = vktargets.render_pass()
+    if g_post_active { pass = vktargets.scene_pass() }
+    if g_depth_split {
+        if g_depth_resolved {
+            pass = vktargets.render_pass_rest()
+            if g_post_active { pass = vktargets.scene_pass_rest() }
+        } else {
+            pass = vktargets.render_pass_first()
+            if g_post_active { pass = vktargets.scene_pass_first() }
+        }
+    }
+    framebuffer = vktargets.framebuffer(g_image_index)
+    if g_post_active { framebuffer = vktargets.scene_framebuffer() }
+    w = vktargets.render_width()
+    h = vktargets.render_height()
+    begin_pass(pass, framebuffer, w, h, 3)
+    viewport(w, h)
+    vkhost.set_pass_open(true)
+}
+
+// A frame begun: the uploads flushed, a pending resize done, the slot's
+// fence waited on and its stamps and the hooks' results collected, the
+// next image acquired (a swapchain out of date is remade and the frame
+// skipped), the command buffer begun and the frame's state reset. False
+// when there is no frame this time.
+frame_begin(r: float, g: float, b: float, a: float) -> bool {
+    if !g_ready || vkhost.recording() { return false }
+    flush_uploads()
+    d = vkdevice.device()
+    if g_needs_resize {
+        if !rebuild(g_pending_width, g_pending_height) { return false }
+    }
+    fence = g_in_flight + g_frame * 8
+    vk.vkWaitForFences(d, 1, fence, 1, 0 - 1)
+    collect_stamps()
+    run_hooks(1)
+    if vktargets.offscreen() {
+        g_image_index = 0
+    } else {
+        res = vk.vkAcquireNextImageKHR(d, vktargets.swapchain(), 0 - 1, (g_image_available as ptr[])[g_frame], null, g_cell)
+        if res == vk.ERROR_OUT_OF_DATE_KHR {
+            rebuild(vktargets.width(), vktargets.height())
+            return false
+        }
+        if res != vk.SUCCESS && res != vk.SUBOPTIMAL_KHR {
+            vkdevice.fail("vkAcquireNextImageKHR failed (VkResult ${res})")
+            return false
+        }
+        g_image_index = (g_cell as uint32[])[0] as int
+    }
+    vk.vkResetFences(d, 1, fence)
+    commands = commands_now()
+    publish_slot()
+    vk.vkResetCommandBuffer(commands, 0)
+    begin = calloc(1, sizeof(VkCommandBufferBeginInfo)) as *VkCommandBufferBeginInfo
+    begin.sType = vk.STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+    begin.flags = vk.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    vk.vkBeginCommandBuffer(commands, begin as ptr)
+    free(begin as ptr)
+
+    g_stamp_next = 0
+    if g_timestamps != null {
+        vk.vkCmdResetQueryPool(commands, g_timestamps, g_frame * STAMPS, STAMPS)
+        stamp()
+    }
+    g_bound_pipeline = null
+    g_bound_texture = 0 - 1
+    g_bound_normal = 0 - 1
+    g_pipeline_binds = 0
+    g_set_binds = 0
+    clear = g_scene_clear as f32[]
+    clear[0] = r as f32
+    clear[1] = g as f32
+    clear[2] = b as f32
+    clear[3] = a as f32
+
+    // A capture channel is the surfaces' own numbers -- albedo, normals,
+    // motion -- and no effect over them: the post chain, the reflections
+    // and the occlusion stand down while one is read.
+    effects = !g_capture_bypass && (g_fxaa || g_bloom || g_ssr_enabled || g_taa_enabled)
+    g_post_active = (vktargets.scaled() || effects) && g_screen_quad > 0 && vktargets.post_texture() > 0
+    vkhost.set_pass_open(false)
+    g_in_shadow_pass = false
+    // Two halves when something reads the scene's depth this frame: the
+    // renderer says what wants it before the frame (set_scene_depth, the
+    // occlusion, the reflection), and the target is made at the size of the
+    // scene, here, so the first frame that needs it has it.
+    g_depth_split = false
+    g_depth_resolved = false
+    wanted = g_ssr_enabled || g_scene_depth_wanted || g_ssao_enabled || g_taa_enabled || g_dlss_mode != 0
+    if wanted && vkpipes.depth_resolve() != null {
+        ensure_camdepth()
+        g_depth_split = vktargets.camdepth_framebuffer() != null
+    }
+    vkdesc.ring_begin(g_frame)
+    g_draw_calls = 0
+    vkhost.set_recording(true)
+    return true
+}
+
+// --- draws -------------------------------------------------------------------------------------------------------
+
+set_blend(on: bool) { g_blend = on }
+// Which normal map the next draws use. Renderer state rather than a draw
+// argument, the way the blend and the program already are: a material sets
+// it once and every draw of that material reads it.
+set_normal_map(handle: int) { g_normal_map = handle }
+// The pose bank the draws after this are posed from, as a float texture's
+// handle, or zero for none. A crowd draw is a skinned draw with a bank bound.
+set_pose_bank(handle: int) { g_pose_bank = handle }
+set_face_culling(on: bool) {
+    g_cull = 0
+    if on { g_cull = 1 }
+}
+set_screen_quad(handle: int) { g_screen_quad = handle }
+
+// The shadow map and the camera depth as the sets bind them.
+set_now(texture: int) -> ptr {
+    shadow_view = null
+    shadow_sampler = null
+    if g_shadow_enabled && vktargets.shadow_view() != null {
+        shadow_view = vktargets.shadow_view()
+        shadow_sampler = vktargets.shadow_sampler()
+    }
+    return vkdesc.set_for(g_frame, texture, g_normal_map, g_pose_bank, g_default_texture, shadow_view, shadow_sampler,
+                          vktargets.camdepth_view(), vktargets.camdepth_sampler(), vkrays.structure(g_frame),
+                          vktargets.lamp_view(), vktargets.lamp_sampler())
+}
+
+bind_pipeline(pipeline: ptr) {
+    if pipeline != g_bound_pipeline {
+        vk.vkCmdBindPipeline(commands_now(), vk.PIPELINE_BIND_POINT_GRAPHICS, pipeline)
+        g_bound_pipeline = pipeline
+        g_pipeline_binds = g_pipeline_binds + 1
+    }
+}
+
+bind_set(set: ptr, offset: int) {
+    (g_set_cell as ptr[])[0] = set
+    (g_dynamic as uint32[])[0] = offset
+    vk.vkCmdBindDescriptorSets(commands_now(), vk.PIPELINE_BIND_POINT_GRAPHICS, vkpipes.layout(), 0, 1, g_set_cell, 1,
+                               g_dynamic)
+}
+
+bind_vertices(binding: int, buffer: ptr) {
+    (g_buffers as ptr[])[0] = buffer
+    (g_offsets as long[])[0] = 0
+    vk.vkCmdBindVertexBuffers(commands_now(), binding, 1, g_buffers, g_offsets)
+}
+
+identity_buffer() -> ptr { return g_identity_buffer }
+empty_skin_buffer() -> ptr { return g_empty_skin_buffer }
+
+// One draw: a slice of the frame's ring holding the block the caller has
+// been filling, the set for its texture, normal map and bank, the pipeline
+// bound when it changed, and the mesh with its instances -- a stream, or
+// the one identity -- and its skin, or the unused one.
+draw_pipeline(pipeline: ptr, handle: int, texture: int, instances: int, instance_count: int) {
+    if !vkhost.recording() || !vkmesh.in_range(handle) { return }
+    open_scene_pass()
+    if !vkmesh.drawable(handle) || vkmesh.index_count(handle) == 0 { return }
+    tex = texture
+    if !vktexture.valid(tex) { tex = g_default_texture }
+    offset = vkdesc.ring_push(g_frame, vkdesc.program())
+    if offset < 0 { return }
+    set = set_now(tex)
+    if set == null { return }
+    bind_pipeline(pipeline)
+    // The set is bound every draw because its dynamic offset moves every
+    // draw; what is counted is the material behind it changing.
+    if tex != g_bound_texture || g_normal_map != g_bound_normal {
+        g_bound_texture = tex
+        g_bound_normal = g_normal_map
+        g_set_binds = g_set_binds + 1
+    }
+    bind_set(set, offset)
+    bind_vertices(0, vkmesh.vertex_buffer(handle))
+    count = instance_count
+    if vkmesh.in_range(instances) && instance_count > 0 {
+        if vkmesh.drawable(instances) { bind_vertices(1, vkmesh.vertex_buffer(instances)) }
+    } else {
+        bind_vertices(1, identity_buffer())
+        count = 1
+    }
+    skin = vkmesh.skin_buffer(handle)
+    if skin != null { bind_vertices(2, skin) } else { bind_vertices(2, empty_skin_buffer()) }
+    vk.vkCmdBindIndexBuffer(commands_now(), vkmesh.index_buffer(handle), 0, vk.INDEX_TYPE_UINT32)
+    vk.vkCmdDrawIndexed(commands_now(), vkmesh.index_count(handle), count, 0, 0, 0)
+    g_draw_calls = g_draw_calls + 1
+}
+
+// The pipeline a lit draw of `handle` takes: by the mesh (skinned or not),
+// the pose bank (a crowd), the program (water), the instances (points) and
+// the blend state.
+pipeline_for(handle: int, points: bool) -> ptr {
+    opaque = vkpipes.scene(g_cull)
+    blended = vkpipes.scene_blend()
+    skinned = vkmesh.skinned(handle)
+    if points && vkpipes.points(g_cull) != null && vkpipes.points_blend() != null {
+        opaque = vkpipes.points(g_cull)
+        blended = vkpipes.points_blend()
+    } else if vkdesc.program() == vkdesc.PROGRAM_WATER && vkpipes.water(g_cull) != null && vkpipes.water_blend() != null {
+        opaque = vkpipes.water(g_cull)
+        blended = vkpipes.water_blend()
+    } else if skinned && g_pose_bank > 0 && vkpipes.crowd(g_cull) != null && vkpipes.crowd_blend() != null {
+        opaque = vkpipes.crowd(g_cull)
+        blended = vkpipes.crowd_blend()
+    } else if skinned && vkpipes.skinned(g_cull) != null && vkpipes.skinned_blend() != null {
+        opaque = vkpipes.skinned(g_cull)
+        blended = vkpipes.skinned_blend()
+    }
+    if g_blend { return blended }
+    return opaque
+}
+
+instances_are_points(instances: int, count: int) -> bool {
+    if count <= 0 || instances <= 0 { return false }
+    return vkmesh.drawable(instances) && vkmesh.points(instances)
+}
+
+// A model's draw: its mesh, its texture, its instance stream and how many
+// of them.
+draw(handle: int, texture: int, instances: int, instance_count: int) {
+    draw_pipeline(pipeline_for(handle, instances_are_points(instances, instance_count)), handle, texture, instances,
+                  instance_count)
+}
+
+// The draw of an instance stream by the count a command on the device
+// holds -- a tier of ae3d.vkcrowd's crowd: `instances` at binding 1, the
+// command at `offset` in `draws`. The pipeline is the one the mesh and the
+// pose bank would have chosen for a lit draw, or the crowd's depth one in
+// the shadow pass (`shadow`), where only it draws.
+draw_indirect(handle: int, texture: int, instances: ptr, draws: ptr, offset: long, shadow: bool) {
+    if shadow && (vkpipes.shadow() == null || !g_in_shadow_pass) { return }
+    if !vkhost.recording() || !vkmesh.in_range(handle) { return }
+    if !shadow { open_scene_pass() }
+    if !vkmesh.drawable(handle) || vkmesh.index_count(handle) == 0 { return }
+    pipeline = null
+    if shadow {
+        pipeline = vkpipes.shadow()
+        if vkmesh.skinned(handle) && vkpipes.skinned_shadow() != null { pipeline = vkpipes.skinned_shadow() }
+        if g_pose_bank > 0 && vkpipes.crowd_shadow() != null { pipeline = vkpipes.crowd_shadow() }
+        vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+    } else {
+        pipeline = pipeline_for(handle, false)
+    }
+    if pipeline == null { return }
+    tex = texture
+    if !vktexture.valid(tex) { tex = g_default_texture }
+    at = vkdesc.ring_push(g_frame, vkdesc.program())
+    if at < 0 { return }
+    set = set_now(tex)
+    if set == null { return }
+    bind_pipeline(pipeline)
+    bind_set(set, at)
+    bind_vertices(0, vkmesh.vertex_buffer(handle))
+    bind_vertices(1, instances)
+    skin = vkmesh.skin_buffer(handle)
+    if skin != null { bind_vertices(2, skin) } else { bind_vertices(2, empty_skin_buffer()) }
+    vk.vkCmdBindIndexBuffer(commands_now(), vkmesh.index_buffer(handle), 0, vk.INDEX_TYPE_UINT32)
+    vk.vkCmdDrawIndexedIndirect(commands_now(), draws, offset, 1, 20)
+    g_draw_calls = g_draw_calls + 1
+}
+
+// A flat sky needs no geometry: the clear colour already fills every pixel
+// the scene does not cover, so only a textured sky is drawn -- the clouds'
+// weather at binding 3 and their shape at 4, where a model draw keeps its
+// normal map and its pose bank.
+draw_sky(handle: int, texture: int, weather: int, shape: int) {
+    if vkpipes.sky() == null || texture <= 0 { return }
+    normal_was = g_normal_map
+    bank_was = g_pose_bank
+    vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+    g_normal_map = weather
+    g_pose_bank = shape
+    draw_pipeline(vkpipes.sky(), handle, texture, 0, 1)
+    g_normal_map = normal_was
+    g_pose_bank = bank_was
+    stamp_through(3)
+}
+
+// The sky is done, drawn or not: the renderer says so before the opaque
+// draws, so a frame with no sky to draw does not charge the opaque draws
+// to the sky -- the stamp the sky draw would have written is written here,
+// at the same moment, and the sky stage reads zero.
+mark_sky_done() {
+    if !vkhost.recording() { return }
+    open_scene_pass()
+    stamp_through(3)
+}
+
+// The opaque draws are done: the renderer says so before the occlusion and
+// the transparent draws, so the stamps split them.
+mark_opaque_done() {
+    if !vkhost.recording() { return }
+    open_scene_pass()
+    stamp_through(4)
+}
+
+// --- the shadow pass ---------------------------------------------------------------------------------------------
+
+// Shadows on or off. Sets are cached per texture, so binding 2 keeps
+// whatever image it was written with: toggling rewrites it on every set
+// already handed out, otherwise the scene would sample the previous state
+// forever.
+set_shadows(on: bool) {
+    if g_shadow_enabled == on { return }
+    g_shadow_enabled = on
+    if !g_ready { return }
+    vk.vkDeviceWaitIdle(vkdevice.device())
+    if g_shadow_enabled && vktargets.shadow_view() != null {
+        vkdesc.rewrite_shadow(vktargets.shadow_view(), vktargets.shadow_sampler())
+    } else {
+        vkdesc.rewrite_shadow(vktexture.view(g_default_texture), vktexture.sampler_of(g_default_texture))
+    }
+}
+
+shadows() -> bool { return g_shadow_enabled }
+
+// The shadow pass begun, before the scene pass: the map cleared and its
+// viewport set. The pass leaves the map in shader-read layout, so the
+// scene pass that follows in the same command buffer samples it without a
+// barrier of its own.
+shadow_begin() -> bool {
+    if !vkhost.recording() || !g_shadow_enabled || vktargets.shadow_framebuffer() == null { return false }
+    if vkhost.pass_open() { return false }
+    memset(g_clears, 0, 48 as long)
+    (g_clears as f32[])[0] = 1.0
+    size = vktargets.SHADOW_SIZE
+    // The pass leaves the atlas readable, whatever it draws.
+    vktargets.set_shadow_ready(true)
+    begin_pass(vktargets.shadow_pass(), vktargets.shadow_framebuffer(), size, size, 1)
+    viewport(size, size)
+    g_in_shadow_pass = true
+    vkhost.set_pass_open(true)
+    return true
+}
+
+// A caster's draw into the map: the depth pipeline for its instances (as
+// points), its skin, or its crowd's poses -- a crowd casts from the poses
+// its bank gives each instance, or its shadows would stand in the bind
+// pose under walking figures.
+shadow_draw(handle: int, instances: int, instance_count: int) {
+    pipeline = vkpipes.shadow()
+    if pipeline == null || !g_in_shadow_pass { return }
+    if instances_are_points(instances, instance_count) && vkpipes.point_shadow() != null {
+        pipeline = vkpipes.point_shadow()
+    } else if vkmesh.skinned(handle) && vkpipes.skinned_shadow() != null {
+        pipeline = vkpipes.skinned_shadow()
+        if g_pose_bank > 0 && vkpipes.crowd_shadow() != null { pipeline = vkpipes.crowd_shadow() }
+    }
+    vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+    draw_pipeline(pipeline, handle, g_default_texture, instances, instance_count)
+}
+
+// The tile of the atlas the next shadow draws land in: `size` texels a side
+// from (x, y), measured from the atlas's first row -- a cascade's tile
+// (#469), or a lamp's face.
+shadow_viewport(x: int, y: int, size: int) {
+    if !vkhost.recording() || !g_in_shadow_pass { return }
+    viewport_at(x, y, size, size)
+}
+
+// The lamps' atlas pass (ae3d.lampshadows): opened on the atlas as it was
+// left, for lamp_shadow_tile to clear and draw a face at a time, and closed
+// by shadow_end like the cascades' pass.
+lamp_shadow_begin() -> bool { return lamp_pass_begin(vktargets.lamp_framebuffer()) }
+
+// The lamps' static layer's pass: as the atlas's, on the layer beneath.
+lamp_static_begin() -> bool { return lamp_pass_begin(vktargets.lamp_static_framebuffer()) }
+
+lamp_pass_begin(framebuffer: ptr) -> bool {
+    if !vkhost.recording() || framebuffer == null { return false }
+    if vkhost.pass_open() { return false }
+    size = vktargets.LAMP_SHADOW_SIZE
+    begin_pass(vktargets.lamp_pass(), framebuffer, size, size, 0)
+    g_in_shadow_pass = true
+    vkhost.set_pass_open(true)
+    return true
+}
+
+// A face's tile of the lamps' atlas: the draws that follow land in it, and
+// it is cleared to the far plane first, the rest of the atlas left.
+lamp_shadow_tile(x: int, y: int, size: int) {
+    if !vkhost.recording() || !g_in_shadow_pass { return }
+    shadow_viewport(x, y, size)
+    clear = calloc(1, sizeof(VkClearAttachment)) as *VkClearAttachment
+    clear.aspectMask = vk.IMAGE_ASPECT_DEPTH_BIT
+    clear.clearValue.depthStencil.depth = 1.0
+    rect = calloc(1, sizeof(VkClearRect)) as *VkClearRect
+    rect.rect.offset.x = x
+    rect.rect.offset.y = y
+    rect.rect.extent.width = size
+    rect.rect.extent.height = size
+    rect.layerCount = 1
+    vk.vkCmdClearAttachments(commands_now(), 1, clear as ptr, 1, rect as ptr)
+    free(rect as ptr)
+    free(clear as ptr)
+}
+
+// One image barrier of a lamps' atlas's depth into `at`.
+lamp_barrier(at: ptr, image: ptr, old: int, new_layout: int, src_access: int, dst_access: int) {
+    b = at as *VkImageMemoryBarrier
+    b.sType = vk.STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+    b.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.subresourceRange.aspectMask = vk.IMAGE_ASPECT_DEPTH_BIT
+    b.subresourceRange.levelCount = 1
+    b.subresourceRange.layerCount = 1
+    b.image = image
+    b.oldLayout = old
+    b.newLayout = new_layout
+    b.srcAccessMask = src_access
+    b.dstAccessMask = dst_access
+}
+
+// `count` tiles of `size` texels, their corners at `corners` (x then y as
+// ints, from the atlas's first row), copied from the static layer into the
+// atlas the shader reads: outside any pass, after the static layer's pass
+// wrote them and before the atlas's pass draws what moves over them.
+lamp_copy(corners: ptr, count: int, size: int) {
+    if !vkhost.recording() || vkhost.pass_open() || count <= 0 || corners == null { return }
+    regions = calloc(count, sizeof(VkImageCopy))
+    if regions == null { return }
+    xy = corners as int[]
+    i = 0
+    while i < count {
+        r = (regions + i * sizeof(VkImageCopy)) as *VkImageCopy
+        r.srcSubresource.aspectMask = vk.IMAGE_ASPECT_DEPTH_BIT
+        r.srcSubresource.layerCount = 1
+        r.dstSubresource.aspectMask = vk.IMAGE_ASPECT_DEPTH_BIT
+        r.dstSubresource.layerCount = 1
+        r.srcOffset.x = xy[i * 2]
+        r.srcOffset.y = xy[i * 2 + 1]
+        r.dstOffset.x = xy[i * 2]
+        r.dstOffset.y = xy[i * 2 + 1]
+        r.extent.width = size
+        r.extent.height = size
+        r.extent.depth = 1
+        i = i + 1
+    }
+    commands = commands_now()
+    read = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    barriers = calloc(2, sizeof(VkImageMemoryBarrier))
+    second = barriers + sizeof(VkImageMemoryBarrier)
+    // The static layer, written by its pass, is read by the copy; the
+    // atlas, read by last frame's lit pass and written by its own pass, is
+    // written by it.
+    lamp_barrier(barriers, vktargets.lamp_static_image(), read, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                 vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, vk.ACCESS_TRANSFER_READ_BIT)
+    lamp_barrier(second, vktargets.lamp_image(), read, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | vk.ACCESS_SHADER_READ_BIT, vk.ACCESS_TRANSFER_WRITE_BIT)
+    vk.vkCmdPipelineBarrier(commands,
+                            vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT | vk.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                            vk.PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                            vk.PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 2, barriers)
+    vk.vkCmdCopyImage(commands, vktargets.lamp_static_image(), vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      vktargets.lamp_image(), vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, count, regions)
+    // Back to the layout both passes and the lit pass take them in: the
+    // atlas's copied depths for the draws over them and the lit pass's
+    // reads, the static layer's reads done before its pass writes it again.
+    lamp_barrier(barriers, vktargets.lamp_static_image(), vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, read, 0,
+                 vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+    lamp_barrier(second, vktargets.lamp_image(), vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, read,
+                 vk.ACCESS_TRANSFER_WRITE_BIT,
+                 vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                 vk.ACCESS_SHADER_READ_BIT)
+    vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_TRANSFER_BIT,
+                            vk.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | vk.PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                            vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                            0, 0, null, 0, null, 2, barriers)
+    free(barriers)
+    free(regions)
+}
+
+// How many times the lamps' atlas has been made: its faces hold nothing
+// drawn before the last.
+lamp_shadow_generation() -> int { return vktargets.lamp_generation() }
+
+// This frame slot's cluster buffers, grown to hold `light_bytes` and
+// `word_bytes` when they do not: after frame_begin, when the slot's last
+// submission has finished. False when a buffer could not be made.
+clusters_reserve(light_bytes: long, word_bytes: long) -> bool {
+    if !g_ready { return false }
+    return vkdesc.clusters_reserve(g_frame, light_bytes, word_bytes)
+}
+
+// Where this frame slot's lamps and lists are written.
+clusters_lights() -> ptr { return vkdesc.clusters_lights(g_frame) }
+clusters_words() -> ptr { return vkdesc.clusters_words(g_frame) }
+
+shadow_end() {
+    if !vkhost.recording() || !g_in_shadow_pass { return }
+    vk.vkCmdEndRenderPass(commands_now())
+    g_in_shadow_pass = false
+    vkhost.set_pass_open(false)
+    stamp_through(1)
+    viewport(vktargets.render_width(), vktargets.render_height())
+}
+
+// --- the scene's depth -------------------------------------------------------------------------------------------
+
+// The camera depth made where something reads it: the reflection, the
+// occlusion, the temporal pass, the water reading the ground under it.
+set_scene_depth(on: bool) {
+    g_scene_depth_wanted = on
+    if !g_ready || !on { return }
+    ensure_camdepth()
+}
+
+// Whether the depth the occlusion, the reflection and the water read will
+// be there this frame: the frame is drawn in two halves with the resolve
+// between them.
+scene_depth_ready() -> bool {
+    return g_depth_split && vktargets.camdepth_framebuffer() != null && vktargets.camdepth_view() != null
+}
+
+// A full-screen draw with `view` at binding 1 -- the colour source of a
+// composite, or the frame's depth for the resolve -- the camera depth at 2,
+// at 3 `third` (the temporal pass's history) or the default texture, and
+// the frame's motion vectors at 4; through its own set at `slot`, written
+// every draw because both images are remade on resize.
+draw_screen_with(pipeline: ptr, sets: ptr, slot: int, view: ptr, sampler: ptr, layout: int, third: ptr, third_sampler: ptr) {
+    if pipeline == null || !vkmesh.drawable(g_screen_quad) { return }
+    if vktargets.camdepth_view() == null || view == null || sampler == null { return }
+    if vkmesh.index_count(g_screen_quad) == 0 { return }
+    post_sets_current()
+    set = (sets as ptr[])[slot]
+    if set == null {
+        set = vkdesc.allocate()
+        if set == null { return }
+        (sets as ptr[])[slot] = set
+    }
+    at = vkdesc.ring_push(g_frame, vkdesc.PROGRAM_SCENE)
+    if at < 0 { return }
+    buffer = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+    buffer.buffer = vkdesc.ring_buffer(g_frame)
+    buffer.offset = 0
+    buffer.range = vkscene.SCENE_SIZE
+    images = calloc(4, sizeof(VkDescriptorImageInfo))
+    writes = calloc(5, sizeof(VkWriteDescriptorSet))
+    read = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    screen_image(images, 0, view, sampler, layout)
+    screen_image(images, 1, vktargets.camdepth_view(), vktargets.camdepth_sampler(), read)
+    if third != null {
+        screen_image(images, 2, third, third_sampler, read)
+    } else {
+        screen_image(images, 2, vktexture.view(g_default_texture), vktexture.sampler_of(g_default_texture), read)
+    }
+    // Binding 4 is the frame's motion vectors, for the temporal pass.
+    velocity = vktargets.velocity_texture()
+    if velocity == 0 { velocity = g_default_texture }
+    screen_image(images, 3, vktexture.view(velocity), vktexture.sampler_of(velocity), read)
+    w0 = writes as *VkWriteDescriptorSet
+    w0.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    w0.dstSet = set
+    w0.dstBinding = 0
+    w0.descriptorCount = 1
+    w0.descriptorType = vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+    w0.pBufferInfo = buffer as ptr
+    k = 1
+    while k < 5 {
+        w = (writes + k * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+        w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+        w.dstSet = set
+        w.dstBinding = k
+        w.descriptorCount = 1
+        w.descriptorType = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+        w.pImageInfo = images + (k - 1) * sizeof(VkDescriptorImageInfo)
+        k = k + 1
+    }
+    vk.vkUpdateDescriptorSets(vkdevice.device(), 5, writes, 0, null)
+    free(writes)
+    free(images)
+    free(buffer as ptr)
+    bind_pipeline(pipeline)
+    bind_set(set, at)
+    bind_vertices(0, vkmesh.vertex_buffer(g_screen_quad))
+    bind_vertices(1, identity_buffer())
+    bind_vertices(2, empty_skin_buffer())
+    vk.vkCmdBindIndexBuffer(commands_now(), vkmesh.index_buffer(g_screen_quad), 0, vk.INDEX_TYPE_UINT32)
+    vk.vkCmdDrawIndexed(commands_now(), vkmesh.index_count(g_screen_quad), 1, 0, 0, 0)
+    g_draw_calls = g_draw_calls + 1
+}
+
+screen_image(images: ptr, index: int, view: ptr, sampler: ptr, layout: int) {
+    info = (images + index * sizeof(VkDescriptorImageInfo)) as *VkDescriptorImageInfo
+    info.imageLayout = layout
+    info.imageView = view
+    info.sampler = sampler
+}
+
+// A full-screen draw of a texture.
+draw_screen(pipeline: ptr, sets: ptr, slot: int, colour: int) {
+    if !vktexture.valid(colour) { return }
+    draw_screen_with(pipeline, sets, slot, vktexture.view(colour), vktexture.sampler_of(colour),
+                     vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, null, null)
+}
+
+// The scene's depth, as the opaque draws left it, resolved into the
+// camera-depth image the occlusion, the reflection and the water read.
+// Called by the renderer between its opaque and its transparent draws: the
+// first half of the scene pass is ended, the frame's depth -- multisampled,
+// so not a thing a blit can copy -- is drawn into the target through the
+// resolve shader, and the second half opens at the next draw. Nothing when
+// no one reads the depth this frame. It used to be a prepass that drew the
+// whole visible scene again, depth only, before the sky: a second pass
+// over every triangle, and one that could not draw a picture of a figure
+// (an impostor) or a near figure's real silhouette without paying for it
+// again.
+resolve_scene_depth() -> bool {
+    if !vkhost.recording() || !g_depth_split || g_depth_resolved { return false }
+    if vktargets.camdepth_framebuffer() == null || vkpipes.depth_resolve() == null { return false }
+    open_scene_pass()
+    vk.vkCmdEndRenderPass(commands_now())
+    vkhost.set_pass_open(false)
+    g_depth_resolved = true
+    memset(g_clears, 0, 48 as long)
+    (g_clears as f32[])[0] = 1.0
+    w = vktargets.render_width()
+    h = vktargets.render_height()
+    begin_pass(vktargets.camdepth_pass(), vktargets.camdepth_framebuffer(), w, h, 1)
+    vkhost.set_pass_open(true)
+    viewport(w, h)
+    ((vkdesc.block(vkdesc.PROGRAM_SCENE) + vkscene.OFF_DEPTHSAMPLECOUNT) as int[])[0] = vktargets.samples()
+    vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+    draw_screen_with(vkpipes.depth_resolve(), g_resolve_sets, g_frame, vktargets.depth_view(), vktargets.camdepth_sampler(),
+                     vk.IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, null, null)
+    vk.vkCmdEndRenderPass(commands_now())
+    vkhost.set_pass_open(false)
+    return true
+}
+
+// --- effects -----------------------------------------------------------------------------------------------------
+
+set_post(fxaa: bool, bloom: bool, threshold: float, intensity: float) {
+    g_fxaa = fxaa
+    g_bloom = bloom
+    g_bloom_threshold = (threshold as f32) as float
+    g_bloom_intensity = (intensity as f32) as float
+}
+post_active() -> bool { return g_post_active }
+
+// The bloom intensity on its own, so a caller can read it, dial it out to
+// see what the bloom is worth, and put it back, without knowing the other
+// post parameters the scene set. Every bloom term scales by it, so zero is
+// off with the pipeline otherwise unchanged.
+set_bloom_intensity(intensity: float) { g_bloom_intensity = (intensity as f32) as float }
+bloom_intensity() -> float { return g_bloom_intensity }
+
+// Screen-space reflection on or off. The camera-depth target it samples is
+// made the first time it is turned on, and remade if the frame has since
+// been remade at a different size, so a scene that never asks for it
+// allocates nothing.
+set_ssr(on: bool) {
+    g_ssr_enabled = on
+    if !g_ready || !on { return }
+    ensure_camdepth()
+}
+ssr() -> bool { return g_ssr_enabled }
+set_ssr_params(road_height: float, strength: float) {
+    g_ssr_road_height = (road_height as f32) as float
+    g_ssr_strength = (strength as f32) as float
+}
+
+// While a capture channel is read, no effect runs over the frame.
+set_capture_bypass(on: bool) { g_capture_bypass = on }
+
+// Ambient occlusion on or off, with how far a thing shadows its neighbours
+// (metres) and how dark that goes. The camera depth it reads is the
+// reflection's target, made the same way when it is first wanted.
+set_ssao(on: bool, radius: float, intensity: float) {
+    g_ssao_enabled = on
+    g_ssao_radius = (radius as f32) as float
+    g_ssao_intensity = (intensity as f32) as float
+    if !g_ready || !on { return }
+    ensure_camdepth()
+}
+ssao() -> bool { return g_ssao_enabled }
+ssao_radius() -> float { return g_ssao_radius }
+ssao_intensity() -> float { return g_ssao_intensity }
+
+// Temporal anti-aliasing on or off. It reads the scene's depth, so the
+// target that holds it is made the same way, with the two history
+// textures beside it; and it composites through the post chain, which is
+// turned on by it.
+set_taa(on: bool) {
+    if g_taa_enabled == on { return }
+    g_taa_enabled = on
+    if !g_ready { return }
+    vk.vkDeviceWaitIdle(vkdevice.device())
+    vktargets.camdepth_destroy()
+    if on || g_ssr_enabled || g_ssao_enabled || g_scene_depth_wanted {
+        vktargets.camdepth_create(vktargets.render_width(), vktargets.render_height(), on)
+    }
+}
+taa() -> bool { return g_taa_enabled }
+// Whether this frame's temporal pass will fold a history in, or take the
+// frame as it is: what the blend uniform is set from.
+taa_history() -> bool { return g_taa_enabled && vktargets.taa_history_valid() }
+
+// The occlusion, over the opaque scene: a multiply drawn inside the scene
+// pass with depth off, reading the camera depth the resolve wrote. Nothing
+// when the occlusion is off, the depth was not resolved, or the pipeline
+// did not build; the scene is then simply not darkened.
+draw_ssao() {
+    if !vkhost.recording() || !g_ssao_enabled || vkpipes.ssao() == null || g_capture_bypass { return }
+    if vktargets.camdepth_view() == null || vktargets.camdepth_framebuffer() == null || g_default_texture <= 0 { return }
+    open_scene_pass()
+    block_float(vkscene.OFF_SSAORADIUS, g_ssao_radius)
+    block_float(vkscene.OFF_SSAOINTENSITY, g_ssao_intensity)
+    draw_screen(vkpipes.ssao(), g_ssao_sets, g_frame, g_default_texture)
+    stamp_through(5)
+}
+
+// A float into the scene program's block, which the sky, the shadow pass
+// and the composites read whatever program the last model selected.
+block_float(offset: int, value: float) {
+    ((vkdesc.block(vkdesc.PROGRAM_SCENE) + offset) as f32[])[0] = value as f32
+}
+
+// The texel of what the post passes sample: the scene's size for the
+// passes over the scene, the frame's once an upscaler has written it.
+set_texel(w: int, h: int) {
+    t = (vkdesc.block(vkdesc.PROGRAM_SCENE) + vkscene.OFF_TEXELSIZE) as f32[]
+    t[0] = 0.0
+    t[1] = 0.0
+    if w != 0 { t[0] = (1.0 as f32) / (w as f32) }
+    if h != 0 { t[1] = (1.0 as f32) / (h as f32) }
+}
+
+// The post uniforms live in the shared scene block, so both the reflective
+// composite and the ordinary one read them; set once before either draws.
+setup_post_uniforms() {
+    set_texel(vktargets.render_width(), vktargets.render_height())
+    block_float(vkscene.OFF_BLOOMTHRESHOLD, g_bloom_threshold)
+    block_float(vkscene.OFF_BLOOMINTENSITY, g_bloom_intensity)
+    block_float(vkscene.OFF_EDGETHRESHOLD, 0.125)
+    block_float(vkscene.OFF_EDGETHRESHOLDMIN, 0.0625)
+    block_float(vkscene.OFF_SUBPIXELQUALITY, 0.75)
+    block_float(vkscene.OFF_SSRROADHEIGHT, g_ssr_road_height)
+    block_float(vkscene.OFF_SSRSTRENGTH, g_ssr_strength)
+    vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+}
+
+// The ordinary composite: bloom, else fxaa, else a straight copy, reading
+// the given colour source -- the scene directly, or the reflected
+// intermediate when the reflection ran a stage before it. AE3D_VK_SHOW_DEPTH
+// set composites the resolved scene depth in place of the frame: what the
+// occlusion, the reflection and the water read, looked at.
+draw_composite(source: int) {
+    index = 0
+    if g_fxaa && vkpipes.post(1) != null { index = 1 }
+    if g_bloom && vkpipes.post(2) != null { index = 2 }
+    if getenv("AE3D_VK_SHOW_DEPTH") != null && vktargets.camdepth_view() != null && vktargets.camdepth_sampler() != null &&
+       vkpipes.post(0) != null {
+        draw_screen_with(vkpipes.post(0), g_show_sets, g_frame, vktargets.camdepth_view(), vktargets.camdepth_sampler(),
+                         vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, null, null)
+        return
+    }
+    draw_pipeline(vkpipes.post(index), g_screen_quad, source, 0, 1)
+}
+
+// --- the frame's end ---------------------------------------------------------------------------------------------
+
+// The frame finished: the uploads flushed (a model added while the frame
+// was recorded is drawn by it), the scene pass closed, the post chain run
+// -- the reflection, DLSS or the temporal pass, the composite at the
+// frame's size -- the hooks recorded, the stamps closed, and the frame
+// submitted and, windowed, presented. Nothing waits here: a frame read
+// back lands in its own slot's buffer, and whoever asks for the pixels
+// waits for it then (frame_wait); a program that renders without reading
+// never stalls at all.
+frame_end() -> bool {
+    if !vkhost.recording() { return false }
+    flush_uploads()
+    open_scene_pass()
+    commands = commands_now()
+    vk.vkCmdEndRenderPass(commands)
+    vkhost.set_pass_open(false)
+    stamp_through(6)
+    slot = g_frame
+
+    if g_post_active {
+        post_sets_current()
+        rw = vktargets.render_width()
+        rh = vktargets.render_height()
+        // The reflective stage runs when the reflection is on and its
+        // targets are made. It mirrors the scene into the intermediate; the
+        // ordinary composite then reads that instead of the scene colour,
+        // so the bloom it does picks up the mirrored lamps as well.
+        ssr_now = g_ssr_enabled && vkpipes.post(3) != null && vktargets.ssr_framebuffer() != null &&
+                  vktargets.camdepth_framebuffer() != null && vktargets.ssr_reflect_texture() > 0
+        setup_post_uniforms()
+        if ssr_now {
+            begin_pass(vktargets.ssr_pass(), vktargets.ssr_framebuffer(), rw, rh, 0)
+            vkhost.set_pass_open(true)
+            viewport(rw, rh)
+            draw_screen(vkpipes.post(3), g_ssr_sets, slot, vktargets.post_texture())
+            vk.vkCmdEndRenderPass(commands)
+            vkhost.set_pass_open(false)
+        }
+        source = vktargets.post_texture()
+        if ssr_now { source = vktargets.ssr_reflect_texture() }
+
+        // DLSS, in the temporal pass's place: the scene at its size, its
+        // depth and its motion vectors into the frame at the frame's.
+        if g_dlss_mode != 0 {
+            upscaled = run_dlss(source)
+            if upscaled != 0 {
+                source = upscaled
+                // The composite samples the frame-size output now.
+                set_texel(vktargets.width(), vktargets.height())
+            }
+        }
+
+        // The temporal pass: this frame folded into the history, written
+        // into the other history texture, which the composite then reads and
+        // the next frame reads back as its history.
+        if g_dlss_mode == 0 && g_taa_enabled && vkpipes.taa() != null && vktargets.taa_framebuffer(0) != null &&
+           vktargets.taa_framebuffer(1) != null && vktargets.camdepth_framebuffer() != null && source > 0 {
+            cur = vktargets.taa_current()
+            old = 1 - cur
+            history = vktargets.taa_texture(old)
+            blend = 1.0
+            if vktargets.taa_history_valid() { blend = 0.1 }
+            block_float(vkscene.OFF_TAABLEND, blend)
+            begin_pass(vktargets.ssr_pass(), vktargets.taa_framebuffer(cur), rw, rh, 0)
+            vkhost.set_pass_open(true)
+            viewport(rw, rh)
+            // With no history yet (the first frame, or after a resize) the
+            // pass weighs it at nothing, and the frame itself is bound in
+            // its place: the history texture has never been written, and
+            // binding it undefined was an error on every such frame (#405).
+            if !vktargets.taa_history_valid() { history = source }
+            draw_screen_with(vkpipes.taa(), g_taa_sets, cur * FRAMES + slot, vktexture.view(source),
+                             vktexture.sampler_of(source), vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             vktexture.view(history), vktexture.sampler_of(history))
+            vk.vkCmdEndRenderPass(commands)
+            vkhost.set_pass_open(false)
+            source = vktargets.taa_texture(cur)
+            vktargets.set_taa_history(true)
+            vktargets.set_taa_current(old)
+        }
+
+        // The composite, at the frame's own size: the scene drawn smaller
+        // is scaled up by the sampling here.
+        fw = vktargets.width()
+        fh = vktargets.height()
+        begin_pass(vktargets.post_pass(), vktargets.post_framebuffer(g_image_index), fw, fh, 0)
+        vkhost.set_pass_open(true)
+        viewport(fw, fh)
+        draw_composite(source)
+        vk.vkCmdEndRenderPass(commands)
+        vkhost.set_pass_open(false)
+    }
+
+    // The Aether modules' parts, by stage: its light measured (ae3d.vkmeter),
+    // the overlay drawn over it (ae3d.vkoverlay), the frame read back
+    // (ae3d.vkreadback). An offscreen frame's image is left in
+    // transfer-source layout by its pass; a windowed one's each moves from
+    // presenting and back.
+    run_hooks(0)
+
+    stamp_through(7)
+    stamped = 0
+    if g_stamp_next == STAMPS { stamped = 1 }
+    (g_stamped as int[])[g_frame] = stamped
+    vk.vkEndCommandBuffer(commands)
+
+    submit = calloc(1, sizeof(VkSubmitInfo)) as *VkSubmitInfo
+    submit.sType = vk.STRUCTURE_TYPE_SUBMIT_INFO
+    wait_stage = calloc(1, 4)
+    (wait_stage as uint32[])[0] = vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+    if !vktargets.offscreen() {
+        submit.waitSemaphoreCount = 1
+        submit.pWaitSemaphores = g_image_available + g_frame * 8
+        submit.pWaitDstStageMask = wait_stage
+        submit.signalSemaphoreCount = 1
+        submit.pSignalSemaphores = g_render_finished + g_frame * 8
+    }
+    submit.commandBufferCount = 1
+    submit.pCommandBuffers = g_commands + g_frame * 8
+    res = vk.vkQueueSubmit(vkdevice.graphics_queue(), 1, submit as ptr, (g_in_flight as ptr[])[g_frame])
+    free(wait_stage)
+    free(submit as ptr)
+    if res != vk.SUCCESS {
+        vkhost.set_recording(false)
+        vkdevice.fail("vkQueueSubmit failed (VkResult ${res})")
+        return false
+    }
+    if vktargets.offscreen() {
+        g_frame = (g_frame + 1) % FRAMES
+        publish_slot()
+        vkhost.set_recording(false)
+        return true
+    }
+
+    present = calloc(1, sizeof(VkPresentInfoKHR)) as *VkPresentInfoKHR
+    present.sType = vk.STRUCTURE_TYPE_PRESENT_INFO_KHR
+    present.waitSemaphoreCount = 1
+    present.pWaitSemaphores = g_render_finished + g_frame * 8
+    present.swapchainCount = 1
+    (g_cell as ptr[])[0] = vktargets.swapchain()
+    present.pSwapchains = g_cell
+    (g_cell as uint32[])[2] = g_image_index
+    present.pImageIndices = g_cell + 8
+    res = vk.vkQueuePresentKHR(vkdevice.present_queue(), present as ptr)
+    free(present as ptr)
+    if res == vk.ERROR_OUT_OF_DATE_KHR || res == vk.SUBOPTIMAL_KHR {
+        g_needs_resize = true
+        g_pending_width = vktargets.width()
+        g_pending_height = vktargets.height()
+    } else if res != vk.SUCCESS {
+        vkhost.set_recording(false)
+        vkdevice.fail("vkQueuePresentKHR failed (VkResult ${res})")
+        return false
+    }
+    g_frame = (g_frame + 1) % FRAMES
+    publish_slot()
+    vkhost.set_recording(false)
+    return true
+}
+
+// --- sizes and samples -------------------------------------------------------------------------------------------
+
+// The multisampling asked for before the backend starts: the most the
+// frame takes, 4 unless told otherwise; 0 or 1 is none, which is what an
+// upscaler wants, since a resolved pixel has no sub-pixel detail left.
+set_samples(samples: int) { g_samples_wanted = samples }
+
+// Draw the scene at `scale` of the frame's size (0.25..1), the composite
+// scaling it up: the frame's cost is the scene's pixels. The targets are
+// remade at the next frame. Returns the scale in force.
+set_render_scale(scale: float) -> float {
+    s = scale
+    if s > 1.0 { s = 1.0 }
+    if s < 0.25 { s = 0.25 }
+    if g_render_scale == s { return s }
+    g_render_scale = s
+    vktargets.set_render_scale(s)
+    if g_ready {
+        g_needs_resize = true
+        g_pending_width = vktargets.width()
+        g_pending_height = vktargets.height()
+    }
+    return s
+}
+render_scale() -> float {
+    if g_render_scale > 0.0 { return g_render_scale }
+    return 1.0
+}
+
+velocity_texture() -> int { return vktargets.velocity_texture() }
+
+// A texture destroyed, the sets naming it let go first.
+texture_destroy(handle: int) { vkdesc.texture_destroy(handle) }
+
+// --- DLSS --------------------------------------------------------------------------------------------------------
+
+// DLSS runs here: the runtime loaded and the device fit for it.
+dlss_available() -> bool { return g_ready && g_dlss_loaded && g_dlss_supported }
+dlss() -> int { return g_dlss_mode }
+dlss_failed() -> bool { return g_dlss_failed }
+
+// DLSS at `mode` (0 off, 1 performance, 2 balanced, 3 quality, 4 ultra
+// performance, 5 ultra quality, 6 DLAA): the scene is drawn at the render
+// size the mode wants for the frame's size and DLSS writes the frame from
+// it, in place of the temporal pass. Returns the mode in force: 0 where
+// DLSS is not available.
+set_dlss(mode: int) -> int {
+    if mode <= 0 || !dlss_available() {
+        if g_dlss_mode != 0 {
+            g_dlss_mode = 0
+            set_render_scale(1.0)
+            vk.vkDeviceWaitIdle(vkdevice.device())
+            vktargets.dlss_output_destroy()
+        }
+        return 0
+    }
+    rw = calloc(1, 4)
+    rh = calloc(1, 4)
+    fw = vktargets.width()
+    fh = vktargets.height()
+    ok = ae3d_dlss_optimal(mode, fw, fh, rw, rh) == 1
+    width = (rw as uint32[])[0] as int
+    free(rw)
+    free(rh)
+    if !ok || ae3d_dlss_set_options(mode, fw, fh) != 1 {
+        vkdevice.fail(ae3d_dlss_last_error())
+        return 0
+    }
+    g_dlss_mode = mode
+    // The mode's render size, as a scale of the frame; DLSS takes any size
+    // between the mode's least and most, so a pixel of rounding is fine.
+    set_render_scale((width as float) / (fw as float))
+    vk.vkDeviceWaitIdle(vkdevice.device())
+    vktargets.dlss_output_destroy()
+    if !vktargets.dlss_output_create() {
+        g_dlss_mode = 0
+        return 0
+    }
+    g_dlss_reset = true
+    return mode
+}
+
+// The camera the frame is drawn with, for DLSS to reproject by: the view
+// and the unjittered projection, last frame's pair, the jitter in texture
+// space, the lens, and where the camera stands and looks. Matrices are
+// column-major, OpenGL-shaped; the Vulkan clip correction is applied here.
+dlss_camera(view: ptr, projection: ptr, prev_view: ptr, prev_projection: ptr, jitter_x: float, jitter_y: float,
+            near_plane: float, far_plane: float, fov: float, aspect: float,
+            position: ptr, up: ptr, right: ptr, forward: ptr) {
+    if view == null || projection == null || prev_view == null || prev_projection == null { return }
+    scratch()
+    m = calloc(16 * 9, 8)
+    proj_c = m
+    inv_proj = m + 128
+    vp = m + 256
+    inv_vp = m + 384
+    pvp = m + 512
+    c2p = m + 640
+    p2c = m + 768
+    prev_proj_c = m + 896
+    view_c = m + 1024
+    vkdesc.clip_correct(projection, proj_c)
+    vkdesc.clip_correct(prev_projection, prev_proj_c)
+    memcpy(view_c, view, 128 as long)
+    vkdesc.mat4_mul(proj_c, view_c, vp)
+    vkdesc.mat4_mul(prev_proj_c, prev_view, pvp)
+    if !vkdesc.mat4_invert(proj_c, inv_proj) { memcpy(inv_proj, proj_c, 128 as long) }
+    if !vkdesc.mat4_invert(vp, inv_vp) { memcpy(inv_vp, vp, 128 as long) }
+    // This frame's clip to last frame's: through the world.
+    vkdesc.mat4_mul(pvp, inv_vp, c2p)
+    if !vkdesc.mat4_invert(c2p, p2c) { memcpy(p2c, c2p, 128 as long) }
+    cam = g_dlss_camera as f32[]
+    i = 0
+    while i < 16 {
+        cam[i] = (proj_c as float[])[i] as f32
+        cam[16 + i] = (inv_proj as float[])[i] as f32
+        cam[32 + i] = (c2p as float[])[i] as f32
+        cam[48 + i] = (p2c as float[])[i] as f32
+        i = i + 1
+    }
+    free(m)
+    // The jitter in pixels of the render size; the motion vectors are in
+    // texture space, from where a pixel is to where it was: DLSS wants them
+    // the other way round and in that space.
+    cam[64] = (jitter_x * (vktargets.render_width() as float)) as f32
+    cam[65] = (jitter_y * (vktargets.render_height() as float)) as f32
+    cam[66] = 0.0 - 1.0
+    cam[67] = 0.0 - 1.0
+    i = 0
+    while i < 3 {
+        cam[68 + i] = (position as float[])[i] as f32
+        cam[71 + i] = (up as float[])[i] as f32
+        cam[74 + i] = (right as float[])[i] as f32
+        cam[77 + i] = (forward as float[])[i] as f32
+        i = i + 1
+    }
+    cam[80] = near_plane as f32
+    cam[81] = far_plane as f32
+    cam[82] = fov as f32
+    cam[83] = aspect as f32
+    words = g_dlss_camera as int[]
+    words[84] = 0
+    words[85] = 0
+    if g_dlss_reset { words[85] = 1 }
+    g_dlss_camera_set = true
+}
+
+// One of the four images DLSS is handed, at `index`.
+dlss_image(index: int, image: ptr, memory: ptr, view: ptr, layout: int, w: int, h: int, format: int, usage: int) {
+    at = g_dlss_images + index * DLSS_IMAGE_BYTES
+    handles = at as ptr[]
+    handles[0] = image
+    handles[1] = memory
+    handles[2] = view
+    words = (at + 24) as uint32[]
+    words[0] = layout
+    words[1] = w
+    words[2] = h
+    words[3] = format
+    words[4] = usage
+}
+
+// The upscale, recorded between the scene's passes and the composite: the
+// frame's constants and its four images tagged, evaluated into the output,
+// which the composite then samples. The texture to composite from, or 0
+// when DLSS did not run this frame. The renderer's bound state is
+// forgotten afterwards, since the evaluation bound its own.
+run_dlss(source: int) -> int {
+    output = vktargets.dlss_output()
+    velocity = vktargets.velocity_texture()
+    if g_dlss_mode == 0 || output == 0 || velocity == 0 || vktargets.camdepth_view() == null { return 0 }
+    if !vktexture.valid(source) || !g_dlss_camera_set || !g_depth_resolved { return 0 }
+    commands = commands_now()
+    if vktargets.dlss_output_fresh() {
+        // The output starts in no layout; it is kept shader-readable between
+        // frames, and DLSS moves it to what it writes through and back.
+        b = calloc(1, sizeof(VkImageMemoryBarrier)) as *VkImageMemoryBarrier
+        b.sType = vk.STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+        b.oldLayout = vk.IMAGE_LAYOUT_UNDEFINED
+        b.newLayout = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        b.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+        b.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+        b.image = vktexture.image_of(output)
+        b.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+        b.subresourceRange.levelCount = 1
+        b.subresourceRange.layerCount = 1
+        b.dstAccessMask = vk.ACCESS_SHADER_READ_BIT
+        vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT, vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                0, 0, null, 0, null, 1, b as ptr)
+        free(b as ptr)
+        vktargets.set_dlss_output_fresh(false)
+    }
+    frame = g_dlss_frame
+    g_dlss_frame = g_dlss_frame + 1
+    if ae3d_dlss_begin_frame(frame) != 1 {
+        vkdevice.fail(ae3d_dlss_last_error())
+        return 0
+    }
+    if ae3d_dlss_set_constants(g_dlss_camera) != 1 {
+        vkdevice.fail(ae3d_dlss_last_error())
+        return 0
+    }
+    g_dlss_reset = false
+    read = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    rw = vktargets.render_width()
+    rh = vktargets.render_height()
+    dlss_image(0, vktargets.camdepth_image(), vktargets.camdepth_memory(), vktargets.camdepth_view(), read, rw, rh,
+               vktargets.depth_format(), vk.IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT)
+    dlss_image(1, vktexture.image_of(velocity), vktexture.memory_of(velocity), vktexture.view(velocity), read, rw, rh,
+               vktargets.velocity_format(), vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT)
+    dlss_image(2, vktexture.image_of(source), vktexture.memory_of(source), vktexture.view(source), read, rw, rh,
+               vktargets.color_format(), vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT)
+    dlss_image(3, vktexture.image_of(output), vktexture.memory_of(output), vktexture.view(output), read,
+               vktargets.width(), vktargets.height(), vk.FORMAT_R8G8B8A8_UNORM,
+               vk.IMAGE_USAGE_STORAGE_BIT | vk.IMAGE_USAGE_SAMPLED_BIT | vk.IMAGE_USAGE_TRANSFER_SRC_BIT |
+               vk.IMAGE_USAGE_TRANSFER_DST_BIT)
+    tagged = ae3d_dlss_tag(g_dlss_images, g_dlss_images + DLSS_IMAGE_BYTES, g_dlss_images + 2 * DLSS_IMAGE_BYTES,
+                           g_dlss_images + 3 * DLSS_IMAGE_BYTES, commands) == 1
+    if !tagged || ae3d_dlss_evaluate(commands) != 1 {
+        // A frame DLSS would not take: said once, and the frame is drawn as
+        // it was, at the scene's size, from here on.
+        io.stderr_write("ae3d: DLSS off: ${ae3d_dlss_last_error()}\n")
+        vkdevice.fail(ae3d_dlss_last_error())
+        g_dlss_mode = 0
+        g_dlss_failed = true
+        return 0
+    }
+    g_bound_pipeline = null
+    g_bound_texture = 0
+    g_bound_normal = 0
+    return output
+}

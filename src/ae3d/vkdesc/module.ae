@@ -1,0 +1,813 @@
+// ae3d.vkdesc -- what a Vulkan draw reads (#402): the scene's uniform
+// block, one per program, the frame's ring of them, and the descriptor
+// sets that bind a block's slice with a draw's images.
+//
+// One block per program, the way OpenGL gives every program its own
+// uniform state: sharing one would let a model's uniforms leak into the
+// next draw that uses a different program, since the two blocks share
+// member names. The renderer writes the block of the program in force;
+// every draw copies it whole into the next slice of the frame's ring, a
+// buffer mapped for good and bound with a dynamic offset, so a frame's
+// uniforms are written once and never reallocated.
+//
+// A draw's set binds that slice at 0, its colour at 1, the shadow atlas at
+// 2, its normal map at 3, at 4 whichever auxiliary image it needs -- a
+// crowd's pose bank, or the camera depth for a water surface -- at 5 the
+// frame's acceleration structure, where the device traces, at 6 and 7 the
+// frame slot's clustered lamps and the cells' lists (#468), and at 8 the
+// lamps' shadow atlas (#490). Sets are cached against the three images they
+// name, per frame slot: two materials can share a colour and differ in
+// their normal map, and keying on one of them hands the second the first
+// one's surface.
+
+import contrib.vulkan.vk
+import ae3d.vkhost
+import ae3d.vkdevice
+import ae3d.vktexture
+import ae3d.vkscene
+import std.string
+import std.io
+
+exports (
+    FRAMES, MAX_SETS, PROGRAM_SCENE, PROGRAM_WATER, PROGRAM_COUNT, AUX_SCENE_DEPTH,
+    clusters_reserve, clusters_lights, clusters_words,
+    start, stop, set_layout, pool, reset, forget_all, forget_texture, forget_aux, texture_destroy,
+    program, set_program, block, set_float, set_int, set_vec3, set_mat4, set_mat4v, set_mat4_floats, set_clip_mat4,
+    set_inv_viewproj, set_float_array, set_vec3_array, offset, clip_correct, mat4_mul, mat4_invert,
+    ring_begin, ring_push, ring_buffer, set_for, allocate, rewrite_shadow
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+extern memset(p: ptr, value: int, n: long) -> ptr
+
+const FRAMES = 2
+// Sets a frame slot holds: one for every texture a draw can name.
+const MAX_SETS = 256
+const PROGRAM_SCENE = 0
+const PROGRAM_WATER = 1
+const PROGRAM_COUNT = 2
+// Asked for at binding 4 in place of a texture handle: the camera depth.
+const AUX_SCENE_DEPTH = 0 - 1
+// A cached set whose texture has been destroyed. Not zero: zero is a
+// texture handle nothing uses, and not -1 alone, which reads as an error.
+const SET_FREE = 0 - 2
+// Draws a frame: its ring holds as many blocks.
+const DRAWS_PER_FRAME = 4096
+// What a slot's cluster buffers start at: enough for a street of lamps
+// without a regrow, a few kilobytes against the scene's megabytes.
+const CLUSTER_LIGHT_BYTES = 20480    // 256 lamps of five vec4s
+const CLUSTER_WORD_BYTES = 262144    // 65,536 words
+
+var g_set_layout: ptr = null
+var g_pool: ptr = null
+var g_blocks: ptr = null           // PROGRAM_COUNT scene blocks, SCENE_SIZE bytes each
+var g_program = 0
+// The frames' rings: a buffer each, mapped, how far apart the blocks sit
+// and how many a frame has taken.
+var g_ring_buffer: ptr = null      // VkBuffer[FRAMES]
+var g_ring_memory: ptr = null      // VkDeviceMemory[FRAMES]
+var g_ring_mapped: ptr = null      // void*[FRAMES]
+var g_ring_used: ptr = null        // int[FRAMES]
+var g_stride = 0
+// The set cache, per frame slot: the set and the three images it names.
+var g_sets: ptr = null             // VkDescriptorSet[FRAMES * MAX_SETS]
+var g_set_texture: ptr = null      // int[FRAMES * MAX_SETS]
+var g_set_normal: ptr = null
+var g_set_bank: ptr = null
+var g_set_count: ptr = null        // int[FRAMES]
+// The scene's clustered lamps, per frame slot (#468): the lamps and the
+// cells' lists ae3d.lightgrid builds, written by ae3d.vulkan into mapped,
+// coherent memory before the slot's draws, read by the scene fragment
+// shader as storage buffers at bindings 6 and 7. Grown in place when a
+// scene needs more, once the slot's fence has passed.
+var g_lights: ptr = null           // VKCluster[FRAMES]
+var g_words: ptr = null            // VKCluster[FRAMES]
+
+struct VKCluster {
+    buffer: ptr
+    memory: ptr
+    mapped: ptr
+    size: int
+}
+// The writes a set takes, made once: its buffer, its five images, its
+// structure, and the six writes.
+var g_writes: ptr = null
+var g_infos: ptr = null
+var g_structure: ptr = null
+var g_structure_handle: ptr = null
+var g_cell: ptr = null
+
+cell_at(frame: int, index: int) -> int { return frame * MAX_SETS + index }
+
+// The set layout, the pool and the frames' rings on the device ae3d.vkdevice
+// made. False, with the reason in its last error, when one would not make.
+start() -> bool {
+    d = vkhost.device()
+    rays = vkdevice.ray_query()
+    if g_blocks == null {
+        g_blocks = calloc(PROGRAM_COUNT, vkscene.SCENE_SIZE)
+        g_ring_buffer = calloc(FRAMES, 8)
+        g_ring_memory = calloc(FRAMES, 8)
+        g_ring_mapped = calloc(FRAMES, 8)
+        g_ring_used = calloc(FRAMES, 4)
+        g_sets = calloc(FRAMES * MAX_SETS, 8)
+        g_set_texture = calloc(FRAMES * MAX_SETS, 4)
+        g_set_normal = calloc(FRAMES * MAX_SETS, 4)
+        g_set_bank = calloc(FRAMES * MAX_SETS, 4)
+        g_set_count = calloc(FRAMES, 4)
+        g_writes = calloc(7, sizeof(VkWriteDescriptorSet))
+        g_infos = calloc(7, sizeof(VkDescriptorImageInfo))
+        g_lights = calloc(FRAMES, sizeof(VKCluster))
+        g_words = calloc(FRAMES, sizeof(VKCluster))
+        g_structure = calloc(1, sizeof(VkWriteDescriptorSetAccelerationStructureKHR))
+        g_structure_handle = calloc(1, 8)
+        g_cell = calloc(4, 8)
+    }
+    memset(g_blocks, 0, (PROGRAM_COUNT * vkscene.SCENE_SIZE) as long)
+    memset(g_set_count, 0, (FRAMES * 4) as long)
+    g_program = PROGRAM_SCENE
+
+    // In the order the layout lists them: 0 to 4, the lamps at 6 and 7 and
+    // their atlas at 8, and the structure at 5 last, so it can be left off.
+    order = [0, 1, 2, 3, 4, 6, 7, 8, 5]
+    bindings = calloc(9, sizeof(VkDescriptorSetLayoutBinding))
+    i = 0
+    while i < 9 {
+        b = (bindings + i * sizeof(VkDescriptorSetLayoutBinding)) as *VkDescriptorSetLayoutBinding
+        n = order[i]
+        b.binding = n
+        b.descriptorCount = 1
+        b.descriptorType = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+        b.stageFlags = vk.SHADER_STAGE_FRAGMENT_BIT
+        // The block, read by both stages.
+        if n == 0 {
+            b.descriptorType = vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+            b.stageFlags = vk.SHADER_STAGE_VERTEX_BIT | vk.SHADER_STAGE_FRAGMENT_BIT
+        }
+        // The pose bank: a float texture of baked bone palettes the crowd
+        // vertex shader fetches by (bone, frame). Read in the vertex stage,
+        // which is what sets this binding apart from the other three.
+        if n == 4 { b.stageFlags = vk.SHADER_STAGE_VERTEX_BIT | vk.SHADER_STAGE_FRAGMENT_BIT }
+        // The clustered lamps: storage buffers the scene fragment shader
+        // indexes.
+        if n == 6 || n == 7 { b.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER }
+        // The scene's acceleration structure, for the rays the fragment
+        // traces; only where the device traces, since a layout naming a
+        // descriptor type the device has no extension for is refused.
+        if n == 5 { b.descriptorType = vk.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR }
+        i = i + 1
+    }
+    info = calloc(1, sizeof(VkDescriptorSetLayoutCreateInfo)) as *VkDescriptorSetLayoutCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    info.bindingCount = 8
+    if rays { info.bindingCount = 9 }
+    info.pBindings = bindings
+    r = vk.vkCreateDescriptorSetLayout(d, info as ptr, null, g_cell)
+    g_set_layout = (g_cell as ptr[])[0]
+    free(info as ptr)
+    free(bindings)
+    if r != vk.SUCCESS {
+        g_set_layout = null
+        vkdevice.fail("vkCreateDescriptorSetLayout failed")
+        return false
+    }
+
+    sizes = calloc(4, sizeof(VkDescriptorPoolSize))
+    s0 = sizes as *VkDescriptorPoolSize
+    s0.type = vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+    s0.descriptorCount = FRAMES * MAX_SETS
+    s1 = (sizes + sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
+    s1.type = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+    s1.descriptorCount = FRAMES * MAX_SETS * 5
+    s2 = (sizes + 2 * sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
+    s2.type = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+    s2.descriptorCount = FRAMES * MAX_SETS * 2
+    s3 = (sizes + 3 * sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
+    s3.type = vk.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
+    s3.descriptorCount = FRAMES * MAX_SETS
+    pool_info = calloc(1, sizeof(VkDescriptorPoolCreateInfo)) as *VkDescriptorPoolCreateInfo
+    pool_info.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+    pool_info.maxSets = FRAMES * MAX_SETS
+    pool_info.poolSizeCount = 3
+    if rays { pool_info.poolSizeCount = 4 }
+    pool_info.pPoolSizes = sizes
+    r = vk.vkCreateDescriptorPool(d, pool_info as ptr, null, g_cell)
+    g_pool = (g_cell as ptr[])[0]
+    free(pool_info as ptr)
+    free(sizes)
+    if r != vk.SUCCESS {
+        g_pool = null
+        vkdevice.fail("vkCreateDescriptorPool failed")
+        return false
+    }
+
+    // Every draw gets its own slice of one mapped buffer, bound with a
+    // dynamic offset.
+    alignment = vkdevice.uniform_alignment()
+    if alignment == 0 { alignment = 1 }
+    g_stride = (vkscene.SCENE_SIZE + alignment - 1) / alignment * alignment
+    host = vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT
+    f = 0
+    while f < FRAMES {
+        ring = vkhost.buffer_of(g_stride * DRAWS_PER_FRAME, vk.BUFFER_USAGE_UNIFORM_BUFFER_BIT, host)
+        (g_ring_buffer as ptr[])[f] = ring.buffer
+        (g_ring_memory as ptr[])[f] = ring.memory
+        if ring.buffer == null {
+            vkdevice.fail("uniform vkCreateBuffer failed")
+            return false
+        }
+        r = vk.vkMapMemory(d, ring.memory, 0, vk.WHOLE_SIZE, 0, g_cell)
+        if r != vk.SUCCESS {
+            vkdevice.fail("uniform vkMapMemory failed")
+            return false
+        }
+        (g_ring_mapped as ptr[])[f] = (g_cell as ptr[])[0]
+        (g_ring_used as int[])[f] = 0
+        if !cluster_make(cluster_at(g_lights, f), CLUSTER_LIGHT_BYTES) ||
+           !cluster_make(cluster_at(g_words, f), CLUSTER_WORD_BYTES) {
+            return false
+        }
+        f = f + 1
+    }
+    return true
+}
+
+// --- the clustered lamps -----------------------------------------------------------------------------------------
+
+cluster_at(table: ptr, frame: int) -> *VKCluster { return (table + frame * sizeof(VKCluster)) as *VKCluster }
+
+// A cluster buffer `bytes` long, host-visible, coherent and mapped, zeroed
+// so a slot drawn before its first write lists no lamps.
+cluster_make(c: *VKCluster, bytes: int) -> bool {
+    host = vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT
+    made = vkhost.buffer_of(bytes, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT, host)
+    if made.buffer == null { return false }
+    c.buffer = made.buffer
+    c.memory = made.memory
+    if vk.vkMapMemory(vkhost.device(), made.memory, 0, vk.WHOLE_SIZE, 0, g_cell) != vk.SUCCESS {
+        vkdevice.fail("cluster vkMapMemory failed")
+        return false
+    }
+    c.mapped = (g_cell as ptr[])[0]
+    memset(c.mapped, 0, bytes as long)
+    c.size = bytes
+    return true
+}
+
+cluster_destroy(c: *VKCluster) {
+    d = vkhost.device()
+    if c.mapped != null { vk.vkUnmapMemory(d, c.memory) }
+    if c.buffer != null { vk.vkDestroyBuffer(d, c.buffer, null) }
+    if c.memory != null { vk.vkFreeMemory(d, c.memory, null) }
+    memset(c as ptr, 0, sizeof(VKCluster) as long)
+}
+
+// The two cluster buffers of `frame` into a set's bindings 6 and 7.
+write_clusters(set: ptr, frame: int) {
+    infos = calloc(2, sizeof(VkDescriptorBufferInfo))
+    i0 = infos as *VkDescriptorBufferInfo
+    i0.buffer = cluster_at(g_lights, frame).buffer
+    i0.range = vk.WHOLE_SIZE
+    i1 = (infos + sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+    i1.buffer = cluster_at(g_words, frame).buffer
+    i1.range = vk.WHOLE_SIZE
+    writes = calloc(2, sizeof(VkWriteDescriptorSet))
+    k = 0
+    while k < 2 {
+        w = (writes + k * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+        w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+        w.dstSet = set
+        w.dstBinding = 6 + k
+        w.descriptorCount = 1
+        w.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+        w.pBufferInfo = infos + k * sizeof(VkDescriptorBufferInfo)
+        k = k + 1
+    }
+    vk.vkUpdateDescriptorSets(vkhost.device(), 2, writes, 0, null)
+    free(writes)
+    free(infos)
+}
+
+// A cluster buffer grown to hold `bytes` when it does not; whether it grew,
+// in `grew`'s first word. False when the new one could not be made.
+cluster_fit(c: *VKCluster, bytes: int, least: int, grew: ptr) -> bool {
+    if bytes <= c.size { return true }
+    size = c.size
+    if size == 0 { size = least }
+    while size < bytes { size = size * 2 }
+    cluster_destroy(c)
+    if !cluster_make(c, size) { return false }
+    (grew as int[])[0] = 1
+    return true
+}
+
+// Frame slot `frame`'s cluster buffers, grown to hold `light_bytes` and
+// `word_bytes` when they do not. Called by ae3d.vulkan after the frame has
+// begun, when the slot's last submission has finished, so a buffer can be
+// remade under it; every set of the slot is then pointed at the new one.
+// False when a buffer could not be made.
+clusters_reserve(frame: int, light_bytes: long, word_bytes: long) -> bool {
+    if g_lights == null { return false }
+    grew = calloc(1, 4)
+    ok = cluster_fit(cluster_at(g_lights, frame), light_bytes as int, CLUSTER_LIGHT_BYTES, grew) &&
+         cluster_fit(cluster_at(g_words, frame), word_bytes as int, CLUSTER_WORD_BYTES, grew)
+    if ok && (grew as int[])[0] == 1 {
+        n = (g_set_count as int[])[frame]
+        i = 0
+        while i < n {
+            write_clusters((g_sets as ptr[])[cell_at(frame, i)], frame)
+            i = i + 1
+        }
+    }
+    free(grew)
+    return ok
+}
+
+// Where frame slot `frame`'s lamps and lists are written.
+clusters_lights(frame: int) -> ptr { return cluster_at(g_lights, frame).mapped }
+clusters_words(frame: int) -> ptr { return cluster_at(g_words, frame).mapped }
+
+// Everything made here destroyed, the device idle: at shutdown.
+stop() {
+    d = vkhost.device()
+    if d == null || g_blocks == null { return }
+    f = 0
+    while f < FRAMES {
+        memory = (g_ring_memory as ptr[])[f]
+        if (g_ring_mapped as ptr[])[f] != null { vk.vkUnmapMemory(d, memory) }
+        if (g_ring_buffer as ptr[])[f] != null { vk.vkDestroyBuffer(d, (g_ring_buffer as ptr[])[f], null) }
+        if memory != null { vk.vkFreeMemory(d, memory, null) }
+        (g_ring_buffer as ptr[])[f] = null
+        (g_ring_memory as ptr[])[f] = null
+        (g_ring_mapped as ptr[])[f] = null
+        cluster_destroy(cluster_at(g_lights, f))
+        cluster_destroy(cluster_at(g_words, f))
+        f = f + 1
+    }
+    if g_pool != null { vk.vkDestroyDescriptorPool(d, g_pool, null) }
+    if g_set_layout != null { vk.vkDestroyDescriptorSetLayout(d, g_set_layout, null) }
+    g_pool = null
+    g_set_layout = null
+    memset(g_set_count, 0, (FRAMES * 4) as long)
+}
+
+set_layout() -> ptr { return g_set_layout }
+pool() -> ptr { return g_pool }
+
+// The pool emptied and the cache with it: every set handed out goes, for a
+// rebuild that destroys the images they name.
+reset() {
+    if g_pool != null { vk.vkResetDescriptorPool(vkhost.device(), g_pool, 0) }
+    memset(g_set_count, 0, (FRAMES * 4) as long)
+}
+
+// Every cached set of both frame slots written again when next claimed:
+// what they bind has changed under them (a structure remade, samplers
+// remade at a new bias).
+forget_all() {
+    if g_set_count == null { return }
+    f = 0
+    while f < FRAMES {
+        n = (g_set_count as int[])[f]
+        i = 0
+        while i < n {
+            (g_set_texture as int[])[cell_at(f, i)] = SET_FREE
+            i = i + 1
+        }
+        f = f + 1
+    }
+}
+
+// The sets that name `handle` -- as their colour, their normal map or their
+// pose bank -- let go: handles are reused, and a set written for an image
+// being destroyed would be handed to whichever texture takes its handle
+// next, naming a view that no longer exists (the validation layer counted
+// 36 draws through a destroyed view and sampler in tests/test_backend_parity).
+// The sets go back on the free list and are written again when claimed.
+forget_texture(handle: int) {
+    if g_set_count == null { return }
+    f = 0
+    while f < FRAMES {
+        n = (g_set_count as int[])[f]
+        i = 0
+        while i < n {
+            c = cell_at(f, i)
+            if (g_set_texture as int[])[c] == handle || (g_set_normal as int[])[c] == handle ||
+               (g_set_bank as int[])[c] == handle {
+                (g_set_texture as int[])[c] = SET_FREE
+            }
+            i = i + 1
+        }
+        f = f + 1
+    }
+}
+
+// The sets that bound the camera depth at binding 4, let go: its view is
+// about to go.
+forget_aux() {
+    if g_set_count == null { return }
+    f = 0
+    while f < FRAMES {
+        n = (g_set_count as int[])[f]
+        i = 0
+        while i < n {
+            c = cell_at(f, i)
+            if (g_set_bank as int[])[c] == AUX_SCENE_DEPTH { (g_set_texture as int[])[c] = SET_FREE }
+            i = i + 1
+        }
+        f = f + 1
+    }
+}
+
+// A texture destroyed, the sets naming it let go first.
+texture_destroy(handle: int) {
+    if !vktexture.valid(handle) || vkhost.device() == null { return }
+    forget_texture(handle)
+    vktexture.destroy(handle)
+}
+
+// --- the blocks --------------------------------------------------------------------------------------------------
+
+// The program whose block the setters write: a program there is none of
+// falls back to the scene one, which is what the OpenGL backend does with
+// a shader that fails to compile.
+program() -> int { return g_program }
+set_program(p: int) {
+    g_program = PROGRAM_SCENE
+    if p >= 0 && p < PROGRAM_COUNT { g_program = p }
+}
+
+// A program's block.
+block(p: int) -> ptr { return g_blocks + p * vkscene.SCENE_SIZE }
+
+// Whether `bytes` at `offset` are inside a block. A write past it -- a
+// uniform array longer than the block's -- is dropped, and said once.
+var g_overrun_said = false
+fits(offset: int, bytes: int) -> bool {
+    if offset >= 0 && offset + bytes <= vkscene.SCENE_SIZE { return true }
+    if !g_overrun_said {
+        g_overrun_said = true
+        io.stderr_write("ae3d: a uniform write at byte ${offset} (${bytes} bytes) is past the ${vkscene.SCENE_SIZE}-byte block; dropped\n")
+    }
+    return false
+}
+
+set_float(offset: int, value: float) {
+    if offset < 0 || !fits(offset, 4) { return }
+    ((block(g_program) + offset) as f32[])[0] = value as f32
+}
+set_int(offset: int, value: int) {
+    if offset < 0 || !fits(offset, 4) { return }
+    ((block(g_program) + offset) as int[])[0] = value
+}
+set_vec3(offset: int, x: float, y: float, z: float) {
+    if offset < 0 || !fits(offset, 12) { return }
+    v = (block(g_program) + offset) as f32[]
+    v[0] = x as f32
+    v[1] = y as f32
+    v[2] = z as f32
+}
+// Sixteen doubles, column-major, as floats.
+set_mat4(offset: int, m: ptr) {
+    if m == null || offset < 0 || !fits(offset, 64) { return }
+    v = (block(g_program) + offset) as f32[]
+    src = m as float[]
+    i = 0
+    while i < 16 {
+        v[i] = src[i] as f32
+        i = i + 1
+    }
+}
+// Into `p`'s block rather than the program's in force.
+set_mat4_floats(p: int, offset: int, m: ptr) {
+    if !fits(offset, 64) { return }
+    v = (block(p) + offset) as f32[]
+    src = m as float[]
+    i = 0
+    while i < 16 {
+        v[i] = src[i] as f32
+        i = i + 1
+    }
+}
+
+// The bone palette, which is already the floats the block wants: std140
+// gives a mat4 array a stride of 64 bytes, which is the matrix itself, so
+// the run copies whole rather than a matrix at a time.
+set_mat4v(offset: int, count: int, values: ptr) {
+    bytes = count * 64
+    if values == null || count <= 0 || offset < 0 { return }
+    if offset + bytes > vkscene.SCENE_SIZE { return }
+    memcpy(block(g_program) + offset, values, bytes as long)
+}
+
+// The Vulkan clip correction (y down, z in 0..1) applied to a column-major
+// OpenGL-shaped matrix that reaches clip space, into `c`.
+clip_correct(m: ptr, c: ptr) {
+    src = m as float[]
+    out = c as float[]
+    column = 0
+    while column < 4 {
+        out[column * 4] = src[column * 4]
+        out[column * 4 + 1] = 0.0 - src[column * 4 + 1]
+        out[column * 4 + 2] = 0.5 * (src[column * 4 + 2] + src[column * 4 + 3])
+        out[column * 4 + 3] = src[column * 4 + 3]
+        column = column + 1
+    }
+}
+
+// Vulkan clip space puts y downward and z in [0, 1] while the engine's
+// matrices are OpenGL-shaped, so the correction is folded in here rather
+// than making every caller keep two projections. It applies to whichever
+// matrix reaches clip space last, the combined view-projection for the
+// scene and the projection alone for the skybox, which multiplies the two
+// in the shader.
+set_clip_mat4(offset: int, m: ptr) {
+    if m == null { return }
+    corrected = calloc(16, 8)
+    clip_correct(m, corrected)
+    set_mat4(offset, corrected)
+    free(corrected)
+}
+
+// out = a * b, column-major.
+mat4_mul(a: ptr, b: ptr, out: ptr) {
+    x = a as float[]
+    y = b as float[]
+    z = out as float[]
+    c = 0
+    while c < 4 {
+        r = 0
+        while r < 4 {
+            sum = 0.0
+            k = 0
+            while k < 4 {
+                sum = sum + x[k * 4 + r] * y[c * 4 + k]
+                k = k + 1
+            }
+            z[c * 4 + r] = sum
+            r = r + 1
+        }
+        c = c + 1
+    }
+}
+
+// The inverse of a column-major matrix into `inv`; false when it has none.
+mat4_invert(m: ptr, inverse: ptr) -> bool {
+    c = m as float[]
+    inv = inverse as float[]
+    inv[0]  =  c[5]*c[10]*c[15] - c[5]*c[11]*c[14] - c[9]*c[6]*c[15] + c[9]*c[7]*c[14] + c[13]*c[6]*c[11] - c[13]*c[7]*c[10]
+    inv[4]  = 0.0 - c[4]*c[10]*c[15] + c[4]*c[11]*c[14] + c[8]*c[6]*c[15] - c[8]*c[7]*c[14] - c[12]*c[6]*c[11] + c[12]*c[7]*c[10]
+    inv[8]  =  c[4]*c[9]*c[15]  - c[4]*c[11]*c[13] - c[8]*c[5]*c[15] + c[8]*c[7]*c[13] + c[12]*c[5]*c[11] - c[12]*c[7]*c[9]
+    inv[12] = 0.0 - c[4]*c[9]*c[14]  + c[4]*c[10]*c[13] + c[8]*c[5]*c[14] - c[8]*c[6]*c[13] - c[12]*c[5]*c[10] + c[12]*c[6]*c[9]
+    inv[1]  = 0.0 - c[1]*c[10]*c[15] + c[1]*c[11]*c[14] + c[9]*c[2]*c[15] - c[9]*c[3]*c[14] - c[13]*c[2]*c[11] + c[13]*c[3]*c[10]
+    inv[5]  =  c[0]*c[10]*c[15] - c[0]*c[11]*c[14] - c[8]*c[2]*c[15] + c[8]*c[3]*c[14] + c[12]*c[2]*c[11] - c[12]*c[3]*c[10]
+    inv[9]  = 0.0 - c[0]*c[9]*c[15]  + c[0]*c[11]*c[13] + c[8]*c[1]*c[15] - c[8]*c[3]*c[13] - c[12]*c[1]*c[11] + c[12]*c[3]*c[9]
+    inv[13] =  c[0]*c[9]*c[14]  - c[0]*c[10]*c[13] - c[8]*c[1]*c[14] + c[8]*c[2]*c[13] + c[12]*c[1]*c[10] - c[12]*c[2]*c[9]
+    inv[2]  =  c[1]*c[6]*c[15]  - c[1]*c[7]*c[14]  - c[5]*c[2]*c[15] + c[5]*c[3]*c[14] + c[13]*c[2]*c[7]  - c[13]*c[3]*c[6]
+    inv[6]  = 0.0 - c[0]*c[6]*c[15]  + c[0]*c[7]*c[14]  + c[4]*c[2]*c[15] - c[4]*c[3]*c[14] - c[12]*c[2]*c[7]  + c[12]*c[3]*c[6]
+    inv[10] =  c[0]*c[5]*c[15]  - c[0]*c[7]*c[13]  - c[4]*c[1]*c[15] + c[4]*c[3]*c[13] + c[12]*c[1]*c[7]  - c[12]*c[3]*c[5]
+    inv[14] = 0.0 - c[0]*c[5]*c[14]  + c[0]*c[6]*c[13]  + c[4]*c[1]*c[14] - c[4]*c[2]*c[13] - c[12]*c[1]*c[6]  + c[12]*c[2]*c[5]
+    inv[3]  = 0.0 - c[1]*c[6]*c[11]  + c[1]*c[7]*c[10]  + c[5]*c[2]*c[11] - c[5]*c[3]*c[10] - c[9]*c[2]*c[7]   + c[9]*c[3]*c[6]
+    inv[7]  =  c[0]*c[6]*c[11]  - c[0]*c[7]*c[10]  - c[4]*c[2]*c[11] + c[4]*c[3]*c[10] + c[8]*c[2]*c[7]   - c[8]*c[3]*c[6]
+    inv[11] = 0.0 - c[0]*c[5]*c[11]  + c[0]*c[7]*c[9]   + c[4]*c[1]*c[11] - c[4]*c[3]*c[9]  - c[8]*c[1]*c[7]   + c[8]*c[3]*c[5]
+    inv[15] =  c[0]*c[5]*c[10]  - c[0]*c[6]*c[9]   - c[4]*c[1]*c[10] + c[4]*c[2]*c[9]  + c[8]*c[1]*c[6]   - c[8]*c[2]*c[5]
+    det = c[0]*inv[0] + c[1]*inv[4] + c[2]*inv[8] + c[3]*inv[12]
+    if det > 0.0 - 0.000000000001 && det < 0.000000000001 { return false }
+    det = 1.0 / det
+    i = 0
+    while i < 16 {
+        inv[i] = inv[i] * det
+        i = i + 1
+    }
+    return true
+}
+
+// The inverse of the clip-corrected view-projection, for the reflection's
+// shader to rebuild a world position from a screen pixel and its depth. It
+// inverts the same matrix the vertex stage used -- the corrected one,
+// mapping world to Vulkan's clip space -- so the correction comes first.
+set_inv_viewproj(offset: int, m: ptr) {
+    if m == null { return }
+    c = calloc(16, 8)
+    inv = calloc(16, 8)
+    clip_correct(m, c)
+    if mat4_invert(c, inv) { set_mat4(offset, inv) } else { set_mat4(offset, c) }
+    free(c)
+    free(inv)
+}
+
+// A float array as ae3d.core lays one out (FloatValues): the values,
+// 32-bit, then their count. std140 gives every array element a 16-byte slot
+// whatever it holds, so a wave table cannot be copied in as a flat run.
+set_float_array(offset: int, handle: ptr) {
+    if handle == null || offset < 0 { return }
+    values = (handle as ptr[])[0] as f32[]
+    count = ((handle + 8) as int[])[0]
+    i = 0
+    while i < count && fits(offset + i * 16, 4) {
+        ((block(g_program) + offset + i * 16) as f32[])[0] = values[i]
+        i = i + 1
+    }
+}
+
+set_vec3_array(offset: int, handle: ptr) {
+    if handle == null || offset < 0 { return }
+    values = (handle as ptr[])[0] as f32[]
+    count = ((handle + 8) as int[])[0] / 3
+    i = 0
+    while i < count && fits(offset + i * 16, 12) {
+        v = (block(g_program) + offset + i * 16) as f32[]
+        v[0] = values[i * 3]
+        v[1] = values[i * 3 + 1]
+        v[2] = values[i * 3 + 2]
+        i = i + 1
+    }
+}
+
+// A model's own uniform's offset by its name, -1 for none: resolved once
+// and cached on the uniform by the renderer.
+offset(name: string) -> int { return vkscene.offset_of(name) }
+
+// --- the ring ----------------------------------------------------------------------------------------------------
+
+// The frame slot's ring emptied, at the frame's start.
+ring_begin(frame: int) { (g_ring_used as int[])[frame] = 0 }
+
+// Program `p`'s block copied into the next slice of the frame's ring: its
+// dynamic offset, or -1 when the ring is full.
+ring_push(frame: int, p: int) -> int {
+    used = (g_ring_used as int[])[frame]
+    if used >= DRAWS_PER_FRAME { return 0 - 1 }
+    (g_ring_used as int[])[frame] = used + 1
+    at = used * g_stride
+    memcpy((g_ring_mapped as ptr[])[frame] + at, block(p), vkscene.SCENE_SIZE as long)
+    return at
+}
+
+ring_buffer(frame: int) -> ptr { return (g_ring_buffer as ptr[])[frame] }
+
+// A set from the pool, of the scene's layout; null when the pool is out.
+allocate() -> ptr {
+    (g_cell as ptr[])[1] = g_set_layout
+    alloc = calloc(1, sizeof(VkDescriptorSetAllocateInfo)) as *VkDescriptorSetAllocateInfo
+    alloc.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+    alloc.descriptorPool = g_pool
+    alloc.descriptorSetCount = 1
+    alloc.pSetLayouts = g_cell + 8
+    r = vk.vkAllocateDescriptorSets(vkhost.device(), alloc as ptr, g_cell)
+    free(alloc as ptr)
+    if r != vk.SUCCESS { return null }
+    return (g_cell as ptr[])[0]
+}
+
+image_write(index: int, set: ptr, binding: int, view: ptr, sampler: ptr, layout: int) {
+    info = (g_infos + index * sizeof(VkDescriptorImageInfo)) as *VkDescriptorImageInfo
+    info.imageLayout = layout
+    info.imageView = view
+    info.sampler = sampler
+    w = (g_writes + index * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+    memset(w as ptr, 0, sizeof(VkWriteDescriptorSet) as long)
+    w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    w.dstSet = set
+    w.dstBinding = binding
+    w.descriptorCount = 1
+    w.descriptorType = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+    w.pImageInfo = info as ptr
+}
+
+// The frame slot's set binding `texture` at 1, `normal` at 3 and `bank` at
+// 4 -- a texture handle, or AUX_SCENE_DEPTH for the camera depth at
+// `depth_view` -- with the shadow atlas `shadow_view` at 2 (the default
+// texture when there is none: white, nothing occluded), the frame's
+// structure `structure` at 5 where the device traces, the slot's clustered
+// lamps at 6 and 7, and the lamps' atlas `lamp_view` at 8 (the default
+// texture before it is made; the shader reads it only where a lamp has a
+// slot): the cached one, or one written now. A set left by a destroyed
+// texture is written again, which is what keeps a scene that swaps textures
+// from exhausting the pool. Null when the pool is out.
+set_for(frame: int, texture: int, normal: int, bank: int, default_texture: int,
+        shadow_view: ptr, shadow_sampler: ptr, depth_view: ptr, depth_sampler: ptr, structure: ptr,
+        lamp_view: ptr, lamp_sampler: ptr) -> ptr {
+    normal_handle = normal
+    if !vktexture.valid(normal_handle) { normal_handle = default_texture }
+    bank_handle = bank
+    if bank_handle == AUX_SCENE_DEPTH {
+        if depth_view == null || depth_sampler == null { bank_handle = default_texture }
+    } else if !vktexture.valid(bank_handle) {
+        bank_handle = default_texture
+    }
+    reuse = 0 - 1
+    n = (g_set_count as int[])[frame]
+    i = 0
+    while i < n {
+        c = cell_at(frame, i)
+        if (g_set_texture as int[])[c] == texture && (g_set_normal as int[])[c] == normal_handle &&
+           (g_set_bank as int[])[c] == bank_handle {
+            return (g_sets as ptr[])[c]
+        }
+        if (g_set_texture as int[])[c] == SET_FREE && reuse < 0 { reuse = i }
+        i = i + 1
+    }
+    if reuse < 0 && n >= MAX_SETS { return null }
+    if !vktexture.valid(texture) { return null }
+
+    set = null
+    if reuse >= 0 {
+        set = (g_sets as ptr[])[cell_at(frame, reuse)]
+    } else {
+        set = allocate()
+        if set == null { return null }
+    }
+
+    buffer = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+    buffer.buffer = ring_buffer(frame)
+    buffer.offset = 0
+    buffer.range = vkscene.SCENE_SIZE
+    w = g_writes as *VkWriteDescriptorSet
+    memset(w as ptr, 0, sizeof(VkWriteDescriptorSet) as long)
+    w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    w.dstSet = set
+    w.dstBinding = 0
+    w.descriptorCount = 1
+    w.descriptorType = vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+    w.pBufferInfo = buffer as ptr
+    read = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    image_write(1, set, 1, vktexture.view(texture), vktexture.sampler_of(texture), read)
+    // Binding 2 is the shadow map. With shadows off it holds the default
+    // white texture, which reads as nothing occluded.
+    if shadow_view != null {
+        image_write(2, set, 2, shadow_view, shadow_sampler, read)
+    } else {
+        image_write(2, set, 2, vktexture.view(default_texture), vktexture.sampler_of(default_texture), read)
+    }
+    image_write(3, set, 3, vktexture.view(normal_handle), vktexture.sampler_of(normal_handle), read)
+    // Binding 4 is the pose bank the crowd vertex shader reads its bones
+    // from, or the camera depth; a draw that is neither binds the default
+    // texture there and never samples it.
+    if bank_handle == AUX_SCENE_DEPTH {
+        image_write(4, set, 4, depth_view, depth_sampler, read)
+    } else {
+        image_write(4, set, 4, vktexture.view(bank_handle), vktexture.sampler_of(bank_handle), read)
+    }
+    count = 5
+    // Binding 5 is the scene's acceleration structure, this frame's: what
+    // the fragment traces its rays through where the device traces.
+    if vkdevice.ray_query() && structure != null {
+        (g_structure_handle as ptr[])[0] = structure
+        as_write = g_structure as *VkWriteDescriptorSetAccelerationStructureKHR
+        as_write.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR
+        as_write.accelerationStructureCount = 1
+        as_write.pAccelerationStructures = g_structure_handle
+        w5 = (g_writes + 5 * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+        memset(w5 as ptr, 0, sizeof(VkWriteDescriptorSet) as long)
+        w5.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+        w5.pNext = as_write as ptr
+        w5.dstSet = set
+        w5.dstBinding = 5
+        w5.descriptorCount = 1
+        w5.descriptorType = vk.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
+        count = 6
+    }
+    // Binding 8 is the lamps' shadow atlas, or the default texture before
+    // it is made.
+    if lamp_view != null {
+        image_write(count, set, 8, lamp_view, lamp_sampler, read)
+    } else {
+        image_write(count, set, 8, vktexture.view(default_texture), vktexture.sampler_of(default_texture), read)
+    }
+    count = count + 1
+    vk.vkUpdateDescriptorSets(vkhost.device(), count, g_writes, 0, null)
+    free(buffer as ptr)
+    write_clusters(set, frame)
+
+    index = reuse
+    if reuse < 0 {
+        index = n
+        (g_set_count as int[])[frame] = n + 1
+    }
+    c = cell_at(frame, index)
+    (g_sets as ptr[])[c] = set
+    (g_set_texture as int[])[c] = texture
+    (g_set_normal as int[])[c] = normal_handle
+    (g_set_bank as int[])[c] = bank_handle
+    return set
+}
+
+// Every cached set's binding 2 rewritten to `view`: shadows turned on or
+// off, which the sets already handed out would otherwise go on reading.
+rewrite_shadow(view: ptr, sampler: ptr) {
+    if g_set_count == null { return }
+    f = 0
+    while f < FRAMES {
+        n = (g_set_count as int[])[f]
+        i = 0
+        while i < n {
+            image_write(0, (g_sets as ptr[])[cell_at(f, i)], 2, view, sampler, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            vk.vkUpdateDescriptorSets(vkhost.device(), 1, g_writes, 0, null)
+            i = i + 1
+        }
+        f = f + 1
+    }
+}
