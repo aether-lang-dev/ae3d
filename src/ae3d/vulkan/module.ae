@@ -44,7 +44,7 @@ exports (
     renderer_set_normal_strength, renderer_set_occlusion_strength, renderer_set_capture_channel, renderer_set_wetness, renderer_set_frame_exposure, renderer_set_meter, renderer_meter, renderer_material_texture_size,
     renderer_load_texture, renderer_release_texture, renderer_sample_count, renderer_set_post,
     renderer_set_bloom_intensity, renderer_bloom_intensity,
-    renderer_set_shadows, renderer_shadows, renderer_set_ssr, renderer_ssr, renderer_set_ssr_params, renderer_set_taa, renderer_taa, request_dlss, dlss_available, renderer_set_dlss, renderer_dlss, set_samples, renderer_ray_query, renderer_set_ray_shadows, renderer_ray_shadows, renderer_set_sun_size, renderer_sun_size, renderer_set_ray_occlusion, renderer_ray_occlusion, renderer_set_lamp_size, renderer_set_ray_budget, renderer_ray_budget, renderer_ray_figures, renderer_ray_reach, renderer_add_light, renderer_remove_light,
+    renderer_set_shadows, renderer_shadows, renderer_set_ssr, renderer_ssr, renderer_set_ssr_params, renderer_set_taa, renderer_taa, request_dlss, dlss_available, renderer_set_dlss, renderer_dlss, set_samples, renderer_ray_query, renderer_set_ray_shadows, renderer_ray_shadows, renderer_set_sun_size, renderer_sun_size, renderer_set_ray_occlusion, renderer_ray_occlusion, renderer_set_lamp_size, renderer_set_ray_budget, renderer_ray_budget, renderer_ray_figures, renderer_ray_reach, renderer_set_ray_skinned, renderer_ray_skinned, renderer_map_drawn, renderer_add_light, renderer_remove_light,
     renderer_set_fog, renderer_fog, renderer_set_clouds, renderer_set_sky_overcast, renderer_set_shadow_distance, renderer_shadow_distance,
     renderer_set_ssao, renderer_ssao,
     skybox_create, skybox_free,
@@ -192,6 +192,10 @@ struct VKRenderer {
     defaults: ptr
     loaded_names: ptr
     shading_loaded: ptr
+    // The skinned figures posed into this frame's structure, nearest first
+    // (choose_skinned), and whether the map was drawn this frame.
+    skinned_rays: ptr
+    map_drawn: bool
 }
 
 available() -> bool {
@@ -298,6 +302,7 @@ renderer_new() -> *VKRenderer {
     // Nothing has been written into these blocks yet, so what they hold is not
     // what a default is.
     r.shading_loaded = calloc(vkdesc.PROGRAM_COUNT, 4)
+    r.skinned_rays = list.new()
     return r
 }
 
@@ -335,6 +340,7 @@ renderer_free(r: *VKRenderer) {
     if r.loaded_names != null { free(r.loaded_names) }
     if r.shading_loaded != null { free(r.shading_loaded) }
     if r.frustum != null { core.frustum_free(r.frustum) }
+    if r.skinned_rays != null { list.free(r.skinned_rays) }
     heap.free(r)
 }
 
@@ -564,6 +570,16 @@ renderer_ray_shadows(r: *VKRenderer) -> bool { return vkrays.shadows() }
 // rays last took, and the reach that took them, for a benchmark to report.
 renderer_set_ray_budget(r: *VKRenderer, figures: int) { vkrays.set_budget(figures) }
 renderer_ray_budget(r: *VKRenderer) -> int { return vkrays.budget() }
+// How many skinned figures a frame poses into the rays, the nearest first
+// (32 unless set; 0 leaves them all to the map), and how many it did.
+renderer_set_ray_skinned(r: *VKRenderer, figures: int) { vkrays.set_skin_budget(figures) }
+renderer_ray_skinned(r: *VKRenderer) -> int { return vkrays.skinned() }
+// Whether the last frame drew the key light's cascades: not where the rays
+// shaded everything that casts.
+renderer_map_drawn(r: *VKRenderer) -> bool {
+    if r == null { return false }
+    return r.map_drawn
+}
 renderer_ray_figures(r: *VKRenderer) -> int { return vkrays.figures() }
 renderer_ray_reach(r: *VKRenderer) -> float { return vkrays.reach_now() }
 
@@ -604,9 +620,11 @@ renderer_set_lamp_size(r: *VKRenderer, metres: float) {
     r.lamp_radius = metres * 0.5
 }
 
-// A model whose shadow the rays cast: a static mesh drawn on its own or
-// through a matrix stream, with its shadow on. A skinned figure, a crowd
-// and a point stream have no structure to trace and keep the map.
+// A model whose shadow the rays cast from the structure its mesh was
+// uploaded with: a static mesh drawn on its own or through a matrix
+// stream, with its shadow on. A skinned figure is posed into the rays each
+// frame instead (skin_traced), a crowd by its pose structures
+// (crowd_traced), and a point stream keeps the map.
 traced(m: *Model) -> bool {
     if m == null || !m.visible || !m.casts_shadow || m.vbo == 0 { return false }
     if m.skeleton != null || m.pose_bank != null || m.device_crowd != null { return false }
@@ -623,6 +641,101 @@ crowd_traced(m: *Model) -> bool {
     return dc.poses != 0
 }
 
+// Whether a crowd casts a shadow at all: one of the models drawing it is
+// shown and casts. A crowd that casts none writes nothing into the rays,
+// as it draws nothing into the map.
+crowd_casts(r: *VKRenderer, dc: *DeviceCrowd) -> bool {
+    count = list.size(r.models)
+    i = 0
+    while i < count {
+        m = list.get_raw(r.models, i) as *Model
+        if m != null && m.visible && m.casts_shadow && m.device_crowd == dc as ptr { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// A skinned figure that could be posed into the rays: one drawn on its own
+// by its skeleton, with its shadow on.
+skinned_candidate(m: *Model) -> bool {
+    if m == null || !m.visible || !m.casts_shadow || m.vbo == 0 || m.skeleton == null { return false }
+    if m.pose_bank != null || m.device_crowd != null || m.is_instanced { return false }
+    return vkmesh.skinned(m.vbo)
+}
+
+// A skinned figure posed into this frame's structure: the map need not
+// draw it.
+skin_traced(m: *Model) -> bool {
+    if m == null || m.skeleton == null || m.vbo == 0 { return false }
+    return vkrays.skin_posed(m.vbo)
+}
+
+// The skinned figures this frame poses into the rays: those within the
+// rays' reach of the camera (the shadow distance, every one where there is
+// none), the nearest first, as many as the budget takes. The rest keep the
+// map. Before the frame's room is reserved, which counts them.
+choose_skinned(r: *VKRenderer, cam: *Camera) {
+    list.clear(r.skinned_rays)
+    if !vkrays.shadows() || vkrays.skin_budget() <= 0 { return }
+    reach = r.shadow_distance
+    count = list.size(r.models)
+    i = 0
+    while i < count {
+        m = list.get_raw(r.models, i) as *Model
+        if skinned_candidate(m) {
+            core.model_sync_transform(m)
+            d = figure_distance(m, cam)
+            if reach <= 0.0 || d - m.bounding_radius <= reach {
+                // Into the list by distance, nearest first.
+                at = 0
+                while at < list.size(r.skinned_rays) && figure_distance(list.get_raw(r.skinned_rays, at) as *Model, cam) <= d {
+                    at = at + 1
+                }
+                list.add_raw(r.skinned_rays, m as ptr)
+                k = list.size(r.skinned_rays) - 1
+                while k > at {
+                    list.set(r.skinned_rays, k, list.get_raw(r.skinned_rays, k - 1))
+                    k = k - 1
+                }
+                list.set(r.skinned_rays, at, m as ptr)
+            }
+        }
+        i = i + 1
+    }
+    while list.size(r.skinned_rays) > vkrays.skin_budget() {
+        list.remove(r.skinned_rays, list.size(r.skinned_rays) - 1)
+    }
+}
+
+// How far a skinned figure stands from the camera: its model's origin, the
+// feet of a figure (its bounds are its bind pose's, about the origin).
+figure_distance(m: *Model, cam: *Camera) -> float {
+    dx = m.model_matrix.m12 - cam.position.x
+    dy = m.model_matrix.m13 - cam.position.y
+    dz = m.model_matrix.m14 - cam.position.z
+    return core.sqrt_of(dx * dx + dy * dy + dz * dz)
+}
+
+// The chosen figures posed into this frame's structure: each one skinned by
+// the palette its draw is posed by, its structure refitted from that, and
+// its instance at its model's matrix. A figure the rays could not take
+// keeps the map (skin_traced says no).
+pose_skinned(r: *VKRenderer) {
+    n = list.size(r.skinned_rays)
+    i = 0
+    while i < n {
+        m = list.get_raw(r.skinned_rays, i) as *Model
+        sk = m.skeleton as *Skeleton
+        skin.skeleton_update(sk)
+        bones = skin.skeleton_count(sk)
+        vkrays.skin_pose(m.vbo, vkmesh.vertex_buffer(m.vbo), vkmesh.skin_buffer(m.vbo), vkmesh.index_buffer(m.vbo),
+                         vkmesh.vertex_count(m.vbo), vkmesh.index_count(m.vbo),
+                         core.palette_data(skin.skeleton_palette(sk)), bones, (&m.model_matrix) as ptr)
+        i = i + 1
+    }
+    vkrays.skin_end()
+}
+
 // Room in the frame's structure for everything that will be in it -- the
 // crowds' figures, which the sorts write, and the static scene's
 // instances -- before any sort records into it, since the buffer cannot
@@ -631,7 +744,8 @@ reserve_ray_scene(r: *VKRenderer) {
     if !vkrays.shadows() { return }
     // The crowd's figures in the rays reach as far as the map did.
     vkrays.set_reach(r.shadow_distance)
-    statics = 0
+    // The skinned figures chosen for the rays take a slot each.
+    statics = list.size(r.skinned_rays)
     figures = 0
     count = list.size(r.models)
     i = 0
@@ -641,7 +755,7 @@ reserve_ray_scene(r: *VKRenderer) {
             if m.is_instanced { statics = statics + core.model_instance_count(m) } else { statics = statics + 1 }
         } else if crowd_traced(m) {
             dc = m.device_crowd as *DeviceCrowd
-            if dc.reserved_serial != r.sort_serial + 1 {
+            if dc.reserved_serial != r.sort_serial + 1 && crowd_casts(r, dc) {
                 dc.reserved_serial = r.sort_serial + 1
                 figures = figures + dc.count
             }
@@ -676,6 +790,7 @@ build_ray_scene(r: *VKRenderer) {
         }
         i = i + 1
     }
+    pose_skinned(r)
     // Nothing traced in view this frame: an empty structure all the same.
     if !vkrays.build() { vkrays.empty() }
 }
@@ -853,6 +968,7 @@ shadow_kind(m: *Model) -> int {
 
 render_shadow_pass(r: *VKRenderer, light: *Light, cam: *Camera) {
     r.key_cascaded = false
+    r.map_drawn = false
     if light == null || !vkframe.shadows() { return }
 
     // The depth pass has a block of its own to write into, and which one that
@@ -862,12 +978,17 @@ render_shadow_pass(r: *VKRenderer, light: *Light, cam: *Camera) {
 
     gather_casters(r, false)
     // The key light's cascades when it is the sun or the moon. A lamp that
-    // is the key light has a cube of its own below, like every lamp.
-    if light.mode == core.MODE_DIRECTIONAL {
+    // is the key light has a cube of its own below, like every lamp. Where
+    // the rays shade everything that casts -- the static scene, the skinned
+    // figures posed into them, the crowds -- there is nothing left for the
+    // cascades, and they are not drawn at all: the shader reads the rays
+    // alone, and the frame's shadow pass costs nothing (#492).
+    if light.mode == core.MODE_DIRECTIONAL && !(vkrays.shadows_now() && casters_empty(r)) {
         fit_cascades(r, light, cam)
         c = r.cascades as *Cascades
         if vkframe.shadow_begin() {
             r.key_cascaded = true
+            r.map_drawn = true
             // The casters by the pipeline that draws them -- the plain ones
             // and the instanced batches, then the skinned, the crowds and
             // the point streams (shadow_kind) -- and each kind into every
@@ -894,6 +1015,7 @@ render_shadow_pass(r: *VKRenderer, light: *Light, cam: *Camera) {
         }
     }
     draw_lamp_faces(r)
+    vkframe.shadow_done()
     vkdesc.set_clip_mat4(vkscene.OFF_LIGHTSPACEMATRIX, &r.shadow_space)
 }
 
@@ -927,7 +1049,7 @@ gather_casters(r: *VKRenderer, lamps: bool) {
             i = i + 1
             continue
         }
-        if !lamps && rays && (traced(m) || crowd_traced(m)) {
+        if !lamps && rays && (traced(m) || crowd_traced(m) || skin_traced(m)) {
             i = i + 1
             continue
         }
@@ -968,6 +1090,19 @@ gather_casters(r: *VKRenderer, lamps: bool) {
         if b.count > 1 { sync_batch_instances(b) }
         i = i + 1
     }
+}
+
+// Whether the cascades have nothing to draw this frame: no single caster
+// and no batch with a member (gather_casters, for the cascades).
+casters_empty(r: *VKRenderer) -> bool {
+    if r.shadow_singles != null && list.size(r.shadow_singles) > 0 { return false }
+    i = 0
+    while i < r.shadow_batch_count {
+        b = list.get_raw(r.shadow_batches, i) as *VKBatch
+        if b.count > 0 { return false }
+        i = i + 1
+    }
+    return true
 }
 
 // Whether a caster in the sphere at `centre` of `radius` goes into the tile
@@ -1244,7 +1379,7 @@ sort_device_crowds(r: *VKRenderer) {
             if dc.sorted_serial != r.sort_serial {
                 dc.sorted_serial = r.sort_serial
                 if dc.count > 0 && vkcrowd.fill(dc.handle, dc.pos, dc.yaw, dc.phase, dc.col, dc.start, dc.count) > 0 {
-                    vkcrowd.sort(dc.handle, dc.cx, dc.cz, dc.near_dist, dc.mid_dist, dc.cull_dist)
+                    vkcrowd.sort(dc.handle, dc.cx, dc.cz, dc.near_dist, dc.mid_dist, dc.cull_dist, crowd_casts(r, dc))
                 }
             }
         }
@@ -2165,6 +2300,7 @@ renderer_render(r: *VKRenderer, cam: *Camera, light: *Light) {
         i = i + 1
     }
 
+    choose_skinned(r, cam)
     reserve_ray_scene(r)
     sort_device_crowds(r)
     build_ray_scene(r)

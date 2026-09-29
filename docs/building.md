@@ -142,6 +142,7 @@ to read them.
 | `AE3D_AGENT_RECORD=path` | write the channel's whole session to `path`, every request and answer, for `tools/agent_replay.ae` ([agent.md](agent.md#recording-a-session-and-replaying-it)) |
 | `AE3D_MSAA=n`, `AE3D_TAA=1`, `AE3D_SSAO=1`, `AE3D_SSR=1` | the anti-aliasing and screen-space passes |
 | `AE3D_RAYS=1` | shadows by ray through the scene's acceleration structure, where the device has ray queries |
+| `AE3D_RAY_SKINNED=n` | how many skinned figures the rays pose a frame, the nearest first (32; 0 leaves them to the shadow map) |
 | `AE3D_SUN_SIZE=n` | the sun's size for the rays' penumbra, in tenths of a degree (5 is the sun; 0, the default, a point) |
 | `AE3D_RAY_AO=1` | ambient occlusion by ray in the screen-space pass's place |
 | `AE3D_DLSS=n` | DLSS at mode `n` (1 performance, 2 balanced, 3 quality, 6 DLAA) |
