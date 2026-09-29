@@ -466,7 +466,7 @@ done
 step "examples build and run"
 # The benchmark is built in the same pass: build_together starts from a clean
 # status directory, so a later call would forget that the examples built.
-build_together examples/*.ae tools/ae3d_bench.ae tools/measure_scene.ae tools/ae3d_agent.ae tools/ae3d_view.ae tools/critique_scene.ae tools/zombie_street.ae tools/bake_impostor.ae tools/fold_changes.ae
+build_together examples/*.ae tools/ae3d_bench.ae tools/measure_scene.ae tools/ae3d_agent.ae tools/ae3d_view.ae tools/critique_scene.ae tools/zombie_street.ae tools/bake_impostor.ae tools/fold_changes.ae tools/scene_parity.ae
 for example in examples/*.ae; do
     name="$(basename "$example" .ae)"
     if ! built_ok "$name"; then
@@ -754,6 +754,102 @@ elif ! built_ok zombie_street; then
 else
     frame_cost opengl 7915
     frame_cost vulkan 7916
+fi
+
+step "the scenes, drawn alike by both renderers"
+# The backend parity suite holds the renderers to each other on test scenes
+# of a few models; this holds them to each other on the scenes a person looks
+# at (#494), which is where zombie_city drew garbage on OpenGL at 3397101 with
+# every suite passing. Each scene runs on both at a fixed tick and holds at
+# the same frame, so the horde, the car and the clouds stand in the same
+# place; tools/scene_parity.ae compares the two frames region by region
+# (sky, facades, road, figures, the rest) against the tolerances it writes
+# down, and fails on a hole: a model on one renderer where the other shows
+# the sky or the clear colour.
+# What the two do not both do is off here, by name: the ray-traced shadows
+# and occlusion (Vulkan's alone; AE3D_RAYS=0), the eye's adaptation (it
+# meters each renderer's own frame; AE3D_EYE=0) and the temporal pass (it
+# folds in however many frames the hold drew; AE3D_TAA=0); the tool turns
+# the screen-space reflections off (Vulkan's alone until #491).
+scene_parity() {   # scene_parity <program> <name> <port> [VAR=value ...]
+    parity_program="$1"
+    parity_view="$2"
+    parity_name="scene parity ($2)"
+    parity_port="$3"
+    shift 3
+    parity_log="$(mktemp)"
+    parity_gl_log="$(mktemp)"
+    parity_vk_log="$(mktemp)"
+    # zombie_street takes its renderer as its argument; the examples, from
+    # AE3D_API.
+    parity_gl_arg=""
+    parity_vk_arg=""
+    if [ "$parity_program" = zombie_street ]; then
+        parity_gl_arg="opengl"
+        parity_vk_arg="vulkan"
+    fi
+    env "$@" AE3D_API=opengl AE3D_AGENT="$parity_port" AE3D_TICK=60 AE3D_HOLD=90 \
+        AE3D_RAYS=0 AE3D_EYE=0 AE3D_TAA=0 AE3D_HIDDEN=1 AE3D_WIDTH=640 AE3D_HEIGHT=360 \
+        AE3D_FRAMES=100000 ./build/"$parity_program" $parity_gl_arg >"$parity_gl_log" 2>&1 &
+    parity_gl=$!
+    env "$@" AE3D_API=vulkan AE3D_AGENT="$((parity_port + 1))" AE3D_TICK=60 AE3D_HOLD=90 \
+        AE3D_RAYS=0 AE3D_EYE=0 AE3D_TAA=0 AE3D_HIDDEN=1 AE3D_WIDTH=640 AE3D_HEIGHT=360 \
+        AE3D_FRAMES=100000 ./build/"$parity_program" $parity_vk_arg >"$parity_vk_log" 2>&1 &
+    parity_vk=$!
+    # Each scene opens its port after its window and its first frame; asked
+    # again while that is what came back and both scenes are alive.
+    parity_status=2
+    attempt=0
+    while [ "$attempt" -lt 300 ]; do
+        kill -0 "$parity_gl" 2>/dev/null || break
+        kill -0 "$parity_vk" 2>/dev/null || break
+        bounded "$RUN_LIMIT" ./build/scene_parity "$parity_port" "$((parity_port + 1))" --hold 90 --name "$parity_view" >"$parity_log" 2>&1
+        parity_status=$?
+        grep -q 'nothing answering' "$parity_log" || break
+        attempt=$((attempt + 1))
+        sleep 0.2
+    done
+    if [ "$parity_status" -eq 0 ]; then
+        pass "$parity_name"
+        grep -E '^  (ok|--)' "$parity_log" | sed 's/^/      /'
+    elif [ "$parity_status" -eq 3 ]; then
+        skip "$parity_name" "a frame cannot be read back on this machine"
+    elif grep -q 'no Vulkan driver' "$parity_vk_log"; then
+        skip "$parity_name" "no Vulkan driver"
+    elif [ "$parity_status" -eq 2 ] && { ! kill -0 "$parity_gl" 2>/dev/null || ! kill -0 "$parity_vk" 2>/dev/null; }; then
+        skip "$parity_name" "a scene could not open a window"
+    else
+        fail "$parity_name"
+        grep -E '^  |scene_parity:' "$parity_log" | sed 's/^/        /' | head -24
+    fi
+    kill "$parity_gl" "$parity_vk" 2>/dev/null
+    wait "$parity_gl" 2>/dev/null
+    wait "$parity_vk" 2>/dev/null
+    rm -f "$parity_log" "$parity_gl_log" "$parity_vk_log"
+}
+if ! built_ok scene_parity; then
+    fail "scene_parity (build)"
+    sed 's/^/        /' "$BUILD_DIR/scene_parity.log" | head -20
+elif ! have_display; then
+    skip "scene parity" "no display"
+else
+    if built_ok zombie_street; then
+        scene_parity zombie_street "zombie_street" 7941
+    else
+        skip "scene parity (zombie_street)" "it did not build"
+    fi
+    if built_ok zombie_city; then
+        for parity_view in 0 1 2 3 4 5 6; do
+            scene_parity zombie_city "zombie_city, view $parity_view" 7941 AE3D_VIEW="$parity_view"
+        done
+    else
+        skip "scene parity (zombie_city)" "it did not build"
+    fi
+    if built_ok street_drive; then
+        scene_parity street_drive "street_drive" 7941
+    else
+        skip "scene parity (street_drive)" "it did not build"
+    fi
 fi
 
 # The editor runs on either renderer, so both are checked: the Vulkan option

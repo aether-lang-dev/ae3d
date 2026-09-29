@@ -152,6 +152,8 @@ to read them.
 | `AE3D_CAMERA_WANDER=n` | fly the camera at random for `n` frames by injected keys and say the nearest it came to anything drawn ([rendering.md](rendering.md#the-camera)); `AE3D_CAMERA_WANDER_SPEED`, `_RANGE`, `_SEED` |
 | `AE3D_PHYSICS_SCENE=pyramid\|pile\|ragdolls\|cloth` | the reference scene `examples/physics` runs |
 | `AE3D_VIEW=3`, `AE3D_CAMX/Y/Z`, `AE3D_AIMX/Y/Z` | a camera placed by number, for sweeps ([testing.md](testing.md)) |
+| `AE3D_TICK=60`, `AE3D_HOLD=90` | every frame advances the world and the renderers' clock by 1/60 s whatever the wall clock did, and the agent channel holds the scene at frame 90: the same frame on every run and on either renderer ([testing.md](testing.md#the-scenes-on-both-renderers)) |
+| `AE3D_EYE=0` | the eye's adaptation off, where a scene turns it on |
 | `AE3D_DIAG=1` | a scene's own diagnostics on the console |
 | `AE3D_FONT_CACHE=dir` | where baked glyph atlases are kept, `build/cache/fonts` by default; `off` bakes every time ([ui.md](ui.md)) |
 

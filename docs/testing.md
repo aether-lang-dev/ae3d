@@ -95,6 +95,44 @@ Both run on both backends in `ci.sh`, and both exit 3 rather than 1 where
 the frame cannot be read back (software Vulkan on a headless runner has no
 swapchain), which is a skip and not a judgement.
 
+## The scenes on both renderers
+
+`test_backend_parity` holds the renderers to each other on test scenes of a
+few models. Nothing held them to each other on the scenes a person looks at,
+which is how `zombie_city` came to draw garbage on OpenGL at 3397101 (the
+scenes pack's merge) with every suite passing (#494).
+`tools/scene_parity.ae` does, in `ci.sh`, for `zombie_city` from each of its
+views 0 to 6, `zombie_street` and `street_drive`:
+
+- Each scene runs on OpenGL and on Vulkan at a fixed tick and holds at the
+  same frame (`AE3D_TICK=60 AE3D_HOLD=90`, 640 by 360), so the horde, the
+  car and the clouds stand in the same place on both.
+- What the two do not both do is off, by name: the ray-traced shadows and
+  occlusion (`AE3D_RAYS=0`), the eye's adaptation (`AE3D_EYE=0`, it meters
+  each renderer's own frame), the temporal pass (`AE3D_TAA=0`, it folds in
+  however many frames the hold drew) and the screen-space reflections (the
+  tool turns them off through `render.set`; Vulkan's alone until #491).
+- The frame is read as a 32 by 18 grid (`frame.grid`), then again with
+  every model hidden and with each region's models alone
+  (`scene.isolate matching=[...]`): the sky, the facades, the road, the
+  figures, and the rest -- whatever a model draws that no region names --
+  so nothing drawn goes unjudged. Each region's mean difference between the
+  renderers is held to its tolerance, 0..255: sky 2, facades 4, road 5.5,
+  figures 8, the rest 2. Those are the worst measured across the nine views
+  (sky 0.6, facades 2.5, road 3.4, figures 5.3, the rest 0.5, identical over
+  three runs on an RTX 4070 Ti) and half again, never under 2.
+- A hole fails the view: a cell where one renderer draws a model and the
+  other, differing there by more than 12, shows its own sky or the clear
+  colour. The first three are printed with what each renderer shows.
+
+At 3397101 every `zombie_city` view fails -- its facades and road 17 to 55
+apart, its figures 10 to 31, 16 to 197 of the 576 cells holes -- and
+`zombie_street` and `street_drive`, which it drew right, pass. The check
+found one real difference on its first run: the lamp's haze in the fogged
+air was Vulkan's alone, and `zombie_street` drew a fifth brighter there
+(mean red 92 against 74); it is on both renderers now, and the two agree to
+0.3 on the street's facades.
+
 ## Looking at a scene
 
 One still hides most of what goes wrong in a scene: a figure that

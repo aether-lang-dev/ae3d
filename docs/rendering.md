@@ -12,7 +12,10 @@ The feature list in full, with the reasoning behind each. The [README](../README
   lights, a Gerstner ocean, an instanced voxel chunk, the clouds, the
   occlusion and instances placed as points. They agree to within 0.7% of
   channels, and CI fails if the generated Vulkan shaders fall behind the GLSL
-  they are made from.
+  they are made from. The scenes a person looks at are held to each other
+  too: `tools/scene_parity.ae` draws `zombie_city` from its seven views,
+  `zombie_street` and `street_drive` on both at a fixed tick and compares
+  them region by region ([testing.md](testing.md#the-scenes-on-both-renderers)).
 - **The sun by the hour.** `engine_set_time_of_day(hours)` puts the sun where
   the hour does and sets the key light, the fog and a sky drawn from the same
   sun -- blue at noon, gold and red at dusk, moonlit at night -- so the sky,
@@ -52,9 +55,11 @@ The feature list in full, with the reasoning behind each. The [README](../README
   both backends), the key light's shadow in four cascades that a moving camera does not
   move ([Shadows](#shadows), both
   backends), volumetric clouds and their shadows, a sky drawn from the sun by
-  the hour or a painted one, fog applied after tone mapping, MSAA, FXAA and
-  bloom. Screen-space reflections on wet surfaces on
-  Vulkan.
+  the hour or a painted one, fog applied after tone mapping and the key
+  lamp's light scattered in the fogged air (the haze stands around a lamp
+  and thins away from it, marched along the view ray; both backends,
+  `rendering.set_frame_haze`), MSAA, FXAA and bloom. Screen-space
+  reflections on wet surfaces on Vulkan.
 - **A wet road, not a mirror.** The reflection (`engine_set_ssr(e, on,
   road_height, strength)`) is Fresnel-weighted -- little from a camera
   looking down at the road, most at a grazing look -- over a puddle mask in
