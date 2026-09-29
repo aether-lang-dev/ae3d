@@ -46,7 +46,11 @@ behaviours on the engine, added and removed like any other.
 2. **`fixed_update`** as many times as the frame's time covers at the fixed
    step (1/60 s by default, `engine_set_fixed_step`). Simulation goes here:
    the physics world steps, the horde separates and moves, the weather's
-   particles fall.
+   particles fall. An object another peer simulates -- in a multiplayer
+   session, what the host owns seen from a client, or another client's
+   player -- is passed by: its scripts' `fixed_update` runs only where the
+   object is simulated (`behaviour.object_remote`,
+   [networking.md](networking.md#who-simulates-what)).
 3. **The clips advance** by the frame's delta, then **`update`** runs once
    with it: game logic, cameras, anything that reads the simulation.
 4. **The clips are applied** to their skins, then **`pose`** runs:
