@@ -42,7 +42,7 @@
   the device's time 6.60 to 6.43 ms; 20,000 with a 28 m near band go from
   18.4 to 19.05 fps, 54.2 to 52.4 ms. The 139 and 54 fps docs/rendering.md
   gave were measured on 18 September; the tree before this change draws
-  the same city at 144 and 18.4 today (at 20,000 the 28 m near band now
+  the same city at 144 and 18.4 today (#498; at 20,000 the 28 m near band now
   holds some 4,500 whole figures).
 - A crowd none of whose models casts writes nothing into the rays, as it
   draws nothing into the map. The sort's copy of its counts waits for its

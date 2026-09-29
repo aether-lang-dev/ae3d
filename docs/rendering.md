@@ -405,7 +405,7 @@ each, alternating with the tree before, at 720p on an RTX 4070 Ti. The
 139 and 54 fps this page gave before were measured on 18 September;
 the city has changed since -- at 20,000 its 28 m near band now holds
 some 4,500 figures drawn whole, 137 million triangles a frame -- and on the same
-machine the tree before this change draws it at 144 and 18.4.)
+machine the tree before this change draws it at 144 and 18.4, #498.)
 
 What is left for the rays to do next: reflections by ray (#323).
 
