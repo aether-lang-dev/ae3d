@@ -107,6 +107,15 @@ views 0 to 6, `zombie_street` and `street_drive`:
 - Each scene runs on OpenGL and on Vulkan at a fixed tick and holds at the
   same frame (`AE3D_TICK=60 AE3D_HOLD=90`, 640 by 360), so the horde, the
   car and the clouds stand in the same place on both.
+- On a shared runner (`CI` set) both renderers are software rasterisers
+  (llvmpipe and lavapipe on Linux) and the job has minutes left, so the
+  same check is made lighter: 320 by 180, held at frame 12, the city's
+  horde a hundred strong with a 12 m near band (still all three tiers;
+  400 drawn whole to 600 m were 19 s a frame on llvmpipe), and four of its
+  seven views -- 0 (the street and the horde), 2 (the near band up close),
+  4 (the wet road at a grazing angle) and 5 (the sky and the skyline). A
+  view took 53 to 68 s there on a 24-thread machine; the step prints its
+  total.
 - What the two do not both do is off, by name: the ray-traced shadows and
   occlusion (`AE3D_RAYS=0`), the eye's adaptation (`AE3D_EYE=0`, it meters
   each renderer's own frame), the temporal pass (`AE3D_TAA=0`, it folds in
@@ -117,10 +126,14 @@ views 0 to 6, `zombie_street` and `street_drive`:
   (`scene.isolate matching=[...]`): the sky, the facades, the road, the
   figures, and the rest -- whatever a model draws that no region names --
   so nothing drawn goes unjudged. Each region's mean difference between the
-  renderers is held to its tolerance, 0..255: sky 2, facades 4, road 5.5,
-  figures 8, the rest 2. Those are the worst measured across the nine views
-  (sky 0.6, facades 2.5, road 3.4, figures 5.3, the rest 0.5, identical over
-  three runs on an RTX 4070 Ti) and half again, never under 2.
+  renderers is held to 2 of 255: the worst measured and half again, never
+  under 2. The worst were, on an RTX 4070 Ti (nine views, three runs, the
+  same to the tenth), sky 0.2, facades 0.7, road 0.8, figures 1.2, the rest
+  0.5; on Mesa 26's llvmpipe and lavapipe (nine views, the runner's
+  settings, two runs), sky 0.6, facades 0.8, road 1.1, figures 0.7, the rest
+  0.4, and road 1.3 with the horde a hundred strong as the runner has it. The verdict names both devices. What is left under 2 -- the
+  occlusion's grain and the wet road's far streaks, a unit apart -- is
+  #503.
 - A hole fails the view: a cell where one renderer draws a model and the
   other, differing there by more than 12, shows its own sky or the clear
   colour. The first three are printed with what each renderer shows.
@@ -128,10 +141,21 @@ views 0 to 6, `zombie_street` and `street_drive`:
 At 3397101 every `zombie_city` view fails -- its facades and road 17 to 55
 apart, its figures 10 to 31, 16 to 197 of the 576 cells holes -- and
 `zombie_street` and `street_drive`, which it drew right, pass. The check
-found one real difference on its first run: the lamp's haze in the fogged
-air was Vulkan's alone, and `zombie_street` drew a fifth brighter there
-(mean red 92 against 74); it is on both renderers now, and the two agree to
-0.3 on the street's facades.
+has found three real differences:
+- the lamp's haze in the fogged air was Vulkan's alone, and `zombie_street`
+  drew a fifth brighter there (mean red 92 against 74);
+- Vulkan turned every normal map inside out: the tangent frame is solved
+  from the screen's derivatives, the solve dropped the sign of its
+  determinant, and the screen's y runs up on OpenGL and down on Vulkan.
+  The wet road's ripples turned the other way, 2.2 and 5.3 apart on the
+  street's road and figures on a GPU and 6.4 and 14.7 on a runner's Mesa;
+  now 0.0 and 0.1 (`test_backend_parity`'s bricks under a raking light:
+  33,506 channels apart before, 852 now);
+- a crowd sorted on the device is one model whose bounds are one figure's
+  at the origin, and a lamp's face asked by those drew the crowd only where
+  it held the origin: in the city a lamp's pool in the horde was lit on
+  Vulkan with no figure's shadow in it (view 3's road 3.3 apart, now 0.8;
+  `test_ray_shadows` holds a figure 212 m out under a lamp of its own).
 
 ## Looking at a scene
 

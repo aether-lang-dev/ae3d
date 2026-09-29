@@ -771,6 +771,44 @@ step "the scenes, drawn alike by both renderers"
 # meters each renderer's own frame; AE3D_EYE=0) and the temporal pass (it
 # folds in however many frames the hold drew; AE3D_TAA=0); the tool turns
 # the screen-space reflections off (Vulkan's alone until #491).
+#
+# On a shared runner (CI set) both renderers are software rasterisers
+# (llvmpipe and lavapipe on Linux), billed for every vertex and pixel, and
+# the step has the few minutes the job has left. There it is the same check
+# made lighter, each part for its reason:
+# - 320 by 180, the size every other CI draw is made at: a quarter of the
+#   pixels, and the grid's cells ten pixels across instead of twenty;
+# - held at frame 12 rather than 90: every frame before the hold is drawn,
+#   and any moment both renderers hold at is a moment to compare them at;
+# - the city's horde a hundred strong with a 12 m near band (AE3D_CROWD=100
+#   AE3D_NEAR=12): its 400 zombies drawn whole to 600 m are 12 million
+#   triangles a frame, 19 s a frame on llvmpipe even at 320 by 180 and past
+#   the step's limit before frame 12, and every lamp's face draws the horde
+#   again for its shadow; a hundred at 12 m still stand in all three tiers
+#   -- the near meshes, the far mesh, the impostors -- and a view takes
+#   about a minute on both renderers (53 to 68 s on Mesa, 24 threads)
+#   where 400 took over two;
+# - four of its seven views, one for each region at its largest: 0, the
+#   street with the horde in all three tiers; 2, low in the horde, the near
+#   band's figures up close; 4, grazing along the wet road, where its
+#   normal maps and the lamps' streaks are; 5, toward the moon, the sky, the
+#   clouds and the skyline. Views 1, 3 and 6 are the same surfaces from
+#   other places and stay in the full run on a GPU.
+# The tolerances are the same: measured on both, the renderers agree as
+# closely on the software rasterisers as on a GPU (tools/scene_parity.ae).
+if [ -n "${CI:-}" ]; then
+    parity_width=320
+    parity_height=180
+    parity_hold=12
+    parity_views="0 2 4 5"
+    parity_city="AE3D_CROWD=100 AE3D_NEAR=12"
+else
+    parity_width=640
+    parity_height=360
+    parity_hold=90
+    parity_views="0 1 2 3 4 5 6"
+    parity_city=""
+fi
 scene_parity() {   # scene_parity <program> <name> <port> [VAR=value ...]
     parity_program="$1"
     parity_view="$2"
@@ -788,12 +826,12 @@ scene_parity() {   # scene_parity <program> <name> <port> [VAR=value ...]
         parity_gl_arg="opengl"
         parity_vk_arg="vulkan"
     fi
-    env "$@" AE3D_API=opengl AE3D_AGENT="$parity_port" AE3D_TICK=60 AE3D_HOLD=90 \
-        AE3D_RAYS=0 AE3D_EYE=0 AE3D_TAA=0 AE3D_HIDDEN=1 AE3D_WIDTH=640 AE3D_HEIGHT=360 \
+    env "$@" AE3D_API=opengl AE3D_AGENT="$parity_port" AE3D_TICK=60 AE3D_HOLD="$parity_hold" \
+        AE3D_RAYS=0 AE3D_EYE=0 AE3D_TAA=0 AE3D_HIDDEN=1 AE3D_WIDTH="$parity_width" AE3D_HEIGHT="$parity_height" \
         AE3D_FRAMES=100000 ./build/"$parity_program" $parity_gl_arg >"$parity_gl_log" 2>&1 &
     parity_gl=$!
-    env "$@" AE3D_API=vulkan AE3D_AGENT="$((parity_port + 1))" AE3D_TICK=60 AE3D_HOLD=90 \
-        AE3D_RAYS=0 AE3D_EYE=0 AE3D_TAA=0 AE3D_HIDDEN=1 AE3D_WIDTH=640 AE3D_HEIGHT=360 \
+    env "$@" AE3D_API=vulkan AE3D_AGENT="$((parity_port + 1))" AE3D_TICK=60 AE3D_HOLD="$parity_hold" \
+        AE3D_RAYS=0 AE3D_EYE=0 AE3D_TAA=0 AE3D_HIDDEN=1 AE3D_WIDTH="$parity_width" AE3D_HEIGHT="$parity_height" \
         AE3D_FRAMES=100000 ./build/"$parity_program" $parity_vk_arg >"$parity_vk_log" 2>&1 &
     parity_vk=$!
     # Each scene opens its port after its window and its first frame; asked
@@ -803,7 +841,7 @@ scene_parity() {   # scene_parity <program> <name> <port> [VAR=value ...]
     while [ "$attempt" -lt 300 ]; do
         kill -0 "$parity_gl" 2>/dev/null || break
         kill -0 "$parity_vk" 2>/dev/null || break
-        bounded "$RUN_LIMIT" ./build/scene_parity "$parity_port" "$((parity_port + 1))" --hold 90 --name "$parity_view" >"$parity_log" 2>&1
+        bounded "$RUN_LIMIT" ./build/scene_parity "$parity_port" "$((parity_port + 1))" --hold "$parity_hold" --name "$parity_view" >"$parity_log" 2>&1
         parity_status=$?
         grep -q 'nothing answering' "$parity_log" || break
         attempt=$((attempt + 1))
@@ -811,7 +849,10 @@ scene_parity() {   # scene_parity <program> <name> <port> [VAR=value ...]
     done
     if [ "$parity_status" -eq 0 ]; then
         pass "$parity_name"
-        grep -E '^  (ok|--)' "$parity_log" | sed 's/^/      /'
+        grep -E '^scene_parity: .* against |^  (ok|--)' "$parity_log" | sed 's/^/      /'
+    elif [ "$parity_status" -eq 124 ]; then
+        fail "$parity_name (not held and compared within ${RUN_LIMIT}s)"
+        tail -3 "$parity_gl_log" "$parity_vk_log" | sed 's/^/        /'
     elif [ "$parity_status" -eq 3 ]; then
         skip "$parity_name" "a frame cannot be read back on this machine"
     elif grep -q 'no Vulkan driver' "$parity_vk_log"; then
@@ -833,14 +874,15 @@ if ! built_ok scene_parity; then
 elif ! have_display; then
     skip "scene parity" "no display"
 else
+    parity_started="$(date +%s)"
     if built_ok zombie_street; then
         scene_parity zombie_street "zombie_street" 7941
     else
         skip "scene parity (zombie_street)" "it did not build"
     fi
     if built_ok zombie_city; then
-        for parity_view in 0 1 2 3 4 5 6; do
-            scene_parity zombie_city "zombie_city, view $parity_view" 7941 AE3D_VIEW="$parity_view"
+        for parity_view in $parity_views; do
+            scene_parity zombie_city "zombie_city, view $parity_view" 7941 AE3D_VIEW="$parity_view" $parity_city
         done
     else
         skip "scene parity (zombie_city)" "it did not build"
@@ -850,6 +892,7 @@ else
     else
         skip "scene parity (street_drive)" "it did not build"
     fi
+    echo "        the scenes compared in $(( $(date +%s) - parity_started ))s, ${parity_width} by ${parity_height} at frame ${parity_hold}"
 fi
 
 # The editor runs on either renderer, so both are checked: the Vulkan option

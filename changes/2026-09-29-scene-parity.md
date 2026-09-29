@@ -5,13 +5,20 @@
   OpenGL and on Vulkan at a fixed tick, held at the same frame (640 by 360,
   frame 90), compared region by region -- the sky, the facades, the road,
   the figures and the rest (whatever a model draws that no region names) --
-  as the mean of a 32 by 18 grid's cell differences. The tolerances are
-  written in the tool with what they were measured from: sky 2, facades 4,
-  road 5.5, figures 8, the rest 2 (of 255), against the worst of the nine
-  views at sky 0.6, facades 2.5, road 3.4, figures 5.3 and the rest 0.5,
-  the same to the tenth over three runs. A view also fails on a hole: a
-  cell where one renderer draws a model and the other shows the sky or the
-  clear colour.
+  as the mean of a 32 by 18 grid's cell differences, each region held to 2
+  of 255. The tolerances are written in the tool with what they were
+  measured from: the worst of the nine views was sky 0.2, facades 0.7, road
+  0.8, figures 1.2 and the rest 0.5 on an RTX 4070 Ti (three runs, the
+  same to the tenth), and 0.6, 0.8, 1.1, 0.7 and 0.4 on Mesa 26's llvmpipe
+  and lavapipe; each tolerance is the worst and half again, never under 2.
+  A view also fails on a hole: a cell where one renderer draws a model and
+  the other shows the sky or the clear colour. What is left under 2 is
+  #503.
+- On a shared runner, where both renderers are software rasterisers and
+  the job has minutes left, the same check is made lighter: 320 by 180,
+  held at frame 12, the city's horde a hundred strong with a 12 m near band
+  (all three tiers still drawn), and views 0, 2, 4 and 5 of its seven, each
+  kept for a region at its largest. The step prints its total.
 - What the two renderers do not both do is off by name: the rays
   (`AE3D_RAYS=0`), the eye's adaptation (`AE3D_EYE=0`), the temporal pass
   (`AE3D_TAA=0`) and the screen-space reflections (Vulkan's alone until
@@ -43,6 +50,28 @@
   now (`rendering.set_frame_haze`); `test_fog` holds a ground beside a
   configured slab to its haze on both (it lost all of it before: 701456
   against 827234).
+- The check found two more, both fixed in the renderers:
+  - Vulkan turned every normal map inside out. The tangent frame is solved
+    from the screen's derivatives, the solve dropped the sign of its
+    determinant, and the screen's y runs up on OpenGL and down on Vulkan:
+    the wet road's ripples ran the other way, zombie_street's road and
+    figure 2.2 and 5.3 apart on a GPU and 6.4 and 14.7 on a runner's Mesa;
+    now 0.0 and 0.1. `test_backend_parity` lays bricks under a raking light
+    (33,506 of 147,456 channels apart before, 852 now).
+  - A crowd sorted on the device is one model whose bounds are one figure's
+    at the origin; a lamp's face, and a cascade, asked by those drew the
+    crowd only where they held the origin, and a lamp's pool in the city's
+    horde was lit with no figure's shadow in it (view 3's road 3.3 apart,
+    now 0.8). It is bounded by its figures now, as OpenGL's crowd is by its
+    instances; `test_ray_shadows` stands a figure 212 m out under a lamp of
+    its own (497 against 675 casting nothing; 675 before). Drawing it there
+    costs the city at 20,000 figures (rays on) 19.05 fps to 17.5, the shadow
+    stage 2.3 ms to 9.6 with the crowd's depth shader dropping figures past a
+    lamp's reach (10.9 without); each lamp's faces drawing only the figures
+    within its reach is #505. At 400 it stays at 144 fps, 6.55 to 6.68 ms
+    of device time.
+  - And the occlusion's normal took its upward neighbour from the screen's
+    y, which runs the other way on Vulkan; it takes the one above on both.
 - `zombie_city`'s impostor tier is named for its figure
   (`Zombie_Body, impostors`), so the channel and the check find the
   horde's far band.

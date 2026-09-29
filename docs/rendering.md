@@ -406,6 +406,12 @@ each, alternating with the tree before, at 720p on an RTX 4070 Ti. The
 the city has changed since -- at 20,000 its 28 m near band now holds
 some 4,500 figures drawn whole, 137 million triangles a frame -- and on the same
 machine the tree before this change draws it at 144 and 18.4, #498.)
+The scene parity check (#494) then found the horde missing from the lamps'
+own shadows on Vulkan -- a crowd sorted on the device was bounded by one
+figure at the origin -- and put it there: at 20,000 the frame is 17.5 fps,
+the lamps beyond the rays' reach each drawing the horde into their faces
+(the shadow stage 9.6 ms, from 2.3), until each lamp's faces draw only the
+figures within its reach (#505). At 400 it stays at 144.
 
 What is left for the rays to do next: reflections by ray (#323).
 
