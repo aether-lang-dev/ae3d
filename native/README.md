@@ -19,9 +19,13 @@ frame's light meter
 (`ae3d.vkmeter`), the text and rectangles drawn over the frame
 (`ae3d.vkoverlay`), reading a frame back, offscreen or captured
 (`ae3d.vkreadback`), making textures -- a model's image with its mip
-chain, the clouds' volumes, the pose banks (`ae3d.vktexture`) -- and
+chain, the clouds' volumes, the pose banks (`ae3d.vktexture`) --
 uploading meshes, geometry that many models share uploaded once
-(`ae3d.vkmesh`), are Aether, their buffers and memory `ae3d.vkhost`'s.
+(`ae3d.vkmesh`), the scene's acceleration structures the shadow rays are
+traced through, a mesh's at upload, the frame's once a frame and a
+crowd's poses (`ae3d.vkrays`), and the crowd sorted by a compute pass on
+the device into the tiers it draws (`ae3d.vkcrowd`), are Aether, their
+buffers and memory `ae3d.vkhost`'s, their SPIR-V `ae3d.vkspirv`'s.
 
 What was C for other reasons has moved too: the crowd's kernels
 (`ae3d.horde`), the flow field (`ae3d.nav`), the weather's particles
@@ -39,7 +43,7 @@ every image in the repository and 87 fixtures decode to the bytes stb gave
 
 | folder | what | why still C |
 |---|---|---|
-| `gpu/` | `vulkan.c`, the Vulkan renderer but for its device, its meter, its readback, its overlay, making its textures and uploading its meshes; `opengl_api.c`, the resolver `ae3d.glapi` looks up every OpenGL entry point through; `offscreen.c`, the offscreen GL context (CGL on macOS, a hidden GLFW window elsewhere); `jobs.c`, the door through which the renderers' own loops reach `ae3d.jobs`; `stores.h`, the mesh and instance stores as the renderers read them (they are `ae3d.geometry`'s, in Aether; `stores.c` lets `tests/test_geometry` hold the two layouts together); `shaders/`, the Vulkan GLSL that `tools/generate_shaders.ae` derives from the OpenGL sources in `src/ae3d/shaders` (`vulkan_shaders.h`, the SPIR-V, and `vulkan_uniforms.h`, the uniform block, are its output too) | the OpenGL renderer is Aether (`ae3d.gl`, `ae3d.glapi`, `ae3d.offscreen`, `ae3d.capture`) but for the resolver and the contexts, which are the platform's; the Vulkan one moves next ([#398](https://github.com/nicolas-maman/ae3d/issues/398), [#402](https://github.com/nicolas-maman/ae3d/issues/402)) |
+| `gpu/` | `vulkan.c`, the Vulkan renderer but for its device, its meter, its readback, its overlay, making its textures, uploading its meshes, its rays and its device crowds; `opengl_api.c`, the resolver `ae3d.glapi` looks up every OpenGL entry point through; `offscreen.c`, the offscreen GL context (CGL on macOS, a hidden GLFW window elsewhere); `jobs.c`, the door through which the renderers' own loops reach `ae3d.jobs`; `stores.h`, the mesh and instance stores as the renderers read them (they are `ae3d.geometry`'s, in Aether; `stores.c` lets `tests/test_geometry` hold the two layouts together); `shaders/`, the Vulkan GLSL that `tools/generate_shaders.ae` derives from the OpenGL sources in `src/ae3d/shaders` (`ae3d.vkspirv` and `vulkan_shaders.h`, the SPIR-V, and `vulkan_uniforms.h`, the uniform block, are its output too) | the OpenGL renderer is Aether (`ae3d.gl`, `ae3d.glapi`, `ae3d.offscreen`, `ae3d.capture`) but for the resolver and the contexts, which are the platform's; the Vulkan one moves next ([#398](https://github.com/nicolas-maman/ae3d/issues/398), [#402](https://github.com/nicolas-maman/ae3d/issues/402)) |
 | `platform/` | `crash.c`, the native stack printed on a crash; `metal_surface.m`, the CAMetalLayer MoltenVK draws into on macOS | a signal handler may call only what is async-signal-safe and has to be installed when the library loads, before any entry point; the Objective-C runtime |
 | `dlss/` | `streamline.cpp`, DLSS through NVIDIA Streamline; `stub.c`, what is built without the SDK | the SDK's interface is C++ |
 

@@ -11,10 +11,10 @@
 // megabytes, handed to the backend to free once the batch that reads it
 // has run.
 //
-// The backend adopts the buffers into the mesh table its draws read
-// (ae3d_vk_mesh_adopt), and builds the mesh's bottom-level structure for
-// the rays there, into the same batch: the acceleration-structure commands
-// are not in contrib.vulkan.vk yet (aether-lang-dev/aether#2203).
+// Where the device traces rays, the mesh's bottom-level structure is built
+// into the same batch, after the copies (ae3d.vkrays), and kept with the
+// mesh. The backend adopts the buffers into the mesh table its draws read
+// (ae3d_vk_mesh_adopt).
 //
 // Geometry that appears many times is uploaded once, so the models using
 // it can be merged into a single instanced draw: this module keeps the
@@ -24,15 +24,15 @@
 
 import contrib.vulkan.vk
 import ae3d.vkhost
+import ae3d.vkrays
 import ae3d.geometry
 
 exports (
-    mesh_upload, mesh_free, mesh_shared, mesh_forget, uploads, shares, live, slots
+    mesh_upload, mesh_free, mesh_shared, mesh_forget, blas_address, uploads, shares, live, slots
 )
 
 extern ae3d_vk_mesh_adopt(vertex_buffer: ptr, vertex_memory: ptr, index_buffer: ptr, index_memory: ptr,
-                          skin_buffer: ptr, skin_memory: ptr, vertex_count: int, index_count: int) -> int
-extern ae3d_vk_mesh_usage() -> int
+                          skin_buffer: ptr, skin_memory: ptr, index_count: int) -> int
 extern ae3d_vk_mesh_count() -> int
 extern ae3d_vk_free_mesh(handle: int)
 extern ae3d_vk_batch_commands() -> ptr
@@ -55,13 +55,19 @@ const CHUNK = 16777216
 
 // What was uploaded under a handle: how much, a copy of the bytes it was
 // built from (null for a skinned mesh, which never shares, or where the
-// copy could not be had), and how many models draw it.
+// copy could not be had), how many models draw it, and its structure for
+// the rays (nulls and 0 for none: a skinned mesh, or a device that does not
+// trace).
 struct VKMeshShape {
     vertices: ptr
     indices: ptr
     vertex_count: int
     index_count: int                 // as uploaded: a mesh without indices is numbered
     refs: int
+    blas: ptr
+    blas_buffer: ptr
+    blas_memory: ptr
+    blas_address: long
 }
 
 var g_shapes: ptr = null             // by handle, what the backend's table holds a mesh in
@@ -118,13 +124,28 @@ put(handle: int, shape: *VKMeshShape) {
     (g_shapes as ptr[])[handle] = shape as ptr
 }
 
-drop(handle: int) {
+// The record under `handle` forgotten, its copies freed; its structure
+// too, when `with_structure` (the device no longer reading it).
+drop(handle: int, with_structure: bool) {
     shape = shape_at(handle)
     if shape == null { return }
+    if with_structure { vkrays.blas_free(structure_of(shape)) }
     if shape.vertices != null { free(shape.vertices) }
     if shape.indices != null { free(shape.indices) }
     free(shape as ptr)
     (g_shapes as ptr[])[handle] = null
+}
+
+structure_of(shape: *VKMeshShape) -> Blas {
+    return Blas { handle: shape.blas, buffer: shape.blas_buffer, memory: shape.blas_memory, address: shape.blas_address }
+}
+
+// The address of the structure the rays trace the mesh under `handle` by,
+// for its instances in the frame's structure; 0 for none.
+blas_address(handle: int) -> long {
+    shape = shape_at(handle)
+    if shape == null { return 0 as long }
+    return shape.blas_address
 }
 
 // The mesh already uploaded from these bytes, or 0.
@@ -177,9 +198,11 @@ stage(commands: ptr, source: ptr, bytes: int, target: ptr) -> bool {
     return true
 }
 
-// The buffers of a mesh made, filled and adopted: its handle, or 0.
-upload_new(mesh: ptr, vertices: ptr, indices: ptr, vertex_count: int, index_count: int, skinned: bool) -> int {
-    rays = ae3d_vk_mesh_usage()
+// The buffers of a mesh made, filled and adopted, its structure for the
+// rays built into `shape`: its handle, or 0.
+upload_new(mesh: ptr, vertices: ptr, indices: ptr, vertex_count: int, index_count: int, skinned: bool,
+           shape: *VKMeshShape) -> int {
+    rays = vkrays.input_usage()
     vertex_bytes = vertex_count * STRIDE
     index_bytes = index_count * 4
     skin_bytes = vertex_count * SKIN_STRIDE
@@ -210,8 +233,20 @@ upload_new(mesh: ptr, vertices: ptr, indices: ptr, vertex_count: int, index_coun
         ae3d_vk_set_error("a mesh's upload could not be staged")
         return 0
     }
-    return ae3d_vk_mesh_adopt(vb.buffer, vb.memory, ib.buffer, ib.memory, sb.buffer, sb.memory,
-                              vertex_count, index_count)
+    // Its structure for the rays, a skinned mesh's pose not being in its
+    // buffers: into the batch, after the copies it reads.
+    if vkrays.query() && !skinned {
+        b = vkrays.blas_build(vb.buffer, ib.buffer, vertex_count, index_count, STRIDE, commands)
+        shape.blas = b.handle
+        shape.blas_buffer = b.buffer
+        shape.blas_memory = b.memory
+        shape.blas_address = b.address
+    }
+    handle = ae3d_vk_mesh_adopt(vb.buffer, vb.memory, ib.buffer, ib.memory, sb.buffer, sb.memory, index_count)
+    // Refused, the backend ran the batch before destroying the buffers: the
+    // structure built from them goes after them.
+    if handle == 0 { vkrays.blas_free(structure_of(shape)) }
+    return handle
 }
 
 // A mesh on the device: the handle the backend draws it by, the one
@@ -225,7 +260,7 @@ mesh_upload(mesh: ptr) -> int {
     }
     // Handles from another device name nothing on this one.
     if d != g_device {
-        mesh_forget()
+        forget(false)
         g_device = d
     }
     vertices = geometry.mesh_vertex_data(mesh)
@@ -270,10 +305,11 @@ mesh_upload(mesh: ptr) -> int {
         index_count = vertex_count
     }
 
-    handle = upload_new(mesh, vertices, indices, vertex_count, index_count, skinned)
+    shape = calloc(1, sizeof(VKMeshShape)) as *VKMeshShape
+    handle = upload_new(mesh, vertices, indices, vertex_count, index_count, skinned, shape)
+    if handle == 0 { free(shape as ptr) }
     if handle != 0 {
         g_uploads = g_uploads + 1
-        shape = calloc(1, sizeof(VKMeshShape)) as *VKMeshShape
         shape.vertex_count = vertex_count
         shape.index_count = index_count
         shape.refs = 1
@@ -291,7 +327,7 @@ mesh_upload(mesh: ptr) -> int {
             }
         }
         // A slot the backend hands out again was let go of through here.
-        drop(handle)
+        drop(handle, true)
         put(handle, shape)
     }
     if numbered != null { free(numbered) }
@@ -303,12 +339,18 @@ mesh_upload(mesh: ptr) -> int {
 mesh_free(handle: int) {
     if handle <= 0 { return }
     shape = shape_at(handle)
-    if shape != null {
-        shape.refs = shape.refs - 1
-        if shape.refs > 0 { return }
-        drop(handle)
+    if shape == null {
+        ae3d_vk_free_mesh(handle)
+        return
     }
+    shape.refs = shape.refs - 1
+    if shape.refs > 0 { return }
+    // The structure after the buffers: the backend waits for the device
+    // before it frees them, and the frames in flight may trace it.
+    structure = structure_of(shape)
+    drop(handle, false)
     ae3d_vk_free_mesh(handle)
+    vkrays.blas_free(structure)
 }
 
 // Whether more than one model draws this mesh. The upload hands the same
@@ -320,13 +362,18 @@ mesh_shared(handle: int) -> bool {
     return shape.vertices != null && shape.refs > 1
 }
 
-// Everything forgotten, when the backend has shut down (its table went
-// with it) or the device changed: the copies freed, and the staging, which
-// the backend freed at its last flush, let go of.
-mesh_forget() {
+// Everything forgotten when the backend has shut down (its table went
+// with it): the copies freed, the structures destroyed on the device that
+// is still up, and the staging, which the backend freed at its last flush,
+// let go of.
+mesh_forget() { forget(true) }
+
+// The same, `with_structures` or not: a device that changed took them
+// with it.
+forget(with_structures: bool) {
     h = 1
     while h < g_capacity {
-        drop(h)
+        drop(h, with_structures)
         h = h + 1
     }
     if g_shapes != null { free(g_shapes) }
