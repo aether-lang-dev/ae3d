@@ -47,4 +47,7 @@
 - A crowd none of whose models casts writes nothing into the rays, as it
   draws nothing into the map. The sort's copy of its counts waits for its
   writes as a write, which sync validation found once the sort's layout
-  grew a binding.
+  grew a binding. And a crowd's descriptor sets go back to the pool when
+  it is freed: a program that made and freed crowds as it went could make
+  seven more after its first and no more (`test_device_crowd` now makes
+  twenty, one after another).
