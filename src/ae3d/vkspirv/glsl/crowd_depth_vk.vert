@@ -167,6 +167,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float impostorHeight;
     float crowdTravel;
     float crowdPhaseStep;
+    vec4 shadowReach;
 };
 layout(set = 0, binding = 1) uniform sampler2D textureSampler;
 layout(set = 0, binding = 2) uniform sampler2D shadowMap;
@@ -181,6 +182,13 @@ layout(location = 11) in float instancePhase;
 
 
 
+
+// Into a lamp's face: where the lamp stands and how far from it a figure
+// can stand and still shadow anything its map covers (0 for everywhere, a
+// cascade). A figure further off lies on no line from the lamp to a
+// surface it lights, and is not posed or drawn: the whole crowd is drawn
+// into every face that the crowd reaches, and most of it is nowhere near
+// the lamp.
 
 
 mat4 boneAt(int bone, int frame) {
@@ -200,6 +208,11 @@ mat4 skinAt(int frame) {
 
 void main() {
     mat4 modelMatrix = model * instanceModel;
+    if (shadowReach.w > 0.0 && distance(modelMatrix[3].xyz, shadowReach.xyz) > shadowReach.w) {
+        // Outside every clip volume: the triangle is dropped.
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        return;
+    }
     float fpos = instancePhase * float(poseBankFrames);
     int frame0 = int(floor(fpos));
     float blend = fpos - float(frame0);

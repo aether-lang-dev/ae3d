@@ -167,6 +167,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float impostorHeight;
     float crowdTravel;
     float crowdPhaseStep;
+    vec4 shadowReach;
 };
 layout(set = 0, binding = 1) uniform sampler2DMS depthSamples;
 

@@ -167,6 +167,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float impostorHeight;
     float crowdTravel;
     float crowdPhaseStep;
+    vec4 shadowReach;
 };
 
 // Nothing to write. The depth attachment takes gl_FragCoord.z on its own, and
