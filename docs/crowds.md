@@ -104,7 +104,8 @@ A cell points one of eight ways, so the heading it asks for is one of
 eight constants, not libm's `atan2`, which isn't the same function on
 every platform: a horde stepped on every peer of a game
 ([networking.md](networking.md#the-horde)) turns by the same bits on each.
-`AE3D_HUNT=1` sends the city's horde after the camera with it.
+The city's horde hunts the camera with it, so it fills the view it is
+seen from (`AE3D_HUNT=0` lets it wander instead).
 
 ## What is checked
 

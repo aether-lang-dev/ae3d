@@ -1,0 +1,470 @@
+// The scene's point and spot lights, cut into the clusters of the view that
+// each one reaches (#468).
+//
+// A pixel is lit by the lights whose light reaches it, and by no other.
+// Picking a fixed number of lights for the whole frame -- the nearest to the
+// camera, as the renderers did -- lights a lamp's pool while the camera
+// stands near it and puts it out when the camera walks away, so a street
+// lit by its lamps changes as it is looked at. Clustered shading is the
+// standing answer: the view frustum is cut into a grid of cells, COLUMNS by
+// ROWS across the screen and SLICES deep, the depth cut logarithmically so a
+// cell is as long as it is wide at any distance; every light is listed in
+// the cells its sphere of reach overlaps; and a pixel shades with the list
+// of its own cell. The frame then pays for the lights near a pixel, not for
+// the number of lights in the scene, and every lamp lights its ground
+// wherever the camera is.
+//
+// This builds the lists on the CPU every frame, for both renderers, into
+// one layout they upload as it stands (OpenGL as textures, Vulkan as storage
+// buffers):
+//
+//   lights  LIGHT_FLOATS floats a light, five vec4s:
+//           position.xyz, reach      the sphere it lights
+//           color.rgb, intensity
+//           direction.xyz, kind      a spot's axis; 0 point, 2 spot
+//           constant, linear, quadratic, temperature
+//           spot cos outer, spot cos inner, shadow slot, 0
+//           (the slot of the lamp's own shadow, ae3d.lampshadows, or -1)
+//   tail    after the lights, room for set_tail's floats: the lamps'
+//           shadows (ae3d.lampshadows.write_slots), uploaded with them
+//   words   first, per cell, where its list starts and how long it is (two
+//           words a cell, cells ordered x fastest, then y, then depth);
+//           then the lists themselves, light indices. Floats, not integers:
+//           OpenGL 4.1 reads them from a float texture, and every index and
+//           offset stays far below the 2^24 a float holds exactly.
+//
+// A cell of the grid is located from a world position by `view_projection`
+// (for its column and row) and `forward` (for its depth): the matrices the
+// grid was cut with, not the renderer's jittered projection, so the CPU's
+// cells and the shader's lookup cannot disagree. The shader's side is
+// `cluster_of` in ae3d.shaders.
+//
+// The key light and the directional lights are not clustered: they reach
+// every pixel, and the renderers keep them in their small uniform array.
+
+import std.list
+import ae3d.core
+
+exports (
+    LightGrid, grid_new, grid_free, build, reach, set_tail, tail_data, data_floats,
+    placed_light, set_shadow_slot,
+    light_count, light_data, word_count, word_data, cell_count, cell_of,
+    COLUMNS, ROWS, SLICES, LIGHT_FLOATS, FADE_START
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern realloc(p: ptr, size: long) -> ptr
+extern free(p: ptr)
+extern sqrt(x: float) -> float
+extern log(x: float) -> float
+extern floor(x: float) -> float
+extern exp(x: float) -> float
+
+const COLUMNS = 16
+const ROWS = 9
+const SLICES = 24
+const LIGHT_FLOATS = 20
+// A light reaches as far as its attenuation takes it to REACH_FRACTION of
+// its value at the light, the fall-off the shader used to cut at; the last
+// quarter of that distance fades smoothly to nothing (FADE_START), so a
+// pool ends in a gradient rather than an edge wherever the cut falls.
+const REACH_FRACTION = 0.015625
+const FADE_START = 0.75
+
+struct LightGrid {
+    columns: int
+    rows: int
+    slices: int
+    near: float
+    far: float
+    depth_scale: float           // slice = log(depth) * scale + bias
+    depth_bias: float
+    perspective: bool
+    view: Mat4
+    view_projection: Mat4        // the matrix a cell's column and row are read by
+    forward: Vec3                // depth = dot(forward, p) + forward_w
+    forward_w: float
+    projection: Mat4
+    lights: ptr                  // f32[light_capacity * LIGHT_FLOATS]
+    light_capacity: int
+    light_total: int
+    tail: int                    // floats kept after the lights (set_tail)
+    words: ptr                   // f32[word_capacity]
+    word_capacity: int
+    word_total: int
+    counts: ptr                  // int[cells], a scratch per build
+    placed: ptr                  // *Light list of the lights clustered this build
+    // The cells' view-space bounds, worked out once a build: the depth each
+    // slice starts at, and the x of every column edge and the y of every
+    // row edge at each of those depths.
+    depths: ptr                  // float[slices + 1]
+    edges_x: ptr                 // float[(columns + 1) * (slices + 1)]
+    edges_y: ptr                 // float[(rows + 1) * (slices + 1)]
+    // Every (cell, light) a build finds, in the order found: counted as they
+    // are found, listed from here once the offsets are known.
+    pairs: ptr                   // int[pair_capacity * 2]
+    pair_capacity: int
+    pair_total: int
+}
+
+grid_new() -> *LightGrid {
+    g = calloc(1, sizeof(LightGrid)) as *LightGrid
+    g.columns = COLUMNS
+    g.rows = ROWS
+    g.slices = SLICES
+    g.light_capacity = 64
+    g.lights = calloc(g.light_capacity * LIGHT_FLOATS, 4)
+    g.word_capacity = cell_count(g) * 2 + 1024
+    g.words = calloc(g.word_capacity, 4)
+    g.counts = calloc(cell_count(g), 4)
+    g.placed = list.new()
+    g.depths = calloc(g.slices + 1, 8)
+    g.edges_x = calloc((g.columns + 1) * (g.slices + 1), 8)
+    g.edges_y = calloc((g.rows + 1) * (g.slices + 1), 8)
+    g.pair_capacity = 4096
+    g.pairs = calloc(g.pair_capacity * 2, 4)
+    return g
+}
+
+grid_free(g: *LightGrid) {
+    if g == null { return }
+    free(g.lights)
+    free(g.words)
+    free(g.counts)
+    list.free(g.placed)
+    free(g.depths)
+    free(g.edges_x)
+    free(g.edges_y)
+    free(g.pairs)
+    free(g as ptr)
+}
+
+cell_count(g: *LightGrid) -> int { return g.columns * g.rows * g.slices }
+light_count(g: *LightGrid) -> int { return g.light_total }
+light_data(g: *LightGrid) -> ptr { return g.lights }
+
+// Room for `floats` more after the lights, from the next build on: what the
+// renderers upload with the lights and the shader reads after them.
+set_tail(g: *LightGrid, floats: int) { g.tail = floats }
+tail_data(g: *LightGrid) -> ptr { return g.lights + g.light_total * LIGHT_FLOATS * 4 }
+// How many floats the lights and the tail come to.
+data_floats(g: *LightGrid) -> int { return g.light_total * LIGHT_FLOATS + g.tail }
+
+// The light this build wrote as light `i`, and its shadow's slot.
+placed_light(g: *LightGrid, i: int) -> *Light { return list.get_raw(g.placed, i) as *Light }
+set_shadow_slot(g: *LightGrid, i: int, slot: int) {
+    (g.lights as f32[])[i * LIGHT_FLOATS + 18] = slot as f32
+}
+word_count(g: *LightGrid) -> int { return g.word_total }
+word_data(g: *LightGrid) -> ptr { return g.words }
+
+// How far a point or spot light reaches: where its attenuation falls to
+// REACH_FRACTION of its value at the light. A light that does not fade
+// (no linear or quadratic term) reaches `unbounded`.
+reach(l: *Light, unbounded: float) -> float {
+    c = l.constant_atten
+    if c <= 0.0 { c = 1.0 }
+    a = l.quadratic_atten
+    b = l.linear_atten
+    // c + b d + a d^2 = c / REACH_FRACTION
+    target = c / REACH_FRACTION - c
+    if a > 0.0 {
+        return (0.0 - b + sqrt(b * b + 4.0 * a * target)) / (2.0 * a)
+    }
+    if b > 0.0 { return target / b }
+    return unbounded
+}
+
+// The lists for this frame: every point and spot light of `lights` other
+// than `key`, against the camera's view.
+build(g: *LightGrid, lights: ptr, key: *Light, cam: *Camera) {
+    g.view = core.camera_view(cam)
+    g.projection = core.camera_projection(cam)
+    g.view_projection = core.mat4_mul(g.projection, g.view)
+    g.perspective = g.projection.m15 == 0.0
+    g.near = cam.near
+    g.far = cam.far
+    if g.near <= 0.0 { g.near = 0.01 }
+    if g.far <= g.near { g.far = g.near * 1000.0 }
+    span = log(g.far / g.near)
+    g.depth_scale = (g.slices as float) / span
+    g.depth_bias = 0.0 - (g.slices as float) * log(g.near) / span
+    // The view's z row, negated: depth grows away from the eye.
+    g.forward = core.vec3(0.0 - g.view.m2, 0.0 - g.view.m6, 0.0 - g.view.m10)
+    g.forward_w = 0.0 - g.view.m14
+
+    bounds(g)
+
+    list.clear(g.placed)
+    if lights != null {
+        i = 0
+        while i < list.size(lights) {
+            l = list.get_raw(lights, i) as *Light
+            if l != null && l != key && l.mode != core.MODE_DIRECTIONAL {
+                list.add_raw(g.placed, l as ptr)
+            }
+            i = i + 1
+        }
+    }
+    n = list.size(g.placed)
+    grow_lights(g, n + (g.tail + LIGHT_FLOATS - 1) / LIGHT_FLOATS)
+    g.light_total = n
+
+    cells = cell_count(g)
+    counts = g.counts as int[]
+    i = 0
+    while i < cells {
+        counts[i] = 0
+        i = i + 1
+    }
+    g.pair_total = 0
+    i = 0
+    while i < n {
+        l = list.get_raw(g.placed, i) as *Light
+        write_light(g, i, l)
+        visit(g, i, l)
+        i = i + 1
+    }
+    // The offsets from the counts, then the lists from the pairs, each
+    // cell's in light order.
+    grow_words(g, cells * 2 + g.pair_total)
+    g.word_total = cells * 2 + g.pair_total
+    words = g.words as f32[]
+    at = cells * 2
+    i = 0
+    while i < cells {
+        words[i * 2] = at as f32
+        words[i * 2 + 1] = 0.0 as f32
+        at = at + counts[i]
+        i = i + 1
+    }
+    pairs = g.pairs as int[]
+    k = 0
+    while k < g.pair_total {
+        cell = pairs[k * 2]
+        slot = (words[cell * 2] as int) + (words[cell * 2 + 1] as int)
+        words[slot] = pairs[k * 2 + 1] as f32
+        words[cell * 2 + 1] = ((words[cell * 2 + 1] as int) + 1) as f32
+        k = k + 1
+    }
+}
+
+// The cells' bounds for this camera: the slices' depths, and the column and
+// row edges at each depth.
+bounds(g: *LightGrid) {
+    depths = g.depths as float[]
+    ex = g.edges_x as float[]
+    ey = g.edges_y as float[]
+    span = log(g.far / g.near)
+    z = 0
+    while z <= g.slices {
+        depths[z] = g.near * exp((z as float) / (g.slices as float) * span)
+        z = z + 1
+    }
+    c = 0
+    while c <= g.columns {
+        ndc = -1.0 + 2.0 * (c as float) / (g.columns as float)
+        z = 0
+        while z <= g.slices {
+            ex[c * (g.slices + 1) + z] = view_x(g, ndc, depths[z])
+            z = z + 1
+        }
+        c = c + 1
+    }
+    r = 0
+    while r <= g.rows {
+        ndc = -1.0 + 2.0 * (r as float) / (g.rows as float)
+        z = 0
+        while z <= g.slices {
+            ey[r * (g.slices + 1) + z] = view_y(g, ndc, depths[z])
+            z = z + 1
+        }
+        r = r + 1
+    }
+}
+
+grow_lights(g: *LightGrid, n: int) {
+    if n <= g.light_capacity { return }
+    while g.light_capacity < n { g.light_capacity = g.light_capacity * 2 }
+    g.lights = realloc(g.lights, (g.light_capacity * LIGHT_FLOATS * 4) as long)
+}
+
+grow_words(g: *LightGrid, n: int) {
+    if n <= g.word_capacity { return }
+    while g.word_capacity < n { g.word_capacity = g.word_capacity * 2 }
+    g.words = realloc(g.words, (g.word_capacity * 4) as long)
+}
+
+write_light(g: *LightGrid, i: int, l: *Light) {
+    out = g.lights as f32[]
+    at = i * LIGHT_FLOATS
+    out[at] = l.position.x as f32
+    out[at + 1] = l.position.y as f32
+    out[at + 2] = l.position.z as f32
+    out[at + 3] = reach(l, g.far * 2.0) as f32
+    out[at + 4] = l.color.x as f32
+    out[at + 5] = l.color.y as f32
+    out[at + 6] = l.color.z as f32
+    out[at + 7] = l.intensity as f32
+    // The shader's Light.isDirectional: 0 a point, 2 a spot (1, a
+    // directional light, is never clustered).
+    kind = 0.0
+    if l.mode == core.MODE_SPOT { kind = 2.0 }
+    out[at + 8] = l.direction.x as f32
+    out[at + 9] = l.direction.y as f32
+    out[at + 10] = l.direction.z as f32
+    out[at + 11] = kind as f32
+    out[at + 12] = l.constant_atten as f32
+    out[at + 13] = l.linear_atten as f32
+    out[at + 14] = l.quadratic_atten as f32
+    out[at + 15] = l.temperature as f32
+    out[at + 16] = l.spot_cos_outer as f32
+    out[at + 17] = l.spot_cos_inner as f32
+    // No shadow of its own until a renderer gives it one (set_shadow_slot).
+    out[at + 18] = (0.0 - 1.0) as f32
+    out[at + 19] = 0.0 as f32
+}
+
+// Every cell light `index` reaches, counted and remembered as a pair. The
+// test is the distance from the light's view-space centre to the cell's
+// view-space box against its reach, taken axis by axis: a slice the sphere
+// misses in depth is passed over whole, a row it misses in y too, so only
+// the cells near the sphere are tested at all. The box bounds the cell --
+// a slice of a frustum -- so the test is conservative by the box's corners
+// and exact everywhere else.
+visit(g: *LightGrid, index: int, l: *Light) {
+    r = reach(l, g.far * 2.0)
+    c = core.mat4_transform_point(g.view, l.position)
+    // View space looks down -z: the light's depth is -c.z.
+    d = 0.0 - c.z
+    nearest = d - r
+    farthest = d + r
+    if farthest < g.near || nearest > g.far { return }
+    if nearest < g.near { nearest = g.near }
+    if farthest > g.far { farthest = g.far }
+    z0 = slice_of(g, nearest)
+    z1 = slice_of(g, farthest)
+    depths = g.depths as float[]
+    ex = g.edges_x as float[]
+    ey = g.edges_y as float[]
+    counts = g.counts as int[]
+    stride = g.slices + 1
+    r2 = r * r
+    z = z0
+    while z <= z1 {
+        dz = gap(c.z, 0.0 - depths[z + 1], 0.0 - depths[z])
+        left = r2 - dz * dz
+        if left >= 0.0 {
+            y = 0
+            while y < g.rows {
+                lo_y = min_of(ey[y * stride + z], ey[y * stride + z + 1])
+                hi_y = max_of(ey[(y + 1) * stride + z], ey[(y + 1) * stride + z + 1])
+                dy = gap(c.y, lo_y, hi_y)
+                row_left = left - dy * dy
+                if row_left >= 0.0 {
+                    x = 0
+                    while x < g.columns {
+                        lo_x = min_of(ex[x * stride + z], ex[x * stride + z + 1])
+                        hi_x = max_of(ex[(x + 1) * stride + z], ex[(x + 1) * stride + z + 1])
+                        dx = gap(c.x, lo_x, hi_x)
+                        if dx * dx <= row_left {
+                            cell = (z * g.rows + y) * g.columns + x
+                            counts[cell] = counts[cell] + 1
+                            add_pair(g, cell, index)
+                        }
+                        x = x + 1
+                    }
+                }
+                y = y + 1
+            }
+        }
+        z = z + 1
+    }
+}
+
+add_pair(g: *LightGrid, cell: int, index: int) {
+    if g.pair_total >= g.pair_capacity {
+        g.pair_capacity = g.pair_capacity * 2
+        g.pairs = realloc(g.pairs, (g.pair_capacity * 2 * 4) as long)
+    }
+    pairs = g.pairs as int[]
+    pairs[g.pair_total * 2] = cell
+    pairs[g.pair_total * 2 + 1] = index
+    g.pair_total = g.pair_total + 1
+}
+
+min_of(a: float, b: float) -> float {
+    if b < a { return b }
+    return a
+}
+
+max_of(a: float, b: float) -> float {
+    if b > a { return b }
+    return a
+}
+
+// A view-space x at depth `d` to normalised device x, by the projection the
+// grid is cut with (its jitter term included, zero without one).
+ndc_x(g: *LightGrid, x: float, d: float) -> float {
+    p = g.projection
+    if g.perspective { return p.m0 * x / d - p.m8 }
+    return p.m0 * x + p.m12
+}
+
+ndc_y(g: *LightGrid, y: float, d: float) -> float {
+    p = g.projection
+    if g.perspective { return p.m5 * y / d - p.m9 }
+    return p.m5 * y + p.m13
+}
+
+// And back: the view-space x at depth `d` of a normalised device x.
+view_x(g: *LightGrid, ndc: float, d: float) -> float {
+    p = g.projection
+    if g.perspective { return (ndc + p.m8) * d / p.m0 }
+    return (ndc - p.m12) / p.m0
+}
+
+view_y(g: *LightGrid, ndc: float, d: float) -> float {
+    p = g.projection
+    if g.perspective { return (ndc + p.m9) * d / p.m5 }
+    return (ndc - p.m13) / p.m5
+}
+
+column_of(g: *LightGrid, ndc: float) -> int {
+    return clamp_index(floor((ndc * 0.5 + 0.5) * (g.columns as float)), g.columns)
+}
+
+row_of(g: *LightGrid, ndc: float) -> int {
+    return clamp_index(floor((ndc * 0.5 + 0.5) * (g.rows as float)), g.rows)
+}
+
+slice_of(g: *LightGrid, depth: float) -> int {
+    if depth <= g.near { return 0 }
+    return clamp_index(floor(log(depth) * g.depth_scale + g.depth_bias), g.slices)
+}
+
+clamp_index(v: float, n: int) -> int {
+    i = v as int
+    if i < 0 { return 0 }
+    if i >= n { return n - 1 }
+    return i
+}
+
+gap(v: float, lo: float, hi: float) -> float {
+    if v < lo { return lo - v }
+    if v > hi { return v - hi }
+    return 0.0
+}
+
+// The cell a world position falls in, by the same arithmetic the shader
+// does: what the tests hold the lists against.
+cell_of(g: *LightGrid, p: Vec3) -> int {
+    clip = core.mat4_mul_v4(g.view_projection, Vec4 { x: p.x, y: p.y, z: p.z, w: 1.0 })
+    w = clip.w
+    if w == 0.0 { w = 1.0 }
+    d = core.v3_dot(g.forward, p) + g.forward_w
+    x = column_of(g, clip.x / w)
+    y = row_of(g, clip.y / w)
+    z = slice_of(g, d)
+    return (z * g.rows + y) * g.columns + x
+}

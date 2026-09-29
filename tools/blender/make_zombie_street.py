@@ -233,7 +233,7 @@ def _unit_uvs(bm):
                               (position[second] - lows[1]) / spans[1])
 
 
-def _finish(bm, name, surface, repeats, smooth=False):
+def _finish(bm, name, surface, repeats, smooth=False, wound=False):
     """Weld, face outwards, project and hand back an object.
 
     Flat by default: a wall is planes meeting at edges. A surface that is
@@ -241,9 +241,18 @@ def _finish(bm, name, surface, repeats, smooth=False):
     smooth, or every quad of it takes its own tilt and a raking light reads
     the wear as bands across the street, a metre and a half apart, brightest
     where the tarmac is wet and mirrors a lamp.
+
+    `wound` keeps the faces the way they were wound. Facing outwards is
+    worked out from a solid's shape, and a set of loose sheets -- the panes
+    of a front, all in one plane -- has none: recalc_face_normals turned
+    222 of the street's 346 pane triangles to face into their buildings
+    (#478), culled from the street, every such window a hole onto the
+    hollow shell behind it. A pane is wound to face the street where it is
+    made, and kept that way.
     """
     bmesh.ops.remove_doubles(bm, verts=list(bm.verts), dist=1e-5)
-    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+    if not wound:
+        bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
     bm.normal_update()
     if smooth:
         for face in bm.faces:
@@ -377,8 +386,14 @@ def building(name, width, depth, height, base, surface, repeats, sign, trim,
     at = sign * (REVEAL * 0.35)
     for hx0, hx1, hz0, hz1, door in holes:
         panes = dark if (door or rng.random() > 0.34) else lit
-        _face(panes, [(hx0 + 0.04, at, hz0 + 0.04), (hx1 - 0.04, at, hz0 + 0.04),
-                      (hx1 - 0.04, at, hz1 - 0.04), (hx0 + 0.04, at, hz1 - 0.04)])
+        # Facing the street: these corners in this order face -y, out of a
+        # building that runs back to +y (sign 1); one that runs back to -y
+        # wants them the other way round. _finish keeps the winding.
+        corners = [(hx0 + 0.04, at, hz0 + 0.04), (hx1 - 0.04, at, hz0 + 0.04),
+                   (hx1 - 0.04, at, hz1 - 0.04), (hx0 + 0.04, at, hz1 - 0.04)]
+        if sign < 0:
+            corners.reverse()
+        _face(panes, corners)
         if door:
             continue
         # The glazing bar is joinery and belongs to the frame, not to the
@@ -389,9 +404,9 @@ def building(name, width, depth, height, base, surface, repeats, sign, trim,
     trim_obj = _finish(band, name + "_Trim", trim, 2.2)
     trim_obj.parent = shell_obj
 
-    dark_obj = _finish(dark, name + "_Glass", glass, 0.0)
+    dark_obj = _finish(dark, name + "_Glass", glass, 0.0, wound=True)
     dark_obj.parent = shell_obj
-    lit_obj = _finish(lit, name + "_Lit", glow, 0.0)
+    lit_obj = _finish(lit, name + "_Lit", glow, 0.0, wound=True)
     lit_obj.parent = shell_obj
 
     # Downpipes at the party walls, from the gutter to a shoe above the

@@ -1,0 +1,536 @@
+// The camera that collides with the scene (#470), held to numbers.
+//
+// The engine flies its camera by the input -- keys injected here, as an
+// agent or a replay would -- through a scene of boxes with no physics: a
+// road 60 m square, a wall, and a corner of two walls. At speed, from
+// every direction that matters:
+//
+//   - the road: diving at it face first, and dropping onto it by the
+//     rise axis, the eye comes to rest a radius over it;
+//   - the wall: at 200 m/s, three metres a frame and six times the wall's
+//     thickness, it stops a radius short and never passes;
+//   - the slide: into the wall at 45 degrees, it slides along it at the
+//     speed its move has along the wall, not stuck to it;
+//   - the corner: into two walls at once, it rests a radius from both;
+//   - the edge: off the road's edge and down, it stops a radius over the
+//     lowest surface of the scene and cannot get under the road from the
+//     side -- never under the ground;
+//   - every frame of all of it, the eye is outside every box and at least
+//     its radius from each, measured from the boxes themselves;
+//   - off (engine_set_camera_collision), it flies through the wall;
+//   - with physics attached, the camera keeps out of the world's static
+//     bodies and passes what moves (a kinematic crate) and what the
+//     physics does not hold (the model wall); with physics freed, it
+//     keeps out of the models again;
+//   - a chase camera's boom stops in front of the wall between it and
+//     where it wanted to be, a model's or the physics world's;
+//   - a pane wound the wrong way round, facing away from the eye, stops it
+//     all the same: a surface is solid from both sides;
+//   - an instanced model marked solid stops it at each instance, and one
+//     not marked -- a crowd, the rain -- does not.
+//
+// Each phase runs for a time rather than a count of frames, so the test
+// asks the same of the camera at 30 frames a second and at 1000.
+//
+// And what it costs: a move through the scene, in microseconds.
+
+import std.heap
+import ae3d.core
+import ae3d.platform
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.input
+import ae3d.loader
+import ae3d.physics
+import ae3d.viewpoint
+
+extern sqrt(x: float) -> float
+extern calloc(count: int, size: int) -> ptr
+extern free(block: ptr)
+
+const ROAD = 0
+const DROP = 1
+const WALL = 2
+const SLIDE = 3
+const CORNER = 4
+const EDGE = 5
+const EDGE_BACK = 6
+const OFF = 7
+const PHYSICS = 8
+const PHYSICS_PASS = 9
+const MODELS_AGAIN = 10
+const PANE = 11
+const INSTANCED = 12
+const LOOSE = 13
+const DONE = 14
+
+// The wall's face toward the camera, and the corner's two faces.
+const WALL_FACE = 9.75
+const CORNER_FACE = 0.0 - 25.5
+// The road: its top at 0, its bottom at -0.5, its edge at x = 30.
+const ROAD_EDGE = 30.0
+const ROAD_BOTTOM = 0.0 - 0.5
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+struct Run {
+    phase: int
+    frames: int                    // frames into the phase
+    seconds: float                 // and seconds: a phase runs for a time, whatever the frame rate
+    radius: float
+    boxes: ptr                     // float[]: lo and hi of every box the models are
+    box_count: int
+    worst: float                   // the least clearance from any box, any frame, collision on
+    inside: int                    // frames that ended with the eye inside a box
+    under: int                     // frames that ended under the road, within its edge
+    road_rest: float
+    drop_rest: float
+    wall_most: float               // the furthest along x toward the wall, at 200 m/s
+    wall_rest: float
+    slide_touch: float             // seconds into the slide it met the wall
+    slide_z0: float
+    slide_z1: float
+    slide_t0: float
+    slide_t1: float
+    slide_seconds: float
+    slide_x_most: float
+    corner_x: float
+    corner_z: float
+    edge_low: float                // the lowest the eye got past the road's edge
+    edge_back_x: float             // the least x going back under the road
+    off_x: float
+    physics: ptr                   // *Physics
+    crate_passed: bool
+    physics_x: float
+    model_wall_passed: bool
+    lent_boom_x: float
+    lent_boomed: bool
+    edge_down: bool
+    pane_x: float
+    instance_z: float
+    loose_z: float
+    solid_instances: ptr           // *Model
+    loose_instances: ptr           // *Model
+    again_x: float
+    boom_x: float
+    move_us: float
+}
+
+// A box of these extents at this centre, drawn and in the scene.
+box_at(e: *Engine, run: *Run, name: string, centre: Vec3, size: Vec3) -> *GameObject {
+    m = loader.cube(1.0)
+    core.model_set_scale(m, size.x, size.y, size.z)
+    core.model_set_position(m, centre.x, centre.y, centre.z)
+    o = engine.object(e, name, m)
+    values = run.boxes as float[]
+    at = run.box_count * 6
+    values[at] = centre.x - size.x * 0.5
+    values[at + 1] = centre.y - size.y * 0.5
+    values[at + 2] = centre.z - size.z * 0.5
+    values[at + 3] = centre.x + size.x * 0.5
+    values[at + 4] = centre.y + size.y * 0.5
+    values[at + 5] = centre.z + size.z * 0.5
+    run.box_count = run.box_count + 1
+    return o
+}
+
+// How far the eye is from the nearest box: zero inside one.
+clearance(run: *Run, p: Vec3) -> float {
+    values = run.boxes as float[]
+    least = 1000000.0
+    i = 0
+    while i < run.box_count {
+        at = i * 6
+        dx = 0.0
+        if p.x < values[at] { dx = values[at] - p.x }
+        if p.x > values[at + 3] { dx = p.x - values[at + 3] }
+        dy = 0.0
+        if p.y < values[at + 1] { dy = values[at + 1] - p.y }
+        if p.y > values[at + 4] { dy = p.y - values[at + 4] }
+        dz = 0.0
+        if p.z < values[at + 2] { dz = values[at + 2] - p.z }
+        if p.z > values[at + 5] { dz = p.z - values[at + 5] }
+        d = sqrt(dx * dx + dy * dy + dz * dz)
+        if d < least { least = d }
+        i = i + 1
+    }
+    return least
+}
+
+// The camera put at `at`, looking along yaw and pitch, flying at `speed`,
+// with `key` held and every other key up.
+set_up(e: *Engine, at: Vec3, yaw: float, pitch: float, speed: float, key: int) {
+    cam = engine.engine_camera(e)
+    cam.position = at
+    cam.yaw = yaw
+    cam.pitch = pitch
+    core.camera_update_vectors(cam)
+    core.camera_set_speed(cam, speed)
+    keys = engine.engine_input(e)
+    input.inject_clear(keys)
+    if key >= 0 { input.inject_key(keys, key, true) }
+}
+
+start(state: ptr, e: *Engine) {
+    run = state as *Run
+    box_at(e, run, "Road", core.vec3(0.0, 0.0 - 0.25, 0.0), core.vec3(60.0, 0.5, 60.0))
+    box_at(e, run, "Wall", core.vec3(10.0, 3.0, 0.0), core.vec3(0.5, 6.0, 30.0))
+    box_at(e, run, "CornerX", core.vec3(0.0 - 15.5, 3.0, 0.0 - 25.75), core.vec3(21.0, 6.0, 0.5))
+    box_at(e, run, "CornerZ", core.vec3(0.0 - 25.75, 3.0, 0.0 - 15.5), core.vec3(0.5, 6.0, 21.0))
+    run.radius = engine.engine_camera_radius(e)
+    run.worst = 1000000.0
+    run.edge_low = 1000000.0
+    run.edge_back_x = 1000000.0
+    run.slide_touch = 0.0 - 1.0
+    run.slide_x_most = 0.0 - 1000000.0
+    run.wall_most = 0.0 - 1000000.0
+    run.physics_x = 1000000.0
+    // A pane at x = -4 wound to face -x, away from an eye coming from +x.
+    pane = core.model_new()
+    away = core.vec3(0.0 - 1.0, 0.0, 0.0)
+    core.mesh_push_vertex(pane.mesh, core.vec3(0.0 - 4.0, 0.0, 3.0), 0.0, 0.0, away)
+    core.mesh_push_vertex(pane.mesh, core.vec3(0.0 - 4.0, 0.0, 7.0), 1.0, 0.0, away)
+    core.mesh_push_vertex(pane.mesh, core.vec3(0.0 - 4.0, 4.0, 7.0), 1.0, 1.0, away)
+    core.mesh_push_vertex(pane.mesh, core.vec3(0.0 - 4.0, 4.0, 3.0), 0.0, 1.0, away)
+    core.mesh_push_triangle(pane.mesh, 0, 1, 2)
+    core.mesh_push_triangle(pane.mesh, 0, 2, 3)
+    core.model_update_matrix(pane)
+    engine.object(e, "Pane", pane)
+    values = run.boxes as float[]
+    at = run.box_count * 6
+    values[at] = 0.0 - 4.0
+    values[at + 1] = 0.0
+    values[at + 2] = 3.0
+    values[at + 3] = 0.0 - 4.0
+    values[at + 4] = 4.0
+    values[at + 5] = 7.0
+    run.box_count = run.box_count + 1
+    // Two instances of a 2 x 4 x 2 box, made solid, at (15, 2, -20) and
+    // (18, 2, -20); one of a box not marked, at (25, 2, -20).
+    solid = loader.cube(1.0)
+    core.model_set_scale(solid, 2.0, 4.0, 2.0)
+    core.model_enable_instancing(solid, 2)
+    core.model_set_instance_position(solid, 0, core.vec3(15.0, 2.0, 0.0 - 20.0))
+    core.model_set_instance_position(solid, 1, core.vec3(18.0, 2.0, 0.0 - 20.0))
+    core.model_recalculate_bounds(solid)
+    core.model_set_solid(solid, true)
+    engine.engine_add_model(e, solid)
+    run.solid_instances = solid as ptr
+    k = 0
+    while k < 2 {
+        at = run.box_count * 6
+        cx = 15.0 + 3.0 * (k as float)
+        values[at] = cx - 1.0
+        values[at + 1] = 0.0
+        values[at + 2] = 0.0 - 21.0
+        values[at + 3] = cx + 1.0
+        values[at + 4] = 4.0
+        values[at + 5] = 0.0 - 19.0
+        run.box_count = run.box_count + 1
+        k = k + 1
+    }
+    loose = loader.cube(1.0)
+    core.model_set_scale(loose, 2.0, 4.0, 2.0)
+    core.model_enable_instancing(loose, 1)
+    core.model_set_instance_position(loose, 0, core.vec3(25.0, 2.0, 0.0 - 20.0))
+    core.model_recalculate_bounds(loose)
+    engine.engine_add_model(e, loose)
+    run.loose_instances = loose as ptr
+    // Face first at the road from three metres, at 60 m/s.
+    set_up(e, core.vec3(0.0, 3.0, 0.0), 0.0 - 90.0, 0.0 - 89.0, 60.0, platform.KEY_W)
+}
+
+update(state: ptr, e: *Engine, delta: float) {
+    run = state as *Run
+    cam = engine.engine_camera(e)
+    at = cam.position
+    run.frames = run.frames + 1
+    run.seconds = run.seconds + delta
+    // Every frame the collision is on and the models are the scene: the
+    // eye outside every box and a radius from each.
+    if run.phase != OFF && run.phase != PHYSICS && run.phase != PHYSICS_PASS && run.phase != LOOSE && run.phase != DONE {
+        gap = clearance(run, at)
+        if gap < run.worst { run.worst = gap }
+        if gap <= 0.0 { run.inside = run.inside + 1 }
+        if at.x < ROAD_EDGE && at.x > 0.0 - ROAD_EDGE && at.z < ROAD_EDGE && at.z > 0.0 - ROAD_EDGE && at.y < 0.0 { run.under = run.under + 1 }
+    }
+    if run.phase == ROAD {
+        if over(run, 0.5) {
+            run.road_rest = at.y
+            run.phase = DROP
+            run.frames = 0
+            run.seconds = 0.0
+            // Down onto it by the rise axis, level, at 60 m/s.
+            set_up(e, core.vec3(2.0, 3.0, 2.0), 0.0 - 90.0, 0.0, 60.0, platform.KEY_LEFT_CONTROL)
+        }
+    } else if run.phase == DROP {
+        if over(run, 0.5) {
+            run.drop_rest = at.y
+            run.phase = WALL
+            run.frames = 0
+            run.seconds = 0.0
+            // At the wall along +x at 200 m/s.
+            set_up(e, core.vec3(0.0, 2.0, 0.0), 0.0, 0.0, 200.0, platform.KEY_W)
+        }
+    } else if run.phase == WALL {
+        if at.x > run.wall_most { run.wall_most = at.x }
+        if over(run, 0.5) {
+            run.wall_rest = at.x
+            run.phase = SLIDE
+            run.frames = 0
+            run.seconds = 0.0
+            // Into the wall at 45 degrees, 20 m/s: 14.1 m/s along it.
+            set_up(e, core.vec3(5.0, 2.0, 0.0 - 14.0), 45.0, 0.0, 20.0, platform.KEY_W)
+            run.slide_seconds = 0.0
+        }
+    } else if run.phase == SLIDE {
+        run.slide_seconds = run.slide_seconds + delta
+        if at.x > run.slide_x_most { run.slide_x_most = at.x }
+        touching = at.x > WALL_FACE - run.radius - 0.02
+        if touching && run.slide_touch < 0.0 {
+            run.slide_touch = run.slide_seconds
+            run.slide_z0 = at.z
+            run.slide_t0 = run.slide_seconds
+        }
+        // Measured along the wall from the touch to the wall's far end,
+        // or the phase's end.
+        if run.slide_touch >= 0.0 && at.z < 13.0 {
+            run.slide_z1 = at.z
+            run.slide_t1 = run.slide_seconds
+        }
+        if over(run, 3.0) || at.z >= 13.0 {
+            run.phase = CORNER
+            run.frames = 0
+            run.seconds = 0.0
+            // Into the corner of two walls, head on, at 60 m/s.
+            set_up(e, core.vec3(0.0 - 12.0, 2.0, 0.0 - 12.0), 0.0 - 135.0, 0.0, 60.0, platform.KEY_W)
+        }
+    } else if run.phase == CORNER {
+        if over(run, 0.6) {
+            run.corner_x = at.x
+            run.corner_z = at.z
+            run.phase = EDGE
+            run.frames = 0
+            run.seconds = 0.0
+            // Off the road's edge, then down.
+            set_up(e, core.vec3(27.0, 1.0, 0.0), 0.0, 0.0, 20.0, platform.KEY_W)
+        }
+    } else if run.phase == EDGE {
+        if at.x > ROAD_EDGE && at.y < run.edge_low { run.edge_low = at.y }
+        if !run.edge_down && over(run, 0.3) {
+            run.edge_down = true
+            input.inject_clear(engine.engine_input(e))
+            input.inject_key(engine.engine_input(e), platform.KEY_LEFT_CONTROL, true)
+        }
+        if run.edge_down && over(run, 1.0) {
+            run.phase = EDGE_BACK
+            run.frames = 0
+            run.seconds = 0.0
+            // Back toward the road, level, below its top: under it, if
+            // anything let it.
+            set_up(e, at, 180.0, 0.0, 20.0, platform.KEY_W)
+        }
+    } else if run.phase == EDGE_BACK {
+        if at.x < run.edge_back_x { run.edge_back_x = at.x }
+        if at.y < run.edge_low { run.edge_low = at.y }
+        if over(run, 0.6) {
+            // The boom, before the collision goes off.
+            run.boom_x = engine.engine_camera_boom(e, core.vec3(0.0, 2.0, 0.0), core.vec3(15.0, 2.0, 0.0)).x
+            measure_moves(e, run)
+            run.phase = OFF
+            run.frames = 0
+            run.seconds = 0.0
+            engine.engine_set_camera_collision(e, false)
+            set_up(e, core.vec3(0.0, 2.0, 0.0), 0.0, 0.0, 60.0, platform.KEY_W)
+        }
+    } else if run.phase == OFF {
+        if over(run, 0.5) {
+            run.off_x = at.x
+            engine.engine_set_camera_collision(e, true)
+            // Physics: a static wall at x = -10, a kinematic crate before
+            // it; the road and the model wall are not the physics's.
+            p = physics.attach(e)
+            run.physics = p as ptr
+            wall = engine.object(e, "Static wall", loader.cube(1.0))
+            core.model_set_scale(behaviour.object_model(wall), 0.5, 6.0, 10.0)
+            behaviour.object_set_position(wall, core.vec3(0.0 - 10.0, 3.0, 0.0))
+            physics.box_collider(wall, core.vec3(0.25, 3.0, 5.0), physics.material(0.5, 0.0))
+            crate = engine.object(e, "Crate", loader.cube(1.0))
+            behaviour.object_set_position(crate, core.vec3(0.0 - 5.0, 2.0, 0.0))
+            physics.rigidbody(crate, physics.KINEMATIC)
+            physics.box_collider(crate, core.vec3(0.5, 0.5, 0.5), physics.material(0.5, 0.0))
+            run.phase = PHYSICS
+            run.frames = 0
+            run.seconds = 0.0
+            set_up(e, core.vec3(0.0, 2.0, 0.0), 180.0, 0.0, 30.0, platform.KEY_W)
+        }
+    } else if run.phase == PHYSICS {
+        if at.x < 0.0 - 5.6 { run.crate_passed = true }
+        if at.x < run.physics_x { run.physics_x = at.x }
+        if !run.lent_boomed && over(run, 0.3) {
+            run.lent_boomed = true
+            // A chase camera's boom through the physics world's wall.
+            run.lent_boom_x = engine.engine_camera_boom(e, core.vec3(0.0, 2.0, 0.0), core.vec3(0.0 - 15.0, 2.0, 0.0)).x
+        }
+        if run.lent_boomed && over(run, 0.6) {
+            run.phase = PHYSICS_PASS
+            run.frames = 0
+            run.seconds = 0.0
+            set_up(e, core.vec3(0.0, 2.0, 0.0), 0.0, 0.0, 30.0, platform.KEY_W)
+        }
+    } else if run.phase == PHYSICS_PASS {
+        if at.x > 10.5 { run.model_wall_passed = true }
+        if over(run, 0.6) {
+            physics.physics_free(run.physics as *Physics)
+            run.physics = null
+            run.phase = MODELS_AGAIN
+            run.frames = 0
+            run.seconds = 0.0
+            set_up(e, core.vec3(0.0, 2.0, 1.0), 0.0, 0.0, 60.0, platform.KEY_W)
+        }
+    } else if run.phase == MODELS_AGAIN {
+        if over(run, 0.4) {
+            run.again_x = at.x
+            run.phase = PANE
+            run.frames = 0
+            run.seconds = 0.0
+            // At the pane from behind it.
+            set_up(e, core.vec3(0.0, 2.0, 5.0), 180.0, 0.0, 60.0, platform.KEY_W)
+        }
+    } else if run.phase == PANE {
+        if over(run, 0.4) {
+            run.pane_x = at.x
+            run.phase = INSTANCED
+            run.frames = 0
+            run.seconds = 0.0
+            // At the first solid instance, along -z.
+            set_up(e, core.vec3(15.0, 2.0, 0.0 - 14.0), 0.0 - 90.0, 0.0, 60.0, platform.KEY_W)
+        }
+    } else if run.phase == INSTANCED {
+        if over(run, 0.4) {
+            run.instance_z = at.z
+            run.phase = LOOSE
+            run.frames = 0
+            run.seconds = 0.0
+            // And through the one not marked.
+            set_up(e, core.vec3(25.0, 2.0, 0.0 - 14.0), 0.0 - 90.0, 0.0, 60.0, platform.KEY_W)
+        }
+    } else if run.phase == LOOSE {
+        if over(run, 0.2) {
+            run.loose_z = at.z
+            run.phase = DONE
+            input.inject_clear(engine.engine_input(e))
+            engine.engine_stop(e)
+        }
+    }
+}
+
+// Whether a phase has run its time, and at least a few frames of it.
+over(run: *Run, seconds: float) -> bool {
+    return run.seconds >= seconds && run.frames >= 8
+}
+
+// What a move costs: a thousand sweeps of a metre along the road, each
+// into the wall's gathered bodies, with the scene scanned once.
+measure_moves(e: *Engine, run: *Run) {
+    started = platform.time()
+    i = 0
+    at = core.vec3(5.0, 1.0, 0.0)
+    while i < 1000 {
+        at = engine.engine_camera_move(e, core.vec3(8.0, 1.0, (i % 20) as float - 10.0), core.vec3(2.0, 0.0, 0.5))
+        i = i + 1
+    }
+    run.move_us = (platform.time() - started) * 1000.0
+    if at.x > WALL_FACE { run.move_us = 0.0 - run.move_us }
+}
+
+main() {
+    e = engine.engine_new()
+    engine.engine_set_size(e, 320, 180)
+    engine.engine_set_title(e, "ae3d camera collision test")
+    engine.engine_set_frame_limit(e, 100000)
+    engine.engine_set_shadows(e, false)
+    run = heap.new(Run)
+    run.phase = ROAD
+    run.boxes = calloc(16 * 6, 8)
+    b = engine.behaviour_new("the drive", run as ptr)
+    b.start = start
+    b.update = update
+    engine.engine_add_behaviour(e, b)
+    if !engine.engine_run(e) {
+        println("camera_collision: SKIP no window available")
+        engine.engine_free(e)
+        if run.solid_instances != null { core.model_free(run.solid_instances as *Model) }
+        if run.loose_instances != null { core.model_free(run.loose_instances as *Model) }
+        free(run.boxes)
+        heap.free(run)
+        return
+    }
+    r = run.radius
+    slop = 0.02
+    println("camera_collision: a sphere of ${r} m around the eye, flown by the keys through ${run.box_count} boxes")
+    println("  every frame: the least clearance from any box ${run.worst} m; ${run.inside} frames inside one, ${run.under} under the road")
+    check("the eye never ends a frame inside a box", run.inside == 0)
+    check("and never nearer any box than its radius", run.worst >= r)
+    check("and never under the road", run.under == 0)
+    println("  road: face first at 60 m/s, rests at y ${run.road_rest}; by the rise axis, at ${run.drop_rest}")
+    check("diving at the road it rests a radius over it (within 2 cm)", run.road_rest >= r && run.road_rest < r + slop)
+    check("dropping onto it by the rise axis, the same", run.drop_rest >= r && run.drop_rest < r + slop)
+    println("  wall: at 200 m/s, furthest x ${run.wall_most}, rests at ${run.wall_rest}; its face at ${WALL_FACE}")
+    check("at 200 m/s it never passes the wall's face less its radius", run.wall_most <= WALL_FACE - r)
+    check("and rests there, within 2 cm", run.wall_rest > WALL_FACE - r - slop)
+    along = 20.0 * 0.70710678
+    slid = 0.0
+    if run.slide_t1 > run.slide_t0 { slid = (run.slide_z1 - run.slide_z0) / (run.slide_t1 - run.slide_t0) }
+    println("  slide: met the wall ${run.slide_touch} s in, then ${slid} m/s along it over ${run.slide_t1 - run.slide_t0} s (its move along the wall ${along} m/s); x at most ${run.slide_x_most}")
+    check("into the wall at 45 degrees it slides along it at 95% of its move along the wall or more", run.slide_touch >= 0.0 && run.slide_t1 - run.slide_t0 > 0.5 && slid >= along * 0.95 && slid <= along * 1.01)
+    check("and never into it", run.slide_x_most <= WALL_FACE - r)
+    println("  corner: rests at (${run.corner_x}, ${run.corner_z}); its faces at ${CORNER_FACE}")
+    check("into a corner it rests a radius from both faces (within 2 cm)",
+          run.corner_x >= CORNER_FACE + r && run.corner_x < CORNER_FACE + r + slop &&
+          run.corner_z >= CORNER_FACE + r && run.corner_z < CORNER_FACE + r + slop)
+    lowest = viewpoint.lowest(engine.engine_viewpoint(e))
+    println("  edge: past the road's edge the eye went down to y ${run.edge_low} (the scene's lowest surface ${lowest}); back toward the road, x at least ${run.edge_back_x}")
+    check("past the edge it stops a radius over the scene's lowest surface", run.edge_low >= ROAD_BOTTOM + r && run.edge_low < ROAD_BOTTOM + r + slop)
+    check("and cannot get under the road from the side", run.edge_back_x >= ROAD_EDGE + r)
+    println("  boom: from (0, 2, 0) toward (15, 2, 0) stops at x ${run.boom_x}")
+    check("a chase camera's boom stops in front of the wall", run.boom_x <= WALL_FACE - r && run.boom_x > WALL_FACE - r - slop)
+    println("  off: flown at the wall with the collision off, x ${run.off_x}")
+    check("with the collision off it flies through the wall", run.off_x > WALL_FACE + 0.5)
+    println("  physics: through the kinematic crate ${run.crate_passed}, stopped at x ${run.physics_x} (the static wall's face at -9.75); the model wall passed ${run.model_wall_passed}")
+    check("with physics, it keeps out of the world's static bodies", run.physics_x >= 0.0 - 9.75 + r && run.physics_x < 0.0 - 9.75 + r + slop)
+    check("and passes what moves, and what the physics does not hold", run.crate_passed && run.model_wall_passed)
+    println("  physics: a boom from (0, 2, 0) toward (-15, 2, 0) stops at x ${run.lent_boom_x}")
+    check("a chase camera's boom stops in front of the physics world's wall", run.lent_boom_x >= 0.0 - 9.75 + r && run.lent_boom_x < 0.0 - 9.75 + r + slop)
+    println("  physics freed: the model wall stops it at x ${run.again_x}")
+    check("with physics freed it keeps out of the models again", run.again_x <= WALL_FACE - r && run.again_x > WALL_FACE - r - slop)
+    println("  pane: flown at a pane from behind it, stopped at x ${run.pane_x}; the pane at -4")
+    check("a pane facing away from the eye stops it a radius short", run.pane_x >= 0.0 - 4.0 + r && run.pane_x < 0.0 - 4.0 + r + slop)
+    println("  instances: stopped at z ${run.instance_z} by the solid instance (its face at -19); through the loose one to z ${run.loose_z}")
+    check("an instanced model marked solid stops it at its instance", run.instance_z >= 0.0 - 19.0 + r && run.instance_z < 0.0 - 19.0 + r + slop)
+    check("and one not marked lets it through", run.loose_z < 0.0 - 21.0)
+    v = engine.engine_viewpoint(e)
+    println("  cost: a sweep ${run.move_us} us (a thousand, ${viewpoint.solid_count(v)} solids, ${viewpoint.body_count(v)} bodies, ${viewpoint.mesh_count(v)} collision meshes of ${viewpoint.collision_triangles(v)} triangles made)")
+    check("a sweep costs under 100 microseconds", run.move_us > 0.0 && run.move_us < 100.0)
+    engine.engine_free(e)
+    core.model_free(run.solid_instances as *Model)
+    core.model_free(run.loose_instances as *Model)
+    free(run.boxes)
+    heap.free(run)
+    if g_failures == 0 {
+        println("camera_collision: all checks passed (${g_checks})")
+    } else {
+        println("camera_collision: ${g_failures} of ${g_checks} checks FAILED")
+    }
+}
