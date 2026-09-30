@@ -18,6 +18,7 @@ at the root is the front page; this is the map.
 | [The agent channel](agent.md) | The JSON channel a program, a test or an AI agent drives a running scene through |
 | [Natural motion](motion.md) | `ae3d.motion`: active ragdolls -- the animation played by joint motors within a torque budget, balance, hits that weaken a limb, and what the test holds them to |
 | [Networking](networking.md) | `ae3d.net`: a host and its clients, the transports (loopback with simulated conditions, TCP), replication and interpolation, and the numbers they are held to |
+| [Components](components.md) | Game objects as their components, the scene as an object: the registry of kinds the inspector, the scene file and the agent read, and the engine's own kinds |
 | [The editor](editor.md) | The scene editor: panels, controls, undo, scene files, how the viewport is drawn |
 | [The game UI layer](ui.md) | Text and screen-space UI for a game: the TrueType reader, the distance-field glyph atlas, layout, and what they are held to |
 | [Performance](performance.md) | How a frame is measured, and where the frames are on the machine the numbers were taken on |

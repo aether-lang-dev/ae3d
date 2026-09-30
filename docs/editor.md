@@ -43,8 +43,8 @@ against its bounding sphere first, so selection stays cheap with a full scene.
 
 ## Panels
 
-**Scene** is the hierarchy: a tree of the scene's objects, roots in scene
-order, an object's children under it behind a disclosure, closed until
+**Scene** is the hierarchy: the scene itself first, as a row named Scene,
+then a tree of the scene's objects, roots in scene order, an object's children under it behind a disclosure, closed until
 opened -- the street of `examples/street_drive.ae` opens as its five
 blocks, its car, its crate walls and its bystanders, ten rows for 1,212
 models, and expands where you look. A parent is any object another's
@@ -63,7 +63,37 @@ the group away; Add has a **Group** of its own, empty, for what is put
 under it later. Either is one edit to undo, however many parents it
 changed. The inspector shows the last object clicked and an edit
 reaches everything selected, so typing a height with three objects
-selected puts all three at that height. The grid and the selection
+selected puts all three at that height, each keeping its own place.
+
+**Inspector** is the selected object's components, a panel each, drawn
+from their kinds ([components](components.md)):
+- **Transform first**, as in Unity, then the rest in the object's order.
+- **Each panel** has an enable switch, its name, and a menu (⋮) of Reset,
+  Move Up, Move Down and Remove. The Transform is reset, never removed.
+- **Every field is a row by its type:** a switch, a slider with a box, a
+  box, three boxes with coloured axis letters (a rotation in degrees), a
+  colour chip with its hex, a row of choices, or a text box. An asset's
+  box has a "..." listing what the editor knows of that kind (the engine's
+  skies, the textures) and Browse for anything else.
+- **Add Component** lists every kind the object may be given, the engine's
+  and the game's, one per object where the kind says so.
+- **Rows follow the value, whoever changed it:** a script, the gizmo, the
+  physics, the agent, an undo. Each frame a row compares what it shows with
+  what the component holds, and a box being typed into is never rewritten
+  under the caret.
+- **Selecting an object of the same shape** keeps the panels and shows the
+  new object in them.
+- **Undo:** every edit, add and removal is one step, however many objects
+  it reached.
+
+Selecting **Scene** shows the scene's own components: Environment (the sky
+image or colour, the sun by the hour, clouds, overcast, fog) and Rendering
+(the post passes, shadows, reflections, occlusion, TAA). They are the
+settings of the engine the viewport is drawn with, so a scene opened, a
+preset or an undo shows in the rows as it lands. The key light is the
+scene's Light. The scene's other sections (the weather, the render
+presets, the shading switches and the viewport's own camera) show with it
+too. The grid and the selection
 outlines are the editor's own geometry: the renderer draws them, but
 they are not objects and do not appear here.
 

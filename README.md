@@ -10,9 +10,9 @@ scene editor; and a control channel through which a program, a test or an
 AI agent builds a scene, reads back what was drawn and checks the frame by
 number rather than by eye.
 
-![A car on wheel joints driving the zombie street at night, crates and bystanders on the pavements](docs/images/street-drive.png)
+![A horde walking a wet city street at night under a street lamp, lit windows and stars overhead](docs/images/zombie-city-night.png)
 
-<sub>`examples/street_drive.ae`: the street from the Blender pipeline, every building and kerb colliding as its own triangles, every crate and bench as the convex hull of its mesh, a car on suspension, drive and steering joints, and the pipeline's zombie figures standing as sprung ragdolls that wear them -- the rig driven by the bodies -- until the car reaches them. 501 bodies stepped over every core; 144 fps hidden on an RTX 4070 Ti at 1280×720 with ray-traced shadows on, the physics 0.09 ms of the frame.</sub>
+<sub>`examples/zombie_city.ae` on Vulkan at 1920×1080: the pipeline's city, a skinned horde posed in the vertex shader from one pose bank, the lamp's pool and its shadows on a wet road that mirrors it, clustered lights, a starred sky.</sub>
 
 ae3d is the successor to [Gopher3D](https://github.com/nicolas-maman/gopher3D),
 the same author's Go engine, rebuilt in [Aether](https://github.com/aether-lang-dev/aether)
@@ -37,7 +37,7 @@ kernels; what remains in C is there for one stated reason each
 | **Natural motion** | `ae3d.motion`, an active ragdoll on any dressed figure: the animation played by joint motors within an adult's torque budget, a blow that knocks it off its pose and back or down, a struck limb that goes weak and recovers, a fall with the hands out and the head tucked, and getting up again face up or face down, handed back to the animation with nothing to jump ([docs/motion.md](docs/motion.md)). |
 | **Multiplayer in the engine** | `ae3d.net`: host or join over UDP -- a handshake, acknowledgements, a reliable ordered channel of its own and fragments on the one socket -- TCP, or an in-process loopback, any of them with simulated latency, jitter and loss; networked objects replicated and interpolated, held to within a millimetre and a half of the host over a perfect link; players that walk the instant their client asks, predicted and reconciled against the host; snapshots quantised to a tenth of a millimetre and sent as changes against the last one each client acknowledged, a still scene 510 bytes a second where whole snapshots cost 24 KB; only what is near each client, within its budget of bytes, the most urgent first; a horde every peer simulates, its struck zombies handed to ragdolls the host simulates and every client draws; and the editor playing a scene as a host and its clients ([docs/networking.md](docs/networking.md)). |
 | **Input as a game names it** | Actions and axes bound once to keys, mouse and gamepad, read by name from any script, injectable from a test or an agent. The camera they fly keeps out of the scene -- swept and slid, never through a wall or under the ground -- and one call frames a model of any size. |
-| **An editor** | Hierarchy, inspector, gizmos, terrain sculpting, physics bodies and a Simulate button, Play as a host and up to four clients over a simulated link, each world shown in turn and its player walked from the keys, undo, scene files; opens any program's scene (`AE3D_SCENE_OUT`); one dark theme on every platform. |
+| **An editor** | Objects as their components and the scene as one of them, as in Unity: a panel a component, drawn from what the component's kind declares, Add Component, edits across a selection ([components](docs/components.md)). Hierarchy, gizmos, terrain sculpting, physics bodies and a Simulate button, Play as a host and up to four clients over a simulated link, each world shown in turn and its player walked from the keys, undo, scene files; opens any program's scene (`AE3D_SCENE_OUT`); one dark theme on every platform. |
 
 Each row is a page in [docs/](docs/README.md) with the reasoning and the
 measurement behind it.
@@ -126,8 +126,8 @@ together: [docs/architecture.md](docs/architecture.md).
 
 | | |
 |---|---|
-| ![The city at night, its horde under the lamps](docs/images/zombie-city.png) | ![The seabed under the swell, caustics on the sand](docs/images/caustics.png) |
-| `zombie_city` -- the street in a city of streets, its horde closing on the camera over the flow field, three tiers by distance | `caustics` -- the seabed under a Gerstner swell, the light refracted through the surface every frame |
+| ![A car on wheel joints driving the zombie street at night](docs/images/street-drive.png) | ![The seabed under the swell, caustics on the sand](docs/images/caustics.png) |
+| `street_drive` -- the street's every building and kerb colliding as its own triangles, a car on suspension, drive and steering joints, the figures sprung ragdolls until it reaches them: 501 bodies, the physics 0.09 ms of a 144 fps frame | `caustics` -- the seabed under a Gerstner swell, the light refracted through the surface every frame |
 | ![A pyramid of crates scattered by a cannonball](docs/images/physics-pyramid.png) | ![A hundred thousand survivors from a CC0 glTF](docs/images/gltf-crowd.png) |
 | `physics` -- four of the physics engine's reference scenes, every body a game object | `gltf_crowd` -- a public glTF figure, its walk baked, a hundred thousand of it sorted on the device |
 | ![Rain, a storm, dust and snow over an island](docs/images/weather.png) | ![A million grains of sand](docs/images/sand.png) |

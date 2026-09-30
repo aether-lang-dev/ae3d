@@ -7,8 +7,10 @@ honours.
 ## Requirements
 
 - The [Aether toolchain](https://github.com/aether-lang-dev/aether): `ae`
-  and `aetherc` on `PATH`, 0.700 or later. The physics engine's
-  cross-platform tests were proved at that version and the engine follows it.
+  and `aetherc` on `PATH`, 0.727 or later: `std.observe` and `struct T
+  @observable` (aether-lang-dev/aether#2220) are how a script's own stores
+  on a component reach the inspector, a save and the network
+  ([components](components.md)).
 - A C compiler (`cc`, `gcc` or `clang`), for the C under `native/` and for
   the C Aether generates.
 - GLFW 3.3 or later as a shared library (the one every package manager
