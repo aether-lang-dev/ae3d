@@ -779,8 +779,11 @@ Held to numbers: `tests/test_lamp_shadows.ae`, offscreen on both renderers.
   once at upload.
 - **The frame's uniforms go up once per program, not once per model.** Of the
   uniforms a draw needs, all but one are the same for every model in the
-  frame. Draws that share geometry and a material are merged into one
-  instanced draw automatically (`core.set_draw_merging(false)` turns it off).
+  frame. Draws that share geometry and a material -- its colour, its normal
+  map and its numbers -- are merged into one instanced draw automatically
+  (`core.set_draw_merging(false)` turns it off). A merged draw goes after
+  every model drawn on its own, and sets everything it is shaded and posed
+  by itself rather than keep what the draw before it left.
 - **The frame allocates nothing.** `benchmarks/bench_frame.ae` runs the
   heaviest per-frame work two thousand times with no window: 578us to upload
   two hundred thousand instance matrices, under a microsecond each for

@@ -72,6 +72,59 @@
     of device time.
   - And the occlusion's normal took its upward neighbour from the screen's
     y, which runs the other way on Vulkan; it takes the one above on both.
+- The runner's own Mesa (25.0.7, LLVM 20) found three more, all in how a
+  merged draw -- models sharing a mesh and a material, drawn as one
+  instanced call after every model drawn on its own -- inherited the state
+  of the draw before it:
+  - Vulkan's merged draw never set its normal map, nor said whether it had
+    one: a street's tiles and kerbs were shaded by the map of whichever
+    model drew before them, or by none. `street_drive`'s figures were 2.9
+    apart on the runner (worst cell 45.4), the city's view 5 road 2.0; now
+    0.2 (worst 1.8) and 1.2. A material group was the same on Vulkan, and
+    two materials alike but for their normal maps were merged on both
+    renderers, all drawn with the first one's (`core.material_equals`
+    compares the map now). `test_backend_parity` draws brick tiles merged
+    after a plain slab: 8,164 of 147,456 channels apart between the
+    renderers without the fix, 269 with; merged against drawn one by one on
+    Vulkan 7,889 without, 0 with; tiles bumped as paving merged with the
+    bricks 24,579 without, 0 with; a grouped plane 23,923 without, 852 with.
+  - A merged draw was posed by whatever drew before it. On Vulkan a
+    crowd's draw leaves the block saying skinned, with its bank bound, and
+    the first merged draw after it was skinned by the unused skin stream,
+    every weight zero, and collapsed to a point: in the city the benches and
+    the blocks' base slabs were gone wherever a horde was in view (view 5's
+    ground under the horde alone: 6.46 apart, now 0.03). On OpenGL the same
+    happened after a skinned figure in the scene program, posed by its bones
+    through skin attributes the mesh does not have; and the renderer's
+    cache of whether the program was skinned outlived a change of program.
+    `test_backend_parity` draws the tiles after a skinned slab: 90,421
+    channels off the plain slab's frame on Vulkan without the fix, 90,410
+    on OpenGL without its own, 0 on both with.
+  - And, found beside them, a model split across materials on Vulkan drew
+    its whole mesh once per group, each time in that group's material, and
+    every group in the pass its own material belonged to: a model of two
+    materials came out in one, a translucent group opaque. Each group is
+    its own run of the indices now (`vkframe.draw_range`), in its own pass,
+    as on OpenGL. `test_backend_parity`'s plane of a red half and a
+    translucent blue one over a white slab: 47,696 channels apart without
+    the ranges, 11,723 without the passes, 1,283 with both.
+  - `test_backend_parity`'s bricks put OpenGL's normal strength back to 1
+    after drawing them flat, where both renderers start at 2.5: every map
+    case after it compared one backend at two and a half times the other.
+- `zombie_street`'s critique, on the runner's Vulkan, read the figure's
+  shadow as 2 cells darkened by 30% where it wanted 3. The shadow was not
+  weaker: with the wet road's reflection off, lavapipe's cells are
+  OpenGL's on the same Mesa, 5 and 5, percent for percent. The reflection
+  (Vulkan's alone until #491) lays the figure's mirror image over the cells
+  around its feet; unshadowed they are the lamp's pool, white already (245
+  to 252 of 255), and it adds nothing, while over the shadow it adds up to
+  15. The check reads the shadow with the reflection off now, and prints
+  the count with it (an RTX 4070 Ti: 6 either way, OpenGL 6). And the
+  critique's reflection checks set their own strength, 1.5, and put back
+  only whether the reflection was on, so every check after them measured
+  a reflection a quarter stronger than the street's 1.2: they put back its
+  road height and strength too, which `frame.stats` reports now
+  (`render.ssr_road_height`, `render.ssr_strength`).
 - `zombie_city`'s impostor tier is named for its figure
   (`Zombie_Body, impostors`), so the channel and the check find the
   horde's far band.

@@ -84,7 +84,13 @@ rig `tools/zombie_street.ae` -- one block, one zombie:
   triangle count, the street lit in pools rather than flooded flat, no
   foot through the road, a planted foot staying planted, the strike
   reaching past the walk, the head following the body. Each constant
-  carries the reason for its value beside it.
+  carries the reason for its value beside it. A check that turns a setting
+  off to measure what it does puts back what the scene had, every part of
+  it (`frame.stats` reports the reflection's road height and strength for
+  that), and each judges its own effect alone: the figure's shadow is read
+  with the wet road's reflection off, since the reflection lays the
+  figure's mirror image over the same cells and is judged by checks of its
+  own.
 - **`tools/ae3d_bench.ae`** records what a frame costs -- draws, triangles,
   program and material binds, GPU pass times -- in
   `resources/zombie_street.<backend>.budget.json`, and a build that draws
@@ -141,7 +147,7 @@ views 0 to 6, `zombie_street` and `street_drive`:
 At 3397101 every `zombie_city` view fails -- its facades and road 17 to 55
 apart, its figures 10 to 31, 16 to 197 of the 576 cells holes -- and
 `zombie_street` and `street_drive`, which it drew right, pass. The check
-has found three real differences:
+has found these real differences:
 - the lamp's haze in the fogged air was Vulkan's alone, and `zombie_street`
   drew a fifth brighter there (mean red 92 against 74);
 - Vulkan turned every normal map inside out: the tangent frame is solved
@@ -155,7 +161,15 @@ has found three real differences:
   at the origin, and a lamp's face asked by those drew the crowd only where
   it held the origin: in the city a lamp's pool in the horde was lit on
   Vulkan with no figure's shadow in it (view 3's road 3.3 apart, now 0.8;
-  `test_ray_shadows` holds a figure 212 m out under a lamp of its own).
+  `test_ray_shadows` holds a figure 212 m out under a lamp of its own);
+- a merged draw -- models sharing a mesh and a material, drawn as one
+  instanced call after every model drawn on its own -- kept what the draw
+  before it left: on Vulkan the normal map (`street_drive`'s figures 2.9
+  apart on the runner's Mesa, worst cell 45.4; the city's view 5 road 2.0),
+  and on both renderers the pose of a skinned model or a crowd drawn before
+  it, which on Vulkan collapsed the city's benches wherever a horde was in
+  view. `test_backend_parity` draws brick tiles merged after a plain slab
+  and after a skinned one, and against themselves drawn one by one.
 
 ## Looking at a scene
 
