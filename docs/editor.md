@@ -43,8 +43,8 @@ against its bounding sphere first, so selection stays cheap with a full scene.
 
 ## Panels
 
-**Scene** is the hierarchy: a tree of the scene's objects, roots in scene
-order, an object's children under it behind a disclosure, closed until
+**Scene** is the hierarchy: the scene itself first, as a row named Scene,
+then a tree of the scene's objects, roots in scene order, an object's children under it behind a disclosure, closed until
 opened -- the street of `examples/street_drive.ae` opens as its five
 blocks, its car, its crate walls and its bystanders, ten rows for 1,212
 models, and expands where you look. A parent is any object another's
@@ -63,7 +63,37 @@ the group away; Add has a **Group** of its own, empty, for what is put
 under it later. Either is one edit to undo, however many parents it
 changed. The inspector shows the last object clicked and an edit
 reaches everything selected, so typing a height with three objects
-selected puts all three at that height. The grid and the selection
+selected puts all three at that height, each keeping its own place.
+
+**Inspector** is the selected object's components, a panel each, drawn
+from their kinds ([components](components.md)):
+- **Transform first**, as in Unity, then the rest in the object's order.
+- **Each panel** has an enable switch, its name, and a menu (⋮) of Reset,
+  Move Up, Move Down and Remove. The Transform is reset, never removed.
+- **Every field is a row by its type:** a switch, a slider with a box, a
+  box, three boxes with coloured axis letters (a rotation in degrees), a
+  colour chip with its hex, a row of choices, or a text box. An asset's
+  box has a "..." listing what the editor knows of that kind (the engine's
+  skies, the textures) and Browse for anything else.
+- **Add Component** lists every kind the object may be given, the engine's
+  and the game's, one per object where the kind says so.
+- **Rows follow the value, whoever changed it:** a script, the gizmo, the
+  physics, the agent, an undo. Each frame a row compares what it shows with
+  what the component holds, and a box being typed into is never rewritten
+  under the caret.
+- **Selecting an object of the same shape** keeps the panels and shows the
+  new object in them.
+- **Undo:** every edit, add and removal is one step, however many objects
+  it reached.
+
+Selecting **Scene** shows the scene's own components: Environment (the sky
+image or colour, the sun by the hour, clouds, overcast, fog) and Rendering
+(the post passes, shadows, reflections, occlusion, TAA). They are the
+settings of the engine the viewport is drawn with, so a scene opened, a
+preset or an undo shows in the rows as it lands. The key light is the
+scene's Light. The scene's other sections (the weather, the render
+presets, the shading switches and the viewport's own camera) show with it
+too. The grid and the selection
 outlines are the editor's own geometry: the renderer draws them, but
 they are not objects and do not appear here.
 
@@ -110,46 +140,66 @@ under `resources/figures` (glTF, `.glb`). Clicking one loads it into the scene
 and frames it. A figure comes in as a group at the origin with the figure
 under it (`ae3d.figure`), playing its first clip.
 
-**Behaviour** attaches a script to the selected object. A script is an ordinary
-Aether source file in `resources/scripts`, with Unity's phases by Unity's
-names and the engine's signatures -- the functions a program hands to
-`engine.script`, so one script shape serves the editor and a game:
+**Behaviour** attaches a script to the selected object. A script is a
+component ([components](components.md#scripts)): an Aether source file in
+`resources/scripts` whose state is a struct of its own, one for every object
+it is on, whose fields are what the inspector shows and the scene saves, and
+whose phases are Unity's, by Unity's names:
 
 ```aether
 import ae3d.core
 import ae3d.behaviour
+import ae3d.component
 
-exports (update)
+exports (Spin, create, destroy, fields, update)
 
-update(state: ptr, go: *GameObject, delta: float) {
-    core.model_rotate(behaviour.object_model(go), 0.0, delta * 60.0, 0.0)
+struct Spin {
+    speed: float                   // degrees a second
+}
+
+create() -> ptr {
+    s = heap.new(Spin)
+    s.speed = 60.0
+    return s as ptr
+}
+
+destroy(p: ptr) { heap.free(p as *Spin) }
+
+fields(k: *ComponentKind) {
+    component.float_field(k, "speed", offsetof(Spin, speed), 0.0 - 720.0, 720.0)
+}
+
+update(p: ptr, go: *GameObject, delta: float) {
+    s = p as *Spin
+    core.model_rotate(behaviour.object_model(go), 0.0, delta * s.speed, 0.0)
 }
 ```
 
-The editor hands a null `state` (a script keeps its own in its globals) and
-the game object the script is on; every row of the hierarchy is a
-`GameObject` in the editor's scene, its model the object's, and
-`engine.of(go)` is the editor's engine -- the camera, the light, the weather
--- as it would be in a program.
-
 `scripts/build_script.sh resources/scripts/spin.ae` compiles it into a shared
-library beside the editor, and the editor opens what it finds: the buttons in
-the section are the files in that directory, so adding a behaviour is adding a
-file and the editor does not have to be taught what it does. A script may also
-export `start`, which runs once when it is attached.
+library, and the editor opens what it finds and registers each as a
+component kind listed under Scripts. A button in the section puts that
+script on the selected object in place of any other (None takes them off);
+Add Component gives an object more than one. The script's panel in the
+inspector is its fields, edited, reset and undone like any component's, and
+two objects running the same script are two states: two bobs at two
+heights, two orbits at two radii.
 
 **New script** writes a template into `resources/scripts` and says where it
 went. Building it is the same step that builds every other script, and the
 editor picks the library up when it appears.
 
-A script rebuilt while the editor is open is reopened without restarting it,
-and starts again on everything carrying it. The editor compiles nothing: it
-watches the library rather than the source, so a source saved with an error in
-it leaves the last good behaviour running until the build succeeds.
+A script rebuilt while the editor is open is reopened without restarting it.
+Every object carrying it -- and every one deleted and kept for undo -- keeps
+its fields: they are read out, its state is freed by the old library and
+made again by the new, the fields are written back by name (one the new code
+renamed takes its default), and its start runs again. The editor compiles
+nothing: it watches the library rather than the source, so a source saved
+with an error in it leaves the last good behaviour running until the build
+succeeds.
 
-The scene records the script by name, so a project that still has the file gets
-the assignment back when it loads. A scene naming a script the project does not
-have gets none rather than a wrong one.
+The scene saves a script as a component, with its fields, so a project that
+still has the file gets the script back as it was set. A scene naming a
+script this project does not have keeps it, and writes it back when saved.
 
 A script links the same engine library the editor links,
 `build/libae3d_native`, so a call into the engine reaches the one copy the
@@ -331,13 +381,14 @@ tested without a window: `tests/test_history.ae`.
 
 ## Behaviours
 
-Spin, bob and orbit can be attached to any object and run in the frame loop.
-Gopher3D compiles and hot-reloads Go scripts; these are built in, because the
-part that matters in an editor is attaching a behaviour and watching it run.
-
-Bob moves by the derivative of its own curve rather than to an absolute height,
-so it needs no memory of where the object started and still works after the
-object is dragged somewhere else.
+Spin, bob, orbit and pulse are scripts in `resources/scripts`, attached to any
+object and run in the frame loop. Each keeps its state per object: bob's
+clock, orbit's angle and the radius it started at, pulse's size to breathe
+about. Bob moves by the derivative of its own curve rather than to an
+absolute height, so it needs no memory of where the object started and still
+works after the object is dragged somewhere else. Orbit starts from where the
+object stands, at its own distance and angle, rather than jumping onto a
+circle.
 
 ## What a scene keeps
 

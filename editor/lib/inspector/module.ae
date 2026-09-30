@@ -1,0 +1,1237 @@
+// The inspector: a game object as its components, drawn from what each
+// component's kind says it is made of (ae3d.component), as Unity's
+// inspector draws a GameObject.
+//
+// Nothing here knows a kind. A panel a component: a header with its
+// enable switch, its name and a menu (reset, move up, move down, remove),
+// and a row a field, by the field's type -- a switch, a slider and a box
+// for a bounded number, a box for an unbounded one, three boxes with axis
+// letters for a vector, degrees about each axis for a rotation, a chip and
+// a hex box for a colour, a row of choices for an enum, a box for text and
+// a box with a picker for an asset. A kind the game adds is drawn the day
+// it is registered, and so is every field added to one.
+//
+// The rows follow what they show, whoever changed it: each frame every
+// row compares the value it last showed with the component's, and only a
+// row whose value moved is written -- a script's stores, the gizmo, the
+// physics, the agent and an undo all show as they land. A box being typed
+// into is never written to under the caret.
+//
+// The panels built for a shape (the same kinds, in the same order) are kept
+// as a view, and selecting any object of that shape shows that view pointed
+// at its components: nothing is built, nothing flickers, and a widget found
+// once is the same widget after the selection moves. Building a panel costs
+// a native widget per control, tens of milliseconds a panel on win32, so
+// going back and forth between a cube and a light built them every time:
+// now each shape is built once, the least recently shown dropped past
+// VIEWS_KEPT, and every view dropped when the kinds themselves change (a
+// script reloaded with other fields).
+//
+// Every edit goes through the registry, so a kind's validate runs; it
+// reaches every selected object that carries the same kind (Unity's
+// multi-object editing); and each object's change is handed to the editor
+// (`on_change`) with its fields before and after, which is what undo
+// records.
+
+import ui
+import std.list
+import std.string
+import std.json
+import ae3d.core
+import ae3d.behaviour
+import ae3d.component
+
+exports (
+    Inspector, InspectorPanel, InspectorBinding, AssetChoice,
+    inspector_new, inspector_free, set_assets, asset_choice_new, show, refresh, shown, panel_count, binding_count,
+    set_peers, edit_float, edit_bool, edit_int, edit_vec3, edit_axis_of, edit_text, add_kind, remove_component,
+    reset_component, move_component, set_enabled, bindings_of, binding_at, kinds_offered, number_text
+)
+
+const LABEL_W = 92
+const FIELD_W = 78
+const VECTOR_W = 60
+const AXIS_W = 10
+const READOUT_W = 58
+const CHIP_W = 22
+// The shapes whose panels are kept built: the editor's own kinds make a
+// handful (a mesh, a light, water, terrain, the scene), with room for a
+// game's.
+const VIEWS_KEPT = 12
+
+// What a row's control is.
+const CONTROL_TOGGLE = 0
+const CONTROL_SLIDER = 1           // a slider and a box
+const CONTROL_FIELD = 2            // a box
+const CONTROL_VECTOR = 3           // three boxes
+const CONTROL_COLOR = 4            // a chip and a hex box
+const CONTROL_CHOICES = 5          // a row of buttons
+const CONTROL_TEXT = 6
+
+struct InspectorBinding {
+    component: ptr                 // *Component: the one shown now
+    field: ptr                     // *ComponentField
+    control: int
+    handles: ptr                   // int[]: the row's widgets, by control
+    handle_count: int
+    // What the row shows, as it last wrote it: a number, a vector's three,
+    // a switch or a choice as 0 or 1 or its index, text as text.
+    shown_x: float
+    shown_y: float
+    shown_z: float
+    shown_text: string
+    painted: bool                  // it has been written at least once
+    choices: int                   // an asset field's list of choices, and whether it is open
+    choices_open: bool
+}
+
+// One asset an asset field offers: what the list shows, and the path it
+// writes.
+struct AssetChoice {
+    label: string
+    path: string
+}
+
+asset_choice_new(label: string, path: string) -> *AssetChoice {
+    a = heap.new(AssetChoice)
+    a.label = string.copy(label)
+    a.path = string.copy(path)
+    return a
+}
+
+struct InspectorPanel {
+    component: ptr
+    kind: ptr                      // *ComponentKind
+    header: int
+    body: int
+    actions: int                   // the row of what can be done to it, open or not
+    actions_open: bool
+    enabled_toggle: int
+    caret: int
+    open: bool
+    enabled_shown: int             // what the switch shows: -1 unwritten, 0, 1
+}
+
+// The panels of one shape, built once: its container under the inspector's
+// root, the kinds it was built for, in order, and its panels, rows and Add
+// Component.
+struct InspectorView {
+    stack: int
+    scene: bool
+    kinds: ptr                     // list of *ComponentKind
+    panels: ptr                    // list of *InspectorPanel
+    bindings: ptr                  // list of *InspectorBinding
+    adder: int
+    adder_list: int
+    generation: int                // the registry's, when it was built
+    used: int                      // when it was last shown, by the inspector's count
+}
+
+struct Inspector {
+    root: int                      // the container the views are built in
+    object: ptr                    // *GameObject, or null
+    // The view shown: its container, panels and rows, or the empty lists
+    // below when nothing is.
+    view: ptr                      // *InspectorView, or null
+    stack: int
+    panels: ptr                    // list of *InspectorPanel
+    bindings: ptr                  // list of *InspectorBinding
+    views: ptr                     // list of *InspectorView
+    no_panels: ptr
+    no_bindings: ptr
+    shows: int                     // counts the views shown, for the least recent
+    scene: bool                    // the object is the scene's root: its kinds are the scene's
+    // The rest of the selection: every edit reaches the same kind on each
+    // (list of *GameObject, the editor's, borrowed), or null.
+    peers: ptr
+    // Told of every edit: the object, the component's kind, its fields before
+    // and after as JSON text. What the editor records for undo, and marks the
+    // scene changed by.
+    on_change: fn(ptr, ptr, string, string, string)
+    // Told when a component is added or removed: the object, the kind, its
+    // fields, and whether it was added.
+    on_structure: fn(ptr, ptr, string, string, bool)
+    host: ptr
+    adder: int                     // Add Component
+    adder_list: int                // the kinds it offers, while open
+    adder_open: bool
+    // The assets of a kind ("sky", "texture", "model") the editor knows of,
+    // as a list of *AssetChoice this frees: what an asset field's "..."
+    // lists before Browse.
+    on_assets: fn(ptr, string) -> ptr
+}
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+inspector_new(root: int, host: ptr, on_change: fn(ptr, ptr, string, string, string),
+              on_structure: fn(ptr, ptr, string, string, bool)) -> *Inspector {
+    ins = heap.new(Inspector)
+    ins.root = root
+    ins.views = list.new()
+    ins.no_panels = list.new()
+    ins.no_bindings = list.new()
+    ins.panels = ins.no_panels
+    ins.bindings = ins.no_bindings
+    ins.host = host
+    ins.on_change = on_change
+    ins.on_structure = on_structure
+    return ins
+}
+
+set_assets(ins: *Inspector, on_assets: fn(ptr, string) -> ptr) { ins.on_assets = on_assets }
+
+// The other selected objects an edit reaches; null for none.
+set_peers(ins: *Inspector, peers: ptr) { ins.peers = peers }
+
+// The view's rows and panels freed, and the view: not its widgets, which
+// are the toolkit's (view_drop takes them off the inspector first).
+view_free(v: *InspectorView) {
+    count = list.size(v.bindings)
+    i = 0
+    while i < count {
+        b = list.get_raw(v.bindings, i) as *InspectorBinding
+        if b.handles != null { free(b.handles) }
+        heap.free(b)
+        i = i + 1
+    }
+    list.free(v.bindings)
+    count = list.size(v.panels)
+    i = 0
+    while i < count {
+        heap.free(list.get_raw(v.panels, i) as *InspectorPanel)
+        i = i + 1
+    }
+    list.free(v.panels)
+    list.free(v.kinds)
+    heap.free(v)
+}
+
+// The view gone, widgets and all.
+view_drop(ins: *Inspector, v: *InspectorView) {
+    if ins.view == v as ptr { show_view(ins, null) }
+    count = list.size(ins.views)
+    i = 0
+    while i < count {
+        if list.get_raw(ins.views, i) == v as ptr {
+            list.remove(ins.views, i)
+            count = 0
+        }
+        i = i + 1
+    }
+    ui.remove_child(ins.root, v.stack)
+    view_free(v)
+}
+
+inspector_free(ins: *Inspector) {
+    if ins == null { return }
+    count = list.size(ins.views)
+    i = 0
+    while i < count {
+        view_free(list.get_raw(ins.views, i) as *InspectorView)
+        i = i + 1
+    }
+    list.free(ins.views)
+    list.free(ins.no_bindings)
+    list.free(ins.no_panels)
+    heap.free(ins)
+}
+
+shown(ins: *Inspector) -> *GameObject { return ins.object as *GameObject }
+panel_count(ins: *Inspector) -> int { return list.size(ins.panels) }
+binding_count(ins: *Inspector) -> int { return list.size(ins.bindings) }
+bindings_of(ins: *Inspector) -> ptr { return ins.bindings }
+binding_at(ins: *Inspector, index: int) -> *InspectorBinding {
+    if index < 0 || index >= list.size(ins.bindings) { return null }
+    return list.get_raw(ins.bindings, index) as *InspectorBinding
+}
+
+flag_of(on: bool) -> int {
+    if on { return 1 }
+    return 0
+}
+
+// --- text in and out ---------------------------------------------------------------
+
+// A number as a box shows it: rounded to two places, which is what a
+// person edits, with its sign whatever the whole part is (-0.25 is not
+// 0.25).
+number_text(value: float) -> string {
+    sign = ""
+    magnitude = value
+    if value < 0.0 { magnitude = 0.0 - value }
+    hundredths = (magnitude * 100.0 + 0.5) as long
+    if value < 0.0 && hundredths > 0 { sign = "-" }
+    whole = hundredths / 100
+    fraction = hundredths - whole * 100
+    if fraction < 10 { return "${sign}${whole}.0${fraction}" }
+    return "${sign}${whole}.${fraction}"
+}
+
+hex_digit(value: int) -> string {
+    return string.substring("0123456789abcdef", value, value + 1)
+}
+
+hex_of(channel: float) -> string {
+    v = (channel * 255.0 + 0.5) as int
+    if v < 0 { v = 0 }
+    if v > 255 { v = 255 }
+    return string.concat(hex_digit(v / 16), hex_digit(v % 16))
+}
+
+color_hex(c: Vec3) -> string {
+    return "#${hex_of(c.x)}${hex_of(c.y)}${hex_of(c.z)}"
+}
+
+hex_value(ch: int) -> int {
+    if ch >= 48 && ch <= 57 { return ch - 48 }
+    if ch >= 97 && ch <= 102 { return ch - 87 }
+    if ch >= 65 && ch <= 70 { return ch - 55 }
+    return 0 - 1
+}
+
+// The byte two hex digits at `at` spell, or -1.
+hex_pair(text: string, at: int) -> int {
+    hi = hex_value(string.char_at(text, at))
+    lo = hex_value(string.char_at(text, at + 1))
+    if hi < 0 || lo < 0 { return 0 - 1 }
+    return hi * 16 + lo
+}
+
+// "#rrggbb" or "rrggbb" as a colour; its red is -1 when the text is not one.
+parse_hex(text: string) -> Vec3 {
+    bad = core.vec3(0.0 - 1.0, 0.0, 0.0)
+    start = 0
+    if string.starts_with(text, "#") == 1 { start = 1 }
+    if string.length(text) - start != 6 { return bad }
+    r = hex_pair(text, start)
+    g = hex_pair(text, start + 2)
+    b = hex_pair(text, start + 4)
+    if r < 0 || g < 0 || b < 0 { return bad }
+    return core.vec3(r as float / 255.0, g as float / 255.0, b as float / 255.0)
+}
+
+// --- edits ---------------------------------------------------------------------
+
+fields_text(c: *Component) -> string {
+    fields = component.to_json(c, false)
+    text = json.stringify_raw(fields)
+    json.free(fields)
+    return text
+}
+
+told(ins: *Inspector, o: *GameObject, c: *Component, before: string) {
+    after = fields_text(c)
+    if ins.on_change != null {
+        changed = ins.on_change
+        changed(ins.host, o as ptr, component.kind_name(component.kind_of(c)), before, after)
+    }
+    string.free(after)
+    string.free(before)
+}
+
+// The shown object and every peer carrying the kind, each with its own
+// component of it: what an edit of a field of that kind reaches.
+targets(ins: *Inspector, k: *ComponentKind) -> ptr {
+    out = list.new()
+    o = ins.object as *GameObject
+    if o == null || k == null { return out }
+    list.add_raw(out, o)
+    if ins.peers != null {
+        count = list.size(ins.peers)
+        i = 0
+        while i < count {
+            peer = list.get_raw(ins.peers, i) as *GameObject
+            if peer != null && peer != o && component.find(peer, k) != null { list.add_raw(out, peer) }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// One write, made to every target: `kind` 0 a float, 1 an int, 2 a bool,
+// 3 a vector (or a rotation in degrees), 4 text. For a vector, `axis` 0 to
+// 2 writes that axis alone on each target, over the target's own other
+// two -- typing y with three objects selected sets their heights, not
+// their places -- and -1 the whole vector.
+write_all(ins: *Inspector, f: *ComponentField, kind: int, number: float, v: Vec3, text: string, axis: int) {
+    shown = ins.object as *GameObject
+    if shown == null { return }
+    k = kind_of_field(ins, f)
+    everyone = targets(ins, k)
+    count = list.size(everyone)
+    i = 0
+    while i < count {
+        o = list.get_raw(everyone, i) as *GameObject
+        c = component.find(o, k)
+        if c != null {
+            before = fields_text(c)
+            if kind == 0 { component.set_float(c, f, number) }
+            if kind == 1 { component.set_int(c, f, number as int) }
+            if kind == 2 { component.set_bool(c, f, number != 0.0) }
+            if kind == 3 {
+                w = v
+                if axis >= 0 {
+                    w = vector_value(c, f)
+                    if axis == 0 { w.x = v.x }
+                    if axis == 1 { w.y = v.y }
+                    if axis == 2 { w.z = v.z }
+                }
+                if f.type == component.TYPE_ROTATION {
+                    component.set_rotation(c, f, core.quat_from_euler(core.deg_to_rad(w.x), core.deg_to_rad(w.y),
+                                                                      core.deg_to_rad(w.z)))
+                } else {
+                    component.set_vec3(c, f, w)
+                }
+            }
+            if kind == 4 { component.set_text(c, f, text) }
+            told(ins, o, c, before)
+        }
+        i = i + 1
+    }
+    list.free(everyone)
+}
+
+// The kind a field belongs to, among the shown object's panels.
+kind_of_field(ins: *Inspector, f: *ComponentField) -> *ComponentKind {
+    count = list.size(ins.panels)
+    i = 0
+    while i < count {
+        p = list.get_raw(ins.panels, i) as *InspectorPanel
+        if component.field_index(p.kind as *ComponentKind, f.name) >= 0 &&
+           component.field_at(p.kind as *ComponentKind, component.field_index(p.kind as *ComponentKind, f.name)) == f {
+            return p.kind as *ComponentKind
+        }
+        i = i + 1
+    }
+    return null
+}
+
+edit_float(ins: *Inspector, f: *ComponentField, value: float) { write_all(ins, f, 0, value, core.vec3(0.0, 0.0, 0.0), "", 0 - 1) }
+edit_int(ins: *Inspector, f: *ComponentField, value: int) { write_all(ins, f, 1, value as float, core.vec3(0.0, 0.0, 0.0), "", 0 - 1) }
+edit_bool(ins: *Inspector, f: *ComponentField, value: bool) {
+    flag = 0.0
+    if value { flag = 1.0 }
+    write_all(ins, f, 2, flag, core.vec3(0.0, 0.0, 0.0), "", 0 - 1)
+}
+edit_vec3(ins: *Inspector, f: *ComponentField, value: Vec3) { write_all(ins, f, 3, 0.0, value, "", 0 - 1) }
+edit_text(ins: *Inspector, f: *ComponentField, value: string) { write_all(ins, f, 4, 0.0, core.vec3(0.0, 0.0, 0.0), value, 0 - 1) }
+
+// One axis of a vector, a colour channel or a rotation's angle, typed into
+// its box: that axis on every selected object, each keeping its other two.
+edit_axis(ins: *Inspector, b: *InspectorBinding, axis: int, value: float) {
+    write_all(ins, b.field as *ComponentField, 3, 0.0, core.vec3(value, value, value), "", axis)
+}
+
+// A vector field as its boxes show it: a rotation in degrees.
+vector_value(c: *Component, f: *ComponentField) -> Vec3 {
+    if f.type == component.TYPE_ROTATION {
+        e = core.quat_to_euler(component.get_rotation(c, f))
+        return core.vec3(core.rad_to_deg(e.x), core.rad_to_deg(e.y), core.rad_to_deg(e.z))
+    }
+    return component.get_vec3(c, f)
+}
+
+// The same as a box of a vector row typed into, for a caller that has the
+// field rather than the row: the editor's own checks.
+edit_axis_of(ins: *Inspector, f: *ComponentField, axis: int, value: float) {
+    write_all(ins, f, 3, 0.0, core.vec3(value, value, value), "", axis)
+}
+
+set_enabled(ins: *Inspector, p: *InspectorPanel, on: bool) {
+    k = p.kind as *ComponentKind
+    everyone = targets(ins, k)
+    count = list.size(everyone)
+    i = 0
+    while i < count {
+        o = list.get_raw(everyone, i) as *GameObject
+        c = component.find(o, k)
+        if c != null {
+            before = fields_text(c)
+            behaviour.component_set_enabled(c, on)
+            component.touch(c)
+            told(ins, o, c, before)
+        }
+        i = i + 1
+    }
+    list.free(everyone)
+}
+
+reset_component(ins: *Inspector, p: *InspectorPanel) {
+    k = p.kind as *ComponentKind
+    everyone = targets(ins, k)
+    count = list.size(everyone)
+    i = 0
+    while i < count {
+        o = list.get_raw(everyone, i) as *GameObject
+        c = component.find(o, k)
+        if c != null {
+            before = fields_text(c)
+            component.reset(c)
+            told(ins, o, c, before)
+        }
+        i = i + 1
+    }
+    list.free(everyone)
+}
+
+// The kinds the object may be given: every registered kind of its side --
+// the scene's for the scene's root, the rest for an object -- that it does
+// not already carry if it may carry only one, in the order they were
+// registered: the engine's, then the game's.
+kinds_offered(ins: *Inspector) -> ptr {
+    offered = list.new()
+    o = ins.object as *GameObject
+    if o == null { return offered }
+    count = component.kind_count()
+    i = 0
+    while i < count {
+        k = component.kind_at(i)
+        fits = k.scene == ins.scene
+        if fits && k.unique && component.find(o, k) != null { fits = false }
+        if fits && k.create == null { fits = false }
+        if fits { list.add_raw(offered, k) }
+        i = i + 1
+    }
+    return offered
+}
+
+add_kind(ins: *Inspector, k: *ComponentKind) -> *Component {
+    o = ins.object as *GameObject
+    c = component.add(o, k)
+    if c == null { return null }
+    fields = fields_text(c)
+    if ins.on_structure != null {
+        changed = ins.on_structure
+        changed(ins.host, o as ptr, k.name, fields, true)
+    }
+    string.free(fields)
+    show(ins, o, ins.scene)
+    return c
+}
+
+remove_component(ins: *Inspector, p: *InspectorPanel) {
+    o = ins.object as *GameObject
+    k = p.kind as *ComponentKind
+    c = component.find(o, k)
+    if o == null || c == null { return }
+    fields = fields_text(c)
+    name = string.copy(k.name)
+    component.remove(o, c)
+    if ins.on_structure != null {
+        changed = ins.on_structure
+        changed(ins.host, o as ptr, name, fields, false)
+    }
+    string.free(name)
+    string.free(fields)
+    show(ins, o, ins.scene)
+}
+
+// A component one place up (-1) or down (+1) among the object's: the order
+// the inspector draws them in and the phases run in. The transform stays
+// first, as in Unity.
+move_component(ins: *Inspector, p: *InspectorPanel, step: int) {
+    o = ins.object as *GameObject
+    if o == null { return }
+    c = component.find(o, p.kind as *ComponentKind)
+    count = behaviour.object_component_count(o)
+    at = 0 - 1
+    i = 0
+    while i < count {
+        if behaviour.object_component(o, i) == c { at = i }
+        i = i + 1
+    }
+    target = at + step
+    if at < 0 || target < 0 || target >= count { return }
+    other = behaviour.object_component(o, target)
+    if is_transform(component.kind_of(other)) || is_transform(p.kind as *ComponentKind) { return }
+    list.set(o.components, target, c)
+    list.set(o.components, at, other)
+    rebuild(ins)
+}
+
+is_transform(k: *ComponentKind) -> bool {
+    return k != null && string.equals(k.name, "Transform") == 1
+}
+
+// --- building ------------------------------------------------------------------
+
+label_of(parent: int, name: string) -> int {
+    caption = ui.text(parent, name)
+    ui.add_css_class(caption, "label")
+    ui.width(caption, LABEL_W)
+    return caption
+}
+
+bind(ins: *Inspector, c: *Component, f: *ComponentField, control: int, count: int) -> *InspectorBinding {
+    b = heap.new(InspectorBinding)
+    b.component = c as ptr
+    b.field = f as ptr
+    b.control = control
+    b.handles = calloc(count, 4)
+    b.handle_count = count
+    b.shown_text = ""
+    list.add_raw(ins.bindings, b)
+    return b
+}
+
+handle_at(b: *InspectorBinding, index: int) -> int {
+    handles = b.handles as int[]
+    return handles[index]
+}
+
+set_handle(b: *InspectorBinding, index: int, handle: int) {
+    handles = b.handles as int[]
+    handles[index] = handle
+}
+
+// A commit typed into a box: the value the box now holds is what the row
+// shows, so the refresh leaves the typed text alone until the value moves
+// again.
+typed(b: *InspectorBinding) {
+    c = b.component as *Component
+    f = b.field as *ComponentField
+    if b.control == CONTROL_VECTOR {
+        v = vector_value(c, f)
+        b.shown_x = v.x
+        b.shown_y = v.y
+        b.shown_z = v.z
+    } else if b.control == CONTROL_COLOR {
+        v = component.get_vec3(c, f)
+        b.shown_x = v.x
+        b.shown_y = v.y
+        b.shown_z = v.z
+    } else if b.control == CONTROL_TEXT {
+        b.shown_text = core.set_owned(b.shown_text, component.get_text(c, f))
+    } else {
+        b.shown_x = number_of(c, f)
+        // The box holds what was typed; the slider beside it follows now,
+        // since the refresh leaves a row alone whose value it has shown.
+        if b.control == CONTROL_SLIDER { ui.set_slider(handle_at(b, 0), b.shown_x) }
+    }
+    if b.control == CONTROL_COLOR { ui.style_bg_color(handle_at(b, 0), b.shown_x, b.shown_y, b.shown_z, 1.0) }
+}
+
+number_of(c: *Component, f: *ComponentField) -> float {
+    if f.type == component.TYPE_INT || f.type == component.TYPE_ENUM { return component.get_int(c, f) as float }
+    if f.type == component.TYPE_BOOL {
+        if component.get_bool(c, f) { return 1.0 }
+        return 0.0
+    }
+    return component.get_float(c, f)
+}
+
+// One choice of an enum: a button that picks it. Its own call, so the
+// closure holds this choice and not the loop's last.
+choice_button(ins: *Inspector, row: int, b: *InspectorBinding, pick: int) -> int {
+    f = b.field as *ComponentField
+    button = ui.btn(row, component.enum_choice(f, pick)) callback {
+        edit_int(ins, f, pick)
+    }
+    ui.add_css_class(button, "action")
+    ui.height(button, 22)
+    ui.fill_width(button)
+    return button
+}
+
+// One axis of a vector row: its coloured letter and its box.
+axis_box(ins: *Inspector, row: int, b: *InspectorBinding, axis: int, letter: string, style: string) -> int {
+    mark = ui.text(row, letter)
+    ui.add_css_class(mark, style)
+    ui.width(mark, AXIS_W)
+    box = ui.textfield(row, "0.00") callback |text: string| {
+        if string.string_try_float(text) != 0 {
+            edit_axis(ins, b, axis, string.string_get_float(text))
+            typed(b)
+        }
+    }
+    ui.add_css_class(box, "field")
+    ui.width(box, VECTOR_W)
+    return box
+}
+
+// One entry of Add Component: the kind under its heading.
+kind_entry(ins: *Inspector, parent: int, kind: *ComponentKind) {
+    entry = ui.btn(parent, "${kind.category} / ${kind.name}") callback { add_kind(ins, kind) }
+    ui.add_css_class(entry, "action")
+    ui.height(entry, 22)
+    ui.fill_width(entry)
+}
+
+// Add Component's list, opened or closed, built from what the object may
+// be given now each time it opens: buttons in the panel rather than a menu,
+// since a menu the toolkit makes is never given back, and the kinds offered
+// change with every object.
+toggle_adder(ins: *Inspector) {
+    ins.adder_open = !ins.adder_open
+    ui.clear_children(ins.adder_list)
+    if ins.adder_open {
+        offered = kinds_offered(ins)
+        n = list.size(offered)
+        j = 0
+        while j < n {
+            kind_entry(ins, ins.adder_list, list.get_raw(offered, j) as *ComponentKind)
+            j = j + 1
+        }
+        if n == 0 {
+            nothing = ui.text(ins.adder_list, "nothing more to add")
+            ui.add_css_class(nothing, "label")
+        }
+        list.free(offered)
+    }
+    ui.set_hidden(ins.adder_list, flag_of(!ins.adder_open))
+}
+
+// The assets an asset field offers, opened under its row or closed: the
+// editor's list of that kind, then Browse for any file.
+toggle_choices(ins: *Inspector, b: *InspectorBinding) {
+    f = b.field as *ComponentField
+    b.choices_open = !b.choices_open
+    ui.clear_children(b.choices)
+    if b.choices_open {
+        if ins.on_assets != null {
+            listing = ins.on_assets
+            offered = listing(ins.host, f.asset_kind)
+            if offered != null {
+                n = list.size(offered)
+                i = 0
+                while i < n {
+                    choice = list.get_raw(offered, i) as *AssetChoice
+                    choice_entry(ins, b, choice.label, choice.path)
+                    heap.free(choice)
+                    i = i + 1
+                }
+                list.free(offered)
+            }
+        }
+        browse = ui.btn(b.choices, "Browse...") callback {
+            chosen = ui.open_file("Choose ${f.name}", "resources")
+            if chosen != "" { edit_text(ins, f, chosen) }
+            toggle_choices(ins, b)
+        }
+        ui.add_css_class(browse, "action")
+        ui.height(browse, 22)
+        ui.fill_width(browse)
+    }
+    ui.set_hidden(b.choices, flag_of(!b.choices_open))
+}
+
+choice_entry(ins: *Inspector, b: *InspectorBinding, label: string, path: string) {
+    f = b.field as *ComponentField
+    entry = ui.btn(b.choices, label) callback {
+        edit_text(ins, f, path)
+        toggle_choices(ins, b)
+    }
+    ui.add_css_class(entry, "action")
+    ui.height(entry, 22)
+    ui.fill_width(entry)
+}
+
+// What can be done to the component, as a row of buttons under its header,
+// opened or closed: reset, move it up or down, and take it off. The
+// transform is what places the object: as in Unity it is reset, never
+// removed.
+toggle_actions(ins: *Inspector, p: *InspectorPanel) {
+    p.actions_open = !p.actions_open
+    ui.clear_children(p.actions)
+    if p.actions_open {
+        action_button(ins, p, "Reset", 0)
+        action_button(ins, p, "Move Up", 1)
+        action_button(ins, p, "Move Down", 2)
+        if !is_transform(p.kind as *ComponentKind) { action_button(ins, p, "Remove", 3) }
+    }
+    ui.set_hidden(p.actions, flag_of(!p.actions_open))
+}
+
+action_button(ins: *Inspector, p: *InspectorPanel, label: string, what: int) {
+    button = ui.btn(p.actions, label) callback {
+        if what == 0 {
+            reset_component(ins, p)
+            toggle_actions(ins, p)
+        }
+        if what == 1 { move_component(ins, p, 0 - 1) }
+        if what == 2 { move_component(ins, p, 1) }
+        if what == 3 { remove_component(ins, p) }
+    }
+    ui.add_css_class(button, "action")
+    ui.height(button, 22)
+    ui.fill_width(button)
+}
+
+number_box(ins: *Inspector, row: int, b: *InspectorBinding, width: int) -> int {
+    f = b.field as *ComponentField
+    box = ui.textfield(row, "0.00") callback |text: string| {
+        if string.string_try_float(text) != 0 {
+            value = string.string_get_float(text)
+            if f.type == component.TYPE_INT { edit_int(ins, f, value as int) } else { edit_float(ins, f, value) }
+            typed(b)
+        }
+    }
+    ui.add_css_class(box, "field")
+    ui.width(box, width)
+    return box
+}
+
+row_for(ins: *Inspector, body: int, c: *Component, f: *ComponentField) {
+    vector = f.type == component.TYPE_VEC3 || f.type == component.TYPE_ROTATION
+    spacing = 8
+    if vector { spacing = 4 }
+    row = ui.hstack(body, spacing)
+    ui.add_css_class(row, "row")
+    if vector {
+        // Three boxes and their letters take the width a slider row gives its
+        // label column and slider: the caption takes what is left.
+        caption = ui.text(row, f.name)
+        ui.add_css_class(caption, "label")
+    } else {
+        label_of(row, f.name)
+    }
+    if f.tooltip != "" { ui.style_tooltip(row, f.tooltip) }
+
+    if f.type == component.TYPE_BOOL {
+        b = bind(ins, c, f, CONTROL_TOGGLE, 1)
+        ui.spacer(row)
+        toggle = ui.toggle(row, "") callback |on: bool| {
+            edit_bool(ins, f, on)
+            typed(b)
+        }
+        set_handle(b, 0, toggle)
+    } else if f.type == component.TYPE_ENUM {
+        choices = component.enum_choice_count(f)
+        b = bind(ins, c, f, CONTROL_CHOICES, choices)
+        i = 0
+        while i < choices {
+            set_handle(b, i, choice_button(ins, row, b, i))
+            i = i + 1
+        }
+    } else if (f.type == component.TYPE_FLOAT || f.type == component.TYPE_INT) && f.max > f.min {
+        b = bind(ins, c, f, CONTROL_SLIDER, 2)
+        slider = ui.slider(row, f.min, f.max, f.min) callback |value: float| {
+            if f.type == component.TYPE_INT { edit_int(ins, f, value as int) } else { edit_float(ins, f, value) }
+        }
+        ui.height(slider, 16)
+        ui.fill_width(slider)
+        set_handle(b, 0, slider)
+        set_handle(b, 1, number_box(ins, row, b, READOUT_W))
+    } else if f.type == component.TYPE_FLOAT || f.type == component.TYPE_INT {
+        b = bind(ins, c, f, CONTROL_FIELD, 1)
+        ui.spacer(row)
+        set_handle(b, 0, number_box(ins, row, b, FIELD_W))
+    } else if vector {
+        b = bind(ins, c, f, CONTROL_VECTOR, 3)
+        ui.spacer(row)
+        set_handle(b, 0, axis_box(ins, row, b, 0, "X", "axis-x"))
+        set_handle(b, 1, axis_box(ins, row, b, 1, "Y", "axis-y"))
+        set_handle(b, 2, axis_box(ins, row, b, 2, "Z", "axis-z"))
+    } else if f.type == component.TYPE_COLOR {
+        b = bind(ins, c, f, CONTROL_COLOR, 2)
+        ui.spacer(row)
+        chip = ui.text(row, " ")
+        ui.add_css_class(chip, "chip")
+        ui.width(chip, CHIP_W)
+        ui.height(chip, 14)
+        box = ui.textfield(row, "#000000") callback |text: string| {
+            colour = parse_hex(text)
+            if colour.x >= 0.0 {
+                edit_vec3(ins, f, colour)
+                typed(b)
+            }
+        }
+        ui.add_css_class(box, "field")
+        ui.width(box, FIELD_W)
+        set_handle(b, 0, chip)
+        set_handle(b, 1, box)
+    } else {
+        b = bind(ins, c, f, CONTROL_TEXT, 2)
+        box = ui.textfield(row, "") callback |text: string| {
+            edit_text(ins, f, text)
+            typed(b)
+        }
+        ui.add_css_class(box, "field")
+        ui.fill_width(box)
+        set_handle(b, 0, box)
+        if f.type == component.TYPE_ASSET {
+            b.choices = ui.vstack(body, 4)
+            ui.fill_width(b.choices)
+            ui.set_hidden(b.choices, 1)
+            browse = ui.btn(row, "...") callback { toggle_choices(ins, b) }
+            ui.add_css_class(browse, "action")
+            ui.height(browse, 22)
+            ui.width(browse, 28)
+            set_handle(b, 1, browse)
+        }
+    }
+    if (f.flags & component.FIELD_READONLY) != 0 { ui.enabled(row, 0) }
+}
+
+panel_for(ins: *Inspector, c: *Component) {
+    k = component.kind_of(c)
+    p = heap.new(InspectorPanel)
+    p.component = c as ptr
+    p.kind = k as ptr
+    p.open = true
+    p.enabled_shown = 0 - 1
+    list.add_raw(ins.panels, p)
+
+    header = ui.hstack(ins.stack, 6)
+    ui.add_css_class(header, "heading")
+    ui.fill_width(header)
+    p.header = header
+    strip = ui.hstack(header, 6)
+    ui.add_css_class(strip, "row")
+    ui.fill_width(strip)
+    caret = ui.text(strip, "▾")
+    ui.add_css_class(caret, "caption")
+    ui.width(caret, 10)
+    p.caret = caret
+    enabled = ui.toggle(strip, "") callback |on: bool| {
+        set_enabled(ins, p, on)
+        p.enabled_shown = flag_of(on)
+    }
+    p.enabled_toggle = enabled
+    title = ui.text(strip, k.name)
+    ui.add_css_class(title, "caption")
+    ui.spacer(strip)
+    menu_button = ui.btn(strip, "⋮") callback { toggle_actions(ins, p) }
+    ui.style_flat(menu_button)
+    ui.width(menu_button, 22)
+
+    actions = ui.hstack(ins.stack, 4)
+    ui.add_css_class(actions, "row")
+    ui.fill_width(actions)
+    ui.set_hidden(actions, 1)
+    p.actions = actions
+
+    body = ui.vstack(ins.stack, 6)
+    ui.fill_width(body)
+    p.body = body
+    ui.on_click(caret) callback {
+        p.open = !p.open
+        ui.set_hidden(p.body, flag_of(!p.open))
+        if p.open { ui.set_text(p.caret, "▾") } else { ui.set_text(p.caret, "▸") }
+    }
+
+    count = component.field_count(k)
+    i = 0
+    while i < count {
+        f = component.field_at(k, i)
+        if (f.flags & component.FIELD_HIDDEN) == 0 { row_for(ins, body, c, f) }
+        i = i + 1
+    }
+}
+
+// The object's registry components in the order they are drawn: the
+// transform first, as in Unity, then the rest in the object's order.
+drawn_components(o: *GameObject) -> ptr {
+    out = list.new()
+    count = behaviour.object_component_count(o)
+    i = 0
+    while i < count {
+        c = behaviour.object_component(o, i)
+        if is_transform(component.kind_of(c)) { list.add_raw(out, c) }
+        i = i + 1
+    }
+    i = 0
+    while i < count {
+        c = behaviour.object_component(o, i)
+        if component.kind_of(c) != null && !is_transform(component.kind_of(c)) { list.add_raw(out, c) }
+        i = i + 1
+    }
+    return out
+}
+
+// Whether the panels built are for components of these kinds, in order.
+same_shape(ins: *Inspector, drawn: ptr) -> bool {
+    if list.size(drawn) != list.size(ins.panels) { return false }
+    count = list.size(drawn)
+    i = 0
+    while i < count {
+        p = list.get_raw(ins.panels, i) as *InspectorPanel
+        if p.kind != component.kind_of(list.get_raw(drawn, i) as *Component) as ptr { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// The panels pointed at `drawn`, which is the shape they were built for.
+rebind(ins: *Inspector, drawn: ptr) {
+    count = list.size(drawn)
+    i = 0
+    while i < count {
+        c = list.get_raw(drawn, i) as *Component
+        p = list.get_raw(ins.panels, i) as *InspectorPanel
+        p.component = c as ptr
+        p.enabled_shown = 0 - 1
+        i = i + 1
+    }
+    count = list.size(ins.bindings)
+    i = 0
+    while i < count {
+        b = list.get_raw(ins.bindings, i) as *InspectorBinding
+        b.component = component_of_kind(ins, b.field as *ComponentField) as ptr
+        b.painted = false
+        i = i + 1
+    }
+}
+
+// The panel's component a field belongs to.
+component_of_kind(ins: *Inspector, f: *ComponentField) -> *Component {
+    k = kind_of_field(ins, f)
+    count = list.size(ins.panels)
+    i = 0
+    while i < count {
+        p = list.get_raw(ins.panels, i) as *InspectorPanel
+        if p.kind == k as ptr { return p.component as *Component }
+        i = i + 1
+    }
+    return null
+}
+
+// The object shown: `o`, its components as panels and Add Component; null
+// clears it. `scene` says the object is the scene's root, whose kinds are
+// the scene's. An object of a shape shown before is shown in that shape's
+// view, pointed at its components; another shape is built as a view of its
+// own.
+show(ins: *Inspector, o: *GameObject, scene: bool) {
+    drop_stale(ins)
+    if o == null {
+        show_view(ins, null)
+        ins.object = null
+        return
+    }
+    ins.object = o as ptr
+    ins.scene = scene
+    drawn = drawn_components(o)
+    v = view_for(ins, drawn, scene)
+    if v == null {
+        build(ins, drawn)
+    } else {
+        show_view(ins, v)
+        rebind(ins, drawn)
+        paint_all(ins)
+    }
+    list.free(drawn)
+}
+
+// The panels for the object shown after a component was added, removed or
+// moved: its new shape's view.
+rebuild(ins: *Inspector) {
+    o = ins.object as *GameObject
+    if o == null { return }
+    show(ins, o, ins.scene)
+}
+
+// The view built for these kinds in this order on this side, if one is kept.
+view_for(ins: *Inspector, drawn: ptr, scene: bool) -> *InspectorView {
+    count = list.size(ins.views)
+    i = 0
+    while i < count {
+        v = list.get_raw(ins.views, i) as *InspectorView
+        if v.scene == scene && view_fits(v, drawn) { return v }
+        i = i + 1
+    }
+    return null
+}
+
+view_fits(v: *InspectorView, drawn: ptr) -> bool {
+    count = list.size(drawn)
+    if count != list.size(v.kinds) { return false }
+    i = 0
+    while i < count {
+        if list.get_raw(v.kinds, i) != component.kind_of(list.get_raw(drawn, i) as *Component) as ptr { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Every view built from kinds that have changed since, gone: a reloaded
+// script's fields are other fields than the rows were made for.
+drop_stale(ins: *Inspector) {
+    now = component.generation()
+    i = list.size(ins.views) - 1
+    while i >= 0 {
+        v = list.get_raw(ins.views, i) as *InspectorView
+        if v.generation != now { view_drop(ins, v) }
+        i = i - 1
+    }
+}
+
+// The view the inspector shows, the one before hidden, or none. Its lists
+// are the inspector's while it is shown, so what builds and paints reads
+// them there.
+show_view(ins: *Inspector, v: *InspectorView) {
+    if ins.view == v as ptr { return }
+    if ins.view != null {
+        was = ins.view as *InspectorView
+        // An open list of kinds to add was the last object's.
+        if ins.adder_open { toggle_adder(ins) }
+        ui.set_hidden(was.stack, 1)
+    }
+    ins.view = v as ptr
+    if v == null {
+        ins.stack = 0
+        ins.panels = ins.no_panels
+        ins.bindings = ins.no_bindings
+        ins.adder = 0
+        ins.adder_list = 0
+        return
+    }
+    ui.set_hidden(v.stack, 0)
+    ins.stack = v.stack
+    ins.panels = v.panels
+    ins.bindings = v.bindings
+    ins.adder = v.adder
+    ins.adder_list = v.adder_list
+    ins.adder_open = false
+    ins.shows = ins.shows + 1
+    v.used = ins.shows
+}
+
+// A view for the object's shape, built, shown and painted; past VIEWS_KEPT
+// the least recently shown other than it goes.
+build(ins: *Inspector, drawn: ptr) {
+    v = heap.new(InspectorView)
+    v.scene = ins.scene
+    v.generation = component.generation()
+    v.kinds = list.new()
+    v.panels = list.new()
+    v.bindings = list.new()
+    count = list.size(drawn)
+    i = 0
+    while i < count {
+        list.add_raw(v.kinds, component.kind_of(list.get_raw(drawn, i) as *Component))
+        i = i + 1
+    }
+    v.stack = ui.vstack(ins.root, 6)
+    ui.fill_width(v.stack)
+    list.add_raw(ins.views, v)
+    show_view(ins, v)
+
+    i = 0
+    while i < count {
+        panel_for(ins, list.get_raw(drawn, i) as *Component)
+        i = i + 1
+    }
+    v.adder = ui.btn(v.stack, "Add Component") callback { toggle_adder(ins) }
+    ui.add_css_class(v.adder, "primary")
+    ui.height(v.adder, 24)
+    ui.fill_width(v.adder)
+    v.adder_list = ui.vstack(v.stack, 4)
+    ui.fill_width(v.adder_list)
+    ui.set_hidden(v.adder_list, 1)
+    ins.adder = v.adder
+    ins.adder_list = v.adder_list
+    ins.adder_open = false
+
+    if list.size(ins.views) > VIEWS_KEPT {
+        oldest = null
+        j = 0
+        while j < list.size(ins.views) {
+            w = list.get_raw(ins.views, j) as *InspectorView
+            if w != v && (oldest == null || w.used < (oldest as *InspectorView).used) { oldest = w as ptr }
+            j = j + 1
+        }
+        if oldest != null { view_drop(ins, oldest as *InspectorView) }
+    }
+    paint_all(ins)
+}
+
+// --- following what the rows show ------------------------------------------------------
+
+// Every row brought to what its component holds, where that moved since
+// the row last showed it. Shown in another view when the object's
+// components were added to, taken from or reordered by something other than
+// this inspector (a script, the agent, an undo), or the kinds changed.
+refresh(ins: *Inspector) {
+    o = ins.object as *GameObject
+    if o == null { return }
+    drawn = drawn_components(o)
+    fits = ins.view != null && (ins.view as *InspectorView).generation == component.generation() && same_shape(ins, drawn)
+    list.free(drawn)
+    if !fits {
+        show(ins, o, ins.scene)
+        return
+    }
+    paint_all(ins)
+}
+
+paint_all(ins: *Inspector) {
+    focused = ui.focused_widget()
+    count = list.size(ins.bindings)
+    i = 0
+    while i < count {
+        paint(list.get_raw(ins.bindings, i) as *InspectorBinding, focused)
+        i = i + 1
+    }
+    count = list.size(ins.panels)
+    i = 0
+    while i < count {
+        p = list.get_raw(ins.panels, i) as *InspectorPanel
+        on = flag_of(behaviour.component_enabled(p.component as *Component))
+        if on != p.enabled_shown {
+            ui.set_toggle(p.enabled_toggle, on)
+            p.enabled_shown = on
+        }
+        i = i + 1
+    }
+}
+
+// A box's text, unless it is the one being typed into.
+put_text(handle: int, text: string, focused: int) {
+    if handle != focused { ui.set_text(handle, text) }
+}
+
+paint(b: *InspectorBinding, focused: int) {
+    c = b.component as *Component
+    f = b.field as *ComponentField
+    if c == null { return }
+    if b.control == CONTROL_VECTOR || b.control == CONTROL_COLOR {
+        v = component.get_vec3(c, f)
+        if b.control == CONTROL_VECTOR { v = vector_value(c, f) }
+        if b.painted && v.x == b.shown_x && v.y == b.shown_y && v.z == b.shown_z { return }
+        b.shown_x = v.x
+        b.shown_y = v.y
+        b.shown_z = v.z
+        b.painted = true
+        if b.control == CONTROL_VECTOR {
+            put_text(handle_at(b, 0), number_text(v.x), focused)
+            put_text(handle_at(b, 1), number_text(v.y), focused)
+            put_text(handle_at(b, 2), number_text(v.z), focused)
+        } else {
+            ui.style_bg_color(handle_at(b, 0), v.x, v.y, v.z, 1.0)
+            put_text(handle_at(b, 1), color_hex(v), focused)
+        }
+        return
+    }
+    if b.control == CONTROL_TEXT {
+        text = component.get_text(c, f)
+        if b.painted && string.equals(text, b.shown_text) == 1 { return }
+        b.shown_text = core.set_owned(b.shown_text, text)
+        b.painted = true
+        put_text(handle_at(b, 0), text, focused)
+        return
+    }
+    value = number_of(c, f)
+    if b.painted && value == b.shown_x { return }
+    b.shown_x = value
+    b.painted = true
+    if b.control == CONTROL_TOGGLE {
+        ui.set_toggle(handle_at(b, 0), flag_of(value != 0.0))
+    } else if b.control == CONTROL_CHOICES {
+        active = value as int
+        i = 0
+        while i < b.handle_count {
+            if i == active {
+                ui.style_bg_color(handle_at(b, i), 0.184, 0.435, 0.922, 1.0)
+            } else {
+                ui.style_bg_color(handle_at(b, i), 0.173, 0.192, 0.227, 1.0)
+            }
+            i = i + 1
+        }
+    } else if b.control == CONTROL_SLIDER {
+        ui.set_slider(handle_at(b, 0), value)
+        put_text(handle_at(b, 1), number_text(value), focused)
+    } else {
+        put_text(handle_at(b, 0), number_text(value), focused)
+    }
+}

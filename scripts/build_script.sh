@@ -40,15 +40,33 @@ fi
 AETHER_LIB_DIR="$ROOT/src" aetherc "$SOURCE" "$GEN"
 
 CC="${CC:-cc}"
+# What the script leaves to the program that loads it, by platform. A
+# script uses the Aether runtime as any Aether code does -- its fields are
+# named strings, its state is allocated -- and where that runtime comes
+# from differs:
+#   Linux    left undefined, and resolved against the host's at load: the
+#            editor exports its symbols (-rdynamic), so the script shares
+#            the host's runtime, its observers included.
+#   macOS    the same, said to the linker: undefined names are looked up in
+#            the loading program (-undefined dynamic_lookup).
+#   Windows  a DLL resolves every name at its own link and an executable
+#            exports nothing, so the script carries the runtime's library
+#            itself. It shares the host's C runtime (UCRT), so memory one
+#            allocates the other frees; what it does not share is the
+#            runtime's own tables, so a store the script makes on an
+#            @observable state is told to its own observers, not the
+#            host's. aether-lang-dev/aether#2297 asks for the runtime and
+#            the engine as one library both link.
+RUNTIME_LIBS=""
 case "$(uname -s)" in
-    # The Aether runtime comes from the toolchain's own library; what stays
-    # undefined is the engine, and that is resolved by linking the same engine
-    # library the host links.
-    Darwin) LINK_FLAGS="-dynamiclib" ;;
+    Darwin) LINK_FLAGS="-dynamiclib -undefined dynamic_lookup" ;;
+    MINGW*|MSYS*|CYGWIN*)
+        LINK_FLAGS="-shared"
+        RUNTIME_LIBS="$(ae3d_runtime_link_flags "$(ae cflags --libs 2>/dev/null || true)")" ;;
     *)      LINK_FLAGS="-shared" ;;
 esac
 
-if [ ! -f "$(ae3d_native_library)" ]; then
+if [ ! -f "$(ae3d_native_library)" ] || { [ -n "$RUNTIME_LIBS" ] && [ ! -f "$(ae3d_runtime_library)" ]; }; then
     ./build.sh --natives >/dev/null
 fi
 
@@ -58,6 +76,6 @@ fi
 ae3d_glfw_flags
 # shellcheck disable=SC2086
 $CC -O2 -fwrapv $(ae3d_fp_flags) $(ae3d_native_pic_flag) $AETHER_CFLAGS $LINK_FLAGS \
-    "$GEN" $(ae3d_native_link_flags ..) $GLFW_LIBS -o "$LIB"
+    "$GEN" $(ae3d_native_link_flags ..) $GLFW_LIBS $RUNTIME_LIBS -o "$LIB"
 
 echo "built: $LIB"

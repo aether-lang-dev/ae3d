@@ -156,6 +156,100 @@ ae3d_native_build() {
         $ae3d_extra_libs $(ae3d_platform_libs "$(uname -s)") -o "$ae3d_lib"
 }
 
+# The Aether runtime, one per process. A script is a library of its own
+# with Aether code in it, and that code calls the runtime: its strings, its
+# allocations, the accounting the runtime keeps of both, its observers. Two
+# runtimes in one process -- the program's and a script's -- each account
+# for what the other allocated and frees, and the first string one frees
+# for the other underflows its books. So the program and every script it
+# loads use one runtime:
+#   Linux    the program exports its symbols (-rdynamic, ae3d_program_flags)
+#            and a script leaves the runtime to be found in it;
+#   macOS    the same, a script linked -undefined dynamic_lookup;
+#   Windows  an executable exports nothing a DLL can import, so the
+#            runtime is made a DLL of its own here, from the toolchain's
+#            static library whole, and the program and every script link
+#            it, as both link the engine's own C (libae3d_native).
+# aether-lang-dev/aether#2297 asks for the runtime and the engine as one
+# library the language builds; until then this is that library on Windows.
+ae3d_runtime_library() {
+    printf '%s' "build/aether_runtime$(ae3d_native_suffix)"
+}
+
+# The runtime's DLL built from the toolchain's static library, when the
+# library is newer than the DLL or the DLL is missing: Windows only.
+#
+#   ae3d_runtime_build <cc> "<the toolchain's --libs>"
+ae3d_runtime_build() {
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*|Windows_NT) ;;
+        *) return 0 ;;
+    esac
+    ae3d_rt_dir=""
+    for ae3d_flag in $2; do
+        case "$ae3d_flag" in -L*) [ -f "${ae3d_flag#-L}/libaether.a" ] && ae3d_rt_dir="${ae3d_flag#-L}" ;; esac
+    done
+    if [ -z "$ae3d_rt_dir" ]; then
+        echo "ae3d: the toolchain's --libs names no directory holding libaether.a" >&2
+        return 1
+    fi
+    ae3d_rt_lib="$(ae3d_runtime_library)"
+    if [ -f "$ae3d_rt_lib" ] && [ ! "$ae3d_rt_dir/libaether.a" -nt "$ae3d_rt_lib" ]; then return 0; fi
+    # What the runtime itself links: the toolchain's --libs without the
+    # runtime's own name, and the optional libraries its archive calls into.
+    # A program is given those only when it uses the module that needs them
+    # (ae adds -lzstd for std.zstd), so --libs never names them; the whole
+    # archive linked into one library needs every one it references. Which
+    # it references is read off the archive's undefined symbols, by the
+    # prefix each library's API has -- the libraries ae's own table of
+    # optional ones names (tools/ae.c, optional_link_requirement).
+    ae3d_rt_deps=""
+    for ae3d_flag in $2; do
+        [ "$ae3d_flag" = "-laether" ] || ae3d_rt_deps="$ae3d_rt_deps $ae3d_flag"
+    done
+    # Undefined in the archive as a whole: named by a member and defined by
+    # none (PCRE2 is built into it, so its calls resolve inside).
+    nm --defined-only "$ae3d_rt_dir/libaether.a" 2>/dev/null | awk 'NF >= 3 {print $3}' | sort -u > build/aether_runtime.defined
+    ae3d_rt_undefined=" $(nm -u "$ae3d_rt_dir/libaether.a" 2>/dev/null | awk 'NF && $NF !~ /:$/ {print $NF}' | sort -u |
+        comm -23 - build/aether_runtime.defined | tr '\n' ' ')"
+    rm -f build/aether_runtime.defined
+    case "$ae3d_rt_undefined" in *ZSTD_*) ae3d_rt_deps="$ae3d_rt_deps -lzstd" ;; esac
+    case "$ae3d_rt_undefined" in *nghttp2_*) ae3d_rt_deps="$ae3d_rt_deps -lnghttp2" ;; esac
+    case "$ae3d_rt_undefined" in *pcre2_*) ae3d_rt_deps="$ae3d_rt_deps -lpcre2-8" ;; esac
+    case "$ae3d_rt_undefined" in *Brotli*) ae3d_rt_deps="$ae3d_rt_deps -lbrotlienc -lbrotlicommon" ;; esac
+    case "$ae3d_rt_undefined" in *" fy_"*) ae3d_rt_deps="$ae3d_rt_deps -lfyaml" ;; esac
+    mkdir -p build
+    # shellcheck disable=SC2086
+    "$1" -shared -Wl,--whole-archive "$ae3d_rt_dir/libaether.a" -Wl,--no-whole-archive \
+        -Wl,--out-implib,"$ae3d_rt_lib.a" $ae3d_rt_deps -o "$ae3d_rt_lib"
+}
+
+# The toolchain's --libs as a program or a script links them: the runtime
+# is the shared one on Windows, the static library elsewhere (where the
+# program exports it).
+#
+#   ae3d_runtime_link_flags "<the toolchain's --libs>"
+ae3d_runtime_link_flags() {
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*|Windows_NT)
+            ae3d_rt_out="-Lbuild -laether_runtime"
+            for ae3d_flag in $1; do
+                [ "$ae3d_flag" = "-laether" ] || ae3d_rt_out="$ae3d_rt_out $ae3d_flag"
+            done
+            printf '%s' "$ae3d_rt_out" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# What every program is linked with beyond its libraries: on Linux its
+# symbols exported, so a script it loads finds the runtime in it.
+ae3d_program_flags() {
+    case "$(uname -s)" in
+        Linux|FreeBSD) printf '%s' "-rdynamic" ;;
+        *) printf '%s' "" ;;
+    esac
+}
+
 # DLSS through NVIDIA Streamline: the C++ shim (native/dlss/streamline.cpp) when
 # AE3D_STREAMLINE_ROOT names the SDK, the stub (native/dlss/stub.c),
 # which says DLSS was not built in, otherwise. Whichever is built, the

@@ -58,6 +58,14 @@ interleaved with the first.
 | `input.set` | `[key], [mouse], [button], [axis], [value], [down], [clear]` | Press or release a key, mouse button or pad button, hold a pad axis at a value, or clear every injection: what the engine's input reads next frame beside the real devices. |
 | `input.get` |  | Every bound action with its state this frame: down, pressed, released, value. |
 | `light.set` | `[index], [position], [direction], [color], [intensity], [ambient]` | Change a light. |
+| `object.list` | `[filter]` | The scene's game objects: index, name, tag, whether active, and the kinds of their components in order. The scene itself comes first as index -1, named Scene: its components are what is the scene's rather than any object's (Environment, Rendering, a script keeping the game's rules). With filter, only the objects whose name has the text. |
+| `object.get` | `object` | One object and every component on it: its kind, whether enabled, its version (how many times it has changed) and its fields by name. object is an index from object.list, a name, or Scene. |
+| `component.kinds` |  | Every kind of component there is -- the engine's and the game's -- with the heading it is listed under, whether an object may carry only one, whether it is the scene's, and each field's name, type (bool, int, float, vec3, color, rotation, enum, text, asset), range, choices and tooltip. |
+| `component.get` | `object, kind` | The fields of the object's component of that kind, by name. |
+| `component.set` | `object, kind, fields` | Writes the fields named in fields ({name: value}), each held to its range, and answers the component as it is now, with how many of the names the kind has no field for (unknown). |
+| `component.add` | `object, kind, [fields]` | Adds a component of that kind with its defaults, and the fields given; refused when the kind is one per object and the object has one. |
+| `component.remove` | `object, kind` | Removes the object's component of that kind. |
+| `component.enable` | `object, kind, on` | Enables or disables the object's component of that kind: a disabled component's phases do not run. |
 | `scene.save` | `path, [mesh_directory]` | Write the scene to JSON, with generated geometry beside it. |
 | `scene.load` | `path` | Replace the scene with one from a file, and reframe the camera as it was saved. |
 | `frame.capture` |  | Read the finished frame into the engine. Answers with its size once it is there. |

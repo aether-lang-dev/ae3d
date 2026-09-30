@@ -1,0 +1,1058 @@
+// Component kinds: what a component is made of, said once, read by everything
+// that has to walk it.
+//
+// A game object is its components (ae3d.behaviour), and five things need to
+// see inside one without knowing its type: the editor's inspector draws a
+// row per field, the scene file and a save game write and read each one, the
+// network sends the ones that changed, and the agent answers
+// `component.get Player Health value`. Unity gets that from C# reflection,
+// Godot from binding each property in ClassDB, Unreal from UPROPERTY. This is
+// Godot's shape over Aether's layout builtins: a kind is registered once,
+// beside its struct, a field at a time by `offsetof`, so renaming a field
+// breaks the build rather than the save file (a derived schema is asked of
+// the language in aether-lang-dev/aether#2298):
+//
+//     struct Bob @observable { rate: float  height: float  clock: float }
+//
+//     bob_new() -> ptr {
+//         b = heap.new(Bob)
+//         b.rate = 2.0
+//         b.height = 6.0
+//         return b as ptr
+//     }
+//     bob_free(p: ptr) { heap.free(p as *Bob) }
+//
+//     k = component.kind("Bob", "Motion", bob_new, bob_free)
+//     component.float_field(k, "rate", offsetof(Bob, rate), 0.0, 10.0)
+//     component.float_field(k, "height", offsetof(Bob, height), 0.0, 50.0)
+//     component.float_field(k, "clock", offsetof(Bob, clock), 0.0, 0.0)
+//     component.set_flags(k, "clock", component.FIELD_TRANSIENT)
+//     component.phases(k, null, bob_update, null, null)
+//
+//     c = component.add(go, k)        // its own Bob, its defaults, freed with it
+//
+// Defaults have one source: the kind's constructor. The registry makes one
+// instance when the kind is registered and reads every default off it --
+// for a new component, for the inspector's reset, and for a save that
+// writes only what differs from them.
+//
+// A field of text (an asset's path, a clip's name) is read and written
+// through the two functions it was registered with: a string in a struct
+// is a pointer and an ownership flag, and only code that knows the struct's
+// type can replace one without leaking the old or freeing a borrowed one.
+// Everything else is read and written at its offset.
+//
+// A write through the registry calls the kind's `validate` with the field
+// it changed -- Unity's OnValidate: the transform's marks its model moved,
+// a light's re-derives its cone -- and bumps the component's version, which
+// is how the inspector, the network and a save see that it changed. A kind
+// whose state struct is `@observable` (aether#2220) has its script's own
+// stores (`self.health = 50`) bump the version too, through std.observe.
+
+import std.list
+import std.heap
+import std.string
+import std.mem
+import std.json
+import std.observe
+import ae3d.core
+import ae3d.behaviour
+import ae3d.scene
+
+exports (
+    ComponentKind, ComponentField,
+    TYPE_BOOL, TYPE_INT, TYPE_FLOAT, TYPE_VEC3, TYPE_COLOR, TYPE_ROTATION, TYPE_ENUM, TYPE_TEXT, TYPE_ASSET,
+    FIELD_TRANSIENT, FIELD_READONLY, FIELD_HIDDEN,
+    kind, kind_free, kinds_clear, kind_count, kind_at, kind_find, kind_named, kind_of, enum_choice_add,
+    set_unique, set_scene, set_observable, set_validate, set_category, phases, set_lifecycle,
+    bool_field, bool_property, int_field, float_field, float_property, vec3_field, color_field, rotation_field, enum_field, text_field, asset_field,
+    set_flags, set_tooltip, set_step,
+    field_count, field_at, field_named, field_index, field_default_float, field_default_vec3,
+    add, add_with, attach_state, remove, find, find_named, version, touch, data_of, kind_name, generation,
+    get_bool, set_bool, get_int, set_int, get_float, set_float, get_vec3, set_vec3,
+    get_rotation, set_rotation, get_text, set_text,
+    enum_choice_count, enum_choice, reset_field, reset,
+    to_json, from_json, differs, copy_fields, last_error,
+    entry_json, saved_for, attach_loaded, kind_redefine, release_state, replace_state
+)
+
+const TYPE_BOOL = 0
+const TYPE_INT = 1
+const TYPE_FLOAT = 2
+const TYPE_VEC3 = 3
+// A colour: three floats, 0..1 each, as a Vec3 of red, green and blue.
+const TYPE_COLOR = 4
+// A rotation: a quaternion in the state, shown and written as degrees
+// about each axis (yaw, pitch, roll) where a person reads it.
+const TYPE_ROTATION = 5
+// An int that is one of named choices, written by name.
+const TYPE_ENUM = 6
+const TYPE_TEXT = 7
+// Text that names an asset: a path, drawn with a picker.
+const TYPE_ASSET = 8
+
+// Not written to a scene or a save: what the component works out as it runs.
+const FIELD_TRANSIENT = 1
+// Shown, never edited: what it reports.
+const FIELD_READONLY = 2
+// Neither shown nor written: the component's own bookkeeping.
+const FIELD_HIDDEN = 4
+
+struct ComponentField {
+    name: string
+    tooltip: string
+    type: int
+    offset: int
+    min: float
+    max: float
+    step: float
+    flags: int
+    choices: ptr                   // list of *ChoiceName, for TYPE_ENUM
+    get_text: fn(ptr) -> string    // TYPE_TEXT and TYPE_ASSET
+    set_text: fn(ptr, string)
+    // A float the state derives rather than holds at an offset (a spot's
+    // cone in degrees over the cosine the shader wants): read and written
+    // through these, and the offset is -1.
+    get_number: fn(ptr) -> float
+    set_number: fn(ptr, float)
+    // A switch the state derives in the same way (the sun driving the sky,
+    // over an hour that is kept when it does not).
+    get_flag: fn(ptr) -> bool
+    set_flag: fn(ptr, bool)
+    asset_kind: string             // what an asset field names: "model", "texture", "script", ...
+}
+
+struct ChoiceName {
+    text: string
+}
+
+struct ComponentKind {
+    name: string
+    category: string
+    fields: ptr                    // list of *ComponentField, in the order they are drawn
+    create: fn() -> ptr            // a state with its defaults, owned by the component
+    destroy: fn(ptr)
+    validate: fn(ptr, int)         // after a write through the registry, with the field's index
+    awake: fn(ptr, *GameObject)
+    start: fn(ptr, *GameObject)
+    update: fn(ptr, *GameObject, float)
+    fixed_update: fn(ptr, *GameObject, float)
+    late_update: fn(ptr, *GameObject, float)
+    on_destroy: fn(ptr, *GameObject)
+    unique: bool                   // at most one on an object
+    scene: bool                    // lives on the scene's root, not on an object
+    observable: bool               // its state struct is @observable
+    defaults: ptr                  // one state made by create, read for every default
+    id: int
+}
+
+var g_kinds: ptr = null
+var g_error = ""
+// Counts every change to what a kind is made of: a field added, a kind
+// redefined by a reloaded script, freed or cleared. What was built from a
+// kind's fields (an inspector's rows) is stale once it moves.
+var g_generation = 0
+
+generation() -> int { return g_generation }
+
+last_error() -> string { return g_error }
+
+// The message kept for last_error, owned: the one before it freed, since a
+// module's variable does not free what it held when it is given another.
+set_error(text: string) { g_error = core.set_owned(g_error, text) }
+
+registry() -> ptr {
+    if g_kinds == null { g_kinds = list.new() }
+    return g_kinds
+}
+
+// A kind, registered: its name, the heading it is listed under in Add
+// Component, and the state's constructor and destructor. A kind of the same
+// name already registered is answered instead, so registering at every start
+// of a program that is started twice (the editor's play) makes one kind.
+kind(name: string, category: string, create: fn() -> ptr, destroy: fn(ptr)) -> *ComponentKind {
+    existing = kind_named(name)
+    if existing != null { return existing }
+    k = heap.new(ComponentKind)
+    k.name = string.copy(name)
+    k.category = string.copy(category)
+    k.fields = list.new()
+    k.create = create
+    k.destroy = destroy
+    if create != null { k.defaults = create() }
+    k.id = list.size(registry())
+    list.add_raw(registry(), k)
+    return k
+}
+
+kind_free(k: *ComponentKind) {
+    if k == null { return }
+    g_generation = g_generation + 1
+    count = list.size(k.fields)
+    i = 0
+    while i < count {
+        f = list.get_raw(k.fields, i) as *ComponentField
+        free_choices(f)
+        heap.free(f)
+        i = i + 1
+    }
+    list.free(k.fields)
+    if k.defaults != null && k.destroy != null { k.destroy(k.defaults) }
+    heap.free(k)
+}
+
+free_choices(f: *ComponentField) {
+    if f.choices == null { return }
+    count = list.size(f.choices)
+    i = 0
+    while i < count {
+        heap.free(list.get_raw(f.choices, i) as *ChoiceName)
+        i = i + 1
+    }
+    list.free(f.choices)
+}
+
+// Every kind freed: the end of a program, or of a test.
+kinds_clear() {
+    if g_kinds == null { return }
+    g_generation = g_generation + 1
+    count = list.size(g_kinds)
+    i = 0
+    while i < count {
+        kind_free(list.get_raw(g_kinds, i) as *ComponentKind)
+        i = i + 1
+    }
+    list.free(g_kinds)
+    g_kinds = null
+}
+
+kind_count() -> int { return list.size(registry()) }
+
+kind_at(index: int) -> *ComponentKind {
+    if index < 0 || index >= kind_count() { return null }
+    return list.get_raw(registry(), index) as *ComponentKind
+}
+
+kind_named(name: string) -> *ComponentKind {
+    count = kind_count()
+    i = 0
+    while i < count {
+        k = kind_at(i)
+        if string.equals(k.name, name) == 1 { return k }
+        i = i + 1
+    }
+    return null
+}
+
+// The same, and says so when there is none: what a scene file or the agent
+// asks by name.
+kind_find(name: string) -> *ComponentKind {
+    k = kind_named(name)
+    if k == null { set_error("no component kind named '${name}'") }
+    return k
+}
+
+kind_name(k: *ComponentKind) -> string {
+    if k == null { return "" }
+    return k.name
+}
+
+// The kind a component was made of, or null for one made by hand
+// (behaviour.object_add_script with a state of the caller's own).
+kind_of(c: *Component) -> *ComponentKind {
+    if c == null { return null }
+    return c.schema as *ComponentKind
+}
+
+set_unique(k: *ComponentKind, unique: bool) { k.unique = unique }
+set_scene(k: *ComponentKind, scene: bool) { k.scene = scene }
+set_observable(k: *ComponentKind, observable: bool) { k.observable = observable }
+set_validate(k: *ComponentKind, validate: fn(ptr, int)) { k.validate = validate }
+set_category(k: *ComponentKind, category: string) { k.category = core.set_owned(k.category, category) }
+
+// Unity's phases, by Unity's names; any may be null.
+phases(k: *ComponentKind, start: fn(ptr, *GameObject), update: fn(ptr, *GameObject, float),
+       fixed_update: fn(ptr, *GameObject, float), late_update: fn(ptr, *GameObject, float)) {
+    k.start = start
+    k.update = update
+    k.fixed_update = fixed_update
+    k.late_update = late_update
+}
+
+// The two phases around a component's life: awake as it is added, before
+// anything else runs, and on_destroy as it is removed or its object freed.
+set_lifecycle(k: *ComponentKind, awake: fn(ptr, *GameObject), on_destroy: fn(ptr, *GameObject)) {
+    k.awake = awake
+    k.on_destroy = on_destroy
+}
+
+new_field(k: *ComponentKind, name: string, type: int, offset: int) -> *ComponentField {
+    f = heap.new(ComponentField)
+    f.name = string.copy(name)
+    f.tooltip = ""
+    f.asset_kind = ""
+    f.type = type
+    f.offset = offset
+    list.add_raw(k.fields, f)
+    g_generation = g_generation + 1
+    return f
+}
+
+bool_field(k: *ComponentKind, name: string, offset: int) -> *ComponentField {
+    return new_field(k, name, TYPE_BOOL, offset)
+}
+
+// A switch worked out from the state, read and written through `get` and `set`.
+bool_property(k: *ComponentKind, name: string, get: fn(ptr) -> bool, set: fn(ptr, bool)) -> *ComponentField {
+    f = new_field(k, name, TYPE_BOOL, 0 - 1)
+    f.get_flag = get
+    f.set_flag = set
+    return f
+}
+
+// An int, bounded by min and max; equal bounds leave it unbounded.
+int_field(k: *ComponentKind, name: string, offset: int, min: int, max: int) -> *ComponentField {
+    f = new_field(k, name, TYPE_INT, offset)
+    f.min = min as float
+    f.max = max as float
+    f.step = 1.0
+    return f
+}
+
+// A float, bounded by min and max; equal bounds leave it unbounded (a
+// position has no range, a light's intensity does).
+float_field(k: *ComponentKind, name: string, offset: int, min: float, max: float) -> *ComponentField {
+    f = new_field(k, name, TYPE_FLOAT, offset)
+    f.min = min
+    f.max = max
+    return f
+}
+
+// A float that is worked out from the state rather than stored in it, read
+// and written through `get` and `set`: shown and saved as the number a
+// person sets, whatever the state keeps.
+float_property(k: *ComponentKind, name: string, get: fn(ptr) -> float, set: fn(ptr, float),
+               min: float, max: float) -> *ComponentField {
+    f = new_field(k, name, TYPE_FLOAT, 0 - 1)
+    f.get_number = get
+    f.set_number = set
+    f.min = min
+    f.max = max
+    return f
+}
+
+vec3_field(k: *ComponentKind, name: string, offset: int) -> *ComponentField {
+    return new_field(k, name, TYPE_VEC3, offset)
+}
+
+color_field(k: *ComponentKind, name: string, offset: int) -> *ComponentField {
+    f = new_field(k, name, TYPE_COLOR, offset)
+    f.min = 0.0
+    f.max = 1.0
+    return f
+}
+
+rotation_field(k: *ComponentKind, name: string, offset: int) -> *ComponentField {
+    return new_field(k, name, TYPE_ROTATION, offset)
+}
+
+// An int that is one of named choices, added in order with
+// enum_choice_add: 0 is the first. Written to a file by name, so reordering
+// the choices never changes what a saved scene meant.
+enum_field(k: *ComponentKind, name: string, offset: int) -> *ComponentField {
+    f = new_field(k, name, TYPE_ENUM, offset)
+    f.choices = list.new()
+    f.step = 1.0
+    return f
+}
+
+enum_choice_add(f: *ComponentField, choice: string) {
+    if f == null || f.choices == null { return }
+    named = heap.new(ChoiceName)
+    named.text = string.copy(choice)
+    list.add_raw(f.choices, named)
+    f.min = 0.0
+    f.max = (list.size(f.choices) - 1) as float
+}
+
+text_field(k: *ComponentKind, name: string, get_text: fn(ptr) -> string, set_text: fn(ptr, string)) -> *ComponentField {
+    f = new_field(k, name, TYPE_TEXT, 0 - 1)
+    f.get_text = get_text
+    f.set_text = set_text
+    return f
+}
+
+// Text that names an asset of `asset_kind` ("model", "texture", "figure",
+// "script", "sound"): what the inspector offers a picker for.
+asset_field(k: *ComponentKind, name: string, asset_kind: string, get_text: fn(ptr) -> string,
+            set_text: fn(ptr, string)) -> *ComponentField {
+    f = new_field(k, name, TYPE_ASSET, 0 - 1)
+    f.get_text = get_text
+    f.set_text = set_text
+    f.asset_kind = string.copy(asset_kind)
+    return f
+}
+
+set_flags(k: *ComponentKind, name: string, flags: int) {
+    f = field_named(k, name)
+    if f != null { f.flags = flags }
+}
+
+set_tooltip(k: *ComponentKind, name: string, tooltip: string) {
+    f = field_named(k, name)
+    if f != null { f.tooltip = core.set_owned(f.tooltip, tooltip) }
+}
+
+// How far one notch of a drag or an arrow key moves the value.
+set_step(k: *ComponentKind, name: string, step: float) {
+    f = field_named(k, name)
+    if f != null { f.step = step }
+}
+
+field_count(k: *ComponentKind) -> int {
+    if k == null { return 0 }
+    return list.size(k.fields)
+}
+
+field_at(k: *ComponentKind, index: int) -> *ComponentField {
+    if k == null || index < 0 || index >= field_count(k) { return null }
+    return list.get_raw(k.fields, index) as *ComponentField
+}
+
+field_index(k: *ComponentKind, name: string) -> int {
+    count = field_count(k)
+    i = 0
+    while i < count {
+        if string.equals(field_at(k, i).name, name) == 1 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+field_named(k: *ComponentKind, name: string) -> *ComponentField {
+    return field_at(k, field_index(k, name))
+}
+
+enum_choice_count(f: *ComponentField) -> int {
+    if f == null || f.choices == null { return 0 }
+    return list.size(f.choices)
+}
+
+enum_choice(f: *ComponentField, index: int) -> string {
+    if index < 0 || index >= enum_choice_count(f) { return "" }
+    return (list.get_raw(f.choices, index) as *ChoiceName).text
+}
+
+enum_index(f: *ComponentField, name: string) -> int {
+    count = enum_choice_count(f)
+    i = 0
+    while i < count {
+        if string.equals(enum_choice(f, i), name) == 1 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// --- the state, read and written by its schema ---------------------------------
+
+read_float_at(data: ptr, offset: int) -> float {
+    return mem.float_from_bits(mem.get_long(data, offset))
+}
+
+// A float field's value in `data`, at its offset or through its property.
+float_of(data: ptr, f: *ComponentField) -> float {
+    if f.offset < 0 {
+        getter = f.get_number
+        if getter == null { return 0.0 }
+        return getter(data)
+    }
+    return read_float_at(data, f.offset)
+}
+
+flag_of(data: ptr, f: *ComponentField) -> bool {
+    if f.offset < 0 {
+        getter = f.get_flag
+        if getter == null { return false }
+        return getter(data)
+    }
+    return mem.get_int(data, f.offset) != 0
+}
+
+write_flag(data: ptr, f: *ComponentField, value: bool) {
+    if f.offset < 0 {
+        setter = f.set_flag
+        if setter != null { setter(data, value) }
+        return
+    }
+    bits = 0
+    if value { bits = 1 }
+    mem.set_int(data, f.offset, bits)
+}
+
+write_float(data: ptr, f: *ComponentField, value: float) {
+    if f.offset < 0 {
+        setter = f.set_number
+        if setter != null { setter(data, value) }
+        return
+    }
+    write_float_at(data, f.offset, value)
+}
+
+write_float_at(data: ptr, offset: int, value: float) {
+    mem.set_long(data, offset, mem.bits_of_float(value))
+}
+
+clamped(f: *ComponentField, value: float) -> float {
+    if f.max > f.min {
+        if value < f.min { return f.min }
+        if value > f.max { return f.max }
+    }
+    return value
+}
+
+data_of(c: *Component) -> ptr {
+    if c == null { return null }
+    return c.state
+}
+
+// What changed, said to everything that watches: the kind's validate and
+// the version the inspector, the network and a save compare against.
+changed(c: *Component, field: int) {
+    k = kind_of(c)
+    if k != null && k.validate != null { k.validate(c.state, field) }
+    c.version = c.version + 1
+}
+
+// That the component changed by a route the registry did not see: a system
+// that wrote its state directly and wants the inspector and the network to
+// know. Scripts on an @observable state never need it.
+touch(c: *Component) {
+    if c != null { c.version = c.version + 1 }
+}
+
+version(c: *Component) -> int {
+    if c == null { return 0 }
+    return c.version
+}
+
+get_bool(c: *Component, f: *ComponentField) -> bool {
+    if c == null || f == null || f.type != TYPE_BOOL { return false }
+    return flag_of(c.state, f)
+}
+
+set_bool(c: *Component, f: *ComponentField, value: bool) {
+    if c == null || f == null || f.type != TYPE_BOOL { return }
+    write_flag(c.state, f, value)
+    changed(c, field_index(kind_of(c), f.name))
+}
+
+get_int(c: *Component, f: *ComponentField) -> int {
+    if c == null || f == null || (f.type != TYPE_INT && f.type != TYPE_ENUM) { return 0 }
+    return mem.get_int(c.state, f.offset)
+}
+
+set_int(c: *Component, f: *ComponentField, value: int) {
+    if c == null || f == null || (f.type != TYPE_INT && f.type != TYPE_ENUM) { return }
+    mem.set_int(c.state, f.offset, clamped(f, value as float) as int)
+    changed(c, field_index(kind_of(c), f.name))
+}
+
+get_float(c: *Component, f: *ComponentField) -> float {
+    if c == null || f == null || f.type != TYPE_FLOAT { return 0.0 }
+    return float_of(c.state, f)
+}
+
+set_float(c: *Component, f: *ComponentField, value: float) {
+    if c == null || f == null || f.type != TYPE_FLOAT { return }
+    write_float(c.state, f, clamped(f, value))
+    changed(c, field_index(kind_of(c), f.name))
+}
+
+// A vector or a colour: three floats from the field's offset.
+get_vec3(c: *Component, f: *ComponentField) -> Vec3 {
+    if c == null || f == null || (f.type != TYPE_VEC3 && f.type != TYPE_COLOR) { return core.vec3(0.0, 0.0, 0.0) }
+    return core.vec3(read_float_at(c.state, f.offset), read_float_at(c.state, f.offset + 8),
+                     read_float_at(c.state, f.offset + 16))
+}
+
+set_vec3(c: *Component, f: *ComponentField, value: Vec3) {
+    if c == null || f == null || (f.type != TYPE_VEC3 && f.type != TYPE_COLOR) { return }
+    write_float_at(c.state, f.offset, clamped(f, value.x))
+    write_float_at(c.state, f.offset + 8, clamped(f, value.y))
+    write_float_at(c.state, f.offset + 16, clamped(f, value.z))
+    changed(c, field_index(kind_of(c), f.name))
+}
+
+// A rotation as the quaternion it is stored as.
+get_rotation(c: *Component, f: *ComponentField) -> Quat {
+    if c == null || f == null || f.type != TYPE_ROTATION { return core.quat(0.0, 0.0, 0.0, 1.0) }
+    return core.quat(read_float_at(c.state, f.offset), read_float_at(c.state, f.offset + 8),
+                     read_float_at(c.state, f.offset + 16), read_float_at(c.state, f.offset + 24))
+}
+
+set_rotation(c: *Component, f: *ComponentField, value: Quat) {
+    if c == null || f == null || f.type != TYPE_ROTATION { return }
+    q = core.quat_normalize(value)
+    write_float_at(c.state, f.offset, q.x)
+    write_float_at(c.state, f.offset + 8, q.y)
+    write_float_at(c.state, f.offset + 16, q.z)
+    write_float_at(c.state, f.offset + 24, q.w)
+    changed(c, field_index(kind_of(c), f.name))
+}
+
+get_text(c: *Component, f: *ComponentField) -> string {
+    if c == null || f == null || f.get_text == null { return "" }
+    getter = f.get_text
+    return getter(c.state)
+}
+
+set_text(c: *Component, f: *ComponentField, value: string) {
+    if c == null || f == null || f.set_text == null { return }
+    setter = f.set_text
+    setter(c.state, value)
+    changed(c, field_index(kind_of(c), f.name))
+}
+
+// The field back to the kind's default.
+reset_field(c: *Component, f: *ComponentField) {
+    k = kind_of(c)
+    if k == null || f == null || k.defaults == null { return }
+    copy_field(c.state, k.defaults, f)
+    changed(c, field_index(k, f.name))
+}
+
+// Every field back to its default: the inspector's Reset.
+reset(c: *Component) {
+    k = kind_of(c)
+    if k == null || k.defaults == null { return }
+    count = field_count(k)
+    i = 0
+    while i < count {
+        f = field_at(k, i)
+        if (f.flags & FIELD_HIDDEN) == 0 { copy_field(c.state, k.defaults, f) }
+        i = i + 1
+    }
+    changed(c, 0 - 1)
+}
+
+field_width(f: *ComponentField) -> int {
+    if f.type == TYPE_FLOAT { return 8 }
+    if f.type == TYPE_VEC3 || f.type == TYPE_COLOR { return 24 }
+    if f.type == TYPE_ROTATION { return 32 }
+    return 4                       // bool, int, enum
+}
+
+copy_field(dst: ptr, src: ptr, f: *ComponentField) {
+    if f.type == TYPE_FLOAT && f.offset < 0 {
+        write_float(dst, f, float_of(src, f))
+        return
+    }
+    if f.type == TYPE_BOOL && f.offset < 0 {
+        write_flag(dst, f, flag_of(src, f))
+        return
+    }
+    if f.type == TYPE_TEXT || f.type == TYPE_ASSET {
+        getter = f.get_text
+        setter = f.set_text
+        if getter != null && setter != null { setter(dst, getter(src)) }
+        return
+    }
+    mem.copy_at(dst, f.offset as long, src, f.offset as long, field_width(f) as long)
+}
+
+// Every field of one component's state onto another of the same kind: a
+// duplicated object, a prefab's instance. Hidden fields are the kind's own
+// bookkeeping and are left alone.
+copy_fields(dst: *Component, src: *Component) {
+    k = kind_of(dst)
+    if k == null || k != kind_of(src) { return }
+    count = field_count(k)
+    i = 0
+    while i < count {
+        f = field_at(k, i)
+        if (f.flags & FIELD_HIDDEN) == 0 { copy_field(dst.state, src.state, f) }
+        i = i + 1
+    }
+    changed(dst, 0 - 1)
+}
+
+field_default_float(k: *ComponentKind, f: *ComponentField) -> float {
+    if k == null || k.defaults == null || f == null || f.type != TYPE_FLOAT { return 0.0 }
+    return float_of(k.defaults, f)
+}
+
+field_default_vec3(k: *ComponentKind, f: *ComponentField) -> Vec3 {
+    if k == null || k.defaults == null || f == null { return core.vec3(0.0, 0.0, 0.0) }
+    return core.vec3(read_float_at(k.defaults, f.offset), read_float_at(k.defaults, f.offset + 8),
+                     read_float_at(k.defaults, f.offset + 16))
+}
+
+// Whether the field holds something other than the kind's default: what a
+// save writes (only the differences, over the authored scene), and what the
+// inspector shows in bold.
+differs(c: *Component, f: *ComponentField) -> bool {
+    k = kind_of(c)
+    if k == null || f == null || k.defaults == null { return true }
+    if f.type == TYPE_TEXT || f.type == TYPE_ASSET {
+        getter = f.get_text
+        if getter == null { return false }
+        return string.equals(getter(c.state), getter(k.defaults)) != 1
+    }
+    if f.type == TYPE_FLOAT && f.offset < 0 { return float_of(c.state, f) != float_of(k.defaults, f) }
+    if f.type == TYPE_BOOL && f.offset < 0 { return flag_of(c.state, f) != flag_of(k.defaults, f) }
+    return mem.compare_at(c.state, f.offset as long, k.defaults, f.offset as long, field_width(f) as long) != 0
+}
+
+// --- components on objects -----------------------------------------------------
+
+// A component of kind k on the object, with a state of its own made by the
+// kind's constructor and freed with the component. Null, with last_error
+// saying why, when the kind is one per object and the object has one, or is
+// the scene's and the object is not the scene's root.
+add(o: *GameObject, k: *ComponentKind) -> *Component {
+    if o == null || k == null { return null }
+    if k.unique && find(o, k) != null {
+        set_error("${o.name} already has a ${k.name}")
+        return null
+    }
+    if k.create == null {
+        set_error("${k.name} has no constructor; attach_state gives it one")
+        return null
+    }
+    return attach_state(o, k, k.create(), true)
+}
+
+// The same with a state the caller made: a model that is its own transform,
+// a light the renderer already holds. `owned` says whether the component
+// frees it with the kind's destructor.
+attach_state(o: *GameObject, k: *ComponentKind, data: ptr, owned: bool) -> *Component {
+    c = behaviour.component_new(k.name, behaviour.KIND_CUSTOM, data)
+    c.schema = k as ptr
+    c.awake = k.awake
+    c.start = k.start
+    c.update = k.update
+    c.fixed_update = k.fixed_update
+    c.late_update = k.late_update
+    c.destroy = k.on_destroy
+    if owned { c.dispose = k.destroy }
+    if k.observable && data != null {
+        // A store the script makes on its own state (`self.health = 50`)
+        // is a change the inspector and the network have to see, as much as
+        // one the inspector makes. The version is on the component, which
+        // outlives no observer: behaviour.component_free unobserves first.
+        watched = c
+        c.observer = observe.observe(data, |obj: ptr| {
+            watched.version = watched.version + 1
+        })
+    }
+    behaviour.object_add_component(o, c)
+    return c
+}
+
+// The same as add, with its fields read from a scene file's or a save's
+// JSON (what from_json takes) before awake runs.
+add_with(o: *GameObject, k: *ComponentKind, node: ptr) -> *Component {
+    if o == null || k == null { return null }
+    if k.unique && find(o, k) != null {
+        set_error("${o.name} already has a ${k.name}")
+        return null
+    }
+    if k.create == null { return null }
+    data = k.create()
+    // Read into a bare component first, so the fields are the file's by the
+    // time awake sees them.
+    staged = behaviour.component_new(k.name, behaviour.KIND_CUSTOM, data)
+    staged.schema = k as ptr
+    from_json(staged, node)
+    staged.state = null
+    behaviour.component_free(staged)
+    return attach_state(o, k, data, true)
+}
+
+remove(o: *GameObject, c: *Component) {
+    if o == null || c == null { return }
+    behaviour.object_remove_component(o, c)
+}
+
+find(o: *GameObject, k: *ComponentKind) -> *Component {
+    if o == null || k == null { return null }
+    count = behaviour.object_component_count(o)
+    i = 0
+    while i < count {
+        c = behaviour.object_component(o, i)
+        if c != null && c.schema == k as ptr { return c }
+        i = i + 1
+    }
+    return null
+}
+
+find_named(o: *GameObject, name: string) -> *Component {
+    return find(o, kind_named(name))
+}
+
+// --- JSON: the scene file, a save, the agent --------------------------------
+
+vec3_json(v: Vec3) -> ptr {
+    a = json.arr()
+    json.array_add_raw(a, json.num(v.x))
+    json.array_add_raw(a, json.num(v.y))
+    json.array_add_raw(a, json.num(v.z))
+    return a
+}
+
+// The component's fields as a JSON object, every field that is neither
+// hidden nor transient, by name. With `changed_only`, only those that
+// differ from the kind's defaults: a save over an authored scene.
+to_json(c: *Component, changed_only: bool) -> ptr {
+    out = json.obj()
+    k = kind_of(c)
+    if k == null { return out }
+    count = field_count(k)
+    i = 0
+    while i < count {
+        f = field_at(k, i)
+        skip = (f.flags & (FIELD_HIDDEN | FIELD_TRANSIENT)) != 0
+        if !skip && changed_only && !differs(c, f) { skip = true }
+        if !skip { json.object_set_raw(out, f.name, field_json(c, f)) }
+        i = i + 1
+    }
+    return out
+}
+
+field_json(c: *Component, f: *ComponentField) -> ptr {
+    if f.type == TYPE_BOOL { return json.boolean(get_bool(c, f)) }
+    if f.type == TYPE_INT { return json.from_int(get_int(c, f)) }
+    if f.type == TYPE_ENUM { return json.str(enum_choice(f, get_int(c, f))) }
+    if f.type == TYPE_FLOAT { return json.num(get_float(c, f)) }
+    if f.type == TYPE_VEC3 || f.type == TYPE_COLOR { return vec3_json(get_vec3(c, f)) }
+    if f.type == TYPE_ROTATION {
+        q = get_rotation(c, f)
+        a = json.arr()
+        json.array_add_raw(a, json.num(q.x))
+        json.array_add_raw(a, json.num(q.y))
+        json.array_add_raw(a, json.num(q.z))
+        json.array_add_raw(a, json.num(q.w))
+        return a
+    }
+    return json.str(get_text(c, f))
+}
+
+number_at(node: ptr, index: int) -> float {
+    item = json.array_get_raw(node, index)
+    if item == null { return 0.0 }
+    return json.get_number(item)
+}
+
+// Fields read from a JSON object by name. A field the object does not
+// name keeps what it has, so a file written before a field was added loads
+// with that field at its default; a name the kind no longer has is ignored
+// and counted, and the count is answered so a caller can say so. An enum
+// written by a name the kind no longer offers keeps its value.
+from_json(c: *Component, node: ptr) -> int {
+    k = kind_of(c)
+    if k == null || node == null { return 0 }
+    count = field_count(k)
+    i = 0
+    while i < count {
+        f = field_at(k, i)
+        value = json.object_get_raw(node, f.name)
+        // A hidden field is the kind's own and a read-only one is what it
+        // reports: neither is written from outside.
+        if value != null && (f.flags & (FIELD_HIDDEN | FIELD_READONLY)) == 0 { read_field(c, f, value) }
+        i = i + 1
+    }
+    changed(c, 0 - 1)
+    return unknown_names(k, node)
+}
+
+read_field(c: *Component, f: *ComponentField, value: ptr) {
+    if f.type == TYPE_BOOL {
+        write_flag(c.state, f, json.get_bool(value) != 0)
+    } else if f.type == TYPE_INT {
+        mem.set_int(c.state, f.offset, clamped(f, json.get_int(value) as float) as int)
+    } else if f.type == TYPE_ENUM {
+        choice = enum_index(f, json.get_string_raw(value))
+        if choice >= 0 { mem.set_int(c.state, f.offset, choice) }
+    } else if f.type == TYPE_FLOAT {
+        write_float(c.state, f, clamped(f, json.get_number(value)))
+    } else if f.type == TYPE_VEC3 || f.type == TYPE_COLOR {
+        write_float_at(c.state, f.offset, clamped(f, number_at(value, 0)))
+        write_float_at(c.state, f.offset + 8, clamped(f, number_at(value, 1)))
+        write_float_at(c.state, f.offset + 16, clamped(f, number_at(value, 2)))
+    } else if f.type == TYPE_ROTATION {
+        q = core.quat_normalize(core.quat(number_at(value, 0), number_at(value, 1), number_at(value, 2), number_at(value, 3)))
+        write_float_at(c.state, f.offset, q.x)
+        write_float_at(c.state, f.offset + 8, q.y)
+        write_float_at(c.state, f.offset + 16, q.z)
+        write_float_at(c.state, f.offset + 24, q.w)
+    } else if f.set_text != null {
+        setter = f.set_text
+        setter(c.state, json.get_string_raw(value))
+    }
+}
+
+// How many names the object has that the kind has no field for.
+unknown_names(k: *ComponentKind, node: ptr) -> int {
+    unknown = 0
+    count = json.object_size_raw(node)
+    i = 0
+    while i < count {
+        if field_index(k, json.object_key_at(node, i)) < 0 { unknown = unknown + 1 }
+        i = i + 1
+    }
+    return unknown
+}
+
+// --- the scene file -------------------------------------------------------------
+
+// A component as a scene file keeps it: its kind, whether it is enabled,
+// and every field that is written.
+entry_json(c: *Component) -> ptr {
+    entry = json.obj()
+    json.object_set_raw(entry, "kind", json.str(kind_name(kind_of(c))))
+    json.object_set_raw(entry, "enabled", json.boolean(behaviour.component_enabled(c)))
+    json.object_set_raw(entry, "fields", to_json(c, false))
+    return entry
+}
+
+collect_owned(o: *GameObject, model: *Model, out: ptr) {
+    count = behaviour.object_component_count(o)
+    i = 0
+    while i < count {
+        c = behaviour.object_component(o, i)
+        // Only a component that owns its state is the file's to write: one
+        // that is a view of a model, a light or the engine's settings is
+        // written by whatever owns those.
+        if c != null && kind_of(c) != null && c.dispose != null {
+            list.add_raw(out, scene.saved_component_new(model, entry_json(c)))
+        }
+        i = i + 1
+    }
+}
+
+// The components of the scene's objects and of the scene itself that own
+// their state, as scene.scene_save takes them.
+saved_for(s: *Scene) -> ptr {
+    out = list.new()
+    if s == null { return out }
+    root = behaviour.scene_root(s)
+    if root != null { collect_owned(root, null, out) }
+    count = behaviour.scene_count(s)
+    i = 0
+    while i < count {
+        o = behaviour.scene_object(s, i)
+        if o != null { collect_owned(o, o.model as *Model, out) }
+        i = i + 1
+    }
+    return out
+}
+
+// Components read from a scene file (scene.scene_load_components) put on
+// the objects they were on: `objects` holds, at each loaded model's index,
+// the object made for it. A component of a kind this program has not
+// registered -- a game's script the editor has not built -- is not lost:
+// it is answered as a SavedComponent on its model, to be written back when
+// the scene is, and last_error counts them.
+attach_loaded(s: *Scene, objects: ptr, loaded: ptr) -> ptr {
+    unresolved = list.new()
+    if s == null || loaded == null { return unresolved }
+    missing = 0
+    count = list.size(loaded)
+    i = 0
+    while i < count {
+        entry = list.get_raw(loaded, i) as *LoadedComponent
+        o = null as *GameObject
+        if entry.model < 0 {
+            o = behaviour.scene_root(s)
+        } else if objects != null && entry.model < list.size(objects) {
+            o = list.get_raw(objects, entry.model) as *GameObject
+        }
+        k = kind_named(entry.kind)
+        if o != null && k == null {
+            kept = json.obj()
+            json.object_set_raw(kept, "kind", json.str(entry.kind))
+            json.object_set_raw(kept, "enabled", json.boolean(entry.enabled))
+            if entry.fields != null {
+                text = json.stringify_raw(entry.fields)
+                json.object_set_raw(kept, "fields", json.parse_raw(text))
+                string.free(text)
+            }
+            model = null as *Model
+            if entry.model >= 0 { model = o.model as *Model }
+            list.add_raw(unresolved, scene.saved_component_new(model, kept))
+            missing = missing + 1
+        } else if o != null {
+            c = find(o, k)
+            if c == null || !k.unique { c = add_with(o, k, entry.fields) } else { from_json(c, entry.fields) }
+            if c != null { behaviour.component_set_enabled(c, entry.enabled) }
+        }
+        i = i + 1
+    }
+    if missing > 0 { set_error("${missing} component(s) of kinds this program does not have, kept to be written back") }
+    return unresolved
+}
+
+// --- a kind made anew -----------------------------------------------------------------
+
+// The kind's constructor and destructor replaced and its fields cleared, to
+// be registered again: a script library rebuilt is the same kind with new
+// code. The defaults are freed by the destructor that made them and made
+// again by the new constructor.
+kind_redefine(k: *ComponentKind, create: fn() -> ptr, destroy: fn(ptr)) {
+    if k == null { return }
+    g_generation = g_generation + 1
+    count = list.size(k.fields)
+    i = 0
+    while i < count {
+        f = list.get_raw(k.fields, i) as *ComponentField
+        free_choices(f)
+        heap.free(f)
+        i = i + 1
+    }
+    list.clear(k.fields)
+    if k.defaults != null && k.destroy != null {
+        old_destroy = k.destroy
+        old_destroy(k.defaults)
+    }
+    k.defaults = null
+    k.create = create
+    k.destroy = destroy
+    if create != null { k.defaults = create() }
+}
+
+// The component's state freed and taken off it, leaving the component: what
+// a reload does with the code that made the state, before that code goes.
+release_state(c: *Component) {
+    if c == null || c.state == null { return }
+    if c.observer != 0 {
+        observe.unobserve(c.state, c.observer)
+        c.observer = 0
+    }
+    if c.dispose != null {
+        free_state = c.dispose
+        free_state(c.state)
+    }
+    c.state = null
+}
+
+// A new state for the component, owned by it, with its kind's phases and
+// destructor as they are now.
+replace_state(c: *Component, data: ptr) {
+    k = kind_of(c)
+    if c == null || k == null { return }
+    c.state = data
+    c.dispose = k.destroy
+    c.awake = k.awake
+    c.start = k.start
+    c.update = k.update
+    c.fixed_update = k.fixed_update
+    c.late_update = k.late_update
+    c.destroy = k.on_destroy
+    if k.observable && data != null {
+        watched = c
+        c.observer = observe.observe(data, |obj: ptr| {
+            watched.version = watched.version + 1
+        })
+    }
+    c.version = c.version + 1
+}

@@ -163,6 +163,7 @@ for obj in "$OBJ_DIR"/*.o; do
 done
 
 ae3d_native_build "$CC" "$OBJ_DIR" "$CFLAGS" "$GLFW_LIBS"
+ae3d_runtime_build "$CC" "$AETHER_LIBS"
 
 if [ "$NATIVES_ONLY" = 1 ]; then
     echo "built: $(ae3d_native_library)"
@@ -188,7 +189,7 @@ AETHER_SOURCES="$(sed -n 's|^// aether-source: ||p' "$GEN" | tr '\\' '/')"
 # toolchain is built against zlib its --libs already carries -lz, Apple's ld
 # warns about a duplicate library, and ci.sh reads a warning in a build log as
 # a failure. GLFW is named: the program's own Aether calls it (ae3d.platform).
-"$CC" $CFLAGS $FP_FLAGS $VULKAN_CFLAGS "$GEN" $AETHER_SOURCES $(ae3d_native_link_flags) $GLFW_LIBS $AETHER_COMPILE_FLAGS $AETHER_LIBS $PLATFORM_LIBS -o "$OUT"
+"$CC" $CFLAGS $FP_FLAGS $VULKAN_CFLAGS "$GEN" $AETHER_SOURCES $(ae3d_native_link_flags) $GLFW_LIBS $AETHER_COMPILE_FLAGS $(ae3d_runtime_link_flags "$AETHER_LIBS") $(ae3d_program_flags) $PLATFORM_LIBS -o "$OUT"
 
 # MinGW gcc appends .exe to an output name that has no extension, so the file
 # is not at the path this asked for. Name the one that exists.
