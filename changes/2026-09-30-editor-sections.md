@@ -14,3 +14,23 @@
 - `tools/drive_editor.ae` finds a component panel by its title
   (`component_body_id`) and counts the rows inside it: 159 checks, all
   passing on both backends. `tests/test_components.ae`: 65.
+- **Terrain** is a component kind (`components.terrain_kind`,
+  `attach_terrain`, `terrain_of`) over the terrain's voxel world: its biome
+  and style are choices and its seed a whole number. Each write fills the
+  world again and draws it on the model it already has
+  (`terrain.rebuild`); a sculpted world is drawn again with `terrain.draw`.
+  The editor's biome buttons, style buttons and seed row, with their undo
+  slots and row check, are gone; its section is the sculpting brush alone
+  (SCULPT), shown with a terrain selected. A terrain edit says what was
+  built in the console and counts the new geometry in the title.
+- The component registry has `int_property` and `enum_property`: an int or
+  a choice the state derives through accessors, as `float_property` and
+  `bool_property` already were -- read, written, copied, reset, compared
+  and saved like the rest.
+- **A model's geometry can change while a renderer holds it.**
+  `core.model_geometry_changed(m)` bumps the model's geometry stamp, and
+  both renderers take a model whose stamp moved past what they uploaded out
+  and add it back before the next frame: one compare a model when nothing
+  changed. A game regenerating terrain or swapping a mesh no longer has to
+  reach into the backend, and the editor no longer does.
+- `voxel.world_model(w)` is the model a world was last built onto.
