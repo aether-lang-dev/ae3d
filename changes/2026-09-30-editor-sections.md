@@ -85,3 +85,19 @@ view sizing, 62 fps timers); the pin moves to it. In the editor:
   and the last rows of both side panels (PLAY, BEHAVIOUR) were unreachable.
 - The wheel pushed away zooms in, as in Unity and Blender; it zoomed out,
   and a sideways scroll zoomed out too.
+
+### `ae build` and `ae run` build every example
+
+- `aether.toml` at the root: aephysics as a dependency patched to its
+  submodule (aephysics#55 exports its root) and `-ffp-contract=off`, so
+  `ae run examples/physics.ae` builds and runs with the toolchain alone.
+- The engine's modules say what they need: `ae3d.core` names the crash
+  handler with `@source`, `ae3d.vkdevice` the DLSS stub and macOS's Metal
+  layer, and `ae3d.platform` links GLFW and the platform's windowing and GL
+  libraries with `@link` in `when target.os` arms.
+- The examples' black hole renderer is imported as
+  `examples.lib.blackhole`, by its path from the root, so it needs no
+  search path; `examples/lib` is off `AETHER_LIB_DIR`.
+- `build.sh` and the editor's build leave out of a program the `@source`
+  files the engine's shared library carries (`ae3d_program_sources`): one
+  crash handler, and the Streamline shim rather than the stub.

@@ -57,6 +57,17 @@ pacman -S mingw-w64-ucrt-x86_64-{gcc,glfw,zlib,pkgconf,vulkan-headers,vulkan-loa
 
 ```bash
 git submodule update --init                                       # deps/aephysics, the physics engine
+ae run examples/spinning_cube.ae                                  # build and run, as any Aether project
+ae build examples/street_drive.ae -o build/street_drive            # or a binary to keep
+```
+
+The toolchain alone builds every example: `aether.toml` names the physics
+engine, and each module brings the C files and libraries it needs. `build.sh`
+builds the same programs against the engine as one shared library, which is
+what a program that loads scripts (the editor) needs, and the DLSS shim when
+`AE3D_STREAMLINE_ROOT` names the Streamline SDK:
+
+```bash
 ./build.sh examples/spinning_cube.ae && ./build/spinning_cube
 ./build.sh examples/street_drive.ae  && ./build/street_drive      # W/S A/D space shift; drives itself if left alone
 ./build.sh examples/zombie_city.ae   && AE3D_CROWD=100000 ./build/zombie_city

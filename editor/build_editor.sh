@@ -149,8 +149,8 @@ export AETHER_LIB_DIR="$ROOT/src:$ROOT/editor/lib:$UI_ROOT:$AEPHYSICS"
 aetherc "$SOURCE" "$GEN"
 # C files a module compiles into the program with @source (contrib.vulkan's
 # loader, which ae3d.vkmeter's contrib.vulkan.vk calls through), as build.sh
-# links them.
-AETHER_SOURCES="$(sed -n 's|^// aether-source: ||p' "$GEN" | tr '\\' '/')"
+# links them: the engine's own are left to its library.
+AETHER_SOURCES="$(ae3d_program_sources "$GEN" "$ROOT")"
 
 # zlib belongs to the engine, which is a library of its own and names it on its
 # own link line; GLFW is named, since the engine's Aether calls it

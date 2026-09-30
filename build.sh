@@ -170,20 +170,19 @@ if [ "$NATIVES_ONLY" = 1 ]; then
     exit 0
 fi
 
-# Two module trees. ae3d.* is the engine, under src/. examples/lib/ is shared
-# code belonging to the examples themselves -- a black hole renderer is a tech
-# demo, not an engine feature, and putting it under src/ would have told everyone
-# who looked otherwise. It is factored out of the example rather than left inside
-# it because three callers want the same renderer: the example draws it, the
-# benchmark times it, and the test checks it against general relativity.
-# Three module trees: ae3d.* under src/, the examples' shared code under
-# examples/lib/, and aephysics.* in its submodule.
-export AETHER_LIB_DIR="$ROOT/src:$ROOT/examples/lib:$AEPHYSICS"
+# Two module trees: ae3d.* under src/ and aephysics.* in its submodule,
+# the same two aether.toml gives `ae build` and `ae run` (src/ by the
+# compiler's own rule, aephysics as a dependency patched to deps/). The
+# examples' shared code (a black hole renderer is a tech demo, not an engine
+# feature) is imported by its path from the root, examples.lib.blackhole,
+# which needs no search path at all.
+export AETHER_LIB_DIR="$ROOT/src:$AEPHYSICS"
 "$AETHERC" "$SOURCE" "$GEN"
 # C files a module compiles into the program with @source (contrib.vulkan's
 # loader, which contrib.vulkan.vk calls through): aetherc names them at the
-# top of what it generates, as `ae build` reads them.
-AETHER_SOURCES="$(sed -n 's|^// aether-source: ||p' "$GEN" | tr '\\' '/')"
+# top of what it generates, as `ae build` reads them. The engine's own are
+# left to its library (ae3d_program_sources).
+AETHER_SOURCES="$(ae3d_program_sources "$GEN" "$ROOT")"
 # zlib is the engine's, and the engine is a library of its own that names it
 # on its own link line. Naming it again here is not harmless: where the Aether
 # toolchain is built against zlib its --libs already carries -lz, Apple's ld

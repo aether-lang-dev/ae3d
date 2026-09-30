@@ -312,16 +312,17 @@ for module in src/ae3d/*/; do
     rm -f "$probe" "${probe%.ae}.c"
 done
 
-# Shared code belonging to the examples, on its own search path outside the
-# engine's namespace. Type-checked the same way: a module that stops compiling
+# Shared code belonging to the examples, outside the engine's namespace and
+# imported by its path from the root (examples.lib.<name>), as the examples
+# import it. Type-checked the same way: a module that stops compiling
 # should fail here, rather than three lines later in whichever example happens to
 # get built first.
 for module in examples/lib/*/; do
     [ -e "$module" ] || continue
     name="$(basename "$module")"
     probe="$(mktemp -t ae3d_probe.XXXXXX).ae"
-    printf 'import %s\nmain() { println("ok") }\n' "$name" > "$probe"
-    if AETHER_LIB_DIR="$PWD/src:$PWD/examples/lib" aetherc "$probe" "${probe%.ae}.c" >/tmp/ae3d_mod.log 2>&1; then
+    printf 'import examples.lib.%s\nmain() { println("ok") }\n' "$name" > "$probe"
+    if AETHER_LIB_DIR="$PWD/src" aetherc "$probe" "${probe%.ae}.c" >/tmp/ae3d_mod.log 2>&1; then
         pass "examples/lib/$name"
     else
         fail "examples/lib/$name"
