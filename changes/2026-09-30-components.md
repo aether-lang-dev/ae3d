@@ -61,3 +61,17 @@
   - `AE3D_EDITOR_PROFILE=1` marks every frame of a bounded run, the snapshot,
     each stage of the report and the window closing; `ci.sh` runs the editor
     with it and prints the log's tail when a run fails, so a hang says where.
+  - The inspector keeps the panels of each shape it has shown (the kinds,
+    in order) as a view, hidden while another shows: selecting a light,
+    a cube and the light again builds the light's panels once. A panel is a
+    native widget per control, 20 to 60 ms each on win32, so a selection
+    that changed shape cost up to 165 ms and now costs a rebind. Twelve
+    shapes are kept, the least recently shown dropped first.
+  - `component.generation()` counts every change to what the kinds are made
+    of. The inspector drops views built before one: a script reloaded with
+    other fields left its rows pointing at the fields the reload freed.
+  - The water and terrain sections hide with their bodies, not a row at a
+    time: each row hidden was a layout of the column on win32
+    (aether-lang-dev/aether-ui#206).
+  - The editor driver finds and counts the widgets that are showing, as a
+    person would, since the inspector's hidden views carry the same captions.
