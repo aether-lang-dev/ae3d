@@ -54,6 +54,8 @@ const LOSS = 0.1
 const BUDGET = 120                   // bytes a snapshot in the budget run: records wait their turn
 const LABELS = 6
 const CHANGES = 1024                 // the host's changes kept, and a client's hooks
+const IDS = 64                       // object ids a client's held ticks are kept for
+const HELD = 8192                    // a client's held ticks kept, over every object
 
 var g_checks = 0
 var g_failures = 0
@@ -145,6 +147,65 @@ struct Side {
     own_health: int                  // client: its own player's health, as its hooks last said
     last_stage: int                  // client: the stage its hook last saw
     backwards: int                   // client: hooks that saw a stage no later than the one before
+    rocket_id: int                   // the rocket's id, kept past its going
+    // Client: every object's fields as each snapshot taken brought them --
+    // the object and the tick they were sent at, each time that moved. A
+    // change the client never held a snapshot of folds into the next.
+    held: int
+    held_id: ptr                     // int[HELD]
+    held_tick: ptr                   // int[HELD]
+    held_last: ptr                   // int[IDS]: the tick last kept, by id
+}
+
+// A snapshot taken: every object whose fields it brought at a tick other
+// than the last kept, kept.
+took_snapshot(context: ptr, tick: int, now: float) {
+    s = context as *Side
+    last = s.held_last as int[]
+    id = 1
+    while id < IDS {
+        brought = net.fields_tick(s.session, id)
+        if brought > 0 && brought != last[id] && s.held < HELD {
+            (s.held_id as int[])[s.held] = id
+            (s.held_tick as int[])[s.held] = brought
+            s.held = s.held + 1
+            last[id] = brought
+        }
+        id = id + 1
+    }
+}
+
+// The object a logged field is on, by its id on this side.
+field_object(s: *Side, field: int) -> int {
+    if field == 400 { return s.rocket_id }
+    if field == 300 { return net.id_of(s.session, s.mover) }
+    if field >= 200 {
+        pl = net.player_of(s.session, field - 200)
+        if pl == null { return 0 }
+        return pl.net_id
+    }
+    return net.id_of(s.session, (s.crates as ptr[])[field / 8] as *GameObject)
+}
+
+// Whether the client held a snapshot that brought change `k`: one with the
+// object's fields sent at or after it, and before the field changed again.
+held_change(l: *Log, s: *Side, k: int) -> bool {
+    field = (l.change_field as int[])[k]
+    from = (l.change_tick as int[])[k]
+    until = 1 << 30
+    j = k + 1
+    while j < l.changes && until == 1 << 30 {
+        if (l.change_field as int[])[j] == field { until = (l.change_tick as int[])[j] }
+        j = j + 1
+    }
+    id = field_object(s, field)
+    i = 0
+    while i < s.held {
+        at = (s.held_tick as int[])[i]
+        if (s.held_id as int[])[i] == id && at >= from && at < until { return true }
+        i = i + 1
+    }
+    return false
 }
 
 make_player(context: ptr, client: int) -> *CharacterController {
@@ -166,6 +227,7 @@ make_rocket(context: ptr, id: int) -> *GameObject {
     if !net.hosting(s.session) { net.on_changed(s.session, o, "fuel", hooked_fuel, s as ptr) }
     s.rocket = o
     s.rocket_was = o
+    s.rocket_id = id
     s.rockets = s.rockets + 1
     return o
 }
@@ -276,9 +338,13 @@ side_new(session: *Net) -> *Side {
     s.hook_field = calloc(CHANGES, 4)
     s.hook_value = calloc(CHANGES, 8)
     s.hook_tick = calloc(CHANGES, 4)
+    s.held_id = calloc(HELD, 4)
+    s.held_tick = calloc(HELD, 4)
+    s.held_last = calloc(IDS, 4)
     s.fuel = calloc(1, sizeof(Fuel)) as *Fuel
     s.stage = calloc(1, sizeof(Stage)) as *Stage
     host = net.hosting(session)
+    if !host { net.on_snapshot(session, took_snapshot, s as ptr) }
     k = 0
     while k < CRATES {
         o = behaviour.object_new("crate")
@@ -343,6 +409,9 @@ side_free(s: *Side) {
     free(s.hook_field)
     free(s.hook_value)
     free(s.hook_tick)
+    free(s.held_id)
+    free(s.held_tick)
+    free(s.held_last)
     free(s.fuel as ptr)
     free(s.stage as ptr)
     free(s as ptr)
@@ -565,34 +634,53 @@ struct Tally {
     missing: int
     extra: int
     early: int                       // a hook at a tick before the change it reports
+    folded: int                      // changes no snapshot the client held brought: state, not events
 }
 
 tally(l: *Log, s: *Side, t: *Tally, only: int) {
-    used = calloc(CHANGES, 4)
+    used = calloc(CHANGES, 4)          // 1 matched, 2 folded
+    u = used as int[]
     j = 0
     while j < s.hooked {
         field = (s.hook_field as int[])[j]
         if only >= 0 && field != only { j = j + 1 ; continue }
-        // The first change to this field not yet matched, in the host's order.
+        value = (s.hook_value as long[])[j]
+        // The first change to this field not yet matched, in the host's
+        // order. A field is state: a change no snapshot the client held
+        // brought was never there to see, and folds into the next.
         found = 0 - 1
         k = 0
         while k < l.changes && found < 0 {
-            if (l.change_field as int[])[k] == field && (used as int[])[k] == 0 { found = k }
+            if (l.change_field as int[])[k] == field && u[k] == 0 {
+                if (l.change_value as long[])[k] == value || held_change(l, s, k) {
+                    found = k
+                } else {
+                    u[k] = 2
+                    t.folded = t.folded + 1
+                }
+            }
             k = k + 1
         }
-        if found >= 0 && (l.change_value as long[])[found] == (s.hook_value as long[])[j] {
-            (used as int[])[found] = 1
+        if found >= 0 && (l.change_value as long[])[found] == value {
+            u[found] = 1
             t.matched = t.matched + 1
             if (s.hook_tick as int[])[j] < (l.change_tick as int[])[found] { t.early = t.early + 1 }
         } else {
             t.extra = t.extra + 1
-            if t.extra <= 3 { println("  (a hook on field ${field} at tick ${(s.hook_tick as int[])[j]} said ${(s.hook_value as long[])[j]})") }
+            if t.extra <= 3 { println("  (a hook on field ${field} at tick ${(s.hook_tick as int[])[j]} said ${value})") }
         }
         j = j + 1
     }
     k = 0
     while k < l.changes {
-        if (used as int[])[k] == 0 { t.missing = t.missing + 1 }
+        if u[k] == 0 && (only < 0 || (l.change_field as int[])[k] == only) {
+            if held_change(l, s, k) {
+                t.missing = t.missing + 1
+                if t.missing <= 3 { println("  (no hook for field ${(l.change_field as int[])[k]}'s change at tick ${(l.change_tick as int[])[k]}, which a snapshot held brought)") }
+            } else {
+                t.folded = t.folded + 1
+            }
+        }
         k = k + 1
     }
     free(used)
@@ -601,6 +689,92 @@ tally(l: *Log, s: *Side, t: *Tally, only: int) {
 pace(start: float, step: int) {
     due = start + (step as float) * STEP
     while platform.time() < due { sleep(0) }
+}
+
+// A host and two clients playing the scene: what the host logged, and
+// where the clock and the commands are.
+struct FieldRun {
+    l: *Log
+    host: *Side
+    one: *Side
+    two: *Side
+    last_tick: int
+    commands: float
+    last: float
+}
+
+field_run_new(host_session: *Net, one_session: *Net, two_session: *Net) -> *FieldRun {
+    r = calloc(1, sizeof(FieldRun)) as *FieldRun
+    r.host = side_new(host_session)
+    net.host_play(host_session, 0.0)
+    r.one = side_new(one_session)
+    r.two = side_new(two_session)
+    r.l = log_new()
+    return r
+}
+
+field_run_free(r: *FieldRun) {
+    log_free(r.l)
+    side_free(r.one)
+    side_free(r.two)
+    side_free(r.host)
+    free(r as ptr)
+}
+
+// One frame at `now`: the clients' commands at the step's rate, the host's
+// writes, every side stepped, and each client compared with the host at
+// the tick of its newest snapshot.
+play_frame(r: *FieldRun, now: float) {
+    r.commands = r.commands + (now - r.last)
+    r.last = now
+    while r.commands >= STEP {
+        r.commands = r.commands - STEP
+        if net.my_player(r.one.session) != null { net.player_input(r.one.session, core.vec3(0.0, 0.0, 0.0), 0.0, now) }
+        if net.my_player(r.two.session) != null { net.player_input(r.two.session, core.vec3(0.0, 0.0, 0.0), 0.0, now) }
+    }
+    host_writes(r.l, r.host, r.one, r.two, net.host_tick(r.host.session) + 1, now)
+    net.step(r.host.session, now)
+    if net.host_tick(r.host.session) != r.last_tick {
+        r.last_tick = net.host_tick(r.host.session)
+        log_tick(r.l, r.host, r.last_tick)
+    }
+    net.step(r.one.session, now)
+    net.step(r.two.session, now)
+    compare(r.l, r.one)
+    compare(r.l, r.two)
+}
+
+// What a run held to: every field the host's at each client's snapshot's
+// tick, a hook for every change a snapshot the client held brought, and
+// the rocket's fields with it. `said` prints the numbers.
+field_run_checks(r: *FieldRun, name: string, said: bool) {
+    l = r.l
+    one = r.one
+    two = r.two
+    host = r.host
+    if said {
+        println("  the host made ${l.changes} changes from tick ${l.from}; at the end client 1 holds tick ${net.snapshot_tick(one.session)} and client 2 ${net.snapshot_tick(two.session)} of ${net.host_tick(host.session)}")
+        println("  every frame, every field against the host's at the tick of the newest snapshot: client 1 ${one.fields} values over ${one.compared} frames, ${one.different} different; client 2 ${two.fields} over ${two.compared}, ${two.different} different")
+    }
+    check("${name}every client's copy of every field is the host's at its snapshot's tick, bit for bit", one.compared > 150 && two.compared > 150 && one.different == 0 && two.different == 0)
+    t1 = Tally { matched: 0, missing: 0, extra: 0, early: 0, folded: 0 }
+    t2 = Tally { matched: 0, missing: 0, extra: 0, early: 0, folded: 0 }
+    tally(l, one, &t1, 0 - 1)
+    tally(l, two, &t2, 0 - 1)
+    if said || t1.missing + t1.extra + t1.early + t2.missing + t2.extra + t2.early > 0 {
+        println("  hooks: client 1 ${one.hooked} fired, ${t1.matched} matched to the host's changes in order, ${t1.folded} folded into the next (never held), ${t1.missing} missed, ${t1.extra} extra, ${t1.early} early; client 2 ${two.hooked}, ${t2.matched}, ${t2.folded}, ${t2.missing}, ${t2.extra}, ${t2.early}")
+    }
+    check("${name}a hook fires once for every change a snapshot held brought, with its value, in the host's order, and for nothing else",
+          l.changes > 250 && t1.matched + t1.folded == l.changes && t1.missing == 0 && t1.extra == 0 && t1.early == 0 &&
+          t2.matched + t2.folded == l.changes && t2.missing == 0 && t2.extra == 0 && t2.early == 0)
+    own1 = ((host.vitals as ptr[])[net.client_id(one.session)] as *Vitals).health
+    own2 = ((host.vitals as ptr[])[net.client_id(two.session)] as *Vitals).health
+    if said { println("  own health: client 1 hooked ${one.own_health} and the host has ${own1}; client 2 ${two.own_health} and ${own2}") }
+    check("${name}a client's own player's fields reach it", own1 < 100 && own2 < 100 && one.own_health == own1 && two.own_health == own2)
+    if said { println("  the rocket: made ${one.rockets} and ${two.rockets} time(s) on the clients, let go ${one.rocket == null} and ${two.rocket == null}; its fields left: ${net.field_count(one.session, one.rocket_was)} and ${net.field_count(two.session, two.rocket_was)}") }
+    check("${name}a created object's fields come with it and go with it",
+          one.rockets == 1 && two.rockets == 1 && one.rocket == null && two.rocket == null &&
+          net.field_count(one.session, one.rocket_was) == 0 && net.field_count(two.session, two.rocket_was) == 0)
 }
 
 lossy_run() {
@@ -612,63 +786,71 @@ lossy_run() {
     }
     port = net.udp_port(host_session)
     net.set_conditions(host_session, LATENCY, JITTER, LOSS)
-    host = side_new(host_session)
-    net.host_play(host_session, 0.0)
-    one = side_new(net.join_udp("127.0.0.1", port))
-    net.set_conditions(one.session, LATENCY, JITTER, LOSS)
-    two = side_new(net.join_udp("127.0.0.1", port))
-    net.set_conditions(two.session, LATENCY, JITTER, LOSS)
-    l = log_new()
+    one_session = net.join_udp("127.0.0.1", port)
+    net.set_conditions(one_session, LATENCY, JITTER, LOSS)
+    two_session = net.join_udp("127.0.0.1", port)
+    net.set_conditions(two_session, LATENCY, JITTER, LOSS)
+    r = field_run_new(host_session, one_session, two_session)
     start = platform.time()
     frame = 0
-    last_tick = 0
-    commands = 0.0
-    last = 0.0
     while true {
         frame = frame + 1
         pace(start, frame)
         now = platform.time() - start
         if now >= RUN { break }
-        commands = commands + (now - last)
-        last = now
-        while commands >= STEP {
-            commands = commands - STEP
-            if net.my_player(one.session) != null { net.player_input(one.session, core.vec3(0.0, 0.0, 0.0), 0.0, now) }
-            if net.my_player(two.session) != null { net.player_input(two.session, core.vec3(0.0, 0.0, 0.0), 0.0, now) }
-        }
-        host_writes(l, host, one, two, net.host_tick(host.session) + 1, now)
-        net.step(host.session, now)
-        if net.host_tick(host.session) != last_tick {
-            last_tick = net.host_tick(host.session)
-            log_tick(l, host, last_tick)
-        }
-        net.step(one.session, now)
-        net.step(two.session, now)
-        compare(l, one)
-        compare(l, two)
+        play_frame(r, now)
     }
-    println("  the host made ${l.changes} changes from tick ${l.from}; at the end client 1 holds tick ${net.snapshot_tick(one.session)} and client 2 ${net.snapshot_tick(two.session)} of ${net.host_tick(host.session)}")
-    println("  every frame, every field against the host's at the tick of the newest snapshot: client 1 ${one.fields} values over ${one.compared} frames, ${one.different} different; client 2 ${two.fields} over ${two.compared}, ${two.different} different")
-    check("every client's copy of every field is the host's at its snapshot's tick, bit for bit", one.compared > 150 && two.compared > 150 && one.different == 0 && two.different == 0)
-    t1 = Tally { matched: 0, missing: 0, extra: 0, early: 0 }
-    t2 = Tally { matched: 0, missing: 0, extra: 0, early: 0 }
-    tally(l, one, &t1, 0 - 1)
-    tally(l, two, &t2, 0 - 1)
-    println("  hooks: client 1 ${one.hooked} fired, ${t1.matched} matched to the host's changes in order, ${t1.missing} changes missed, ${t1.extra} extra, ${t1.early} early; client 2 ${two.hooked}, ${t2.matched}, ${t2.missing}, ${t2.extra}, ${t2.early}")
-    check("a hook fires once for every change, with its value, in the host's order, and for nothing else",
-          l.changes > 250 && t1.matched == l.changes && t1.extra == 0 && t1.early == 0 && t2.matched == l.changes && t2.extra == 0 && t2.early == 0)
-    own1 = ((host.vitals as ptr[])[net.client_id(one.session)] as *Vitals).health
-    own2 = ((host.vitals as ptr[])[net.client_id(two.session)] as *Vitals).health
-    println("  own health: client 1 hooked ${one.own_health} and the host has ${own1}; client 2 ${two.own_health} and ${own2}")
-    check("a client's own player's fields reach it", own1 < 100 && own2 < 100 && one.own_health == own1 && two.own_health == own2)
-    println("  the rocket: made ${one.rockets} and ${two.rockets} time(s) on the clients, let go ${one.rocket == null} and ${two.rocket == null}; its fields left: ${net.field_count(one.session, one.rocket_was)} and ${net.field_count(two.session, two.rocket_was)}")
-    check("a created object's fields come with it and go with it",
-          one.rockets == 1 && two.rockets == 1 && one.rocket == null && two.rocket == null &&
-          net.field_count(one.session, one.rocket_was) == 0 && net.field_count(two.session, two.rocket_was) == 0)
-    log_free(l)
-    side_free(one)
-    side_free(two)
-    side_free(host)
+    field_run_checks(r, "", true)
+    field_run_free(r)
+}
+
+// The seeds of the loopback's generator under which a client lost every
+// snapshot between two of a field's changes (five in a row, from 2536's
+// ticks 110 to 114): the scene over the loopback on the test's clock, so
+// each run is the same run every time. The first change folds into the
+// next, and nothing else may be off.
+const BURSTS = 5
+
+burst_seed(k: int) -> long {
+    if k == 0 { return 2536 as long }
+    if k == 1 { return 3297 as long }
+    if k == 2 { return 3841 as long }
+    if k == 3 { return 6189 as long }
+    return 13873 as long
+}
+
+burst_runs() {
+    println("fields: the same scene over the loopback on the test's clock, under the ${BURSTS} seeds whose loss takes every snapshot between two changes")
+    folded = 0
+    k = 0
+    while k < BURSTS {
+        hub = net.hub_new()
+        hub.seed = burst_seed(k)
+        net.hub_set_conditions(hub, LATENCY, JITTER, LOSS)
+        // One after another: a client joins a hub with its host on it.
+        host_session = net.host_loopback(hub)
+        one_session = net.join_loopback(hub)
+        two_session = net.join_loopback(hub)
+        r = field_run_new(host_session, one_session, two_session)
+        frame = 0
+        while true {
+            frame = frame + 1
+            now = (frame as float) * STEP
+            if now >= RUN { break }
+            play_frame(r, now)
+        }
+        field_run_checks(r, "seed ${burst_seed(k)}: ", false)
+        t1 = Tally { matched: 0, missing: 0, extra: 0, early: 0, folded: 0 }
+        t2 = Tally { matched: 0, missing: 0, extra: 0, early: 0, folded: 0 }
+        tally(r.l, r.one, &t1, 0 - 1)
+        tally(r.l, r.two, &t2, 0 - 1)
+        folded = folded + t1.folded + t2.folded
+        field_run_free(r)
+        net.hub_free(hub)
+        k = k + 1
+    }
+    // What these seeds are for: each has a change no snapshot held brought.
+    check("and under every one of them some change folded, so the rule was met where it bites (${folded})", folded >= BURSTS)
 }
 
 // --- within a budget ------------------------------------------------------------------------------
@@ -835,6 +1017,7 @@ refusals() {
 
 main() {
     lossy_run()
+    burst_runs()
     budget_run()
     cost()
     refusals()
