@@ -34,3 +34,17 @@
   changed. A game regenerating terrain or swapping a mesh no longer has to
   reach into the backend, and the editor no longer does.
 - `voxel.world_model(w)` is the model a world was last built onto.
+- **Physics Body** is a component kind (`components.physics_kind`,
+  `attach_physics`, `physics_of`) owning the body record the scene file
+  writes: its body and collider are choices by the file's names, a
+  character is always a capsule, and a body always has weight. An object
+  without a body has no component; Add Component gives it one and Remove
+  takes it away, both undone as component steps. The editor's No body /
+  Static / Kinematic / Dynamic / Character and collider buttons, its
+  friction, bounce and density rows and their undo are gone.
+- `component.set_recorded(k, true)`: a kind the scene file records in a
+  typed record of its own (a body is its model's physics) is left out of
+  the saved components, so it is never written twice.
+- A choice with more than three options lays them in rows of three under
+  its caption: five biomes or five colliders beside a caption ran past the
+  inspector at its narrowest, which the driver now checks.

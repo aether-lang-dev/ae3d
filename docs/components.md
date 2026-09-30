@@ -100,6 +100,7 @@ that position agree without anything syncing them.
 | Camera | the camera it carries | field of view, near, far, speed, sensitivity, invert mouse |
 | Water | the surface's simulation | wave height, speed, scale and randomness, color, opacity, foam and its intensity, shore fade and foam, reflection, sky color, sky, caustics and their intensity and scale, shadow, distortion, normal strength |
 | Terrain | the terrain's voxel world | biome, seed, style (blocks or smooth); each write fills and draws the world again on its model |
+| Physics Body | the body record the scene file writes | body (static, kinematic, dynamic, character), collider (box, sphere, capsule, hull, mesh), friction, bounce, density; no body is no component |
 | Environment | the engine | sky (an image, or none), sky color, sun by time, time of day, clouds, cloud wind, overcast and its color, fog, fog start, end, density and color |
 | Rendering | the engine | FXAA, bloom and its threshold and intensity, shadows and their distance, reflections and their height and strength, ambient occlusion and its radius and intensity, temporal antialiasing |
 
