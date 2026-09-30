@@ -48,3 +48,11 @@
 - A choice with more than three options lays them in rows of three under
   its caption: five biomes or five colliders beside a caption ran past the
   inspector at its narrowest, which the driver now checks.
+- **Figure** is a component kind, registered beside its struct in
+  ae3d.figure (`figure.figure_kind`, `attach_figure`): the clip it plays,
+  chosen by name from the figure's own file through the inspector's picker
+  (the editor lists the shown figure's clips), whether it loops, its pace
+  and how far into the clip it stands. A figure comes from a file, so the
+  kind has no constructor and Add Component never offers it. The editor's
+  FIGURE section -- eight clip buttons, Loop, the speed and time rows and
+  their undo -- is gone.
