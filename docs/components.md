@@ -139,6 +139,40 @@ Loading reads the fields by name:
 A game's script, opened in an editor that has not built it, survives the
 round trip.
 
+## Scripts
+
+A script is a component kind in a file of its own, built into a shared
+library and opened at run time (`ae3d.script`). The file declares its state
+struct, `create` and `destroy` for it, `fields(k)` registering what the
+inspector shows and the scene saves, and whichever of Unity's phases it
+needs -- `awake`, `start`, `update`, `fixed_update`, `late_update`,
+`on_destroy`. `script.script_kind(lib, name)` registers it under Scripts;
+from there it is given to objects as any component is. A game that compiles
+its scripts in registers the same functions with `component.kind` directly,
+so one file serves the editor and a shipped game.
+
+`script.script_reload(kind, old, new, scene, others)` swaps a rebuilt
+library under every object carrying it: each attachment's fields are read
+out, its state freed by the old library and made again by the new, and the
+fields written back by name.
+
+**One Aether runtime per process.** A script is Aether code, and Aether code
+calls the runtime -- its strings, its allocations, the accounting it keeps
+of both. Two runtimes in one process, the program's and a script's, each
+free what the other allocated and the books underflow (the runtime asserts
+it). So a script uses the program's runtime:
+- on Linux the program exports its symbols (`-rdynamic`) and the script
+  leaves the runtime to be found in it;
+- on macOS the script is linked `-undefined dynamic_lookup`;
+- on Windows, where an executable exports nothing a DLL can import, the
+  runtime is a DLL of its own, `build/aether_runtime.dll`, made from the
+  toolchain's static library by `scripts/native.sh`, which every program and
+  every script links, as both link the engine's C (`libae3d_native`).
+
+aether-lang-dev/aether#2297 asks the language for that library: the runtime
+and the engine as one library that a program and its scripts link, on every
+platform.
+
 ## Asked over the channel
 
 `object.list`, `object.get`, `component.kinds`, `component.get`,

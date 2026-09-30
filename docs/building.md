@@ -12,7 +12,11 @@ honours.
   on a component reach the inspector, a save and the network
   ([components](components.md)).
 - A C compiler (`cc`, `gcc` or `clang`), for the C under `native/` and for
-  the C Aether generates.
+  the C Aether generates. On Windows the build also makes
+  `build/aether_runtime.dll` from the toolchain's `libaether.a` (the whole
+  archive, with the optional libraries it calls into, such as zstd), which
+  every program and every script links, so a script and the program that
+  loads it share one runtime ([components](components.md#scripts)).
 - GLFW 3.3 or later as a shared library (the one every package manager
   ships: the window layer calls it from Aether and the renderers from C,
   and a static copy in each would be two libraries with two states), zlib,
