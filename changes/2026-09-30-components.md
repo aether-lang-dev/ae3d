@@ -53,3 +53,11 @@
   - A light's cone set in degrees refused an outer angle narrower than the
     inner one; the angle just set now wins and the other gives way.
   - `core.quat_to_euler` joins `quat_from_euler`.
+  - The editor's bounded run checks its rows grouped by the object each
+    reads, selecting each object once rather than twice a row: a selection
+    builds the inspector's panels, and the check took 3 s of a 4 s run on
+    Windows and more than the 90 s backstop under GTK on a software display.
+    It takes 0.65 s now, with the same report.
+  - `AE3D_EDITOR_PROFILE=1` marks every frame of a bounded run, the snapshot,
+    each stage of the report and the window closing; `ci.sh` runs the editor
+    with it and prints the log's tail when a run fails, so a hang says where.

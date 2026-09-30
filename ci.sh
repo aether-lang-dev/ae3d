@@ -982,7 +982,10 @@ check_editor_run() {
     # Every run plays too (#476): a host and two clients from the first
     # frame, each world drawn in turn, then measured and stopped before the
     # rest of the report is taken.
+    # The profile names each stage and every frame, so a run the backstop
+    # kills says where it stopped: its tail is printed with the failure.
     AETHER_UI_HEADLESS=1 \
+    AE3D_EDITOR_PROFILE=1 \
     AE3D_EDITOR_BACKEND="$editor_backend" \
     AE3D_EDITOR_FRAMES=30 \
     AE3D_EDITOR_PLAY=2 \
@@ -998,6 +1001,7 @@ check_editor_run() {
     fi
     if [ "$status" -ne 0 ]; then
         fail "$name (exited $status)"
+        tail -n 25 "$log" | sed 's/^/        /'
     elif [ ! -s "$report" ]; then
         fail "$name (wrote no report)"
     elif [ ! -s "$snapshot" ]; then
