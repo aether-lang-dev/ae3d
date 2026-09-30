@@ -101,3 +101,16 @@ view sizing, 62 fps timers); the pin moves to it. In the editor:
 - `build.sh` and the editor's build leave out of a program the `@source`
   files the engine's shared library carries (`ae3d_program_sources`): one
   crash handler, and the Streamline shim rather than the stub.
+
+### A destroyed object's last fields reach every client (#513)
+
+A snapshot leaves a destroyed object out and the destroy carries only its
+place, so a change the host made in the object's last tick, carried by one
+snapshot a client lost, never arrived: the client held ticks past the
+destroy with the old value (macOS CI, the rocket's last burn at tick 145
+and its destroy at 146). The host now keeps the fields as they were when
+the object went, and snapshots against a base older than the destroy carry
+them (flag 8) until every client has acknowledged a snapshot of that tick.
+Reproduced under contention (29% of runs with the destroy on the tick after
+a burn; 300 of 300 pass with the fix); `last_change` in test_net_fields
+holds it deterministically over the hub.
