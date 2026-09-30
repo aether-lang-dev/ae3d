@@ -70,3 +70,18 @@
   has a function `f` names the function -- why Natural Motion lives in
   ae3d.components beside Physics Body (both views over the scene's records)
   rather than in ae3d.motion, whose getters share the fields' names.
+
+### The editor takes real mouse input on Windows
+
+Driven with physical clicks, drags and the wheel, the editor was slow and
+most of it ignored the mouse. aether-ui#217 fixes the toolkit side (clicks
+on rows and rounded buttons, toggle/slider/picker values, the wheel, scroll
+view sizing, 62 fps timers); the pin moves to it. In the editor:
+
+- The viewport is made at a 240-pixel height floor, as it already was for
+  width, and fills what the console and status footer leave. Made at 620,
+  the toolbar, view, console and footer asked for 892 pixels in a window
+  with 824 under the status bar, so the row ran past the window: the footer
+  and the last rows of both side panels (PLAY, BEHAVIOUR) were unreachable.
+- The wheel pushed away zooms in, as in Unity and Blender; it zoomed out,
+  and a sideways scroll zoomed out too.
