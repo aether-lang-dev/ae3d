@@ -312,16 +312,17 @@ for module in src/ae3d/*/; do
     rm -f "$probe" "${probe%.ae}.c"
 done
 
-# Shared code belonging to the examples, on its own search path outside the
-# engine's namespace. Type-checked the same way: a module that stops compiling
+# Shared code belonging to the examples, outside the engine's namespace and
+# imported by its path from the root (examples.lib.<name>), as the examples
+# import it. Type-checked the same way: a module that stops compiling
 # should fail here, rather than three lines later in whichever example happens to
 # get built first.
 for module in examples/lib/*/; do
     [ -e "$module" ] || continue
     name="$(basename "$module")"
     probe="$(mktemp -t ae3d_probe.XXXXXX).ae"
-    printf 'import %s\nmain() { println("ok") }\n' "$name" > "$probe"
-    if AETHER_LIB_DIR="$PWD/src:$PWD/examples/lib" aetherc "$probe" "${probe%.ae}.c" >/tmp/ae3d_mod.log 2>&1; then
+    printf 'import examples.lib.%s\nmain() { println("ok") }\n' "$name" > "$probe"
+    if AETHER_LIB_DIR="$PWD/src" aetherc "$probe" "${probe%.ae}.c" >/tmp/ae3d_mod.log 2>&1; then
         pass "examples/lib/$name"
     else
         fail "examples/lib/$name"
@@ -974,7 +975,9 @@ check_editor_run() {
     snapshot="$(mktemp -t ae3d_shot.XXXXXX).png"
     log="$(mktemp)"
     # A bounded run ends itself; the timeout is only a backstop so a hang
-    # fails the step rather than blocking it.
+    # fails the step rather than blocking it. Under Xvfb and llvmpipe a run
+    # draws at one frame a second and is ready after 13 to 33 seconds, by
+    # the runner: 90 seconds killed a run that was still drawing (#514).
     # Never onto the desktop. A run of this file opened an editor window per
     # backend per scene and took the keyboard with it, which makes it unusable
     # beside anything else. The window still exists and still answers the test
@@ -992,7 +995,7 @@ check_editor_run() {
     AE3D_EDITOR_SCENE="$editor_scene" \
     AE3D_EDITOR_SNAPSHOT="$snapshot" \
     AE3D_EDITOR_REPORT="$report" \
-        timeout 90 ./build/ae3d_editor >"$log" 2>&1
+        timeout 180 ./build/ae3d_editor >"$log" 2>&1
     status=$?
     if grep -q 'no Vulkan driver' "$log"; then
         skip "$name" "$(sed -n 's/.*no Vulkan driver (\(.*\)),.*/\1/p' "$log" | head -1)"
@@ -1272,7 +1275,11 @@ else
             # a real click exercises.
             for driver_backend in opengl vulkan; do
                 driver_log="$(mktemp)"
-                if ./build/drive_editor --backend "$driver_backend" \
+                # A backstop, as the editor's own runs have: an editor that
+                # stops answering fails this step with its log, rather than
+                # holding the runner until the job's limit cancels it and
+                # takes every result after it along.
+                if timeout 900 ./build/drive_editor --backend "$driver_backend" \
                         --port 8797 >"$driver_log" 2>&1; then
                     pass "ae3d_editor (driver, $driver_backend)"
                 else

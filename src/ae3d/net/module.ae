@@ -193,6 +193,7 @@ const MSG_PONG = 12
 const SNAP_OWN = 1                   // the client's own player follows
 const SNAP_PREVIOUS = 2              // the previous tick's time follows
 const SNAP_WANTED = 4                // the oldest command the host lacks follows
+const SNAP_GONE = 8                  // the last fields of objects destroyed since the base follow the records
 
 // A record's fields.
 const FIELD_X = 1
@@ -768,6 +769,16 @@ struct NetLayout {
     precisions: ptr                  // float[FIELDS_MOST]
 }
 
+// Host: an object destroyed with fields, as they were when it went: the
+// snapshots leave it out from then on, so they carry these instead, to
+// every client that has not yet acknowledged a snapshot of `tick`.
+struct NetGone {
+    id: int
+    tick: int                        // the first tick without it
+    lay: *NetLayout                  // its layout, at 0
+    words: ptr                       // long[lay.words]
+}
+
 // What a field's hook is told: the object, the field (its name and its
 // order among the object's), the snapshot's tick that changed it, and this
 // side's time in the step it arrived.
@@ -899,6 +910,7 @@ struct Net {
     layouts: ptr                     // list of *NetLayout, null where an object has none
     field_words: int
     spare_words: ptr                 // list of *NetLayout let go, whose words a new one of their size takes
+    gone: ptr                        // host: list of *NetGone some client has not had
     // Client: the view it sends (#487), what it last sent, and when.
     view_set: bool
     view_eye: Vec3
@@ -954,6 +966,7 @@ net_new(role: int, kind: int) -> *Net {
     n.replicated = list.new()
     n.layouts = list.new()
     n.spare_words = list.new()
+    n.gone = list.new()
     n.sighted = true
     n.view_sent_at = 0.0 - 1.0
     n.smoothing = SMOOTHING
@@ -2523,6 +2536,7 @@ send_snapshot(n: *Net, now: float) {
         if p.welcomed && p.open { snapshot_to(n, p, now) }
         i = i + 1
     }
+    drop_gone(n)
     // This tick's states are the next tick's previous ones.
     was = n.previous
     n.previous = n.current
@@ -3072,14 +3086,32 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
     // out of the budget's room from the start).
     send_previous = base != null && base.tick < n.tick - 1 && n.previous.used
     lacked = wanted_command(p)
+    // The destroyed objects' last fields it carries: each its id, its
+    // block's length, and the block whole (a client that no longer has the
+    // object's layout steps over it).
+    rec = n.measured
+    gone = 0
+    gone_bytes = 0
+    k = 0
+    while k < list.size(n.gone) {
+        g = list.get_raw(n.gone, k) as *NetGone
+        if gone_due(g, base) {
+            rec.length = 0
+            write_fields(rec, g.lay, g.words, g.words, true)
+            gone = gone + 1
+            gone_bytes = gone_bytes + varint_size(g.id as long) + varint_size(rec.length as long) + rec.length
+        }
+        k = k + 1
+    }
+    if gone > 0 { gone_bytes = gone_bytes + varint_size(gone as long) }
     room = 0
     if budget > 0 {
         room = budget_room(n, budget, count)
         if send_own { room = room - 17 }
         if send_previous { room = room - 4 }
         if lacked > 0 { room = room - 5 }
+        room = room - gone_bytes
     }
-    rec = n.measured
     chosen = 0
     k = 0
     while k < candidates {
@@ -3173,6 +3205,7 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
     if send_own { flags = flags | SNAP_OWN }
     if send_previous && held { flags = flags | SNAP_PREVIOUS }
     if lacked > 0 { flags = flags | SNAP_WANTED }
+    if gone > 0 { flags = flags | SNAP_GONE }
     put_u8(b, flags)
     if send_own {
         own = told.own as float[]
@@ -3198,6 +3231,23 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
             if sights[i] == SIGHT_OUT || sights[i] == SIGHT_HIDDEN { p.hidden_bytes = p.hidden_bytes + spent }
         }
         i = i + 1
+    }
+    if gone > 0 {
+        put_varint(b, gone as long)
+        k = 0
+        while k < list.size(n.gone) {
+            g = list.get_raw(n.gone, k) as *NetGone
+            if gone_due(g, base) {
+                rec.length = 0
+                write_fields(rec, g.lay, g.words, g.words, true)
+                put_varint(b, g.id as long)
+                put_varint(b, rec.length as long)
+                buf_reserve(b, rec.length)
+                memcpy(b.data + b.length, rec.data, rec.length as long)
+                b.length = b.length + rec.length
+            }
+            k = k + 1
+        }
     }
     n.objects_sent = n.objects_sent + (chosen as long)
     p.snapshots = p.snapshots + 1
@@ -3325,6 +3375,25 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
         carried[j] = index
         carried_fields[j] = fields
         j = j + 1
+    }
+    // The last fields of objects the host destroyed: as a record's, where
+    // this side still has the object's layout; stepped over where not.
+    if (flags & SNAP_GONE) != 0 && r.ok {
+        gone = (get_varint(r)) as int
+        g = 0
+        while g < gone && r.ok {
+            index = ((get_varint(r)) as int) - 1
+            length = (get_varint(r)) as int
+            if !r.ok || index < 0 || index >= count || length < 0 || r.at + length > r.length { r.ok = false ; break }
+            lay = layout_at(n, index + 1)
+            if lay != null && lay.at >= 0 {
+                block = NetReader { data: r.data, length: r.at + length, at: r.at, ok: true }
+                if !read_fields_wire(n, &block, shot, index, true) { r.ok = false ; break }
+                fticks[index] = tick
+            }
+            r.at = r.at + length
+            g = g + 1
+        }
     }
     if !r.ok {
         shot.used = false
@@ -4731,7 +4800,71 @@ destroy_object(n: *Net, o: *GameObject, now: float) {
         if p.welcomed { deliver(n, p, true, out.data, out.length, now) }
         i = i + 1
     }
+    keep_gone(n, no, now)
     forget(n, no)
+}
+
+// Host: a destroyed object's fields as they are now, for the snapshots to
+// carry: a change only a lost snapshot carried, or one made since the last
+// tick, would otherwise never reach a client.
+keep_gone(n: *Net, no: *NetObject, now: float) {
+    lay = layout_at(n, no.id)
+    if lay == null || lay.at < 0 || lay.count == 0 || no.fields == null { return }
+    g = calloc(1, sizeof(NetGone)) as *NetGone
+    g.id = no.id
+    g.tick = n.tick + 1
+    g.lay = calloc(1, sizeof(NetLayout)) as *NetLayout
+    g.lay.count = lay.count
+    g.lay.at = 0
+    g.lay.words = lay.words
+    g.lay.kinds = calloc(FIELDS_MOST, 4)
+    g.lay.offsets = calloc(FIELDS_MOST, 4)
+    g.lay.precisions = calloc(FIELDS_MOST, 8)
+    memcpy(g.lay.kinds, lay.kinds, (FIELDS_MOST * 4) as long)
+    memcpy(g.lay.offsets, lay.offsets, (FIELDS_MOST * 4) as long)
+    memcpy(g.lay.precisions, lay.precisions, (FIELDS_MOST * 8) as long)
+    fields_now = snapshot_new()
+    snapshot_reset(fields_now, g.tick, now, 0, n.field_words)
+    read_fields(n, no, lay, fields_now)
+    g.words = calloc(lay.words, 8)
+    memcpy(g.words, fields_now.fvalues + lay.at * 8, (lay.words * 8) as long)
+    snapshot_free(fields_now)
+    list.add_raw(n.gone, g as ptr)
+}
+
+gone_free(g: *NetGone) {
+    layout_free(g.lay)
+    free(g.words)
+    free(g as ptr)
+}
+
+// Whether a snapshot against `base` carries this one: when the client may
+// not hold a snapshot of its tick.
+gone_due(g: *NetGone, base: *Snapshot) -> bool {
+    return base == null || base.tick < g.tick
+}
+
+// Host: the destroyed objects every client has acknowledged a snapshot of
+// their tick for, let go -- the first snapshot at or after it a client
+// took carried them.
+drop_gone(n: *Net) {
+    k = 0
+    while k < list.size(n.gone) {
+        g = list.get_raw(n.gone, k) as *NetGone
+        had = true
+        i = 0
+        while i < list.size(n.peers) {
+            p = list.get_raw(n.peers, i) as *Peer
+            if p.welcomed && p.open && p.acked_tick < g.tick { had = false }
+            i = i + 1
+        }
+        if had {
+            gone_free(g)
+            list.remove(n.gone, k)
+        } else {
+            k = k + 1
+        }
+    }
 }
 
 // The game object at a net id, or null (none, or destroyed).
@@ -5469,6 +5602,12 @@ net_free(n: *Net) {
         i = i + 1
     }
     list.free(n.spare_words)
+    i = 0
+    while i < list.size(n.gone) {
+        gone_free(list.get_raw(n.gone, i) as *NetGone)
+        i = i + 1
+    }
+    list.free(n.gone)
     i = 0
     while i < list.size(g_sessions) {
         if list.get_raw(g_sessions, i) == n as ptr {

@@ -49,8 +49,33 @@ GLFW_CFLAGS="-I/c/msys64/ucrt64/include" GLFW_LIBS="-L/c/msys64/ucrt64/lib -lglf
 
 ## Building a program
 
+With the toolchain alone, from the repository root:
+
 ```bash
 git submodule update --init                 # deps/aephysics, the physics engine
+ae run examples/spinning_cube.ae            # build (cached) and run
+ae build examples/physics.ae -o build/physics
+```
+
+`aether.toml` declares aephysics as a dependency patched to its submodule
+(which exports its root, so `aephysics.*` needs no `--lib`) and compiles
+everything with `-ffp-contract=off`, as `build.sh` does. The rest comes from
+the modules a program imports: `ae3d.core` names the crash handler
+(`@source`), `ae3d.vkdevice` the DLSS stub and, on macOS, the Metal layer,
+and `ae3d.platform` links GLFW and the system's windowing and GL libraries
+for the platform it is built on (`@link` in a `when target.os` arm; MSYS2
+calls GLFW `glfw3`). A library search path the machine needs, Homebrew's
+`/opt/homebrew/lib` and its include directory, goes in `LIBRARY_PATH` and
+`CPATH`. The examples' shared code is imported by its path from the root
+(`import examples.lib.blackhole`).
+
+`build.sh` builds the same programs another way, which a program that loads
+scripts needs: the engine's C as one shared library that the program and
+every script link, and the DLSS shim against the Streamline SDK. It leaves
+out of the program the `@source` files that library carries, so a program
+has one crash handler and the real DLSS, not the stub.
+
+```bash
 ./build.sh examples/spinning_cube.ae        # -> build/spinning_cube
 ./build.sh examples/zombie_city.ae city     # -> build/city
 ./build.sh --natives                        # the engine's C library only

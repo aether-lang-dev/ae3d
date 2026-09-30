@@ -283,6 +283,27 @@ ae3d_native_sources() {
     printf '%s' "$list"
 }
 
+# The C files the generated program names (`// aether-source:`, from the
+# modules' @source) less the engine's own under native/. The engine's modules
+# name those so `ae build` and `ae run` compile them in; a program built here
+# links the engine's shared library, which already carries them, and a second
+# copy would be a second crash handler and the DLSS stub in front of the
+# Streamline shim.
+#
+#   ae3d_program_sources <generated C> <repository root>
+ae3d_program_sources() {
+    ae3d_engine="$(cd "$2/native" && pwd -P)"
+    ae3d_out=""
+    for ae3d_src in $(sed -n 's|^// aether-source: ||p' "$1" | tr '\\' '/'); do
+        ae3d_dir="$(cd "$(dirname "$ae3d_src")" && pwd -P)"
+        case "$ae3d_dir/" in
+            "$ae3d_engine/"*) ;;
+            *) ae3d_out="$ae3d_out $ae3d_src" ;;
+        esac
+    done
+    printf '%s' "$ae3d_out"
+}
+
 # The compiler and the flags a native source takes: C++ for the shim, with
 # the SDK's headers and without the runtime the engine's library does not
 # link (no exceptions, no RTTI, nothing from the standard library).
