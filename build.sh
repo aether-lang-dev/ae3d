@@ -50,6 +50,11 @@ if ! command -v "$CC" >/dev/null 2>&1; then
     exit 1
 fi
 AETHERC="${AETHERC:-aetherc}"
+# A program run in front of every compile, as CMake's compiler launcher is:
+# ccache on the runners (#511), which gives back an object at once when the
+# C it is asked to compile is what it compiled before -- a suite whose
+# imports a change did not touch generates the same C byte for byte.
+LAUNCHER="${AE3D_CC_LAUNCHER:-}"
 CFLAGS="${CFLAGS:--O2}"
 WARN="-Wall -Wextra"
 
@@ -143,7 +148,7 @@ for src in $NATIVE_SOURCES; do
     extra="$(ae3d_native_extra_flags "$src")"
     compiler="$(ae3d_native_compiler "$CC" "$src")"
     if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$newest_header" -nt "$obj" ]; then
-        "$compiler" -c $CFLAGS $FP_FLAGS $WARN $PIC $extra $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o "$obj"
+        $LAUNCHER "$compiler" -c $CFLAGS $FP_FLAGS $WARN $PIC $extra $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o "$obj"
     fi
 done
 
@@ -188,7 +193,22 @@ AETHER_SOURCES="$(ae3d_program_sources "$GEN" "$ROOT")"
 # toolchain is built against zlib its --libs already carries -lz, Apple's ld
 # warns about a duplicate library, and ci.sh reads a warning in a build log as
 # a failure. GLFW is named: the program's own Aether calls it (ae3d.platform).
-"$CC" $CFLAGS $FP_FLAGS $VULKAN_CFLAGS "$GEN" $AETHER_SOURCES $(ae3d_native_link_flags) $GLFW_LIBS $AETHER_COMPILE_FLAGS $(ae3d_runtime_link_flags "$AETHER_LIBS") $(ae3d_program_flags) $PLATFORM_LIBS -o "$OUT"
+#
+# Compiled, each file to an object of its own, then linked: a compile is
+# what a launcher can cache, and a command that compiles and links at once
+# is one it cannot. The objects are the program's, under build/obj/<name>/,
+# since several programs are built at once.
+PROGRAM_OBJ_DIR="$OBJ_DIR/$NAME"
+mkdir -p "$PROGRAM_OBJ_DIR"
+PROGRAM_OBJECTS="$PROGRAM_OBJ_DIR/$NAME.o"
+$LAUNCHER "$CC" -c $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $AETHER_COMPILE_FLAGS "$GEN" -o "$PROGRAM_OBJ_DIR/$NAME.o"
+for src in $AETHER_SOURCES; do
+    base="$(basename "$src")"
+    obj="$PROGRAM_OBJ_DIR/${base%.*}.o"
+    $LAUNCHER "$CC" -c $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $AETHER_COMPILE_FLAGS "$src" -o "$obj"
+    PROGRAM_OBJECTS="$PROGRAM_OBJECTS $obj"
+done
+"$CC" $CFLAGS $PROGRAM_OBJECTS $(ae3d_native_link_flags) $GLFW_LIBS $AETHER_COMPILE_FLAGS $(ae3d_runtime_link_flags "$AETHER_LIBS") $(ae3d_program_flags) $PLATFORM_LIBS -o "$OUT"
 
 # MinGW gcc appends .exe to an output name that has no extension, so the file
 # is not at the path this asked for. Name the one that exists.
