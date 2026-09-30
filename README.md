@@ -10,9 +10,9 @@ scene editor; and a control channel through which a program, a test or an
 AI agent builds a scene, reads back what was drawn and checks the frame by
 number rather than by eye.
 
-![A horde walking a wet city street at night under a street lamp, lit windows and stars overhead](docs/images/zombie-city-night.png)
+![Four frames from ae3d: a sea floor under moving caustics, a black hole bending the stars around its disk, rain over an island in a Gerstner sea, and the editor with a selected cube and its components](docs/images/hero.png)
 
-<sub>`examples/zombie_city.ae` on Vulkan at 1920×1080: the pipeline's city, a skinned horde posed in the vertex shader from one pose bank, the lamp's pool and its shadows on a wet road that mirrors it, clustered lights, a starred sky.</sub>
+<sub>Unedited Vulkan frames from the current engine: `examples/caustics.ae`, a sea floor lit through the moving surface above it; `examples/black_hole.ae`, the disk and its jets ray-marched through the hole's curved space; `examples/smooth_terrain.ae` under `AE3D_WEATHER=storm`, rain over surface-nets terrain in a Gerstner sea; and the editor (`editor/`), an object as its components.</sub>
 
 ae3d is the successor to [Gopher3D](https://github.com/nicolas-maman/gopher3D),
 the same author's Go engine, rebuilt in [Aether](https://github.com/aether-lang-dev/aether)
