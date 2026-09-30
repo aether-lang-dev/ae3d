@@ -1,45 +1,71 @@
-// Scripts you can assign to an object.
+// Scripts: source files that are component kinds.
 //
-// A script is an ordinary Aether source file with Unity's phases in it, by
-// Unity's names and with the engine's signatures -- the same functions a
-// program hands to engine.script:
+// A script is an ordinary Aether source file, and it is a component. Its
+// state is a struct of its own, one for every object it is attached to;
+// its fields are what the inspector shows and the scene saves; its phases
+// are Unity's, by Unity's names:
 //
-//     start(state: ptr, go: *GameObject)                 once, when it is attached
-//     update(state: ptr, go: *GameObject, delta: float)  every frame
+//     struct Bob { rate: float  height: float  clock: float }
 //
-// It is compiled into a shared library and opened at runtime, so attaching one
-// is a matter of remembering which library answers for which object. That is
-// how a MonoBehaviour works in Unity and a script in Godot, and what
-// gopher3D's script manager was reaching for. The editor hands a null state
-// (a script keeps its own in its globals) and the game object the script
-// is attached to; the model is behaviour.object_model(go).
+//     create() -> ptr { ... }                          // a state, with its defaults
+//     destroy(p: ptr) { heap.free(p as *Bob) }
+//     fields(k: *ComponentKind) {                      // what is shown and saved
+//         component.float_field(k, "rate", offsetof(Bob, rate), 0.0, 10.0)
+//         ...
+//     }
+//     awake(p: ptr, go: *GameObject)                   // as it is attached
+//     start(p: ptr, go: *GameObject)                   // before its first update
+//     update(p: ptr, go: *GameObject, delta: float)    // every frame
+//     fixed_update(p: ptr, go: *GameObject, step: float)
+//     late_update(p: ptr, go: *GameObject, delta: float)
+//     on_destroy(p: ptr, go: *GameObject)              // as it is taken off
 //
-// CRITICAL: a script is compiled from the same sources as the host and reaches
-// back into it for the runtime, so the two agree about what a Model is only
-// while they are built from the same tree. Build scripts with the binary that
-// will run them.
+// create, destroy and fields are what make a file a script; every phase
+// is optional. It is compiled into a shared library (scripts/build_script.sh)
+// and opened at run time: script_kind registers the library as a component
+// kind named for the script, so an object is given one as it is given any
+// component (component.add), from the editor's Add Component or a program.
+// A game that compiles its scripts in registers the same functions with
+// ae3d.component directly; one file serves both.
+//
+// A library rebuilt while the editor runs is swapped under the objects
+// carrying it (script_reload): each attachment's fields are read out, its
+// state freed by the old library and made again by the new, and the fields
+// written back by name -- a field the new code renamed takes its default,
+// the rest carry over.
+//
+// CRITICAL: a script is compiled from the same sources as the host, so the
+// two agree about what a Model is only while they are built from the same
+// tree. Build scripts with the tree that will run them.
 
 import std.list
 import std.heap
 import std.string
+import std.json
 import std.os
 import std.dl
 import ae3d.core
 import ae3d.behaviour
+import ae3d.component
 
 exports (
     Script,
-    script_open, script_close, script_start, script_update,
-    script_path, script_has_start, library_path, last_error
+    script_open, script_close, script_kind, script_reload,
+    script_path, library_path, last_error
 )
 
-// A loaded script: its library, and its phases resolved once, called
-// through their C signatures (the script's state, the game object it is
-// on, and for update the frame).
+// A loaded script: its library and what it exports, resolved once.
 struct Script {
     handle: ptr
-    start: ptr                     // the library's start, or null: a script that only moves something has no setup
-    update: ptr                    // its update, what makes a library a script
+    create: ptr
+    destroy: ptr
+    fields: ptr
+    awake: ptr
+    start: ptr
+    update: ptr
+    fixed_update: ptr
+    late_update: ptr
+    on_destroy: ptr
     path: string
 }
 
@@ -64,9 +90,9 @@ library_path(directory: string, name: string) -> string {
     return path
 }
 
-// Open a compiled script. Answers null and says why rather than half a script:
-// a library with no update in it is a file that is not a script, and a
-// caller that gets one back would call into nothing every frame.
+// Open a compiled script. Answers null and says why rather than half a
+// script: a library without create, destroy and fields is not a script,
+// and a component made of it would have no state to run on.
 script_open(path: string) -> *Script {
     g_error = ""
     if path == "" {
@@ -80,23 +106,31 @@ script_open(path: string) -> *Script {
         g_error = "${path}: ${reason}"
         return null
     }
-    update = dl.symbol_raw(handle, "update")
-    if update == null {
+    create = dl.symbol_raw(handle, "create")
+    destroy = dl.symbol_raw(handle, "destroy")
+    fields = dl.symbol_raw(handle, "fields")
+    if create == null || destroy == null || fields == null {
         dl.close_raw(handle)
-        g_error = "${path}: no update in it"
+        g_error = "${path}: a script exports create, destroy and fields"
         return null
     }
     s = heap.new(Script)
     s.handle = handle
-    s.update = update
+    s.create = create
+    s.destroy = destroy
+    s.fields = fields
+    s.awake = dl.symbol_raw(handle, "awake")
     s.start = dl.symbol_raw(handle, "start")
-    s.path = path
+    s.update = dl.symbol_raw(handle, "update")
+    s.fixed_update = dl.symbol_raw(handle, "fixed_update")
+    s.late_update = dl.symbol_raw(handle, "late_update")
+    s.on_destroy = dl.symbol_raw(handle, "on_destroy")
+    s.path = string.copy(path)
     return s
 }
 
 // CRITICAL: the path is not freed here. A struct owns its string fields and
-// heap.free releases them, so freeing it as well is a double free, and this
-// aborted on the first script it closed. See docs/writing-aether.md.
+// heap.free releases them, so freeing it as well is a double free.
 script_close(s: *Script) {
     if s == null { return }
     if s.handle != null { dl.close_raw(s.handle) }
@@ -108,22 +142,102 @@ script_path(s: *Script) -> string {
     return s.path
 }
 
-// Whether it has anything to do when it is attached. A script that only moves
-// something has no setup, and calling a function it does not have would be a
-// crash rather than a no-op.
-script_has_start(s: *Script) -> bool {
-    if s == null { return false }
-    return s.start != null
+// The kind's functions, its fields and its defaults, from `s`.
+define(k: *ComponentKind, s: *Script) {
+    component.kind_redefine(k, s.create as fn() -> ptr, s.destroy as fn(ptr))
+    declare_fields = s.fields as fn(ptr)
+    declare_fields(k as ptr)
+    k.awake = s.awake as fn(ptr, *GameObject)
+    k.start = s.start as fn(ptr, *GameObject)
+    k.update = s.update as fn(ptr, *GameObject, float)
+    k.fixed_update = s.fixed_update as fn(ptr, *GameObject, float)
+    k.late_update = s.late_update as fn(ptr, *GameObject, float)
+    k.on_destroy = s.on_destroy as fn(ptr, *GameObject)
 }
 
-script_start(s: *Script, state: ptr, go: *GameObject) {
-    if s == null || go == null || s.start == null { return }
-    start = s.start as fn(ptr, ptr) -> void
-    start(state, go as ptr)
+// The script as a component kind named `name`, listed under Scripts:
+// registered the first time, and its functions and fields taken from `s`
+// again every time after (a script rebuilt is the same kind, done anew).
+// One per object: a script is a behaviour of the object, and two of the
+// same on one object would be the same behaviour twice.
+script_kind(s: *Script, name: string) -> *ComponentKind {
+    if s == null { return null }
+    k = component.kind_named(name)
+    if k == null {
+        k = component.kind(name, "Scripts", s.create as fn() -> ptr, s.destroy as fn(ptr))
+    }
+    define(k, s)
+    component.set_unique(k, true)
+    return k
 }
 
-script_update(s: *Script, state: ptr, go: *GameObject, delta: float) {
-    if s == null || go == null || s.update == null { return }
-    update = s.update as fn(ptr, ptr, float) -> void
-    update(state, go as ptr, delta)
+// The kind moved from `old` to `replaced`, with every attachment kept --
+// on the scene's objects, on its root, and on `others` (a list of objects
+// out of the scene and still held, as an editor keeps what it deleted for
+// undo; null for none): its fields read out, its state freed by the library
+// that made it, made again by the new one, the fields written back by
+// name, and its start run again on the next frame. `old` stays open until
+// the caller closes it after this returns.
+script_reload(k: *ComponentKind, old: *Script, replaced: *Script, s: *Scene, others: ptr) {
+    if k == null || replaced == null { return }
+    held = list.new()
+    collect(k, behaviour.scene_root(s), held)
+    count = 0
+    if s != null { count = behaviour.scene_count(s) }
+    i = 0
+    while i < count {
+        collect(k, behaviour.scene_object(s, i), held)
+        i = i + 1
+    }
+    if others != null {
+        i = 0
+        while i < list.size(others) {
+            collect(k, list.get_raw(others, i) as *GameObject, held)
+            i = i + 1
+        }
+    }
+    // Every state read out and freed while the old library's code is still
+    // there to free it.
+    n = list.size(held)
+    i = 0
+    while i < n {
+        h = list.get_raw(held, i) as *HeldState
+        component.release_state(h.component as *Component)
+        i = i + 1
+    }
+    define(k, replaced)
+    i = 0
+    while i < n {
+        h = list.get_raw(held, i) as *HeldState
+        c = h.component as *Component
+        component.replace_state(c, k.create())
+        component.from_json(c, h.fields)
+        c.started = false
+        json.free(h.fields)
+        heap.free(h)
+        i = i + 1
+    }
+    list.free(held)
+}
+
+// A component of the kind being reloaded, and its fields as they were.
+struct HeldState {
+    component: ptr
+    fields: ptr
+}
+
+collect(k: *ComponentKind, o: *GameObject, held: ptr) {
+    if o == null { return }
+    count = behaviour.object_component_count(o)
+    i = 0
+    while i < count {
+        c = behaviour.object_component(o, i)
+        if c != null && c.schema == k as ptr {
+            h = heap.new(HeldState)
+            h.component = c as ptr
+            h.fields = component.to_json(c, false)
+            list.add_raw(held, h)
+        }
+        i = i + 1
+    }
 }

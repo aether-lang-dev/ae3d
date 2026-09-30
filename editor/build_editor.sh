@@ -141,6 +141,7 @@ for src in $NATIVE_SOURCES; do
 done
 
 ae3d_native_build "$CC" "$OBJ_DIR" "$CFLAGS" "$GLFW_LIBS"
+ae3d_runtime_build "$CC" "$AETHER_LIBS"
 
 # Every module tree on the search path: ae3d.* out of src/, ui and vg.* out
 # of the aether-ui checkout, aephysics.* out of its submodule.
@@ -155,7 +156,7 @@ AETHER_SOURCES="$(sed -n 's|^// aether-source: ||p' "$GEN" | tr '\\' '/')"
 # own link line; GLFW is named, since the engine's Aether calls it
 # (ae3d.platform). PLATFORM_LIBS here is aether-ui's.
 "$CC" $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $UI_FLAGS "$GEN" $UI_SOURCES $AETHER_SOURCES $(ae3d_native_link_flags) $GLFW_LIBS \
-    $AETHER_COMPILE_FLAGS $AETHER_LIBS $PLATFORM_LIBS \
+    $AETHER_COMPILE_FLAGS $(ae3d_runtime_link_flags "$AETHER_LIBS") $(ae3d_program_flags) $PLATFORM_LIBS \
     -o "$OUT"
 
 echo "built: $OUT"
