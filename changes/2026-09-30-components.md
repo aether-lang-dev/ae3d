@@ -75,3 +75,9 @@
     (aether-lang-dev/aether-ui#206).
   - The editor driver finds and counts the widgets that are showing, as a
     person would, since the inspector's hidden views carry the same captions.
+  - `AE3D_EDITOR_CHURN=n` selects the scene and every object n times over
+    before the report and reports `churn_growth`, what the Aether runtime
+    accounts for beyond the second round, and `churn_held`. Twenty rounds
+    grow nothing. The runtime counts lists but not `heap.new` or strings
+    yet (a planted list leak shows, planted struct and string leaks do not:
+    aether-lang-dev/aether#2310), so it is a check on lists until then.
