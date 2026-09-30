@@ -1,0 +1,847 @@
+// Fields of a script's state, replicated beside the transform (#486). A
+// host and two clients in one process, each a world of its own, over real
+// datagrams on this machine's loopback interface: every side's link 50 ms
+// +- 20 ms each way (the jitter reorders the datagrams) and 10% of them
+// lost. Twelve crates, each with a field of every kind -- an int, a float
+// to a hundredth, a bool, a Vec3 to a millimetre, a float sent as its 64
+// bits, a text -- changed by the host on schedules of their own; an object
+// whose place jumps with a field; every player with its health; a rocket
+// created mid-run whose fuel burns down, then destroyed. Held to numbers:
+//
+//   - every client's copy of every field is the host's at the tick of the
+//     newest snapshot it holds, bit for bit (a float the host's steps of
+//     its precision, the same bits; one sent whole, the host's bits), at
+//     every frame;
+//   - a hook fires once for every change the host made, on every client,
+//     with the value the host gave it, in the order the host gave them,
+//     and never for anything else;
+//   - a client's own player's fields reach it (its transform goes apart,
+//     reconciled; its fields in a record of their own);
+//   - a created object's fields, registered by its kind's maker on every
+//     side, arrive with it and go with it;
+//   - a field and the transform it goes with arrive in the same snapshot:
+//     within a budget that leaves records for later, the object's place
+//     and its field always agree on a client, and every change still
+//     fires its hook once;
+//   - what fields cost: nothing at all while they stand still (the same
+//     bytes to the byte as the scene with no fields, over the same lossy
+//     loopback), and what their changes cost when they do change.
+
+import std.mem
+import std.string
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.loader
+import ae3d.physics
+import ae3d.platform
+import ae3d.net
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern floor(x: float) -> float
+
+const CRATES = 12
+const WORDS = 8                      // the words a crate's fields are logged in: int, speed, bool, aim xyz, exact, label
+const ROW = 104                      // a tick's log: the crates', the stage, the fuel, three players' health, and room
+const TICKS = 512                    // the host's field values kept, a ring by tick
+const STEP = 0.016666666666666666
+const RUN = 6.0                      // seconds on the real clock
+const CHANGES_UNTIL = 4.8            // the host changes nothing after this, so every change is through by the end
+const LATENCY = 0.03
+const JITTER = 0.04
+const LOSS = 0.1
+const BUDGET = 120                   // bytes a snapshot in the budget run: records wait their turn
+const LABELS = 6
+const CHANGES = 1024                 // the host's changes kept, and a client's hooks
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+label_of(k: int) -> string {
+    if k == 0 { return "" }
+    if k == 1 { return "idle" }
+    if k == 2 { return "armed" }
+    if k == 3 { return "firing: all barrels" }
+    if k == 4 { return "empty" }
+    return "reloading the magazine now!"
+}
+
+label_index(text: string) -> int {
+    k = 0
+    while k < LABELS {
+        if string.equals(label_of(k), text) == 1 { return k }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+field_name(f: int) -> string {
+    if f == 0 { return "health" }
+    if f == 1 { return "speed" }
+    if f == 2 { return "armed" }
+    if f == 3 { return "aim" }
+    if f == 4 { return "exact" }
+    return "label"
+}
+
+// A crate's script state: what its fields are kept in.
+struct Crate {
+    health: int
+    speed: float
+    armed: bool
+    aim: Vec3
+    exact: float
+}
+
+// A player's.
+struct Vitals {
+    health: int
+}
+
+// The object whose place jumps with its stage.
+struct Stage {
+    stage: int
+}
+
+// A rocket's, made by the kind's maker on every side.
+struct Fuel {
+    fuel: float
+}
+
+struct Side {
+    world: *Engine
+    session: *Net
+    crates: ptr                      // *GameObject[CRATES]
+    states: ptr                      // *Crate[CRATES]
+    mover: *GameObject
+    stage: *Stage
+    vitals: ptr                      // *Vitals[3], by client id: every player's
+    rocket: *GameObject
+    rocket_was: *GameObject          // the one made, after it has gone
+    rockets: int                     // made here
+    fuel: *Fuel
+    // Client: the hooks, as they fired: which field (crate * 8 + field, or
+    // 200 + player, 300 the stage, 400 the fuel), the value, and the tick.
+    hooked: int
+    hook_field: ptr                  // int[CHANGES]
+    hook_value: ptr                  // long[CHANGES]
+    hook_tick: ptr                   // int[CHANGES]
+    compared: int                    // frames whose every field was compared with the host at its tick
+    fields: int                      // field values compared
+    different: int                   // of them, not the host's
+    disagreed: int                   // snapshots the stage and the place disagreed in
+    staged: int                      // and were compared in
+    own_health: int                  // client: its own player's health, as its hooks last said
+    last_stage: int                  // client: the stage its hook last saw
+    backwards: int                   // client: hooks that saw a stage no later than the one before
+}
+
+make_player(context: ptr, client: int) -> *CharacterController {
+    s = context as *Side
+    o = engine.object(s.world, "Player ${client}", null)
+    behaviour.object_set_position(o, core.vec3(((client - 1) * 4) as float, 0.0, 0.0 - 6.0))
+    v = (s.vitals as ptr[])[client] as *Vitals
+    v.health = 100
+    net.replicate(s.session, o, "health", &v.health, net.REPLICATE_INT)
+    if !net.hosting(s.session) { net.on_changed(s.session, o, "health", hooked_player, s as ptr) }
+    return physics.character_controller(o, 0.3, 1.8)
+}
+
+make_rocket(context: ptr, id: int) -> *GameObject {
+    s = context as *Side
+    o = behaviour.object_new("rocket")
+    s.fuel.fuel = 50.0
+    net.replicate(s.session, o, "fuel", &s.fuel.fuel, net.REPLICATE_FLOAT, 0.1)
+    if !net.hosting(s.session) { net.on_changed(s.session, o, "fuel", hooked_fuel, s as ptr) }
+    s.rocket = o
+    s.rocket_was = o
+    s.rockets = s.rockets + 1
+    return o
+}
+
+unmake_rocket(context: ptr, o: *GameObject) {
+    s = context as *Side
+    if s.rocket == o { s.rocket = null }
+    behaviour.object_free(o)
+}
+
+hooked(context: ptr, change: *NetChange) {
+    s = context as *Side
+    k = 0
+    while k < CRATES {
+        if (s.crates as ptr[])[k] == change.object as ptr {
+            c = (s.states as ptr[])[k] as *Crate
+            value = 0 as long
+            if change.order == 0 { value = c.health as long }
+            if change.order == 1 { value = steps(c.speed, 0.01) }
+            if change.order == 2 && c.armed { value = 1 as long }
+            if change.order == 3 { value = steps(c.aim.x, 0.001) }
+            if change.order == 4 { value = mem.bits_of_float(c.exact) }
+            if change.order == 5 { value = label_index(net.text(s.session, change.object, "label")) as long }
+            record_hook(s, k * 8 + change.order, value, change.tick)
+        }
+        k = k + 1
+    }
+}
+
+hooked_player(context: ptr, change: *NetChange) {
+    s = context as *Side
+    k = 0
+    while k <= 2 {
+        pl = net.player_of(s.session, k)
+        if pl != null && pl.controller.object as ptr == change.object as ptr {
+            h = ((s.vitals as ptr[])[k] as *Vitals).health
+            record_hook(s, 200 + k, h as long, change.tick)
+            if k == net.client_id(s.session) { s.own_health = h }
+        }
+        k = k + 1
+    }
+}
+
+// The stage changed on a client: in the snapshot that brought it, the
+// mover's place is the one the host gave it with that stage.
+hooked_stage(context: ptr, change: *NetChange) {
+    s = context as *Side
+    record_hook(s, 300, s.stage.stage as long, change.tick)
+    stage_agrees(s)
+    if s.stage.stage <= s.last_stage { s.backwards = s.backwards + 1 }
+    s.last_stage = s.stage.stage
+}
+
+hooked_fuel(context: ptr, change: *NetChange) {
+    s = context as *Side
+    record_hook(s, 400, steps(s.fuel.fuel, 0.1), change.tick)
+}
+
+record_hook(s: *Side, field: int, value: long, tick: int) {
+    if s.hooked >= CHANGES { return }
+    (s.hook_field as int[])[s.hooked] = field
+    (s.hook_value as long[])[s.hooked] = value
+    (s.hook_tick as int[])[s.hooked] = tick
+    s.hooked = s.hooked + 1
+}
+
+steps(v: float, precision: float) -> long { return floor(v / precision + 0.5) as long }
+
+// The mover's place, as the client's newest snapshot has it, against the
+// stage its fields say: they came in one record, so they always agree.
+stage_agrees(s: *Side) {
+    values = calloc(7, 8)
+    id = net.id_of(s.session, s.mover)
+    if net.state_at(s.session, id, values) {
+        s.staged = s.staged + 1
+        d = (values as float[])[0] - (s.stage.stage as float) * 2.0
+        if d < 0.0 { d = 0.0 - d }
+        if d > 0.0002 { s.disagreed = s.disagreed + 1 }
+    }
+    free(values)
+}
+
+world_new() -> *Engine {
+    e = engine.engine_new()
+    physics.attach(e)
+    ground = engine.object(e, "Ground", loader.cube(1.0))
+    behaviour.object_set_position(ground, core.vec3(0.0, 0.0 - 0.5, 0.0))
+    physics.box_collider(ground, core.vec3(40.0, 0.5, 40.0), physics.material(0.8, 0.0))
+    return e
+}
+
+// The scene every side builds the same: the crates and their fields,
+// registered before each crate is networked (the order both sides share
+// is the registration's, whichever comes first), the mover networked
+// before its field, the rocket's kind, the players.
+side_new(session: *Net) -> *Side {
+    s = calloc(1, sizeof(Side)) as *Side
+    s.world = world_new()
+    s.session = session
+    s.crates = calloc(CRATES, 8)
+    s.states = calloc(CRATES, 8)
+    s.vitals = calloc(3, 8)
+    k = 0
+    while k <= 2 {
+        (s.vitals as ptr[])[k] = calloc(1, sizeof(Vitals))
+        k = k + 1
+    }
+    s.hook_field = calloc(CHANGES, 4)
+    s.hook_value = calloc(CHANGES, 8)
+    s.hook_tick = calloc(CHANGES, 4)
+    s.fuel = calloc(1, sizeof(Fuel)) as *Fuel
+    s.stage = calloc(1, sizeof(Stage)) as *Stage
+    host = net.hosting(session)
+    k = 0
+    while k < CRATES {
+        o = behaviour.object_new("crate")
+        behaviour.object_set_position(o, core.vec3(((k % 4) as float) * 3.0 - 4.5, 0.0, ((k / 4) as float) * 3.0))
+        c = calloc(1, sizeof(Crate)) as *Crate
+        c.health = 100
+        (s.crates as ptr[])[k] = o as ptr
+        (s.states as ptr[])[k] = c as ptr
+        add_fields(session, o, c)
+        net.networked(session, o)
+        if !host {
+            f = 0
+            while f < 6 {
+                net.on_changed(session, o, field_name(f), hooked, s as ptr)
+                f = f + 1
+            }
+        }
+        k = k + 1
+    }
+    s.mover = behaviour.object_new("mover")
+    net.networked(session, s.mover)
+    net.replicate(session, s.mover, "stage", &s.stage.stage, net.REPLICATE_INT)
+    if !host { net.on_changed(session, s.mover, "stage", hooked_stage, s as ptr) }
+    net.object_kind(session, "rocket", make_rocket, unmake_rocket, s as ptr)
+    net.set_player_maker(session, make_player, s as ptr)
+    return s
+}
+
+add_fields(n: *Net, o: *GameObject, c: *Crate) {
+    net.replicate(n, o, "health", &c.health, net.REPLICATE_INT)
+    net.replicate(n, o, "speed", &c.speed, net.REPLICATE_FLOAT, 0.01)
+    net.replicate(n, o, "armed", &c.armed, net.REPLICATE_BOOL)
+    net.replicate(n, o, "aim", &c.aim, net.REPLICATE_VEC3, 0.001)
+    net.replicate(n, o, "exact", &c.exact, net.REPLICATE_FLOAT)
+    net.replicate(n, o, "label", null, net.REPLICATE_TEXT)
+}
+
+side_free(s: *Side) {
+    k = 0
+    while k <= 2 {
+        pl = net.player_of(s.session, k)
+        if pl != null { physics.character_free(pl.controller) }
+        k = k + 1
+    }
+    net.net_free(s.session)
+    k = 0
+    while k < CRATES {
+        behaviour.object_free((s.crates as ptr[])[k] as *GameObject)
+        free((s.states as ptr[])[k])
+        k = k + 1
+    }
+    k = 0
+    while k <= 2 {
+        free((s.vitals as ptr[])[k])
+        k = k + 1
+    }
+    behaviour.object_free(s.mover)
+    engine.engine_free(s.world)
+    free(s.crates)
+    free(s.states)
+    free(s.vitals)
+    free(s.hook_field)
+    free(s.hook_value)
+    free(s.hook_tick)
+    free(s.fuel as ptr)
+    free(s.stage as ptr)
+    free(s as ptr)
+}
+
+// The host's own log: every field's value at every tick, as the wire
+// carries it (the steps of a float's precision, a float's bits, a label's
+// place in the table), and every change it made, in order, at the tick
+// that took it.
+struct Log {
+    values: ptr                      // long[TICKS * ROW]
+    ticks: ptr                       // int[TICKS]: the tick each slot holds
+    changes: int
+    change_field: ptr                // int[CHANGES]
+    change_value: ptr                // long[CHANGES]
+    change_tick: ptr                 // int[CHANGES]
+    from: int                        // the tick the changes began at: every client holding snapshots
+    written: int                     // the tick the host last wrote for: a tick takes two frames, and writes once
+}
+
+log_new() -> *Log {
+    l = calloc(1, sizeof(Log)) as *Log
+    l.values = calloc(TICKS * ROW, 8)
+    l.ticks = calloc(TICKS, 4)
+    l.change_field = calloc(CHANGES, 4)
+    l.change_value = calloc(CHANGES, 8)
+    l.change_tick = calloc(CHANGES, 4)
+    return l
+}
+
+log_free(l: *Log) {
+    free(l.values)
+    free(l.ticks)
+    free(l.change_field)
+    free(l.change_value)
+    free(l.change_tick)
+    free(l as ptr)
+}
+
+log_change(l: *Log, field: int, value: long, tick: int) {
+    if l.changes >= CHANGES { return }
+    (l.change_field as int[])[l.changes] = field
+    (l.change_value as long[])[l.changes] = value
+    (l.change_tick as int[])[l.changes] = tick
+    l.changes = l.changes + 1
+}
+
+// The host's fields at the tick just taken, into the log's row for it.
+log_tick(l: *Log, host: *Side, tick: int) {
+    slot = tick % TICKS
+    (l.ticks as int[])[slot] = tick
+    row = l.values as long[]
+    at = slot * ROW
+    k = 0
+    while k < CRATES {
+        c = (host.states as ptr[])[k] as *Crate
+        w = at + k * WORDS
+        row[w] = c.health as long
+        row[w + 1] = steps(c.speed, 0.01)
+        row[w + 2] = 0 as long
+        if c.armed { row[w + 2] = 1 as long }
+        row[w + 3] = steps(c.aim.x, 0.001)
+        row[w + 4] = steps(c.aim.y, 0.001)
+        row[w + 5] = steps(c.aim.z, 0.001)
+        row[w + 6] = mem.bits_of_float(c.exact)
+        row[w + 7] = label_index(net.text(host.session, (host.crates as ptr[])[k] as *GameObject, "label")) as long
+        k = k + 1
+    }
+    w = at + CRATES * WORDS
+    row[w] = host.stage.stage as long
+    row[w + 1] = steps(host.fuel.fuel, 0.1)
+    p = 0
+    while p <= 2 {
+        row[w + 2 + p] = (((host.vitals as ptr[])[p] as *Vitals).health) as long
+        p = p + 1
+    }
+}
+
+// Whether crate `crate`'s field `f` changes at `tick`: every
+// 7 + crate + 2 f ticks from when the changes began.
+changes_at(l: *Log, crate: int, f: int, tick: int) -> bool {
+    every = 7 + crate + 2 * f
+    return tick > l.from && (tick - l.from) % every == 0
+}
+
+// The host's scripts at a step: each crate's fields changed on their
+// schedules, the stage moved with its place, the players' health, the
+// rocket made, burnt and let go. What changed is logged at `tick`, the
+// tick that will take it. Nothing changes until every client holds
+// snapshots and every player is known everywhere (a change before a
+// client could see it is not one it is owed), nor after CHANGES_UNTIL.
+host_writes(l: *Log, host: *Side, one: *Side, two: *Side, tick: int, now: float) {
+    if l.from == 0 {
+        ready = net.snapshot_tick(one.session) > 0 && net.snapshot_tick(two.session) > 0
+        p = 0
+        while p <= 2 {
+            if net.player_of(one.session, p) == null || net.player_of(two.session, p) == null { ready = false }
+            p = p + 1
+        }
+        if ready { l.from = tick }
+        return
+    }
+    if tick == l.written { return }
+    l.written = tick
+    if now >= CHANGES_UNTIL {
+        if host.rocket != null { net.destroy_object(host.session, host.rocket, now) }
+        return
+    }
+    k = 0
+    while k < CRATES {
+        c = (host.states as ptr[])[k] as *Crate
+        o = (host.crates as ptr[])[k] as *GameObject
+        if changes_at(l, k, 0, tick) {
+            c.health = c.health - 3 - k
+            log_change(l, k * 8, c.health as long, tick)
+        }
+        if changes_at(l, k, 1, tick) {
+            c.speed = c.speed + 0.37 + (k as float) * 0.011
+            log_change(l, k * 8 + 1, steps(c.speed, 0.01), tick)
+        }
+        if changes_at(l, k, 2, tick) {
+            c.armed = !c.armed
+            flag = 0 as long
+            if c.armed { flag = 1 as long }
+            log_change(l, k * 8 + 2, flag, tick)
+        }
+        if changes_at(l, k, 3, tick) {
+            c.aim = core.vec3(c.aim.x + 0.1234567, c.aim.y - 0.25, c.aim.z + (k as float) * 0.003)
+            log_change(l, k * 8 + 3, steps(c.aim.x, 0.001), tick)
+        }
+        if changes_at(l, k, 4, tick) {
+            c.exact = c.exact + 0.1 + 1.0 / (3.0 + (k as float))
+            log_change(l, k * 8 + 4, mem.bits_of_float(c.exact), tick)
+        }
+        if changes_at(l, k, 5, tick) {
+            next = (label_index(net.text(host.session, o, "label")) + 1) % LABELS
+            net.set_text(host.session, o, "label", label_of(next))
+            log_change(l, k * 8 + 5, next as long, tick)
+        }
+        k = k + 1
+    }
+    // The stage and the place it puts the mover at, together.
+    if (tick - l.from) % 6 == 0 {
+        host.stage.stage = host.stage.stage + 1
+        behaviour.object_set_position(host.mover, core.vec3((host.stage.stage as float) * 2.0, 0.0, 12.0))
+        log_change(l, 300, host.stage.stage as long, tick)
+    }
+    // Every player's health, a player a turn.
+    if (tick - l.from) % 15 == 0 {
+        p = ((tick - l.from) / 15) % 3
+        v = (host.vitals as ptr[])[p] as *Vitals
+        v.health = v.health - 7
+        log_change(l, 200 + p, v.health as long, tick)
+    }
+    // The rocket: made at 2 s, and burnt every five ticks once every
+    // client has made its own.
+    if host.rockets == 0 && now >= 2.0 {
+        net.create_object(host.session, "rocket", core.vec3(0.0, 1.0, 5.0), core.quat(0.0, 0.0, 0.0, 1.0), now)
+    }
+    if host.rocket != null && one.rocket != null && two.rocket != null && tick % 5 == 0 {
+        host.fuel.fuel = host.fuel.fuel - 1.3
+        log_change(l, 400, steps(host.fuel.fuel, 0.1), tick)
+    }
+}
+
+// A client's every field against the host's at the tick of its newest
+// snapshot, bit for bit.
+compare(l: *Log, s: *Side) {
+    tick = net.snapshot_tick(s.session)
+    if tick <= 0 || (l.ticks as int[])[tick % TICKS] != tick { return }
+    row = l.values as long[]
+    at = (tick % TICKS) * ROW
+    k = 0
+    while k < CRATES {
+        c = (s.states as ptr[])[k] as *Crate
+        w = at + k * WORDS
+        if !net.fields_known(s.session, net.id_of(s.session, (s.crates as ptr[])[k] as *GameObject)) { return }
+        differs(s, tick, k * 8, (c.health as long) != row[w])
+        // A float is the host's steps times the precision: the same bits.
+        differs(s, tick, k * 8 + 1, mem.bits_of_float(c.speed) != mem.bits_of_float((row[w + 1] as float) * 0.01))
+        differs(s, tick, k * 8 + 2, c.armed != (row[w + 2] == (1 as long)))
+        differs(s, tick, k * 8 + 3, mem.bits_of_float(c.aim.x) != mem.bits_of_float((row[w + 3] as float) * 0.001) ||
+                mem.bits_of_float(c.aim.y) != mem.bits_of_float((row[w + 4] as float) * 0.001) ||
+                mem.bits_of_float(c.aim.z) != mem.bits_of_float((row[w + 5] as float) * 0.001))
+        differs(s, tick, k * 8 + 4, mem.bits_of_float(c.exact) != row[w + 6])
+        differs(s, tick, k * 8 + 5, (label_index(net.text(s.session, (s.crates as ptr[])[k] as *GameObject, "label")) as long) != row[w + 7])
+        k = k + 1
+    }
+    w = at + CRATES * WORDS
+    differs(s, tick, 300, (s.stage.stage as long) != row[w])
+    if s.rocket != null && net.fields_known(s.session, net.id_of(s.session, s.rocket)) {
+        differs(s, tick, 400, mem.bits_of_float(s.fuel.fuel) != mem.bits_of_float((row[w + 1] as float) * 0.1))
+    }
+    p = 0
+    while p <= 2 {
+        // A player told of before any snapshot carried it holds what its
+        // maker gave it, not yet the host's.
+        pl = net.player_of(s.session, p)
+        if pl != null && net.fields_known(s.session, pl.net_id) {
+            differs(s, tick, 200 + p, ((((s.vitals as ptr[])[p] as *Vitals).health) as long) != row[w + 2 + p])
+        }
+        p = p + 1
+    }
+    s.compared = s.compared + 1
+    stage_agrees(s)
+}
+
+// A field compared: counted, and the first few that differ named.
+differs(s: *Side, tick: int, field: int, off: bool) {
+    s.fields = s.fields + 1
+    if !off { return }
+    s.different = s.different + 1
+    if s.different <= 3 { println("  (client ${net.client_id(s.session)}: field ${field} not the host's at tick ${tick})") }
+}
+
+// A client's hooks against the host's changes: each change to a field once,
+// with its value, in its order, at its tick or after; nothing else.
+struct Tally {
+    matched: int
+    missing: int
+    extra: int
+    early: int                       // a hook at a tick before the change it reports
+}
+
+tally(l: *Log, s: *Side, t: *Tally, only: int) {
+    used = calloc(CHANGES, 4)
+    j = 0
+    while j < s.hooked {
+        field = (s.hook_field as int[])[j]
+        if only >= 0 && field != only { j = j + 1 ; continue }
+        // The first change to this field not yet matched, in the host's order.
+        found = 0 - 1
+        k = 0
+        while k < l.changes && found < 0 {
+            if (l.change_field as int[])[k] == field && (used as int[])[k] == 0 { found = k }
+            k = k + 1
+        }
+        if found >= 0 && (l.change_value as long[])[found] == (s.hook_value as long[])[j] {
+            (used as int[])[found] = 1
+            t.matched = t.matched + 1
+            if (s.hook_tick as int[])[j] < (l.change_tick as int[])[found] { t.early = t.early + 1 }
+        } else {
+            t.extra = t.extra + 1
+            if t.extra <= 3 { println("  (a hook on field ${field} at tick ${(s.hook_tick as int[])[j]} said ${(s.hook_value as long[])[j]})") }
+        }
+        j = j + 1
+    }
+    k = 0
+    while k < l.changes {
+        if (used as int[])[k] == 0 { t.missing = t.missing + 1 }
+        k = k + 1
+    }
+    free(used)
+}
+
+pace(start: float, step: int) {
+    due = start + (step as float) * STEP
+    while platform.time() < due { sleep(0) }
+}
+
+lossy_run() {
+    println("fields: a host and two clients over loopback UDP, 50 +- 20 ms each way and 10% of datagrams lost")
+    host_session = net.host_udp("127.0.0.1", 0)
+    if host_session == null {
+        println("  SKIP ${net.last_error()}")
+        return
+    }
+    port = net.udp_port(host_session)
+    net.set_conditions(host_session, LATENCY, JITTER, LOSS)
+    host = side_new(host_session)
+    net.host_play(host_session, 0.0)
+    one = side_new(net.join_udp("127.0.0.1", port))
+    net.set_conditions(one.session, LATENCY, JITTER, LOSS)
+    two = side_new(net.join_udp("127.0.0.1", port))
+    net.set_conditions(two.session, LATENCY, JITTER, LOSS)
+    l = log_new()
+    start = platform.time()
+    frame = 0
+    last_tick = 0
+    commands = 0.0
+    last = 0.0
+    while true {
+        frame = frame + 1
+        pace(start, frame)
+        now = platform.time() - start
+        if now >= RUN { break }
+        commands = commands + (now - last)
+        last = now
+        while commands >= STEP {
+            commands = commands - STEP
+            if net.my_player(one.session) != null { net.player_input(one.session, core.vec3(0.0, 0.0, 0.0), 0.0, now) }
+            if net.my_player(two.session) != null { net.player_input(two.session, core.vec3(0.0, 0.0, 0.0), 0.0, now) }
+        }
+        host_writes(l, host, one, two, net.host_tick(host.session) + 1, now)
+        net.step(host.session, now)
+        if net.host_tick(host.session) != last_tick {
+            last_tick = net.host_tick(host.session)
+            log_tick(l, host, last_tick)
+        }
+        net.step(one.session, now)
+        net.step(two.session, now)
+        compare(l, one)
+        compare(l, two)
+    }
+    println("  the host made ${l.changes} changes from tick ${l.from}; at the end client 1 holds tick ${net.snapshot_tick(one.session)} and client 2 ${net.snapshot_tick(two.session)} of ${net.host_tick(host.session)}")
+    println("  every frame, every field against the host's at the tick of the newest snapshot: client 1 ${one.fields} values over ${one.compared} frames, ${one.different} different; client 2 ${two.fields} over ${two.compared}, ${two.different} different")
+    check("every client's copy of every field is the host's at its snapshot's tick, bit for bit", one.compared > 150 && two.compared > 150 && one.different == 0 && two.different == 0)
+    t1 = Tally { matched: 0, missing: 0, extra: 0, early: 0 }
+    t2 = Tally { matched: 0, missing: 0, extra: 0, early: 0 }
+    tally(l, one, &t1, 0 - 1)
+    tally(l, two, &t2, 0 - 1)
+    println("  hooks: client 1 ${one.hooked} fired, ${t1.matched} matched to the host's changes in order, ${t1.missing} changes missed, ${t1.extra} extra, ${t1.early} early; client 2 ${two.hooked}, ${t2.matched}, ${t2.missing}, ${t2.extra}, ${t2.early}")
+    check("a hook fires once for every change, with its value, in the host's order, and for nothing else",
+          l.changes > 250 && t1.matched == l.changes && t1.extra == 0 && t1.early == 0 && t2.matched == l.changes && t2.extra == 0 && t2.early == 0)
+    own1 = ((host.vitals as ptr[])[net.client_id(one.session)] as *Vitals).health
+    own2 = ((host.vitals as ptr[])[net.client_id(two.session)] as *Vitals).health
+    println("  own health: client 1 hooked ${one.own_health} and the host has ${own1}; client 2 ${two.own_health} and ${own2}")
+    check("a client's own player's fields reach it", own1 < 100 && own2 < 100 && one.own_health == own1 && two.own_health == own2)
+    println("  the rocket: made ${one.rockets} and ${two.rockets} time(s) on the clients, let go ${one.rocket == null} and ${two.rocket == null}; its fields left: ${net.field_count(one.session, one.rocket_was)} and ${net.field_count(two.session, two.rocket_was)}")
+    check("a created object's fields come with it and go with it",
+          one.rockets == 1 && two.rockets == 1 && one.rocket == null && two.rocket == null &&
+          net.field_count(one.session, one.rocket_was) == 0 && net.field_count(two.session, two.rocket_was) == 0)
+    log_free(l)
+    side_free(one)
+    side_free(two)
+    side_free(host)
+}
+
+// --- within a budget ------------------------------------------------------------------------------
+
+// The same scene over the loopback hub with 50 ms, 20 of jitter and 10%
+// lost, on the test's clock, every crate moving and its fields changing,
+// the stage and its place jumping together, and a budget that fits a few
+// records a snapshot: the records the budget leaves wait their turn,
+// never split.
+budget_run() {
+    println("budget: the same scene over the loopback, a budget of ${BUDGET} bytes a snapshot")
+    hub = net.hub_new()
+    net.hub_set_conditions(hub, 0.05, 0.02, 0.1)
+    host = side_new(net.host_loopback(hub))
+    net.set_budget(host.session, BUDGET)
+    one = side_new(net.join_loopback(hub))
+    l = log_new()
+    step = 0
+    while step < 600 {
+        now = (step as float) * STEP
+        if l.from == 0 && net.snapshot_tick(one.session) > 0 { l.from = net.host_tick(host.session) + 1 }
+        tick = net.host_tick(host.session) + 1
+        if l.from > 0 && now < 8.0 {
+            k = 0
+            while k < CRATES {
+                o = (host.crates as ptr[])[k] as *GameObject
+                behaviour.object_set_position(o, core.vec3(core.cos_of(now + (k as float)) * 4.0, 0.0, core.sin_of(now + (k as float)) * 4.0))
+                c = (host.states as ptr[])[k] as *Crate
+                c.speed = now * (k as float)
+                k = k + 1
+            }
+            if (tick - l.from) % 12 == 0 && tick != l.written {
+                l.written = tick
+                host.stage.stage = host.stage.stage + 1
+                behaviour.object_set_position(host.mover, core.vec3((host.stage.stage as float) * 2.0, 0.0, 12.0))
+                log_change(l, 300, host.stage.stage as long, tick)
+            }
+        }
+        net.step(host.session, now)
+        net.step(one.session, now)
+        step = step + 1
+    }
+    largest = net.largest_snapshot(host.session, 1)
+    println("  the largest snapshot ${largest} bytes; the most an object waited ${net.worst_wait_any(host.session, 1)} ticks, the mover ${net.worst_wait(host.session, 1, net.id_of(host.session, host.mover))}")
+    println("  the stage: ${l.changes} changes on the host, ${one.staged} seen by the client's hook, ${one.backwards} backwards, the place in its snapshot not the stage's in ${one.disagreed}; the client ends at ${one.stage.stage}, the host at ${host.stage.stage}")
+    check("within a budget that leaves records waiting, a field and its transform arrive together, always",
+          largest <= BUDGET && net.worst_wait_any(host.session, 1) > 0 && one.staged > 10 && one.disagreed == 0)
+    // A field is state: a change the budget kept back until the next one
+    // came is that next one on the client, never a step back.
+    check("and a field held back by the budget never goes backwards, and ends at the host's", one.backwards == 0 && one.stage.stage == host.stage.stage)
+    log_free(l)
+    side_free(one)
+    side_free(host)
+    net.hub_free(hub)
+}
+
+// --- what fields cost ----------------------------------------------------------------------------
+
+// Twenty objects moving round a circle, over the loopback's 50 ms and 10%
+// lost, on the test's clock, with six fields each or none; the fields
+// still after the first ten steps, or changing every step. The snapshot
+// bytes of the two seconds after the first.
+cost_run(fields: bool, changing: bool) -> long {
+    hub = net.hub_new()
+    net.hub_set_conditions(hub, 0.05, 0.0, 0.1)
+    host = net.host_loopback(hub)
+    client = net.join_loopback(hub)
+    objects = calloc(20, 8)
+    others = calloc(20, 8)
+    mine = calloc(20, 8)
+    theirs = calloc(20, 8)
+    k = 0
+    while k < 20 {
+        o = behaviour.object_new("thing")
+        c = behaviour.object_new("thing")
+        a = calloc(1, sizeof(Crate)) as *Crate
+        b = calloc(1, sizeof(Crate)) as *Crate
+        if fields {
+            add_fields(host, o, a)
+            add_fields(client, c, b)
+        }
+        net.networked(host, o)
+        net.networked(client, c)
+        (objects as ptr[])[k] = o as ptr
+        (others as ptr[])[k] = c as ptr
+        (mine as ptr[])[k] = a as ptr
+        (theirs as ptr[])[k] = b as ptr
+        k = k + 1
+    }
+    before = 0 as long
+    step = 0
+    while step < 180 {
+        now = (step as float) * STEP
+        k = 0
+        while k < 20 {
+            o = (objects as ptr[])[k] as *GameObject
+            behaviour.object_set_position(o, core.vec3(core.cos_of(now + (k as float)) * 5.0, 0.0, core.sin_of(now + (k as float)) * 5.0))
+            a = (mine as ptr[])[k] as *Crate
+            if step < 10 || changing {
+                a.health = step + k
+                a.speed = (step as float) * 0.5
+                a.aim = core.vec3((step as float) * 0.01, 0.0, 1.0)
+                a.exact = (step as float) / 7.0
+            }
+            k = k + 1
+        }
+        net.step(host, now)
+        net.step(client, now)
+        if step == 60 { before = net.snapshot_bytes(host, 1) }
+        step = step + 1
+    }
+    spent = net.snapshot_bytes(host, 1) - before
+    net.net_free(client)
+    net.net_free(host)
+    net.hub_free(hub)
+    k = 0
+    while k < 20 {
+        behaviour.object_free((objects as ptr[])[k] as *GameObject)
+        behaviour.object_free((others as ptr[])[k] as *GameObject)
+        free((mine as ptr[])[k])
+        free((theirs as ptr[])[k])
+        k = k + 1
+    }
+    free(objects)
+    free(others)
+    free(mine)
+    free(theirs)
+    return spent
+}
+
+cost() {
+    println("cost: twenty objects moving, six fields each or none, over the loopback's 50 ms and 10% lost; the snapshot bytes of the two seconds after the first")
+    bare = cost_run(false, false)
+    still = cost_run(true, false)
+    changing = cost_run(true, true)
+    println("  no fields ${bare} bytes; six fields standing still ${still}; six fields changing every step ${changing} (${((changing - bare) as float) / 2.0 / 1024.0} KB a second more)")
+    check("fields that stand still cost nothing: the same bytes to the byte as the scene without them", still == bare)
+    check("and changing ones cost what their changes take", changing > bare)
+}
+
+// --- what cannot be ------------------------------------------------------------------------------
+
+refusals() {
+    hub = net.hub_new()
+    host = net.host_loopback(hub)
+    o = behaviour.object_new("thing")
+    c = calloc(1, sizeof(Crate)) as *Crate
+    net.networked(host, o)
+    ok_first = net.replicate(host, o, "health", &c.health, net.REPLICATE_INT)
+    twice = net.replicate(host, o, "health", &c.health, net.REPLICATE_INT)
+    no_place = net.replicate(host, o, "speed", null, net.REPLICATE_FLOAT)
+    text_place = net.replicate(host, o, "label", &c.health, net.REPLICATE_TEXT)
+    net.replicate(host, o, "label", null, net.REPLICATE_TEXT)
+    long_text = net.set_text(host, o, "label", "a text of more than thirty-one bytes, which no field holds")
+    net.step(host, 0.0)
+    late = net.replicate(host, o, "late", &c.health, net.REPLICATE_INT)
+    check("a field is refused where it cannot be: twice, with nowhere to keep it, a text given a place, a text too long, after the first tick",
+          ok_first && !twice && !no_place && !text_place && !long_text && !late && net.field_count(host, o) == 2)
+    net.net_free(host)
+    net.hub_free(hub)
+    behaviour.object_free(o)
+    free(c as ptr)
+}
+
+main() {
+    lossy_run()
+    budget_run()
+    cost()
+    refusals()
+    check("every session made is let go", net.alive() == 0)
+    if g_failures == 0 {
+        println("fields: all checks passed (${g_checks})")
+    } else {
+        println("fields: ${g_failures} failure(s) of ${g_checks}")
+    }
+}

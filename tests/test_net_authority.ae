@@ -1,0 +1,312 @@
+// Who simulates what, and how a client corrects what it draws (#413): a
+// host and two clients in one process over the loopback hub, each a world
+// of its own run by engine_update on the test's clock. Held to numbers:
+//
+//   - a script's fixed_update runs on the host for what the host owns and
+//     on the owning client for its player, and nowhere else; update, what
+//     an object looks like, runs on every side;
+//   - a dynamic body on an object the host owns is kinematic on a client,
+//     driven where the session puts it: it follows the host's body as the
+//     host pushes it along the ground, and is dynamic again once the
+//     session gives it back;
+//   - a remote object is corrected smoothly: after a burst of lost
+//     snapshots the client's view runs past the newest and holds it, and
+//     when the snapshots come again it is drawn on from where it stood,
+//     its error falling away, never a snap -- measured against the same
+//     burst with the smoothing off.
+
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.loader
+import ae3d.physics
+import ae3d.net
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern cos(x: float) -> float
+extern sin(x: float) -> float
+extern sqrt(x: float) -> float
+
+const STEP = 0.016666666666666666
+const CLIENTS = 2
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+// What a script counted, on one object on one side.
+struct Counts {
+    fixed: int
+    updates: int
+}
+
+counted_fixed(state: ptr, o: *GameObject, step: float) {
+    c = state as *Counts
+    c.fixed = c.fixed + 1
+}
+
+counted_update(state: ptr, o: *GameObject, delta: float) {
+    c = state as *Counts
+    c.updates = c.updates + 1
+}
+
+// A side: its world, session, the crate with a script and a body, and a
+// count a player's script keeps, by client.
+struct Side {
+    world: *Engine
+    session: *Net
+    crate: *GameObject
+    crate_counts: *Counts
+    player_counts: ptr               // *Counts[CLIENTS + 1]
+}
+
+make_player(context: ptr, client: int) -> *CharacterController {
+    s = context as *Side
+    o = engine.object(s.world, "Player ${client}", null)
+    behaviour.object_set_position(o, core.vec3((client as float) * 3.0 - 3.0, 0.0, 0.0 - 4.0))
+    engine.script(o, "player", (s.player_counts as ptr[])[client], null, counted_update, counted_fixed)
+    return physics.character_controller(o, 0.3, 1.8)
+}
+
+side_new(session: *Net) -> *Side {
+    s = calloc(1, sizeof(Side)) as *Side
+    s.world = engine.engine_new()
+    physics.attach(s.world)
+    ground = engine.object(s.world, "Ground", null)
+    behaviour.object_set_position(ground, core.vec3(0.0, 0.0 - 0.5, 0.0))
+    physics.box_collider(ground, core.vec3(40.0, 0.5, 40.0), physics.material(0.1, 0.0))
+    s.session = session
+    s.player_counts = calloc(CLIENTS + 1, 8)
+    k = 0
+    while k <= CLIENTS {
+        (s.player_counts as ptr[])[k] = calloc(1, sizeof(Counts))
+        k = k + 1
+    }
+    // The crate: a dynamic body on the ground, a script on it.
+    s.crate_counts = calloc(1, sizeof(Counts)) as *Counts
+    s.crate = engine.object(s.world, "Crate", null)
+    behaviour.object_set_position(s.crate, core.vec3(0.0, 0.5, 0.0))
+    physics.rigidbody(s.crate, physics.DYNAMIC)
+    physics.box_collider(s.crate, core.vec3(0.5, 0.5, 0.5), physics.material(0.1, 0.0))
+    engine.script(s.crate, "crate", s.crate_counts as ptr, null, counted_update, counted_fixed)
+    net.networked(session, s.crate)
+    net.set_player_maker(session, make_player, s as ptr)
+    return s
+}
+
+side_free(s: *Side) {
+    k = 0
+    while k <= CLIENTS {
+        pl = net.player_of(s.session, k)
+        if pl != null { physics.character_free(pl.controller) }
+        k = k + 1
+    }
+    net.net_free(s.session)
+    engine.engine_free(s.world)
+    k = 0
+    while k <= CLIENTS {
+        free((s.player_counts as ptr[])[k])
+        k = k + 1
+    }
+    free(s.player_counts)
+    free(s.crate_counts as ptr)
+    free(s as ptr)
+}
+
+player_fixed(s: *Side, client: int) -> int { return ((s.player_counts as ptr[])[client] as *Counts).fixed }
+player_updates(s: *Side, client: int) -> int { return ((s.player_counts as ptr[])[client] as *Counts).updates }
+
+authority() {
+    println("authority: a host and two clients over the loopback, 50 ms, each a world run by engine_update")
+    hub = net.hub_new()
+    net.hub_set_conditions(hub, 0.05, 0.0, 0.0)
+    host = side_new(net.host_loopback(hub))
+    net.host_play(host.session, 0.0)
+    clients = calloc(CLIENTS, 8)
+    k = 0
+    while k < CLIENTS {
+        (clients as ptr[])[k] = side_new(net.join_loopback(hub)) as ptr
+        k = k + 1
+    }
+    one = (clients as ptr[])[0] as *Side
+    two = (clients as ptr[])[1] as *Side
+    // Once every side is up, the host pushes its crate along x at 2 m/s;
+    // where it had it, step by step, is kept to measure the client by.
+    pushed_at = 1.0
+    host_x = calloc(240, 8)
+    worst_follow = 0.0
+    followed = 0
+    fell = 0.0
+    step = 0
+    while step < 240 {
+        now = (step as float) * STEP
+        if now >= pushed_at {
+            rb = physics.rigidbody_of(host.crate)
+            v = physics.rigidbody_velocity(rb)
+            physics.rigidbody_set_velocity(rb, core.vec3(2.0, v.y, 0.0))
+        }
+        k = 0
+        while k < CLIENTS {
+            s = (clients as ptr[])[k] as *Side
+            if net.my_player(s.session) != null { net.player_input(s.session, core.vec3(0.0, 0.0, 0.0), 0.0, now) }
+            k = k + 1
+        }
+        net.player_input(host.session, core.vec3(0.0, 0.0, 0.0), 0.0, now)
+        engine.engine_update(host.world, STEP)
+        net.step(host.session, now)
+        (host_x as float[])[step] = behaviour.object_position(host.crate).x
+        k = 0
+        while k < CLIENTS {
+            s = (clients as ptr[])[k] as *Side
+            engine.engine_update(s.world, STEP)
+            net.step(s.session, now)
+            k = k + 1
+        }
+        // The client's crate, drawn where the session puts it, against
+        // where the host had it at the client's view time, between the two
+        // steps around that moment.
+        view = net.view_time(one.session, now)
+        if view > pushed_at + 0.3 {
+            at = behaviour.object_position(one.crate)
+            back = (view / STEP) as int
+            t = view / STEP - (back as float)
+            xs = host_x as float[]
+            want = xs[back] + (xs[back + 1] - xs[back]) * t
+            off = at.x - want
+            if off < 0.0 { off = 0.0 - off }
+            if off > worst_follow { worst_follow = off }
+            followed = followed + 1
+            if at.y < 0.4 { fell = fell + 1.0 }
+        }
+        step = step + 1
+    }
+    c1 = net.client_id(one.session)
+    c2 = net.client_id(two.session)
+    println("  the crate's script: fixed_update ${host.crate_counts.fixed} times on the host, ${one.crate_counts.fixed} and ${two.crate_counts.fixed} on the clients; update ${host.crate_counts.updates}, ${one.crate_counts.updates} and ${two.crate_counts.updates}")
+    check("a script's fixed_update runs on the host for what the host owns, and on no client; its update everywhere",
+          host.crate_counts.fixed > 200 && one.crate_counts.fixed == 0 && two.crate_counts.fixed == 0 &&
+          one.crate_counts.updates > 200 && two.crate_counts.updates > 200 && behaviour.object_remote(one.crate) && !behaviour.object_remote(host.crate))
+    println("  client ${c1}'s player's script: fixed_update ${player_fixed(one, c1)} times on its own client, ${player_fixed(two, c1)} on the other, ${player_fixed(host, c1)} on the host; the host's player's ${player_fixed(host, 0)} on the host, ${player_fixed(one, 0)} and ${player_fixed(two, 0)} on the clients")
+    check("a player's fixed_update runs where its commands are: its own client's, or the host's own on the host",
+          player_fixed(one, c1) > 100 && player_fixed(two, c1) == 0 && player_fixed(host, c1) == 0 &&
+          player_fixed(two, c2) > 100 && player_fixed(one, c2) == 0 && player_fixed(host, c2) == 0 &&
+          player_fixed(host, 0) > 100 && player_fixed(one, 0) == 0 && player_fixed(two, 0) == 0 &&
+          player_updates(one, c2) > 100)
+    rb = physics.rigidbody_of(one.crate)
+    kind = physics.rigidbody_kind(rb)
+    println("  the client's crate: kinematic ${kind == physics.KINEMATIC}; drawn at most ${worst_follow * 1000.0} mm off the host's slide over ${followed} steps, below the ground on ${fell}")
+    check("a body the host owns is kinematic on a client, following the host's", kind == physics.KINEMATIC && followed > 100 && worst_follow < 0.02 && fell == 0.0)
+    net.release(one.session)
+    check("and dynamic again, simulated here, once the session gives it back",
+          physics.rigidbody_kind(rb) == physics.DYNAMIC && !behaviour.object_remote(one.crate))
+    k = 0
+    while k < CLIENTS {
+        side_free((clients as ptr[])[k] as *Side)
+        k = k + 1
+    }
+    free(clients)
+    free(host_x)
+    side_free(host)
+    net.hub_free(hub)
+}
+
+// --- a burst of losses ------------------------------------------------------------------------------
+
+// An object round a circle of 4 m at 1.5 radians a second (6 m/s), over the
+// loopback's 50 ms, and every snapshot lost for 400 ms from 1.5 s: the
+// client's view runs past the newest and holds the object there. What the
+// client draws, step by step: the most it moved in one step after the
+// burst, and how far it was drawn from where the host had it at the view
+// time, 0.8 s after the snapshots came again: eight of the smoothing's
+// time constants, the error e^-8 of what it was.
+struct Burst {
+    largest_step: float              // the most the drawing moved in one step, the burst's
+    steady_step: float               // and before the burst, moving as it does
+    settled_off: float               // drawn off the host's path, 0.8 s after the snapshots came again
+}
+
+burst_run(smoothing: float) -> *Burst {
+    result = calloc(1, sizeof(Burst)) as *Burst
+    hub = net.hub_new()
+    net.hub_set_conditions(hub, 0.05, 0.0, 0.0)
+    host = net.host_loopback(hub)
+    client = net.join_loopback(hub)
+    net.set_smoothing(client, smoothing)
+    ho = behaviour.object_new("runner")
+    co = behaviour.object_new("runner")
+    net.networked(host, ho)
+    net.networked(client, co)
+    was = core.vec3(0.0, 0.0, 0.0)
+    drawn_before = false
+    resumed = 0.0 - 1.0
+    step = 0
+    while step < 240 {
+        now = (step as float) * STEP
+        net.hub_set_conditions(hub, 0.05, 0.0, 0.0)
+        if now >= 1.5 && now < 1.9 { net.hub_set_conditions(hub, 0.05, 0.0, 1.0) }
+        behaviour.object_set_position(ho, core.vec3(4.0 * cos(now * 1.5), 0.0, 4.0 * sin(now * 1.5)))
+        net.step(host, now)
+        net.step(client, now)
+        at = behaviour.object_position(co)
+        if net.known(client, 1) {
+            if drawn_before {
+                moved = core.v3_len(core.v3_sub(at, was))
+                if now > 1.0 && now < 1.5 && moved > result.steady_step { result.steady_step = moved }
+                if now >= 1.5 && moved > result.largest_step { result.largest_step = moved }
+            }
+            was = at
+            drawn_before = true
+        }
+        // The first step the snapshots come again: the burst's last lost
+        // one was sent before 1.9 s, the next lands 50 ms after.
+        if resumed < 0.0 && now >= 1.95 { resumed = now }
+        if resumed > 0.0 && now >= resumed + 0.8 && result.settled_off == 0.0 {
+            view = net.view_time(client, now)
+            want = core.vec3(4.0 * cos(view * 1.5), 0.0, 4.0 * sin(view * 1.5))
+            result.settled_off = core.v3_len(core.v3_sub(at, want))
+            if result.settled_off == 0.0 { result.settled_off = 0.0000001 }
+        }
+        step = step + 1
+    }
+    net.net_free(client)
+    net.net_free(host)
+    net.hub_free(hub)
+    behaviour.object_free(ho)
+    behaviour.object_free(co)
+    return result
+}
+
+burst() {
+    println("burst: an object round a circle at 6 m/s, over the loopback's 50 ms, every snapshot lost for 400 ms")
+    snapped = burst_run(0.0)
+    smooth = burst_run(0.1)
+    println("  a step's move before the burst ${smooth.steady_step * 1000.0} mm; after it, the largest ${snapped.largest_step * 1000.0} mm with the smoothing off, ${smooth.largest_step * 1000.0} mm with it (0.1 s)")
+    check("with no smoothing, the object snaps when the snapshots come again", snapped.largest_step > 1.0)
+    check("smoothed, it is drawn on from where it stood: no step a third of that snap, nor more than a fifth of what it had to make up",
+          smooth.largest_step * 3.0 < snapped.largest_step && smooth.largest_step < smooth.steady_step + snapped.largest_step * 0.2)
+    println("  0.8 s after the snapshots came again, drawn ${smooth.settled_off * 1000.0} mm off where the host had it at the view time (${snapped.settled_off * 1000.0} mm with no smoothing)")
+    check("and its error has fallen away within 0.8 s: drawn within 2 mm of the host's", smooth.settled_off < 0.002 && snapped.settled_off < 0.002)
+    free(snapped as ptr)
+    free(smooth as ptr)
+}
+
+main() {
+    authority()
+    burst()
+    check("every session made is let go", net.alive() == 0)
+    if g_failures == 0 {
+        println("authority: all checks passed (${g_checks})")
+    } else {
+        println("authority: ${g_failures} failure(s) of ${g_checks}")
+    }
+}
