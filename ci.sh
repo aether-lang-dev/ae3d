@@ -948,8 +948,8 @@ if [ -n "${CI:-}" ]; then
     export AE3D_BENCH_BLOCKS="${AE3D_BENCH_BLOCKS:-1}"
 fi
 
-fi
 if [ -n "$editor_scale_was" ]; then export AE3D_RENDER_SCALE="$editor_scale_was"; else unset AE3D_RENDER_SCALE; fi
+fi
 
 if in_tier full; then
 step "benchmarks"
