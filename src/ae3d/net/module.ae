@@ -65,7 +65,7 @@ import ae3d.physics
 exports (
     Net, NetObject, LoopHub,
     ROLE_HOST, ROLE_CLIENT,
-    hub_new, hub_free, hub_set_conditions,
+    hub_new, hub_free, hub_set_conditions, hub_set_reliable_delay,
     host_loopback, join_loopback, host_tcp, join_tcp, tcp_port,
     host_udp, join_udp, udp_port, set_conditions, set_timeout, last_heard, flush,
     networked, networked_count, step, attach, connected, disconnected, hosting, client_id, peer_count, view_time,
@@ -193,7 +193,7 @@ const MSG_PONG = 12
 const SNAP_OWN = 1                   // the client's own player follows
 const SNAP_PREVIOUS = 2              // the previous tick's time follows
 const SNAP_WANTED = 4                // the oldest command the host lacks follows
-const SNAP_GONE = 8                  // the last fields of objects destroyed since the base follow the records
+const SNAP_GONE = 8                  // the objects destroyed since the base follow the records: when, where, their last fields
 
 // A record's fields.
 const FIELD_X = 1
@@ -485,6 +485,7 @@ struct LoopHub {
     latency: float                   // seconds, one way
     jitter: float                    // up to this much more, uniformly
     loss: float                      // the share of unreliable parcels dropped
+    reliable_delay: float            // seconds more a reliable parcel takes: its lost sends resent
     seed: long
     last_reliable: ptr               // float[HUB_ENDPOINTS]: when the last reliable parcel to each lands
     joining: ptr                     // int[HUB_ENDPOINTS]: endpoints the host has not seen yet
@@ -525,6 +526,15 @@ hub_set_conditions(h: *LoopHub, latency: float, jitter: float, loss: float) {
     h.loss = loss
 }
 
+// A reliable message never goes missing on the hub, but over UDP one lost
+// on the way lands only when its resend does, a round trip timeout later,
+// grown by half for each resend lost again. This makes every reliable
+// parcel from now on that much later, so a test can hold the engine to
+// what it does while one is on its way.
+hub_set_reliable_delay(h: *LoopHub, seconds: float) {
+    h.reliable_delay = seconds
+}
+
 // A uniform number in [0, 1) from the hub's own generator: the same
 // conditions give the same run.
 hub_random(h: *LoopHub) -> float {
@@ -538,6 +548,7 @@ hub_post(h: *LoopHub, from: int, to: int, reliable: bool, data: ptr, length: int
     if !reliable && h.loss > 0.0 && hub_random(h) < h.loss { return }
     lands = now + h.latency
     if h.jitter > 0.0 { lands = lands + h.jitter * hub_random(h) }
+    if reliable { lands = lands + h.reliable_delay }
     ends = h.last_reliable as float[]
     if reliable && to >= 0 && to < HUB_ENDPOINTS {
         if lands < ends[to] { lands = ends[to] }
@@ -671,9 +682,10 @@ struct Snapshot {
     fcapacity: int
     fknown: ptr                      // int[capacity]
     // Client: the tick of the record that last brought an object's fields.
-    // A snapshot cannot say an object is gone, so after the host destroys
-    // one its fields are the base's again, older than the ones applied:
-    // only what is at least as new as those is written.
+    // A snapshot names an object only while the host still holds it back
+    // in its gone list, so after that its fields are the base's again,
+    // older than the ones applied: only what is at least as new as those is
+    // written.
     fticks: ptr                      // int[capacity]
 }
 
@@ -775,7 +787,9 @@ struct NetLayout {
 struct NetGone {
     id: int
     tick: int                        // the first tick without it
-    lay: *NetLayout                  // its layout, at 0
+    went: float                      // the host's time it went
+    place: ptr                       // float[7]: where it was, x y z and its turn
+    lay: *NetLayout                  // its layout, at 0; null where it had no fields
     words: ptr                       // long[lay.words]
 }
 
@@ -911,6 +925,14 @@ struct Net {
     field_words: int
     spare_words: ptr                 // list of *NetLayout let go, whose words a new one of their size takes
     gone: ptr                        // host: list of *NetGone some client has not had
+    free_ids: ptr                    // host: int[free_capacity], ids no client can still hold, ascending
+    free_count: int
+    free_capacity: int
+    // Client: the tick of the snapshot that first said the object at each
+    // index went (0 for none): the ones after it no longer carry its state
+    // forward, and a record for the index after it is a new object's.
+    gone_at: ptr                     // int[gone_capacity]
+    gone_capacity: int
     // Client: the view it sends (#487), what it last sent, and when.
     view_set: bool
     view_eye: Vec3
@@ -1860,7 +1882,9 @@ bind_fields(n: *Net, no: *NetObject) {
         }
         i = i + 1
     }
-    if bound && n.role == ROLE_CLIENT {
+    // Not from a snapshot that still carries an old object at this id: its
+    // own come in its first record.
+    if bound && n.role == ROLE_CLIENT && gone_tick(n, no.id - 1) == 0 {
         shot = ring_find(n.received, n.newest_tick)
         if shot != null { apply_object_fields(n, no, shot, n.last_step) }
     }
@@ -1929,10 +1953,10 @@ place_layout(n: *Net, lay: *NetLayout) {
     n.field_words = n.field_words + lay.words
 }
 
-// An object gone for good (its id is never given again): its fields let
-// go, and its words kept for the next layout of their size. A snapshot
-// that still has them marks them known under the old id, which nothing
-// asks again; the new object's are unknown in it until told.
+// An object gone: its fields let go, and its words kept for the next
+// layout of their size. The snapshots after the one that said it went no
+// longer carry them forward (gone_tick), so an object given its id again
+// (#500) is unknown in them until its own first record.
 drop_fields(n: *Net, id: int) {
     i = 0
     while i < list.size(n.replicated) {
@@ -3086,9 +3110,10 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
     // out of the budget's room from the start).
     send_previous = base != null && base.tick < n.tick - 1 && n.previous.used
     lacked = wanted_command(p)
-    // The destroyed objects' last fields it carries: each its id, its
-    // block's length, and the block whole (a client that no longer has the
-    // object's layout steps over it).
+    // The objects destroyed that the client may not have heard of: each its
+    // id, the host's time it went and where (as the destroy message says
+    // them), its fields block's length and the block whole (a client that no
+    // longer has the object's layout steps over it).
     rec = n.measured
     gone = 0
     gone_bytes = 0
@@ -3097,9 +3122,9 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
         g = list.get_raw(n.gone, k) as *NetGone
         if gone_due(g, base) {
             rec.length = 0
-            write_fields(rec, g.lay, g.words, g.words, true)
+            if g.lay != null { write_fields(rec, g.lay, g.words, g.words, true) }
             gone = gone + 1
-            gone_bytes = gone_bytes + varint_size(g.id as long) + varint_size(rec.length as long) + rec.length
+            gone_bytes = gone_bytes + varint_size(g.id as long) + 32 + varint_size(rec.length as long) + rec.length
         }
         k = k + 1
     }
@@ -3239,8 +3264,15 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
             g = list.get_raw(n.gone, k) as *NetGone
             if gone_due(g, base) {
                 rec.length = 0
-                write_fields(rec, g.lay, g.words, g.words, true)
+                if g.lay != null { write_fields(rec, g.lay, g.words, g.words, true) }
                 put_varint(b, g.id as long)
+                put_f32(b, g.went)
+                place = g.place as float[]
+                q = 0
+                while q < 7 {
+                    put_f32(b, place[q])
+                    q = q + 1
+                }
                 put_varint(b, rec.length as long)
                 buf_reserve(b, rec.length)
                 memcpy(b.data + b.length, rec.data, rec.length as long)
@@ -3295,6 +3327,12 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
         bt = base.fticks as int[]
         i = 0
         while i < count && i < base.count {
+            // Past the snapshot that said the object here went, the base's
+            // state and fields for it are the old object's.
+            if gone_tick(n, i) > 0 && tick > gone_tick(n, i) {
+                i = i + 1
+                continue
+            }
             if bk[i] == 1 {
                 at = i * STATE
                 states[at] = bs[at]
@@ -3351,6 +3389,15 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
         whole = (fields & FIELD_WHOLE) != 0
         moved = (fields & (FIELD_X | FIELD_Y | FIELD_Z | FIELD_ROTATION | FIELD_WHOLE)) != 0
         if moved && !whole && known[index] != 1 { r.ok = false ; break }
+        // A record for an index past the snapshot that said its object went
+        // is a new object's, at an id the host gave again (#500): an old one
+        // still leaving here is finished, so it takes none of the new one's
+        // samples or fields, and the new one's layout is learned afresh.
+        if gone_tick(n, index) > 0 && tick > gone_tick(n, index) {
+            old = object_by_id(n, index + 1)
+            if old != null && old.leaving { forget(n, old) }
+            set_gone_tick(n, index, 0)
+        }
         at = index * STATE
         k = 0
         while k < 3 {
@@ -3376,17 +3423,35 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
         carried_fields[j] = fields
         j = j + 1
     }
-    // The last fields of objects the host destroyed: as a record's, where
-    // this side still has the object's layout; stepped over where not.
+    // The objects the host destroyed: each leaves as the destroy message
+    // would have it leave, if that has not arrived yet (it is reliable, and
+    // resent late under loss), and its last fields are read as a record's,
+    // where this side still has its layout; stepped over where not.
+    gone_values = null as ptr
     if (flags & SNAP_GONE) != 0 && r.ok {
         gone = (get_varint(r)) as int
+        gone_values = calloc(7, 8)
+        gv = gone_values as float[]
         g = 0
         while g < gone && r.ok {
             index = ((get_varint(r)) as int) - 1
+            went = get_f32(r)
+            q = 0
+            while q < 7 {
+                gv[q] = get_f32(r)
+                q = q + 1
+            }
             length = (get_varint(r)) as int
             if !r.ok || index < 0 || index >= count || length < 0 || r.at + length > r.length { r.ok = false ; break }
+            leaving = object_by_id(n, index + 1)
+            if leaving != null && leaving.kind > 0 && !leaving.leaving { leave_at(leaving, went, gv) }
+            // Its place is not known from here on; its last fields are, in
+            // the first snapshot that says it went, and not after.
+            known[index] = 0
+            first = gone_tick(n, index) == 0 || gone_tick(n, index) == tick
+            if gone_tick(n, index) == 0 { set_gone_tick(n, index, tick) }
             lay = layout_at(n, index + 1)
-            if lay != null && lay.at >= 0 {
+            if first && length > 0 && lay != null && lay.at >= 0 {
                 block = NetReader { data: r.data, length: r.at + length, at: r.at, ok: true }
                 if !read_fields_wire(n, &block, shot, index, true) { r.ok = false ; break }
                 fticks[index] = tick
@@ -3395,6 +3460,7 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
             g = g + 1
         }
     }
+    if gone_values != null { free(gone_values) }
     if !r.ok {
         shot.used = false
         return
@@ -4709,8 +4775,11 @@ take_event(n: *Net, sender: int, r: *NetReader, now: float) {
 // driven in) is known by the id the host gives it, the next after every id
 // so far, and by its kind: the host tells every client the id, the kind
 // and where it is, and each client makes its own with the kind's maker.
-// An id is never given again, so a snapshot or a delta that still names a
-// destroyed object finds nothing there.
+// An id is given again once every client has acknowledged a snapshot
+// after its object's destroy (#500): none can still hold a base with the
+// old object in it, and each has dropped it from the snapshots it takes
+// since. The lowest free id goes first, so the snapshots' object count
+// stays as large as the objects alive at once.
 
 // A kind of object the host creates: `maker(context, id)` returns a new
 // game object for net id `id` (the session places it), and
@@ -4749,7 +4818,7 @@ create_object(n: *Net, name: string, position: Vec3, rotation: Quat, now: float)
         return null
     }
     k = list.get_raw(n.kinds, kind - 1) as *NetKind
-    id = list.size(n.objects) + 1
+    id = next_id(n)
     maker = k.maker
     o = maker(k.context, id)
     if o == null { return null }
@@ -4800,19 +4869,33 @@ destroy_object(n: *Net, o: *GameObject, now: float) {
         if p.welcomed { deliver(n, p, true, out.data, out.length, now) }
         i = i + 1
     }
-    keep_gone(n, no, now)
+    keep_gone(n, no, now, where, turn)
     forget(n, no)
 }
 
-// Host: a destroyed object's fields as they are now, for the snapshots to
-// carry: a change only a lost snapshot carried, or one made since the last
-// tick, would otherwise never reach a client.
-keep_gone(n: *Net, no: *NetObject, now: float) {
-    lay = layout_at(n, no.id)
-    if lay == null || lay.at < 0 || lay.count == 0 || no.fields == null { return }
+// Host: a destroyed object as it went -- when, where, and its fields as
+// they are now -- for the snapshots to carry. The destroy message is
+// reliable, and under loss its resends come late: a client held an object
+// for over a second after the host let it go (#515). And a change only a
+// lost snapshot carried, or one made since the last tick, would otherwise
+// never reach a client (#513).
+keep_gone(n: *Net, no: *NetObject, now: float, where: Vec3, turn: Quat) {
     g = calloc(1, sizeof(NetGone)) as *NetGone
     g.id = no.id
     g.tick = n.tick + 1
+    g.went = now
+    g.place = calloc(7, 8)
+    place = g.place as float[]
+    place[0] = where.x
+    place[1] = where.y
+    place[2] = where.z
+    place[3] = turn.x
+    place[4] = turn.y
+    place[5] = turn.z
+    place[6] = turn.w
+    list.add_raw(n.gone, g as ptr)
+    lay = layout_at(n, no.id)
+    if lay == null || lay.at < 0 || lay.count == 0 || no.fields == null { return }
     g.lay = calloc(1, sizeof(NetLayout)) as *NetLayout
     g.lay.count = lay.count
     g.lay.at = 0
@@ -4829,12 +4912,12 @@ keep_gone(n: *Net, no: *NetObject, now: float) {
     g.words = calloc(lay.words, 8)
     memcpy(g.words, fields_now.fvalues + lay.at * 8, (lay.words * 8) as long)
     snapshot_free(fields_now)
-    list.add_raw(n.gone, g as ptr)
 }
 
 gone_free(g: *NetGone) {
-    layout_free(g.lay)
-    free(g.words)
+    if g.lay != null { layout_free(g.lay) }
+    if g.words != null { free(g.words) }
+    free(g.place)
     free(g as ptr)
 }
 
@@ -4859,12 +4942,68 @@ drop_gone(n: *Net) {
             i = i + 1
         }
         if had {
+            free_id(n, g.id)
             gone_free(g)
             list.remove(n.gone, k)
         } else {
             k = k + 1
         }
     }
+}
+
+// Host: an id given back, kept in order so the lowest is given first --
+// the snapshots' object count and every per-object array stay as small as
+// the objects alive at once (#500).
+free_id(n: *Net, id: int) {
+    if n.free_count >= n.free_capacity {
+        wanted = n.free_capacity * 2
+        if wanted < 16 { wanted = 16 }
+        n.free_ids = grown(n.free_ids, n.free_capacity, wanted, 4)
+        n.free_capacity = wanted
+    }
+    ids = n.free_ids as int[]
+    at = n.free_count
+    while at > 0 && ids[at - 1] > id {
+        ids[at] = ids[at - 1]
+        at = at - 1
+    }
+    ids[at] = id
+    n.free_count = n.free_count + 1
+}
+
+// Host: the id a created object takes: the lowest one given back, or the
+// next after every id there has been.
+next_id(n: *Net) -> int {
+    if n.free_count > 0 {
+        ids = n.free_ids as int[]
+        id = ids[0]
+        k = 1
+        while k < n.free_count {
+            ids[k - 1] = ids[k]
+            k = k + 1
+        }
+        n.free_count = n.free_count - 1
+        return id
+    }
+    return list.size(n.objects) + 1
+}
+
+// Client: the gone tick of index `i`, 0 for none.
+gone_tick(n: *Net, i: int) -> int {
+    if i < 0 || i >= n.gone_capacity { return 0 }
+    return (n.gone_at as int[])[i]
+}
+
+set_gone_tick(n: *Net, i: int, tick: int) {
+    if i < 0 { return }
+    if i >= n.gone_capacity {
+        wanted = n.gone_capacity * 2
+        if wanted < 64 { wanted = 64 }
+        while wanted <= i { wanted = wanted * 2 }
+        n.gone_at = grown(n.gone_at, n.gone_capacity, wanted, 4)
+        n.gone_capacity = wanted
+    }
+    (n.gone_at as int[])[i] = tick
 }
 
 // The game object at a net id, or null (none, or destroyed).
@@ -4928,6 +5067,10 @@ client_create(n: *Net, r: *NetReader) {
         v[k] = get_f32(r)
         k = k + 1
     }
+    // An id the host gave again while the old object is still leaving here
+    // (its moment not reached): the old one is finished first (#500).
+    old = object_by_id(n, id)
+    if r.ok && old != null && old.leaving { forget(n, old) }
     if r.ok && kind >= 1 && kind <= list.size(n.kinds) && object_by_id(n, id) == null {
         nk = list.get_raw(n.kinds, kind - 1) as *NetKind
         maker = nk.maker
@@ -4944,10 +5087,8 @@ client_create(n: *Net, r: *NetReader) {
     free(values)
 }
 
-// The host destroyed an object: its last place is its last sample. A
-// snapshot cannot say an object is gone (one it leaves out is as it was),
-// so any sample from after that moment is the old state carried on and is
-// dropped. The object goes when this side's view reaches the moment.
+// The host destroyed an object, told by the reliable message or by the
+// snapshots, whichever arrives first.
 client_destroy(n: *Net, r: *NetReader) {
     id = get_u32(r)
     host_time = get_f32(r)
@@ -4959,17 +5100,24 @@ client_destroy(n: *Net, r: *NetReader) {
         k = k + 1
     }
     no = object_by_id(n, id)
-    if r.ok && no != null && no.kind > 0 && !no.leaving {
-        h = no.history as float[]
-        while no.count > 0 && h[no.newest * SAMPLE] >= host_time {
-            no.newest = (no.newest - 1 + HISTORY) % HISTORY
-            no.count = no.count - 1
-        }
-        add_sample(no, host_time, v, 0)
-        no.leaving = true
-        no.leaves = host_time
-    }
+    if r.ok && no != null && no.kind > 0 && !no.leaving { leave_at(no, host_time, v) }
     free(values)
+}
+
+// An object the host destroyed at `host_time`, at the place and turn in
+// `v`: that place is its last sample. A record left out of a snapshot says
+// the object is as it was, so any sample from after that moment is the old
+// state carried on and is dropped. It goes when this side's view reaches
+// the moment.
+leave_at(no: *NetObject, host_time: float, v: float[]) {
+    h = no.history as float[]
+    while no.count > 0 && h[no.newest * SAMPLE] >= host_time {
+        no.newest = (no.newest - 1 + HISTORY) % HISTORY
+        no.count = no.count - 1
+    }
+    add_sample(no, host_time, v, 0)
+    no.leaving = true
+    no.leaves = host_time
 }
 
 // The leaving objects whose moment this side's view has reached, let go.
@@ -5608,6 +5756,8 @@ net_free(n: *Net) {
         i = i + 1
     }
     list.free(n.gone)
+    if n.free_ids != null { free(n.free_ids) }
+    if n.gone_at != null { free(n.gone_at) }
     i = 0
     while i < list.size(g_sessions) {
         if list.get_raw(g_sessions, i) == n as ptr {

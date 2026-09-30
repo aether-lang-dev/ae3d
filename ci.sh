@@ -815,6 +815,15 @@ else
 fi
 
 UI_ROOT="${AETHER_UI_ROOT:-$ROOT/../aether-ui}"
+# GTK draws its window through GL, GLES first. Mesa's software GLES has no
+# half-float vertex data, so GTK's GL renderer did not start on a runner and
+# every frame of the editor's window was painted by cairo on the CPU: 600 to
+# 850 ms a frame, the editor at one frame a second, and its step fourteen
+# minutes of a Linux run (#516). llvmpipe's desktop GL has what the renderer
+# needs; GTK 4.14 takes it when asked.
+if [ "$(uname -s)" = "Linux" ]; then
+    export GDK_DEBUG="${GDK_DEBUG:+$GDK_DEBUG,}gl-prefer-gl"
+fi
 if [ ! -f "$UI_ROOT/ui/module.ae" ]; then
     skip "ae3d_editor" "aether-ui not found at $UI_ROOT"
 elif ! have_display; then
@@ -871,11 +880,16 @@ else
             fail "ae3d_editor (driver, build)"
             sed 's/^/        /' /tmp/ae3d_driver_build.log | head -12
         else
-            # Both backends. The report checks have always run on each, but
-            # nothing had ever pressed a widget on the Vulkan one, and the
-            # editor's controls reach the renderer through a vtable that only
-            # a real click exercises.
-            for driver_backend in opengl vulkan; do
+            # Both backends in the local gate. The report checks have always
+            # run on each, but nothing had ever pressed a widget on the Vulkan
+            # one, and the editor's controls reach the renderer through a
+            # vtable that only a real click exercises. A runner drives the
+            # default backend, Vulkan, alone: each drive is five minutes under
+            # a software rasteriser (#511), and the bounded runs above still
+            # hold both backends there.
+            driver_backends="opengl vulkan"
+            [ "$TIER" = all ] || driver_backends="vulkan"
+            for driver_backend in $driver_backends; do
                 driver_log="$(mktemp)"
                 # A backstop, as the editor's own runs have: an editor that
                 # stops answering fails this step with its log, rather than
