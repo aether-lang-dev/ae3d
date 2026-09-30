@@ -56,3 +56,17 @@
   kind has no constructor and Add Component never offers it. The editor's
   FIGURE section -- eight clip buttons, Loop, the speed and time rows and
   their undo -- is gone.
+- **Natural Motion** is a component kind (`components.natural_kind`,
+  `attach_natural`, `natural_of`) owning the motion record the scene file
+  writes with a figure: its mode by the file's name, whether it protects
+  itself falling, its strength and when it gets up. A figure without it has
+  no component; Add Component gives one. The simulation, the save and the
+  load read it off the figure's object. The editor's MOTION section, its
+  rows, undo slots and the figure row's own copy of the record are gone.
+- With every per-object setting a component, the editor's row check runs
+  the rows it has left (the selection's and the view's) without selecting
+  anything.
+- aether-lang-dev/aether#2320: `offsetof(T, f)` inside a module that also
+  has a function `f` names the function -- why Natural Motion lives in
+  ae3d.components beside Physics Body (both views over the scene's records)
+  rather than in ae3d.motion, whose getters share the fields' names.

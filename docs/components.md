@@ -102,6 +102,7 @@ that position agree without anything syncing them.
 | Terrain | the terrain's voxel world | biome, seed, style (blocks or smooth); each write fills and draws the world again on its model |
 | Physics Body | the body record the scene file writes | body (static, kinematic, dynamic, character), collider (box, sphere, capsule, hull, mesh), friction, bounce, density; no body is no component |
 | Figure | the animated figure (ae3d.figure) | clip (by the file's name; none stops it), loop, speed, time (a share of the clip); made from its file, never added from a menu |
+| Natural Motion | the motion record the scene file writes with the figure | mode (animated, powered, limp), protective, strength, get up after; no natural motion is no component |
 | Environment | the engine | sky (an image, or none), sky color, sun by time, time of day, clouds, cloud wind, overcast and its color, fog, fog start, end, density and color |
 | Rendering | the engine | FXAA, bloom and its threshold and intensity, shadows and their distance, reflections and their height and strength, ambient occlusion and its radius and intensity, temporal antialiasing |
 
