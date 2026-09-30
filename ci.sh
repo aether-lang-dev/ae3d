@@ -975,7 +975,9 @@ check_editor_run() {
     snapshot="$(mktemp -t ae3d_shot.XXXXXX).png"
     log="$(mktemp)"
     # A bounded run ends itself; the timeout is only a backstop so a hang
-    # fails the step rather than blocking it.
+    # fails the step rather than blocking it. Under Xvfb and llvmpipe a run
+    # draws at one frame a second and is ready after 13 to 33 seconds, by
+    # the runner: 90 seconds killed a run that was still drawing (#514).
     # Never onto the desktop. A run of this file opened an editor window per
     # backend per scene and took the keyboard with it, which makes it unusable
     # beside anything else. The window still exists and still answers the test
@@ -993,7 +995,7 @@ check_editor_run() {
     AE3D_EDITOR_SCENE="$editor_scene" \
     AE3D_EDITOR_SNAPSHOT="$snapshot" \
     AE3D_EDITOR_REPORT="$report" \
-        timeout 90 ./build/ae3d_editor >"$log" 2>&1
+        timeout 180 ./build/ae3d_editor >"$log" 2>&1
     status=$?
     if grep -q 'no Vulkan driver' "$log"; then
         skip "$name" "$(sed -n 's/.*no Vulkan driver (\(.*\)),.*/\1/p' "$log" | head -1)"
