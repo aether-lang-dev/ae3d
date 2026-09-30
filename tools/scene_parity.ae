@@ -1,0 +1,490 @@
+// One scene drawn by both renderers at the same moment, compared region by
+// region (#494).
+//
+//     AE3D_TICK=60 AE3D_HOLD=90 AE3D_AGENT=7931 AE3D_API=opengl ./build/zombie_city &
+//     AE3D_TICK=60 AE3D_HOLD=90 AE3D_AGENT=7932 AE3D_API=vulkan ./build/zombie_city &
+//     ./build/scene_parity 7931 7932 [--hold 90] [--name "zombie_city, view 0"]
+//
+// The backend parity suite holds OpenGL and Vulkan to each other on test
+// scenes of a few models. This holds them to each other on the scenes a
+// person looks at, which is where zombie_city came to draw garbage on
+// OpenGL with every suite passing (3397101, kept as this check's
+// reproduction).
+//
+// A moment both renderers can draw: each scene runs a fixed tick
+// (AE3D_TICK: every frame advances the world by 1/60 s whatever the wall
+// clock did, and the renderers animate by the ticks, not the clock) and
+// holds at the same frame (AE3D_HOLD), so the horde, the car and the clouds
+// stand where they stand in the other. ci.sh holds at frame 90 at 640 by
+// 360 on a GPU, and at frame 12 at 320 by 180 on a runner's software
+// rasterisers; the verdict names the devices. What the two renderers do
+// not both do is turned off, by name, never silently: screen-space reflections
+// (Vulkan's alone until #491) through the channel here; the rays (Vulkan's
+// alone), the eye's adaptation (it adapts to each renderer's own meter, a
+// frame behind on one and not the other) and the temporal pass (it folds
+// in however many frames a hold happened to draw) by the scene's
+// environment, which ci.sh sets.
+//
+// The frame is read as a grid of cells (frame.grid, 32 by 18: 20 pixels a
+// cell at 640 by 360), then again with every model hidden -- the sky alone
+// -- and again with each region's models alone. A cell belongs to a region
+// where that region's models change what the sky alone shows, on either
+// renderer; the sky is where no model does; the rest is where a model is
+// drawn that no region names. Then, for every region, the mean of the
+// cells' colour difference between the two renderers, against the region's
+// tolerance; and every cell where one renderer draws a model and the other
+// shows what is behind it -- the sky, or the clear colour -- is a hole.
+//
+// Held to 3397101, the merge that drew garbage on OpenGL: every zombie_city
+// view fails there: its facades and road 17 to 55 apart (of 255), where
+// they are 0.8 at the most now, its figures 10 to 31, and 16 to 197 of its
+// 576 cells holes. zombie_street and street_drive, which that merge drew
+// right, pass on it.
+//
+// Exits 0 when every region is within its tolerance and there is no hole, 1
+// naming what differs, 2 when a scene could not be reached, 3 when a frame
+// cannot be read back on this machine (software Vulkan on a headless
+// runner), which is a skip and not a verdict.
+import std.os
+import std.json
+import std.string
+import ae3d.probe
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+const COLUMNS = 32
+const ROWS = 18
+const CELLS = 576                        // COLUMNS * ROWS
+// A cell's colour difference is the mean over red, green and blue of how
+// far apart two cells' means are, 0..255.
+//
+// A region's models make a cell theirs when they move it this far from
+// what the sky alone shows: past a region's own dither and its fog.
+const COVERS = 3.0
+// How far apart the renderers may draw a region, as the mean of its cells'
+// differences, 0..255. Each tolerance is the worst it measured and half
+// again, rounded up to a half, and never under 2 (a mean two levels apart
+// is not a difference an eye finds): a renderer drifting is caught and a
+// driver's rounding is not. The worst view of each region, measured:
+// - on a GPU (an RTX 4070 Ti; the nine views, 640 by 360, frame 90, three
+//   runs, the same to the tenth): sky 0.2, facades 0.7 and road 0.8
+//   (zombie_city view 3), figures 1.2 (street_drive), the rest 0.5;
+// - on the software rasterisers a runner has (Mesa 26.1.8's llvmpipe and
+//   lavapipe; the nine views, 320 by 180, frame 12, the city's near band
+//   12 m, two runs, the same): sky 0.6 (view 1), facades 0.8 (view 3), road
+//   1.1 (view 5), figures 0.7, the rest 0.4; and as ci.sh runs it there
+//   (the city a hundred strong, views 0, 2, 4 and 5): road 1.3 (view 5),
+//   the rest no higher.
+// So every region is held to 2 on both. What is left under it is the
+// occlusion's grain in recesses and at silhouettes, and the wet road's
+// streaks at a distance, where the two renderers' mip chains and depth
+// differ by a unit (#503); a cell of either can be 29 apart.
+// They were 2.5 to 5.3 when this check was written, and 6.4 and 14.7 on a
+// runner's Mesa: Vulkan turned every normal map inside out, and a crowd
+// sorted on the device threw no shadow from a lamp away from the origin.
+// Both are fixed; tests/test_backend_parity and tests/test_ray_shadows
+// hold them.
+const SKY_TOLERANCE = 2.0
+const FACADES_TOLERANCE = 2.0
+const ROAD_TOLERANCE = 2.0
+const FIGURES_TOLERANCE = 2.0
+const REST_TOLERANCE = 2.0
+// A hole: a cell the two renderers draw this far apart, where one draws a
+// model (its colour this far from what its sky alone shows) and the other
+// shows its own sky (within SHOWS_SKY of it), or shows the clear colour over
+// more than half the cell where the first does not. The two frames have to
+// differ there: a street whose tarmac is the shade of the clear colour
+// shows it on both renderers, and that is not a hole.
+const DRAWN = 12.0
+const SHOWS_SKY = 1.5
+const CLEAR_SHARE = 0.5
+// How long a scene may take to reach the frame it holds at.
+const REACH_SECONDS = 600
+
+const REGIONS = 4
+// And the rest: cells a model draws in on either renderer that none of the
+// named regions' models cover -- the street's props, and whatever a scene
+// adds that no pattern here names -- compared too, so nothing drawn goes
+// unjudged because nobody named it.
+const COMPARED = 5
+// A region's models, by what their names hold: the street export's objects
+// and the city's merged blocks (named for their materials), the road and
+// its paving, and what moves on it.
+const FACADES = "Street_Block|WallBrick|WallConcrete|WindowGlass|WindowLit|TrimStone|Skyline|LampGlow|LampMetal"
+const ROAD = "Street_Road|Street_Ground|Street_Kerb|Street_Path|RoadTarmac|PathPaving|Tarmac|Ground"
+const FIGURES = "Zombie_|Bystander|Car|Wheel"
+
+var g_failures = 0
+
+// --- reading a renderer -----------------------------------------------------------------------------------------
+
+struct Side {
+    probe: ptr                     // *Probe
+    port: int
+    name: string                   // the backend the scene says it draws with
+    device: string                 // and the device it draws on
+    named: bool                    // name and device are copies this side owns
+    clear: int                     // its clear colour, as RGBA packed into an int
+    full: ptr                      // float[CELLS * 4]: the frame
+    sky: ptr                       // the frame with every model hidden
+    regions: ptr                   // float[REGIONS * CELLS * 4]: each region's models alone
+}
+
+request(op: string) -> ptr {
+    r = json.obj()
+    json.object_set_raw(r, "op", json.str(op))
+    return r
+}
+
+// One request, and its answer's result copied out by `take`; the scene gone
+// ends the run as unreachable.
+ask(s: *Side, r: ptr) -> ptr {
+    answered = probe.ask(s.probe as *Probe, r)
+    json.free(r)
+    if answered == null {
+        println("scene_parity: port ${s.port} went away: ${probe.last_error()}")
+        os.exit(2)
+    }
+    return answered
+}
+
+// What the scene answers with frame.stats; null when it refused.
+stats(s: *Side) -> ptr {
+    answered = ask(s, request("frame.stats"))
+    if !probe.accepted(answered) {
+        json.free(answered)
+        return null
+    }
+    return answered
+}
+
+// Waits for the scene to hold at `hold`, and reads what it draws with and
+// its clear colour. False when it never got there.
+reach(s: *Side, hold: int) -> bool {
+    waited = 0
+    while waited < REACH_SECONDS * 10 {
+        answered = stats(s)
+        if answered != null {
+            result = probe.result(answered)
+            frame = probe.integer(result, "frame")
+            paused = probe.flag(result, "paused")
+            if paused && frame >= hold {
+                if s.named {
+                    string.free(s.name)
+                    string.free(s.device)
+                }
+                s.name = string.copy(probe.text(result, "backend"))
+                s.device = string.copy(probe.text(result, "device"))
+                s.named = true
+                clear = probe.field(result, "clear")
+                r = (json.get_number(json.array_get_raw(clear, 0)) * 255.0 + 0.5) as int
+                g = (json.get_number(json.array_get_raw(clear, 1)) * 255.0 + 0.5) as int
+                b = (json.get_number(json.array_get_raw(clear, 2)) * 255.0 + 0.5) as int
+                s.clear = (r << 24) | (g << 16) | (b << 8) | 255
+                json.free(answered)
+                if frame != hold {
+                    println("scene_parity: port ${s.port} held at frame ${frame}, not ${hold}")
+                    return false
+                }
+                return true
+            }
+            json.free(answered)
+        }
+        sleep(100)
+        waited = waited + 1
+    }
+    println("scene_parity: port ${s.port} never held at frame ${hold}")
+    return false
+}
+
+// The frame as the grid, into `into` (CELLS * 4 floats: red, green, blue,
+// and the share of the cell that is not the clear colour). False when the
+// frame cannot be read here.
+grid(s: *Side, into: ptr) -> bool {
+    r = request("frame.grid")
+    json.object_set_raw(r, "columns", json.from_int(COLUMNS as long))
+    json.object_set_raw(r, "rows", json.from_int(ROWS as long))
+    json.object_set_raw(r, "background", json.from_int(s.clear as long))
+    json.object_set_raw(r, "tolerance", json.from_int(6 as long))
+    answered = ask(s, r)
+    if !probe.accepted(answered) {
+        println("scene_parity: ${s.name}: frame.grid: ${probe.refusal(answered)}")
+        json.free(answered)
+        return false
+    }
+    cells = probe.field(probe.result(answered), "cells")
+    out = into as float[]
+    y = 0
+    while y < ROWS {
+        row = json.array_get_raw(cells, y)
+        x = 0
+        while x < COLUMNS {
+            cell = json.array_get_raw(row, x)
+            at = (y * COLUMNS + x) * 4
+            // The channel answers colours in 0..1; kept here in 0..255,
+            // the units the tolerances are written in.
+            k = 0
+            while k < 3 {
+                out[at + k] = json.get_number(json.array_get_raw(cell, k)) * 255.0
+                k = k + 1
+            }
+            out[at + 3] = json.get_number(json.array_get_raw(cell, 3))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    json.free(answered)
+    return true
+}
+
+// Only the models whose names hold one of `names` ("a|b|c"), or none.
+show_only(s: *Side, names: string, nothing: bool) {
+    r = request("scene.isolate")
+    if nothing {
+        json.object_set_raw(r, "none", json.boolean(1))
+    } else {
+        matching = json.arr()
+        parts = string.split(names, "|")
+        n = string.array_size(parts)
+        i = 0
+        while i < n {
+            json.array_add_raw(matching, json.str(string.array_get(parts, i)))
+            i = i + 1
+        }
+        string.array_free(parts)
+        json.object_set_raw(r, "matching", matching)
+    }
+    json.free(ask(s, r))
+}
+
+region_names(k: int) -> string {
+    if k == 1 { return FACADES }
+    if k == 2 { return ROAD }
+    if k == 3 { return FIGURES }
+    return ""
+}
+
+region_label(k: int) -> string {
+    if k == 0 { return "sky" }
+    if k == 1 { return "facades" }
+    if k == 2 { return "road" }
+    if k == 3 { return "figures" }
+    return "the rest"
+}
+
+region_tolerance(k: int) -> float {
+    if k == 0 { return SKY_TOLERANCE }
+    if k == 1 { return FACADES_TOLERANCE }
+    if k == 2 { return ROAD_TOLERANCE }
+    if k == 3 { return FIGURES_TOLERANCE }
+    return REST_TOLERANCE
+}
+
+// Everything this comparison reads of one renderer: the frame with the
+// reflections off, the sky alone, and each region's models alone. False
+// when a frame cannot be read.
+read_side(s: *Side) -> bool {
+    r = request("render.set")
+    json.object_set_raw(r, "ssr", json.boolean(0))
+    json.free(ask(s, r))
+    s.full = calloc(CELLS * 4, 8)
+    s.sky = calloc(CELLS * 4, 8)
+    s.regions = calloc(REGIONS * CELLS * 4, 8)
+    if !grid(s, s.full) { return false }
+    show_only(s, "", true)
+    if !grid(s, s.sky) { return false }
+    k = 1
+    while k < REGIONS {
+        show_only(s, region_names(k), false)
+        if !grid(s, s.regions + k * CELLS * 4 * 8) { return false }
+        k = k + 1
+    }
+    return true
+}
+
+// --- comparing ---------------------------------------------------------------------------------------------------
+
+// Two grids' cell `c`: the mean over red, green and blue of the difference.
+difference(a: ptr, b: ptr, c: int) -> float {
+    x = a as float[]
+    y = b as float[]
+    d = 0.0
+    k = 0
+    while k < 3 {
+        v = x[c * 4 + k] - y[c * 4 + k]
+        if v < 0.0 { v = 0.0 - v }
+        d = d + v
+        k = k + 1
+    }
+    return d / 3.0
+}
+
+// Whether region `k`'s models cover cell `c` on side `s`.
+covers(s: *Side, k: int, c: int) -> bool {
+    return difference(s.regions + k * CELLS * 4 * 8, s.sky, c) > COVERS
+}
+
+// Whether any model covers cell `c` on side `s`.
+drawn(s: *Side, c: int) -> bool { return difference(s.full, s.sky, c) > COVERS }
+
+// The cells of region `k`: its models cover them on either side; for the
+// sky, no model covers them on either; for the rest, a model is drawn there
+// on either side and no named region covers it on either.
+in_region(a: *Side, b: *Side, k: int, c: int) -> bool {
+    if k == 0 { return !drawn(a, c) && !drawn(b, c) }
+    if k < REGIONS { return covers(a, k, c) || covers(b, k, c) }
+    if !drawn(a, c) && !drawn(b, c) { return false }
+    named = 1
+    while named < REGIONS {
+        if covers(a, named, c) || covers(b, named, c) { return false }
+        named = named + 1
+    }
+    return true
+}
+
+// A cell `drawer` draws a model in where `other` shows what is behind one.
+hole(drawer: *Side, other: *Side, c: int) -> bool {
+    if difference(drawer.full, other.full, c) <= DRAWN { return false }
+    if difference(drawer.full, drawer.sky, c) <= DRAWN { return false }
+    if difference(other.full, other.sky, c) <= SHOWS_SKY { return true }
+    drawn_share = (drawer.full as float[])[c * 4 + 3]
+    other_share = (other.full as float[])[c * 4 + 3]
+    return other_share < CLEAR_SHARE && drawn_share >= CLEAR_SHARE
+}
+
+cell_name(c: int) -> string { return "(${c % COLUMNS}, ${c / COLUMNS})" }
+
+colour(grid: ptr, c: int) -> string {
+    v = grid as float[]
+    return "${fmt1(v[c * 4])},${fmt1(v[c * 4 + 1])},${fmt1(v[c * 4 + 2])}"
+}
+
+// What each renderer shows at a hole: its frame, its sky alone there, and
+// how much of the cell is not the clear colour.
+explain(s: *Side, c: int) -> string {
+    covered = (s.full as float[])[c * 4 + 3]
+    return "${s.name} ${colour(s.full, c)} over its sky ${colour(s.sky, c)} (${fmt1(covered * 100.0)}% not clear)"
+}
+
+fmt1(v: float) -> string {
+    tenths = (v * 10.0 + 0.5) as int
+    return "${tenths / 10}.${tenths % 10}"
+}
+
+compare(a: *Side, b: *Side, name: string) {
+    k = 0
+    while k < COMPARED {
+        count = 0
+        sum = 0.0
+        worst = 0.0
+        worst_cell = 0
+        c = 0
+        while c < CELLS {
+            if in_region(a, b, k, c) {
+                d = difference(a.full, b.full, c)
+                sum = sum + d
+                count = count + 1
+                if d > worst {
+                    worst = d
+                    worst_cell = c
+                }
+            }
+            c = c + 1
+        }
+        label = region_label(k)
+        if count == 0 {
+            println("  --   ${name}: ${label}: not in this view")
+        } else {
+            mean = sum / (count as float)
+            tolerance = region_tolerance(k)
+            tag = "ok  "
+            if mean > tolerance {
+                tag = "FAIL"
+                g_failures = g_failures + 1
+            }
+            println("  ${tag} ${name}: ${label}: ${fmt1(mean)} over ${count} cells (tolerance ${fmt1(tolerance)}; worst ${fmt1(worst)} at ${cell_name(worst_cell)})")
+        }
+        k = k + 1
+    }
+    holes = 0
+    c = 0
+    while c < CELLS {
+        if hole(a, b, c) || hole(b, a, c) {
+            holes = holes + 1
+            // The first few, with what each renderer shows there.
+            if holes <= 3 { println("  hole ${cell_name(c)}: ${explain(a, c)}; ${explain(b, c)}") }
+        }
+        c = c + 1
+    }
+    if holes > 0 {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}: ${holes} cells where one renderer draws a model and the other the sky or the clear colour")
+    } else {
+        println("  ok   ${name}: no holes")
+    }
+}
+
+side_open(port: int) -> *Side {
+    s = calloc(1, sizeof(Side)) as *Side
+    s.port = port
+    s.name = ""
+    s.device = ""
+    s.probe = probe.open(port) as ptr
+    if s.probe == null {
+        println("scene_parity: nothing answering on port ${port}: ${probe.last_error()}")
+        os.exit(2)
+    }
+    return s
+}
+
+side_free(s: *Side) {
+    if s.full != null { free(s.full) }
+    if s.sky != null { free(s.sky) }
+    if s.regions != null { free(s.regions) }
+    if s.named {
+        string.free(s.name)
+        string.free(s.device)
+    }
+    probe.close(s.probe as *Probe)
+    free(s as ptr)
+}
+
+main() {
+    if os.args_count() < 3 {
+        println("usage: scene_parity <port> <port> [--hold <frame>] [--name <what>]")
+        os.exit(2)
+    }
+    first_port = string.get_int(os.args_get(1))
+    second_port = string.get_int(os.args_get(2))
+    hold = 90
+    name = "scene"
+    i = 3
+    while i < os.args_count() {
+        argument = os.args_get(i)
+        if argument == "--hold" && i + 1 < os.args_count() {
+            hold = string.get_int(os.args_get(i + 1))
+            i = i + 1
+        } else if argument == "--name" && i + 1 < os.args_count() {
+            name = os.args_get(i + 1)
+            i = i + 1
+        }
+        i = i + 1
+    }
+    a = side_open(first_port)
+    b = side_open(second_port)
+    if !reach(a, hold) || !reach(b, hold) { os.exit(2) }
+    if !read_side(a) || !read_side(b) {
+        println("scene_parity: SKIP the frame cannot be read back here")
+        os.exit(3)
+    }
+    println("scene_parity: ${name}, ${a.name} (${a.device}) against ${b.name} (${b.device}) at frame ${hold}")
+    compare(a, b, name)
+    side_free(a)
+    side_free(b)
+    if g_failures > 0 {
+        println("scene_parity: ${name}: ${g_failures} failure(s)")
+        os.exit(1)
+    }
+    println("scene_parity: ${name}: the renderers agree")
+}

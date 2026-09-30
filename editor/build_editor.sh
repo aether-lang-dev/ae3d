@@ -136,7 +136,7 @@ for src in $NATIVE_SOURCES; do
     extra="$(ae3d_native_extra_flags "$src")"
     compiler="$(ae3d_native_compiler "$CC" "$src")"
     if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$newest_header" -nt "$obj" ]; then
-        "$compiler" -c $CFLAGS $FP_FLAGS $WARN $PIC -Inative $extra $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o "$obj"
+        "$compiler" -c $CFLAGS $FP_FLAGS $WARN $PIC $extra $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o "$obj"
     fi
 done
 

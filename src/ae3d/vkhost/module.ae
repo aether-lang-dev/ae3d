@@ -1,25 +1,31 @@
-// ae3d.vkhost -- what the Vulkan backend's Aether modules make on the
-// frame's device (#402): memory of a kind, and buffers the host reads or
-// writes, mapped for good. ae3d.vkmeter's readings and ae3d.vkreadback's
-// frames are copied into the first kind; ae3d.vkoverlay's vertices, and its
-// atlas on the way to the device, are written into the second.
+// ae3d.vkhost -- what the Vulkan backend's modules make on the frame's
+// device (#402): memory of a kind, buffers the host reads or writes, mapped
+// for good, and buffers the device alone reads; images and samplers; the
+// command pool, the one-off command buffers what is made outside the frame
+// is recorded into, and the upload batch; and the frame being recorded,
+// for the modules that record into it before its passes.
+// ae3d.vkmeter's readings and ae3d.vkreadback's frames are copied into the
+// first kind; ae3d.vkoverlay's vertices, its atlas on the way to the
+// device, ae3d.vktexture's texels and ae3d.vkmesh's meshes are written into
+// the second; a mesh's vertices and indices are the third.
 //
-// The device is the C backend's (native/gpu/vulkan.c); `device()` is it,
-// with contrib.vulkan.vk's commands loaded through its own entry points the
-// first time a module asks after it was made.
+// The device is ae3d.vkdevice's, which loads contrib.vulkan.vk's commands
+// through its own entry points when it makes it.
 
 import contrib.vulkan.vk
+import ae3d.vkdevice
 
 exports (
-    HostBuffer, device, memory_type, allocate, host_buffer, upload_buffer, mapped_buffer, host_buffer_free
+    HostBuffer, DeviceBuffer, device, memory_type, allocate, host_buffer, upload_buffer, mapped_buffer,
+    host_buffer_free, device_buffer, buffer_of, upload, device_buffer_free,
+    VKImage, image, image_free, sampler, start, stop, command_pool, once_begin, once_end,
+    batch_commands, batch_keep, batch_serial, flush,
+    frame_commands, frame_slot, recording, pass_open, set_frame, set_recording, set_pass_open
 )
 
-extern ae3d_vk_physical_device_handle() -> ptr
-extern ae3d_vk_device_handle() -> ptr
 extern calloc(count: int, size: int) -> ptr
 extern free(p: ptr)
-
-var g_loaded: ptr = null            // the device whose entry points contrib.vulkan.vk calls through
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
 
 // A buffer the host reads: the buffer, its memory, where it is mapped, and
 // how long it is.
@@ -30,20 +36,20 @@ struct HostBuffer {
     bytes: int
 }
 
-// The frame's device, its commands loaded.
-device() -> ptr {
-    d = ae3d_vk_device_handle()
-    if d != null && g_loaded != d {
-        vk.load_device(d)
-        g_loaded = d
-    }
-    return d
+// A buffer in the device's own memory: the buffer and its memory, both
+// null when it could not be made.
+struct DeviceBuffer {
+    buffer: ptr                      // VkBuffer
+    memory: ptr                      // VkDeviceMemory
 }
+
+// The frame's device, its commands loaded; null before it is made.
+device() -> ptr { return vkdevice.device() }
 
 // The index of a memory type `bits` allows with all of `wanted`, or -1.
 memory_type(bits: int, wanted: int) -> int {
     props = calloc(1, sizeof(VkPhysicalDeviceMemoryProperties)) as *VkPhysicalDeviceMemoryProperties
-    vk.vkGetPhysicalDeviceMemoryProperties(ae3d_vk_physical_device_handle(), props as ptr)
+    vk.vkGetPhysicalDeviceMemoryProperties(vkdevice.physical(), props as ptr)
     found = 0 - 1
     i = 0
     while i < (props.memoryTypeCount) as int && found < 0 {
@@ -58,16 +64,29 @@ memory_type(bits: int, wanted: int) -> int {
 // Memory of a kind `wanted` for what `requirements` asks; null when there
 // is none.
 allocate(requirements: *VkMemoryRequirements, wanted: int) -> ptr {
+    return allocate_addressed(requirements, wanted, false)
+}
+
+// The same, `addressed` for a buffer a shader or the rays' builder reaches
+// by its device address, which its memory has to be allocated for.
+allocate_addressed(requirements: *VkMemoryRequirements, wanted: int, addressed: bool) -> ptr {
     kind = memory_type((requirements.memoryTypeBits) as int, wanted)
     if kind < 0 { return null }
     info = calloc(1, sizeof(VkMemoryAllocateInfo)) as *VkMemoryAllocateInfo
     info.sType = vk.STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
     info.allocationSize = requirements.size
     info.memoryTypeIndex = kind
+    flags = calloc(1, sizeof(VkMemoryAllocateFlagsInfo)) as *VkMemoryAllocateFlagsInfo
+    if addressed {
+        flags.sType = vk.STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO
+        flags.flags = vk.MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+        info.pNext = flags as ptr
+    }
     out = calloc(1, 8)
     r = vk.vkAllocateMemory(device(), info as ptr, null, out)
     got = (out as ptr[])[0]
     free(out)
+    free(flags as ptr)
     free(info as ptr)
     if r != vk.SUCCESS { return null }
     return got
@@ -134,7 +153,7 @@ make_buffer(bytes: int, usage: int, cached: bool) -> *HostBuffer {
 // A host buffer gone, on the device it was made on. Nothing for null.
 host_buffer_free(b: *HostBuffer) {
     if b == null { return }
-    d = ae3d_vk_device_handle()
+    d = device()
     if d != null {
         if b.mapped != null { vk.vkUnmapMemory(d, b.memory) }
         if b.buffer != null { vk.vkDestroyBuffer(d, b.buffer, null) }
@@ -142,3 +161,344 @@ host_buffer_free(b: *HostBuffer) {
     }
     free(b as ptr)
 }
+
+// A buffer `bytes` long in device-local memory, for `usage`: what a draw
+// reads fastest, filled by a copy. Its memory is allocated for a device
+// address when the usage asks for one. Nulls when the device could not
+// make it; nothing is left behind then.
+device_buffer(bytes: int, usage: int) -> DeviceBuffer {
+    return buffer_of(bytes, usage, vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+}
+
+// A buffer `bytes` long for `usage`, in the first kind of memory with all
+// of `wanted`, allocated for a device address when the usage asks for one.
+// Nulls when there is no such memory or the device could not make it.
+buffer_of(bytes: int, usage: int, wanted: int) -> DeviceBuffer {
+    d = device()
+    ci = calloc(1, sizeof(VkBufferCreateInfo)) as *VkBufferCreateInfo
+    ci.sType = vk.STRUCTURE_TYPE_BUFFER_CREATE_INFO
+    ci.size = bytes
+    ci.usage = usage
+    ci.sharingMode = vk.SHARING_MODE_EXCLUSIVE
+    out = calloc(1, 8)
+    r = vk.vkCreateBuffer(d, ci as ptr, null, out)
+    free(ci as ptr)
+    buffer = (out as ptr[])[0]
+    free(out)
+    if r != vk.SUCCESS { return DeviceBuffer { buffer: null, memory: null } }
+    needs = calloc(1, sizeof(VkMemoryRequirements)) as *VkMemoryRequirements
+    vk.vkGetBufferMemoryRequirements(d, buffer, needs as ptr)
+    memory = allocate_addressed(needs, wanted, (usage & vk.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0)
+    free(needs as ptr)
+    if memory == null {
+        vk.vkDestroyBuffer(d, buffer, null)
+        return DeviceBuffer { buffer: null, memory: null }
+    }
+    vk.vkBindBufferMemory(d, buffer, memory, 0)
+    return DeviceBuffer { buffer: buffer, memory: memory }
+}
+
+// `bytes` bytes from `data` in a device-local buffer for `usage`, staged
+// and copied in a one-off command buffer, submitted and waited on:
+// for what is made once, outside the frame. Nulls when it could not be.
+upload(data: ptr, bytes: int, usage: int) -> DeviceBuffer {
+    staging = upload_buffer(bytes)
+    if staging == null { return DeviceBuffer { buffer: null, memory: null } }
+    memcpy(staging.mapped, data, bytes as long)
+    made = device_buffer(bytes, usage | vk.BUFFER_USAGE_TRANSFER_DST_BIT)
+    if made.buffer != null {
+        commands = once_begin()
+        region = calloc(1, sizeof(VkBufferCopy)) as *VkBufferCopy
+        region.size = bytes
+        vk.vkCmdCopyBuffer(commands, staging.buffer, made.buffer, 1, region as ptr)
+        free(region as ptr)
+        once_end(commands)
+    }
+    host_buffer_free(staging)
+    return made
+}
+
+// A device buffer gone. Nothing for nulls.
+device_buffer_free(b: DeviceBuffer) {
+    d = device()
+    if d == null { return }
+    if b.buffer != null { vk.vkDestroyBuffer(d, b.buffer, null) }
+    if b.memory != null { vk.vkFreeMemory(d, b.memory, null) }
+}
+
+// --- images ------------------------------------------------------------------------------------------------------
+
+// An image with its memory and its view; nulls when it could not be made.
+struct VKImage {
+    image: ptr                       // VkImage
+    memory: ptr                      // VkDeviceMemory
+    view: ptr                        // VkImageView
+}
+
+// A two-dimensional image of `levels` mip levels, `format`, `samples`
+// samples a pixel and `usage`, in device memory, with a view of all of it
+// through `aspect`. Nulls when it could not be made, with the reason in
+// the backend's last error; nothing is left behind then.
+image(width: int, height: int, levels: int, format: int, samples: int, usage: int, aspect: int) -> VKImage {
+    d = device()
+    out = VKImage { image: null, memory: null, view: null }
+    info = calloc(1, sizeof(VkImageCreateInfo)) as *VkImageCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_IMAGE_CREATE_INFO
+    info.imageType = vk.IMAGE_TYPE_2D
+    info.format = format
+    info.extent.width = width
+    info.extent.height = height
+    info.extent.depth = 1
+    info.mipLevels = levels
+    info.arrayLayers = 1
+    info.samples = samples
+    info.tiling = vk.IMAGE_TILING_OPTIMAL
+    info.usage = usage
+    info.sharingMode = vk.SHARING_MODE_EXCLUSIVE
+    info.initialLayout = vk.IMAGE_LAYOUT_UNDEFINED
+    cell = calloc(1, 8)
+    r = vk.vkCreateImage(d, info as ptr, null, cell)
+    free(info as ptr)
+    made = (cell as ptr[])[0]
+    free(cell)
+    if r != vk.SUCCESS {
+        vkdevice.fail("vkCreateImage failed")
+        return out
+    }
+    needs = calloc(1, sizeof(VkMemoryRequirements)) as *VkMemoryRequirements
+    vk.vkGetImageMemoryRequirements(d, made, needs as ptr)
+    memory = allocate(needs, vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+    free(needs as ptr)
+    if memory == null {
+        vk.vkDestroyImage(d, made, null)
+        vkdevice.fail("image vkAllocateMemory failed")
+        return out
+    }
+    vk.vkBindImageMemory(d, made, memory, 0)
+    view_info = calloc(1, sizeof(VkImageViewCreateInfo)) as *VkImageViewCreateInfo
+    view_info.sType = vk.STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+    view_info.image = made
+    view_info.viewType = vk.IMAGE_VIEW_TYPE_2D
+    view_info.format = format
+    view_info.subresourceRange.aspectMask = aspect
+    view_info.subresourceRange.levelCount = levels
+    view_info.subresourceRange.layerCount = 1
+    cell = calloc(1, 8)
+    r = vk.vkCreateImageView(d, view_info as ptr, null, cell)
+    free(view_info as ptr)
+    view = (cell as ptr[])[0]
+    free(cell)
+    if r != vk.SUCCESS {
+        vk.vkDestroyImage(d, made, null)
+        vk.vkFreeMemory(d, memory, null)
+        vkdevice.fail("image vkCreateImageView failed")
+        return out
+    }
+    return VKImage { image: made, memory: memory, view: view }
+}
+
+// An image gone, with its view and its memory. Nothing for nulls.
+image_free(img: VKImage) {
+    d = device()
+    if d == null { return }
+    if img.view != null { vk.vkDestroyImageView(d, img.view, null) }
+    if img.image != null { vk.vkDestroyImage(d, img.image, null) }
+    if img.memory != null { vk.vkFreeMemory(d, img.memory, null) }
+}
+
+// A sampler: `filter` both ways, `address` on every axis, `mipmap` between
+// levels, up to `max_lod`, biased by `bias`; null when it would not make.
+sampler(filter: int, address: int, mipmap: int, max_lod: float, bias: float) -> ptr {
+    info = calloc(1, sizeof(VkSamplerCreateInfo)) as *VkSamplerCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_SAMPLER_CREATE_INFO
+    info.magFilter = filter
+    info.minFilter = filter
+    info.addressModeU = address
+    info.addressModeV = address
+    info.addressModeW = address
+    info.mipmapMode = mipmap
+    info.maxLod = max_lod as f32
+    info.mipLodBias = bias as f32
+    cell = calloc(1, 8)
+    r = vk.vkCreateSampler(device(), info as ptr, null, cell)
+    free(info as ptr)
+    made = (cell as ptr[])[0]
+    free(cell)
+    if r != vk.SUCCESS { return null }
+    return made
+}
+
+// --- commands ----------------------------------------------------------------------------------------------------
+
+var g_pool: ptr = null             // the device's command pool: the frames' buffers and the one-off ones
+
+// The command pool on the device's graphics queue, its buffers resettable:
+// made once the device is up. False when it would not make.
+start() -> bool {
+    info = calloc(1, sizeof(VkCommandPoolCreateInfo)) as *VkCommandPoolCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+    info.flags = vk.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+    info.queueFamilyIndex = vkdevice.graphics_family()
+    cell = calloc(1, 8)
+    r = vk.vkCreateCommandPool(device(), info as ptr, null, cell)
+    free(info as ptr)
+    g_pool = (cell as ptr[])[0]
+    free(cell)
+    if r != vk.SUCCESS {
+        g_pool = null
+        vkdevice.fail("vkCreateCommandPool failed (VkResult ${r})")
+        return false
+    }
+    return true
+}
+
+// The pool gone, after everything recorded from it has run.
+stop() {
+    flush()
+    if g_batch_kept != null { free(g_batch_kept) }
+    if g_batch_kept_memory != null { free(g_batch_kept_memory) }
+    g_batch_kept = null
+    g_batch_kept_memory = null
+    g_batch_capacity = 0
+    if g_pool != null { vk.vkDestroyCommandPool(device(), g_pool, null) }
+    g_pool = null
+}
+
+command_pool() -> ptr { return g_pool }
+
+// A primary command buffer from the pool, begun for one submission; null
+// when none could be had.
+begun() -> ptr {
+    alloc = calloc(1, sizeof(VkCommandBufferAllocateInfo)) as *VkCommandBufferAllocateInfo
+    alloc.sType = vk.STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+    alloc.commandPool = g_pool
+    alloc.level = vk.COMMAND_BUFFER_LEVEL_PRIMARY
+    alloc.commandBufferCount = 1
+    cell = calloc(1, 8)
+    r = vk.vkAllocateCommandBuffers(device(), alloc as ptr, cell)
+    free(alloc as ptr)
+    commands = (cell as ptr[])[0]
+    free(cell)
+    if r != vk.SUCCESS { return null }
+    begin = calloc(1, sizeof(VkCommandBufferBeginInfo)) as *VkCommandBufferBeginInfo
+    begin.sType = vk.STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+    begin.flags = vk.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    vk.vkBeginCommandBuffer(commands, begin as ptr)
+    free(begin as ptr)
+    return commands
+}
+
+// `commands` ended, submitted to the graphics queue, waited for and freed.
+submitted(commands: ptr) {
+    vk.vkEndCommandBuffer(commands)
+    cell = calloc(1, 8)
+    (cell as ptr[])[0] = commands
+    submit = calloc(1, sizeof(VkSubmitInfo)) as *VkSubmitInfo
+    submit.sType = vk.STRUCTURE_TYPE_SUBMIT_INFO
+    submit.commandBufferCount = 1
+    submit.pCommandBuffers = cell
+    vk.vkQueueSubmit(vkdevice.graphics_queue(), 1, submit as ptr, null)
+    vk.vkQueueWaitIdle(vkdevice.graphics_queue())
+    vk.vkFreeCommandBuffers(device(), g_pool, 1, cell)
+    free(submit as ptr)
+    free(cell)
+}
+
+// One command buffer, submitted and waited on: what uploads and layout
+// changes outside the frame are recorded into.
+once_begin() -> ptr { return begun() }
+once_end(commands: ptr) {
+    if commands == null { return }
+    submitted(commands)
+}
+
+// --- the upload batch --------------------------------------------------------------------------------------------
+
+// Meshes' uploads and structures recorded together and submitted once
+// (flush) rather than a submit and a wait each: a scene of 250 distinct
+// meshes waited on the queue 750 times. What it reads -- the staging, the
+// structures' scratch -- is kept until it has run.
+var g_batch: ptr = null
+var g_batch_kept: ptr = null       // VkBuffer[]
+var g_batch_kept_memory: ptr = null  // VkDeviceMemory[]
+var g_batch_count = 0
+var g_batch_capacity = 0
+// Counts the flushes for as long as the process runs (a restart of the
+// backend does not reset it): staging taken before the last one is gone.
+var g_batch_serial = 0
+
+// The batch's command buffer, begun the first time something is recorded
+// into it; null when it could not be.
+batch_commands() -> ptr {
+    if g_batch == null { g_batch = begun() }
+    return g_batch
+}
+
+// A buffer the batch reads, kept until the batch has run.
+batch_keep(buffer: ptr, memory: ptr) {
+    if g_batch_count == g_batch_capacity {
+        grown = g_batch_capacity * 2
+        if grown == 0 { grown = 64 }
+        buffers = calloc(grown, 8)
+        memories = calloc(grown, 8)
+        if g_batch_kept != null {
+            memcpy(buffers, g_batch_kept, (g_batch_count * 8) as long)
+            memcpy(memories, g_batch_kept_memory, (g_batch_count * 8) as long)
+            free(g_batch_kept)
+            free(g_batch_kept_memory)
+        }
+        g_batch_kept = buffers
+        g_batch_kept_memory = memories
+        g_batch_capacity = grown
+    }
+    (g_batch_kept as ptr[])[g_batch_count] = buffer
+    (g_batch_kept_memory as ptr[])[g_batch_count] = memory
+    g_batch_count = g_batch_count + 1
+}
+
+batch_serial() -> int { return g_batch_serial }
+
+// Submit what the batch recorded and wait for it once, then free the
+// staging and scratch it kept. Called before a frame is begun and before
+// one is submitted (the frame reads what the batch wrote), before a mesh
+// is freed (the batch may name its buffers) and at shutdown. Nothing to do
+// when nothing was recorded.
+flush() {
+    d = device()
+    if g_batch != null {
+        submitted(g_batch)
+        g_batch = null
+    }
+    // Staging still mapped is unmapped by freeing it.
+    i = 0
+    while i < g_batch_count {
+        vk.vkDestroyBuffer(d, (g_batch_kept as ptr[])[i], null)
+        vk.vkFreeMemory(d, (g_batch_kept_memory as ptr[])[i], null)
+        i = i + 1
+    }
+    g_batch_count = 0
+    g_batch_serial = g_batch_serial + 1
+}
+
+// --- the frame being recorded ------------------------------------------------------------------------------------
+
+// What ae3d.vkframe is recording, for the modules that record into it
+// before its passes and sit below it (the rays' build, ae3d.vkrays): its
+// command buffer and its slot among the frames in flight, whether a frame
+// is being recorded, and whether a pass is open in it. Written by the
+// frame alone.
+var g_frame_commands: ptr = null
+var g_frame_slot = 0
+var g_recording = false
+var g_pass_open = false
+
+frame_commands() -> ptr { return g_frame_commands }
+frame_slot() -> int { return g_frame_slot }
+recording() -> bool { return g_recording }
+pass_open() -> bool { return g_pass_open }
+set_frame(commands: ptr, slot: int) {
+    g_frame_commands = commands
+    g_frame_slot = slot
+}
+set_recording(on: bool) { g_recording = on }
+set_pass_open(open: bool) { g_pass_open = open }

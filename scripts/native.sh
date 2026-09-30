@@ -68,9 +68,9 @@ ae3d_glfw_flags() {
         GLFW_LIBS="-lglfw"
     fi
 }
-# The Vulkan headers. GLFW is included with GLFW_INCLUDE_VULKAN, so vulkan.h
-# has to be found even though nothing links against the loader (it is opened
-# at run time). VULKAN_CFLAGS in the environment wins, as GLFW's flags do;
+# The Vulkan headers: contrib.vulkan's C, which every program is built with,
+# and the DLSS shim include vulkan.h, so it has to be found even though
+# nothing links against the loader (it is opened at run time). VULKAN_CFLAGS in the environment wins, as GLFW's flags do;
 # then pkg-config, Homebrew's prefix, and the LunarG SDK, which spells the
 # directory Include on Windows and include everywhere else and arrives there
 # as a Windows path.
@@ -181,8 +181,7 @@ ae3d_dlss_source() {
 #
 #   ae3d_native_sources <object directory> <aephysics root>
 ae3d_native_sources() {
-    list="native/gpu/opengl_api.c native/gpu/offscreen.c native/gpu/vulkan.c native/gpu/jobs.c native/gpu/stores.c"
-    list="$list native/platform/crash.c"
+    list="native/platform/crash.c"
     list="$list $(ae3d_dlss_source "$1") $2/aephysics/native/aephysics_native.c"
     if [ "$(uname -s)" = "Darwin" ]; then
         list="$list native/platform/metal_surface.m"

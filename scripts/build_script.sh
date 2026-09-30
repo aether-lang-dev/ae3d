@@ -57,7 +57,7 @@ fi
 # (ae3d.platform), and on Windows a DLL resolves everything at its link.
 ae3d_glfw_flags
 # shellcheck disable=SC2086
-$CC -O2 -fwrapv $(ae3d_fp_flags) $(ae3d_native_pic_flag) $AETHER_CFLAGS -Inative $LINK_FLAGS \
+$CC -O2 -fwrapv $(ae3d_fp_flags) $(ae3d_native_pic_flag) $AETHER_CFLAGS $LINK_FLAGS \
     "$GEN" $(ae3d_native_link_flags ..) $GLFW_LIBS -o "$LIB"
 
 echo "built: $LIB"

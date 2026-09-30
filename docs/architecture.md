@@ -116,7 +116,7 @@ says what it is for and why it is shaped as it is.
 | Area | Modules |
 |---|---|
 | Foundation | `core` (linear algebra, scene types, camera, the backend vtable), `platform` (the window, input and timing, over GLFW called directly), `engine` (the loop, behaviours, the window), `behaviour` (game objects and components), `input` (actions and axes), `jobs` (the pool), `viewpoint` (where the camera may stand -- a sphere the scene's static geometry keeps out -- and where it stands to frame something) |
-| Rendering | `vulkan`, `gl`, `glapi` (the GL entry points), `capture` (a GL frame read back), `vkmeter` (the frame's light), `vkreadback` (a frame read back, offscreen or captured), `vktexture` (textures made and uploaded), `vkoverlay` (the HUD recorded into the frame), `vkhost` (their buffers and memory; the five on contrib.vulkan.vk), `shaders` (the GLSL), `vkscene` (generated), `rendering` (shading presets), `lightgrid` (the lamps cut into the view's clusters, for both renderers), `cascades` (the key light's shadow in cascades a moving camera does not move), `lampshadows` (each lamp's own shadow, a cube of maps in an atlas, drawn in a static and a moving layer), `offscreen` (a frame to a buffer), `sky` (the sun by the hour), `cloudnoise` (the clouds' textures), `water` (a Gerstner sea), `weather` (rain, snow, dust, storm) |
+| Rendering | `vulkan`, `gl`, `glapi` (the GL entry points), `capture` (a GL frame read back), `vkdevice` (the loader, the instance, the surface and the device), `vkframe` (the frame: its passes, its draws, its post chain, DLSS, the submit), `vktargets` (what the frame draws into), `vkpipes` (the pipelines), `vkdesc` (the uniform blocks and the descriptor sets), `vkmeter` (the frame's light), `vkreadback` (a frame read back, offscreen or captured), `vktexture` (textures made and uploaded, and their table), `vkmesh` (meshes uploaded, geometry many models share uploaded once, and the instance streams), `vkrays` (the acceleration structures the shadow rays trace, and the skinned figures posed into them each frame), `vkcrowd` (a crowd sorted on the device), `vkoverlay` (the HUD recorded into the frame), `vkhost` (their buffers, images and command buffers; the thirteen on contrib.vulkan.vk), `shaders` (the GLSL), `vkscene` and `vkspirv` (generated: the uniform block's offsets, the SPIR-V), `rendering` (shading presets), `lightgrid` (the lamps cut into the view's clusters, for both renderers), `cascades` (the key light's shadow in cascades a moving camera does not move), `lampshadows` (each lamp's own shadow, a cube of maps in an atlas, drawn in a static and a moving layer), `offscreen` (a frame to a buffer), `sky` (the sun by the hour), `cloudnoise` (the clouds' textures), `water` (a Gerstner sea), `weather` (rain, snow, dust, storm) |
 | Geometry and assets | `geometry` (the mesh and instance stores the renderers read), `posing` (bone palettes, pose banks), `loader` (OBJ, primitives), `gltf`, `figure` (an animated glTF figure as one game object, and its scene record), `assets` (the Blender export), `blob` (a file as bytes), `picture` (an image file as RGBA: PNG, JPEG, TGA, BMP, and images registered by name), `jpeg` (its JPEG decoder), `inflate` (its PNG's deflate), `png` (a frame as a file), `noise`, `voxel`, `terrain`, `raycast`, `skin`, `anim`, `ik`, `glyphs` (a TrueType font, and its glyphs as a distance-field atlas; [ui.md](ui.md)) |
 | Game UI | `hud` (text and rectangles over the frame in the window's pixels, drawn by both renderers; [ui.md](ui.md)) |
 | Simulation | `physics` (aephysics in the loop: bodies, ragdolls, vehicles, the character controller), `motion` (the active ragdoll: muscles, balance, the protective fall, getting up), `handover` (a horde's struck zombies handed to a pool of active ragdolls and taken back), `crowd` (pose banks, the device crowd), `horde` (the crowd's kernels), `nav` (the flow field), `ecs` (dense columns for crowds too large to be objects) |
@@ -125,19 +125,22 @@ says what it is for and why it is shaped as it is.
 
 ## What is still C, and why
 
-The engine is written in Aether. `native/` holds the C that remains, by
-role, and each folder is there for one reason, stated in
-[native/README.md](../native/README.md):
+The engine is written in Aether. `native/` holds the C that remains --
+the platform's and DLSS's -- and each folder is there for one reason,
+stated in [native/README.md](../native/README.md):
 
 | Folder | Why |
 |---|---|
-| `gpu/` | the Vulkan renderer, moving to Aether a part at a time (#402), and the OpenGL resolver and contexts, which are the platform's; the OpenGL renderer itself is Aether (#398). The stores they draw from are already Aether's (`ae3d.geometry`), read in place through `gpu/stores.h`, whose layout `tests/test_geometry` holds to the Aether structs. Aether's 32-bit float ([aether#2134](https://github.com/aether-lang-dev/aether/issues/2134)) is what made that possible. |
 | `platform/` | the crash handler (a signal handler may call only what is async-signal-safe, and it is installed when the library loads), and the Objective-C surface MoltenVK draws into on macOS |
 | `dlss/` | the Streamline SDK's interface is C++ |
 
-What was C for any other reason has moved to Aether on this branch, each
-port measured against the C it replaced in the same run on the same
-machine: the crowd's kernels (`ae3d.horde`: half a million separated in
+What was C for any other reason has moved to Aether, each port measured
+against the C it replaced in the same run on the same machine: both
+renderers -- OpenGL's calls, its GL entry points and its offscreen
+context, and Vulkan whole, on contrib.vulkan.vk, every step drawing the
+same numbers in `tests/test_backend_parity` channel for channel (#398,
+#402) -- the mesh and instance stores and the door their loops reach the
+job pool through, the crowd's kernels (`ae3d.horde`: half a million separated in
 51.4 ms against the C's 51.5), the flow field (`ae3d.nav`: the flood 8.2 ms
 against 8.3), the weather's particles, the clouds' noise (the weather map
 byte for byte the same, the shape within one count in 22 texels of a
@@ -149,10 +152,10 @@ repository and 87 fixtures the same bytes stb_image gave; a 2048 x 2048
 PNG in 62 ms against 63, a 2048 x 2048 JPEG in 34 ms against stb's SSE2
 path's 20, as fast as its scalar one's 37).
 
-`native/ae3d.h` is the C API the Aether modules bind through `extern`;
-`native/internal.h` is what the C files share with each other. Every C
-file compiles under `-Wall -Wextra -Werror` on all three platforms, and
-`ci.sh` compiles each one alone to prove it.
+There is no C API left to declare: the Aether modules bind the few entry
+points in `native/` by `extern` directly. Every C file compiles under
+`-Wall -Wextra -Werror` on all three platforms, and `ci.sh` compiles each
+one alone to prove it.
 
 ## Dependencies
 

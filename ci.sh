@@ -258,7 +258,7 @@ if ! ./build.sh tools/generate_shaders.ae >/tmp/ae3d_shaders.log 2>&1; then
     fail "generate_shaders (build)"
     sed "s/^/        /" /tmp/ae3d_shaders.log | head -12
 elif ./build/generate_shaders --check >/tmp/ae3d_shaders.log 2>&1; then
-    pass "native/gpu/shaders and vkscene are what src/ae3d/shaders produces"
+    pass "src/ae3d/vkspirv/glsl and vkscene are what src/ae3d/shaders produces"
 else
     fail "generated Vulkan shaders are out of date; run build/generate_shaders"
     sed "s/^/        /" /tmp/ae3d_shaders.log | head -12
@@ -280,7 +280,7 @@ CC="${CC:-cc}"
 ae3d_glfw_flags
 ae3d_vulkan_flags
 for src in native/*/*.c; do
-    if "$CC" -c -O2 $(ae3d_fp_flags) -Wall -Wextra -Werror -Inative $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o /dev/null 2>/tmp/ae3d_cc.log; then
+    if "$CC" -c -O2 $(ae3d_fp_flags) -Wall -Wextra -Werror $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o /dev/null 2>/tmp/ae3d_cc.log; then
         pass "$src"
     else
         fail "$src"
@@ -288,7 +288,7 @@ for src in native/*/*.c; do
     fi
 done
 if [ "$(uname -s)" = "Darwin" ]; then
-    if "$CC" -c -O2 $(ae3d_fp_flags) -Wall -Wextra -Werror -fobjc-arc $GLFW_CFLAGS -Inative native/platform/metal_surface.m -o /dev/null 2>/tmp/ae3d_cc.log; then
+    if "$CC" -c -O2 $(ae3d_fp_flags) -Wall -Wextra -Werror -fobjc-arc $GLFW_CFLAGS native/platform/metal_surface.m -o /dev/null 2>/tmp/ae3d_cc.log; then
         pass "native/platform/metal_surface.m"
     else
         fail "native/platform/metal_surface.m"
@@ -423,10 +423,50 @@ for suite in tests/test_*.ae; do
     fi
 done
 
+step "Vulkan under the validation layer, synchronization included"
+# The suites that read frames back, run again with the Khronos layer and its
+# synchronization validation on: a frame copied out while the pass that wrote
+# it was still writing, or overwritten while the copy was still reading it,
+# or a draw through a descriptor naming a destroyed image, renders right on
+# almost every device and run, and only the layer says so (#458). Any error
+# the layer reports fails the suite. The loader names every layer it inserts
+# when asked (VK_LOADER_DEBUG=layer): a run it did not insert the layer into
+# would pass having checked nothing, so that is a skip, never a pass.
+for name in test_fog test_overlay test_backend_parity; do
+    if ! built_ok "$name"; then
+        skip "$name under the layer" "did not build"
+        continue
+    fi
+    if ! have_display; then
+        skip "$name under the layer" "no display"
+        continue
+    fi
+    output="$(VK_LOADER_DEBUG=layer VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+              VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT \
+              AE3D_FRAMES="$FRAMES" bounded "$RUN_LIMIT" ./build/"$name" 2>&1)"
+    layered_status=$?
+    if ! printf '%s' "$output" | grep -q 'Insert instance layer "VK_LAYER_KHRONOS_validation"'; then
+        skip "$name under the layer" "the Khronos validation layer is not installed"
+        continue
+    fi
+    errors="$(printf '%s\n' "$output" | grep -c 'Validation Error' || true)"
+    if [ "$layered_status" -ne 0 ]; then
+        fail "$name under the layer$(died_on "$layered_status")"
+        printf '%s\n' "$output" | grep -v '^\[Vulkan Loader\]' | sed 's/^/        /' | tail -10
+    elif [ "$errors" != 0 ]; then
+        fail "$name under the layer ($errors validation errors)"
+        printf '%s\n' "$output" | grep -o 'VUID-[A-Za-z0-9_-]*\|SYNC-HAZARD-[A-Z_-]*' | sort | uniq -c | sort -rn | head -5 | sed 's/^/        /'
+    elif printf '%s' "$output" | grep -q "all checks passed"; then
+        pass "$name under the layer"
+    else
+        skip "$name under the layer" "$(printf '%s' "$output" | grep -m1 "SKIP" | sed 's/.*SKIP *//')"
+    fi
+done
+
 step "examples build and run"
 # The benchmark is built in the same pass: build_together starts from a clean
 # status directory, so a later call would forget that the examples built.
-build_together examples/*.ae tools/ae3d_bench.ae tools/measure_scene.ae tools/ae3d_agent.ae tools/ae3d_view.ae tools/critique_scene.ae tools/zombie_street.ae tools/bake_impostor.ae tools/fold_changes.ae
+build_together examples/*.ae tools/ae3d_bench.ae tools/measure_scene.ae tools/ae3d_agent.ae tools/ae3d_view.ae tools/critique_scene.ae tools/zombie_street.ae tools/bake_impostor.ae tools/fold_changes.ae tools/scene_parity.ae
 for example in examples/*.ae; do
     name="$(basename "$example" .ae)"
     if ! built_ok "$name"; then
@@ -772,6 +812,145 @@ elif ! built_ok zombie_street; then
 else
     frame_cost opengl 7915
     frame_cost vulkan 7916
+fi
+
+step "the scenes, drawn alike by both renderers"
+# The backend parity suite holds the renderers to each other on test scenes
+# of a few models; this holds them to each other on the scenes a person looks
+# at (#494), which is where zombie_city drew garbage on OpenGL at 3397101 with
+# every suite passing. Each scene runs on both at a fixed tick and holds at
+# the same frame, so the horde, the car and the clouds stand in the same
+# place; tools/scene_parity.ae compares the two frames region by region
+# (sky, facades, road, figures, the rest) against the tolerances it writes
+# down, and fails on a hole: a model on one renderer where the other shows
+# the sky or the clear colour.
+# What the two do not both do is off here, by name: the ray-traced shadows
+# and occlusion (Vulkan's alone; AE3D_RAYS=0), the eye's adaptation (it
+# meters each renderer's own frame; AE3D_EYE=0) and the temporal pass (it
+# folds in however many frames the hold drew; AE3D_TAA=0); the tool turns
+# the screen-space reflections off (Vulkan's alone until #491).
+#
+# On a shared runner (CI set) both renderers are software rasterisers
+# (llvmpipe and lavapipe on Linux), billed for every vertex and pixel, and
+# the step has the few minutes the job has left. There it is the same check
+# made lighter, each part for its reason:
+# - 320 by 180, the size every other CI draw is made at: a quarter of the
+#   pixels, and the grid's cells ten pixels across instead of twenty;
+# - held at frame 12 rather than 90: every frame before the hold is drawn,
+#   and any moment both renderers hold at is a moment to compare them at;
+# - the city's horde a hundred strong with a 12 m near band (AE3D_CROWD=100
+#   AE3D_NEAR=12): its 400 zombies drawn whole to 600 m are 12 million
+#   triangles a frame, 19 s a frame on llvmpipe even at 320 by 180 and past
+#   the step's limit before frame 12, and every lamp's face draws the horde
+#   again for its shadow; a hundred at 12 m still stand in all three tiers
+#   -- the near meshes, the far mesh, the impostors -- and a view takes
+#   about a minute on both renderers (53 to 68 s on Mesa, 24 threads)
+#   where 400 took over two;
+# - four of its seven views, one for each region at its largest: 0, the
+#   street with the horde in all three tiers; 2, low in the horde, the near
+#   band's figures up close; 4, grazing along the wet road, where its
+#   normal maps and the lamps' streaks are; 5, toward the moon, the sky, the
+#   clouds and the skyline. Views 1, 3 and 6 are the same surfaces from
+#   other places and stay in the full run on a GPU.
+# The tolerances are the same: measured on both, the renderers agree as
+# closely on the software rasterisers as on a GPU (tools/scene_parity.ae).
+if [ -n "${CI:-}" ]; then
+    parity_width=320
+    parity_height=180
+    parity_hold=12
+    parity_views="0 2 4 5"
+    parity_city="AE3D_CROWD=100 AE3D_NEAR=12"
+else
+    parity_width=640
+    parity_height=360
+    parity_hold=90
+    parity_views="0 1 2 3 4 5 6"
+    parity_city=""
+fi
+scene_parity() {   # scene_parity <program> <name> <port> [VAR=value ...]
+    parity_program="$1"
+    parity_view="$2"
+    parity_name="scene parity ($2)"
+    parity_port="$3"
+    shift 3
+    parity_log="$(mktemp)"
+    parity_gl_log="$(mktemp)"
+    parity_vk_log="$(mktemp)"
+    # zombie_street takes its renderer as its argument; the examples, from
+    # AE3D_API.
+    parity_gl_arg=""
+    parity_vk_arg=""
+    if [ "$parity_program" = zombie_street ]; then
+        parity_gl_arg="opengl"
+        parity_vk_arg="vulkan"
+    fi
+    env "$@" AE3D_API=opengl AE3D_AGENT="$parity_port" AE3D_TICK=60 AE3D_HOLD="$parity_hold" \
+        AE3D_RAYS=0 AE3D_EYE=0 AE3D_TAA=0 AE3D_HIDDEN=1 AE3D_WIDTH="$parity_width" AE3D_HEIGHT="$parity_height" \
+        AE3D_FRAMES=100000 ./build/"$parity_program" $parity_gl_arg >"$parity_gl_log" 2>&1 &
+    parity_gl=$!
+    env "$@" AE3D_API=vulkan AE3D_AGENT="$((parity_port + 1))" AE3D_TICK=60 AE3D_HOLD="$parity_hold" \
+        AE3D_RAYS=0 AE3D_EYE=0 AE3D_TAA=0 AE3D_HIDDEN=1 AE3D_WIDTH="$parity_width" AE3D_HEIGHT="$parity_height" \
+        AE3D_FRAMES=100000 ./build/"$parity_program" $parity_vk_arg >"$parity_vk_log" 2>&1 &
+    parity_vk=$!
+    # Each scene opens its port after its window and its first frame; asked
+    # again while that is what came back and both scenes are alive.
+    parity_status=2
+    attempt=0
+    while [ "$attempt" -lt 300 ]; do
+        kill -0 "$parity_gl" 2>/dev/null || break
+        kill -0 "$parity_vk" 2>/dev/null || break
+        bounded "$RUN_LIMIT" ./build/scene_parity "$parity_port" "$((parity_port + 1))" --hold "$parity_hold" --name "$parity_view" >"$parity_log" 2>&1
+        parity_status=$?
+        grep -q 'nothing answering' "$parity_log" || break
+        attempt=$((attempt + 1))
+        sleep 0.2
+    done
+    if [ "$parity_status" -eq 0 ]; then
+        pass "$parity_name"
+        grep -E '^scene_parity: .* against |^  (ok|--)' "$parity_log" | sed 's/^/      /'
+    elif [ "$parity_status" -eq 124 ]; then
+        fail "$parity_name (not held and compared within ${RUN_LIMIT}s)"
+        tail -3 "$parity_gl_log" "$parity_vk_log" | sed 's/^/        /'
+    elif [ "$parity_status" -eq 3 ]; then
+        skip "$parity_name" "a frame cannot be read back on this machine"
+    elif grep -q 'no Vulkan driver' "$parity_vk_log"; then
+        skip "$parity_name" "no Vulkan driver"
+    elif [ "$parity_status" -eq 2 ] && { ! kill -0 "$parity_gl" 2>/dev/null || ! kill -0 "$parity_vk" 2>/dev/null; }; then
+        skip "$parity_name" "a scene could not open a window"
+    else
+        fail "$parity_name"
+        grep -E '^  |scene_parity:' "$parity_log" | sed 's/^/        /' | head -24
+    fi
+    kill "$parity_gl" "$parity_vk" 2>/dev/null
+    wait "$parity_gl" 2>/dev/null
+    wait "$parity_vk" 2>/dev/null
+    rm -f "$parity_log" "$parity_gl_log" "$parity_vk_log"
+}
+if ! built_ok scene_parity; then
+    fail "scene_parity (build)"
+    sed 's/^/        /' "$BUILD_DIR/scene_parity.log" | head -20
+elif ! have_display; then
+    skip "scene parity" "no display"
+else
+    parity_started="$(date +%s)"
+    if built_ok zombie_street; then
+        scene_parity zombie_street "zombie_street" 7941
+    else
+        skip "scene parity (zombie_street)" "it did not build"
+    fi
+    if built_ok zombie_city; then
+        for parity_view in $parity_views; do
+            scene_parity zombie_city "zombie_city, view $parity_view" 7941 AE3D_VIEW="$parity_view" $parity_city
+        done
+    else
+        skip "scene parity (zombie_city)" "it did not build"
+    fi
+    if built_ok street_drive; then
+        scene_parity street_drive "street_drive" 7941
+    else
+        skip "scene parity (street_drive)" "it did not build"
+    fi
+    echo "        the scenes compared in $(( $(date +%s) - parity_started ))s, ${parity_width} by ${parity_height} at frame ${parity_hold}"
 fi
 
 # The editor runs on either renderer, so both are checked: the Vulkan option

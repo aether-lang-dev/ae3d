@@ -1,0 +1,814 @@
+// ae3d.vkcrowd -- a crowd sorted on the Vulkan device (#402), on
+// contrib.vulkan.vk.
+//
+// A crowd's figures are thirty-two bytes each a frame -- where it stands,
+// which way it faces, where its walk is, its colour -- written by the CPU
+// into a host-visible buffer over every core (fill). A compute shader
+// (crowd_sort_vk.comp) sorts them by distance from the camera into three
+// tier streams, near, mid and far, each an instance stream of matrices
+// the tier's model draws, and counts each tier into an indirect draw
+// command; the lit and the shadow draws of every part of every tier then
+// read those counts (draw, shadow_draw), so the CPU never learns how many
+// figures a tier has in the frame it draws. Where the crowd is in the rays
+// (ae3d.vkrays' pose structures), the sort also writes each figure's
+// instance into the frame's acceleration structure, posed at its frame:
+// the near band's by its own mesh where the crowd has structures of it
+// (set_near_poses), the far tier's by the far mesh.
+//
+// The streams and commands are this module's; the draws go through the
+// frame's draw of an instance stream by an indirect count
+// (vkframe.draw_indirect), which binds the mesh, the frame's uniforms and
+// the pipeline for them.
+
+import contrib.vulkan.vk
+import ae3d.vkhost
+import ae3d.vkdevice
+import ae3d.vkrays
+import ae3d.vkframe
+import ae3d.vkspirv
+import ae3d.jobs
+
+exports (
+    start, stop, frame_start, create, destroy, count, set_tier, fill, sort, set_poses, set_near_poses, draw, shadow_draw
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memset(p: ptr, value: int, n: long) -> ptr
+
+const FRAMES = 2
+const MAX_CROWDS = 8
+const TIERS = 3
+// How many models may draw one tier: a figure's parts -- a body and its
+// clothes, or the fifteen pieces of a modular character -- each with its
+// own index count, over the same sorted instances.
+const PARTS = 16
+// The indirect commands, five words each: the sort's own three, whose
+// instance counts it writes (offsets the shader knows), three the shadow
+// pass once read, and then a lit and a shadow command per part of every
+// tier, their counts copied from the sort's after it ran.
+const SORT_DRAWS = 6
+const DRAWS = 102
+const COMMAND_BYTES = 20
+// The sort's push constants: the count and whether there are three tiers,
+// the camera, the tiers' squared distances and the rays' reach, the tiers'
+// scales, the rays' first slot, the pose structures' frames and whether
+// the near band has structures of its own mesh.
+const PARAMS_BYTES = 92
+// The sort's storage buffers: the state, the three tiers, the draws, the
+// rays' instances, the far mesh's pose structures, the rays' count and the
+// near mesh's pose structures.
+const BINDINGS = 9
+
+// A crowd on the device: its state buffers, one a frame in flight, mapped;
+// the three tier streams the sort writes and the draws read; the draw
+// commands, host-visible so the counts can be read back; the sort's
+// descriptor sets; and what the renderer set for each tier and part.
+struct DeviceCrowdState {
+    in_use: bool
+    capacity: int
+    count: int                     // figures filled this frame
+    state: ptr                     // VkBuffer[FRAMES]
+    state_memory: ptr              // VkDeviceMemory[FRAMES]
+    state_mapped: ptr              // void*[FRAMES]
+    tier: ptr                      // VkBuffer[TIERS]
+    tier_memory: ptr               // VkDeviceMemory[TIERS]
+    draws: ptr
+    draws_memory: ptr
+    draws_mapped: ptr
+    sets: ptr                      // VkDescriptorSet[FRAMES]
+    sorted: bool                   // the sort ran this frame
+    scale: ptr                     // f32[TIERS * 4]
+    // Each part's index counts: its lit draw's and its depth proxy's for
+    // the shadow draw; and how many parts a tier has.
+    indices: ptr                   // uint32[TIERS * PARTS]
+    shadow_indices: ptr            // uint32[TIERS * PARTS]
+    parts: ptr                     // int[TIERS]
+    poses: int                     // the pose structures its rays use (a handle), 0 for none
+    near_poses: int                // its near band's, of the near mesh; 0 for none (the far mesh stands in)
+}
+
+var g_crowds: ptr = null           // DeviceCrowdState[MAX_CROWDS]
+var g_set_layout: ptr = null
+var g_pool: ptr = null
+var g_layout: ptr = null
+var g_pipeline: ptr = null
+// The sort's scratch, made once: the draw commands it resets, its push
+// constants, and the copies of its counts.
+var g_commands: ptr = null
+var g_params: ptr = null
+var g_copies: ptr = null
+
+crowd_at(index: int) -> *DeviceCrowdState {
+    return (g_crowds + index * sizeof(DeviceCrowdState)) as *DeviceCrowdState
+}
+
+// The lit command of part `part` of tier `tier`, or its shadow one.
+part_draw(tier: int, part: int, shadow: int) -> int { return SORT_DRAWS + (tier * PARTS + part) * 2 + shadow }
+
+cell() -> ptr { return calloc(1, 8) }
+taken(c: ptr) -> ptr {
+    h = (c as ptr[])[0]
+    free(c)
+    return h
+}
+
+// The sort's descriptor set layout (eight storage buffers), pool, pipeline
+// layout (the push constants) and pipeline, on the device the backend
+// started on. False, with the reason in the backend's last error, when one
+// would not make.
+start() -> bool {
+    d = vkdevice.device()
+    if g_crowds == null { g_crowds = calloc(MAX_CROWDS, sizeof(DeviceCrowdState)) }
+    if g_commands == null {
+        g_commands = calloc(DRAWS * 5, 4)
+        g_params = calloc(1, PARAMS_BYTES)
+        g_copies = calloc(TIERS * (1 + PARTS * 2), sizeof(VkBufferCopy))
+    }
+    bindings = calloc(BINDINGS, sizeof(VkDescriptorSetLayoutBinding))
+    i = 0
+    while i < BINDINGS {
+        b = (bindings + i * sizeof(VkDescriptorSetLayoutBinding)) as *VkDescriptorSetLayoutBinding
+        b.binding = i
+        b.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+        b.descriptorCount = 1
+        b.stageFlags = vk.SHADER_STAGE_COMPUTE_BIT
+        i = i + 1
+    }
+    layout = calloc(1, sizeof(VkDescriptorSetLayoutCreateInfo)) as *VkDescriptorSetLayoutCreateInfo
+    layout.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    layout.bindingCount = BINDINGS
+    layout.pBindings = bindings
+    out = cell()
+    r = vk.vkCreateDescriptorSetLayout(d, layout as ptr, null, out)
+    g_set_layout = taken(out)
+    free(layout as ptr)
+    free(bindings)
+    if r != vk.SUCCESS {
+        g_set_layout = null
+        vkdevice.fail("crowd vkCreateDescriptorSetLayout failed")
+        return false
+    }
+
+    size = calloc(1, sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
+    size.type = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+    size.descriptorCount = BINDINGS * MAX_CROWDS * FRAMES
+    pool = calloc(1, sizeof(VkDescriptorPoolCreateInfo)) as *VkDescriptorPoolCreateInfo
+    pool.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+    // A crowd's sets go back to the pool with it: the pool holds eight
+    // crowds' at a time, and a program that made and freed crowds as it
+    // went ran out of sets at its eighth.
+    pool.flags = vk.DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+    pool.maxSets = MAX_CROWDS * FRAMES
+    pool.poolSizeCount = 1
+    pool.pPoolSizes = size as ptr
+    out = cell()
+    r = vk.vkCreateDescriptorPool(d, pool as ptr, null, out)
+    g_pool = taken(out)
+    free(pool as ptr)
+    free(size as ptr)
+    if r != vk.SUCCESS {
+        g_pool = null
+        vkdevice.fail("crowd vkCreateDescriptorPool failed")
+        return false
+    }
+
+    range = calloc(1, sizeof(VkPushConstantRange)) as *VkPushConstantRange
+    range.stageFlags = vk.SHADER_STAGE_COMPUTE_BIT
+    range.size = PARAMS_BYTES
+    layouts = cell()
+    (layouts as ptr[])[0] = g_set_layout
+    info = calloc(1, sizeof(VkPipelineLayoutCreateInfo)) as *VkPipelineLayoutCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+    info.setLayoutCount = 1
+    info.pSetLayouts = layouts
+    info.pushConstantRangeCount = 1
+    info.pPushConstantRanges = range as ptr
+    out = cell()
+    r = vk.vkCreatePipelineLayout(d, info as ptr, null, out)
+    g_layout = taken(out)
+    free(info as ptr)
+    free(layouts)
+    free(range as ptr)
+    if r != vk.SUCCESS {
+        g_layout = null
+        vkdevice.fail("crowd vkCreatePipelineLayout failed")
+        return false
+    }
+
+    code = vkspirv.code(vkspirv.CROWD_SORT_COMP)
+    module_info = calloc(1, sizeof(VkShaderModuleCreateInfo)) as *VkShaderModuleCreateInfo
+    module_info.sType = vk.STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+    module_info.codeSize = vkspirv.bytes(vkspirv.CROWD_SORT_COMP)
+    module_info.pCode = code
+    out = cell()
+    r = vk.vkCreateShaderModule(d, module_info as ptr, null, out)
+    shader = taken(out)
+    free(module_info as ptr)
+    free(code)
+    if r != vk.SUCCESS {
+        vkdevice.fail("crowd vkCreateShaderModule failed")
+        return false
+    }
+    compute = calloc(1, sizeof(VkComputePipelineCreateInfo)) as *VkComputePipelineCreateInfo
+    compute.sType = vk.STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+    compute.stage.sType = vk.STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+    compute.stage.stage = vk.SHADER_STAGE_COMPUTE_BIT
+    compute.stage.module = shader
+    compute.stage.pName = "main"
+    compute.layout = g_layout
+    out = cell()
+    r = vk.vkCreateComputePipelines(d, null, 1, compute as ptr, null, out)
+    g_pipeline = taken(out)
+    free(compute as ptr)
+    vk.vkDestroyShaderModule(d, shader, null)
+    if r != vk.SUCCESS {
+        g_pipeline = null
+        vkdevice.fail("crowd vkCreateComputePipelines failed")
+        return false
+    }
+    return true
+}
+
+// Every crowd and the sort's objects destroyed, the device idle: before
+// the frame shuts down (ae3d.vkframe). A crowd freed after (the natural order, the
+// engine drew from it) finds nothing to do.
+stop() {
+    d = vkdevice.device()
+    if d == null || g_crowds == null { return }
+    vk.vkDeviceWaitIdle(d)
+    k = 0
+    while k < MAX_CROWDS {
+        free_crowd(crowd_at(k))
+        k = k + 1
+    }
+    if g_pipeline != null { vk.vkDestroyPipeline(d, g_pipeline, null) }
+    if g_layout != null { vk.vkDestroyPipelineLayout(d, g_layout, null) }
+    if g_pool != null { vk.vkDestroyDescriptorPool(d, g_pool, null) }
+    if g_set_layout != null { vk.vkDestroyDescriptorSetLayout(d, g_set_layout, null) }
+    g_pipeline = null
+    g_layout = null
+    g_pool = null
+    g_set_layout = null
+}
+
+// Every crowd unsorted and unfilled, at the frame's start.
+frame_start() {
+    if g_crowds == null { return }
+    k = 0
+    while k < MAX_CROWDS {
+        c = crowd_at(k)
+        c.sorted = false
+        c.count = 0
+        k = k + 1
+    }
+}
+
+free_crowd(c: *DeviceCrowdState) {
+    if !c.in_use { return }
+    d = vkdevice.device()
+    i = 0
+    while i < FRAMES {
+        if (c.state_mapped as ptr[])[i] != null { vk.vkUnmapMemory(d, (c.state_memory as ptr[])[i]) }
+        if (c.state as ptr[])[i] != null { vk.vkDestroyBuffer(d, (c.state as ptr[])[i], null) }
+        if (c.state_memory as ptr[])[i] != null { vk.vkFreeMemory(d, (c.state_memory as ptr[])[i], null) }
+        i = i + 1
+    }
+    i = 0
+    while i < TIERS {
+        if (c.tier as ptr[])[i] != null { vk.vkDestroyBuffer(d, (c.tier as ptr[])[i], null) }
+        if (c.tier_memory as ptr[])[i] != null { vk.vkFreeMemory(d, (c.tier_memory as ptr[])[i], null) }
+        i = i + 1
+    }
+    if c.draws_mapped != null { vk.vkUnmapMemory(d, c.draws_memory) }
+    if c.draws != null { vk.vkDestroyBuffer(d, c.draws, null) }
+    if c.draws_memory != null { vk.vkFreeMemory(d, c.draws_memory, null) }
+    i = 0
+    while i < FRAMES {
+        if c.sets != null && (c.sets as ptr[])[i] != null && g_pool != null {
+            cell_set = cell()
+            (cell_set as ptr[])[0] = (c.sets as ptr[])[i]
+            vk.vkFreeDescriptorSets(d, g_pool, 1, cell_set)
+            free(cell_set)
+        }
+        i = i + 1
+    }
+    release_record(c)
+}
+
+// A crowd's record emptied, its arrays freed (its sets went back to the
+// pool in free_crowd, or with the pool when the device went first).
+release_record(c: *DeviceCrowdState) {
+    if c.state != null { free(c.state) }
+    if c.state_memory != null { free(c.state_memory) }
+    if c.state_mapped != null { free(c.state_mapped) }
+    if c.tier != null { free(c.tier) }
+    if c.tier_memory != null { free(c.tier_memory) }
+    if c.sets != null { free(c.sets) }
+    if c.scale != null { free(c.scale) }
+    if c.indices != null { free(c.indices) }
+    if c.shadow_indices != null { free(c.shadow_indices) }
+    if c.parts != null { free(c.parts) }
+    memset(c as ptr, 0, sizeof(DeviceCrowdState) as long)
+}
+
+
+// A crowd of up to `capacity` figures on the device: its state buffers,
+// its three tier streams and its draw commands. Returns the handle, or 0
+// when the device has no compute for it.
+create(capacity: int) -> int {
+    if !vkframe.ready() || g_pipeline == null || capacity <= 0 { return 0 }
+    slot = 0 - 1
+    k = 0
+    while k < MAX_CROWDS && slot < 0 {
+        if !crowd_at(k).in_use { slot = k }
+        k = k + 1
+    }
+    if slot < 0 {
+        vkdevice.fail("crowd table full")
+        return 0
+    }
+    c = crowd_at(slot)
+    memset(c as ptr, 0, sizeof(DeviceCrowdState) as long)
+    c.in_use = true
+    c.capacity = capacity
+    c.state = calloc(FRAMES, 8)
+    c.state_memory = calloc(FRAMES, 8)
+    c.state_mapped = calloc(FRAMES, 8)
+    c.tier = calloc(TIERS, 8)
+    c.tier_memory = calloc(TIERS, 8)
+    c.sets = calloc(FRAMES, 8)
+    c.scale = calloc(TIERS * 4, 4)
+    c.indices = calloc(TIERS * PARTS, 4)
+    c.shadow_indices = calloc(TIERS * PARTS, 4)
+    c.parts = calloc(TIERS, 4)
+    host = vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT
+    i = 0
+    while i < FRAMES {
+        // The state is written by the CPU and read by the sort: in the
+        // device's own memory where the host can see it (the BAR: sixteen
+        // megabytes a frame at half a million, which read from system
+        // memory over the bus cost the sort more than the sort), and in
+        // system memory where it cannot.
+        bytes = capacity * 32
+        made = vkhost.buffer_of(bytes, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT, vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT | host)
+        if made.buffer == null { made = vkhost.buffer_of(bytes, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT, host) }
+        (c.state as ptr[])[i] = made.buffer
+        (c.state_memory as ptr[])[i] = made.memory
+        if made.buffer == null {
+            free_crowd(c)
+            return 0
+        }
+        out = cell()
+        r = vk.vkMapMemory(vkdevice.device(), made.memory, 0, vk.WHOLE_SIZE, 0, out)
+        (c.state_mapped as ptr[])[i] = taken(out)
+        if r != vk.SUCCESS {
+            (c.state_mapped as ptr[])[i] = null
+            free_crowd(c)
+            return 0
+        }
+        i = i + 1
+    }
+    t = 0
+    while t < TIERS {
+        stream = vkhost.device_buffer(capacity * 80, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_VERTEX_BUFFER_BIT)
+        (c.tier as ptr[])[t] = stream.buffer
+        (c.tier_memory as ptr[])[t] = stream.memory
+        if stream.buffer == null {
+            free_crowd(c)
+            return 0
+        }
+        t = t + 1
+    }
+    draws = vkhost.buffer_of(DRAWS * COMMAND_BYTES,
+                             vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                             vk.BUFFER_USAGE_TRANSFER_DST_BIT | vk.BUFFER_USAGE_TRANSFER_SRC_BIT, host)
+    c.draws = draws.buffer
+    c.draws_memory = draws.memory
+    if draws.buffer == null {
+        free_crowd(c)
+        return 0
+    }
+    out = cell()
+    r = vk.vkMapMemory(vkdevice.device(), c.draws_memory, 0, vk.WHOLE_SIZE, 0, out)
+    c.draws_mapped = taken(out)
+    if r != vk.SUCCESS {
+        c.draws_mapped = null
+        free_crowd(c)
+        return 0
+    }
+    layouts = cell()
+    (layouts as ptr[])[0] = g_set_layout
+    alloc = calloc(1, sizeof(VkDescriptorSetAllocateInfo)) as *VkDescriptorSetAllocateInfo
+    alloc.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+    alloc.descriptorPool = g_pool
+    alloc.descriptorSetCount = 1
+    alloc.pSetLayouts = layouts
+    buffers = calloc(BINDINGS, sizeof(VkDescriptorBufferInfo))
+    writes = calloc(BINDINGS, sizeof(VkWriteDescriptorSet))
+    ok = true
+    i = 0
+    while i < FRAMES && ok {
+        out = cell()
+        ok = vk.vkAllocateDescriptorSets(vkdevice.device(), alloc as ptr, out) == vk.SUCCESS
+        set = taken(out)
+        if ok {
+            (c.sets as ptr[])[i] = set
+            // 5, 6, 7 and 8 are the rays' instances, the pose structures'
+            // addresses, the rays' count and the near band's structures,
+            // named when a frame writes them; the draws stand in until then.
+            b = 0
+            while b < BINDINGS {
+                info = (buffers + b * sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+                info.buffer = c.draws
+                if b == 0 { info.buffer = (c.state as ptr[])[i] }
+                if b >= 1 && b <= 3 { info.buffer = (c.tier as ptr[])[b - 1] }
+                info.offset = 0
+                info.range = vk.WHOLE_SIZE
+                w = (writes + b * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+                w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+                w.dstSet = set
+                w.dstBinding = b
+                w.descriptorCount = 1
+                w.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+                w.pBufferInfo = info as ptr
+                b = b + 1
+            }
+            vk.vkUpdateDescriptorSets(vkdevice.device(), BINDINGS, writes, 0, null)
+        }
+        i = i + 1
+    }
+    free(writes)
+    free(buffers)
+    free(alloc as ptr)
+    free(layouts)
+    if !ok {
+        free_crowd(c)
+        return 0
+    }
+    return slot + 1
+}
+
+valid(handle: int) -> bool {
+    return g_crowds != null && handle > 0 && handle <= MAX_CROWDS && crowd_at(handle - 1).in_use
+}
+
+// How many figures the sort last put in `tier`: read from the draw
+// command, so it is the count of the last frame the device finished, a
+// frame or two behind the one being recorded. A diagnostic and a
+// statistic, not a synchronised read.
+count(handle: int, tier: int) -> int {
+    if !valid(handle) || tier < 0 || tier >= TIERS { return 0 }
+    c = crowd_at(handle - 1)
+    if c.draws_mapped == null { return 0 }
+    return (c.draws_mapped as uint32[])[tier * 5 + 1] as int
+}
+
+// After the renderer has shut down there is no device and the record is
+// already gone with it: a program freeing its crowd after its engine (the
+// natural order, the engine drew from it) must find nothing to do, not a
+// wait on a null device.
+destroy(handle: int) {
+    if g_crowds == null || handle <= 0 || handle > MAX_CROWDS { return }
+    c = crowd_at(handle - 1)
+    d = vkdevice.device()
+    if d == null {
+        if c.in_use { release_record(c) }
+        return
+    }
+    vk.vkDeviceWaitIdle(d)
+    free_crowd(c)
+}
+
+// One part of a tier's figure: the tier's scale, which the sort bakes into
+// the matrices it writes (a figure's parts share it), and the index counts
+// the part's lit draw and its shadow draw (the depth proxy's mesh) take.
+// A part past the room is dropped: it is drawn with nothing.
+set_tier(handle: int, tier: int, part: int, sx: float, sy: float, sz: float, indices: int, shadow_indices: int) {
+    if !valid(handle) || tier < 0 || tier >= TIERS || part < 0 || part >= PARTS { return }
+    c = crowd_at(handle - 1)
+    scale = c.scale as f32[]
+    scale[tier * 4] = sx as f32
+    scale[tier * 4 + 1] = sy as f32
+    scale[tier * 4 + 2] = sz as f32
+    scale[tier * 4 + 3] = 0.0
+    lit = 0
+    if indices > 0 { lit = indices }
+    (c.indices as uint32[])[tier * PARTS + part] = lit
+    shade = lit
+    if shadow_indices > 0 { shade = shadow_indices }
+    (c.shadow_indices as uint32[])[tier * PARTS + part] = shade
+    if part + 1 > (c.parts as int[])[tier] { (c.parts as int[])[tier] = part + 1 }
+}
+
+// A fill's job: the figures from `start` into the mapped state at `out`.
+struct CrowdFill {
+    out: ptr
+    pos: ptr
+    yaw: ptr
+    phase: ptr
+    col: ptr
+    start: int
+}
+
+fill_block(begin: int, end: int, worker: int, context: ptr) {
+    job = context as *CrowdFill
+    out = job.out as f32[]
+    pos = job.pos as float[]
+    yaw = job.yaw as float[]
+    phase = job.phase as float[]
+    col = job.col as float[]
+    i = begin
+    while i < end {
+        f = job.start + i
+        o = i * 8
+        out[o] = pos[f * 3] as f32
+        out[o + 1] = pos[f * 3 + 1] as f32
+        out[o + 2] = pos[f * 3 + 2] as f32
+        out[o + 3] = yaw[f] as f32
+        out[o + 4] = phase[f] as f32
+        if job.col != null {
+            out[o + 5] = col[f * 3] as f32
+            out[o + 6] = col[f * 3 + 1] as f32
+            out[o + 7] = col[f * 3 + 2] as f32
+        } else {
+            out[o + 5] = 1.0
+            out[o + 6] = 1.0
+            out[o + 7] = 1.0
+        }
+        i = i + 1
+    }
+}
+
+// The crowd's figures from `start`, `n` of them, into this frame's state
+// buffer: thirty-two bytes a figure, converted over every core. Between
+// the frame's start and the sort. Returns the count taken.
+fill(handle: int, pos: ptr, yaw: ptr, phase: ptr, col: ptr, start: int, n: int) -> int {
+    if !vkframe.ready() || !vkframe.recording() || !valid(handle) { return 0 }
+    c = crowd_at(handle - 1)
+    if pos == null || yaw == null || phase == null || n <= 0 { return 0 }
+    taken_n = n
+    if taken_n > c.capacity { taken_n = c.capacity }
+    job = CrowdFill { out: (c.state_mapped as ptr[])[vkframe.frame_slot()], pos: pos, yaw: yaw, phase: phase,
+                      col: col, start: start }
+    jobs.parallel_for(fill_block, taken_n, 8192, (&job) as ptr)
+    c.count = taken_n
+    return taken_n
+}
+
+// The crowd's rays: its figures' instances point at these pose structures
+// (0 takes them out of the rays).
+set_poses(handle: int, poses: int) {
+    if g_crowds == null || handle <= 0 || handle > MAX_CROWDS { return }
+    crowd_at(handle - 1).poses = poses
+}
+
+// Its near band's: the near mesh's pose structures, the same bank's frames
+// (0 has the far mesh stand in for the near band too).
+set_near_poses(handle: int, poses: int) {
+    if g_crowds == null || handle <= 0 || handle > MAX_CROWDS { return }
+    crowd_at(handle - 1).near_poses = poses
+}
+
+// A barrier over the whole of `buffer`.
+buffer_barrier(commands: ptr, buffer: ptr, src_access: int, dst_access: int, src_stage: int, dst_stage: int) {
+    b = calloc(1, sizeof(VkBufferMemoryBarrier)) as *VkBufferMemoryBarrier
+    b.sType = vk.STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER
+    b.srcAccessMask = src_access
+    b.dstAccessMask = dst_access
+    b.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.buffer = buffer
+    b.size = vk.WHOLE_SIZE
+    vk.vkCmdPipelineBarrier(commands, src_stage, dst_stage, 0, 0, null, 1, b as ptr, 0, null)
+    free(b as ptr)
+}
+
+// One copy of the sort's count of `tier` into command `into`.
+count_copy(at: int, tier: int, into: int) {
+    copy = (g_copies + at * sizeof(VkBufferCopy)) as *VkBufferCopy
+    copy.srcOffset = (tier * 5 + 1) * 4
+    copy.dstOffset = (into * 5 + 1) * 4
+    copy.size = 4
+}
+
+// The sort, recorded into this frame's command buffer before any pass
+// opens: the draw commands reset with each tier's index count, the last
+// frame's reads of the streams waited for, one thread a figure, and the
+// streams and the commands made visible to the vertex input and the
+// indirect read that follow.
+// `casts`: whether the crowd casts at all -- a crowd none of whose models
+// casts a shadow writes no instance into the rays.
+sort(handle: int, cx: float, cz: float, near_dist: float, mid_dist: float, cull_dist: float, casts: bool) -> bool {
+    if !vkframe.recording() || vkframe.pass_open() || !valid(handle) { return false }
+    c = crowd_at(handle - 1)
+    if c.count <= 0 || g_pipeline == null { return false }
+    frame = vkframe.frame_slot()
+    commands = vkframe.frame_commands()
+    d = vkdevice.device()
+
+    // The streams and the commands of the frame before may still be read;
+    // and the frame before's sort wrote the same streams: this one's writes
+    // come after those, not merely after their reads (#410).
+    before = calloc(1, sizeof(VkBufferMemoryBarrier)) as *VkBufferMemoryBarrier
+    before.sType = vk.STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER
+    before.srcAccessMask = vk.ACCESS_VERTEX_ATTRIBUTE_READ_BIT | vk.ACCESS_INDIRECT_COMMAND_READ_BIT
+    before.dstAccessMask = vk.ACCESS_SHADER_WRITE_BIT | vk.ACCESS_TRANSFER_WRITE_BIT
+    before.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    before.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    before.buffer = c.draws
+    before.size = vk.WHOLE_SIZE
+    sorted_before = calloc(1, sizeof(VkMemoryBarrier)) as *VkMemoryBarrier
+    sorted_before.sType = vk.STRUCTURE_TYPE_MEMORY_BARRIER
+    sorted_before.srcAccessMask = vk.ACCESS_SHADER_WRITE_BIT
+    sorted_before.dstAccessMask = vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_SHADER_WRITE_BIT
+    vk.vkCmdPipelineBarrier(commands,
+                            vk.PIPELINE_STAGE_VERTEX_INPUT_BIT | vk.PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                            vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT | vk.PIPELINE_STAGE_TRANSFER_BIT,
+                            0, 1, sorted_before as ptr, 1, before as ptr, 0, null)
+    free(sorted_before as ptr)
+    free(before as ptr)
+
+    memset(g_commands, 0, (DRAWS * COMMAND_BYTES) as long)
+    words = g_commands as uint32[]
+    lit = c.indices as uint32[]
+    shade = c.shadow_indices as uint32[]
+    parts = c.parts as int[]
+    t = 0
+    while t < TIERS {
+        // The sort's own commands carry the first part's counts, so a crowd
+        // of one part a tier reads as it always did.
+        words[t * 5] = lit[t * PARTS]
+        words[(TIERS + t) * 5] = shade[t * PARTS]
+        p = 0
+        while p < parts[t] {
+            words[part_draw(t, p, 0) * 5] = lit[t * PARTS + p]
+            words[part_draw(t, p, 1) * 5] = shade[t * PARTS + p]
+            p = p + 1
+        }
+        t = t + 1
+    }
+    vk.vkCmdUpdateBuffer(commands, c.draws, 0, (DRAWS * COMMAND_BYTES) as long, g_commands)
+    buffer_barrier(commands, c.draws, vk.ACCESS_TRANSFER_WRITE_BIT,
+                   vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_SHADER_WRITE_BIT,
+                   vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+
+    params = g_params
+    counts = params as uint32[]
+    reals = params as f32[]
+    counts[0] = c.count
+    counts[1] = 0
+    if mid_dist > 0.0 { counts[1] = 1 }
+    reals[2] = cx as f32
+    reals[3] = cz as f32
+    reals[4] = (near_dist * near_dist) as f32
+    reals[5] = (mid_dist * mid_dist) as f32
+    reals[6] = 0.0
+    if cull_dist > 0.0 { reals[6] = (cull_dist * cull_dist) as f32 }
+    reals[7] = 0.0
+    reach = vkrays.reach_now()
+    if reach > 0.0 { reals[7] = (reach * reach) as f32 }
+    scale = c.scale as f32[]
+    k = 0
+    while k < TIERS * 4 {
+        reals[8 + k] = scale[k]
+        k = k + 1
+    }
+    // The rays' instances: a slot a figure in this frame's structure,
+    // reserved here, the pose structures' addresses at binding 6 and the
+    // instances at 5. A crowd without pose structures, or a frame without
+    // rays, writes none.
+    counts[20] = 4294967295
+    counts[21] = 0
+    counts[22] = 0
+    ray_written = false
+    traced = casts && vkrays.shadows() && c.poses > 0 && vkrays.pose_ready(c.poses)
+    traced = traced && vkrays.instances() != null && vkrays.counter() != null
+    traced = traced && vkrays.reserved() && vkrays.limit() > vkrays.statics()
+    if traced {
+        // The near band by its own mesh where its structures are there and
+        // have the far mesh's frames; the far mesh's stand in otherwise.
+        near = c.near_poses > 0 && vkrays.pose_ready(c.near_poses)
+        near = near && vkrays.pose_frames(c.near_poses) == vkrays.pose_frames(c.poses)
+        near_table = vkrays.pose_addresses(c.poses)
+        if near { near_table = vkrays.pose_addresses(c.near_poses) }
+        buffers = calloc(4, sizeof(VkDescriptorBufferInfo))
+        writes = calloc(4, sizeof(VkWriteDescriptorSet))
+        b = 0
+        while b < 4 {
+            info = (buffers + b * sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+            if b == 0 { info.buffer = vkrays.instances() }
+            if b == 1 { info.buffer = vkrays.pose_addresses(c.poses) }
+            if b == 2 { info.buffer = vkrays.counter() }
+            if b == 3 { info.buffer = near_table }
+            info.range = vk.WHOLE_SIZE
+            w = (writes + b * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+            w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+            w.dstSet = (c.sets as ptr[])[frame]
+            w.dstBinding = 5 + b
+            w.descriptorCount = 1
+            w.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+            w.pBufferInfo = info as ptr
+            b = b + 1
+        }
+        vk.vkUpdateDescriptorSets(d, 4, writes, 0, null)
+        free(writes)
+        free(buffers)
+        vkrays.claim()
+        counts[20] = vkrays.limit()
+        counts[21] = vkrays.pose_frames(c.poses)
+        if near { counts[22] = 1 }
+        ray_written = true
+    }
+    vk.vkCmdBindPipeline(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_pipeline)
+    set_cell = cell()
+    (set_cell as ptr[])[0] = (c.sets as ptr[])[frame]
+    vk.vkCmdBindDescriptorSets(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_layout, 0, 1, set_cell, 0, null)
+    free(set_cell)
+    vk.vkCmdPushConstants(commands, g_layout, vk.SHADER_STAGE_COMPUTE_BIT, 0, PARAMS_BYTES, params)
+    vk.vkCmdDispatch(commands, (c.count + 255) / 256, 1, 1)
+
+    // The counts the sort wrote, copied from the lit commands to the shadow
+    // ones: the shadow draw is over the same stream with the proxy's index
+    // count, and an atomic can only count into one place. The copies write
+    // the same buffer the sort wrote, so its writes come before theirs too.
+    buffer_barrier(commands, c.draws, vk.ACCESS_SHADER_WRITE_BIT, vk.ACCESS_TRANSFER_READ_BIT | vk.ACCESS_TRANSFER_WRITE_BIT,
+                   vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT)
+    // The sort's count of each tier into the shadow command and into every
+    // part's lit and shadow command.
+    copies = 0
+    t = 0
+    while t < TIERS {
+        count_copy(copies, t, TIERS + t)
+        copies = copies + 1
+        p = 0
+        while p < parts[t] {
+            count_copy(copies, t, part_draw(t, p, 0))
+            count_copy(copies + 1, t, part_draw(t, p, 1))
+            copies = copies + 2
+            p = p + 1
+        }
+        t = t + 1
+    }
+    vk.vkCmdCopyBuffer(commands, c.draws, c.draws, copies, g_copies)
+    buffer_barrier(commands, c.draws, vk.ACCESS_TRANSFER_WRITE_BIT | vk.ACCESS_SHADER_WRITE_BIT,
+                   vk.ACCESS_INDIRECT_COMMAND_READ_BIT,
+                   vk.PIPELINE_STAGE_TRANSFER_BIT | vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                   vk.PIPELINE_STAGE_DRAW_INDIRECT_BIT)
+    t = 0
+    while t < TIERS {
+        buffer_barrier(commands, (c.tier as ptr[])[t], vk.ACCESS_SHADER_WRITE_BIT, vk.ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
+                       vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.PIPELINE_STAGE_VERTEX_INPUT_BIT)
+        t = t + 1
+    }
+    if ray_written {
+        // The instances the sort wrote and the count it added to, for the
+        // structure's build.
+        rays = calloc(2, sizeof(VkBufferMemoryBarrier))
+        first = rays as *VkBufferMemoryBarrier
+        first.sType = vk.STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER
+        first.srcAccessMask = vk.ACCESS_SHADER_WRITE_BIT
+        first.dstAccessMask = vk.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+        first.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+        first.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+        first.buffer = vkrays.instances()
+        first.size = vk.WHOLE_SIZE
+        second = (rays + sizeof(VkBufferMemoryBarrier)) as *VkBufferMemoryBarrier
+        second.sType = vk.STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER
+        second.srcAccessMask = vk.ACCESS_SHADER_WRITE_BIT | vk.ACCESS_SHADER_READ_BIT
+        second.dstAccessMask = vk.ACCESS_HOST_READ_BIT | vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_SHADER_WRITE_BIT
+        second.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+        second.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+        second.buffer = vkrays.counter()
+        second.size = vk.WHOLE_SIZE
+        vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                vk.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                vk.PIPELINE_STAGE_HOST_BIT,
+                                0, 0, null, 2, rays, 0, null)
+        free(rays)
+    }
+    c.sorted = true
+    return true
+}
+
+// A draw of `mesh` with tier `tier` of crowd `handle` as its instances, as
+// many as the sort counted, through the current pipeline family: the lit
+// draw of part `part`.
+draw(mesh: int, texture: int, handle: int, tier: int, part: int) {
+    if !valid(handle) || tier < 0 || tier >= TIERS || part < 0 || part >= PARTS { return }
+    c = crowd_at(handle - 1)
+    if !c.sorted { return }
+    vkframe.draw_indirect(mesh, texture, (c.tier as ptr[])[tier], c.draws,
+                          (part_draw(tier, part, 0) * COMMAND_BYTES) as long, false)
+}
+
+// Its shadow draw, in the shadow pass: the part's depth proxy by the same
+// count.
+shadow_draw(mesh: int, handle: int, tier: int, part: int) {
+    if !valid(handle) || tier < 0 || tier >= TIERS || part < 0 || part >= PARTS { return }
+    c = crowd_at(handle - 1)
+    if !c.sorted { return }
+    vkframe.draw_indirect(mesh, vkframe.default_texture(), (c.tier as ptr[])[tier], c.draws,
+                          (part_draw(tier, part, 1) * COMMAND_BYTES) as long, true)
+}

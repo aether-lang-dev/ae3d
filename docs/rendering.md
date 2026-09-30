@@ -12,7 +12,10 @@ The feature list in full, with the reasoning behind each. The [README](../README
   lights, a Gerstner ocean, an instanced voxel chunk, the clouds, the
   occlusion and instances placed as points. They agree to within 0.7% of
   channels, and CI fails if the generated Vulkan shaders fall behind the GLSL
-  they are made from.
+  they are made from. The scenes a person looks at are held to each other
+  too: `tools/scene_parity.ae` draws `zombie_city` from its seven views,
+  `zombie_street` and `street_drive` on both at a fixed tick and compares
+  them region by region ([testing.md](testing.md#the-scenes-on-both-renderers)).
 - **The sun by the hour.** `engine_set_time_of_day(hours)` puts the sun where
   the hour does and sets the key light, the fog and a sky drawn from the same
   sun -- blue at noon, gold and red at dusk, moonlit at night -- so the sky,
@@ -52,9 +55,11 @@ The feature list in full, with the reasoning behind each. The [README](../README
   both backends), the key light's shadow in four cascades that a moving camera does not
   move ([Shadows](#shadows), both
   backends), volumetric clouds and their shadows, a sky drawn from the sun by
-  the hour or a painted one, fog applied after tone mapping, MSAA, FXAA and
-  bloom. Screen-space reflections on wet surfaces on
-  Vulkan.
+  the hour or a painted one, fog applied after tone mapping and the key
+  lamp's light scattered in the fogged air (the haze stands around a lamp
+  and thins away from it, marched along the view ray; both backends,
+  `rendering.set_frame_haze`), MSAA, FXAA and bloom. Screen-space
+  reflections on wet surfaces on Vulkan.
 - **A wet road, not a mirror.** The reflection (`engine_set_ssr(e, on,
   road_height, strength)`) is Fresnel-weighted -- little from a camera
   looking down at the road, most at a grazing look -- over a puddle mask in
@@ -222,7 +227,7 @@ uniform budget over); a skinned model's motion is its model's and the
 camera's. Capture channel 3 (`engine_set_capture_channel(e, 3)`,
 `AE3D_CAPTURE=3`) draws the vector in pixels, a hundred either way across
 the byte and 128 for still, and `tests/test_velocity` holds it against the
-camera's own projection to the pixel. On Vulkan `ae3d_vk_velocity_texture`
+camera's own projection to the pixel. On Vulkan `vkframe.velocity_texture`
 is the resolved target, which is what an upscaler is handed (#324).
 
 ### Render scale
@@ -254,10 +259,13 @@ ray-query variant (`scene_rq_vk.frag`, GLSL 4.60, SPIR-V 1.4, the
 structure at binding 5) traces one opaque ray, first hit, from a
 little off the surface: lit, or the shadow's share of the light, exact
 at any distance and with no map's texel to fit the world into. What the
-structure does not hold -- a skinned figure, a point stream, a crowd
-not in the rays -- stays in the shadow map, which is drawn with those
-alone while the rays are on, and the two shadows combine, the darker
-winning. Off, or on a device that does not trace, nothing changes;
+structure does not hold -- a point stream, a crowd not in the rays, a
+skinned figure past the rays' budget -- stays in the shadow map, which is
+drawn with those alone while the rays are on, and the two shadows
+combine, the darker winning; where the rays hold everything that casts,
+the key light's cascades are not drawn at all (the frame's shadow stage is
+the crowd's sort and the structure's build, and any lamp's own faces). Off,
+or on a device that does not trace, nothing changes;
 `AE3D_NO_RAYS=1` keeps the extensions off. `tests/test_ray_shadows`
 holds the rays' shadow to the map's -- the same ground shaded to the
 same depth, the same edge -- and past the edge, a ray's ground fully lit
@@ -281,12 +289,56 @@ the top-level build then takes the whole room, since the instance count
 cannot come from the device on hardware without indirect builds.
 `tests/test_ray_shadows` stands a device-sorted figure beside the ball
 and checks the ground it shades by ray against the map's shadow of it.
+The near band goes in as the mesh it is drawn with:
+`crowd.device_crowd_rays_near(dc, near, bank)` bakes the near tier's mesh
+at every frame of the bank the same way, and the sort points a near
+figure's instance at those, at the near tier's scale, where the far mesh
+stood in for it before -- a zombie beside the camera threw a
+hundred-and-sixty-eight-triangle shadow. The structures are built to be
+compacted and copied into the size they need (a build sizes a structure
+for the worst its triangles could take), and the posed vertices are let
+go once built: the city's zombie, 26,636 triangles at 48 frames with its
+far mesh, takes 35 MB of structures a figure (94 MB uncompacted with the
+posed vertices kept). `tests/test_ray_shadows` draws a figure near the
+camera as a quad twice the width of its far mesh: with the far mesh
+standing in, its shadow by ray is 1,760 pixels off the map's 4,251; with
+the near structures, 1 pixel. A crowd none of whose models casts writes
+nothing into the rays, as it draws nothing into the map.
 Measured in the city (`AE3D_NEAR=3 AE3D_NOPROPS=1 AE3D_SEPN=4`, the
 device sort drawing every part whole): at 400 figures nothing changes;
 at half a million the frame goes from 78 to 63 fps with the whole visible
 horde in the rays -- that scene packs a thousand figures a square metre,
 so a shadow ray crosses hundreds of overlapping structures, a density no
 game scene has -- and 20,000 at a 28 m near band stays at 110.
+
+A skinned figure -- a player, anything drawn by its own skeleton -- is
+posed into the rays each frame (`engine_set_ray_skinned(e, n)`, 32 by
+default, 0 leaves them to the map): the nearest within the shadow
+distance, each skinned on the device by a compute pass
+(`skin_vk.comp`, a thread a vertex) from its bind pose and the palette
+its draw is posed by, into a buffer its bottom-level structure is then
+refitted from, every figure in one build call, and built afresh every
+sixteen frames (the figures taking turns) so a pose far from the one the
+tree was built in does not loosen it. Its instance takes the model's
+matrix as the draw does. `tests/test_ray_shadows` stands a slab on two
+bones with its top carried twenty metres sideways, and reads each shadow
+as what the slab's casting darkens (the frame against the same frame with
+it casting nothing): its shadow by ray has the footprint of its shadow in
+the map to within eight pixels -- measured at 0 of 635 -- and lies 295
+pixels from the upright slab's, so the pose traced is the one drawn;
+posed again, the ray's shadow follows (0 pixels off); and with the slab,
+the ball and the ground all in the rays the map is not drawn. In the
+street, posing the zombie and its clothes (30,364 triangles) costs the
+device 0.12 ms a frame (0.30 against 0.18 ms of the frame's shadow stage,
+the median of three runs each at 720p) and the CPU 0.02 ms; with the
+rays on it used to cast no shadow from the key lamp at all, since a lamp
+the rays cover has no map and the figure was in neither. A figure whose
+palette has not changed since it was last posed keeps its structure and
+costs its instance alone. In `street_drive` the thirteen bystanders (26
+skinned models) are all in the rays at the default budget and the map is
+not drawn: the device's frame is 2.28 ms, against 2.29 ms with them left to
+the map (`AE3D_RAY_SKINNED=0`), their shadows now the rays' like the
+street's.
 
 The sun has a size: `engine_set_sun_size(e, degrees)`, the angle its
 disc subtends (`AE3D_SUN_SIZE=n` in tenths of a degree; the real sun is
@@ -342,8 +394,26 @@ reflection (`engine_set_ssr`), the occlusion by ray and the temporal pass:
 400 figures 139 fps, 20,000 at a 28 m near band 54 (113 with the map alone,
 `AE3D_RAYS=0`).
 
-What is left for the rays to do next: the skinned figures, so the map
-goes; reflections by ray (#323).
+With the rays holding the skinned figures and the near band (#492), the
+city draws no map at all (0 of 590 frames at 400 figures and at 20,000).
+At 400 figures the frame stays at the display's 144 fps and the device's
+time falls from 6.60 to 6.43 ms; at 20,000 with a 28 m near band it goes
+from 18.4 to 19.05 fps, the device's time from 54.2 to 52.4 ms: the
+near band traced as the figures drawn there costs the opaque pass less
+than their stand-ins did. (The median of three runs
+each, alternating with the tree before, at 720p on an RTX 4070 Ti. The
+139 and 54 fps this page gave before were measured on 18 September;
+the city has changed since -- at 20,000 its 28 m near band now holds
+some 4,500 figures drawn whole, 137 million triangles a frame -- and on the same
+machine the tree before this change draws it at 144 and 18.4, #498.)
+The scene parity check (#494) then found the horde missing from the lamps'
+own shadows on Vulkan -- a crowd sorted on the device was bounded by one
+figure at the origin -- and put it there: at 20,000 the frame is 17.5 fps,
+the lamps beyond the rays' reach each drawing the horde into their faces
+(the shadow stage 9.6 ms, from 2.3), until each lamp's faces draw only the
+figures within its reach (#505). At 400 it stays at 144.
+
+What is left for the rays to do next: reflections by ray (#323).
 
 ### DLSS
 
@@ -709,8 +779,11 @@ Held to numbers: `tests/test_lamp_shadows.ae`, offscreen on both renderers.
   once at upload.
 - **The frame's uniforms go up once per program, not once per model.** Of the
   uniforms a draw needs, all but one are the same for every model in the
-  frame. Draws that share geometry and a material are merged into one
-  instanced draw automatically (`core.set_draw_merging(false)` turns it off).
+  frame. Draws that share geometry and a material -- its colour, its normal
+  map and its numbers -- are merged into one instanced draw automatically
+  (`core.set_draw_merging(false)` turns it off). A merged draw goes after
+  every model drawn on its own, and sets everything it is shaded and posed
+  by itself rather than keep what the draw before it left.
 - **The frame allocates nothing.** `benchmarks/bench_frame.ae` runs the
   heaviest per-frame work two thousand times with no window: 578us to upload
   two hundred thousand instance matrices, under a microsecond each for

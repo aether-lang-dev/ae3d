@@ -1,0 +1,1697 @@
+// ae3d.vkrays -- the scene's acceleration structures on the Vulkan backend
+// (#402), on contrib.vulkan.vk.
+//
+// Where the device has VK_KHR_ray_query, every static mesh gets a
+// bottom-level structure at upload (blas_build, from ae3d.vkmesh) and the
+// renderer adds the frame's instances -- the models that cast, with their
+// matrices -- before the passes; the top-level structure is built from
+// them, once a frame, in a ring of two, and the fragment shader traces its
+// shadow rays through it (the ray-query variant of the scene fragment, at
+// binding 5, which ae3d.vkframe binds from structure(frame)). What the
+// structure does not hold stays in the shadow map; the two shadows are
+// combined in the shader, the darker winning.
+//
+// A skinned figure, whose pose is in no buffer -- the draw poses it in its
+// vertex shader -- is posed for the rays each frame (skin_pose): a compute
+// pass (skin_vk.comp) skins its bind pose by the frame's palette into a
+// buffer of its own, and its bottom-level structure is refitted from that
+// (built afresh every REBUILD frames), the nearest figures first up to a
+// budget. A figure past the budget or the reach keeps the map.
+//
+// A crowd's figures are in the rays too, by pose structures: its far mesh
+// skinned on the CPU at every frame of its pose bank, a bottom-level
+// structure each, and their addresses in a buffer the crowd's sort reads
+// (ae3d.vkcrowd) to point each figure's instance at the frame its walk is
+// at. The sort writes those instances into the frame's buffer on the
+// device, past the static scene's slots, and counts them into a word the
+// CPU reads back two frames later: what sizes the room it is given next.
+
+import contrib.vulkan.vk
+import ae3d.vkhost
+import ae3d.vkdevice
+import ae3d.vkdesc
+import ae3d.vkspirv
+import ae3d.geometry
+
+exports (
+    Blas, start, stop, input_usage, blas_build, blas_free,
+    begin, reserve, add, add_one, build, empty, structure,
+    query, set_shadows, shadows, shadows_now, set_reach, reach_now, set_budget, budget, figures,
+    instances, counter, limit, statics, reserved, claim,
+    pose_create, pose_destroy, pose_frames, pose_addresses, pose_ready, pose_bytes,
+    skin_pose, skin_end, skin_posed, skin_forget, set_skin_budget, skin_budget, skinned
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memset(p: ptr, value: int, n: long) -> ptr
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+extern memcmp(a: ptr, b: ptr, n: long) -> int
+extern sqrt(x: float) -> float
+
+const FRAMES = 2
+// The crowds a device keeps, and so the pose structures.
+const MAX_POSES = 8
+// An instance of the top-level structure: its transform (three rows of
+// four floats), the custom index and mask, the binding-table offset and
+// flags, and the bottom-level structure it points at.
+const INSTANCE_BYTES = 64
+
+// A bottom-level structure: the handle, the buffer it lives in and its
+// memory, and the address an instance points at. Nulls and 0 for none.
+struct Blas {
+    handle: ptr
+    buffer: ptr
+    memory: ptr
+    address: long
+}
+
+// A frame slot's top-level structure: the structure and its storage, the
+// scratch its build uses, the instances it is built from (mapped: the
+// static scene's are written by the CPU) and how many they can be, and
+// the count the sorts add to, where the CPU reads it back.
+struct RayFrame {
+    structure: ptr
+    buffer: ptr
+    memory: ptr
+    size: long
+    scratch: ptr
+    scratch_memory: ptr
+    scratch_size: long
+    instances: ptr
+    instances_memory: ptr
+    instances_mapped: ptr
+    capacity: int
+    range: ptr
+    range_memory: ptr
+    range_mapped: ptr
+    built: bool
+}
+
+// A crowd's pose structures: one a frame of its pose bank, the posed
+// vertices each is built from, and the buffer of their addresses.
+struct PoseSet {
+    in_use: bool
+    frames: int
+    vertices: ptr                  // VkBuffer[frames]
+    vertex_memory: ptr             // VkDeviceMemory[frames]
+    blas: ptr                      // Blas[frames]
+    addresses: ptr
+    address_memory: ptr
+    bytes: long                    // what the structures and their vertices take on the device
+}
+
+var g_frames: ptr = null           // RayFrame[FRAMES]
+var g_poses: ptr = null            // PoseSet[MAX_POSES]
+var g_last_blas_size: long = 0     // the size of the structure blas_build last sized
+var g_alignment = 256              // the scratch address's alignment
+var g_query = false
+
+// The frame being gathered: the CPU's instances written, the static
+// scene's slots, whether a sort appended past them, the room reserved, the
+// buffer taken by a sort (no remaking it this frame), and the structure
+// built and readable.
+var g_count = 0
+var g_static = 0
+var g_limit = 0
+var g_dynamic_seen = 0
+var g_appended = false
+var g_reserved = false
+var g_locked = false
+var g_ready = false
+
+// Shadows by ray, how far from the camera a crowd's figures may be in the
+// rays (0 for all) and the reach that keeps them near the budget.
+var g_shadows = false
+var g_reach = 0.0
+var g_reach_now = 0.0
+var g_seen = 0
+// Kept across starts: a program sets it before the renderer is up as
+// often as after. 2048 figures by default, the nearest, whose shadows and
+// occlusion are the ones a camera sees.
+var g_budget = 2048
+
+frame_at(frame: int) -> *RayFrame { return (g_frames + frame * sizeof(RayFrame)) as *RayFrame }
+pose_at(index: int) -> *PoseSet { return (g_poses + index * sizeof(PoseSet)) as *PoseSet }
+
+// The rays on the device ae3d.vkdevice made, where it traces: the build
+// scratch's alignment read, the frame slots made empty. Once a device.
+start() {
+    g_query = vkdevice.ray_query()
+    if g_frames == null { g_frames = calloc(FRAMES, sizeof(RayFrame)) }
+    if g_poses == null { g_poses = calloc(MAX_POSES, sizeof(PoseSet)) }
+    g_count = 0
+    g_static = 0
+    g_limit = 0
+    g_dynamic_seen = 0
+    g_appended = false
+    g_reserved = false
+    g_locked = false
+    g_ready = false
+    g_shadows = false
+    g_reach = 0.0
+    g_reach_now = 0.0
+    g_seen = 0
+    if !g_query { return }
+    props = calloc(1, sizeof(VkPhysicalDeviceAccelerationStructurePropertiesKHR)) as *VkPhysicalDeviceAccelerationStructurePropertiesKHR
+    props.sType = vk.STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR
+    p2 = calloc(1, sizeof(VkPhysicalDeviceProperties2)) as *VkPhysicalDeviceProperties2
+    p2.sType = vk.STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+    p2.pNext = props as ptr
+    vk.vkGetPhysicalDeviceProperties2(vkdevice.physical(), p2 as ptr)
+    g_alignment = (props.minAccelerationStructureScratchOffsetAlignment) as int
+    if g_alignment == 0 { g_alignment = 256 }
+    free(p2 as ptr)
+    free(props as ptr)
+}
+
+// Everything made here destroyed, the device idle: before the frame shuts
+// down (ae3d.vkframe).
+stop() {
+    if g_frames == null { return }
+    d = vkdevice.device()
+    if d != null && g_query {
+        vk.vkDeviceWaitIdle(d)
+        f = 0
+        while f < FRAMES {
+            free_frame(f)
+            f = f + 1
+        }
+        p = 0
+        while p < MAX_POSES {
+            if pose_at(p).in_use { pose_destroy(p + 1) }
+            p = p + 1
+        }
+        skin_stop()
+    }
+    g_query = false
+}
+
+// Whether the device traces rays: extensions, features and entry points.
+query() -> bool { return g_query }
+
+// The usage a mesh's buffers take for the builder to read them.
+input_usage() -> int {
+    if !g_query { return 0 }
+    return vk.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | vk.BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+}
+
+address_of(buffer: ptr) -> long {
+    info = calloc(1, sizeof(VkBufferDeviceAddressInfo)) as *VkBufferDeviceAddressInfo
+    info.sType = vk.STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO
+    info.buffer = buffer
+    a = vk.vkGetBufferDeviceAddress(vkdevice.device(), info as ptr) as long
+    free(info as ptr)
+    return a
+}
+
+// A buffer with its memory and where it is: a build's scratch at an
+// address aligned as the device asks, or a buffer the host writes, mapped.
+struct Placed {
+    buffer: ptr
+    memory: ptr
+    address: long
+    mapped: ptr
+}
+
+// A build's scratch, its address aligned as the device asks.
+scratch_for(size: long) -> Placed {
+    made = vkhost.device_buffer((size + (g_alignment as long)) as int,
+                                vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+    out = Placed { buffer: made.buffer, memory: made.memory, address: 0 as long, mapped: null }
+    if made.buffer != null { out.address = aligned(address_of(made.buffer)) }
+    return out
+}
+
+aligned(raw: long) -> long {
+    a = g_alignment as long
+    return (raw + a - 1) / a * a
+}
+
+// A structure of `size` bytes of `kind` (bottom or top level) in a buffer
+// of its own; nulls when it could not be made.
+make_structure(size: long, kind: int) -> Blas {
+    out = Blas { handle: null, buffer: null, memory: null, address: 0 as long }
+    storage = vkhost.device_buffer(size as int, vk.BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                                               vk.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+    if storage.buffer == null { return out }
+    create = calloc(1, sizeof(VkAccelerationStructureCreateInfoKHR)) as *VkAccelerationStructureCreateInfoKHR
+    create.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR
+    create.buffer = storage.buffer
+    create.size = size
+    create.type = kind
+    cell = calloc(1, 8)
+    r = vk.vkCreateAccelerationStructureKHR(vkdevice.device(), create as ptr, null, cell)
+    handle = (cell as ptr[])[0]
+    free(cell)
+    free(create as ptr)
+    if r != vk.SUCCESS {
+        vkhost.device_buffer_free(storage)
+        return out
+    }
+    out.handle = handle
+    out.buffer = storage.buffer
+    out.memory = storage.memory
+    return out
+}
+
+// A mesh's bottom-level structure, built once from its vertex and index
+// buffers (`stride` bytes a vertex, the position first), fast to trace.
+// With `commands` -- the upload batch (ae3d.vkhost's) -- the build goes into it
+// after the copies that fill its inputs, behind a barrier from their
+// writes to its reads, and its scratch is kept until the batch has run;
+// with null it is submitted on its own and waited for. Nulls when it
+// could not be built: the mesh's shadow then comes from the map alone.
+blas_build(vertices: ptr, indices: ptr, vertex_count: int, index_count: int, stride: int, commands: ptr) -> Blas {
+    return blas_build_with(vertices, indices, vertex_count, index_count, stride, commands,
+                           vk.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
+}
+
+// The same with the build's flags: a structure that will be compacted
+// (compact) is built to allow it.
+blas_build_with(vertices: ptr, indices: ptr, vertex_count: int, index_count: int, stride: int, commands: ptr,
+                flags: int) -> Blas {
+    out = Blas { handle: null, buffer: null, memory: null, address: 0 as long }
+    triangles = index_count / 3
+    if !g_query || triangles == 0 { return out }
+    d = vkdevice.device()
+
+    geometry = calloc(1, sizeof(VkAccelerationStructureGeometryKHR)) as *VkAccelerationStructureGeometryKHR
+    geometry.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR
+    geometry.geometryType = vk.GEOMETRY_TYPE_TRIANGLES_KHR
+    geometry.flags = vk.GEOMETRY_OPAQUE_BIT_KHR
+    geometry.geometry.triangles.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR
+    geometry.geometry.triangles.vertexFormat = vk.FORMAT_R32G32B32_SFLOAT
+    geometry.geometry.triangles.vertexData.deviceAddress = address_of(vertices)
+    geometry.geometry.triangles.vertexStride = stride
+    top = vertex_count - 1
+    if top < 0 { top = 0 }
+    geometry.geometry.triangles.maxVertex = top
+    geometry.geometry.triangles.indexType = vk.INDEX_TYPE_UINT32
+    geometry.geometry.triangles.indexData.deviceAddress = address_of(indices)
+
+    info = calloc(1, sizeof(VkAccelerationStructureBuildGeometryInfoKHR)) as *VkAccelerationStructureBuildGeometryInfoKHR
+    info.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR
+    info.type = vk.ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR
+    info.flags = flags
+    info.mode = vk.BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR
+    info.geometryCount = 1
+    info.pGeometries = geometry as ptr
+
+    sizes = calloc(1, sizeof(VkAccelerationStructureBuildSizesInfoKHR)) as *VkAccelerationStructureBuildSizesInfoKHR
+    sizes.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR
+    count = calloc(1, 4)
+    (count as uint32[])[0] = triangles
+    vk.vkGetAccelerationStructureBuildSizesKHR(d, vk.ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, info as ptr, count, sizes as ptr)
+    free(count)
+
+    g_last_blas_size = sizes.accelerationStructureSize as long
+    made = make_structure(sizes.accelerationStructureSize as long, vk.ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+    scratch = scratch_for(sizes.buildScratchSize as long)
+    free(sizes as ptr)
+    if made.handle == null || scratch.buffer == null {
+        blas_free(made)
+        vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: scratch.buffer, memory: scratch.memory })
+        free(info as ptr)
+        free(geometry as ptr)
+        return out
+    }
+    info.dstAccelerationStructure = made.handle
+    info.scratchData.deviceAddress = scratch.address
+
+    range = calloc(1, sizeof(VkAccelerationStructureBuildRangeInfoKHR)) as *VkAccelerationStructureBuildRangeInfoKHR
+    range.primitiveCount = triangles
+    ranges = calloc(1, 8)
+    (ranges as ptr[])[0] = range as ptr
+    if commands != null {
+        written = calloc(1, sizeof(VkMemoryBarrier)) as *VkMemoryBarrier
+        written.sType = vk.STRUCTURE_TYPE_MEMORY_BARRIER
+        written.srcAccessMask = vk.ACCESS_TRANSFER_WRITE_BIT
+        written.dstAccessMask = vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+        vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_TRANSFER_BIT,
+                                vk.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, written as ptr,
+                                0, null, 0, null)
+        free(written as ptr)
+        vk.vkCmdBuildAccelerationStructuresKHR(commands, 1, info as ptr, ranges)
+        vkhost.batch_keep(scratch.buffer, scratch.memory)
+    } else {
+        once = vkhost.once_begin()
+        if once != null {
+            vk.vkCmdBuildAccelerationStructuresKHR(once, 1, info as ptr, ranges)
+            vkhost.once_end(once)
+        }
+        vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: scratch.buffer, memory: scratch.memory })
+    }
+    free(ranges)
+    free(range as ptr)
+    free(info as ptr)
+    free(geometry as ptr)
+
+    where = calloc(1, sizeof(VkAccelerationStructureDeviceAddressInfoKHR)) as *VkAccelerationStructureDeviceAddressInfoKHR
+    where.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR
+    where.accelerationStructure = made.handle
+    made.address = vk.vkGetAccelerationStructureDeviceAddressKHR(d, where as ptr) as long
+    free(where as ptr)
+    return made
+}
+
+// A structure gone, with its storage. Nothing for nulls.
+blas_free(b: Blas) {
+    d = vkdevice.device()
+    if d == null { return }
+    if b.handle != null { vk.vkDestroyAccelerationStructureKHR(d, b.handle, null) }
+    if b.buffer != null { vk.vkDestroyBuffer(d, b.buffer, null) }
+    if b.memory != null { vk.vkFreeMemory(d, b.memory, null) }
+}
+
+// --- the frame's structure ---------------------------------------------------------------------------------------
+
+free_frame(frame: int) {
+    d = vkdevice.device()
+    f = frame_at(frame)
+    if f.structure != null { vk.vkDestroyAccelerationStructureKHR(d, f.structure, null) }
+    if f.buffer != null { vk.vkDestroyBuffer(d, f.buffer, null) }
+    if f.memory != null { vk.vkFreeMemory(d, f.memory, null) }
+    if f.scratch != null { vk.vkDestroyBuffer(d, f.scratch, null) }
+    if f.scratch_memory != null { vk.vkFreeMemory(d, f.scratch_memory, null) }
+    if f.instances_mapped != null { vk.vkUnmapMemory(d, f.instances_memory) }
+    if f.instances != null { vk.vkDestroyBuffer(d, f.instances, null) }
+    if f.instances_memory != null { vk.vkFreeMemory(d, f.instances_memory, null) }
+    if f.range_mapped != null { vk.vkUnmapMemory(d, f.range_memory) }
+    if f.range != null { vk.vkDestroyBuffer(d, f.range, null) }
+    if f.range_memory != null { vk.vkFreeMemory(d, f.range_memory, null) }
+    memset(f as ptr, 0, sizeof(RayFrame) as long)
+    // The frame's sets named the structure: written again when next claimed.
+    vkdesc.forget_all()
+}
+
+// A buffer the host writes and the device reads: in the device's own
+// memory where the host can see it (the BAR), system memory where it
+// cannot. Mapped for good.
+host_written(bytes: int, usage: int) -> Placed {
+    host = vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT
+    made = vkhost.buffer_of(bytes, usage, vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT | host)
+    if made.buffer == null { made = vkhost.buffer_of(bytes, usage, host) }
+    out = Placed { buffer: made.buffer, memory: made.memory, address: 0 as long, mapped: null }
+    if made.buffer == null { return out }
+    cell = calloc(1, 8)
+    vk.vkMapMemory(vkdevice.device(), made.memory, 0, vk.WHOLE_SIZE, 0, cell)
+    out.mapped = (cell as ptr[])[0]
+    free(cell)
+    return out
+}
+
+// The frame's instance buffer, big enough for `count` instances: grown by
+// doubling, which waits for the device once and remakes the structure
+// with it.
+frame_reserve(frame: int, count: int) -> bool {
+    f = frame_at(frame)
+    capacity = f.capacity
+    if count <= capacity && f.instances != null { return true }
+    // Once a sort has been recorded into this frame's buffer it cannot be
+    // remade: the renderer reserves the frame's total before the sorts
+    // (reserve), and this is what happens when it did not.
+    if g_locked {
+        vkdevice.fail("the rays' instance buffer is full for this frame")
+        return false
+    }
+    while capacity < count {
+        if capacity == 0 { capacity = 256 } else { capacity = capacity * 2 }
+    }
+    vk.vkDeviceWaitIdle(vkdevice.device())
+    free_frame(frame)
+    // Written by the CPU (the static scene) and by the sort (the crowd); a
+    // transfer's destination too: a frame clears the crowds' room with a
+    // fill before the sorts write into it.
+    usage = vk.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | vk.BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            vk.BUFFER_USAGE_TRANSFER_DST_BIT | vk.BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+    made = host_written(capacity * INSTANCE_BYTES, usage)
+    if made.buffer == null { return false }
+    f.instances = made.buffer
+    f.instances_memory = made.memory
+    f.instances_mapped = made.mapped
+    if made.mapped == null {
+        vkdevice.fail("instance vkMapMemory failed")
+        return false
+    }
+    f.capacity = capacity
+    // The count, four words, where the host can read it back.
+    host = vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT
+    range = vkhost.buffer_of(16, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT, host)
+    if range.buffer == null { return false }
+    f.range = range.buffer
+    f.range_memory = range.memory
+    cell = calloc(1, 8)
+    r = vk.vkMapMemory(vkdevice.device(), range.memory, 0, vk.WHOLE_SIZE, 0, cell)
+    f.range_mapped = (cell as ptr[])[0]
+    free(cell)
+    if r != vk.SUCCESS {
+        f.range_mapped = null
+        vkdevice.fail("range vkMapMemory failed")
+        return false
+    }
+    (f.range_mapped as uint32[])[0] = 0
+    return true
+}
+
+// The frame's instances begin: nothing in it yet. At every frame's start.
+begin() {
+    g_count = 0
+    g_static = 0
+    g_appended = false
+    g_reserved = false
+    g_ready = false
+    g_locked = false
+    g_serial = g_serial + 1
+    g_skin_started = false
+    g_skinned_now = 0
+}
+
+// The reach that holds the figures in the rays near the budget. The
+// figures the sorts took when this frame's slot was last used -- two
+// frames ago, before the last two changes of reach took effect -- are the
+// measure, so the steps are small: over the budget the reach shrinks by the
+// fourth root of the ratio, under half of it it grows by the fourth root,
+// and between the two it is left alone, which is what keeps a count read
+// late from swinging the reach back and forth. Never past the reach the
+// renderer set (the shadow distance), never under half a metre.
+reach_follow(seen: int) {
+    if g_budget == 0 || g_reach <= 0.0 {
+        g_reach_now = g_reach
+        return
+    }
+    if g_reach_now <= 0.0 { g_reach_now = g_reach }
+    if seen > g_budget {
+        ratio = (g_budget as float) / (seen as float)
+        g_reach_now = g_reach_now * sqrt(sqrt(ratio))
+    } else if seen * 2 < g_budget {
+        ratio = 4.0
+        if seen > 0 { ratio = (g_budget as float) / (seen as float) }
+        if ratio > 4.0 { ratio = 4.0 }
+        g_reach_now = g_reach_now * sqrt(sqrt(ratio))
+    }
+    if g_reach_now > g_reach { g_reach_now = g_reach }
+    if g_reach_now < 0.5 { g_reach_now = 0.5 }
+}
+
+// A buffer barrier of the whole of `buffer`, recorded into `commands`.
+buffer_barrier(commands: ptr, buffer: ptr, src_access: int, dst_access: int, src_stage: int, dst_stage: int) {
+    b = calloc(1, sizeof(VkBufferMemoryBarrier)) as *VkBufferMemoryBarrier
+    b.sType = vk.STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER
+    b.srcAccessMask = src_access
+    b.dstAccessMask = dst_access
+    b.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.buffer = buffer
+    b.size = vk.WHOLE_SIZE
+    vk.vkCmdPipelineBarrier(commands, src_stage, dst_stage, 0, 0, null, 1, b as ptr, 0, null)
+    free(b as ptr)
+}
+
+// Room for `count` instances this frame, before any sort writes into the
+// buffer: the crowds' figures and the static scene's instances together,
+// of which the static scene's `static_count` take the first slots. The
+// count the build reads starts at those and the sorts add theirs on the
+// device.
+reserve(count: int, static_count: int) -> bool {
+    frame = vkhost.frame_slot()
+    if !g_query || !vkhost.recording() || count <= 0 || vkhost.pass_open() { return false }
+    if !frame_reserve(frame, count) { return false }
+    f = frame_at(frame)
+    statics_now = static_count
+    if statics_now < 0 { statics_now = 0 }
+    if statics_now > f.capacity { statics_now = f.capacity }
+    g_static = statics_now
+    g_count = 0
+    g_reserved = true
+    figures_now = count - statics_now
+    // The count this frame's slot held when it was last used, two frames
+    // ago, is what the sorts appended then: the room for them now is that
+    // and a quarter more, or all of them when nothing is known yet. Kept as
+    // the most seen lately, so a horde walking into view grows it.
+    seen = 0
+    if f.range_mapped != null { seen = (f.range_mapped as uint32[])[0] as int }
+    if seen > g_static { seen = seen - g_static } else { seen = 0 }
+    g_seen = seen
+    reach_follow(seen)
+    if seen > g_dynamic_seen {
+        g_dynamic_seen = seen
+    } else {
+        g_dynamic_seen = g_dynamic_seen - g_dynamic_seen / 16 + seen / 16
+    }
+    room = g_dynamic_seen + g_dynamic_seen / 4 + 4096
+    if g_dynamic_seen == 0 { room = figures_now }
+    if room > figures_now { room = figures_now }
+    g_limit = g_static + room
+    // The count starts at the static scene's slots; the sorts add to it.
+    if f.range_mapped != null { (f.range_mapped as uint32[])[0] = g_static }
+    // The crowds' room zeroed, so a slot no figure takes is inactive. After
+    // this slot's last use, two frames ago: the sorts wrote the buffer from
+    // a compute shader and the build read it. The fill writes it again, so
+    // it waits for both. The meter's barriers at the end of every frame
+    // used to cover this by accident; with the meter off, sync validation
+    // found 54 write-after-write hazards in zombie_city.
+    if room > 0 {
+        commands = vkhost.frame_commands()
+        buffer_barrier(commands, f.instances, vk.ACCESS_SHADER_WRITE_BIT, vk.ACCESS_TRANSFER_WRITE_BIT,
+                       vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT | vk.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                       vk.PIPELINE_STAGE_TRANSFER_BIT)
+        vk.vkCmdFillBuffer(commands, f.instances, (g_static * INSTANCE_BYTES) as long, (room * INSTANCE_BYTES) as long, 0)
+        buffer_barrier(commands, f.instances, vk.ACCESS_TRANSFER_WRITE_BIT,
+                       vk.ACCESS_SHADER_WRITE_BIT | vk.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                       vk.PIPELINE_STAGE_TRANSFER_BIT,
+                       vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT | vk.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR)
+    }
+    return true
+}
+
+// One instance record at `at`: the transform from the column-major matrix
+// of floats at `m`, the mask all on, facing culling off, pointing at the
+// structure at `address`.
+write_instance(at: ptr, m: ptr, address: long) {
+    t = at as f32[]
+    src = m as f32[]
+    r = 0
+    while r < 3 {
+        t[r * 4] = src[r]
+        t[r * 4 + 1] = src[4 + r]
+        t[r * 4 + 2] = src[8 + r]
+        t[r * 4 + 3] = src[12 + r]
+        r = r + 1
+    }
+    words = (at + 48) as uint32[]
+    words[0] = 255 << 24
+    words[1] = vk.GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR << 24
+    ((at + 56) as long[])[0] = address
+}
+
+// `count` instances of the mesh whose structure is at `address`, at the
+// column-major matrices of floats at `matrices`, into this frame's
+// structure. A mesh without a structure (address 0: a skinned one, or one
+// the build refused) adds nothing.
+add(address: long, matrices: ptr, count: int) {
+    frame = vkhost.frame_slot()
+    if !g_query || !vkhost.recording() || count <= 0 || matrices == null || address == 0 { return }
+    if g_static > 0 {
+        // Into the slots reserved for the static scene; past them the
+        // sorts have appended, and an instance more than was counted for
+        // is dropped (and said).
+        if g_count + count > g_static {
+            vkdevice.fail("more static instances than were reserved for the rays")
+            return
+        }
+    } else if !frame_reserve(frame, g_count + count) {
+        return
+    }
+    f = frame_at(frame)
+    i = 0
+    while i < count {
+        at = f.instances_mapped + (g_count + i) * INSTANCE_BYTES
+        memset(at, 0, INSTANCE_BYTES as long)
+        write_instance(at, matrices + i * 64, address)
+        i = i + 1
+    }
+    g_count = g_count + count
+}
+
+// One instance at a column-major matrix of doubles: a model drawn on its
+// own, whose matrix the scene keeps in doubles.
+add_one(address: long, matrix: ptr) {
+    if matrix == null { return }
+    m = calloc(16, 4)
+    floats = m as f32[]
+    doubles = matrix as float[]
+    i = 0
+    while i < 16 {
+        floats[i] = doubles[i] as f32
+        i = i + 1
+    }
+    add(address, m, 1)
+    free(m)
+}
+
+// The frame's top-level structure built from its instances, recorded
+// before any pass and made readable by the fragment shaders that follow.
+// With no instance there is nothing to trace: the rays are off this frame.
+build() -> bool { return build_frame(false) }
+
+// A frame slot that has never had a structure gets an empty one, built
+// with no instances. The scene's pipelines are the ray-query variant
+// wherever the device traces, and they declare the structure's binding
+// whether or not a frame traces: a frame with the rays off left it never
+// written, an error on every draw of every such scene (#405). Built once a
+// slot; a slot that has one, from a traced frame or from this, keeps it.
+empty() -> bool {
+    frame = vkhost.frame_slot()
+    if !g_query || !vkhost.recording() || vkhost.pass_open() { return false }
+    f = frame_at(frame)
+    if f.structure != null && f.built { return true }
+    if !frame_reserve(frame, 1) { return false }
+    g_static = 0
+    g_count = 0
+    g_appended = false
+    if !build_frame(true) { return false }
+    g_ready = false                // built, but nothing in it to trace
+    return true
+}
+
+build_frame(allow_empty: bool) -> bool {
+    frame = vkhost.frame_slot()
+    if !g_query || !vkhost.recording() || vkhost.pass_open() { return false }
+    count = g_count
+    if count == 0 && !g_appended && !allow_empty { return false }
+    f = frame_at(frame)
+    if f.instances == null { return false }
+    d = vkdevice.device()
+    commands = vkhost.frame_commands()
+    // The static slots not written this frame are inactive.
+    if g_static > count {
+        memset(f.instances_mapped + count * INSTANCE_BYTES, 0, ((g_static - count) * INSTANCE_BYTES) as long)
+        count = g_static
+    }
+
+    geometry = calloc(1, sizeof(VkAccelerationStructureGeometryKHR)) as *VkAccelerationStructureGeometryKHR
+    geometry.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR
+    geometry.geometryType = vk.GEOMETRY_TYPE_INSTANCES_KHR
+    geometry.flags = vk.GEOMETRY_OPAQUE_BIT_KHR
+    geometry.geometry.instances.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR
+    geometry.geometry.instances.arrayOfPointers = 0
+    geometry.geometry.instances.data.deviceAddress = address_of(f.instances)
+
+    info = calloc(1, sizeof(VkAccelerationStructureBuildGeometryInfoKHR)) as *VkAccelerationStructureBuildGeometryInfoKHR
+    info.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR
+    info.type = vk.ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
+    // Rebuilt every frame, so the build is what costs, not the trace: a
+    // crowd of half a million instances took eleven milliseconds to build
+    // for a fast trace and about half that for a fast build.
+    info.flags = vk.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR
+    info.mode = vk.BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR
+    info.geometryCount = 1
+    info.pGeometries = geometry as ptr
+
+    // Sized for the buffer's whole capacity, so a frame that adds instances
+    // up to it builds into the structure it has.
+    sizes = calloc(1, sizeof(VkAccelerationStructureBuildSizesInfoKHR)) as *VkAccelerationStructureBuildSizesInfoKHR
+    sizes.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR
+    capacity = calloc(1, 4)
+    (capacity as uint32[])[0] = f.capacity
+    vk.vkGetAccelerationStructureBuildSizesKHR(d, vk.ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, info as ptr, capacity, sizes as ptr)
+    free(capacity)
+    structure_size = sizes.accelerationStructureSize as long
+    scratch_size = sizes.buildScratchSize as long
+    free(sizes as ptr)
+
+    ok = true
+    if f.structure == null || f.size < structure_size {
+        if f.structure != null {
+            vk.vkDeviceWaitIdle(d)
+            vk.vkDestroyAccelerationStructureKHR(d, f.structure, null)
+            vk.vkDestroyBuffer(d, f.buffer, null)
+            vk.vkFreeMemory(d, f.memory, null)
+            f.structure = null
+            f.buffer = null
+            f.memory = null
+        }
+        made = make_structure(structure_size, vk.ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR)
+        if made.handle == null {
+            vkdevice.fail("vkCreateAccelerationStructureKHR failed")
+            ok = false
+        } else {
+            f.structure = made.handle
+            f.buffer = made.buffer
+            f.memory = made.memory
+            f.size = structure_size
+            // The frame's sets named the old one: written again, with this
+            // one, when next claimed.
+            vkdesc.forget_all()
+        }
+    }
+    scratch_address = 0 as long
+    if ok {
+        if f.scratch == null || f.scratch_size < scratch_size {
+            if f.scratch != null {
+                vk.vkDeviceWaitIdle(d)
+                vk.vkDestroyBuffer(d, f.scratch, null)
+                vk.vkFreeMemory(d, f.scratch_memory, null)
+                f.scratch = null
+                f.scratch_memory = null
+            }
+            scratch = scratch_for(scratch_size)
+            if scratch.buffer == null {
+                ok = false
+            } else {
+                f.scratch = scratch.buffer
+                f.scratch_memory = scratch.memory
+                f.scratch_size = scratch_size
+                scratch_address = scratch.address
+            }
+        } else {
+            scratch_address = aligned(address_of(f.scratch))
+        }
+    }
+    if !ok {
+        free(info as ptr)
+        free(geometry as ptr)
+        return false
+    }
+
+    info.dstAccelerationStructure = f.structure
+    info.scratchData.deviceAddress = scratch_address
+    // The static scene's slots and the room the crowds were given: what
+    // the sorts did not fill of it is zero, inactive.
+    if g_appended && g_limit > count { count = g_limit }
+    range = calloc(1, sizeof(VkAccelerationStructureBuildRangeInfoKHR)) as *VkAccelerationStructureBuildRangeInfoKHR
+    range.primitiveCount = count
+    ranges = calloc(1, 8)
+    (ranges as ptr[])[0] = range as ptr
+    vk.vkCmdBuildAccelerationStructuresKHR(commands, 1, info as ptr, ranges)
+    free(ranges)
+    free(range as ptr)
+    free(info as ptr)
+    free(geometry as ptr)
+
+    barrier = calloc(1, sizeof(VkMemoryBarrier)) as *VkMemoryBarrier
+    barrier.sType = vk.STRUCTURE_TYPE_MEMORY_BARRIER
+    barrier.srcAccessMask = vk.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR
+    barrier.dstAccessMask = vk.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+    vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                            vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, barrier as ptr, 0, null, 0, null)
+    free(barrier as ptr)
+    f.built = true
+    g_ready = true
+    return true
+}
+
+// --- what the renderer and a crowd's sort read -------------------------------------------------------------------
+
+// Shadows by ray on or off; on means the shader traces where the frame's
+// structure was built, and the map is left to the skinned.
+set_shadows(on: bool) { g_shadows = on }
+shadows() -> bool { return g_query && g_shadows }
+// This frame traces: the flag the scene block carries, set by the renderer
+// after the build.
+shadows_now() -> bool { return g_query && g_shadows && g_ready }
+
+// How far from the camera a crowd's figures are in the rays: the shadow
+// distance, what the map covered; 0 keeps every figure kept.
+set_reach(metres: float) {
+    g_reach = metres
+    if g_reach < 0.0 { g_reach = 0.0 }
+    if g_reach_now <= 0.0 || (g_reach > 0.0 && g_reach_now > g_reach) { g_reach_now = g_reach }
+}
+reach_now() -> float { return g_reach_now }
+
+// How many of the crowds' figures the rays take a frame: the nearest that
+// many, however dense the crowd (0 for no limit but the reach).
+set_budget(count: int) {
+    g_budget = count
+    if g_budget < 0 { g_budget = 0 }
+}
+budget() -> int { return g_budget }
+figures() -> int { return g_seen }
+
+// This frame's instance buffer and the word the sorts count into, the
+// slot past which they append, the static scene's slots, and whether the
+// frame's room was reserved: what a crowd's sort writes its figures by.
+// The top-level structure built for frame slot `frame`, which the scene's
+// sets bind at binding 5; null when there is none (not traced, not built
+// yet, or gone).
+structure(frame: int) -> ptr {
+    if g_frames == null || frame < 0 || frame >= FRAMES { return null }
+    return frame_at(frame).structure
+}
+
+instances() -> ptr { return frame_at(vkhost.frame_slot()).instances }
+counter() -> ptr { return frame_at(vkhost.frame_slot()).range }
+limit() -> int { return g_limit }
+statics() -> int { return g_static }
+reserved() -> bool { return g_reserved }
+
+// A sort has recorded its figures into this frame's buffer: it cannot be
+// remade this frame, and the build takes the crowds' room.
+claim() {
+    g_locked = true
+    g_appended = true
+}
+
+// --- a crowd's pose structures -----------------------------------------------------------------------------------
+
+// The far mesh at every frame of a crowd's pose bank, each a bottom-level
+// structure: what the crowd's ray instances point at. `mesh` is the far
+// tier's skinned mesh (the engine's, with its skin), `bank` the pose
+// bank's values, `frames` by `bones` column-major matrices. Skinned on the
+// CPU frame by frame -- a hundred and sixty-eight triangles, forty-eight
+// times -- uploaded, built; the addresses go into a buffer the sort reads.
+// Returns a handle, 0 where the device does not trace.
+pose_create(mesh: ptr, bank: ptr, frames: int, bones: int) -> int {
+    if !g_query || mesh == null || bank == null || frames <= 0 || bones <= 0 { return 0 }
+    vertices = geometry.mesh_vertex_data(mesh)
+    skin = geometry.mesh_skin_data(mesh)
+    vertex_count = geometry.mesh_vertex_count(mesh)
+    index_count = geometry.mesh_index_count(mesh)
+    indices = geometry.mesh_index_data(mesh)
+    if vertices == null || skin == null || vertex_count <= 0 || index_count < 3 || indices == null { return 0 }
+    slot = 0 - 1
+    i = 0
+    while i < MAX_POSES && slot < 0 {
+        if !pose_at(i).in_use { slot = i }
+        i = i + 1
+    }
+    if slot < 0 { return 0 }
+    p = pose_at(slot)
+    memset(p as ptr, 0, sizeof(PoseSet) as long)
+    p.frames = frames
+    p.vertices = calloc(frames, 8)
+    p.vertex_memory = calloc(frames, 8)
+    p.blas = calloc(frames, sizeof(Blas))
+    posed = calloc(vertex_count * 3, 4)
+    addresses = calloc(frames, 8)
+    p.in_use = true
+    // One index buffer for every frame: the topology does not move.
+    usage = vk.BUFFER_USAGE_INDEX_BUFFER_BIT | input_usage()
+    index_buffer = vkhost.upload(indices, index_count * 4, usage)
+    ok = index_buffer.buffer != null
+    bind = vertices as f32[]
+    joints = skin as f32[]
+    out = posed as f32[]
+    f = 0
+    while f < frames && ok {
+        palette = (bank + f * bones * 64) as f32[]
+        v = 0
+        while v < vertex_count {
+            px = bind[v * 9]
+            py = bind[v * 9 + 1]
+            pz = bind[v * 9 + 2]
+            f32 ox = 0.0
+            f32 oy = 0.0
+            f32 oz = 0.0
+            k = 0
+            while k < 4 {
+                joint = joints[v * 8 + k] as int
+                f32 w = joints[v * 8 + 4 + k]
+                if w != 0.0 && joint >= 0 && joint < bones {
+                    m = joint * 16
+                    ox = ox + w * (palette[m] * px + palette[m + 4] * py + palette[m + 8] * pz + palette[m + 12])
+                    oy = oy + w * (palette[m + 1] * px + palette[m + 5] * py + palette[m + 9] * pz + palette[m + 13])
+                    oz = oz + w * (palette[m + 2] * px + palette[m + 6] * py + palette[m + 10] * pz + palette[m + 14])
+                }
+                k = k + 1
+            }
+            out[v * 3] = ox
+            out[v * 3 + 1] = oy
+            out[v * 3 + 2] = oz
+            v = v + 1
+        }
+        made = vkhost.upload(posed, vertex_count * 12, vk.BUFFER_USAGE_VERTEX_BUFFER_BIT | input_usage())
+        if made.buffer == null {
+            ok = false
+        } else {
+            // Built and waited for, the posed vertices are no longer read:
+            // a structure keeps nothing of its inputs.
+            b = blas_build_with(made.buffer, index_buffer.buffer, vertex_count, index_count, 12, null,
+                                vk.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                                vk.BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR)
+            vkhost.device_buffer_free(made)
+            p.bytes = p.bytes + g_last_blas_size
+            slot_blas = (p.blas + f * sizeof(Blas)) as *Blas
+            slot_blas.handle = b.handle
+            slot_blas.buffer = b.buffer
+            slot_blas.memory = b.memory
+            slot_blas.address = b.address
+            (addresses as long[])[f] = b.address
+            if b.handle == null { ok = false }
+        }
+        f = f + 1
+    }
+    // Compacted, each structure takes what it needs rather than what the
+    // build sized it for; the addresses are the compacted ones.
+    if ok {
+        compacted = compact(p.blas, frames)
+        if compacted > 0 {
+            p.bytes = compacted
+            f = 0
+            while f < frames {
+                (addresses as long[])[f] = ((p.blas + f * sizeof(Blas)) as *Blas).address
+                f = f + 1
+            }
+        }
+    }
+    if ok {
+        table = vkhost.upload(addresses, frames * 8, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        p.addresses = table.buffer
+        p.address_memory = table.memory
+        ok = table.buffer != null
+    }
+    // The index buffer is the first frame's to keep; every structure was
+    // built from it already, and a structure keeps no reference to its
+    // inputs.
+    vkhost.device_buffer_free(index_buffer)
+    free(posed)
+    free(addresses)
+    if !ok {
+        pose_destroy(slot + 1)
+        return 0
+    }
+    return slot + 1
+}
+
+// The `count` structures at `records` (Blas records, built to allow it)
+// compacted: their compacted sizes asked of the device, a structure of each
+// size made, each copied into its own compacted, and the originals
+// destroyed, the records now naming the copies. A build sizes a structure
+// for the worst its triangles could take; the copy takes what they do.
+// Returns the bytes the copies take, or 0 when it could not, the originals
+// kept.
+compact(records: ptr, count: int) -> long {
+    d = vkdevice.device()
+    if !g_query || d == null || count <= 0 { return 0 as long }
+    pool_info = calloc(1, sizeof(VkQueryPoolCreateInfo)) as *VkQueryPoolCreateInfo
+    pool_info.sType = vk.STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO
+    pool_info.queryType = vk.QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR
+    pool_info.queryCount = count
+    out = cell_of()
+    r = vk.vkCreateQueryPool(d, pool_info as ptr, null, out)
+    pool = taken_from(out)
+    free(pool_info as ptr)
+    if r != vk.SUCCESS { return 0 as long }
+    handles = calloc(count, 8)
+    i = 0
+    while i < count {
+        (handles as ptr[])[i] = ((records + i * sizeof(Blas)) as *Blas).handle
+        i = i + 1
+    }
+    once = vkhost.once_begin()
+    if once == null {
+        vk.vkDestroyQueryPool(d, pool, null)
+        free(handles)
+        return 0 as long
+    }
+    vk.vkCmdResetQueryPool(once, pool, 0, count)
+    // The builds finished in submissions of their own; their writes are
+    // made visible to the query that reads the structures.
+    memory_barrier(once, vk.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR, vk.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                   vk.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, vk.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR)
+    vk.vkCmdWriteAccelerationStructuresPropertiesKHR(once, count, handles,
+                                                     vk.QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR, pool, 0)
+    vkhost.once_end(once)
+    free(handles)
+    sizes = calloc(count, 8)
+    r = vk.vkGetQueryPoolResults(d, pool, 0, count, (count * 8) as long, sizes, 8,
+                                 vk.QUERY_RESULT_64_BIT | vk.QUERY_RESULT_WAIT_BIT)
+    vk.vkDestroyQueryPool(d, pool, null)
+    if r != vk.SUCCESS {
+        free(sizes)
+        return 0 as long
+    }
+    fresh = calloc(count, sizeof(Blas))
+    ok = true
+    total = 0 as long
+    i = 0
+    while i < count && ok {
+        size = (sizes as long[])[i]
+        made = make_structure(size, vk.ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+        slot = (fresh + i * sizeof(Blas)) as *Blas
+        slot.handle = made.handle
+        slot.buffer = made.buffer
+        slot.memory = made.memory
+        if made.handle == null { ok = false }
+        total = total + size
+        i = i + 1
+    }
+    free(sizes)
+    if ok {
+        once = vkhost.once_begin()
+        ok = once != null
+        if ok {
+            copy = calloc(1, sizeof(VkCopyAccelerationStructureInfoKHR)) as *VkCopyAccelerationStructureInfoKHR
+            i = 0
+            while i < count {
+                copy.sType = vk.STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR
+                copy.src = ((records + i * sizeof(Blas)) as *Blas).handle
+                copy.dst = ((fresh + i * sizeof(Blas)) as *Blas).handle
+                copy.mode = vk.COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR
+                vk.vkCmdCopyAccelerationStructureKHR(once, copy as ptr)
+                i = i + 1
+            }
+            free(copy as ptr)
+            vkhost.once_end(once)
+        }
+    }
+    i = 0
+    while i < count {
+        slot = (fresh + i * sizeof(Blas)) as *Blas
+        if ok {
+            old = (records + i * sizeof(Blas)) as *Blas
+            blas_free(Blas { handle: old.handle, buffer: old.buffer, memory: old.memory, address: old.address })
+            where = calloc(1, sizeof(VkAccelerationStructureDeviceAddressInfoKHR)) as *VkAccelerationStructureDeviceAddressInfoKHR
+            where.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR
+            where.accelerationStructure = slot.handle
+            old.handle = slot.handle
+            old.buffer = slot.buffer
+            old.memory = slot.memory
+            old.address = vk.vkGetAccelerationStructureDeviceAddressKHR(d, where as ptr) as long
+            free(where as ptr)
+        } else {
+            blas_free(Blas { handle: slot.handle, buffer: slot.buffer, memory: slot.memory, address: 0 as long })
+        }
+        i = i + 1
+    }
+    free(fresh)
+    if !ok { return 0 as long }
+    return total
+}
+
+pose_destroy(handle: int) {
+    if handle <= 0 || handle > MAX_POSES || g_poses == null { return }
+    p = pose_at(handle - 1)
+    d = vkdevice.device()
+    if d != null {
+        vk.vkDeviceWaitIdle(d)
+        f = 0
+        while f < p.frames {
+            if p.blas != null {
+                b = (p.blas + f * sizeof(Blas)) as *Blas
+                blas_free(Blas { handle: b.handle, buffer: b.buffer, memory: b.memory, address: b.address })
+            }
+            if p.vertices != null && (p.vertices as ptr[])[f] != null { vk.vkDestroyBuffer(d, (p.vertices as ptr[])[f], null) }
+            if p.vertex_memory != null && (p.vertex_memory as ptr[])[f] != null { vk.vkFreeMemory(d, (p.vertex_memory as ptr[])[f], null) }
+            f = f + 1
+        }
+        if p.addresses != null { vk.vkDestroyBuffer(d, p.addresses, null) }
+        if p.address_memory != null { vk.vkFreeMemory(d, p.address_memory, null) }
+    }
+    if p.vertices != null { free(p.vertices) }
+    if p.vertex_memory != null { free(p.vertex_memory) }
+    if p.blas != null { free(p.blas) }
+    memset(p as ptr, 0, sizeof(PoseSet) as long)
+}
+
+// A set's frames and the buffer of its structures' addresses, for a
+// crowd's sort; whether it is there.
+pose_ready(handle: int) -> bool {
+    if handle <= 0 || handle > MAX_POSES || g_poses == null { return false }
+    return pose_at(handle - 1).in_use
+}
+pose_frames(handle: int) -> int { return pose_at(handle - 1).frames }
+pose_addresses(handle: int) -> ptr { return pose_at(handle - 1).addresses }
+// What a set's structures and their posed vertices take on the device, in
+// bytes: the cost of a crowd's mesh in the rays, for its diagnostics.
+pose_bytes(handle: int) -> long {
+    if !pose_ready(handle) { return 0 as long }
+    return pose_at(handle - 1).bytes
+}
+
+// --- skinned figures, posed for the rays each frame (#492) ---------------------------------------------------------
+
+// The skinned figures a device holds structures for, and how many it poses
+// into a frame's structure by default: the nearest, whose shadows are the
+// ones a camera sees. A figure posed costs its skinning, a thread a vertex,
+// and the refit of its structure.
+const MAX_SKINNED = 64
+// A refit keeps the tree the build made for the pose it was built in; a
+// walk that swings the arms far from that pose loosens the tree's boxes a
+// frame at a time, so a figure's structure is built afresh every REBUILD
+// frames, the figures taking their turns on different frames.
+const REBUILD = 16
+const SKIN_GROUP = 64
+const SKIN_PARAMS_BYTES = 8
+
+// A skinned figure's structure: the mesh it poses (vkmesh's handle and
+// buffers), the buffer its posed positions go into, the structure refitted
+// from them and the scratch its builds use, the palette of each frame in
+// flight (written by the host) and the skinning pass's set for each.
+struct SkinSet {
+    in_use: bool
+    mesh: int
+    vertex_count: int
+    index_count: int
+    bones: int                     // the palette's room, in bones
+    indices: ptr                   // the mesh's index buffer
+    posed: ptr
+    posed_memory: ptr
+    posed_address: long
+    blas: ptr
+    blas_buffer: ptr
+    blas_memory: ptr
+    blas_address: long
+    scratch: ptr
+    scratch_memory: ptr
+    scratch_address: long
+    palettes: ptr                  // VkBuffer[FRAMES]
+    palette_memory: ptr            // VkDeviceMemory[FRAMES]
+    palette_mapped: ptr            // void*[FRAMES]
+    sets: ptr                      // VkDescriptorSet[FRAMES]
+    last_palette: ptr              // the palette it was last posed by, f32s
+    built: bool
+    age: int                       // frames refitted since it was built
+    posed_frame: int               // the frame it was last posed in (g_serial)
+    pending: bool                  // posed this frame, its build not yet recorded
+}
+
+var g_skins: ptr = null            // SkinSet[MAX_SKINNED]
+var g_skin_set_layout: ptr = null
+var g_skin_pool: ptr = null
+var g_skin_layout: ptr = null
+var g_skin_pipeline: ptr = null
+var g_skin_budget = 32
+var g_serial = 0                   // frames begun: what was posed in which
+var g_skin_started = false         // this frame's first skinning recorded
+var g_skinned_now = 0              // figures posed into this frame's structure
+var g_skin_ids = 0                 // sets made, for their turns at a rebuild
+
+skin_at(index: int) -> *SkinSet { return (g_skins + index * sizeof(SkinSet)) as *SkinSet }
+
+// How many skinned figures a frame poses into the rays at most (0 for none:
+// they keep the map), and how many this frame did. 32 by default: a
+// street's figures, whose map the rays then leave nothing to draw.
+set_skin_budget(count: int) {
+    g_skin_budget = count
+    if g_skin_budget < 0 { g_skin_budget = 0 }
+    if g_skin_budget > MAX_SKINNED { g_skin_budget = MAX_SKINNED }
+}
+skin_budget() -> int { return g_skin_budget }
+skinned() -> int { return g_skinned_now }
+
+cell_of() -> ptr { return calloc(1, 8) }
+taken_from(c: ptr) -> ptr {
+    h = (c as ptr[])[0]
+    free(c)
+    return h
+}
+
+// The skinning pass's objects, made the first time a figure is posed: its
+// set layout (four storage buffers), a pool its sets are freed back to,
+// the pipeline layout (the push constants) and the pipeline. False, with
+// the reason in the backend's last error, when one would not make.
+skin_pipeline() -> bool {
+    if g_skin_pipeline != null { return true }
+    d = vkdevice.device()
+    if g_skins == null { g_skins = calloc(MAX_SKINNED, sizeof(SkinSet)) }
+    bindings = calloc(4, sizeof(VkDescriptorSetLayoutBinding))
+    i = 0
+    while i < 4 {
+        b = (bindings + i * sizeof(VkDescriptorSetLayoutBinding)) as *VkDescriptorSetLayoutBinding
+        b.binding = i
+        b.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+        b.descriptorCount = 1
+        b.stageFlags = vk.SHADER_STAGE_COMPUTE_BIT
+        i = i + 1
+    }
+    layout = calloc(1, sizeof(VkDescriptorSetLayoutCreateInfo)) as *VkDescriptorSetLayoutCreateInfo
+    layout.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    layout.bindingCount = 4
+    layout.pBindings = bindings
+    out = cell_of()
+    r = vk.vkCreateDescriptorSetLayout(d, layout as ptr, null, out)
+    g_skin_set_layout = taken_from(out)
+    free(layout as ptr)
+    free(bindings)
+    if r != vk.SUCCESS {
+        g_skin_set_layout = null
+        vkdevice.fail("skinning vkCreateDescriptorSetLayout failed")
+        return false
+    }
+    size = calloc(1, sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
+    size.type = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+    size.descriptorCount = 4 * MAX_SKINNED * FRAMES
+    pool = calloc(1, sizeof(VkDescriptorPoolCreateInfo)) as *VkDescriptorPoolCreateInfo
+    pool.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+    // A figure's sets go back to the pool when it goes: a program that
+    // adds and removes skinned figures reuses them.
+    pool.flags = vk.DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+    pool.maxSets = MAX_SKINNED * FRAMES
+    pool.poolSizeCount = 1
+    pool.pPoolSizes = size as ptr
+    out = cell_of()
+    r = vk.vkCreateDescriptorPool(d, pool as ptr, null, out)
+    g_skin_pool = taken_from(out)
+    free(pool as ptr)
+    free(size as ptr)
+    if r != vk.SUCCESS {
+        g_skin_pool = null
+        vkdevice.fail("skinning vkCreateDescriptorPool failed")
+        return false
+    }
+    range = calloc(1, sizeof(VkPushConstantRange)) as *VkPushConstantRange
+    range.stageFlags = vk.SHADER_STAGE_COMPUTE_BIT
+    range.size = SKIN_PARAMS_BYTES
+    layouts = cell_of()
+    (layouts as ptr[])[0] = g_skin_set_layout
+    info = calloc(1, sizeof(VkPipelineLayoutCreateInfo)) as *VkPipelineLayoutCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+    info.setLayoutCount = 1
+    info.pSetLayouts = layouts
+    info.pushConstantRangeCount = 1
+    info.pPushConstantRanges = range as ptr
+    out = cell_of()
+    r = vk.vkCreatePipelineLayout(d, info as ptr, null, out)
+    g_skin_layout = taken_from(out)
+    free(info as ptr)
+    free(layouts)
+    free(range as ptr)
+    if r != vk.SUCCESS {
+        g_skin_layout = null
+        vkdevice.fail("skinning vkCreatePipelineLayout failed")
+        return false
+    }
+    code = vkspirv.code(vkspirv.SKIN_COMP)
+    module_info = calloc(1, sizeof(VkShaderModuleCreateInfo)) as *VkShaderModuleCreateInfo
+    module_info.sType = vk.STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+    module_info.codeSize = vkspirv.bytes(vkspirv.SKIN_COMP)
+    module_info.pCode = code
+    out = cell_of()
+    r = vk.vkCreateShaderModule(d, module_info as ptr, null, out)
+    shader = taken_from(out)
+    free(module_info as ptr)
+    free(code)
+    if r != vk.SUCCESS {
+        vkdevice.fail("skinning vkCreateShaderModule failed")
+        return false
+    }
+    compute = calloc(1, sizeof(VkComputePipelineCreateInfo)) as *VkComputePipelineCreateInfo
+    compute.sType = vk.STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+    compute.stage.sType = vk.STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+    compute.stage.stage = vk.SHADER_STAGE_COMPUTE_BIT
+    compute.stage.module = shader
+    compute.stage.pName = "main"
+    compute.layout = g_skin_layout
+    out = cell_of()
+    r = vk.vkCreateComputePipelines(d, null, 1, compute as ptr, null, out)
+    g_skin_pipeline = taken_from(out)
+    free(compute as ptr)
+    vk.vkDestroyShaderModule(d, shader, null)
+    if r != vk.SUCCESS {
+        g_skin_pipeline = null
+        vkdevice.fail("skinning vkCreateComputePipelines failed")
+        return false
+    }
+    return true
+}
+
+// Every figure's structure gone and the pass's objects with them: the
+// device idle already (stop).
+skin_stop() {
+    d = vkdevice.device()
+    if g_skins != null {
+        i = 0
+        while i < MAX_SKINNED {
+            if skin_at(i).in_use { skin_free(i) }
+            i = i + 1
+        }
+    }
+    if d != null {
+        if g_skin_pipeline != null { vk.vkDestroyPipeline(d, g_skin_pipeline, null) }
+        if g_skin_layout != null { vk.vkDestroyPipelineLayout(d, g_skin_layout, null) }
+        if g_skin_pool != null { vk.vkDestroyDescriptorPool(d, g_skin_pool, null) }
+        if g_skin_set_layout != null { vk.vkDestroyDescriptorSetLayout(d, g_skin_set_layout, null) }
+    }
+    g_skin_pipeline = null
+    g_skin_layout = null
+    g_skin_pool = null
+    g_skin_set_layout = null
+}
+
+// The figure structure posing mesh `mesh`, or -1.
+skin_find(mesh: int) -> int {
+    if g_skins == null { return 0 - 1 }
+    i = 0
+    while i < MAX_SKINNED {
+        k = skin_at(i)
+        if k.in_use && k.mesh == mesh { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// The geometry a figure's structure is built from: its posed positions,
+// three floats a vertex, and the mesh's own indices. The caller frees it.
+skin_geometry(k: *SkinSet) -> ptr {
+    geometry = calloc(1, sizeof(VkAccelerationStructureGeometryKHR)) as *VkAccelerationStructureGeometryKHR
+    geometry.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR
+    geometry.geometryType = vk.GEOMETRY_TYPE_TRIANGLES_KHR
+    geometry.flags = vk.GEOMETRY_OPAQUE_BIT_KHR
+    geometry.geometry.triangles.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR
+    geometry.geometry.triangles.vertexFormat = vk.FORMAT_R32G32B32_SFLOAT
+    geometry.geometry.triangles.vertexData.deviceAddress = k.posed_address
+    geometry.geometry.triangles.vertexStride = 12
+    top = k.vertex_count - 1
+    if top < 0 { top = 0 }
+    geometry.geometry.triangles.maxVertex = top
+    geometry.geometry.triangles.indexType = vk.INDEX_TYPE_UINT32
+    geometry.geometry.triangles.indexData.deviceAddress = address_of(k.indices)
+    return geometry as ptr
+}
+
+// Refitted every frame, and so built to be; fast to trace, since it is
+// traced by every lit pixel near it.
+skin_flags() -> int {
+    return vk.BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR | vk.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
+}
+
+// A figure's structure for mesh `mesh`: its posed buffer, the structure
+// sized for its triangles with room for a refit, the scratch the larger of
+// a build and a refit takes, a palette of `bones` for each frame in
+// flight, and the skinning pass's set for each. Its index, or -1.
+skin_make(mesh: int, vertices: ptr, skin: ptr, indices: ptr, vertex_count: int, index_count: int, bones: int) -> int {
+    slot = 0 - 1
+    i = 0
+    while i < MAX_SKINNED && slot < 0 {
+        if !skin_at(i).in_use { slot = i }
+        i = i + 1
+    }
+    if slot < 0 { return 0 - 1 }
+    d = vkdevice.device()
+    k = skin_at(slot)
+    memset(k as ptr, 0, sizeof(SkinSet) as long)
+    k.in_use = true
+    k.mesh = mesh
+    k.vertex_count = vertex_count
+    k.index_count = index_count
+    k.bones = bones
+    k.indices = indices
+    k.last_palette = calloc(bones, 64)
+    k.palettes = calloc(FRAMES, 8)
+    k.palette_memory = calloc(FRAMES, 8)
+    k.palette_mapped = calloc(FRAMES, 8)
+    k.sets = calloc(FRAMES, 8)
+    // Its turn at a rebuild, so the figures do not all rebuild on one frame.
+    k.age = g_skin_ids % REBUILD
+    g_skin_ids = g_skin_ids + 1
+
+    posed = vkhost.device_buffer(vertex_count * 12, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | input_usage())
+    k.posed = posed.buffer
+    k.posed_memory = posed.memory
+    if posed.buffer == null {
+        skin_free(slot)
+        return 0 - 1
+    }
+    k.posed_address = address_of(posed.buffer)
+
+    geometry = skin_geometry(k)
+    info = calloc(1, sizeof(VkAccelerationStructureBuildGeometryInfoKHR)) as *VkAccelerationStructureBuildGeometryInfoKHR
+    info.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR
+    info.type = vk.ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR
+    info.flags = skin_flags()
+    info.mode = vk.BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR
+    info.geometryCount = 1
+    info.pGeometries = geometry
+    sizes = calloc(1, sizeof(VkAccelerationStructureBuildSizesInfoKHR)) as *VkAccelerationStructureBuildSizesInfoKHR
+    sizes.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR
+    count = calloc(1, 4)
+    (count as uint32[])[0] = index_count / 3
+    vk.vkGetAccelerationStructureBuildSizesKHR(d, vk.ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, info as ptr, count, sizes as ptr)
+    free(count)
+    structure_size = sizes.accelerationStructureSize as long
+    scratch_size = sizes.buildScratchSize as long
+    if (sizes.updateScratchSize as long) > scratch_size { scratch_size = sizes.updateScratchSize as long }
+    free(sizes as ptr)
+    free(info as ptr)
+    free(geometry)
+    made = make_structure(structure_size, vk.ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+    k.blas = made.handle
+    k.blas_buffer = made.buffer
+    k.blas_memory = made.memory
+    scratch = scratch_for(scratch_size)
+    k.scratch = scratch.buffer
+    k.scratch_memory = scratch.memory
+    k.scratch_address = scratch.address
+    if made.handle == null || scratch.buffer == null {
+        skin_free(slot)
+        return 0 - 1
+    }
+    where = calloc(1, sizeof(VkAccelerationStructureDeviceAddressInfoKHR)) as *VkAccelerationStructureDeviceAddressInfoKHR
+    where.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR
+    where.accelerationStructure = made.handle
+    k.blas_address = vk.vkGetAccelerationStructureDeviceAddressKHR(d, where as ptr) as long
+    free(where as ptr)
+
+    // A palette a frame in flight, written by the host each frame it is
+    // posed: the slot's last frame finished before its fence let this one
+    // begin.
+    f = 0
+    while f < FRAMES {
+        palette = host_written(bones * 64, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        (k.palettes as ptr[])[f] = palette.buffer
+        (k.palette_memory as ptr[])[f] = palette.memory
+        (k.palette_mapped as ptr[])[f] = palette.mapped
+        if palette.buffer == null || palette.mapped == null {
+            skin_free(slot)
+            return 0 - 1
+        }
+        f = f + 1
+    }
+
+    layouts = calloc(FRAMES, 8)
+    f = 0
+    while f < FRAMES {
+        (layouts as ptr[])[f] = g_skin_set_layout
+        f = f + 1
+    }
+    alloc = calloc(1, sizeof(VkDescriptorSetAllocateInfo)) as *VkDescriptorSetAllocateInfo
+    alloc.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+    alloc.descriptorPool = g_skin_pool
+    alloc.descriptorSetCount = FRAMES
+    alloc.pSetLayouts = layouts
+    r = vk.vkAllocateDescriptorSets(d, alloc as ptr, k.sets)
+    free(alloc as ptr)
+    free(layouts)
+    if r != vk.SUCCESS {
+        memset(k.sets, 0, (FRAMES * 8) as long)
+        vkdevice.fail("skinning vkAllocateDescriptorSets failed")
+        skin_free(slot)
+        return 0 - 1
+    }
+    buffers = calloc(4, sizeof(VkDescriptorBufferInfo))
+    writes = calloc(4, sizeof(VkWriteDescriptorSet))
+    f = 0
+    while f < FRAMES {
+        b = 0
+        while b < 4 {
+            buffer_info = (buffers + b * sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+            if b == 0 { buffer_info.buffer = vertices }
+            if b == 1 { buffer_info.buffer = skin }
+            if b == 2 { buffer_info.buffer = (k.palettes as ptr[])[f] }
+            if b == 3 { buffer_info.buffer = k.posed }
+            buffer_info.offset = 0
+            buffer_info.range = vk.WHOLE_SIZE
+            w = (writes + b * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+            w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+            w.dstSet = (k.sets as ptr[])[f]
+            w.dstBinding = b
+            w.descriptorCount = 1
+            w.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+            w.pBufferInfo = buffer_info as ptr
+            b = b + 1
+        }
+        vk.vkUpdateDescriptorSets(d, 4, writes, 0, null)
+        f = f + 1
+    }
+    free(writes)
+    free(buffers)
+    return slot
+}
+
+// A figure's structure destroyed with everything it holds, the device no
+// longer reading it (the caller waited).
+skin_free(index: int) {
+    k = skin_at(index)
+    d = vkdevice.device()
+    if d != null {
+        if k.sets != null && (k.sets as ptr[])[0] != null && g_skin_pool != null {
+            vk.vkFreeDescriptorSets(d, g_skin_pool, FRAMES, k.sets)
+        }
+        f = 0
+        while f < FRAMES {
+            if k.palette_mapped != null && (k.palette_mapped as ptr[])[f] != null { vk.vkUnmapMemory(d, (k.palette_memory as ptr[])[f]) }
+            if k.palettes != null && (k.palettes as ptr[])[f] != null { vk.vkDestroyBuffer(d, (k.palettes as ptr[])[f], null) }
+            if k.palette_memory != null && (k.palette_memory as ptr[])[f] != null { vk.vkFreeMemory(d, (k.palette_memory as ptr[])[f], null) }
+            f = f + 1
+        }
+        blas_free(Blas { handle: k.blas, buffer: k.blas_buffer, memory: k.blas_memory, address: k.blas_address })
+        if k.scratch != null { vk.vkDestroyBuffer(d, k.scratch, null) }
+        if k.scratch_memory != null { vk.vkFreeMemory(d, k.scratch_memory, null) }
+        if k.posed != null { vk.vkDestroyBuffer(d, k.posed, null) }
+        if k.posed_memory != null { vk.vkFreeMemory(d, k.posed_memory, null) }
+    }
+    if k.palettes != null { free(k.palettes) }
+    if k.palette_memory != null { free(k.palette_memory) }
+    if k.palette_mapped != null { free(k.palette_mapped) }
+    if k.sets != null { free(k.sets) }
+    if k.last_palette != null { free(k.last_palette) }
+    memset(k as ptr, 0, sizeof(SkinSet) as long)
+}
+
+// The figure structure of mesh `mesh` let go: the mesh is going. Waits for
+// the device, which may still trace it.
+skin_forget(mesh: int) {
+    index = skin_find(mesh)
+    if index < 0 { return }
+    d = vkdevice.device()
+    if d != null { vk.vkDeviceWaitIdle(d) }
+    skin_free(index)
+}
+
+// Whether mesh `mesh`'s figure is in this frame's structure: the map need
+// not draw it.
+skin_posed(mesh: int) -> bool {
+    index = skin_find(mesh)
+    if index < 0 { return false }
+    return skin_at(index).posed_frame == g_serial
+}
+
+// A memory barrier over everything, recorded into `commands`.
+memory_barrier(commands: ptr, src_access: int, dst_access: int, src_stage: int, dst_stage: int) {
+    b = calloc(1, sizeof(VkMemoryBarrier)) as *VkMemoryBarrier
+    b.sType = vk.STRUCTURE_TYPE_MEMORY_BARRIER
+    b.srcAccessMask = src_access
+    b.dstAccessMask = dst_access
+    vk.vkCmdPipelineBarrier(commands, src_stage, dst_stage, 0, 1, b as ptr, 0, null, 0, null)
+    free(b as ptr)
+}
+
+// A skinned figure posed into this frame's structure: mesh `mesh` (its
+// bind-pose `vertices`, its `skin` stream and its `indices`, vkmesh's) by
+// the `bones` matrices of `palette` (column-major f32s, the palette its
+// draw is posed by), at the column-major matrix of doubles `matrix`. The
+// skinning is recorded now and the structure's refit with every other
+// figure's at skin_end; its instance goes into the frame's structure
+// here, after the frame's room was reserved (reserve) and before its
+// build. False where the device does not trace, past this frame's budget,
+// or when its structure could not be made: the figure keeps the map.
+skin_pose(mesh: int, vertices: ptr, skin: ptr, indices: ptr, vertex_count: int, index_count: int,
+          palette: ptr, bones: int, matrix: ptr) -> bool {
+    if !g_query || !vkhost.recording() || vkhost.pass_open() { return false }
+    if g_skinned_now >= g_skin_budget || palette == null || bones <= 0 || matrix == null { return false }
+    if vertices == null || skin == null || indices == null || vertex_count <= 0 || index_count < 3 { return false }
+    if !skin_pipeline() { return false }
+    index = skin_find(mesh)
+    if index >= 0 {
+        was = skin_at(index)
+        // A mesh remade in place under the same handle, or a palette that
+        // grew: the structure is made again for it.
+        if was.vertex_count != vertex_count || was.index_count != index_count || was.bones < bones || was.indices != indices {
+            vk.vkDeviceWaitIdle(vkdevice.device())
+            skin_free(index)
+            index = 0 - 1
+        }
+    }
+    if index < 0 { index = skin_make(mesh, vertices, skin, indices, vertex_count, index_count, bones) }
+    if index < 0 { return false }
+    k = skin_at(index)
+    // A figure that has not moved since it was last posed -- one standing
+    // still, a pose held -- has the structure it needs already: its
+    // instance goes in, and nothing is skinned or refitted.
+    palette_bytes = (bones * 64) as long
+    if k.built && memcmp(k.last_palette, palette, palette_bytes) == 0 {
+        k.posed_frame = g_serial
+        add_one(k.blas_address, matrix)
+        g_skinned_now = g_skinned_now + 1
+        return true
+    }
+    memcpy(k.last_palette, palette, palette_bytes)
+    frame = vkhost.frame_slot()
+    memcpy((k.palette_mapped as ptr[])[frame], palette, (bones * 64) as long)
+    commands = vkhost.frame_commands()
+    if !g_skin_started {
+        // The last frame's refits and its traces through these structures,
+        // and its skinning into the same buffers, finish before this
+        // frame's skinning writes them again and its refits rewrite them.
+        memory_barrier(commands,
+                       vk.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | vk.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+                       vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_SHADER_WRITE_BIT,
+                       vk.ACCESS_SHADER_WRITE_BIT | vk.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                       vk.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                       vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT | vk.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                       vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT | vk.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR)
+        vk.vkCmdBindPipeline(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_skin_pipeline)
+        g_skin_started = true
+    }
+    set_cell = cell_of()
+    (set_cell as ptr[])[0] = (k.sets as ptr[])[frame]
+    vk.vkCmdBindDescriptorSets(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_skin_layout, 0, 1, set_cell, 0, null)
+    free(set_cell)
+    params = calloc(1, SKIN_PARAMS_BYTES)
+    (params as uint32[])[0] = vertex_count
+    (params as uint32[])[1] = bones
+    vk.vkCmdPushConstants(commands, g_skin_layout, vk.SHADER_STAGE_COMPUTE_BIT, 0, SKIN_PARAMS_BYTES, params)
+    free(params)
+    vk.vkCmdDispatch(commands, (vertex_count + SKIN_GROUP - 1) / SKIN_GROUP, 1, 1)
+    k.pending = true
+    k.posed_frame = g_serial
+    add_one(k.blas_address, matrix)
+    g_skinned_now = g_skinned_now + 1
+    return true
+}
+
+// The structures of every figure posed this frame refitted from what the
+// skinning wrote -- built afresh where one is new or its turn has come --
+// in one call, and made readable to the frame structure's build and to
+// the traces after it. Before the frame's build.
+skin_end() {
+    if !g_query || !vkhost.recording() || vkhost.pass_open() || g_skins == null { return }
+    n = 0
+    i = 0
+    while i < MAX_SKINNED {
+        if skin_at(i).in_use && skin_at(i).pending { n = n + 1 }
+        i = i + 1
+    }
+    if n == 0 { return }
+    commands = vkhost.frame_commands()
+    // The posed positions written, for the builds to read.
+    memory_barrier(commands, vk.ACCESS_SHADER_WRITE_BIT,
+                   vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                   vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR)
+    infos = calloc(n, sizeof(VkAccelerationStructureBuildGeometryInfoKHR))
+    geometries = calloc(n, 8)
+    ranges = calloc(n, sizeof(VkAccelerationStructureBuildRangeInfoKHR))
+    range_ptrs = calloc(n, 8)
+    at = 0
+    i = 0
+    while i < MAX_SKINNED {
+        k = skin_at(i)
+        if k.in_use && k.pending {
+            geometry = skin_geometry(k)
+            (geometries as ptr[])[at] = geometry
+            info = (infos + at * sizeof(VkAccelerationStructureBuildGeometryInfoKHR)) as *VkAccelerationStructureBuildGeometryInfoKHR
+            info.sType = vk.STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR
+            info.type = vk.ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR
+            info.flags = skin_flags()
+            info.geometryCount = 1
+            info.pGeometries = geometry
+            info.dstAccelerationStructure = k.blas
+            info.scratchData.deviceAddress = k.scratch_address
+            if !k.built || k.age >= REBUILD {
+                info.mode = vk.BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR
+                k.age = 0
+                k.built = true
+            } else {
+                info.mode = vk.BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR
+                info.srcAccelerationStructure = k.blas
+                k.age = k.age + 1
+            }
+            range = (ranges + at * sizeof(VkAccelerationStructureBuildRangeInfoKHR)) as *VkAccelerationStructureBuildRangeInfoKHR
+            range.primitiveCount = k.index_count / 3
+            (range_ptrs as ptr[])[at] = range as ptr
+            k.pending = false
+            at = at + 1
+        }
+        i = i + 1
+    }
+    vk.vkCmdBuildAccelerationStructuresKHR(commands, n, infos, range_ptrs)
+    // The structures written, for the frame structure's build and for the
+    // fragment shaders that trace through it.
+    memory_barrier(commands, vk.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                   vk.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                   vk.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                   vk.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+    i = 0
+    while i < n {
+        free((geometries as ptr[])[i])
+        i = i + 1
+    }
+    free(geometries)
+    free(infos)
+    free(ranges)
+    free(range_ptrs)
+}

@@ -77,9 +77,9 @@ builds the editor against, and each bump carries a line saying why.
 ## The shaders
 
 `src/ae3d/shaders/module.ae` holds the GLSL, written once for OpenGL.
-`tools/generate_shaders.ae` derives the Vulkan versions -- the uniform
-block layout in `native/gpu/vulkan_uniforms.h`, the SPIR-V in
-`native/gpu/vulkan_shaders.h` and the offsets in `src/ae3d/vkscene` --
+`tools/generate_shaders.ae` derives the Vulkan versions -- the GLSL in
+`src/ae3d/vkspirv/glsl`, the SPIR-V in `src/ae3d/vkspirv` and the uniform
+block's offsets in `src/ae3d/vkscene` --
 asks `glslangValidator` (the Vulkan SDK, on `PATH`) for its own std140
 offsets and stops on the first disagreement:
 
@@ -142,6 +142,7 @@ to read them.
 | `AE3D_AGENT_RECORD=path` | write the channel's whole session to `path`, every request and answer, for `tools/agent_replay.ae` ([agent.md](agent.md#recording-a-session-and-replaying-it)) |
 | `AE3D_MSAA=n`, `AE3D_TAA=1`, `AE3D_SSAO=1`, `AE3D_SSR=1` | the anti-aliasing and screen-space passes |
 | `AE3D_RAYS=1` | shadows by ray through the scene's acceleration structure, where the device has ray queries |
+| `AE3D_RAY_SKINNED=n` | how many skinned figures the rays pose a frame, the nearest first (32; 0 leaves them to the shadow map) |
 | `AE3D_SUN_SIZE=n` | the sun's size for the rays' penumbra, in tenths of a degree (5 is the sun; 0, the default, a point) |
 | `AE3D_RAY_AO=1` | ambient occlusion by ray in the screen-space pass's place |
 | `AE3D_DLSS=n` | DLSS at mode `n` (1 performance, 2 balanced, 3 quality, 6 DLAA) |
@@ -152,6 +153,8 @@ to read them.
 | `AE3D_CAMERA_WANDER=n` | fly the camera at random for `n` frames by injected keys and say the nearest it came to anything drawn ([rendering.md](rendering.md#the-camera)); `AE3D_CAMERA_WANDER_SPEED`, `_RANGE`, `_SEED` |
 | `AE3D_PHYSICS_SCENE=pyramid\|pile\|ragdolls\|cloth` | the reference scene `examples/physics` runs |
 | `AE3D_VIEW=3`, `AE3D_CAMX/Y/Z`, `AE3D_AIMX/Y/Z` | a camera placed by number, for sweeps ([testing.md](testing.md)) |
+| `AE3D_TICK=60`, `AE3D_HOLD=90` | every frame advances the world and the renderers' clock by 1/60 s whatever the wall clock did, and the agent channel holds the scene at frame 90: the same frame on every run and on either renderer ([testing.md](testing.md#the-scenes-on-both-renderers)) |
+| `AE3D_EYE=0` | the eye's adaptation off, where a scene turns it on |
 | `AE3D_DIAG=1` | a scene's own diagnostics on the console |
 | `AE3D_FONT_CACHE=dir` | where baked glyph atlases are kept, `build/cache/fonts` by default; `off` bakes every time ([ui.md](ui.md)) |
 

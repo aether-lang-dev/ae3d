@@ -1,0 +1,547 @@
+// ae3d.vkpipes -- the Vulkan backend's pipelines (#402), on
+// contrib.vulkan.vk, from the SPIR-V in ae3d.vkspirv.
+//
+// Every pipeline shares the scene's vertex input and descriptor set
+// layout, so a pass differs only in its shaders and its depth and blend
+// state. Attributes a shader ignores cost nothing, which is why the
+// fullscreen and skybox passes can be described by the same vertex input
+// as the scene. Cull mode is fixed at pipeline creation before Vulkan 1.3
+// and the loader targets 1.1, so culled and unculled are two pipelines
+// rather than one dynamic state.
+
+import contrib.vulkan.vk
+import ae3d.vkhost
+import ae3d.vkdevice
+import ae3d.vkdesc
+import ae3d.vktargets
+import ae3d.vkspirv
+
+exports (
+    create, destroy, layout,
+    scene, scene_blend, skinned, skinned_blend, crowd, crowd_blend, points, points_blend, water, water_blend,
+    shadow, skinned_shadow, crowd_shadow, point_shadow, sky, post, ssao, depth_resolve, taa
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memset(p: ptr, value: int, n: long) -> ptr
+
+// A vertex is nine floats; an instance sixteen of matrix and four of
+// colour and phase, or eight as a point; a skinned vertex's joints and
+// weights eight more.
+const STRIDE = 36
+const INSTANCE_STRIDE = 80
+const POINT_STRIDE = 32
+const SKIN_STRIDE = 32
+
+var g_layout: ptr = null
+// Indexed by whether back faces are culled: the scene's, the skinned, the
+// crowd's, the points' and the water's; and each one's blended, which is
+// never culled -- a transparent surface shows its own far side.
+var g_scene: ptr = null            // VkPipeline[2]
+var g_scene_blend: ptr = null
+var g_skinned: ptr = null          // VkPipeline[2]
+var g_skinned_blend: ptr = null
+var g_crowd: ptr = null            // VkPipeline[2]
+var g_crowd_blend: ptr = null
+var g_points: ptr = null           // VkPipeline[2]
+var g_points_blend: ptr = null
+var g_water: ptr = null            // VkPipeline[2]
+var g_water_blend: ptr = null
+var g_shadow: ptr = null
+var g_skinned_shadow: ptr = null
+var g_crowd_shadow: ptr = null
+var g_point_shadow: ptr = null
+var g_sky: ptr = null
+var g_post: ptr = null             // VkPipeline[4]: passthrough, fxaa, bloom, the reflection
+var g_ssao: ptr = null
+var g_depth_resolve: ptr = null
+var g_taa: ptr = null
+
+layout() -> ptr { return g_layout }
+scene(cull: int) -> ptr { return (g_scene as ptr[])[cull] }
+scene_blend() -> ptr { return g_scene_blend }
+skinned(cull: int) -> ptr { return (g_skinned as ptr[])[cull] }
+skinned_blend() -> ptr { return g_skinned_blend }
+crowd(cull: int) -> ptr { return (g_crowd as ptr[])[cull] }
+crowd_blend() -> ptr { return g_crowd_blend }
+points(cull: int) -> ptr { return (g_points as ptr[])[cull] }
+points_blend() -> ptr { return g_points_blend }
+water(cull: int) -> ptr { return (g_water as ptr[])[cull] }
+water_blend() -> ptr { return g_water_blend }
+shadow() -> ptr { return g_shadow }
+skinned_shadow() -> ptr { return g_skinned_shadow }
+crowd_shadow() -> ptr { return g_crowd_shadow }
+point_shadow() -> ptr { return g_point_shadow }
+sky() -> ptr { return g_sky }
+post(index: int) -> ptr { return (g_post as ptr[])[index] }
+ssao() -> ptr { return g_ssao }
+depth_resolve() -> ptr { return g_depth_resolve }
+taa() -> ptr { return g_taa }
+
+// A shader module from ae3d.vkspirv's words; null when it would not make.
+shader(which: int) -> ptr {
+    code = vkspirv.code(which)
+    info = calloc(1, sizeof(VkShaderModuleCreateInfo)) as *VkShaderModuleCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+    info.codeSize = vkspirv.bytes(which)
+    info.pCode = code
+    cell = calloc(1, 8)
+    r = vk.vkCreateShaderModule(vkhost.device(), info as ptr, null, cell)
+    m = (cell as ptr[])[0]
+    free(cell)
+    free(info as ptr)
+    free(code)
+    if r != vk.SUCCESS { return null }
+    return m
+}
+
+attribute(at: ptr, location: int, binding: int, format: int, offset: int) {
+    a = at as *VkVertexInputAttributeDescription
+    a.location = location
+    a.binding = binding
+    a.format = format
+    a.offset = offset
+}
+
+// A pipeline over `vertex` and `fragment` for `pass`: blend 0 none, 1
+// alpha, 2 a multiply (what is drawn scales what is there, which is how the
+// occlusion darkens the opaque scene under it); the depth test and write;
+// back faces culled or not; the skin's binding stepping (`skinned`) or
+// striding zero; the instances as matrices or as points. Null when the
+// device would not build it.
+build(vertex: ptr, fragment: ptr, blend: int, depth_test: bool, depth_write: bool, pass: ptr, cull: bool,
+      is_skinned: bool, is_points: bool) -> ptr {
+    stages = calloc(2, sizeof(VkPipelineShaderStageCreateInfo))
+    s0 = stages as *VkPipelineShaderStageCreateInfo
+    s0.sType = vk.STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+    s0.stage = vk.SHADER_STAGE_VERTEX_BIT
+    s0.module = vertex
+    s0.pName = "main"
+    s1 = (stages + sizeof(VkPipelineShaderStageCreateInfo)) as *VkPipelineShaderStageCreateInfo
+    s1.sType = vk.STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+    s1.stage = vk.SHADER_STAGE_FRAGMENT_BIT
+    s1.module = fragment
+    s1.pName = "main"
+
+    // Binding 0 is the mesh, binding 1 is the per-instance matrix and
+    // colour, the same split the OpenGL backend uses for its instanced
+    // attributes.
+    bindings = calloc(3, sizeof(VkVertexInputBindingDescription))
+    b0 = bindings as *VkVertexInputBindingDescription
+    b0.binding = 0
+    b0.stride = STRIDE
+    b0.inputRate = vk.VERTEX_INPUT_RATE_VERTEX
+    b1 = (bindings + sizeof(VkVertexInputBindingDescription)) as *VkVertexInputBindingDescription
+    b1.binding = 1
+    b1.stride = INSTANCE_STRIDE
+    // Points: position and scale, colour, phase -- eight floats. The
+    // matrix's other three columns are named at offset zero, since the
+    // input has to describe every attribute the shader declares, and a
+    // point draw never reads them.
+    if is_points { b1.stride = POINT_STRIDE }
+    b1.inputRate = vk.VERTEX_INPUT_RATE_INSTANCE
+    // Vulkan has no equivalent of leaving an attribute disabled: the vertex
+    // input has to describe every input the shader reads, and one shader
+    // serves both kinds of draw. So both pipelines name the binding, and
+    // what differs is the stride -- the skinned one steps through a joint
+    // and weight per vertex, the plain one strides zero and every vertex
+    // reads the same unused element out of a buffer that is one element
+    // long. That is what makes an unskinned mesh cost nothing: no skin
+    // buffer, no allocation that scales with the mesh, and a branch the
+    // shader does not take.
+    b2 = (bindings + 2 * sizeof(VkVertexInputBindingDescription)) as *VkVertexInputBindingDescription
+    b2.binding = 2
+    b2.stride = 0
+    if is_skinned { b2.stride = SKIN_STRIDE }
+    b2.inputRate = vk.VERTEX_INPUT_RATE_VERTEX
+
+    attributes = calloc(12, sizeof(VkVertexInputAttributeDescription))
+    size = sizeof(VkVertexInputAttributeDescription)
+    attribute(attributes, 0, 0, vk.FORMAT_R32G32B32_SFLOAT, 0)
+    attribute(attributes + size, 1, 0, vk.FORMAT_R32G32_SFLOAT, 12)
+    attribute(attributes + 2 * size, 2, 0, vk.FORMAT_R32G32B32_SFLOAT, 20)
+    i = 0
+    while i < 4 {
+        column = i * 16
+        if is_points { column = 0 }
+        attribute(attributes + (3 + i) * size, 3 + i, 1, vk.FORMAT_R32G32B32A32_SFLOAT, column)
+        i = i + 1
+    }
+    colour = 64
+    if is_points { colour = 16 }
+    attribute(attributes + 7 * size, 7, 1, vk.FORMAT_R32G32B32_SFLOAT, colour)
+    attribute(attributes + 8 * size, 8, 2, vk.FORMAT_R32G32B32A32_SFLOAT, 0)
+    attribute(attributes + 9 * size, 9, 2, vk.FORMAT_R32G32B32A32_SFLOAT, 16)
+    // Baked occlusion, in the vertex rather than a binding of its own, so
+    // no pipeline has to know whether a mesh has any.
+    attribute(attributes + 10 * size, 10, 0, vk.FORMAT_R32_SFLOAT, 32)
+    // The instance's phase in its walk, in the float after its colour that
+    // the stream always carried. Every pipeline names it; only the crowd's
+    // shaders read it.
+    phase = 76
+    if is_points { phase = 28 }
+    attribute(attributes + 11 * size, 11, 1, vk.FORMAT_R32_SFLOAT, phase)
+
+    input = calloc(1, sizeof(VkPipelineVertexInputStateCreateInfo)) as *VkPipelineVertexInputStateCreateInfo
+    input.sType = vk.STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
+    input.vertexBindingDescriptionCount = 3
+    input.pVertexBindingDescriptions = bindings
+    input.vertexAttributeDescriptionCount = 12
+    input.pVertexAttributeDescriptions = attributes
+
+    assembly = calloc(1, sizeof(VkPipelineInputAssemblyStateCreateInfo)) as *VkPipelineInputAssemblyStateCreateInfo
+    assembly.sType = vk.STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
+    assembly.topology = vk.PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+
+    viewport = calloc(1, sizeof(VkPipelineViewportStateCreateInfo)) as *VkPipelineViewportStateCreateInfo
+    viewport.sType = vk.STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO
+    viewport.viewportCount = 1
+    viewport.scissorCount = 1
+
+    raster = calloc(1, sizeof(VkPipelineRasterizationStateCreateInfo)) as *VkPipelineRasterizationStateCreateInfo
+    raster.sType = vk.STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO
+    raster.polygonMode = vk.POLYGON_MODE_FILL
+    raster.cullMode = vk.CULL_MODE_NONE
+    if cull { raster.cullMode = vk.CULL_MODE_BACK_BIT }
+    raster.frontFace = vk.FRONT_FACE_COUNTER_CLOCKWISE
+    raster.lineWidth = 1.0
+
+    // Every pass but the scene's draws single-sampled: the post passes (the
+    // composite, and the one the reflection and the temporal pass share),
+    // the shadow map and the camera depth. The temporal pass's pipeline,
+    // made against the reflection's pass with the scene's four samples,
+    // drew into a one-sample target on every frame the validation layer
+    // watched (#405).
+    multisample = calloc(1, sizeof(VkPipelineMultisampleStateCreateInfo)) as *VkPipelineMultisampleStateCreateInfo
+    multisample.sType = vk.STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO
+    multisample.rasterizationSamples = vktargets.samples()
+    single = pass == vktargets.post_pass() || pass == vktargets.ssr_pass() || pass == vktargets.shadow_pass() ||
+             pass == vktargets.camdepth_pass()
+    if single { multisample.rasterizationSamples = vk.SAMPLE_COUNT_1_BIT }
+
+    depth = calloc(1, sizeof(VkPipelineDepthStencilStateCreateInfo)) as *VkPipelineDepthStencilStateCreateInfo
+    depth.sType = vk.STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO
+    depth.depthTestEnable = 0
+    if depth_test { depth.depthTestEnable = 1 }
+    depth.depthWriteEnable = 0
+    if depth_write { depth.depthWriteEnable = 1 }
+    depth.depthCompareOp = vk.COMPARE_OP_LESS_OR_EQUAL
+    depth.maxDepthBounds = 1.0
+
+    // The second attachment is the scene pass's motion vectors: written as
+    // they are, never blended, by every draw that has them -- the
+    // occlusion composite (the multiply) draws over the scene with no
+    // motion of its own, and its writes are masked off.
+    blends = calloc(2, sizeof(VkPipelineColorBlendAttachmentState))
+    a0 = blends as *VkPipelineColorBlendAttachmentState
+    a0.blendEnable = 0
+    if blend != 0 { a0.blendEnable = 1 }
+    a0.srcColorBlendFactor = vk.BLEND_FACTOR_SRC_ALPHA
+    a0.dstColorBlendFactor = vk.BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+    if blend == 2 {
+        a0.srcColorBlendFactor = vk.BLEND_FACTOR_DST_COLOR
+        a0.dstColorBlendFactor = vk.BLEND_FACTOR_ZERO
+    }
+    a0.colorBlendOp = vk.BLEND_OP_ADD
+    a0.srcAlphaBlendFactor = vk.BLEND_FACTOR_ONE
+    a0.dstAlphaBlendFactor = vk.BLEND_FACTOR_ZERO
+    a0.alphaBlendOp = vk.BLEND_OP_ADD
+    a0.colorWriteMask = vk.COLOR_COMPONENT_R_BIT | vk.COLOR_COMPONENT_G_BIT | vk.COLOR_COMPONENT_B_BIT | vk.COLOR_COMPONENT_A_BIT
+    a1 = (blends + sizeof(VkPipelineColorBlendAttachmentState)) as *VkPipelineColorBlendAttachmentState
+    a1.colorWriteMask = vk.COLOR_COMPONENT_R_BIT | vk.COLOR_COMPONENT_G_BIT
+    if blend == 2 { a1.colorWriteMask = 0 }
+
+    // As many blend attachments as the subpass has colour attachments,
+    // which for the shadow pass is none: it writes depth and nothing else;
+    // the scene pass has its colour and its motion vectors.
+    colour_blend = calloc(1, sizeof(VkPipelineColorBlendStateCreateInfo)) as *VkPipelineColorBlendStateCreateInfo
+    colour_blend.sType = vk.STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO
+    colour_blend.attachmentCount = 1
+    if pass == vktargets.render_pass() { colour_blend.attachmentCount = 2 }
+    if pass == vktargets.shadow_pass() || pass == vktargets.camdepth_pass() { colour_blend.attachmentCount = 0 }
+    colour_blend.pAttachments = blends
+
+    states = calloc(2, 4)
+    (states as int[])[0] = vk.DYNAMIC_STATE_VIEWPORT
+    (states as int[])[1] = vk.DYNAMIC_STATE_SCISSOR
+    dynamic = calloc(1, sizeof(VkPipelineDynamicStateCreateInfo)) as *VkPipelineDynamicStateCreateInfo
+    dynamic.sType = vk.STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
+    dynamic.dynamicStateCount = 2
+    dynamic.pDynamicStates = states
+
+    info = calloc(1, sizeof(VkGraphicsPipelineCreateInfo)) as *VkGraphicsPipelineCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO
+    info.stageCount = 2
+    info.pStages = stages
+    info.pVertexInputState = input as ptr
+    info.pInputAssemblyState = assembly as ptr
+    info.pViewportState = viewport as ptr
+    info.pRasterizationState = raster as ptr
+    info.pMultisampleState = multisample as ptr
+    // The composite has no depth at all.
+    if pass != vktargets.post_pass() { info.pDepthStencilState = depth as ptr }
+    info.pColorBlendState = colour_blend as ptr
+    info.pDynamicState = dynamic as ptr
+    info.layout = g_layout
+    info.renderPass = pass
+    info.subpass = 0
+    cell = calloc(1, 8)
+    r = vk.vkCreateGraphicsPipelines(vkhost.device(), null, 1, info as ptr, null, cell)
+    pipeline = (cell as ptr[])[0]
+    free(cell)
+    free(info as ptr)
+    free(dynamic as ptr)
+    free(states)
+    free(colour_blend as ptr)
+    free(blends)
+    free(depth as ptr)
+    free(multisample as ptr)
+    free(raster as ptr)
+    free(viewport as ptr)
+    free(assembly as ptr)
+    free(input as ptr)
+    free(attributes)
+    free(bindings)
+    free(stages)
+    if r != vk.SUCCESS { return null }
+    return pipeline
+}
+
+// One pass pipeline from two of ae3d.vkspirv's shaders; null, the shaders
+// destroyed either way, when it would not build. False when a shader would
+// not make.
+pass_pipeline(vert: int, frag: int, blend: int, depth_test: bool, depth_write: bool, pass: ptr,
+              is_skinned: bool, is_points: bool) -> ptr {
+    v = shader(vert)
+    f = shader(frag)
+    if v == null || f == null {
+        if v != null { vk.vkDestroyShaderModule(vkhost.device(), v, null) }
+        if f != null { vk.vkDestroyShaderModule(vkhost.device(), f, null) }
+        return null
+    }
+    p = build(v, f, blend, depth_test, depth_write, pass, false, is_skinned, is_points)
+    vk.vkDestroyShaderModule(vkhost.device(), v, null)
+    vk.vkDestroyShaderModule(vkhost.device(), f, null)
+    return p
+}
+
+// The sky is drawn behind everything with depth writes off, and the
+// composite passes have no depth at all, matching what the OpenGL backend
+// sets by hand. Only the passthrough composite is required: an effect that
+// fails to build falls back to it and the scene still reaches the screen,
+// which is what the OpenGL backend does when one of its effect programs
+// fails to compile.
+create_pass_pipelines() -> bool {
+    render = vktargets.render_pass()
+    shadow_pass = vktargets.shadow_pass()
+    post_pass = vktargets.post_pass()
+    g_sky = pass_pipeline(vkspirv.SKY_VERT, vkspirv.SKY_FRAG, 0, true, false, render, false, false)
+    (g_post as ptr[])[0] = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.PASSTHROUGH_FRAG, 0, false, false, post_pass, false, false)
+    if (g_post as ptr[])[0] == null {
+        vkdevice.fail("pass vkCreateGraphicsPipelines failed")
+        return false
+    }
+    (g_post as ptr[])[1] = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.FXAA_FRAG, 0, false, false, post_pass, false, false)
+    (g_post as ptr[])[2] = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.BLOOM_FRAG, 0, false, false, post_pass, false, false)
+    g_shadow = pass_pipeline(vkspirv.DEPTH_VERT, vkspirv.DEPTH_FRAG, 0, true, true, shadow_pass, false, false)
+    if g_shadow == null {
+        vkdevice.fail("pass vkCreateGraphicsPipelines failed")
+        return false
+    }
+    (g_water as ptr[])[0] = pass_pipeline(vkspirv.WATER_VERT, vkspirv.WATER_FRAG, 0, true, true, render, false, false)
+    if (g_water as ptr[])[0] == null {
+        vkdevice.fail("pass vkCreateGraphicsPipelines failed")
+        return false
+    }
+    g_water_blend = pass_pipeline(vkspirv.WATER_VERT, vkspirv.WATER_FRAG, 1, true, false, render, false, false)
+    if g_water_blend == null {
+        vkdevice.fail("pass vkCreateGraphicsPipelines failed")
+        return false
+    }
+    // The culled water pipeline: the one pass pipeline that culls.
+    wv = shader(vkspirv.WATER_VERT)
+    wf = shader(vkspirv.WATER_FRAG)
+    if wv == null || wf == null {
+        vkdevice.fail("pass vkCreateShaderModule failed")
+        return false
+    }
+    (g_water as ptr[])[1] = build(wv, wf, 0, true, true, render, true, false, false)
+    vk.vkDestroyShaderModule(vkhost.device(), wv, null)
+    vk.vkDestroyShaderModule(vkhost.device(), wf, null)
+    if (g_water as ptr[])[1] == null {
+        vkdevice.fail("pass vkCreateGraphicsPipelines failed")
+        return false
+    }
+    g_skinned_shadow = pass_pipeline(vkspirv.DEPTH_VERT, vkspirv.DEPTH_FRAG, 0, true, true, shadow_pass, true, false)
+    if g_skinned_shadow == null {
+        vkdevice.fail("pass vkCreateGraphicsPipelines failed")
+        return false
+    }
+    (g_post as ptr[])[3] = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.SSR_FRAG, 0, false, false, post_pass, false, false)
+    g_crowd_shadow = pass_pipeline(vkspirv.CROWD_DEPTH_VERT, vkspirv.DEPTH_FRAG, 0, true, true, shadow_pass, true, false)
+    g_ssao = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.SSAO_FRAG, 2, false, false, render, false, false)
+    g_point_shadow = pass_pipeline(vkspirv.DEPTH_VERT, vkspirv.DEPTH_FRAG, 0, true, true, shadow_pass, false, true)
+    // The depth resolve draws into the camera-depth pass, depth only, from
+    // the frame's multisampled depth -- or a plain copy of it when the frame
+    // has one sample.
+    resolve = vkspirv.DEPTH_RESOLVE_FRAG
+    if vktargets.samples() == vk.SAMPLE_COUNT_1_BIT { resolve = vkspirv.DEPTH_COPY_FRAG }
+    g_depth_resolve = pass_pipeline(vkspirv.SCREEN_VERT, resolve, 0, true, true, vktargets.camdepth_pass(), false, false)
+    g_taa = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.TAA_FRAG, 0, false, false, vktargets.ssr_pass(), false, false)
+    return true
+}
+
+// The pipeline layout over the scene's set layout, the scene's pipelines
+// (the ray-query fragment where the device traces), the crowd's and the
+// points', and the passes'. False, with the reason in the backend's last
+// error, when a required one would not build.
+create() -> bool {
+    if g_scene == null {
+        g_scene = calloc(2, 8)
+        g_skinned = calloc(2, 8)
+        g_crowd = calloc(2, 8)
+        g_points = calloc(2, 8)
+        g_water = calloc(2, 8)
+        g_post = calloc(4, 8)
+    }
+    d = vkhost.device()
+    vertex = shader(vkspirv.SCENE_VERT)
+    // The fragment that traces its shadow rays where the device traces;
+    // the same source without them everywhere else.
+    fragment_kind = vkspirv.SCENE_FRAG
+    if vkdevice.ray_query() { fragment_kind = vkspirv.SCENE_RQ_FRAG }
+    fragment = shader(fragment_kind)
+    if vertex == null || fragment == null {
+        vkdevice.fail("scene vkCreateShaderModule failed")
+        return false
+    }
+    layouts = calloc(1, 8)
+    (layouts as ptr[])[0] = vkdesc.set_layout()
+    info = calloc(1, sizeof(VkPipelineLayoutCreateInfo)) as *VkPipelineLayoutCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+    info.setLayoutCount = 1
+    info.pSetLayouts = layouts
+    cell = calloc(1, 8)
+    r = vk.vkCreatePipelineLayout(d, info as ptr, null, cell)
+    g_layout = (cell as ptr[])[0]
+    free(cell)
+    free(info as ptr)
+    free(layouts)
+    if r != vk.SUCCESS {
+        g_layout = null
+        vk.vkDestroyShaderModule(d, vertex, null)
+        vk.vkDestroyShaderModule(d, fragment, null)
+        vkdevice.fail("vkCreatePipelineLayout failed")
+        return false
+    }
+    render = vktargets.render_pass()
+    // A transparent surface is never culled: you see through it to its own
+    // far side, so removing that side removes something the frame should
+    // show. The OpenGL backend turns culling off for the transparent pass
+    // for the same reason, which is why only the opaque pipeline comes in
+    // two variants.
+    g_scene_blend = build(vertex, fragment, 1, true, false, render, false, false, false)
+    g_skinned_blend = build(vertex, fragment, 1, true, false, render, false, true, false)
+    ok = true
+    cull = 0
+    while cull < 2 {
+        (g_scene as ptr[])[cull] = build(vertex, fragment, 1, true, true, render, cull == 1, false, false)
+        (g_skinned as ptr[])[cull] = build(vertex, fragment, 1, true, true, render, cull == 1, true, false)
+        if (g_scene as ptr[])[cull] == null || (g_skinned as ptr[])[cull] == null { ok = false }
+        cull = cull + 1
+    }
+    if !ok || g_scene_blend == null || g_skinned_blend == null {
+        vk.vkDestroyShaderModule(d, vertex, null)
+        vk.vkDestroyShaderModule(d, fragment, null)
+        vkdevice.fail("vkCreateGraphicsPipelines failed")
+        return false
+    }
+    // Points: not required, a device that will not build them draws a point
+    // stream through the matrix pipelines, at the stride of a matrix, which
+    // is wrong but not a crash; the parity test says which it is.
+    g_points_blend = build(vertex, fragment, 1, true, false, render, false, false, true)
+    cull = 0
+    while cull < 2 {
+        (g_points as ptr[])[cull] = build(vertex, fragment, 1, true, true, render, cull == 1, false, true)
+        cull = cull + 1
+    }
+    vk.vkDestroyShaderModule(d, vertex, null)
+    // The crowd: the same fragment shader after a vertex shader that poses
+    // each instance from the pose bank. Not required: a device that will
+    // not build it draws a crowd unposed instead of not at all.
+    crowd_vertex = shader(vkspirv.CROWD_VERT)
+    if crowd_vertex != null {
+        g_crowd_blend = build(crowd_vertex, fragment, 1, true, false, render, false, true, false)
+        cull = 0
+        while cull < 2 {
+            (g_crowd as ptr[])[cull] = build(crowd_vertex, fragment, 1, true, true, render, cull == 1, true, false)
+            cull = cull + 1
+        }
+        vk.vkDestroyShaderModule(d, crowd_vertex, null)
+    }
+    vk.vkDestroyShaderModule(d, fragment, null)
+    return create_pass_pipelines()
+}
+
+gone(p: ptr) {
+    if p != null { vk.vkDestroyPipeline(vkhost.device(), p, null) }
+}
+
+// A table of `count` pipelines emptied, where there is one.
+forget(table: ptr, count: int) {
+    if table != null { memset(table, 0, (count * 8) as long) }
+}
+
+// Every pipeline and the layout destroyed, the device idle: at shutdown.
+destroy() {
+    if g_scene == null { return }
+    cull = 0
+    while cull < 2 {
+        gone((g_scene as ptr[])[cull])
+        gone((g_skinned as ptr[])[cull])
+        gone((g_crowd as ptr[])[cull])
+        gone((g_points as ptr[])[cull])
+        gone((g_water as ptr[])[cull])
+        cull = cull + 1
+    }
+    gone(g_scene_blend)
+    gone(g_skinned_blend)
+    gone(g_crowd_blend)
+    gone(g_points_blend)
+    gone(g_water_blend)
+    gone(g_shadow)
+    gone(g_skinned_shadow)
+    gone(g_crowd_shadow)
+    gone(g_point_shadow)
+    gone(g_sky)
+    gone(g_ssao)
+    gone(g_depth_resolve)
+    gone(g_taa)
+    i = 0
+    while i < 4 {
+        gone((g_post as ptr[])[i])
+        i = i + 1
+    }
+    if g_layout != null { vk.vkDestroyPipelineLayout(vkhost.device(), g_layout, null) }
+    forget(g_scene, 2)
+    forget(g_skinned, 2)
+    forget(g_crowd, 2)
+    forget(g_points, 2)
+    forget(g_water, 2)
+    forget(g_post, 4)
+    g_layout = null
+    g_scene_blend = null
+    g_skinned_blend = null
+    g_crowd_blend = null
+    g_points_blend = null
+    g_water_blend = null
+    g_shadow = null
+    g_skinned_shadow = null
+    g_crowd_shadow = null
+    g_point_shadow = null
+    g_sky = null
+    g_ssao = null
+    g_depth_resolve = null
+    g_taa = null
+}

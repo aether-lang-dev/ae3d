@@ -1,0 +1,1343 @@
+// ae3d.vktargets -- what a Vulkan frame is drawn into (#402), on
+// contrib.vulkan.vk: the swapchain or the offscreen image, the scene's
+// multisampled colour, depth and motion vectors, the render passes over
+// them, their framebuffers, and the targets the passes around the scene
+// draw into -- the cascades' shadow atlas, the lamps' shadow atlas and its
+// static layer, the camera depth, the reflection's and the temporal pass's
+// colours, the post chain's scene texture, DLSS's output.
+//
+// The scene is drawn at the render extent -- the frame's times the render
+// scale, 1 unless asked otherwise -- into targets of that size, and the
+// composite draws it to the frame at the frame's. An upscaler (DLSS) sits
+// between the two. A null window means offscreen: no surface, no
+// swapchain, and the frame is read back rather than presented, which is
+// what lets the editor host the renderer inside a toolkit that owns the
+// real window.
+
+import contrib.vulkan.vk
+import ae3d.vkhost
+import ae3d.vkdevice
+import ae3d.vktexture
+import ae3d.vkdesc
+
+exports (
+    SHADOW_SIZE, LAMP_SHADOW_SIZE,
+    choose_formats, pick_samples, create_frame, destroy_frame, create_passes, destroy_passes, create_framebuffers,
+    samples, color_format, depth_format, velocity_format, offscreen, can_capture, image_count, image, image_view,
+    swapchain, width, height, render_width, render_height, render_scale, set_render_scale, scaled,
+    render_pass, render_pass_first, render_pass_rest, scene_pass, scene_pass_first, scene_pass_rest,
+    shadow_pass, camdepth_pass, ssr_pass, post_pass, framebuffer, scene_framebuffer, post_framebuffer,
+    shadow_framebuffer, shadow_view, shadow_sampler, shadow_image, live_shadow_targets, shadow_ready, set_shadow_ready,
+    lamp_pass, lamp_framebuffer, lamp_static_framebuffer, lamp_image, lamp_static_image, lamp_view, lamp_sampler,
+    lamp_generation, create_lamp_target, destroy_lamp_target,
+    velocity_texture, post_texture, depth_view, depth_image,
+    camdepth_create, camdepth_destroy, camdepth_ready, camdepth_fits, camdepth_serial, camdepth_framebuffer,
+    camdepth_view, camdepth_sampler, camdepth_image, camdepth_memory, ssr_framebuffer, ssr_reflect_texture,
+    taa_framebuffer, taa_texture, taa_history_valid, set_taa_history, taa_current, set_taa_current,
+    dlss_output, dlss_output_create, dlss_output_destroy, dlss_output_fresh, set_dlss_output_fresh,
+    lod_bias_for_scale
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memset(p: ptr, value: int, n: long) -> ptr
+extern log(x: float) -> float
+
+// The shadow atlas: four cascades of 2048 texels, two by two (ae3d.cascades'
+// ATLAS and SIZE, #469).
+const SHADOW_SIZE = 4096
+// The lamps' atlas: eight by eight faces of 512 texels (ae3d.lampshadows'
+// ATLAS, FACE and ACROSS).
+const LAMP_SHADOW_SIZE = 4096
+
+// The frame.
+var g_offscreen = false
+var g_color_format = 0
+var g_color_space = 0
+var g_present_mode = 0
+var g_depth_format = 0
+var g_velocity_format = 0
+var g_samples = 1
+var g_width = 0
+var g_height = 0
+var g_render_width = 0
+var g_render_height = 0
+var g_render_scale = 0.0
+var g_swapchain: ptr = null
+var g_image_count = 0
+var g_images: ptr = null           // VkImage[image_count]
+var g_views: ptr = null            // VkImageView[image_count]
+var g_framebuffers: ptr = null     // VkFramebuffer[image_count]
+var g_offscreen_memory: ptr = null // the offscreen image's memory
+var g_can_capture = false          // the surface allows a transfer-source swapchain
+// The scene's own targets: the multisampled colour, the depth, the
+// multisampled motion vectors and the resolved ones as a texture.
+var g_colour: ptr = null           // VKImage
+var g_depth: ptr = null            // VKImage
+var g_velocity: ptr = null         // VKImage
+var g_velocity_texture = 0
+
+// The passes.
+var g_render_pass: ptr = null
+var g_render_pass_first: ptr = null
+var g_render_pass_rest: ptr = null
+var g_scene_pass: ptr = null
+var g_scene_pass_first: ptr = null
+var g_scene_pass_rest: ptr = null
+var g_shadow_pass: ptr = null
+var g_lamp_pass: ptr = null
+var g_camdepth_pass: ptr = null
+var g_ssr_pass: ptr = null
+var g_post_pass: ptr = null
+
+// The shadow map: one depth image, the attachment and what the lit pass
+// samples, with its own sampler; and how many are held.
+var g_shadow_framebuffer: ptr = null
+var g_shadow: ptr = null           // VKImage
+var g_shadow_sampler: ptr = null
+var g_shadow_targets = 0
+// Whether the cascades' atlas has been through its pass since it was made:
+// until then it is in no layout the lit pass may sample, and a frame whose
+// key light is a lamp draws no cascade.
+var g_shadow_ready = false
+
+// The lamps' own shadows (ae3d.lampshadows, #490): one depth atlas of their
+// cube faces, kept from frame to frame -- a face is drawn again only when
+// what stands in it changes, so the pass loads the atlas and clears just
+// the tiles it draws -- and the static layer under it: what stands still,
+// drawn when it changes and copied into the atlas above tile by tile, with
+// what moves drawn over the copy. Their size is their own, not the
+// window's: made once when the backend starts, and kept.
+var g_lamp: ptr = null             // VKImage
+var g_lamp_static: ptr = null      // VKImage
+var g_lamp_framebuffer: ptr = null
+var g_lamp_static_framebuffer: ptr = null
+var g_lamp_sampler: ptr = null
+var g_lamp_generation = 0
+
+// The post chain's scene texture and its framebuffer, and the composite's
+// framebuffers over the frame's images.
+var g_scene_framebuffer: ptr = null
+var g_post_framebuffers: ptr = null // VkFramebuffer[image_count]
+var g_post_texture = 0
+
+// The camera depth, what the occlusion, the reflection and the water read:
+// its pass's framebuffer, image and sampler and its size; the reflection's
+// colour and framebuffer, and the temporal pass's two history textures.
+var g_camdepth_framebuffer: ptr = null
+var g_camdepth: ptr = null         // VKImage
+var g_camdepth_sampler: ptr = null
+var g_camdepth_width = 0
+var g_camdepth_height = 0
+var g_camdepth_serial = 0          // counts the targets destroyed: what sets name them goes stale
+var g_ssr_framebuffer: ptr = null
+var g_ssr_reflect_texture = 0
+var g_taa_texture: ptr = null      // int[2]
+var g_taa_framebuffer: ptr = null  // VkFramebuffer[2]
+var g_taa_history_valid = false
+var g_taa_current = 0
+
+// DLSS's output: the frame-size image it writes, kept in shader-read
+// layout between frames (undefined until the first).
+var g_dlss_output = 0
+var g_dlss_output_fresh = false
+
+var g_cell: ptr = null
+
+// A made image kept here: a VKImage on the heap.
+kept(made: vkhost.VKImage) -> ptr {
+    p = calloc(1, sizeof(VKImage)) as *VKImage
+    p.image = made.image
+    p.memory = made.memory
+    p.view = made.view
+    return p as ptr
+}
+
+// A kept image freed and forgotten; nothing for null.
+unkept(p: ptr) {
+    if p == null { return }
+    img = p as *VKImage
+    vkhost.image_free(vkhost.VKImage { image: img.image, memory: img.memory, view: img.view })
+    free(p)
+}
+
+view_of(p: ptr) -> ptr {
+    if p == null { return null }
+    return (p as *VKImage).view
+}
+
+image_of(p: ptr) -> ptr {
+    if p == null { return null }
+    return (p as *VKImage).image
+}
+
+memory_of(p: ptr) -> ptr {
+    if p == null { return null }
+    return (p as *VKImage).memory
+}
+
+cell() -> ptr {
+    if g_cell == null { g_cell = calloc(8, 8) }
+    return g_cell
+}
+
+// --- what the frame is --------------------------------------------------------------------------------------------
+
+offscreen() -> bool { return g_offscreen }
+samples() -> int { return g_samples }
+color_format() -> int { return g_color_format }
+depth_format() -> int { return g_depth_format }
+velocity_format() -> int { return g_velocity_format }
+can_capture() -> bool { return g_can_capture }
+swapchain() -> ptr { return g_swapchain }
+image_count() -> int { return g_image_count }
+image(index: int) -> ptr {
+    if g_images == null { return null }
+    return (g_images as ptr[])[index]
+}
+image_view(index: int) -> ptr {
+    if g_views == null { return null }
+    return (g_views as ptr[])[index]
+}
+width() -> int { return g_width }
+height() -> int { return g_height }
+render_width() -> int { return g_render_width }
+render_height() -> int { return g_render_height }
+render_scale() -> float { return g_render_scale }
+set_render_scale(scale: float) { g_render_scale = scale }
+depth_view() -> ptr { return view_of(g_depth) }
+depth_image() -> ptr { return image_of(g_depth) }
+velocity_texture() -> int { return g_velocity_texture }
+post_texture() -> int { return g_post_texture }
+
+render_pass() -> ptr { return g_render_pass }
+render_pass_first() -> ptr { return g_render_pass_first }
+render_pass_rest() -> ptr { return g_render_pass_rest }
+scene_pass() -> ptr { return g_scene_pass }
+scene_pass_first() -> ptr { return g_scene_pass_first }
+scene_pass_rest() -> ptr { return g_scene_pass_rest }
+shadow_pass() -> ptr { return g_shadow_pass }
+camdepth_pass() -> ptr { return g_camdepth_pass }
+ssr_pass() -> ptr { return g_ssr_pass }
+post_pass() -> ptr { return g_post_pass }
+framebuffer(index: int) -> ptr {
+    if g_framebuffers == null { return null }
+    return (g_framebuffers as ptr[])[index]
+}
+scene_framebuffer() -> ptr { return g_scene_framebuffer }
+post_framebuffer(index: int) -> ptr {
+    if g_post_framebuffers == null { return null }
+    return (g_post_framebuffers as ptr[])[index]
+}
+shadow_framebuffer() -> ptr { return g_shadow_framebuffer }
+shadow_view() -> ptr { return view_of(g_shadow) }
+shadow_image() -> ptr { return image_of(g_shadow) }
+shadow_sampler() -> ptr { return g_shadow_sampler }
+shadow_ready() -> bool { return g_shadow_ready }
+set_shadow_ready(ready: bool) { g_shadow_ready = ready }
+lamp_pass() -> ptr { return g_lamp_pass }
+lamp_framebuffer() -> ptr { return g_lamp_framebuffer }
+lamp_static_framebuffer() -> ptr { return g_lamp_static_framebuffer }
+lamp_image() -> ptr { return image_of(g_lamp) }
+lamp_static_image() -> ptr { return image_of(g_lamp_static) }
+lamp_view() -> ptr { return view_of(g_lamp) }
+lamp_sampler() -> ptr { return g_lamp_sampler }
+// How many times the lamps' atlas has been made: its faces hold nothing
+// drawn before the last.
+lamp_generation() -> int { return g_lamp_generation }
+// How many shadow targets are held: a rebuild makes a fresh one, so the
+// old one has to go with the swapchain it was made beside; what a test
+// watches to know that it did.
+live_shadow_targets() -> int { return g_shadow_targets }
+
+camdepth_framebuffer() -> ptr { return g_camdepth_framebuffer }
+camdepth_view() -> ptr { return view_of(g_camdepth) }
+camdepth_image() -> ptr { return image_of(g_camdepth) }
+camdepth_memory() -> ptr { return memory_of(g_camdepth) }
+camdepth_sampler() -> ptr { return g_camdepth_sampler }
+camdepth_serial() -> int { return g_camdepth_serial }
+ssr_framebuffer() -> ptr { return g_ssr_framebuffer }
+ssr_reflect_texture() -> int { return g_ssr_reflect_texture }
+taa_framebuffer(k: int) -> ptr {
+    if g_taa_framebuffer == null { return null }
+    return (g_taa_framebuffer as ptr[])[k]
+}
+taa_texture(k: int) -> int {
+    if g_taa_texture == null { return 0 }
+    return (g_taa_texture as int[])[k]
+}
+taa_history_valid() -> bool { return g_taa_history_valid }
+set_taa_history(valid: bool) { g_taa_history_valid = valid }
+taa_current() -> int { return g_taa_current }
+set_taa_current(k: int) { g_taa_current = k }
+dlss_output() -> int { return g_dlss_output }
+dlss_output_fresh() -> bool { return g_dlss_output_fresh }
+set_dlss_output_fresh(fresh: bool) { g_dlss_output_fresh = fresh }
+
+// The scene's own extent: the frame's times the render scale, never less
+// than a pixel. Set whenever the frame's is.
+scale_extent() {
+    scale = 1.0
+    if g_render_scale > 0.0 && g_render_scale < 1.0 { scale = g_render_scale }
+    g_render_width = ((g_width as float) * scale + 0.5) as int
+    g_render_height = ((g_height as float) * scale + 0.5) as int
+    if g_render_width < 1 { g_render_width = 1 }
+    if g_render_height < 1 { g_render_height = 1 }
+}
+
+// The scene is drawn smaller than the frame: the post chain is then what
+// scales it up, so it runs whether or not an effect asked for it.
+scaled() -> bool { return g_render_width != g_width || g_render_height != g_height }
+
+// The scene textures' mip bias for the render scale: log2 of it, 0 at the
+// frame's own size.
+lod_bias_for_scale() -> float {
+    if g_render_width > 0 && g_width > 0 && g_render_width < g_width {
+        return (log((g_render_width as float) / (g_width as float)) / log(2.0)) as f32 as float
+    }
+    return 0.0
+}
+
+// The frame's formats: RGBA offscreen; the surface's BGRA sRGB-nonlinear
+// where it has it, else its first; FIFO presentation; 32-bit float depth.
+choose_formats(surface: ptr) -> bool {
+    g_offscreen = surface == null
+    g_depth_format = vk.FORMAT_D32_SFLOAT
+    g_present_mode = vk.PRESENT_MODE_FIFO_KHR
+    if g_offscreen {
+        g_color_format = vk.FORMAT_R8G8B8A8_UNORM
+        g_color_space = vk.COLOR_SPACE_SRGB_NONLINEAR_KHR
+        return true
+    }
+    physical = vkdevice.physical()
+    c = cell()
+    (c as uint32[])[0] = 0
+    vk.vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, c, null)
+    count = (c as uint32[])[0] as int
+    if count == 0 {
+        vkdevice.fail("surface reports no formats")
+        return false
+    }
+    formats = calloc(count, sizeof(VkSurfaceFormatKHR))
+    vk.vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, c, formats)
+    first = formats as *VkSurfaceFormatKHR
+    g_color_format = first.format
+    g_color_space = first.colorSpace
+    i = 0
+    found = false
+    while i < count && !found {
+        f = (formats + i * sizeof(VkSurfaceFormatKHR)) as *VkSurfaceFormatKHR
+        if f.format == vk.FORMAT_B8G8R8A8_UNORM && f.colorSpace == vk.COLOR_SPACE_SRGB_NONLINEAR_KHR {
+            g_color_format = f.format
+            g_color_space = f.colorSpace
+            found = true
+        }
+        i = i + 1
+    }
+    free(formats)
+    return true
+}
+
+// The multisampling the frame takes, of what the device offers for both
+// colour and depth: at most `wanted` (4, 2 or none).
+pick_samples(wanted: int) {
+    props = calloc(1, sizeof(VkPhysicalDeviceProperties)) as *VkPhysicalDeviceProperties
+    vk.vkGetPhysicalDeviceProperties(vkdevice.physical(), props as ptr)
+    counts = (props.limits.framebufferColorSampleCounts) as int & (props.limits.framebufferDepthSampleCounts) as int
+    free(props as ptr)
+    g_samples = vk.SAMPLE_COUNT_1_BIT
+    if wanted >= 2 && (counts & vk.SAMPLE_COUNT_2_BIT) != 0 { g_samples = vk.SAMPLE_COUNT_2_BIT }
+    if wanted >= 4 && (counts & vk.SAMPLE_COUNT_4_BIT) != 0 { g_samples = vk.SAMPLE_COUNT_4_BIT }
+}
+
+// The motion-vector target beside the depth: the multisampled image the
+// scene draws into when the frame is multisampled, and the resolved one as
+// a texture, point sampled -- a vector is not blended between pixels.
+create_velocity() -> bool {
+    g_velocity_format = vk.FORMAT_R16G16_SFLOAT
+    if g_samples != vk.SAMPLE_COUNT_1_BIT {
+        made = vkhost.image(g_render_width, g_render_height, 1, g_velocity_format, g_samples,
+                            vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+                            vk.IMAGE_ASPECT_COLOR_BIT)
+        if made.image == null { return false }
+        g_velocity = kept(made)
+    }
+    resolved = vkhost.image(g_render_width, g_render_height, 1, g_velocity_format, vk.SAMPLE_COUNT_1_BIT,
+                            vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT, vk.IMAGE_ASPECT_COLOR_BIT)
+    if resolved.image == null { return false }
+    sampler = vkhost.sampler(vk.FILTER_NEAREST, vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, vk.SAMPLER_MIPMAP_MODE_NEAREST, 1.0, 0.0)
+    if sampler == null {
+        vkhost.image_free(resolved)
+        vkdevice.fail("velocity vkCreateSampler failed")
+        return false
+    }
+    g_velocity_texture = vktexture.adopt_target(resolved, sampler, g_render_width, g_render_height)
+    if g_velocity_texture == 0 {
+        vk.vkDestroySampler(vkhost.device(), sampler, null)
+        vkhost.image_free(resolved)
+        return false
+    }
+    return true
+}
+
+// The scene's depth: multisampled with the frame, and sampled as well --
+// the depth resolve reads it after the opaque draws.
+create_depth() -> bool {
+    made = vkhost.image(g_render_width, g_render_height, 1, g_depth_format, g_samples,
+                        vk.IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT, vk.IMAGE_ASPECT_DEPTH_BIT)
+    if made.image == null { return false }
+    g_depth = kept(made)
+    return create_velocity()
+}
+
+// The frame's multisampled colour, when the frame is multisampled.
+create_colour(transient: bool) -> bool {
+    if g_samples == vk.SAMPLE_COUNT_1_BIT { return true }
+    usage = vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+    if transient { usage = usage | vk.IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT }
+    made = vkhost.image(g_render_width, g_render_height, 1, g_color_format, g_samples, usage, vk.IMAGE_ASPECT_COLOR_BIT)
+    if made.image == null { return false }
+    g_colour = kept(made)
+    return true
+}
+
+// The offscreen equivalent of a swapchain: one image the pass resolves
+// into, which is then copied to a host-visible buffer for the caller.
+create_offscreen(w: int, h: int) -> bool {
+    g_width = w
+    g_height = h
+    if g_width < 1 { g_width = 1 }
+    if g_height < 1 { g_height = 1 }
+    scale_extent()
+    g_image_count = 1
+    g_images = calloc(1, 8)
+    g_views = calloc(1, 8)
+    made = vkhost.image(g_width, g_height, 1, g_color_format, vk.SAMPLE_COUNT_1_BIT,
+                        vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_TRANSFER_SRC_BIT, vk.IMAGE_ASPECT_COLOR_BIT)
+    if made.image == null { return false }
+    (g_images as ptr[])[0] = made.image
+    (g_views as ptr[])[0] = made.view
+    g_offscreen_memory = made.memory
+    if !create_colour(false) { return false }
+    return create_depth()
+}
+
+// A surface whose current extent is this wide leaves its size to the
+// swapchain (the extent's uint32, ~0u).
+const SIZED_BY_SWAPCHAIN: uint32 = 0xFFFFFFFF
+
+// The swapchain over `surface` at the surface's extent, or `w` by `h`
+// clamped to what it allows where it lets the caller choose.
+create_swapchain(surface: ptr, w: int, h: int) -> bool {
+    d = vkhost.device()
+    caps = calloc(1, sizeof(VkSurfaceCapabilitiesKHR)) as *VkSurfaceCapabilitiesKHR
+    vk.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vkdevice.physical(), surface, caps as ptr)
+    if caps.currentExtent.width != SIZED_BY_SWAPCHAIN {
+        g_width = (caps.currentExtent.width) as int
+        g_height = (caps.currentExtent.height) as int
+    } else {
+        g_width = w
+        g_height = h
+        if g_width < (caps.minImageExtent.width) as int { g_width = (caps.minImageExtent.width) as int }
+        if g_height < (caps.minImageExtent.height) as int { g_height = (caps.minImageExtent.height) as int }
+        if g_width > (caps.maxImageExtent.width) as int { g_width = (caps.maxImageExtent.width) as int }
+        if g_height > (caps.maxImageExtent.height) as int { g_height = (caps.maxImageExtent.height) as int }
+    }
+    if g_width == 0 || g_height == 0 {
+        free(caps as ptr)
+        vkdevice.fail("surface has zero extent")
+        return false
+    }
+    scale_extent()
+    desired = (caps.minImageCount) as int + 1
+    if (caps.maxImageCount) as int > 0 && desired > (caps.maxImageCount) as int { desired = (caps.maxImageCount) as int }
+
+    info = calloc(1, sizeof(VkSwapchainCreateInfoKHR)) as *VkSwapchainCreateInfoKHR
+    info.sType = vk.STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR
+    info.surface = surface
+    info.minImageCount = desired
+    info.imageFormat = g_color_format
+    info.imageColorSpace = g_color_space
+    info.imageExtent.width = g_width
+    info.imageExtent.height = g_height
+    info.imageArrayLayers = 1
+    info.imageUsage = vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+    // Reading a finished frame back -- for a snapshot, or for the agent to
+    // see what it drew -- means copying the swapchain image, which needs it
+    // to be a transfer source. Nearly every surface allows it; where one
+    // does not the capture path stays off rather than failing to create
+    // the swapchain.
+    g_can_capture = ((caps.supportedUsageFlags) as int & vk.IMAGE_USAGE_TRANSFER_SRC_BIT) != 0
+    if g_can_capture { info.imageUsage = vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_TRANSFER_SRC_BIT }
+    info.preTransform = caps.currentTransform
+    info.compositeAlpha = vk.COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+    info.presentMode = g_present_mode
+    info.clipped = 1
+    families = calloc(2, 4)
+    if vkdevice.graphics_family() != vkdevice.present_family() {
+        (families as uint32[])[0] = vkdevice.graphics_family()
+        (families as uint32[])[1] = vkdevice.present_family()
+        info.imageSharingMode = vk.SHARING_MODE_CONCURRENT
+        info.queueFamilyIndexCount = 2
+        info.pQueueFamilyIndices = families
+    } else {
+        info.imageSharingMode = vk.SHARING_MODE_EXCLUSIVE
+    }
+    c = cell()
+    r = vk.vkCreateSwapchainKHR(d, info as ptr, null, c)
+    g_swapchain = (c as ptr[])[0]
+    free(families)
+    free(info as ptr)
+    free(caps as ptr)
+    if r != vk.SUCCESS {
+        g_swapchain = null
+        vkdevice.fail("vkCreateSwapchainKHR failed (VkResult ${r})")
+        return false
+    }
+    (c as uint32[])[0] = 0
+    vk.vkGetSwapchainImagesKHR(d, g_swapchain, c, null)
+    g_image_count = (c as uint32[])[0] as int
+    g_images = calloc(g_image_count, 8)
+    g_views = calloc(g_image_count, 8)
+    vk.vkGetSwapchainImagesKHR(d, g_swapchain, c, g_images)
+    i = 0
+    while i < g_image_count {
+        view_info = calloc(1, sizeof(VkImageViewCreateInfo)) as *VkImageViewCreateInfo
+        view_info.sType = vk.STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+        view_info.image = (g_images as ptr[])[i]
+        view_info.viewType = vk.IMAGE_VIEW_TYPE_2D
+        view_info.format = g_color_format
+        view_info.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+        view_info.subresourceRange.levelCount = 1
+        view_info.subresourceRange.layerCount = 1
+        r = vk.vkCreateImageView(d, view_info as ptr, null, c)
+        free(view_info as ptr)
+        if r != vk.SUCCESS {
+            vkdevice.fail("vkCreateImageView failed (VkResult ${r})")
+            return false
+        }
+        (g_views as ptr[])[i] = (c as ptr[])[0]
+        i = i + 1
+    }
+    if !create_colour(true) { return false }
+    return create_depth()
+}
+
+// The frame: the offscreen image, or the swapchain over `surface`.
+create_frame(surface: ptr, w: int, h: int) -> bool {
+    if g_offscreen { return create_offscreen(w, h) }
+    return create_swapchain(surface, w, h)
+}
+
+// --- passes ------------------------------------------------------------------------------------------------------
+
+attachment(at: ptr, format: int, samples_now: int, load: int, store: int, initial: int, final: int) {
+    a = at as *VkAttachmentDescription
+    a.format = format
+    a.samples = samples_now
+    a.loadOp = load
+    a.storeOp = store
+    a.stencilLoadOp = vk.ATTACHMENT_LOAD_OP_DONT_CARE
+    a.stencilStoreOp = vk.ATTACHMENT_STORE_OP_DONT_CARE
+    a.initialLayout = initial
+    a.finalLayout = final
+}
+
+// The subpasses are Vulkan's uint32: SUBPASS_EXTERNAL is ~0u, which an int
+// parameter carried as -1.
+dependency(at: ptr, src: uint32, dst: uint32, src_stage: int, dst_stage: int, src_access: int, dst_access: int) {
+    d = at as *VkSubpassDependency
+    d.srcSubpass = src
+    d.dstSubpass = dst
+    d.srcStageMask = src_stage
+    d.dstStageMask = dst_stage
+    d.srcAccessMask = src_access
+    d.dstAccessMask = dst_access
+}
+
+reference(at: ptr, index: int, layout: int) {
+    r = at as *VkAttachmentReference
+    r.attachment = index
+    r.layout = layout
+}
+
+// A render pass from its parts; null when it would not make.
+made_pass(attachments: ptr, count: int, subpass: ptr, dependencies: ptr, dependency_count: int) -> ptr {
+    info = calloc(1, sizeof(VkRenderPassCreateInfo)) as *VkRenderPassCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+    info.attachmentCount = count
+    info.pAttachments = attachments
+    info.subpassCount = 1
+    info.pSubpasses = subpass
+    info.dependencyCount = dependency_count
+    info.pDependencies = dependencies
+    c = cell()
+    r = vk.vkCreateRenderPass(vkhost.device(), info as ptr, null, c)
+    free(info as ptr)
+    if r != vk.SUCCESS { return null }
+    return (c as ptr[])[0]
+}
+
+// The scene's pass. `part`: 0 the whole scene in one pass; 1 its first
+// half, which keeps its colour and depth and ends with the depth readable
+// by a shader; 2 the rest, which loads both and finishes the frame.
+scene_render_pass(present_layout: int, part: int) -> ptr {
+    multisampled = g_samples != vk.SAMPLE_COUNT_1_BIT
+    count = 3
+    if multisampled { count = 5 }
+    a = calloc(5, sizeof(VkAttachmentDescription))
+    size = sizeof(VkAttachmentDescription)
+    // Attachment 0 is what the subpass draws into: the multisampled image
+    // when MSAA is on, otherwise the presentable image itself.
+    store0 = vk.ATTACHMENT_STORE_OP_STORE
+    final0 = present_layout
+    if multisampled {
+        store0 = vk.ATTACHMENT_STORE_OP_DONT_CARE
+        final0 = vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+    }
+    attachment(a, g_color_format, g_samples, vk.ATTACHMENT_LOAD_OP_CLEAR, store0, vk.IMAGE_LAYOUT_UNDEFINED, final0)
+    attachment(a + size, g_depth_format, g_samples, vk.ATTACHMENT_LOAD_OP_CLEAR, vk.ATTACHMENT_STORE_OP_DONT_CARE,
+               vk.IMAGE_LAYOUT_UNDEFINED, vk.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+    // Attachment 2 is the motion vectors, drawn beside the colour: the
+    // multisampled image when MSAA is on, otherwise the texture itself,
+    // which the temporal passes sample when the pass is done.
+    final2 = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    if multisampled { final2 = vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL }
+    attachment(a + 2 * size, g_velocity_format, g_samples, vk.ATTACHMENT_LOAD_OP_CLEAR, store0, vk.IMAGE_LAYOUT_UNDEFINED, final2)
+    // 3 and 4, when MSAA is on: what the colour and the vectors resolve to.
+    attachment(a + 3 * size, g_color_format, vk.SAMPLE_COUNT_1_BIT, vk.ATTACHMENT_LOAD_OP_DONT_CARE,
+               vk.ATTACHMENT_STORE_OP_STORE, vk.IMAGE_LAYOUT_UNDEFINED, present_layout)
+    attachment(a + 4 * size, g_velocity_format, vk.SAMPLE_COUNT_1_BIT, vk.ATTACHMENT_LOAD_OP_DONT_CARE,
+               vk.ATTACHMENT_STORE_OP_STORE, vk.IMAGE_LAYOUT_UNDEFINED, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+
+    refs = calloc(5, sizeof(VkAttachmentReference))
+    rsize = sizeof(VkAttachmentReference)
+    reference(refs, 0, vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+    reference(refs + rsize, 2, vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+    reference(refs + 2 * rsize, 1, vk.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+    reference(refs + 3 * rsize, 3, vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+    reference(refs + 4 * rsize, 4, vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+
+    if part == 1 {
+        // The first half keeps what it drew for the second: the colour and
+        // the vectors stay in their attachment layout, the depth ends
+        // readable. The multisampled images are not resolved yet; the
+        // second half does that once, at the end.
+        a0 = a as *VkAttachmentDescription
+        a0.storeOp = vk.ATTACHMENT_STORE_OP_STORE
+        a0.finalLayout = vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        a1 = (a + size) as *VkAttachmentDescription
+        a1.storeOp = vk.ATTACHMENT_STORE_OP_STORE
+        a1.finalLayout = vk.IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+        a2 = (a + 2 * size) as *VkAttachmentDescription
+        a2.storeOp = vk.ATTACHMENT_STORE_OP_STORE
+        a2.finalLayout = vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        a3 = (a + 3 * size) as *VkAttachmentDescription
+        a3.storeOp = vk.ATTACHMENT_STORE_OP_DONT_CARE
+        a3.finalLayout = vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        a4 = (a + 4 * size) as *VkAttachmentDescription
+        a4.storeOp = vk.ATTACHMENT_STORE_OP_DONT_CARE
+        a4.finalLayout = vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        r3 = (refs + 3 * rsize) as *VkAttachmentReference
+        r3.attachment = vk.ATTACHMENT_UNUSED
+        r4 = (refs + 4 * rsize) as *VkAttachmentReference
+        r4.attachment = vk.ATTACHMENT_UNUSED
+    } else if part == 2 {
+        a0 = a as *VkAttachmentDescription
+        a0.loadOp = vk.ATTACHMENT_LOAD_OP_LOAD
+        a0.initialLayout = vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        a1 = (a + size) as *VkAttachmentDescription
+        a1.loadOp = vk.ATTACHMENT_LOAD_OP_LOAD
+        a1.initialLayout = vk.IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+        a2 = (a + 2 * size) as *VkAttachmentDescription
+        a2.loadOp = vk.ATTACHMENT_LOAD_OP_LOAD
+        a2.initialLayout = vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+    }
+
+    subpass = calloc(1, sizeof(VkSubpassDescription)) as *VkSubpassDescription
+    subpass.pipelineBindPoint = vk.PIPELINE_BIND_POINT_GRAPHICS
+    subpass.colorAttachmentCount = 2
+    subpass.pColorAttachments = refs
+    subpass.pDepthStencilAttachment = refs + 2 * rsize
+    if multisampled { subpass.pResolveAttachments = refs + 3 * rsize }
+
+    deps = calloc(2, sizeof(VkSubpassDependency))
+    // The same dependencies for all three passes, whole and halves: the
+    // pipelines are made against the whole pass and draw in the halves too,
+    // and passes that differ in their dependencies are not compatible (the
+    // validation layer counted thousands of draws against it, #405). What
+    // the second half needs -- after the resolve read the depth and the
+    // first half wrote both -- is waited for in the whole pass as well,
+    // which costs it nothing it would notice.
+    dependency(deps, vk.SUBPASS_EXTERNAL, 0,
+               vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | vk.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+               vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT | vk.PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+               vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | vk.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+               vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT | vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+               vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT | vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+               vk.ACCESS_COLOR_ATTACHMENT_READ_BIT | vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT)
+    // The first half's depth, written here, is read by the resolve's shader
+    // (and, the dependencies being the same in all three, the others').
+    // With no post chain this pass is the frame's last, and what it leaves
+    // in the frame's image -- the colour and its final transition -- is
+    // copied out by the readback (ae3d.vkreadback): a transfer read, which
+    // has to wait for them as the shader's reads do, or the copy races the
+    // pass that wrote the frame (#458).
+    dependency(deps + sizeof(VkSubpassDependency), 0, vk.SUBPASS_EXTERNAL,
+               vk.PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+               vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT | vk.PIPELINE_STAGE_TRANSFER_BIT,
+               vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+               vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_TRANSFER_READ_BIT)
+
+    pass = made_pass(a, count, subpass as ptr, deps, 2)
+    free(deps)
+    free(subpass as ptr)
+    free(refs)
+    free(a)
+    if pass == null { vkdevice.fail("vkCreateRenderPass failed") }
+    return pass
+}
+
+// A depth-only pass -- the shadow atlas's, the camera depth's -- cleared,
+// stored and left in the layout the descriptors read it through; or, for
+// the lamps' atlas (`loaded`), loaded rather than cleared -- the tiles not
+// drawn this frame keep what they hold -- and readable on the way in as on
+// the way out, compatible with the others so the shadow pipelines draw in
+// all of them. Its dependencies: in, its clear and the layout transition
+// wait for the previous frame's sampling of the image and its last depth
+// write, which on one queue are otherwise unordered against them (#410);
+// out, the depth written here is read by a fragment shader after.
+depth_only_pass(loaded: bool) -> ptr {
+    a = calloc(1, sizeof(VkAttachmentDescription))
+    load = vk.ATTACHMENT_LOAD_OP_CLEAR
+    initial = vk.IMAGE_LAYOUT_UNDEFINED
+    if loaded {
+        load = vk.ATTACHMENT_LOAD_OP_LOAD
+        initial = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    }
+    attachment(a, g_depth_format, vk.SAMPLE_COUNT_1_BIT, load, vk.ATTACHMENT_STORE_OP_STORE,
+               initial, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+    ref = calloc(1, sizeof(VkAttachmentReference))
+    reference(ref, 0, vk.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+    subpass = calloc(1, sizeof(VkSubpassDescription)) as *VkSubpassDescription
+    subpass.pipelineBindPoint = vk.PIPELINE_BIND_POINT_GRAPHICS
+    subpass.colorAttachmentCount = 0
+    subpass.pDepthStencilAttachment = ref
+    deps = calloc(2, sizeof(VkSubpassDependency))
+    dependency(deps, vk.SUBPASS_EXTERNAL, 0,
+               vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT | vk.PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+               vk.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | vk.PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+               vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+               vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+    dependency(deps + sizeof(VkSubpassDependency), 0, vk.SUBPASS_EXTERNAL,
+               vk.PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+               vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, vk.ACCESS_SHADER_READ_BIT)
+    pass = made_pass(a, 1, subpass as ptr, deps, 2)
+    free(deps)
+    free(subpass as ptr)
+    free(ref)
+    free(a)
+    return pass
+}
+
+// The composite's pass: a single resolved colour attachment and no depth,
+// ending in `present_layout`. What it samples was written as an attachment
+// before it, and what it writes -- cleared of nothing, from UNDEFINED --
+// was written and read by the passes of the frame before: both orders, or
+// the layout transition races the last frame's reads (#410). And out: what
+// it wrote is sampled by the next pass or blitted and copied by the meter
+// and the capture, after its final transition.
+post_render_pass(present_layout: int) -> ptr {
+    a = calloc(1, sizeof(VkAttachmentDescription))
+    attachment(a, g_color_format, vk.SAMPLE_COUNT_1_BIT, vk.ATTACHMENT_LOAD_OP_DONT_CARE, vk.ATTACHMENT_STORE_OP_STORE,
+               vk.IMAGE_LAYOUT_UNDEFINED, present_layout)
+    ref = calloc(1, sizeof(VkAttachmentReference))
+    reference(ref, 0, vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+    subpass = calloc(1, sizeof(VkSubpassDescription)) as *VkSubpassDescription
+    subpass.pipelineBindPoint = vk.PIPELINE_BIND_POINT_GRAPHICS
+    subpass.colorAttachmentCount = 1
+    subpass.pColorAttachments = ref
+    deps = calloc(2, sizeof(VkSubpassDependency))
+    dependency(deps, vk.SUBPASS_EXTERNAL, 0,
+               vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+               vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT | vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+               vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+    dependency(deps + sizeof(VkSubpassDependency), 0, vk.SUBPASS_EXTERNAL,
+               vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT | vk.PIPELINE_STAGE_TRANSFER_BIT,
+               vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_TRANSFER_READ_BIT)
+    pass = made_pass(a, 1, subpass as ptr, deps, 2)
+    free(deps)
+    free(subpass as ptr)
+    free(ref)
+    free(a)
+    return pass
+}
+
+// Every pass: the scene's, whole and in halves, ending in the layout the
+// frame is presented or read back from (the render passes) or the layout a
+// sampler wants (the scene passes the post chain reads) -- the same
+// attachment descriptions, so the scene's pipelines are valid in either;
+// the shadow map's and the camera depth's; and the composite's, into the
+// frame and into the reflection's and the temporal pass's colours.
+create_passes() -> bool {
+    present = vk.IMAGE_LAYOUT_PRESENT_SRC_KHR
+    if g_offscreen { present = vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL }
+    read = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    g_render_pass = scene_render_pass(present, 0)
+    if g_render_pass == null { return false }
+    g_render_pass_first = scene_render_pass(present, 1)
+    if g_render_pass_first == null { return false }
+    g_render_pass_rest = scene_render_pass(present, 2)
+    if g_render_pass_rest == null { return false }
+    g_scene_pass = scene_render_pass(read, 0)
+    if g_scene_pass == null { return false }
+    g_scene_pass_first = scene_render_pass(read, 1)
+    if g_scene_pass_first == null { return false }
+    g_scene_pass_rest = scene_render_pass(read, 2)
+    if g_scene_pass_rest == null { return false }
+    // Depth, and nothing else. The pass used to write gl_FragCoord.z into
+    // an R32_SFLOAT colour attachment beside a depth attachment holding
+    // that same number, and then throw the depth away: every shadow texel
+    // written twice and one of the two read. The depth image is what is
+    // sampled now, left in the layout the descriptor asks for: binding 2
+    // holds the default white texture when shadows are off, so both the
+    // shadow map and that colour image have to be readable through it.
+    g_shadow_pass = depth_only_pass(false)
+    if g_shadow_pass == null {
+        vkdevice.fail("shadow vkCreateRenderPass failed")
+        return false
+    }
+    g_lamp_pass = depth_only_pass(true)
+    if g_lamp_pass == null {
+        vkdevice.fail("lamp shadow vkCreateRenderPass failed")
+        return false
+    }
+    // The camera depth: the same depth-only pass, drawn from the camera,
+    // single-sample and sampleable by construction.
+    g_camdepth_pass = depth_only_pass(false)
+    if g_camdepth_pass == null {
+        vkdevice.fail("camera-depth vkCreateRenderPass failed")
+        return false
+    }
+    // The reflective composite writes into an off-screen colour target the
+    // final composite then samples, so its pass ends in sampler-read
+    // layout; it stays compatible with the frame's post pass, so one set of
+    // post pipelines is valid in either.
+    g_ssr_pass = post_render_pass(read)
+    if g_ssr_pass == null {
+        vkdevice.fail("post vkCreateRenderPass failed")
+        return false
+    }
+    g_post_pass = post_render_pass(present)
+    if g_post_pass == null {
+        vkdevice.fail("post vkCreateRenderPass failed")
+        return false
+    }
+    return true
+}
+
+destroy_passes() {
+    d = vkhost.device()
+    if g_render_pass != null { vk.vkDestroyRenderPass(d, g_render_pass, null) }
+    if g_render_pass_first != null { vk.vkDestroyRenderPass(d, g_render_pass_first, null) }
+    if g_render_pass_rest != null { vk.vkDestroyRenderPass(d, g_render_pass_rest, null) }
+    if g_scene_pass != null { vk.vkDestroyRenderPass(d, g_scene_pass, null) }
+    if g_scene_pass_first != null { vk.vkDestroyRenderPass(d, g_scene_pass_first, null) }
+    if g_scene_pass_rest != null { vk.vkDestroyRenderPass(d, g_scene_pass_rest, null) }
+    if g_post_pass != null { vk.vkDestroyRenderPass(d, g_post_pass, null) }
+    if g_ssr_pass != null { vk.vkDestroyRenderPass(d, g_ssr_pass, null) }
+    if g_shadow_pass != null { vk.vkDestroyRenderPass(d, g_shadow_pass, null) }
+    if g_lamp_pass != null { vk.vkDestroyRenderPass(d, g_lamp_pass, null) }
+    if g_camdepth_pass != null { vk.vkDestroyRenderPass(d, g_camdepth_pass, null) }
+    g_render_pass = null
+    g_render_pass_first = null
+    g_render_pass_rest = null
+    g_scene_pass = null
+    g_scene_pass_first = null
+    g_scene_pass_rest = null
+    g_post_pass = null
+    g_ssr_pass = null
+    g_shadow_pass = null
+    g_lamp_pass = null
+    g_camdepth_pass = null
+}
+
+// --- framebuffers ------------------------------------------------------------------------------------------------
+
+// A framebuffer over `count` views at `views`, `w` by `h`, for `pass`.
+made_framebuffer(pass: ptr, views: ptr, count: int, w: int, h: int) -> ptr {
+    info = calloc(1, sizeof(VkFramebufferCreateInfo)) as *VkFramebufferCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+    info.renderPass = pass
+    info.attachmentCount = count
+    info.pAttachments = views
+    info.width = w
+    info.height = h
+    info.layers = 1
+    c = cell()
+    r = vk.vkCreateFramebuffer(vkhost.device(), info as ptr, null, c)
+    free(info as ptr)
+    if r != vk.SUCCESS { return null }
+    return (c as ptr[])[0]
+}
+
+// The views the scene pass draws through, the frame's `target` last for a
+// single-sample frame: the colour, the depth, the vectors, and when
+// multisampled the two they resolve to.
+scene_views(views: ptr, target: ptr) -> int {
+    velocity = vktexture.view(g_velocity_texture)
+    if g_samples != vk.SAMPLE_COUNT_1_BIT {
+        (views as ptr[])[0] = view_of(g_colour)
+        (views as ptr[])[1] = view_of(g_depth)
+        (views as ptr[])[2] = view_of(g_velocity)
+        (views as ptr[])[3] = target
+        (views as ptr[])[4] = velocity
+        return 5
+    }
+    (views as ptr[])[0] = target
+    (views as ptr[])[1] = view_of(g_depth)
+    (views as ptr[])[2] = velocity
+    return 3
+}
+
+// A depth image cleared to the far plane -- nothing in front of anything --
+// and left readable, the layout its pass takes it in and leaves it in,
+// ready for the passes, the copies and the lit pass that follow
+// (`dst_access` at `dst_stages`). False when there was no command buffer.
+cleared_far(image: ptr, dst_access: int, dst_stages: int) -> bool {
+    commands = vkhost.once_begin()
+    if commands == null {
+        vkdevice.fail("lamp shadow: no command buffer to clear it with")
+        return false
+    }
+    b = calloc(1, sizeof(VkImageMemoryBarrier)) as *VkImageMemoryBarrier
+    b.sType = vk.STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+    b.oldLayout = vk.IMAGE_LAYOUT_UNDEFINED
+    b.newLayout = vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    b.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.image = image
+    b.subresourceRange.aspectMask = vk.IMAGE_ASPECT_DEPTH_BIT
+    b.subresourceRange.levelCount = 1
+    b.subresourceRange.layerCount = 1
+    b.dstAccessMask = vk.ACCESS_TRANSFER_WRITE_BIT
+    vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT,
+                            0, 0, null, 0, null, 1, b as ptr)
+    value = calloc(1, sizeof(VkClearDepthStencilValue)) as *VkClearDepthStencilValue
+    value.depth = 1.0
+    range = calloc(1, sizeof(VkImageSubresourceRange)) as *VkImageSubresourceRange
+    range.aspectMask = vk.IMAGE_ASPECT_DEPTH_BIT
+    range.levelCount = 1
+    range.layerCount = 1
+    vk.vkCmdClearDepthStencilImage(commands, image, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, value as ptr, 1,
+                                   range as ptr)
+    free(range as ptr)
+    b.oldLayout = vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    b.newLayout = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    b.srcAccessMask = vk.ACCESS_TRANSFER_WRITE_BIT
+    b.dstAccessMask = dst_access
+    vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_TRANSFER_BIT, dst_stages, 0, 0, null, 0, null, 1, b as ptr)
+    vkhost.once_end(commands)
+    free(value as ptr)
+    free(b as ptr)
+    return true
+}
+
+// One of the lamps' two atlases: its image, drawn into by the lamps' pass
+// and copied from and to a tile at a time, and its framebuffer (into
+// `framebuffer_out`); cleared to the far plane and left readable. The kept
+// image, or null.
+make_lamp_image(framebuffer_out: ptr) -> ptr {
+    made = vkhost.image(LAMP_SHADOW_SIZE, LAMP_SHADOW_SIZE, 1, g_depth_format, vk.SAMPLE_COUNT_1_BIT,
+                        vk.IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT |
+                        vk.IMAGE_USAGE_TRANSFER_SRC_BIT | vk.IMAGE_USAGE_TRANSFER_DST_BIT, vk.IMAGE_ASPECT_DEPTH_BIT)
+    if made.image == null { return null }
+    kept_image = kept(made)
+    views = calloc(1, 8)
+    (views as ptr[])[0] = made.view
+    fb = made_framebuffer(g_lamp_pass, views, 1, LAMP_SHADOW_SIZE, LAMP_SHADOW_SIZE)
+    free(views)
+    (framebuffer_out as ptr[])[0] = fb
+    if fb == null {
+        vkdevice.fail("lamp shadow vkCreateFramebuffer failed")
+        return kept_image
+    }
+    if !cleared_far(made.image,
+                    vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                    vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | vk.ACCESS_TRANSFER_READ_BIT,
+                    vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT | vk.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                    vk.PIPELINE_STAGE_TRANSFER_BIT) {
+        (framebuffer_out as ptr[])[0] = null
+        vk.vkDestroyFramebuffer(vkhost.device(), fb, null)
+    }
+    return kept_image
+}
+
+// The lamps' atlases and their sampler, made once when the backend starts
+// (a one-off command buffer clears them, so after the command pool, and
+// before any set is written: every scene set names the atlas). Every time
+// they are made the generation moves on, so what remembers which faces they
+// hold (ae3d.vulkan) forgets them. False when a part would not make.
+create_lamp_target() -> bool {
+    cell = calloc(1, 8)
+    g_lamp = make_lamp_image(cell)
+    g_lamp_framebuffer = (cell as ptr[])[0]
+    if g_lamp == null || g_lamp_framebuffer == null {
+        free(cell)
+        return false
+    }
+    (cell as ptr[])[0] = null
+    g_lamp_static = make_lamp_image(cell)
+    g_lamp_static_framebuffer = (cell as ptr[])[0]
+    free(cell)
+    if g_lamp_static == null || g_lamp_static_framebuffer == null { return false }
+    g_lamp_sampler = vkhost.sampler(vk.FILTER_NEAREST, vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                    vk.SAMPLER_MIPMAP_MODE_NEAREST, 1.0, 0.0)
+    if g_lamp_sampler == null {
+        vkdevice.fail("lamp shadow vkCreateSampler failed")
+        return false
+    }
+    g_lamp_generation = g_lamp_generation + 1
+    return true
+}
+
+// The lamps' atlases gone: at shutdown.
+destroy_lamp_target() {
+    d = vkhost.device()
+    if d == null { return }
+    if g_lamp_framebuffer != null { vk.vkDestroyFramebuffer(d, g_lamp_framebuffer, null) }
+    if g_lamp_static_framebuffer != null { vk.vkDestroyFramebuffer(d, g_lamp_static_framebuffer, null) }
+    unkept(g_lamp)
+    unkept(g_lamp_static)
+    if g_lamp_sampler != null { vk.vkDestroySampler(d, g_lamp_sampler, null) }
+    g_lamp = null
+    g_lamp_static = null
+    g_lamp_framebuffer = null
+    g_lamp_static_framebuffer = null
+    g_lamp_sampler = null
+}
+
+// The cascades' shadow atlas: one image, the depth attachment and what the
+// lit pass samples, with a nearest, clamped sampler. In no layout until its
+// pass first runs (shadow_ready).
+create_shadow_target() -> bool {
+    made = vkhost.image(SHADOW_SIZE, SHADOW_SIZE, 1, g_depth_format, vk.SAMPLE_COUNT_1_BIT,
+                        vk.IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT, vk.IMAGE_ASPECT_DEPTH_BIT)
+    if made.image == null { return false }
+    g_shadow = kept(made)
+    g_shadow_sampler = vkhost.sampler(vk.FILTER_NEAREST, vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                      vk.SAMPLER_MIPMAP_MODE_NEAREST, 1.0, 0.0)
+    if g_shadow_sampler == null {
+        vkdevice.fail("shadow vkCreateSampler failed")
+        return false
+    }
+    views = calloc(1, 8)
+    (views as ptr[])[0] = made.view
+    g_shadow_framebuffer = made_framebuffer(g_shadow_pass, views, 1, SHADOW_SIZE, SHADOW_SIZE)
+    free(views)
+    if g_shadow_framebuffer == null {
+        vkdevice.fail("shadow vkCreateFramebuffer failed")
+        return false
+    }
+    g_shadow_ready = false
+    g_shadow_targets = g_shadow_targets + 1
+    return true
+}
+
+destroy_shadow_target() {
+    d = vkhost.device()
+    if g_shadow_framebuffer != null || g_shadow != null { g_shadow_targets = g_shadow_targets - 1 }
+    if g_shadow_framebuffer != null { vk.vkDestroyFramebuffer(d, g_shadow_framebuffer, null) }
+    if g_shadow_sampler != null { vk.vkDestroySampler(d, g_shadow_sampler, null) }
+    g_shadow_framebuffer = null
+    g_shadow_sampler = null
+    unkept(g_shadow)
+    g_shadow = null
+}
+
+// The scene rendered into a sampled image when the post chain runs, which
+// the composite reads: an ordinary texture, so the descriptor cache binds
+// it with no second path; its framebuffer; and the composite's over the
+// frame's images at the frame's own size -- what scales the scene up when
+// it was drawn smaller.
+create_post_target() -> bool {
+    made = vkhost.image(g_render_width, g_render_height, 1, g_color_format, vk.SAMPLE_COUNT_1_BIT,
+                        vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT, vk.IMAGE_ASPECT_COLOR_BIT)
+    if made.image == null { return false }
+    sampler = vkhost.sampler(vk.FILTER_LINEAR, vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, vk.SAMPLER_MIPMAP_MODE_LINEAR, 1.0, 0.0)
+    if sampler == null {
+        vkhost.image_free(made)
+        vkdevice.fail("post vkCreateSampler failed")
+        return false
+    }
+    g_post_texture = vktexture.adopt_target(made, sampler, g_render_width, g_render_height)
+    if g_post_texture == 0 {
+        vk.vkDestroySampler(vkhost.device(), sampler, null)
+        vkhost.image_free(made)
+        return false
+    }
+    views = calloc(5, 8)
+    count = scene_views(views, made.view)
+    g_scene_framebuffer = made_framebuffer(g_scene_pass, views, count, g_render_width, g_render_height)
+    if g_scene_framebuffer == null {
+        free(views)
+        vkdevice.fail("scene vkCreateFramebuffer failed")
+        return false
+    }
+    g_post_framebuffers = calloc(g_image_count, 8)
+    i = 0
+    while i < g_image_count {
+        (views as ptr[])[0] = (g_views as ptr[])[i]
+        fb = made_framebuffer(g_post_pass, views, 1, g_width, g_height)
+        if fb == null {
+            free(views)
+            vkdevice.fail("post vkCreateFramebuffer failed")
+            return false
+        }
+        (g_post_framebuffers as ptr[])[i] = fb
+        i = i + 1
+    }
+    free(views)
+    return true
+}
+
+// The frame's framebuffers, drawn into straight, without the post chain,
+// only when the scene is the frame's size: their depth and vectors are the
+// scene's, and an attachment smaller than the framebuffer is not allowed.
+// Scaled, the post chain always runs and these stay null. Then the shadow
+// map and the post chain's target.
+create_framebuffers() -> bool {
+    g_framebuffers = calloc(g_image_count, 8)
+    views = calloc(5, 8)
+    i = 0
+    while i < g_image_count && !scaled() {
+        count = scene_views(views, (g_views as ptr[])[i])
+        fb = made_framebuffer(g_render_pass, views, count, g_width, g_height)
+        if fb == null {
+            free(views)
+            vkdevice.fail("vkCreateFramebuffer failed")
+            return false
+        }
+        (g_framebuffers as ptr[])[i] = fb
+        i = i + 1
+    }
+    free(views)
+    if !create_shadow_target() { return false }
+    return create_post_target()
+}
+
+// --- the camera depth --------------------------------------------------------------------------------------------
+
+// Whether the camera depth is made at the scene's size.
+camdepth_fits() -> bool {
+    return g_camdepth_framebuffer != null && g_camdepth_width == g_render_width && g_camdepth_height == g_render_height
+}
+camdepth_ready() -> bool { return g_camdepth_framebuffer != null && g_camdepth != null }
+
+// A colour target the size of the scene, sampled linearly and clamped, in
+// the table: the reflection's, the temporal pass's.
+colour_texture(w: int, h: int, what: string) -> int {
+    made = vkhost.image(w, h, 1, g_color_format, vk.SAMPLE_COUNT_1_BIT,
+                        vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT, vk.IMAGE_ASPECT_COLOR_BIT)
+    if made.image == null { return 0 }
+    sampler = vkhost.sampler(vk.FILTER_LINEAR, vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, vk.SAMPLER_MIPMAP_MODE_LINEAR, 1.0, 0.0)
+    if sampler == null {
+        vkhost.image_free(made)
+        vkdevice.fail("${what} vkCreateSampler failed")
+        return 0
+    }
+    handle = vktexture.adopt_target(made, sampler, w, h)
+    if handle == 0 {
+        vk.vkDestroySampler(vkhost.device(), sampler, null)
+        vkhost.image_free(made)
+    }
+    return handle
+}
+
+// The camera depth at the scene's size, `w` by `h`: the image, a nearest
+// sampler and the depth-only pass's framebuffer; the colour the reflective
+// composite writes, which the ordinary composite then samples; and with
+// the temporal pass on, its two history textures and their framebuffers.
+camdepth_create(w: int, h: int, taa: bool) -> bool {
+    made = vkhost.image(w, h, 1, g_depth_format, vk.SAMPLE_COUNT_1_BIT,
+                        vk.IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT, vk.IMAGE_ASPECT_DEPTH_BIT)
+    if made.image == null { return false }
+    g_camdepth = kept(made)
+    g_camdepth_sampler = vkhost.sampler(vk.FILTER_NEAREST, vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                        vk.SAMPLER_MIPMAP_MODE_NEAREST, 1.0, 0.0)
+    if g_camdepth_sampler == null {
+        vkdevice.fail("camera-depth vkCreateSampler failed")
+        return false
+    }
+    views = calloc(1, 8)
+    (views as ptr[])[0] = made.view
+    g_camdepth_framebuffer = made_framebuffer(g_camdepth_pass, views, 1, w, h)
+    if g_camdepth_framebuffer == null {
+        free(views)
+        vkdevice.fail("camera-depth vkCreateFramebuffer failed")
+        return false
+    }
+    g_camdepth_width = w
+    g_camdepth_height = h
+
+    g_ssr_reflect_texture = colour_texture(w, h, "ssr-reflect")
+    if g_ssr_reflect_texture == 0 {
+        free(views)
+        return false
+    }
+    (views as ptr[])[0] = vktexture.view(g_ssr_reflect_texture)
+    g_ssr_framebuffer = made_framebuffer(g_ssr_pass, views, 1, w, h)
+    if g_ssr_framebuffer == null {
+        free(views)
+        vkdevice.fail("ssr-reflect vkCreateFramebuffer failed")
+        return false
+    }
+    if g_taa_texture == null {
+        g_taa_texture = calloc(2, 4)
+        g_taa_framebuffer = calloc(2, 8)
+    }
+    if taa && g_ssr_pass != null {
+        k = 0
+        while k < 2 {
+            handle = colour_texture(w, h, "taa")
+            if handle == 0 {
+                free(views)
+                return false
+            }
+            (g_taa_texture as int[])[k] = handle
+            (views as ptr[])[0] = vktexture.view(handle)
+            fb = made_framebuffer(g_ssr_pass, views, 1, w, h)
+            if fb == null {
+                free(views)
+                vkdevice.fail("taa vkCreateFramebuffer failed")
+                return false
+            }
+            (g_taa_framebuffer as ptr[])[k] = fb
+            k = k + 1
+        }
+        g_taa_history_valid = false
+        g_taa_current = 0
+    }
+    free(views)
+    return true
+}
+
+// The camera depth and everything made with it destroyed; the sets that
+// bound it let go. Its serial moves, so the post chain's own sets are
+// written again against the next one.
+camdepth_destroy() {
+    d = vkhost.device()
+    // Sets that bound the depth at binding 4 name a view about to go.
+    vkdesc.forget_aux()
+    if g_camdepth_framebuffer != null { vk.vkDestroyFramebuffer(d, g_camdepth_framebuffer, null) }
+    if g_camdepth_sampler != null { vk.vkDestroySampler(d, g_camdepth_sampler, null) }
+    g_camdepth_framebuffer = null
+    g_camdepth_sampler = null
+    unkept(g_camdepth)
+    g_camdepth = null
+    g_camdepth_width = 0
+    g_camdepth_height = 0
+    if g_ssr_framebuffer != null { vk.vkDestroyFramebuffer(d, g_ssr_framebuffer, null) }
+    g_ssr_framebuffer = null
+    if g_ssr_reflect_texture != 0 { vkdesc.texture_destroy(g_ssr_reflect_texture) }
+    g_ssr_reflect_texture = 0
+    if g_taa_texture != null {
+        k = 0
+        while k < 2 {
+            fb = (g_taa_framebuffer as ptr[])[k]
+            if fb != null { vk.vkDestroyFramebuffer(d, fb, null) }
+            (g_taa_framebuffer as ptr[])[k] = null
+            handle = (g_taa_texture as int[])[k]
+            if handle != 0 { vkdesc.texture_destroy(handle) }
+            (g_taa_texture as int[])[k] = 0
+            k = k + 1
+        }
+    }
+    g_taa_history_valid = false
+    g_camdepth_serial = g_camdepth_serial + 1
+}
+
+// --- DLSS's output -----------------------------------------------------------------------------------------------
+
+// The frame-size image DLSS writes, sampled by the composite: made when a
+// mode is set, remade with the frame.
+dlss_output_create() -> bool {
+    made = vkhost.image(g_width, g_height, 1, vk.FORMAT_R8G8B8A8_UNORM, vk.SAMPLE_COUNT_1_BIT,
+                        vk.IMAGE_USAGE_STORAGE_BIT | vk.IMAGE_USAGE_SAMPLED_BIT | vk.IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        vk.IMAGE_USAGE_TRANSFER_DST_BIT, vk.IMAGE_ASPECT_COLOR_BIT)
+    if made.image == null { return false }
+    sampler = vkhost.sampler(vk.FILTER_LINEAR, vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, vk.SAMPLER_MIPMAP_MODE_LINEAR, 1.0, 0.0)
+    if sampler == null {
+        vkhost.image_free(made)
+        vkdevice.fail("dlss vkCreateSampler failed")
+        return false
+    }
+    g_dlss_output = vktexture.adopt_target(made, sampler, g_width, g_height)
+    if g_dlss_output == 0 {
+        vk.vkDestroySampler(vkhost.device(), sampler, null)
+        vkhost.image_free(made)
+        return false
+    }
+    g_dlss_output_fresh = true
+    return true
+}
+
+dlss_output_destroy() {
+    if g_dlss_output != 0 { vkdesc.texture_destroy(g_dlss_output) }
+    g_dlss_output = 0
+}
+
+// --- the frame gone ----------------------------------------------------------------------------------------------
+
+// The frame's images and every target made with them destroyed: the
+// framebuffers, the views, the offscreen image (a swapchain's are its
+// own), the post chain's, the shadow map, the camera depth, the scene's
+// colour, vectors and depth, and the swapchain. The passes stay.
+destroy_frame() {
+    d = vkhost.device()
+    if d == null { return }
+    i = 0
+    while i < g_image_count {
+        if g_framebuffers != null && (g_framebuffers as ptr[])[i] != null {
+            vk.vkDestroyFramebuffer(d, (g_framebuffers as ptr[])[i], null)
+        }
+        if g_views != null && (g_views as ptr[])[i] != null { vk.vkDestroyImageView(d, (g_views as ptr[])[i], null) }
+        if g_post_framebuffers != null && (g_post_framebuffers as ptr[])[i] != null {
+            vk.vkDestroyFramebuffer(d, (g_post_framebuffers as ptr[])[i], null)
+        }
+        i = i + 1
+    }
+    if g_framebuffers != null { free(g_framebuffers) }
+    if g_views != null { free(g_views) }
+    if g_post_framebuffers != null { free(g_post_framebuffers) }
+    g_framebuffers = null
+    g_views = null
+    g_post_framebuffers = null
+    // An offscreen target's image is owned here, unlike a swapchain's,
+    // which the swapchain owns and destroys with itself. (The buffers a
+    // frame is read back into are ae3d.vkreadback's, released by its hook.)
+    if g_offscreen && g_images != null && (g_images as ptr[])[0] != null {
+        vk.vkDestroyImage(d, (g_images as ptr[])[0], null)
+        if g_offscreen_memory != null { vk.vkFreeMemory(d, g_offscreen_memory, null) }
+        g_offscreen_memory = null
+    }
+    if g_images != null { free(g_images) }
+    g_images = null
+    destroy_shadow_target()
+    camdepth_destroy()
+    if g_scene_framebuffer != null { vk.vkDestroyFramebuffer(d, g_scene_framebuffer, null) }
+    g_scene_framebuffer = null
+    if g_post_texture != 0 { vkdesc.texture_destroy(g_post_texture) }
+    g_post_texture = 0
+    unkept(g_colour)
+    g_colour = null
+    unkept(g_velocity)
+    g_velocity = null
+    if g_velocity_texture != 0 { vkdesc.texture_destroy(g_velocity_texture) }
+    g_velocity_texture = 0
+    unkept(g_depth)
+    g_depth = null
+    if g_swapchain != null { vk.vkDestroySwapchainKHR(d, g_swapchain, null) }
+    g_swapchain = null
+    g_image_count = 0
+}

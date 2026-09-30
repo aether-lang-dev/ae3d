@@ -1,5 +1,5 @@
-// ae3d.vktexture -- textures made on the Vulkan backend (#402): the third
-// of native/gpu/vulkan.c to move into Aether, on contrib.vulkan.vk.
+// ae3d.vktexture -- the Vulkan backend's textures (#402), on
+// contrib.vulkan.vk: made, and the table a draw binds them from by handle.
 //
 // Three kinds, as the renderer asks for them:
 //
@@ -15,31 +15,28 @@
 //
 // This module makes the image, its memory and its view, stages the texels
 // through a host buffer (ae3d.vkhost's) and records the upload, the mip
-// chain and the layout changes into a one-off command buffer the backend
-// submits and waits on. The backend adopts what it made into its texture
-// table (ae3d_vk_texture_adopt), which gives it its sampler and a handle,
-// and destroys it with the texture.
+// chain and the layout changes into a one-off command buffer (ae3d.vkhost's)
+// submitted and waited on, then puts it in the table (adopt), which gives it
+// its sampler and a handle. The targets the frame draws into and a later
+// pass samples go in the same table (adopt_target), so a set binds them as
+// it binds any texture.
 
 import contrib.vulkan.vk
+import ae3d.vkdevice
 import ae3d.vkhost
 
 exports (
     SCENE, RGBA, FLOATS,
-    texture_create, texture_create_rgba, texture_create_float, install
+    texture_create, texture_create_rgba, texture_create_float,
+    valid, view, sampler_of, image_of, memory_of, width_of, height_of, adopt, adopt_target, destroy, rebias, clear
 )
 
-extern ae3d_vk_physical_device_handle() -> ptr
-extern ae3d_vk_once_begin() -> ptr
-extern ae3d_vk_once_end(commands: ptr)
-extern ae3d_vk_texture_adopt(image: ptr, memory: ptr, view: ptr, width: int, height: int, mip_levels: int, kind: int) -> int
-extern ae3d_vk_set_texture_maker(maker: ptr)
-// This module's scene-texture maker, by its C name, for its address.
-extern ae3d_vktexture_create(width: int, height: int, rgba: ptr) -> int
 extern calloc(count: int, size: int) -> ptr
 extern free(p: ptr)
 extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+extern memset(p: ptr, value: int, n: long) -> ptr
 
-// The kinds, as ae3d_vk_texture_adopt takes them: which sampler it gets.
+// The kinds, as adopt takes them: which sampler it gets.
 const SCENE = 0
 const RGBA = 1
 const FLOATS = 2
@@ -201,7 +198,7 @@ mip_chain(commands: ptr, image: ptr, width: int, height: int, levels: int) {
 // blitted mip chain needs.
 filterable() -> bool {
     props = calloc(1, sizeof(VkFormatProperties)) as *VkFormatProperties
-    vk.vkGetPhysicalDeviceFormatProperties(ae3d_vk_physical_device_handle(), vk.FORMAT_R8G8B8A8_UNORM, props as ptr)
+    vk.vkGetPhysicalDeviceFormatProperties(vkdevice.physical(), vk.FORMAT_R8G8B8A8_UNORM, props as ptr)
     ok = ((props.optimalTilingFeatures) as int & vk.FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0
     free(props as ptr)
     return ok
@@ -220,7 +217,7 @@ upload(width: int, height: int, depth: int, texels: ptr, bytes: int, format: int
         vkhost.host_buffer_free(staging)
         return 0
     }
-    commands = ae3d_vk_once_begin()
+    commands = vkhost.once_begin()
     // Every level to transfer-destination, not only the one the copy
     // writes: the chain's blits write the rest, and a level still undefined
     // when it was blitted into was hundreds of the validation layer's
@@ -235,20 +232,9 @@ upload(width: int, height: int, depth: int, texels: ptr, bytes: int, format: int
              vk.ACCESS_TRANSFER_WRITE_BIT, vk.ACCESS_SHADER_READ_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT,
              vk.PIPELINE_STAGE_VERTEX_SHADER_BIT | vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1)
     }
-    ae3d_vk_once_end(commands)
+    vkhost.once_end(commands)
     vkhost.host_buffer_free(staging)
-    return ae3d_vk_texture_adopt(made.image, made.memory, made.view, width, height, levels, kind)
-}
-
-// The backend's texture maker, before it starts: the default texture it
-// binds where a draw has none is made while it starts.
-install() {
-    ae3d_vk_set_texture_maker((&ae3d_vktexture_create) as ptr)
-}
-
-@c_callback("ae3d_vktexture_create")
-create_hook(width: int, height: int, rgba: ptr) -> int {
-    return texture_create(width, height, rgba)
+    return adopt(made.image, made.memory, made.view, width, height, levels, kind)
 }
 
 // A scene texture from RGBA bytes, with its mip chain where the format can
@@ -275,4 +261,213 @@ texture_create_rgba(width: int, height: int, depth: int, rgba: ptr) -> int {
 // Four floats a texel, fetched by exact texel.
 texture_create_float(width: int, height: int, rgba: ptr) -> int {
     return upload(width, height, 1, rgba, width * height * 16, vk.FORMAT_R32G32B32A32_SFLOAT, 1, FLOATS)
+}
+
+// --- the table ---------------------------------------------------------------------------------------------------
+
+// The textures a draw binds by handle, slot + 1: 256 of them, as many as a
+// frame's descriptor sets. A scene texture keeps its mip levels, which its
+// sampler reads with the frame's LOD bias.
+const MAX_TEXTURES = 256
+
+struct VKTexture {
+    image: ptr
+    memory: ptr
+    view: ptr
+    sampler: ptr
+    width: int
+    height: int
+    in_use: bool
+    mip_levels: int                  // a scene texture with a mip chain: its sampler takes the LOD bias
+}
+
+var g_table: ptr = null            // VKTexture[MAX_TEXTURES]
+var g_bias = 0.0                   // the scene textures' mip bias for the render scale
+
+slot_at(handle: int) -> *VKTexture { return (g_table + (handle - 1) * sizeof(VKTexture)) as *VKTexture }
+
+table() {
+    if g_table == null { g_table = calloc(MAX_TEXTURES, sizeof(VKTexture)) }
+}
+
+// Whether `handle` names a texture there is.
+valid(handle: int) -> bool {
+    return g_table != null && handle >= 1 && handle <= MAX_TEXTURES && slot_at(handle).in_use
+}
+
+// A texture's view, sampler, image, memory and size, for what binds or
+// reads it. Null and 0 for a handle that names none.
+view(handle: int) -> ptr {
+    if !valid(handle) { return null }
+    return slot_at(handle).view
+}
+sampler_of(handle: int) -> ptr {
+    if !valid(handle) { return null }
+    return slot_at(handle).sampler
+}
+image_of(handle: int) -> ptr {
+    if !valid(handle) { return null }
+    return slot_at(handle).image
+}
+memory_of(handle: int) -> ptr {
+    if !valid(handle) { return null }
+    return slot_at(handle).memory
+}
+width_of(handle: int) -> int {
+    if !valid(handle) { return 0 }
+    return slot_at(handle).width
+}
+height_of(handle: int) -> int {
+    if !valid(handle) { return 0 }
+    return slot_at(handle).height
+}
+
+// The first free slot's handle, or 0 when the table is full.
+free_handle() -> int {
+    table()
+    h = 1
+    while h <= MAX_TEXTURES {
+        if !slot_at(h).in_use { return h }
+        h = h + 1
+    }
+    return 0
+}
+
+// A scene texture's sampler, with the mip chain and the LOD bias of the
+// moment: the scene drawn smaller than the frame for an upscaler picks a
+// coarser mip than the frame's pixels deserve, and the detail lost there
+// is detail the upscaler never gets to reconstruct; the bias, log2 of the
+// scale, keeps the mip the frame's own. Remade for every texture when the
+// scale changes (rebias).
+scene_sampler(t: *VKTexture) -> bool {
+    if t.sampler != null {
+        vk.vkDestroySampler(vkhost.device(), t.sampler, null)
+        t.sampler = null
+    }
+    t.sampler = vkhost.sampler(vk.FILTER_LINEAR, vk.SAMPLER_ADDRESS_MODE_REPEAT, vk.SAMPLER_MIPMAP_MODE_LINEAR,
+                               t.mip_levels as float, g_bias)
+    if t.sampler == null {
+        vkdevice.fail("vkCreateSampler failed")
+        return false
+    }
+    return true
+}
+
+// An image this module made -- uploaded and left readable by the shaders
+// -- into the table, with the sampler its kind is drawn with: a scene
+// texture's linear, repeating, over its mip chain at the frame's LOD bias;
+// an RGBA one's linear and repeating with no mips; a float one's nearest
+// and clamped, fetched by exact texel. The handle, or 0 when the table is
+// full or the sampler would not make, the image then destroyed.
+adopt(image: ptr, memory: ptr, view: ptr, width: int, height: int, mip_levels: int, kind: int) -> int {
+    handle = free_handle()
+    made = vkhost.VKImage { image: image, memory: memory, view: view }
+    if handle == 0 {
+        vkdevice.fail("texture table full")
+        vkhost.image_free(made)
+        return 0
+    }
+    t = slot_at(handle)
+    memset(t as ptr, 0, sizeof(VKTexture) as long)
+    t.image = image
+    t.memory = memory
+    t.view = view
+    t.width = width
+    t.height = height
+    if kind == SCENE {
+        t.mip_levels = mip_levels
+        if !scene_sampler(t) {
+            vkhost.image_free(made)
+            memset(t as ptr, 0, sizeof(VKTexture) as long)
+            return 0
+        }
+    } else {
+        filter = vk.FILTER_LINEAR
+        address = vk.SAMPLER_ADDRESS_MODE_REPEAT
+        if kind == FLOATS {
+            filter = vk.FILTER_NEAREST
+            address = vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+        }
+        t.sampler = vkhost.sampler(filter, address, vk.SAMPLER_MIPMAP_MODE_NEAREST, 0.0, 0.0)
+        if t.sampler == null {
+            vkdevice.fail("vkCreateSampler failed")
+            vkhost.image_free(made)
+            memset(t as ptr, 0, sizeof(VKTexture) as long)
+            return 0
+        }
+    }
+    t.in_use = true
+    return handle
+}
+
+// A target made elsewhere -- an image the frame draws into and a later
+// pass samples -- into the table with its own sampler, so the descriptor
+// cache binds it as it binds any texture. The handle, or 0 when the table
+// is full; the caller keeps the image then.
+adopt_target(made: vkhost.VKImage, sampler: ptr, width: int, height: int) -> int {
+    handle = free_handle()
+    if handle == 0 {
+        vkdevice.fail("texture table full")
+        return 0
+    }
+    t = slot_at(handle)
+    memset(t as ptr, 0, sizeof(VKTexture) as long)
+    t.image = made.image
+    t.memory = made.memory
+    t.view = made.view
+    t.sampler = sampler
+    t.width = width
+    t.height = height
+    t.in_use = true
+    return handle
+}
+
+// The texture under `handle` destroyed, the device idle first. What bound
+// it (ae3d.vkdesc's descriptor sets) has to be told before this.
+destroy(handle: int) {
+    if !valid(handle) || vkhost.device() == null { return }
+    d = vkhost.device()
+    vk.vkDeviceWaitIdle(d)
+    t = slot_at(handle)
+    if t.sampler != null { vk.vkDestroySampler(d, t.sampler, null) }
+    if t.view != null { vk.vkDestroyImageView(d, t.view, null) }
+    if t.image != null { vk.vkDestroyImage(d, t.image, null) }
+    if t.memory != null { vk.vkFreeMemory(d, t.memory, null) }
+    memset(t as ptr, 0, sizeof(VKTexture) as long)
+}
+
+// Every scene texture's sampler remade at `bias`; true when it changed,
+// and the descriptor sets that named the old samplers have to go.
+rebias(bias: float) -> bool {
+    if bias == g_bias { return false }
+    g_bias = bias
+    if vkhost.device() == null || g_table == null { return true }
+    vk.vkDeviceWaitIdle(vkhost.device())
+    h = 1
+    while h <= MAX_TEXTURES {
+        t = slot_at(h)
+        if t.in_use && t.mip_levels > 0 { scene_sampler(t) }
+        h = h + 1
+    }
+    return true
+}
+
+// Every texture destroyed, with the device: at shutdown; the next device
+// starts with no bias.
+clear() {
+    g_bias = 0.0
+    if g_table == null { return }
+    d = vkhost.device()
+    h = 1
+    while h <= MAX_TEXTURES {
+        t = slot_at(h)
+        if t.in_use && d != null {
+            if t.sampler != null { vk.vkDestroySampler(d, t.sampler, null) }
+            if t.view != null { vk.vkDestroyImageView(d, t.view, null) }
+            if t.image != null { vk.vkDestroyImage(d, t.image, null) }
+            if t.memory != null { vk.vkFreeMemory(d, t.memory, null) }
+        }
+        memset(t as ptr, 0, sizeof(VKTexture) as long)
+        h = h + 1
+    }
 }

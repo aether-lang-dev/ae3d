@@ -12,8 +12,6 @@
  * that never opens a window is covered too. The handler re-raises the
  * default so the process still dies and the exit status is unchanged. */
 
-#include "ae3d.h"
-
 #if !defined(_WIN32)
 #  include <signal.h>
 #  include <string.h>
