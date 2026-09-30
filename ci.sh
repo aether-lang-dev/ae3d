@@ -1272,7 +1272,11 @@ else
             # a real click exercises.
             for driver_backend in opengl vulkan; do
                 driver_log="$(mktemp)"
-                if ./build/drive_editor --backend "$driver_backend" \
+                # A backstop, as the editor's own runs have: an editor that
+                # stops answering fails this step with its log, rather than
+                # holding the runner until the job's limit cancels it and
+                # takes every result after it along.
+                if timeout 900 ./build/drive_editor --backend "$driver_backend" \
                         --port 8797 >"$driver_log" 2>&1; then
                     pass "ae3d_editor (driver, $driver_backend)"
                 else
