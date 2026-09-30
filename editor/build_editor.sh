@@ -144,7 +144,7 @@ ae3d_native_build "$CC" "$OBJ_DIR" "$CFLAGS" "$GLFW_LIBS"
 
 # Every module tree on the search path: ae3d.* out of src/, ui and vg.* out
 # of the aether-ui checkout, aephysics.* out of its submodule.
-export AETHER_LIB_DIR="$ROOT/src:$UI_ROOT:$AEPHYSICS"
+export AETHER_LIB_DIR="$ROOT/src:$ROOT/editor/lib:$UI_ROOT:$AEPHYSICS"
 aetherc "$SOURCE" "$GEN"
 # C files a module compiles into the program with @source (contrib.vulkan's
 # loader, which ae3d.vkmeter's contrib.vulkan.vk calls through), as build.sh
