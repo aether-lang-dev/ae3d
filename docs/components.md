@@ -98,6 +98,7 @@ that position agree without anything syncing them.
 | Material | the model's material | color, metallic, roughness, reflectivity, exposure, opacity, texture, normal map |
 | Light | the light it carries | type (point, directional, spot), color, intensity, ambient, temperature, range, direction, inner and outer angle |
 | Camera | the camera it carries | field of view, near, far, speed, sensitivity, invert mouse |
+| Water | the surface's simulation | wave height, speed, scale and randomness, color, opacity, foam and its intensity, shore fade and foam, reflection, sky color, sky, caustics and their intensity and scale, shadow, distortion, normal strength |
 | Environment | the engine | sky (an image, or none), sky color, sun by time, time of day, clouds, cloud wind, overcast and its color, fog, fog start, end, density and color |
 | Rendering | the engine | FXAA, bloom and its threshold and intensity, shadows and their distance, reflections and their height and strength, ambient occlusion and its radius and intensity, temporal antialiasing |
 
