@@ -160,8 +160,8 @@ for (`AE3D_CI_TIER`, set in the workflow's matrix, #511):
 
 | runner | tier | what it runs |
 |---|---|---|
-| Linux | `suites` | every suite, the readback suites again under the Vulkan validation layer, and the checks of what is generated from the tree |
-| Linux | `apps` | the examples, the editor and the benchmarks' smoke run; the showcase scenes (item 6, `scripts/ci_scenes.sh`) only with `AE3D_CI_SCENES=1` |
+| Linux | `suites` | every suite, the readback suites again under the Vulkan validation layer, the checks of what is generated from the tree, and the benchmarks' smoke run |
+| Linux | `apps` | the examples and the editor, its bounded run on OpenGL only through the saved and reopened scene; the showcase scenes (item 6, `scripts/ci_scenes.sh`) only with `AE3D_CI_SCENES=1` |
 | macOS | `leaks` | every suite, each then held to `leaks`, several at a time |
 | Windows | `platform` | the suites over code that differs by platform: sockets, threads, files and formats, float rounding, scripts |
 

@@ -61,8 +61,8 @@ have_display() {
 # three is paid for by the minute and almost all of a minute is compiling:
 #   full      Linux: suites and apps below, on one machine
 #   suites    Linux: every suite, the Vulkan validation layer, the checks of
-#             what is generated from the tree
-#   apps      Linux: the examples, the editor, the benchmarks' smoke run
+#             what is generated from the tree, the benchmarks' smoke run
+#   apps      Linux: the examples and the editor
 #   leaks     macOS: every suite, each held to `leaks`
 #   platform  Windows: the suites over code that differs by platform --
 #             sockets, threads, files and formats, float rounding, scripts
@@ -903,13 +903,18 @@ else
         fail "ae3d_editor (build warnings or errors)"
         grep -E "warning|^error" /tmp/ae3d_build.log | sed 's/^/        /' | head -10
     else
-        for editor_backend in opengl vulkan; do
+        # The roundtrip scene is this one saved and loaded again before the
+        # run starts, so its report describes what came BACK, held to every
+        # check the scene as built is and the sky besides: a scene that drops
+        # a component on the way through the file shows up as a count that
+        # fell. A runner runs it alone on OpenGL, since it fails wherever the
+        # scene as built would; the local gate runs both, which says which of
+        # the two broke.
+        editor_backends="opengl vulkan"
+        [ "$TIER" = all ] || editor_backends="vulkan"
+        for editor_backend in $editor_backends; do
             check_editor_run "$editor_backend"
         done
-        # The same scene saved and loaded again before the run starts, so the
-        # report describes what came BACK. Every component count is asserted
-        # exactly as above, which is the point: a scene that drops a component
-        # on the way through the file shows up here as a count that fell.
         check_editor_run opengl roundtrip
 
         # A name the editor shares with the toolkit it imports is bound
@@ -990,6 +995,13 @@ else
     fi
 fi
 
+if [ -n "$editor_scale_was" ]; then export AE3D_RENDER_SCALE="$editor_scale_was"; else unset AE3D_RENDER_SCALE; fi
+fi
+
+# On the suites' runner: the two Linux runners take about as long with it
+# there, and the apps' one is the run's longest without it.
+if in_tier suites; then
+step "benchmarks"
 # A shared runner is not a machine anyone should take a timing from, and a
 # software rasteriser needs orders of magnitude longer per frame than the
 # hardware these numbers describe. On CI the benchmarks run briefly, as smoke
@@ -998,12 +1010,6 @@ if [ -n "${CI:-}" ]; then
     export AE3D_BENCH_FRAMES="${AE3D_BENCH_FRAMES:-10}"
     export AE3D_BENCH_BLOCKS="${AE3D_BENCH_BLOCKS:-1}"
 fi
-
-if [ -n "$editor_scale_was" ]; then export AE3D_RENDER_SCALE="$editor_scale_was"; else unset AE3D_RENDER_SCALE; fi
-fi
-
-if in_tier apps; then
-step "benchmarks"
 build_together benchmarks/bench_*.ae
 for bench in benchmarks/bench_*.ae; do
     [ -e "$bench" ] || continue
