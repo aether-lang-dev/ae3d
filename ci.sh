@@ -824,6 +824,13 @@ UI_ROOT="${AETHER_UI_ROOT:-$ROOT/../aether-ui}"
 if [ "$(uname -s)" = "Linux" ]; then
     export GDK_DEBUG="${GDK_DEBUG:+$GDK_DEBUG,}gl-prefer-gl"
 fi
+# The viewport at half its size on a runner, the composite scaling it up, as
+# every suite and example there draws at a quarter of theirs: what costs a
+# software rasteriser is the pixels it shades, and the editor's frame at full
+# size was 600 to 850 ms of shadows and scene (#518). The local gate draws it
+# whole.
+editor_scale_was="${AE3D_RENDER_SCALE:-}"
+if [ "$TIER" != all ]; then export AE3D_RENDER_SCALE="${AE3D_RENDER_SCALE:-50}"; fi
 if [ ! -f "$UI_ROOT/ui/module.ae" ]; then
     skip "ae3d_editor" "aether-ui not found at $UI_ROOT"
 elif ! have_display; then
@@ -941,6 +948,7 @@ if [ -n "${CI:-}" ]; then
     export AE3D_BENCH_BLOCKS="${AE3D_BENCH_BLOCKS:-1}"
 fi
 
+if [ -n "$editor_scale_was" ]; then export AE3D_RENDER_SCALE="$editor_scale_was"; else unset AE3D_RENDER_SCALE; fi
 fi
 
 if in_tier full; then

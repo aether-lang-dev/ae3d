@@ -93,7 +93,7 @@ runs from there whatever directory it was called from.
 The variables the script reads, each with a default that finds the usual
 install: `CC`, `CFLAGS`, `GLFW_CFLAGS`/`GLFW_LIBS`,
 `VULKAN_SDK` (for the headers when `pkg-config` does not know Vulkan), and
-`AE3D_STREAMLINE_ROOT` for DLSS (below).
+`AE3D_STREAMLINE_ROOT` for DLSS (below), and `AE3D_CC_LAUNCHER`, a program run in front of every compile (`ccache` on the runners: a program whose generated C has not changed since the last run is not compiled again).
 
 ## The editor
 
