@@ -221,8 +221,9 @@ What each figure is:
 - **The link, the same on every transport:** ten pings a second each way,
   each answered at once. `round_trip_us` is their smoothed round trip and
   `jitter_us` its variance (RFC 6298's), both as the game has them, a frame
-  on either side included; `loss_ppm` is the share of the last fifty pings
-  lost, in parts per million.
+  on either side included; `round_trip_floor_us` the least of the last
+  sixteen, the link without the frames; `loss_ppm` is the share of the last
+  fifty pings lost, in parts per million.
 - **Bytes a second, each way, by kind** (`sent`, `received`), over the last
   whole second (`window_us` long): snapshots, events (every reliable
   message), inputs, acks sent on their own, the link's pings, the
