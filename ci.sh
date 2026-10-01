@@ -153,7 +153,30 @@ build_together() {   # build_together <source> [<source>...]
     # The C half once, up front: every build below would otherwise race to
     # compile the same objects into the same files.
     ./build.sh --natives >"$BUILD_DIR/natives.log" 2>&1 || true
+    pool_started=$SECONDS
     in_pool build_one "$@"
+    build_costs $((SECONDS - pool_started))
+}
+
+# build_costs <wall seconds>: what the pool just spent, from each build's last
+# line, so a run's log says where its minutes went rather than only how many
+# there were: the sum of each phase over every target, and the slowest three.
+build_costs() {
+    cat "$BUILD_DIR"/*.log 2>/dev/null | awk -v wall="$1" -v jobs="$JOBS" '
+        /^built: .*\(aetherc [0-9]+ s, cc [0-9]+ s, link [0-9]+ s\)$/ {
+            n++; a += $(NF-7); c += $(NF-4); l += $(NF-1)
+            name = $2; sub(/.*\//, "", name)
+            total = $(NF-7) + $(NF-4) + $(NF-1)
+            print total, name > "/dev/stderr"
+        }
+        END {
+            if (n) printf "        built %d in %d s, %d at a time: aetherc %d s, cc %d s, link %d s in all\n", n, wall, jobs, a, c, l
+        }' 2>"$BUILD_DIR/costs"
+    if [ -s "$BUILD_DIR/costs" ]; then
+        printf '        slowest:'
+        sort -rn "$BUILD_DIR/costs" | head -3 | awk '{ printf " %s %d s", $2, $1 }'
+        printf '\n'
+    fi
 }
 
 # What build_together made of one target: 0 and a quiet log, or the reason.

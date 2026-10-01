@@ -182,7 +182,12 @@ fi
 # feature) is imported by its path from the root, examples.lib.blackhole,
 # which needs no search path at all.
 export AETHER_LIB_DIR="$ROOT/src:$AEPHYSICS"
+# Where a build's time goes, on its last line: what CI's cost is made of
+# (#511), and what a change to the compile is measured against. Whole
+# seconds, since a build is several and bash 3.2 has no finer clock.
+build_started=$SECONDS
 "$AETHERC" "$SOURCE" "$GEN"
+aetherc_seconds=$((SECONDS - build_started))
 # C files a module compiles into the program with @source (contrib.vulkan's
 # loader, which contrib.vulkan.vk calls through): aetherc names them at the
 # top of what it generates, as `ae build` reads them. The engine's own are
@@ -201,6 +206,7 @@ AETHER_SOURCES="$(ae3d_program_sources "$GEN" "$ROOT")"
 PROGRAM_OBJ_DIR="$OBJ_DIR/$NAME"
 mkdir -p "$PROGRAM_OBJ_DIR"
 PROGRAM_OBJECTS="$PROGRAM_OBJ_DIR/$NAME.o"
+compile_started=$SECONDS
 $LAUNCHER "$CC" -c $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $AETHER_COMPILE_FLAGS "$GEN" -o "$PROGRAM_OBJ_DIR/$NAME.o"
 for src in $AETHER_SOURCES; do
     base="$(basename "$src")"
@@ -208,6 +214,8 @@ for src in $AETHER_SOURCES; do
     $LAUNCHER "$CC" -c $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $AETHER_COMPILE_FLAGS "$src" -o "$obj"
     PROGRAM_OBJECTS="$PROGRAM_OBJECTS $obj"
 done
+cc_seconds=$((SECONDS - compile_started))
+link_started=$SECONDS
 "$CC" $CFLAGS $PROGRAM_OBJECTS $(ae3d_native_link_flags) $GLFW_LIBS $AETHER_COMPILE_FLAGS $(ae3d_runtime_link_flags "$AETHER_LIBS") $(ae3d_program_flags) $PLATFORM_LIBS -o "$OUT"
 
 # MinGW gcc appends .exe to an output name that has no extension, so the file
@@ -216,4 +224,4 @@ if [ ! -f "$OUT" ] && [ -f "$OUT.exe" ]; then
     OUT="$OUT.exe"
 fi
 
-echo "built: $OUT"
+echo "built: $OUT (aetherc $aetherc_seconds s, cc $cc_seconds s, link $((SECONDS - link_started)) s)"
