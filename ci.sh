@@ -934,6 +934,7 @@ else
         fail "ae3d_editor (build warnings or errors)"
         grep -E "warning|^error" /tmp/ae3d_build.log | sed 's/^/        /' | head -10
     else
+        sed -n 's/^built: /        /p' /tmp/ae3d_build.log
         # The roundtrip scene is this one saved and loaded again before the
         # run starts, so its report describes what came BACK, held to every
         # check the scene as built is and the sky besides: a scene that drops
