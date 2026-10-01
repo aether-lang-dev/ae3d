@@ -160,17 +160,21 @@ for (`AE3D_CI_TIER`, set in the workflow's matrix, #511):
 
 | runner | tier | what it runs |
 |---|---|---|
-| Linux | `full` | everything above but the showcase scenes (item 6, `scripts/ci_scenes.sh`), with the Vulkan validation layer |
+| Linux | `suites` | every suite, the readback suites again under the Vulkan validation layer, the checks of what is generated from the tree, and the benchmarks' smoke run |
+| Linux | `apps` | the examples and the editor, its bounded run on OpenGL only through the saved and reopened scene; the showcase scenes (item 6, `scripts/ci_scenes.sh`) only with `AE3D_CI_SCENES=1` |
 | macOS | `leaks` | every suite, each then held to `leaks`, several at a time |
 | Windows | `platform` | the suites over code that differs by platform: sockets, threads, files and formats, float rounding, scripts |
 
-With no tier, the whole gate runs, scenes included. `AE3D_CI_SCENES=1` adds
+The two Linux tiers run at once on two runners; `full` is both on one
+machine. With no tier, the whole gate runs, scenes included. `AE3D_CI_SCENES=1` adds
 the scenes to a runner's tier. A pull request that changes only prose
 (`*.md` but `docs/agent.md`, `changes/`) starts no run, and a push cancels
-the run under way for the one before it.
+the run under way for the one before it. A change to the workflow runs on
+main once it lands, which saves the caches every later pull request
+restores: a pull request reads its own and main's, never another's.
 
 The knobs: `AE3D_CI_FRAMES`, `AE3D_CI_EXAMPLE_FRAMES`, `AE3D_CI_WIDTH`/`HEIGHT`,
-`AE3D_CI_JOBS`, `AE3D_CI_RUN_LIMIT`, `AE3D_CI_TIER`, `AE3D_CI_SCENES=1`, `AE3D_CI_TRACE=1` for a trace of every
+`AE3D_CI_JOBS`, `AE3D_CI_RUN_LIMIT`, `AE3D_CI_TIER`, `AE3D_CI_SCENES=1`, `AE3D_CI_GPU=0` (no suite that draws is built: the macOS and Windows runners can open no window), `AE3D_CI_TRACE=1` for a trace of every
 command, `AE3D_SKIP_LEAKS=1`. A pull request is the unit of review, so the
 runners' checks are on the pull request; a branch without one is not built.
 

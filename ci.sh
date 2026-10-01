@@ -59,8 +59,10 @@ have_display() {
 # change is written on -- runs everything. A runner runs the tier its
 # platform is there for, named in the workflow's matrix, since each of the
 # three is paid for by the minute and almost all of a minute is compiling:
-#   full      Linux: every suite, the examples, the editor, the benchmarks'
-#             smoke run, the Vulkan validation layer
+#   full      Linux: suites and apps below, on one machine
+#   suites    Linux: every suite, the Vulkan validation layer, the checks of
+#             what is generated from the tree, the benchmarks' smoke run
+#   apps      Linux: the examples and the editor
 #   leaks     macOS: every suite, each held to `leaks`
 #   platform  Windows: the suites over code that differs by platform --
 #             sockets, threads, files and formats, float rounding, scripts
@@ -68,14 +70,22 @@ have_display() {
 # runs them only with AE3D_CI_SCENES=1.
 TIER="${AE3D_CI_TIER:-all}"
 case "$TIER" in
-    all|full|leaks|platform) ;;
-    *) echo "ci: unknown AE3D_CI_TIER '$TIER' (all, full, leaks or platform)" >&2; exit 2 ;;
+    all|full|suites|apps|leaks|platform) ;;
+    *) echo "ci: unknown AE3D_CI_TIER '$TIER' (all, full, suites, apps, leaks or platform)" >&2; exit 2 ;;
 esac
 SCENES="${AE3D_CI_SCENES:-}"
 [ "$TIER" = all ] && SCENES=1
 in_tier() {   # in_tier <tier>...: whether this run covers any of them
     [ "$TIER" = all ] && return 0
-    for wanted in "$@"; do [ "$TIER" = "$wanted" ] && return 0; done
+    for wanted in "$@"; do
+        [ "$TIER" = "$wanted" ] && return 0
+        # Linux's share is two runners at once on the workflow, suites and
+        # apps, each about half of what one runner took end to end; full is
+        # the same share on one machine.
+        if [ "$TIER" = full ]; then
+            case "$wanted" in suites|apps) return 0 ;; esac
+        fi
+    done
     return 1
 }
 PLATFORM_SUITES="test_net test_net_authority test_net_budget test_net_delta
@@ -84,11 +94,37 @@ PLATFORM_SUITES="test_net test_net_authority test_net_budget test_net_delta
     test_jobs test_assets test_obj_cache test_image_decode test_gltf
     test_loader test_scene_io test_font test_determinism test_gmath
     test_script"
+# The suites that draw: each needs a window, a GL context or a Vulkan device,
+# and says SKIP where there is none. The macOS and Windows runners have none
+# (run 36919172954: these 61 skipped on macOS), so there each was built --
+# the whole engine compiled again, four of the macOS job's minutes in all --
+# to print SKIP and be held to `leaks` on the way out. AE3D_CI_GPU=0, which the
+# workflow sets on those runners, builds none of them. A suite left off this
+# list is built and skips as before: forgetting one costs time, not coverage.
+GPU_SUITES="test_agent test_agent_attached test_agent_components test_agent_explain
+    test_agent_net test_agent_record test_backend_parity test_batching
+    test_blackhole test_camera_collision test_caustics test_character
+    test_crowd_ecs test_crowd_render test_crowd_render_scale
+    test_culling test_depth_clear test_depth_proxy test_device_crowd
+    test_dlss test_ecs_render test_engine_shadows test_engine_skybox
+    test_figure test_fog test_gameobjects test_gltf_crowd test_hierarchy
+    test_impostor test_instance_colours test_instance_positions
+    test_instance_streams test_instances test_lamp_clusters
+    test_lamp_shadows test_lights test_mesh_edit test_model_mesh
+    test_motion test_offscreen test_overlay test_physics
+    test_ray_occlusion test_ray_shadows test_readback_buffers
+    test_render test_render_scale test_scene_hold test_shading_isolation
+    test_shading_knobs test_shadow_batches test_shadow_cascades
+    test_shadows test_skinned_render test_ssr test_taa test_texture_swap
+    test_trace test_velocity test_vk_mesh test_weather"
 suite_sources() {   # the suites this tier builds and runs
     for suite in tests/test_*.ae; do
         name="$(basename "$suite" .ae)"
         if [ "$TIER" = platform ]; then
             case " $(echo $PLATFORM_SUITES) " in *" $name "*) ;; *) continue ;; esac
+        fi
+        if [ "${AE3D_CI_GPU:-1}" = 0 ]; then
+            case " $(echo $GPU_SUITES) " in *" $name "*) continue ;; esac
         fi
         echo "$suite"
     done
@@ -114,7 +150,28 @@ RUN_LIMIT="${AE3D_CI_RUN_LIMIT:-300}"
 # parallel would have several programs contending for one software rasteriser
 # and report timings nobody can read.
 JOBS="${AE3D_CI_JOBS:-$( (nproc || sysctl -n hw.ncpu) 2>/dev/null || echo 2 )}"
-BUILD_DIR="${TMPDIR:-/tmp}/ae3d_builds"
+export BUILD_DIR="${TMPDIR:-/tmp}/ae3d_builds"
+
+# in_pool <function> <arg>...: the function once for each argument, JOBS at a
+# time, the next starting the moment any one ends. They were started JOBS at a
+# time and waited for JOBS at a time, so every batch took as long as its
+# slowest member and the other cores sat idle until it was done: a whole-engine
+# build of one suite is several times another's. xargs -P is the pool, since
+# `wait -n` needs bash 4.3 and macOS ships 3.2; the function and what it
+# reads are exported to the shells it starts.
+in_pool() {
+    pool_fn="$1"
+    shift
+    [ $# -gt 0 ] || return 0
+    export -f "$pool_fn"
+    printf '%s\n' "$@" | xargs -n 1 -P "$JOBS" "$BASH" -c "$pool_fn \"\$1\"" _ || true
+}
+
+build_one() {   # build_one <source>: its log and its status, under BUILD_DIR
+    target="$(basename "$1" .ae)"
+    ./build.sh "$1" "$target" >"$BUILD_DIR/$target.log" 2>&1
+    echo $? >"$BUILD_DIR/$target.status"
+}
 
 build_together() {   # build_together <source> [<source>...]
     rm -rf "$BUILD_DIR"
@@ -122,20 +179,30 @@ build_together() {   # build_together <source> [<source>...]
     # The C half once, up front: every build below would otherwise race to
     # compile the same objects into the same files.
     ./build.sh --natives >"$BUILD_DIR/natives.log" 2>&1 || true
-    started=0
-    for source in "$@"; do
-        target="$(basename "$source" .ae)"
-        (
-            ./build.sh "$source" "$target" >"$BUILD_DIR/$target.log" 2>&1
-            echo $? >"$BUILD_DIR/$target.status"
-        ) &
-        started=$((started + 1))
-        if [ "$started" -ge "$JOBS" ]; then
-            wait
-            started=0
-        fi
-    done
-    wait
+    pool_started=$SECONDS
+    in_pool build_one "$@"
+    build_costs $((SECONDS - pool_started))
+}
+
+# build_costs <wall seconds>: what the pool just spent, from each build's last
+# line, so a run's log says where its minutes went rather than only how many
+# there were: the sum of each phase over every target, and the slowest three.
+build_costs() {
+    cat "$BUILD_DIR"/*.log 2>/dev/null | awk -v wall="$1" -v jobs="$JOBS" '
+        /^built: .*\(aetherc [0-9]+ s, cc [0-9]+ s, link [0-9]+ s\)$/ {
+            n++; a += $(NF-7); c += $(NF-4); l += $(NF-1)
+            name = $2; sub(/.*\//, "", name)
+            total = $(NF-7) + $(NF-4) + $(NF-1)
+            print total, name > "/dev/stderr"
+        }
+        END {
+            if (n) printf "        built %d in %d s, %d at a time: aetherc %d s, cc %d s, link %d s in all\n", n, wall, jobs, a, c, l
+        }' 2>"$BUILD_DIR/costs"
+    if [ -s "$BUILD_DIR/costs" ]; then
+        printf '        slowest:'
+        sort -rn "$BUILD_DIR/costs" | head -3 | awk '{ printf " %s %d s", $2, $1 }'
+        printf '\n'
+    fi
 }
 
 # What build_together made of one target: 0 and a quiet log, or the reason.
@@ -250,7 +317,7 @@ else
     skip "exported fixtures" "no Blender"
 fi
 
-if in_tier full; then
+if in_tier suites; then
 step "no two surfaces share a plane"
 # Z-fighting is two faces in one plane close enough in depth that rounding
 # decides which is in front. Looked for on screen it depends on where the
@@ -338,6 +405,9 @@ if [ "$(uname -s)" = "Darwin" ]; then
     fi
 fi
 
+# One runner of Linux's two is enough to say a module stopped compiling; the
+# apps half would only say it again.
+if in_tier suites leaks platform; then
 step "modules type-check"
 for module in src/ae3d/*/; do
     name="$(basename "$module")"
@@ -372,6 +442,7 @@ for module in examples/lib/*/; do
     fi
     rm -f "$probe" "${probe%.ae}.c"
 done
+fi
 
 # The scripts an object can be given. They are built before the suites because
 # a script is a separate library the test opens at runtime rather than
@@ -425,8 +496,14 @@ for script_source in resources/scripts/*.ae; do
     pass "script $script_name"
 done
 
+if in_tier suites leaks platform; then
 step "test suites"
 SUITES="$(suite_sources)"
+if [ "${AE3D_CI_GPU:-1}" = 0 ]; then
+    drawn="$(AE3D_CI_GPU=1 suite_sources | wc -l)"
+    drawn=$((drawn - $(printf '%s\n' $SUITES | wc -l)))
+    [ "$drawn" -gt 0 ] && skip "$drawn suites that draw" "AE3D_CI_GPU=0: no window, GL context or Vulkan device here"
+fi
 build_together $SUITES
 for suite in $SUITES; do
     name="$(basename "$suite" .ae)"
@@ -467,7 +544,9 @@ for suite in $SUITES; do
     fi
 done
 
-if in_tier full; then
+fi
+
+if in_tier suites; then
 step "Vulkan under the validation layer, synchronization included"
 # The suites that read frames back, run again with the Khronos layer and its
 # synchronization validation on: a frame copied out while the pass that wrote
@@ -508,6 +587,9 @@ for name in test_fog test_overlay test_backend_parity; do
     fi
 done
 
+fi
+
+if in_tier apps; then
 step "examples build and run"
 # The scenes' tools are built in the same pass when the scenes run:
 # build_together starts from a clean status directory, so a later call would
@@ -548,9 +630,9 @@ done
 
 fi
 
-if [ -n "$SCENES" ] && in_tier full; then
+if [ -n "$SCENES" ] && in_tier apps; then
     . "$ROOT/scripts/ci_scenes.sh"
-elif in_tier full; then
+elif in_tier apps; then
     step "showcase scenes"
     skip "the street, the demo scene, the impostor atlas, renderer parity" "the local gate's; AE3D_CI_SCENES=1 runs them here"
 fi
@@ -801,7 +883,7 @@ check_editor_run() {
     rm -f "$report" "$snapshot" "$log"
 }
 
-if in_tier full; then
+if in_tier apps; then
 step "editor"
 # A print left in from working something out ships silently: it goes to the
 # editor's own console, where it looks like a message the editor meant to
@@ -852,13 +934,19 @@ else
         fail "ae3d_editor (build warnings or errors)"
         grep -E "warning|^error" /tmp/ae3d_build.log | sed 's/^/        /' | head -10
     else
-        for editor_backend in opengl vulkan; do
+        sed -n 's/^built: /        /p' /tmp/ae3d_build.log
+        # The roundtrip scene is this one saved and loaded again before the
+        # run starts, so its report describes what came BACK, held to every
+        # check the scene as built is and the sky besides: a scene that drops
+        # a component on the way through the file shows up as a count that
+        # fell. A runner runs it alone on OpenGL, since it fails wherever the
+        # scene as built would; the local gate runs both, which says which of
+        # the two broke.
+        editor_backends="opengl vulkan"
+        [ "$TIER" = all ] || editor_backends="vulkan"
+        for editor_backend in $editor_backends; do
             check_editor_run "$editor_backend"
         done
-        # The same scene saved and loaded again before the run starts, so the
-        # report describes what came BACK. Every component count is asserted
-        # exactly as above, which is the point: a scene that drops a component
-        # on the way through the file shows up here as a count that fell.
         check_editor_run opengl roundtrip
 
         # A name the editor shares with the toolkit it imports is bound
@@ -939,6 +1027,13 @@ else
     fi
 fi
 
+if [ -n "$editor_scale_was" ]; then export AE3D_RENDER_SCALE="$editor_scale_was"; else unset AE3D_RENDER_SCALE; fi
+fi
+
+# On the suites' runner: the two Linux runners take about as long with it
+# there, and the apps' one is the run's longest without it.
+if in_tier suites; then
+step "benchmarks"
 # A shared runner is not a machine anyone should take a timing from, and a
 # software rasteriser needs orders of magnitude longer per frame than the
 # hardware these numbers describe. On CI the benchmarks run briefly, as smoke
@@ -947,12 +1042,6 @@ if [ -n "${CI:-}" ]; then
     export AE3D_BENCH_FRAMES="${AE3D_BENCH_FRAMES:-10}"
     export AE3D_BENCH_BLOCKS="${AE3D_BENCH_BLOCKS:-1}"
 fi
-
-if [ -n "$editor_scale_was" ]; then export AE3D_RENDER_SCALE="$editor_scale_was"; else unset AE3D_RENDER_SCALE; fi
-fi
-
-if in_tier full; then
-step "benchmarks"
 build_together benchmarks/bench_*.ae
 for bench in benchmarks/bench_*.ae; do
     [ -e "$bench" ] || continue
@@ -989,20 +1078,18 @@ elif command -v leaks >/dev/null 2>&1 && in_tier leaks; then
     # after: one at a time they were half of the macOS runner's minutes, and
     # what a leak run reports is the heap at exit, which a neighbour cannot
     # change.
-    leak_dir="$(mktemp -d)"
-    started=0
+    export leak_dir="$(mktemp -d)" RUN_LIMIT
+    leak_one() {   # leak_one <name>
+        MallocStackLogging=1 bounded "$RUN_LIMIT" leaks --atExit -- "./build/$1" >"$leak_dir/$1.out" 2>&1
+    }
+    export -f bounded
+    leak_targets=""
     for suite in tests/test_*.ae benchmarks/bench_*.ae; do
         [ -e "$suite" ] || continue
         name="$(basename "$suite" .ae)"
-        [ -x "build/$name" ] || continue
-        ( MallocStackLogging=1 bounded "$RUN_LIMIT" leaks --atExit -- "./build/$name" >"$leak_dir/$name.out" 2>&1 ) &
-        started=$((started + 1))
-        if [ "$started" -ge "$JOBS" ]; then
-            wait
-            started=0
-        fi
+        [ -x "build/$name" ] && leak_targets="$leak_targets $name"
     done
-    wait
+    in_pool leak_one $leak_targets
     for suite in tests/test_*.ae benchmarks/bench_*.ae; do
         [ -e "$suite" ] || continue
         name="$(basename "$suite" .ae)"

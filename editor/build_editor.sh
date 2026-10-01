@@ -35,6 +35,8 @@ fi
 mkdir -p build "$OBJ_DIR"
 
 CC="${CC:-cc}"
+# ccache on the runners, as for every other program (build.sh says why).
+LAUNCHER="${AE3D_CC_LAUNCHER:-}"
 CFLAGS="${CFLAGS:--O2}"
 WARN="-Wall -Wextra"
 
@@ -136,7 +138,7 @@ for src in $NATIVE_SOURCES; do
     extra="$(ae3d_native_extra_flags "$src")"
     compiler="$(ae3d_native_compiler "$CC" "$src")"
     if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$newest_header" -nt "$obj" ]; then
-        "$compiler" -c $CFLAGS $FP_FLAGS $WARN $PIC $extra $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o "$obj"
+        $LAUNCHER "$compiler" -c $CFLAGS $FP_FLAGS $WARN $PIC $extra $GLFW_CFLAGS $VULKAN_CFLAGS "$src" -o "$obj"
     fi
 done
 
@@ -146,17 +148,36 @@ ae3d_runtime_build "$CC" "$AETHER_LIBS"
 # Every module tree on the search path: ae3d.* out of src/, ui and vg.* out
 # of the aether-ui checkout, aephysics.* out of its submodule.
 export AETHER_LIB_DIR="$ROOT/src:$ROOT/editor/lib:$UI_ROOT:$AEPHYSICS"
+build_started=$SECONDS
 aetherc "$SOURCE" "$GEN"
+aetherc_seconds=$((SECONDS - build_started))
 # C files a module compiles into the program with @source (contrib.vulkan's
 # loader, which ae3d.vkmeter's contrib.vulkan.vk calls through), as build.sh
 # links them: the engine's own are left to its library.
 AETHER_SOURCES="$(ae3d_program_sources "$GEN" "$ROOT")"
 
+# Each file compiled to an object of its own, then linked, as build.sh does:
+# a compile is what a launcher can cache, and one command that compiled and
+# linked at once could not be. The editor is the largest program there is,
+# and its C was compiled again on every run whatever had changed.
+PROGRAM_OBJ_DIR="$OBJ_DIR/$NAME"
+mkdir -p "$PROGRAM_OBJ_DIR"
+PROGRAM_OBJECTS=""
+compile_started=$SECONDS
+for src in "$GEN" $UI_SOURCES $AETHER_SOURCES; do
+    base="$(basename "$src")"
+    obj="$PROGRAM_OBJ_DIR/${base%.*}.o"
+    $LAUNCHER "$CC" -c $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $UI_FLAGS $AETHER_COMPILE_FLAGS "$src" -o "$obj"
+    PROGRAM_OBJECTS="$PROGRAM_OBJECTS $obj"
+done
+cc_seconds=$((SECONDS - compile_started))
+
 # zlib belongs to the engine, which is a library of its own and names it on its
 # own link line; GLFW is named, since the engine's Aether calls it
 # (ae3d.platform). PLATFORM_LIBS here is aether-ui's.
-"$CC" $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $UI_FLAGS "$GEN" $UI_SOURCES $AETHER_SOURCES $(ae3d_native_link_flags) $GLFW_LIBS \
+link_started=$SECONDS
+"$CC" $CFLAGS $UI_FLAGS $PROGRAM_OBJECTS $(ae3d_native_link_flags) $GLFW_LIBS \
     $AETHER_COMPILE_FLAGS $(ae3d_runtime_link_flags "$AETHER_LIBS") $(ae3d_program_flags) $PLATFORM_LIBS \
     -o "$OUT"
 
-echo "built: $OUT"
+echo "built: $OUT (aetherc $aetherc_seconds s, cc $cc_seconds s, link $((SECONDS - link_started)) s)"
