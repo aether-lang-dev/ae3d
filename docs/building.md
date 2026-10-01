@@ -69,6 +69,34 @@ calls GLFW `glfw3`). A library search path the machine needs, Homebrew's
 `CPATH`. The examples' shared code is imported by its path from the root
 (`import examples.lib.blackhole`).
 
+### ae3d as a dependency
+
+A game in a repository of its own, with ae3d checked out as a submodule (say
+at `ext/ae3d`), names it in its own `aether.toml`:
+
+```toml
+[dependencies]
+"github.com/aether-lang-dev/ae3d" = "0.1.0"
+"github.com/aether-lang-dev/aephysics" = "0.1.0"
+
+[patch]
+"github.com/aether-lang-dev/ae3d" = "ext/ae3d"
+"github.com/aether-lang-dev/aephysics" = "ext/ae3d/deps/aephysics"
+
+[build]
+cflags = "-ffp-contract=off"
+```
+
+ae3d exports `src/ae3d` (`[package] modules`), so `import ae3d.core` resolves
+with no `--lib`. Two lines restate what ae3d's own manifest says, because a
+dependency's manifest does not reach its consumer: the aephysics dependency
+and its patch (aether-lang-dev/aether#2335), and `-ffp-contract=off`, which
+keeps the networked horde and aephysics bit-exact across peers (#441). The
+engine finds the files it ships with (its HUD font) with
+`core.resource_path`: from the working directory, under `AE3D_ROOT`, beside
+the executable or one directory above it. A game run from its own root sets
+`AE3D_ROOT=ext/ae3d`, or ships `resources/` beside its executable.
+
 `build.sh` builds the same programs another way, which a program that loads
 scripts needs: the engine's C as one shared library that the program and
 every script link, and the DLSS shim against the Streamline SDK. It leaves
