@@ -174,7 +174,7 @@ main once it lands, which saves the caches every later pull request
 restores: a pull request reads its own and main's, never another's.
 
 The knobs: `AE3D_CI_FRAMES`, `AE3D_CI_EXAMPLE_FRAMES`, `AE3D_CI_WIDTH`/`HEIGHT`,
-`AE3D_CI_JOBS`, `AE3D_CI_RUN_LIMIT`, `AE3D_CI_TIER`, `AE3D_CI_SCENES=1`, `AE3D_CI_TRACE=1` for a trace of every
+`AE3D_CI_JOBS`, `AE3D_CI_RUN_LIMIT`, `AE3D_CI_TIER`, `AE3D_CI_SCENES=1`, `AE3D_CI_GPU=0` (no suite that draws is built: the macOS and Windows runners can open no window), `AE3D_CI_TRACE=1` for a trace of every
 command, `AE3D_SKIP_LEAKS=1`. A pull request is the unit of review, so the
 runners' checks are on the pull request; a branch without one is not built.
 

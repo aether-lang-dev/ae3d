@@ -94,11 +94,37 @@ PLATFORM_SUITES="test_net test_net_authority test_net_budget test_net_delta
     test_jobs test_assets test_obj_cache test_image_decode test_gltf
     test_loader test_scene_io test_font test_determinism test_gmath
     test_script"
+# The suites that draw: each needs a window, a GL context or a Vulkan device,
+# and says SKIP where there is none. The macOS and Windows runners have none
+# (run 36919172954: these 61 skipped on macOS), so there each was built --
+# the whole engine compiled again, four of the macOS job's minutes in all --
+# to print SKIP and be held to `leaks` on the way out. AE3D_CI_GPU=0, which the
+# workflow sets on those runners, builds none of them. A suite left off this
+# list is built and skips as before: forgetting one costs time, not coverage.
+GPU_SUITES="test_agent test_agent_attached test_agent_components test_agent_explain
+    test_agent_net test_agent_record test_backend_parity test_batching
+    test_blackhole test_camera_collision test_caustics test_character
+    test_crowd_ecs test_crowd_render test_crowd_render_scale
+    test_culling test_depth_clear test_depth_proxy test_device_crowd
+    test_dlss test_ecs_render test_engine_shadows test_engine_skybox
+    test_figure test_fog test_gameobjects test_gltf_crowd test_hierarchy
+    test_impostor test_instance_colours test_instance_positions
+    test_instance_streams test_instances test_lamp_clusters
+    test_lamp_shadows test_lights test_mesh_edit test_model_mesh
+    test_motion test_offscreen test_overlay test_physics
+    test_ray_occlusion test_ray_shadows test_readback_buffers
+    test_render test_render_scale test_scene_hold test_shading_isolation
+    test_shading_knobs test_shadow_batches test_shadow_cascades
+    test_shadows test_skinned_render test_ssr test_taa test_texture_swap
+    test_trace test_velocity test_vk_mesh test_weather"
 suite_sources() {   # the suites this tier builds and runs
     for suite in tests/test_*.ae; do
         name="$(basename "$suite" .ae)"
         if [ "$TIER" = platform ]; then
             case " $(echo $PLATFORM_SUITES) " in *" $name "*) ;; *) continue ;; esac
+        fi
+        if [ "${AE3D_CI_GPU:-1}" = 0 ]; then
+            case " $(echo $GPU_SUITES) " in *" $name "*) continue ;; esac
         fi
         echo "$suite"
     done
@@ -473,6 +499,11 @@ done
 if in_tier suites leaks platform; then
 step "test suites"
 SUITES="$(suite_sources)"
+if [ "${AE3D_CI_GPU:-1}" = 0 ]; then
+    drawn="$(AE3D_CI_GPU=1 suite_sources | wc -l)"
+    drawn=$((drawn - $(printf '%s\n' $SUITES | wc -l)))
+    [ "$drawn" -gt 0 ] && skip "$drawn suites that draw" "AE3D_CI_GPU=0: no window, GL context or Vulkan device here"
+fi
 build_together $SUITES
 for suite in $SUITES; do
     name="$(basename "$suite" .ae)"
