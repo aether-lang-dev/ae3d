@@ -21,3 +21,19 @@
   second still, where it took half.
 - Forward fallers lying still within 3 s of landing: 28 of 30, up from 21.
   Their heads never touch the ground.
+
+### Lag compensation (#499)
+
+- `net.rewind(session, client, seen)` puts every networked object where that
+  client drew it when it acted, and its Rigidbody with it, for a query.
+  `net.restore(session)` puts them back. The host keeps each object's states
+  for the last second, quantised as a client draws them.
+- An acting command carries its view as a tick and 256ths of the next. The
+  mover's `seen` is now that point as a time on the host's clock
+  (`seen_time`), in place of a whole tick.
+- `physics.ray_hit_object` names the object a ray meets first, and
+  `physics.rigidbody_place` puts a body somewhere at once.
+- tests/test_net_rewind.ae: 20 shots at a box crossing at 6 m/s, from a
+  client 100 ms away. All hit against the rewound world, and all miss
+  against the world as it is (by 2.29 m on average). The rewind and its
+  restore cost 1.7 µs a shot.

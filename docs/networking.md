@@ -59,7 +59,7 @@ Protocol 7.
 | hello | client to host, reliable | `u8 1`, `u32 protocol` |
 | welcome | host to client, reliable | `u8 2`, `u32 client id`, `u32 tick rate`, `f64 precision` (metres a step of a position) |
 | snapshot | host to each client, unreliable | `u8 3`, `u32 tick`, `f32 host time`, `u32 ack` (the client's newest command the host has applied), `u8 base gap` (this tick less the tick of the snapshot it is a delta against; 0 for none), `varint objects`, `varint records`, `u8 flags`; with flag 1 the client's own player at full precision, its mover's numbers as `f32` (the controller's: `x y z`, `vy`, grounded); with flag 2 the previous tick's time, `f32`; with flag 4 the oldest command the host lacks while it holds a later one, a varint of its seq less the ack; then a record each: `varint index gap`, `u8 fields`, and the fields it names -- x, y and z, each a zigzag varint of its change in steps of the precision (its value, where the base doesn't have the object), the rotation in 48 bits, and the object's replicated fields ([below](#fields-of-a-scripts-state)); with flag 8, after the records, the objects destroyed since the base: `varint count`, then each `varint index`, `f32 host time` it went, `f32 x y z`, `f32 qx qy qz qw` where it was, `varint length` and its last fields block whole (length 0 for none) |
-| input | client to host, unreliable | `u8 4`, `u16 newest snapshot` (the client's acknowledgement), `u8 flags`, with flag 1 the client's view (18 bytes), its eye from the client's player's place with flag 2, `u32 first seq`, `u8 count`, a bit a command whether it is sent, then per command sent each of its fields in its steps (the controller's: its walk's x and z in millimetres a second, its jump in 64ths of a metre a second), a zigzag varint of what it is less the command before it and that one's own change (the first as it is), and for a command with a bit of an action set, a varint of how many ticks its view was behind the acknowledged snapshot |
+| input | client to host, unreliable | `u8 4`, `u16 newest snapshot` (the client's acknowledgement), `u8 flags`, with flag 1 the client's view (18 bytes), its eye from the client's player's place with flag 2, `u32 first seq`, `u8 count`, a bit a command whether it is sent, then per command sent each of its fields in its steps (the controller's: its walk's x and z in millimetres a second, its jump in 64ths of a metre a second), a zigzag varint of what it is less the command before it and that one's own change (the first as it is), and for a command with a bit of an action set, a varint of how many ticks its view was behind the acknowledged snapshot and a `u8` of the 256ths of a tick it was on from that one |
 | spawn | host to client, reliable | `u8 5`, `u32 net id`, `u32 owner` |
 | ack | client to host, unreliable | `u8 6`, `u16 tick`, `u8 flags`, with flag 1 the view (and flag 2 as an input's): a snapshot the client has, when no input carried it |
 | event | either way, reliable | `u8 7`, `u16 event`, `u8 count`, then `count` `f32` numbers |
@@ -177,8 +177,22 @@ net.player_command(session, values, now)    // each fixed step: float[] in units
 
 - **The command** is the fields registered, both sides the same, each a number in steps of its precision or a field of bits; on the wire each is coded as the walk's are, its change less the change before, and a command the same again is a bit.
 - **The mover.** `apply(context, object, values, step, seen)` moves the player by one command, on the host and in the client's prediction; `save(context, object, out)` writes its movable state, at most eight numbers, and `restore(context, object, values)` puts it back. The state goes in the snapshot's own block, and after every command it is rounded through `save` and `restore` to the 32-bit floats the block carries, on both sides, so the replay starts from exactly the host's state: `apply` must give the same result from the same start.
-- **Actions, where they were aimed.** A command with any bit set carries the tick the client's view had reached when it was made (`seen`, `seen_tick(session, now)`): what the player saw when it swung or fired, for the host to resolve the action against (#499). A command without one carries nothing more.
-- Held to: a game's pawn, its own command (a walk, a facing and an action bit) and its own mover over 100 ms and 5% loss: reconciliation moves it 0 mm, it rests where the host has it, and the host applies all 11 shots once each, each stamped with the tick the client had stamped (tests/test_players.ae).
+- **Actions, where they were aimed.** A command with any bit set carries the point the client's view had reached when it was made: the tick, and how far on to the next in 256ths of one. The mover's `seen` is that point as a time on the host's clock (`seen_time(session, now)` on the client): what the player saw when it swung or fired. A command without one carries nothing more.
+- Held to: a game's pawn, its own command (a walk, a facing and an action bit) and its own mover over 100 ms and 5% loss: reconciliation moves it 0 mm, it rests where the host has it, and the host applies all 11 shots once each, each at the time the client had stamped (tests/test_players.ae).
+
+### Lag compensation
+
+A client draws everything but its own player `interpolation_delay` behind the host, and its command reaches the host a trip later still. So by the time the host applies a shot, what it was aimed at has moved on. The host keeps every networked object's states for the last second -- the ones it sent, quantised as a client draws them -- and puts the world back for the query (#499):
+
+```aether
+fire(context: ptr, o: *GameObject, values: ptr, step: float, seen: float) {
+    net.rewind(session, client, seen)       // every networked object where that client drew it, its body too
+    hit = physics.ray_hit_object(world, from, aim, 30.0)
+    net.restore(session)                    // and back
+}
+```
+
+`rewind` places each object between the two states around `seen`, as the client's view had them, and moves its Rigidbody with it (`physics.rigidbody_place`). The shooter's own player stays where it is: its client drew it ahead, where it was. `restore` puts them all back. Held to (tests/test_net_rewind.ae): a client 100 ms away (20 ms jitter, 2% loss) fires 20 shots at a box crossing at 6 m/s, at where its view draws it. Against the rewound world all 20 hit. Against the world as it is all 20 miss, the ray passing 2.29 m from the box on average. The rewind and its restore cost 1.7 µs a shot on the host, and the box's body is back where it was to the millimetre.
 
 Networked scene objects are marked before hosting or joining, so their ids come first and the players' after them.
 
@@ -528,4 +542,4 @@ The editor's play (#476, [editor.md](editor.md)): a bounded run with a host and 
 
 ## Next
 
-Everything #413 asked for is built but Steam's sockets (SteamNetworkingSockets, with its lobbies and NAT traversal) behind the same calls, which want Valve's proprietary Steamworks SDK, not available to this project or its CI ([#483](https://github.com/nicolas-maman/ae3d/issues/483)). Past #413: lag compensation, which rewinds to `view_time` ([#499](https://github.com/nicolas-maman/ae3d/issues/499)); for the horde, the late joiner's state deflated on top of its quantising, which would probably halve it again ([#501](https://github.com/nicolas-maman/ae3d/issues/501)).
+Everything #413 asked for is built but Steam's sockets (SteamNetworkingSockets, with its lobbies and NAT traversal) behind the same calls, which want Valve's proprietary Steamworks SDK, not available to this project or its CI ([#483](https://github.com/nicolas-maman/ae3d/issues/483)). Past #413: the horde's late-joiner state is at its entropy: deflating it saved under 1% ([#501](https://github.com/nicolas-maman/ae3d/issues/501)), and what would shrink it is a change of what it carries.

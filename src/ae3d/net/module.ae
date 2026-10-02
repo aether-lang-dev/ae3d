@@ -77,7 +77,7 @@ exports (
     traffic, TRAFFIC_SNAPSHOTS, TRAFFIC_EVENTS, TRAFFIC_INPUTS, TRAFFIC_ACKS, TRAFFIC_HEADERS,
     TRAFFIC_ACK_PACKETS, TRAFFIC_RESENT, TRAFFIC_HANDSHAKE, datagrams_sent, largest_datagram, round_trip,
     NetPlayer, set_player_maker, host_play, player_input, my_player, player_of, player_count, prediction_error, input_sent,
-    set_player_object_maker, set_player_mover, command_axis, command_bits, player_command, seen_tick,
+    set_player_object_maker, set_player_mover, command_axis, command_bits, player_command, seen_time, rewind, restore,
     commands_asked,
     NetCall, HOST, EVERYONE, on_event, send_event, send_event_bytes, on_join, on_leave,
     object_kind, create_object, destroy_object, object_of, id_of,
@@ -256,6 +256,7 @@ const EVENT_DISCONNECTED = 2
 const EVENT_MESSAGE = 3
 
 const HISTORY = 32                   // samples an object keeps: a second at 30 a second
+const TICK_TIMES = 64                // host: the times of its last ticks, for a command's view (#499)
 const SMOOTHING = 0.1                // seconds a remote object's drawing error takes to fall to a third
 const TELEPORT = 4.0                 // metres: an error past this is the object moved, taken at once
 const EXTRAPOLATION = 0.1            // seconds a moving object is carried on past the newest snapshot, by default
@@ -870,6 +871,11 @@ struct Net {
     events: ptr                      // list of *NetEvent, this step's
     objects: ptr                     // list of *NetObject, by id - 1
     tick_rate: float
+    // Host: the time it took each of its last TICK_TIMES ticks at, so a
+    // command's view -- a tick and a fraction of the next -- is a time on
+    // its clock; and the objects a rewind moved, with where they were.
+    tick_times: ptr                  // float[TICK_TIMES], by tick % TICK_TIMES
+    rewound: ptr                     // list of *Rewound
     since_tick: float
     tick: int
     last_step: float
@@ -908,7 +914,7 @@ struct Net {
     // A game's own player (#531): made as a game object, moved by the
     // game's mover from the game's commands; the controller's when none.
     player_object_maker: fn(ptr, int) -> *GameObject
-    mover_apply: fn(ptr, *GameObject, ptr, float, int)
+    mover_apply: fn(ptr, *GameObject, ptr, float, float)
     mover_save: fn(ptr, *GameObject, ptr) -> int
     mover_restore: fn(ptr, *GameObject, ptr)
     mover_context: ptr
@@ -994,6 +1000,8 @@ net_new(role: int, kind: int) -> *Net {
     n.events = list.new()
     n.objects = list.new()
     n.tick_rate = 30.0
+    n.tick_times = calloc(TICK_TIMES, 8)
+    n.rewound = list.new()
     n.interpolation_delay = 0.1
     n.last_step = 0.0 - 1.0
     n.out = buf_new(2048)
@@ -2536,9 +2544,11 @@ current_states(n: *Net, shot: *Snapshot, now: float) {
         i = i + 1
     }
     snapshot_reset(shot, n.tick, now, count, n.field_words)
+    (n.tick_times as float[])[n.tick % TICK_TIMES] = now
     states = shot.states as float[]
     known = shot.known as int[]
     fknown = shot.fknown as int[]
+    sample = calloc(7, 8)
     i = 0
     while i < count {
         no = list.get_raw(n.objects, i) as *NetObject
@@ -2550,6 +2560,9 @@ current_states(n: *Net, shot: *Snapshot, now: float) {
             states[at + 2] = quantise(n, where.z)
             states[at + 3] = pack_rotation(rotation_of(no.object))
             known[i] = 1
+            // Kept as a client will draw it, for a rewind to (#499).
+            state_values(n, shot, i, sample as float[], 0)
+            add_sample(no, now, sample as float[], 0)
             lay = layout_at(n, i + 1)
             if lay != null && lay.count > 0 && lay.at >= 0 {
                 read_fields(n, no, lay, shot)
@@ -2558,6 +2571,7 @@ current_states(n: *Net, shot: *Snapshot, now: float) {
         }
         i = i + 1
     }
+    free(sample)
 }
 
 same_state(a: float[], b: float[], index: int) -> bool {
@@ -4192,9 +4206,10 @@ set_player_object_maker(n: *Net, maker: fn(ptr, int) -> *GameObject, context: pt
 // commands and on the client ahead of the host:
 //   apply(context, object, values, step, seen) moves the player by one
 //     command: `values` its fields in units (float[], in the order
-//     registered), `step` seconds, `seen` the tick the client's view had
-//     reached when it made the command -- where its actions were aimed --
-//     or 0 where the command carries no action;
+//     registered), `step` seconds, `seen` the time on the host's clock
+//     the client's view had reached when it made the command -- what it
+//     was drawing, where its actions were aimed, what `rewind` puts back
+//     (#499) -- or 0 where the command carries no action;
 //   save(context, object, out) writes the player's movable state, at most
 //     OWN numbers, into `out` (float[]) and says how many;
 //   restore(context, object, values) puts it back.
@@ -4203,7 +4218,7 @@ set_player_object_maker(n: *Net, maker: fn(ptr, int) -> *GameObject, context: pt
 // for the same start on both sides. After every command the state is
 // rounded through save and restore to the 32-bit floats the snapshot
 // carries, on both sides, so the replay starts from exactly the host's.
-set_player_mover(n: *Net, apply: fn(ptr, *GameObject, ptr, float, int), save: fn(ptr, *GameObject, ptr) -> int,
+set_player_mover(n: *Net, apply: fn(ptr, *GameObject, ptr, float, float), save: fn(ptr, *GameObject, ptr) -> int,
                  restore: fn(ptr, *GameObject, ptr), own: int, context: ptr) {
     n.mover_apply = apply
     n.mover_save = save
@@ -4366,7 +4381,7 @@ apply_inputs(n: *Net, p: *Peer, r: *NetReader, ack_tick: int) {
         coded[f] = 0 as long
         f = f + 1
     }
-    seen = 0
+    seen = 0.0
     i = 0
     while i < count {
         seq = first + i
@@ -4378,8 +4393,11 @@ apply_inputs(n: *Net, p: *Peer, r: *NetReader, ack_tick: int) {
                 coded[f] = value
                 f = f + 1
             }
-            seen = 0
-            if command_acts_coded(n, coded) { seen = ack_tick - ((get_varint(r)) as int) }
+            seen = 0.0
+            if command_acts_coded(n, coded) {
+                seen = (ack_tick - ((get_varint(r)) as int)) as float
+                seen = seen + (get_u8(r) as float) / 256.0
+            }
         } else if i == 0 {
             return
         } else {
@@ -4395,7 +4413,7 @@ apply_inputs(n: *Net, p: *Peer, r: *NetReader, ack_tick: int) {
         if seq > p.last_input && seq <= p.last_input + COMMANDS {
             slot = (seq % COMMANDS) * COMMAND
             q[slot + C_SEQ] = seq as float
-            q[slot + C_SEEN] = seen as float
+            q[slot + C_SEEN] = seen
             f = 0
             while f < n.cmd_count {
                 q[slot + C_VALUE + f] = coded[f] as float
@@ -4431,7 +4449,7 @@ apply_queued(n: *Net, p: *Peer) {
     slot = (next % COMMANDS) * COMMAND
     if (q[slot + C_SEQ]) as int != next { return }
     pl = p.player as *NetPlayer
-    player_apply(n, pl, command_units(n, q, slot), (q[slot + C_SEEN]) as int)
+    player_apply(n, pl, command_units(n, q, slot), q[slot + C_SEEN])
     settle(n, pl)
     p.last_input = next
 }
@@ -4496,8 +4514,8 @@ player_input(n: *Net, walk: Vec3, jump: float, now: float) {
 // A client's command of the game's own (#531), its fields' values in
 // units in `values` (float[], in the order registered): its own player
 // moves by it now, ahead of the host, and it goes to the host with the few
-// before it, as player_input's does. A command that acts carries the tick
-// the client's view had reached. On the host, its own player (host_play)
+// before it, as player_input's does. A command that acts carries the point
+// the client's view had reached: the tick and 256ths of the next. On the host, its own player (host_play)
 // moves, and that is all.
 player_command(n: *Net, values: ptr, now: float) {
     mine = n.mine as *NetPlayer
@@ -4533,9 +4551,9 @@ player_command(n: *Net, values: ptr, now: float) {
         f = f + 1
     }
     cmds[slot + C_SEEN] = 0.0
-    if command_acts(n, cmds, slot) { cmds[slot + C_SEEN] = seen_tick(n, now) as float }
+    if command_acts(n, cmds, slot) { cmds[slot + C_SEEN] = seen_point(n, now) }
     n.command_count = n.command_count + 1
-    player_apply(n, mine, command_units(n, cmds, slot), (cmds[slot + C_SEEN]) as int)
+    player_apply(n, mine, command_units(n, cmds, slot), cmds[slot + C_SEEN])
     settle(n, mine)
     // Each command goes in as many messages from the one it is made in as
     // the link's loss asks (carried_for), so it is lost only when all of
@@ -4595,9 +4613,14 @@ player_command(n: *Net, values: ptr, now: float) {
                 f = f + 1
             }
             if command_acts(n, cmds, at) {
-                behind = n.newest_tick - (cmds[at + C_SEEN]) as int
+                // The view's point: its tick, behind the newest snapshot,
+                // and the 256ths of a tick on from it.
+                seen = cmds[at + C_SEEN]
+                whole = floor(seen)
+                behind = n.newest_tick - (whole as int)
                 if behind < 0 { behind = 0 }
                 put_varint(b, behind as long)
+                put_u8(b, ((seen - whole) * 256.0 + 0.5) as int)
             }
         } else {
             f = 0
@@ -4650,10 +4673,10 @@ command_acts(n: *Net, cmds: float[], at: int) -> bool {
 
 // A player moved by one command: the game's mover, or its controller by
 // the controller's command (a walk along x and z, a jump).
-player_apply(n: *Net, pl: *NetPlayer, values: ptr, seen: int) {
+player_apply(n: *Net, pl: *NetPlayer, values: ptr, seen: float) {
     apply = n.mover_apply
     if apply != null {
-        apply(n.mover_context, pl.object, values, PLAYER_STEP, seen)
+        apply(n.mover_context, pl.object, values, PLAYER_STEP, point_time(n, seen))
         return
     }
     if pl.controller == null { return }
@@ -4680,9 +4703,9 @@ player_save(n: *Net, pl: *NetPlayer, out: ptr) -> int {
 }
 
 player_restore(n: *Net, pl: *NetPlayer, values: ptr) {
-    restore = n.mover_restore
-    if restore != null {
-        restore(n.mover_context, pl.object, values)
+    put_back = n.mover_restore
+    if put_back != null {
+        put_back(n.mover_context, pl.object, values)
         return
     }
     v = values as float[]
@@ -4700,20 +4723,132 @@ own_count(n: *Net) -> int {
     return CONTROLLER_OWN
 }
 
-// The tick the client's view has reached: the newest snapshot it holds
-// whose time the view, `view_time`, is past. What it is drawing, and so
-// where a swing or a shot made now was aimed (#531, for #499).
-seen_tick(n: *Net, now: float) -> int {
+// The point the client's view has reached, as the host's ticks count it:
+// the newest snapshot it holds whose time the view, `view_time`, is past,
+// and how far on toward the next tick, in 256ths of one. What it is
+// drawing, and so where a swing or a shot made now was aimed (#531, #499).
+seen_point(n: *Net, now: float) -> float {
     view = view_time(n, now)
     best = 0
+    time = 0.0
     slots = n.received as ptr[]
     k = 0
     while k < KEPT {
         shot = slots[k] as *Snapshot
-        if shot != null && shot.used && shot.time <= view && shot.tick > best { best = shot.tick }
+        if shot != null && shot.used && shot.time <= view && shot.tick > best {
+            best = shot.tick
+            time = shot.time
+        }
         k = k + 1
     }
-    return best
+    if best == 0 { return 0.0 }
+    part = floor((view - time) * n.tick_rate * 256.0)
+    if part < 0.0 { part = 0.0 }
+    if part > 255.0 { part = 255.0 }
+    return (best as float) + part / 256.0
+}
+
+// The same as a time on the host's clock: what `rewind` takes, and what a
+// player's mover is given as `seen`.
+seen_time(n: *Net, now: float) -> float { return point_time(n, seen_point(n, now)) }
+
+// A view's point -- a tick and 256ths of the next -- as a time on the
+// host's clock: on the host, the time it took that tick at; on a client,
+// the time its snapshot of that tick carried. 0 for none, and -1 for a
+// tick too long gone to say.
+point_time(n: *Net, point: float) -> float {
+    if point <= 0.0 { return 0.0 }
+    whole = floor(point)
+    tick = whole as int
+    on = (point - whole) / n.tick_rate
+    if n.role == ROLE_HOST {
+        if tick > n.tick || n.tick - tick >= TICK_TIMES { return 0.0 - 1.0 }
+        return (n.tick_times as float[])[tick % TICK_TIMES] + on
+    }
+    slots = n.received as ptr[]
+    k = 0
+    while k < KEPT {
+        shot = slots[k] as *Snapshot
+        if shot != null && shot.used && shot.tick == tick { return shot.time + on }
+        k = k + 1
+    }
+    return 0.0 - 1.0
+}
+
+// --- lag compensation (#499) -------------------------------------------------------------------
+
+// An object a rewind moved, and where it was.
+struct Rewound {
+    object: *GameObject
+    position: Vec3
+    rotation: Quat
+}
+
+// Host: every networked object put where `client` drew it at `view` (a
+// time on the host's clock: a mover's `seen`, seen_time) -- between the
+// two states the host kept around that moment, as the client's view had
+// them -- and its body with it, for a query against the world as the
+// client saw it (physics.ray_hit_object, ray_hits). The client's own
+// player stays where it is: the client drew it ahead, where it was. Until
+// `restore`; a rewind while one is in force restores first. False on a
+// client, or for a view the host does not hold.
+rewind(n: *Net, client: int, view: float) -> bool {
+    restore(n)
+    if n.role != ROLE_HOST || view <= 0.0 { return false }
+    mine = null as *GameObject
+    pl = player_of(n, client)
+    if pl != null { mine = pl.object }
+    i = 0
+    while i < list.size(n.objects) {
+        no = list.get_raw(n.objects, i) as *NetObject
+        if no != null && no.object != null && no.object != mine && no.count > 0 {
+            h = no.history as float[]
+            after = 0 - 1
+            before = 0 - 1
+            k = 0
+            while k < no.count {
+                slot = (no.newest - k + HISTORY) % HISTORY
+                if h[slot * SAMPLE] > view {
+                    after = slot
+                } else {
+                    before = slot
+                    break
+                }
+                k = k + 1
+            }
+            if before < 0 { before = after }
+            if after < 0 { after = before }
+            t = sample_share(h, before, after, false, view, 0.0)
+            saved = heap.new(Rewound)
+            saved.object = no.object
+            saved.position = position_of(no.object)
+            saved.rotation = rotation_of(no.object)
+            list.add_raw(n.rewound, saved as ptr)
+            set_transform(no.object, sample_place(h, before, after, t), nlerp(h, before * SAMPLE + 4, after * SAMPLE + 4, t))
+            place_body(no.object)
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Every object a rewind moved put back where it was, its body with it.
+restore(n: *Net) {
+    i = 0
+    while i < list.size(n.rewound) {
+        saved = list.get_raw(n.rewound, i) as *Rewound
+        set_transform(saved.object, saved.position, saved.rotation)
+        place_body(saved.object)
+        heap.free(saved)
+        i = i + 1
+    }
+    list.clear(n.rewound)
+}
+
+// An object's body, if it has one, moved to where the object now is.
+place_body(o: *GameObject) {
+    rb = physics.rigidbody_of(o)
+    if rb != null { physics.rigidbody_place(rb, behaviour.object_world_position(o), behaviour.object_world_rotation(o)) }
 }
 
 // A client's player after a move, as the snapshot carries it: its place
@@ -4813,7 +4948,7 @@ reconcile(n: *Net, own: ptr, ack: int) {
     k = 0
     while k < n.command_count {
         slot = ((n.command_first + k) % COMMANDS) * COMMAND
-        player_apply(n, mine, command_units(n, cmds, slot), (cmds[slot + C_SEEN]) as int)
+        player_apply(n, mine, command_units(n, cmds, slot), cmds[slot + C_SEEN])
         settle(n, mine)
         k = k + 1
     }
@@ -5982,6 +6117,9 @@ attach(e: *Engine, n: *Net) {
 
 net_free(n: *Net) {
     if n == null { return }
+    restore(n)
+    list.free(n.rewound)
+    free(n.tick_times)
     clear_events(n)
     list.free(n.events)
     // A UDP session says it is going, to every connection, before its
