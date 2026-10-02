@@ -1,0 +1,225 @@
+// Lag compensation (#499), held to numbers: a host and a client over a
+// loopback link with 100 ms latency, 20 ms jitter and 2% loss. The host
+// moves a networked box across the client's view at 6 m/s; the client's
+// player, still, fires at the box where its view draws it, every third of
+// a second while the box crosses the middle of its track, its aim the
+// command's axes. On the host, each shot's ray --
+// from the player along the aim -- is cast against the world rewound to
+// where that client drew it (net.rewind at the command's `seen`), and again
+// against the world as it is.
+//
+//   - every shot hits the box in the rewound world;
+//   - the same shots against the world as it is miss, by the metres the
+//     box moved while the shot was on its way and the view was behind;
+//   - after each shot the box is back where it was, its body with it;
+//   - the rewind's cost on the host, stated per shot.
+
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.loader
+import ae3d.physics
+import ae3d.platform
+import ae3d.net
+import aephysics.dynamics
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern exit(code: int)
+extern sqrt(x: float) -> float
+
+const STEPS = 900                    // fifteen seconds
+const STEP = 0.016666666666666666
+const SPEED = 6.0                    // metres a second, the box across the view
+const RANGE = 30.0                   // metres a shot reaches
+const EVERY = 20                     // steps between shots
+const FIRST = 90                     // the first shot's step: the client holds snapshots by then
+const SHOTS = 64
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+// One side's world: an engine never run, its physics, the box at z 10 and
+// a metre up, networked first on both sides so it has the same id.
+struct Side {
+    engine: *Engine
+    session: *Net
+    target: *GameObject
+    pawn: *GameObject               // this side's copy of the client's player
+    host: bool
+    // Host: per shot, whether it hit rewound, whether it hit as things are,
+    // how far the ray passed from the box's middle as things are, and the
+    // seconds the rewind and its restore took.
+    shots: int
+    hit_rewound: int
+    hit_now: int
+    missed_by: float
+    back_off: float
+    rewind_seconds: float
+}
+
+side_new(host: bool) -> *Side {
+    s = calloc(1, sizeof(Side)) as *Side
+    s.host = host
+    s.engine = engine.engine_new()
+    engine.engine_set_fixed_step(s.engine, STEP)
+    physics.attach(s.engine)
+    s.target = engine.object(s.engine, "Target", null)
+    behaviour.object_set_position(s.target, core.vec3(0.0, 1.0, 10.0))
+    if host {
+        rb = physics.rigidbody(s.target, physics.KINEMATIC)
+        physics.box_collider(s.target, core.vec3(0.5, 0.5, 0.5), physics.material(0.5, 0.0))
+        if rb == null { println("  (no rigidbody)") }
+    }
+    return s
+}
+
+// The client's player, on either side: a point at the origin a metre up.
+make_pawn(context: ptr, client: int) -> *GameObject {
+    s = context as *Side
+    o = engine.object(s.engine, "Pawn ${client}", null)
+    behaviour.object_set_position(o, core.vec3(0.0, 1.0, 0.0))
+    if client == 1 { s.pawn = o }
+    return o
+}
+
+// The mover: the player stands; a command with its bit set is a shot along
+// its aim (the first two fields, x and z). On the host, the shot is cast
+// against the world rewound to `seen` and against the world as it is.
+fire(context: ptr, o: *GameObject, values: ptr, step: float, seen: float) {
+    s = context as *Side
+    v = values as float[]
+    if !s.host || v[2] == 0.0 || s.shots >= SHOTS { return }
+    aim = core.v3_normalize(core.vec3(v[0], 0.0, v[1]))
+    from = behaviour.object_position(o)
+    p = physics.of(s.engine)
+    began = platform.time()
+    rewound = net.rewind(s.session, 1, seen)
+    hit = physics.ray_hit_object(p, from, aim, RANGE)
+    net.restore(s.session)
+    s.rewind_seconds = s.rewind_seconds + (platform.time() - began)
+    if rewound && hit == s.target { s.hit_rewound = s.hit_rewound + 1 }
+    if physics.ray_hit_object(p, from, aim, RANGE) == s.target { s.hit_now = s.hit_now + 1 }
+    // How far the ray passes from where the box is now.
+    box = behaviour.object_position(s.target)
+    to = core.v3_sub(box, from)
+    along = core.v3_dot(to, aim)
+    off = core.v3_len(core.v3_sub(to, core.v3_mul(aim, along)))
+    s.missed_by = s.missed_by + off
+    // Back where it was, and its body with it.
+    body = physics.rigidbody_body(physics.rigidbody_of(s.target))
+    gap = core.v3_len(core.v3_sub(dynamics.body_get_position(body), behaviour.object_world_position(s.target)))
+    if gap > s.back_off { s.back_off = gap }
+    s.shots = s.shots + 1
+}
+
+save_pawn(context: ptr, o: *GameObject, out: ptr) -> int {
+    at = behaviour.object_position(o)
+    v = out as float[]
+    v[0] = at.x
+    v[1] = at.y
+    v[2] = at.z
+    return 3
+}
+
+restore_pawn(context: ptr, o: *GameObject, values: ptr) {
+    v = values as float[]
+    behaviour.object_set_position(o, core.vec3(v[0], v[1], v[2]))
+}
+
+play(n: *Net, s: *Side) {
+    s.session = n
+    net.networked(n, s.target)
+    net.set_player_object_maker(n, make_pawn, s as ptr)
+    net.set_player_mover(n, fire, save_pawn, restore_pawn, 3, s as ptr)
+    net.command_axis(n, 0.001)              // aim x
+    net.command_axis(n, 0.001)              // aim z
+    net.command_bits(n)                     // 1 fires
+}
+
+// The box's place at time t: back and forth across x at SPEED, 8 m each way.
+box_at(t: float) -> float {
+    period = 16.0 / SPEED
+    phase = t - period * ((t / period) as int as float)
+    half = period * 0.5
+    if phase < half { return 0.0 - 4.0 + SPEED * phase }
+    return 4.0 - SPEED * (phase - half)
+}
+
+main() {
+    println("rewind: a box at 6 m/s, shot at where a client 100 ms away draws it")
+    hub = net.hub_new()
+    net.hub_set_conditions(hub, 0.1, 0.02, 0.02)
+    host_side = side_new(true)
+    one_side = side_new(false)
+    host = net.host_loopback(hub)
+    play(host, host_side)
+    one = net.join_loopback(hub)
+    play(one, one_side)
+    values = calloc(3, 8) as float[]
+    fired = 0
+    step = 0
+    while step < STEPS {
+        now = (step as float) * STEP
+        behaviour.object_set_position(host_side.target, core.vec3(box_at(now), 1.0, 10.0))
+        engine.engine_update(host_side.engine, STEP)
+        if net.my_player(one) != null && one_side.pawn != null {
+            values[0] = 0.0
+            values[1] = 1.0
+            values[2] = 0.0
+            drawn = behaviour.object_position(one_side.target)
+            // At the box where this client draws it, while it crosses at
+            // full speed: not at the ends of its track, where it turns.
+            if step >= FIRST && step % EVERY == 0 && fired < SHOTS && drawn.x > 0.0 - 2.5 && drawn.x < 2.5 {
+                from = behaviour.object_position(one_side.pawn)
+                aim = core.v3_normalize(core.v3_sub(drawn, from))
+                values[0] = aim.x
+                values[1] = aim.z
+                values[2] = 1.0
+                fired = fired + 1
+            }
+            net.player_command(one, values as ptr, now)
+        }
+        net.step(one, now)
+        net.step(host, now)
+        step = step + 1
+    }
+    s = host_side
+    shots = s.shots
+    mean_miss = 0.0
+    per_shot = 0.0
+    if shots > 0 {
+        mean_miss = s.missed_by / (shots as float)
+        per_shot = s.rewind_seconds / (shots as float)
+    }
+    println("  ${fired} shots fired, ${shots} resolved on the host: ${s.hit_rewound} hit the rewound box, ${s.hit_now} the box as it is; the rays passed ${mean_miss} m from it on average")
+    println("  the rewind and its restore: ${per_shot * 1000000.0} us a shot; the box's body back to within ${s.back_off * 1000.0} mm")
+    check("every shot resolved on the host", shots == fired && shots >= 10)
+    check("every shot hits the box where the client drew it", s.hit_rewound == shots)
+    check("against the world as it is, every one of the same shots misses, by the box's travel (more than a metre on average)", s.hit_now == 0 && mean_miss > 1.0)
+    check("after each shot the box's body is back where the box is", s.back_off < 0.001)
+    free(values as ptr)
+    net.net_free(one)
+    net.net_free(host)
+    net.hub_free(hub)
+    engine.engine_free(one_side.engine)
+    engine.engine_free(host_side.engine)
+    free(host_side as ptr)
+    free(one_side as ptr)
+    if g_failures == 0 {
+        println("rewind: all checks passed (${g_checks})")
+    } else {
+        println("rewind: ${g_failures} failure(s) of ${g_checks}")
+        exit(1)
+    }
+}
