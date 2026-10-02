@@ -36,22 +36,42 @@
 // it with the field's threshold lowered, the glyph grown outward: how far it
 // can grow is the spread the atlas was baked with, which is why the overlay
 // bakes wider than the glyphs' default (FONT_SPREAD).
+//
+// Laid out (#459): the engine tells the overlay the screen it is drawn over
+// each frame -- its size in pixels and the UI's scale, the monitor's
+// content scale (AE3D_UI_SCALE or engine_set_ui_scale over it) -- and
+// `place` puts a box at a corner, an edge or the centre, offset and sized
+// in points, so a HUD keeps its place at any window size and its size on
+// any display. `text_box` wraps text to a width and aligns its lines. A
+// panel clips what is drawn inside it (`push_clip` / `pop_clip`): every
+// quad is cut to the clip on the way in, its atlas place with it, so
+// nothing reaches past the panel and the renderers still draw it all in
+// one call. Images are packed into one RGBA page (`image_load`), drawn
+// from the overlay's second texture.
 
 import std.heap
+import std.list
 import std.string
 import ae3d.core
 import ae3d.glyphs
+import ae3d.picture
 
 exports (
     Hud, hud_new, hud_free, clear, rgba,
     rect, rect_outline, text, text_outlined, text_shadowed, measure,
     set_font, font_ready, atlas, atlas_serial, vertex_count, vertex_data, quad_count,
+    set_screen, screen_width, screen_height, scale, px, place, text_box,
+    push_clip, pop_clip, clip_depth,
+    image_load, image_width, image_height, image, image_page, image_serial, IMAGE_PAGE,
+    TOP_LEFT, TOP, TOP_RIGHT, LEFT, CENTRE, RIGHT, BOTTOM_LEFT, BOTTOM, BOTTOM_RIGHT,
+    ALIGN_LEFT, ALIGN_CENTRE, ALIGN_RIGHT,
     VERTEX_FLOATS, VERTEX_BYTES, DEFAULT_FONT, FONT_SPREAD
 )
 
 extern calloc(count: int, size: int) -> ptr
 extern realloc(p: ptr, size: long) -> ptr
 extern free(p: ptr)
+extern floor(x: float) -> float
 
 // A vertex: x y (pixels), u v (atlas), r g b a, the field's threshold.
 const VERTEX_FLOATS = 9
@@ -70,6 +90,40 @@ const FONT_SPREAD = 6.0
 // spread's edge all round the glyph's box, and the box itself would fill.
 const LOWEST_EDGE = 0.08
 const SOLID = 0.0 - 1.0
+// An image's quad, drawn from the image page rather than the atlas.
+const PICTURE = 0.0 - 2.0
+
+// Where a box is placed on the screen: its anchor and its own point at it.
+const TOP_LEFT = 0
+const TOP = 1
+const TOP_RIGHT = 2
+const LEFT = 3
+const CENTRE = 4
+const RIGHT = 5
+const BOTTOM_LEFT = 6
+const BOTTOM = 7
+const BOTTOM_RIGHT = 8
+
+// How a text box's lines sit in its width.
+const ALIGN_LEFT = 0
+const ALIGN_CENTRE = 1
+const ALIGN_RIGHT = 2
+
+// Panels within panels, this deep.
+const MAX_CLIPS = 16
+
+// The image page's side, texels: RGBA, 4 MB.
+const IMAGE_PAGE = 1024
+
+// An image on the page: where (inside its one-texel border), how big, and
+// the name it was loaded under.
+struct HudImage {
+    name: string
+    x: int
+    y: int
+    width: int
+    height: int
+}
 
 struct Hud {
     vertices: ptr                // float[capacity * VERTEX_FLOATS]
@@ -79,12 +133,33 @@ struct Hud {
     atlas: ptr                   // *GlyphAtlas, the font's; null until text is asked for
     font_tried: bool             // a font was looked for (and not found, while atlas is null)
     serial: int                  // counts the atlases, so a renderer knows to upload anew
+    // The screen it is drawn over, in pixels, and the UI's scale: what
+    // anchors and points are measured in. Set by the engine each frame.
+    width: float
+    height: float
+    ui_scale: float
+    // The clips pushed, x0 y0 x1 y1 each, every one already cut to the one
+    // under it: what is drawn is cut to the top one.
+    clips: ptr                   // float[MAX_CLIPS * 4]
+    clip_count: int
+    // The image page, top row first, null until an image is loaded; the
+    // shelf being filled; the images on it; and a count of its changes, so
+    // a renderer uploads it anew.
+    page: ptr
+    page_serial: int
+    shelf_x: int
+    shelf_y: int
+    shelf_h: int
+    images: ptr                  // list of *HudImage
 }
 
 hud_new() -> *Hud {
     o = heap.new(Hud)
     o.capacity = 6 * 256
     o.vertices = calloc(o.capacity * VERTEX_FLOATS, 4)
+    o.ui_scale = 1.0
+    o.clips = calloc(MAX_CLIPS * 4, 8)
+    o.images = list.new()
     return o
 }
 
@@ -92,6 +167,17 @@ hud_free(o: *Hud) {
     if o == null { return }
     if o.atlas != null { glyphs.atlas_free(o.atlas as *GlyphAtlas) }
     if o.vertices != null { free(o.vertices) }
+    if o.clips != null { free(o.clips) }
+    if o.page != null { free(o.page) }
+    if o.images != null {
+        i = 0
+        while i < list.size(o.images) {
+            // heap.free takes the image's name with it.
+            heap.free(list.get_raw(o.images, i) as *HudImage)
+            i = i + 1
+        }
+        list.free(o.images)
+    }
     heap.free(o)
 }
 
@@ -100,6 +186,7 @@ clear(o: *Hud) {
     if o == null { return }
     o.count = 0
     o.quads = 0
+    o.clip_count = 0
 }
 
 // A colour, 0..1 a channel, as the display shows it.
@@ -198,6 +285,29 @@ vertex(o: *Hud, x: float, y: float, u: float, v: float, c: Vec4, edge: float) {
 // One quad, corner to corner, as two triangles.
 quad(o: *Hud, x0: float, y0: float, x1: float, y1: float, u0: float, v0: float, u1: float, v1: float,
      c: Vec4, edge: float) {
+    if o.clip_count > 0 {
+        // Cut to the clip, the atlas place in proportion: the quads are
+        // upright and their atlas places too, so the cut is exact.
+        k = o.clips as float[]
+        at = (o.clip_count - 1) * 4
+        if x1 <= k[at] || x0 >= k[at + 2] || y1 <= k[at + 1] || y0 >= k[at + 3] { return }
+        if x0 < k[at] {
+            u0 = u0 + (u1 - u0) * (k[at] - x0) / (x1 - x0)
+            x0 = k[at]
+        }
+        if x1 > k[at + 2] {
+            u1 = u0 + (u1 - u0) * (k[at + 2] - x0) / (x1 - x0)
+            x1 = k[at + 2]
+        }
+        if y0 < k[at + 1] {
+            v0 = v0 + (v1 - v0) * (k[at + 1] - y0) / (y1 - y0)
+            y0 = k[at + 1]
+        }
+        if y1 > k[at + 3] {
+            v1 = v0 + (v1 - v0) * (k[at + 3] - y0) / (y1 - y0)
+            y1 = k[at + 3]
+        }
+    }
     if !reserve(o, 6) { return }
     vertex(o, x0, y0, u0, v0, c, edge)
     vertex(o, x1, y0, u1, v0, c, edge)
@@ -290,4 +400,275 @@ text_shadowed(o: *Hud, x: float, y: float, size_px: float, s: string, colour: Ve
 measure(o: *Hud, s: string, size_px: float) -> (float, float) {
     if o == null || !font_ready(o) { return 0.0, 0.0 }
     return glyphs.measure(o.atlas as *GlyphAtlas, s, size_px)
+}
+
+// --- the layout (#459) -----------------------------------------------------------------------
+
+// The screen the overlay is drawn over, in pixels, and the UI's scale:
+// the engine sets it each frame, before the updates lay anything out.
+set_screen(o: *Hud, width: int, height: int, ui_scale: float) {
+    if o == null { return }
+    o.width = width as float
+    o.height = height as float
+    o.ui_scale = ui_scale
+    if o.ui_scale <= 0.0 { o.ui_scale = 1.0 }
+}
+
+screen_width(o: *Hud) -> float {
+    if o == null { return 0.0 }
+    return o.width
+}
+
+screen_height(o: *Hud) -> float {
+    if o == null { return 0.0 }
+    return o.height
+}
+
+scale(o: *Hud) -> float {
+    if o == null { return 1.0 }
+    return o.ui_scale
+}
+
+// Points to pixels: a HUD laid out in points is the same size on any
+// display.
+px(o: *Hud, points: float) -> float { return points * scale(o) }
+
+// A box `w` by `h` points at an anchor, offset `dx`, `dy` points from it
+// (down and right are positive): its top-left, in whole pixels. The box's
+// own point at the anchor is the same one -- its bottom-right corner at
+// BOTTOM_RIGHT, its middle at CENTRE -- so a box offset (-20, -20) at
+// BOTTOM_RIGHT stands 20 points in from that corner whatever the window.
+place(o: *Hud, anchor: int, dx: float, dy: float, w: float, h: float) -> (float, float) {
+    if o == null { return 0.0, 0.0 }
+    a = anchor
+    if a < 0 || a > 8 { a = TOP_LEFT }
+    fx = ((a % 3) as float) * 0.5
+    fy = ((a / 3) as float) * 0.5
+    s = o.ui_scale
+    x = fx * o.width + dx * s - fx * w * s
+    y = fy * o.height + dy * s - fy * h * s
+    return floor(x + 0.5), floor(y + 0.5)
+}
+
+// The width of s[from, to) at size_px.
+span_width(o: *Hud, s: string, from: int, to: int, size_px: float) -> float {
+    if to <= from { return 0.0 }
+    piece = string.substring(s, from, to)
+    w, _h = glyphs.measure(o.atlas as *GlyphAtlas, piece, size_px)
+    string.free(piece)
+    return w
+}
+
+// One line of a text box, s[from, to), placed in the box's width.
+box_line(o: *Hud, s: string, from: int, to: int, x: float, y: float, width: float, size_px: float,
+         colour: Vec4, align: int) {
+    if to <= from { return }
+    piece = string.substring(s, from, to)
+    w, _h = glyphs.measure(o.atlas as *GlyphAtlas, piece, size_px)
+    at = x
+    if align == ALIGN_CENTRE { at = x + floor((width - w) * 0.5 + 0.5) }
+    if align == ALIGN_RIGHT { at = x + width - w }
+    glyph_run(o, at, y, size_px, piece, colour, 0.5)
+    string.free(piece)
+}
+
+// Text wrapped to `width` pixels at its spaces, a newline starting a line
+// of its own, each line aligned in the width (ALIGN_LEFT, _CENTRE,
+// _RIGHT); its top-left at x, y. A word wider than the width has a line
+// to itself. The height it took, in pixels.
+text_box(o: *Hud, x: float, y: float, width: float, size_px: float, s: string, colour: Vec4, align: int) -> float {
+    if o == null || size_px <= 0.0 || width <= 0.0 || !font_ready(o) { return 0.0 }
+    a = o.atlas as *GlyphAtlas
+    _one_w, one_h = glyphs.measure(a, "A", size_px)
+    _two_w, two_h = glyphs.measure(a, "A\nA", size_px)
+    advance = two_h - one_h
+    n = string.length(s)
+    lines = 0
+    start = 0
+    while start <= n {
+        stop = start
+        while stop < n && string.char_at(s, stop) != 10 { stop = stop + 1 }
+        pos = start
+        drew = false
+        while pos < stop {
+            while pos < stop && string.char_at(s, pos) == 32 { pos = pos + 1 }
+            if pos >= stop { break }
+            fit = 0 - 1
+            end = pos
+            going = true
+            while going {
+                word_end = end
+                while word_end < stop && string.char_at(s, word_end) != 32 { word_end = word_end + 1 }
+                if fit < 0 || span_width(o, s, pos, word_end, size_px) <= width {
+                    fit = word_end
+                    if word_end >= stop { going = false } else { end = word_end + 1 }
+                    if span_width(o, s, pos, fit, size_px) > width { going = false }
+                } else {
+                    going = false
+                }
+            }
+            box_line(o, s, pos, fit, x, y + advance * (lines as float), width, size_px, colour, align)
+            lines = lines + 1
+            drew = true
+            pos = fit
+        }
+        // An empty paragraph is a blank line.
+        if !drew { lines = lines + 1 }
+        start = stop + 1
+    }
+    if lines == 0 { return 0.0 }
+    return one_h + advance * ((lines - 1) as float)
+}
+
+// A panel's clip: what is drawn from now until it is popped is cut to this
+// rectangle (pixels) and to every clip pushed before it. False when there
+// are MAX_CLIPS already.
+push_clip(o: *Hud, x: float, y: float, w: float, h: float) -> bool {
+    if o == null || o.clip_count >= MAX_CLIPS { return false }
+    k = o.clips as float[]
+    at = o.clip_count * 4
+    x0 = x
+    y0 = y
+    x1 = x + w
+    y1 = y + h
+    if o.clip_count > 0 {
+        under = at - 4
+        if x0 < k[under] { x0 = k[under] }
+        if y0 < k[under + 1] { y0 = k[under + 1] }
+        if x1 > k[under + 2] { x1 = k[under + 2] }
+        if y1 > k[under + 3] { y1 = k[under + 3] }
+    }
+    if x1 < x0 { x1 = x0 }
+    if y1 < y0 { y1 = y0 }
+    k[at] = x0
+    k[at + 1] = y0
+    k[at + 2] = x1
+    k[at + 3] = y1
+    o.clip_count = o.clip_count + 1
+    return true
+}
+
+pop_clip(o: *Hud) {
+    if o == null || o.clip_count == 0 { return }
+    o.clip_count = o.clip_count - 1
+}
+
+clip_depth(o: *Hud) -> int {
+    if o == null { return 0 }
+    return o.clip_count
+}
+
+// --- images (#459) ---------------------------------------------------------------------------
+
+// An image file (PNG, JPEG, TGA, BMP; or a name picture.register_rgba
+// gave pixels) on the overlay's image page, once: its number, the same for
+// the same path every time after; -1 when it cannot be read or the page
+// has no room (an image is halved until it fits the page). Each is set on
+// the page with its edge texels repeated one texel round it, so a filtered
+// edge does not take its neighbour's colour.
+image_load(o: *Hud, path: string) -> int {
+    if o == null { return 0 - 1 }
+    i = 0
+    while i < list.size(o.images) {
+        known = list.get_raw(o.images, i) as *HudImage
+        if known.name == path { return i }
+        i = i + 1
+    }
+    pic = picture.load(path)
+    if pic == null {
+        println("ae3d: overlay: ${path}: ${picture.error()}")
+        return 0 - 1
+    }
+    picture.fit(pic, IMAGE_PAGE - 2)
+    w = picture.width(pic)
+    h = picture.height(pic)
+    if o.shelf_x + w + 2 > IMAGE_PAGE {
+        o.shelf_y = o.shelf_y + o.shelf_h
+        o.shelf_x = 0
+        o.shelf_h = 0
+    }
+    if o.shelf_y + h + 2 > IMAGE_PAGE {
+        println("ae3d: overlay: ${path}: the image page is full")
+        picture.dispose(pic)
+        return 0 - 1
+    }
+    if o.page == null { o.page = calloc(IMAGE_PAGE * IMAGE_PAGE, 4) }
+    x0 = o.shelf_x
+    y0 = o.shelf_y
+    src = picture.pixels(pic) as byte[]
+    dst = o.page as byte[]
+    // The page's rows from the top; the picture's from the bottom.
+    row = 0 - 1
+    while row <= h {
+        sy = row
+        if sy < 0 { sy = 0 }
+        if sy > h - 1 { sy = h - 1 }
+        from_row = (h - 1 - sy) * w
+        col = 0 - 1
+        while col <= w {
+            sx = col
+            if sx < 0 { sx = 0 }
+            if sx > w - 1 { sx = w - 1 }
+            from = (from_row + sx) * 4
+            to = ((y0 + 1 + row) * IMAGE_PAGE + x0 + 1 + col) * 4
+            dst[to] = src[from]
+            dst[to + 1] = src[from + 1]
+            dst[to + 2] = src[from + 2]
+            dst[to + 3] = src[from + 3]
+            col = col + 1
+        }
+        row = row + 1
+    }
+    picture.dispose(pic)
+    im = heap.new(HudImage)
+    im.name = string.copy(path)
+    im.x = x0 + 1
+    im.y = y0 + 1
+    im.width = w
+    im.height = h
+    list.add_raw(o.images, im as ptr)
+    o.shelf_x = x0 + w + 2
+    if h + 2 > o.shelf_h { o.shelf_h = h + 2 }
+    o.page_serial = o.page_serial + 1
+    return list.size(o.images) - 1
+}
+
+image_at(o: *Hud, id: int) -> *HudImage {
+    if o == null || id < 0 || id >= list.size(o.images) { return null }
+    return list.get_raw(o.images, id) as *HudImage
+}
+
+// An image's size on the page, in texels (after any halving to fit).
+image_width(o: *Hud, id: int) -> int {
+    im = image_at(o, id)
+    if im == null { return 0 }
+    return im.width
+}
+
+image_height(o: *Hud, id: int) -> int {
+    im = image_at(o, id)
+    if im == null { return 0 }
+    return im.height
+}
+
+// Image `id` drawn into a rectangle, its top-left at x, y, multiplied by
+// `tint` (white for the image as it is; alpha fades it).
+image(o: *Hud, id: int, x: float, y: float, w: float, h: float, tint: Vec4) {
+    im = image_at(o, id)
+    if im == null || w <= 0.0 || h <= 0.0 { return }
+    page = IMAGE_PAGE as float
+    quad(o, x, y, x + w, y + h, (im.x as float) / page, (im.y as float) / page,
+         ((im.x + im.width) as float) / page, ((im.y + im.height) as float) / page, tint, PICTURE)
+}
+
+// The image page for a renderer: RGBA, IMAGE_PAGE square, top row first;
+// null while no image is loaded. Uploaded again when image_serial changes.
+image_page(o: *Hud) -> ptr {
+    if o == null { return null }
+    return o.page
+}
+
+image_serial(o: *Hud) -> int {
+    if o == null { return 0 }
+    return o.page_serial
 }

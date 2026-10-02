@@ -250,3 +250,98 @@ Windows machine of [performance.md](performance.md):
 
 Under the Khronos validation layer with synchronisation validation,
 `examples/game_hud.ae` on Vulkan (windowed, captured) reports no error.
+
+### Laid out
+
+A HUD has to keep its place when the window changes size and its size
+when the display is denser (#459). The engine tells the overlay the
+screen it is drawn over at the start of every frame (`hud.set_screen`):
+its size in pixels and the UI's scale. The scale is the window's content
+scale (2 on a display of twice the density, set by the system), unless the
+program sets one (`engine_set_ui_scale`, or `AE3D_UI_SCALE`).
+
+- **Anchors.** `hud.place(o, anchor, dx, dy, w, h)` gives the top-left, in
+  whole pixels, of a box of `w` x `h` points at one of nine anchors, offset
+  in points. The box's own point sits at the anchor: its bottom-right
+  corner at `BOTTOM_RIGHT`, its middle at `CENTRE`. `hud.px(o, points)` is
+  a length in pixels.
+- **Text.** `hud.text_box(o, x, y, width, size_px, text, colour, align)`
+  wraps text at its spaces to a width, starts a new line at each newline,
+  sets each line left, centred or right (`ALIGN_LEFT`, `_CENTRE`,
+  `_RIGHT`) and returns the height it took. A word wider than the width
+  gets a line of its own.
+- **Clipped panels.** `hud.push_clip(o, x, y, w, h)` and `hud.pop_clip(o)`
+  bound what is drawn to a panel, nested panels to where they meet. Each
+  quad is cut to the clip as it is added, and the glyph or image area it
+  shows is cut in proportion. Quads are upright, so the cut is exact,
+  nothing is drawn past the panel, and the overlay is still one draw with
+  no scissor state.
+- **Images.** `hud.image_load(o, path)` puts a picture (PNG, JPEG, TGA,
+  BMP, or a name given pixels by `picture.register_rgba`) on the overlay's
+  1024 x 1024 RGBA image page, once per path, with its edge texels
+  repeated one texel around it so filtering does not bleed into its
+  neighbours. `hud.image(o, id, x, y, w, h, tint)` draws it. The page is the
+  overlay shader's second texture (binding 1 on Vulkan, unit 1 on OpenGL),
+  sent again only when an image is added; a quad picks it by its threshold.
+
+`tests/test_hud_layout.ae` runs on both renderers at 320 x 180 (scale 1)
+and 400 x 240 (scale 1.5):
+
+| What | Number |
+|---|---|
+| Nine anchored boxes | each white to every pixel where the anchor's definition puts it, nothing white one pixel past its edge |
+| A rectangle and a word through an 80 x 40 clip | 3,200 pixels red inside, none inked outside |
+| A clip inside a clip | 800 pixels drawn, the 20 x 40 where the two meet |
+| A sentence wrapped to 130 px | inked from 16 to 134 (the box ends at 146), five lines, within the height returned |
+| Right-aligned and centred words | ending at the width's end; centred to within 1 px |
+| A four-colour image at four times its size | each quarter its own colour (255 in its channel, 0 in the others) |
+| The same image at half alpha | 137, half over the frame exactly |
+| Vulkan against OpenGL | 0 channels of the four frames apart |
+| The engine over a renderer | its overlay's screen and scale are the engine's |
+
+## Menus
+
+`ae3d.menu` is what can be pointed at, clicked and typed into over the
+frame (#484): a pause menu, settings, a lobby. A menu holds widgets laid
+out like any overlay box (anchor, offset and size in points): buttons,
+toggles, sliders, text fields and labels, optionally on a panel. Menus are
+pushed onto the engine's stack (`engine_menus(e)`). The top menu takes the
+input and the ones below are drawn under a veil. The engine processes the
+stack after polling the input and before the updates, so a widget
+activated this frame reads as activated in every script that frame. It
+draws the stack over the HUD after the updates. The editor's engine does
+the same, so a menu written for the game works unchanged in its viewport.
+
+- **Pointing.** A click is a press and a release on the same widget: the
+  topmost under the cursor (the last added, in the top menu, inside its
+  panel). A press on a slider drags it.
+- **Keys and pads.** Tab and Shift+Tab, the up and down arrows and the
+  d-pad move the focus around the widgets in the order they were added,
+  wrapping. Left and right move a focused slider by its step and set a
+  toggle. Enter, Space and A activate. Escape and B pop a menu that may be
+  closed (`set_closable`).
+- **Text.** A focused field takes the typed text, ae3d.input's code points
+  from GLFW's character callback (or `inject_text`), stored as UTF-8.
+  Backspace removes a whole character, not a byte.
+- **The game's input.** While a menu is open, the game's input reads at
+  rest: no action down or pressed, no axis, no mouse movement, no wheel, no
+  typed text. The menu reads the devices underneath (`input.raw_*`). The
+  block holds for the whole frame in which the last menu closes, so the
+  Escape that closes the pause menu does not reopen it. The click that
+  pressed Resume fires no shot.
+
+`examples/game_hud.ae` opens a pause menu with Escape or Start.
+`tests/test_menu.ae` drives a menu with injected cursor, key, pad and text
+events at 320 x 180 (scale 1) and 640 x 360 (scale 2):
+
+| What | Number |
+|---|---|
+| A click where two buttons overlap | the front one's alone; each one's own its |
+| A click between widgets, or outside the panel | nothing |
+| A click 72% along a slider with step 0.1 | 0.7 |
+| Typed "Zoë 7", Backspace, "!é", Backspace | "Zoë 7", then "Zoë !" |
+| Tab x5, Shift+Tab, Down, pad Up, pad Down | focus 0 1 2 3 4 0 4 0 4 0 |
+| A menu over another | takes the click; the one under it is unchanged |
+| The game's reads through clicks, keys, text and movement with a menu open | none stirred |
+| Escape closing the last menu, still held | no "pause" edge for the game |
+| Drawn on both renderers | every widget where the hit test puts it, the focus ring round the focused one only; Vulkan within 360 channels of OpenGL |
