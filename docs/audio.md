@@ -75,8 +75,48 @@ exactly:
 | Music ducked under a voice to 0.35 | 0.35 while the voice plays, 1 after it |
 | 258 sources placed | 0.023 ms a frame at worst |
 
+## The world's sounds
+
+`ae3d.worldsound` (#566) gives the engine's own systems a voice:
+
+```aether
+ws = worldsound.attach(e)              // after physics.attach
+worldsound.follow_weather(ws, w)       // rain, wind, thunder
+worldsound.car(ws, vehicle)            // an engine pitched by the car's speed
+worldsound.hits(ws, true)              // physics contacts
+```
+
+The sounds are made in Aether, not read from files, so a program needs no
+assets for them and every run hears the same samples:
+- **Rain:** two seconds of lightly smoothed noise, looped.
+- **Wind:** four seconds of heavily smoothed noise swelling twice, looped.
+- **Thunder:** three seconds of low noise that cracks in and rolls off.
+- **Engine:** one exact cycle of a 50 Hz tone and five harmonics, looped.
+- **Hit:** an eighth of a second of noise dying away.
+
+Rain, wind and thunder play on AMBIENCE and are not spatial. Engines and
+hits play on EFFECTS, placed where they are.
+
+- **Rain and wind.** The rain's volume is the weather's intensity (in rain
+  and storms). The wind's is its speed over 25 m/s; a storm gusts at 1.8
+  times its wind.
+- **Thunder.** Each lightning flash now records how far off it struck, half
+  a kilometre to six (`weather_strike_distance`). Its thunder is heard that
+  distance over 343 m/s later, at a volume of 1000 / d, kept between 0.15
+  and 1.
+- **Engines.** The pitch is 0.8 + 0.05 times the speed, at most 2.4.
+- **Hits.** A frame keeps its strongest physics contacts, at most four
+  (`MAX_HITS`), and starts them at their points. Volume is the approach
+  speed over 8 m/s, and a harder strike is pitched lower.
+
+`tests/test_worldsound.ae` checks each of these headless:
+- rain at 0.5 is gain 0.5, and 0 cleared; wind at 10 m/s is 0.4;
+- the rain is in the rendered mix;
+- a strike 5,981 m off is heard after 17.45 s (17.44 s by the speed of
+  sound, within a frame);
+- the engine pitch is 1.31533 at 10.31 m/s, exactly 0.8 + 0.05 v;
+- twelve dropped crates are heard 29 times, never more than 4 in a frame.
+
 ## Not yet
 
-Sounds from the engine's own systems (rain, wind, thunder delayed by the
-strike's distance, the car's engine, physics contacts) are #566. The
-editor's inspector section is #567. OGG Vorbis is aether#2364.
+The editor's inspector section is #567. OGG Vorbis is aether#2364.
