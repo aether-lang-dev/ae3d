@@ -363,8 +363,9 @@ step "the scenes, drawn alike by both renderers"
 #   normal maps and the lamps' streaks are; 5, toward the moon, the sky, the
 #   clouds and the skyline. Views 1, 3 and 6 are the same surfaces from
 #   other places and stay in the full run on a GPU.
-# The tolerances are the same: measured on both, the renderers agree as
-# closely on the software rasterisers as on a GPU (tools/scene_parity.ae).
+# The tolerances are the device's: a GPU is held to 1, two and a half
+# times the worst it measured, and a software rasteriser to 2, its worst
+# and half again (tools/scene_parity.ae; #503).
 if [ -n "${CI:-}" ]; then
     parity_width=320
     parity_height=180
