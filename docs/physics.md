@@ -106,13 +106,31 @@ what it struck.
 names them (`Hips`, `Spine`, `Chest`, `Neck`, `ThighL`, `KneeL`,
 `ShoulderL`, `ElbowL`, ...; `ragdoll_dress_named` takes another rig's
 names). Dressing builds the ragdoll again as the rig's own figure
-(#529): the rig is faced the ragdoll's way from where each one's feet
-point and stood on its pelvis, then every body's joint is put at its rig
-bone's head and every bone turned to run along the rig's line --
-pelvis to spine, spine to chest, chest to neck, each thigh to its knee,
-each arm to its elbow, and the neck, calves and forearms to their own
-child (head, ankle, wrist) -- its capsule stretched to the length
-(aephysics.human's `human_fit_shape`). The rig's bind pose is then the
+(#529): the rig is put in its bind pose (`skin.skeleton_strike_bind`:
+every bone where its inverse bind matrix says the mesh was modelled, not
+wherever the file's nodes were saved -- a Blender export carries the
+scene's pose, a stride, a turned body; #539), faced the ragdoll's way
+from where each one's feet point and stood on its pelvis, then every
+body's joint is put at its rig bone's head and every bone turned to run
+along the rig's line -- pelvis to spine, spine to chest, chest to neck,
+each thigh to its knee, each arm to its elbow, the neck and forearms to
+their own child (head, wrist) and each calf to its ankle -- its capsule
+stretched to the length (aephysics.human's `human_fit_shape`). An ankle
+is the calf's child or, on an IK rig whose feet hang from its root (the
+Quaternius characters, Rigify's), the bone heading on the leg's line
+below the knee; a foot with no toe bone points along its own +y, the way
+a glTF bone runs. Where the skeleton carries its skinned mesh (a glTF's
+does: `skin.skeleton_add_mesh`), the feet are fitted to the flesh: a toe
+the rig has no bone for is the foot's farthest point forward, and both
+shins end, by one length, where the lower fitted foot's underside meets
+the mesh's sole -- an IK rig's ankle bone can sit at the sole, and a foot
+hung below it stood the Adventurer 6.4 cm off the ground. An IK foot is
+carried by its calf from then on, so it goes where the shin goes.
+Measured in the bind pose, the figure is then left as it stood: the rig
+back in the pose it had -- a clip's frame, or the pose the file saved --
+the bodies put on it and the root riding the pelvis as the two stand
+there, so dressing moves no bone and a figure dressed mid-clip starts in
+the clip's stance (#542). The rig's bind pose is then the
 ragdoll's rest pose: each joint's spring and limits sit where the
 reference's did about its rest, and the rotation a body carries to its
 bone is a twist with no bend, so a spine that curves -- an MPFB human's
@@ -272,7 +290,13 @@ is: every joint lands on its rig bone's head and every bone on the rig's
 line (each calf's shin, knee to ankle, not its foot), the bind pose is
 the rest, the figure faces its toes, and both stand five seconds
 `POWERED` and hold 90 N·s at the chest from behind, in front and the
-side. The
+side. `tests/test_ragdoll_ik_rig.ae` dresses `ik_man.glb`, a box figure
+rigged as Blender exports an IK rig and saved off its bind pose: striking
+the bind pose makes the palette the identity; dressed in it the figure
+faces its toes, the mesh's sole is the ragdoll's lowest point and the
+legs fit alike; dressed as saved it keeps that pose to the degree; the IK
+feet fall with the shins; and `POWERED` it stands a 40 N·s nudge without
+a step, holds 280 N·s from behind and 200 in front. The
 physics engine's own suites (`scripts/test.sh` in the submodule) hold each
 layer to the reference.
 
