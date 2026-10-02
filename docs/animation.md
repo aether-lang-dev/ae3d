@@ -81,3 +81,42 @@ pace with their gait slowed to match, instead of rotating π in one step.
   at most (the cap);
 - walked into an edge, it turns back by no more than the cap a frame and
   walks back into the street.
+
+## Feet on the world
+
+A clip is made on a flat floor. `ae3d.feet` (#577) puts a walking figure's
+feet on the ground under them, whatever shape it is, every frame in the
+engine's pose phase (after the clips, before the draw):
+
+```aether
+f = feet.attach(e, figure_root, hips, l_hip, l_knee, l_ankle, r_hip, r_knee, r_ankle)
+feet.ground_physics(f, physics.of(e))      // a ray down onto the static world
+feet.ground_height(f, height_fn, state)    // or a function of x and z
+```
+
+- **The target.** Each foot's target is its animated place raised or
+  lowered to the ground under it, by however far that ground is from the
+  root's floor. A swing over a kerb clears the kerb by what it cleared the
+  floor.
+- **The pelvis.** It comes down so the lower foot can reach its ground,
+  and never goes up. It eases at no more than `PELVIS_SPEED`
+  (0.6 m/s), so a kerb appearing under a foot never snaps the body down.
+- **The legs.** Each is solved onto its target with `ae3d.ik`'s two-bone
+  solver, its knee turned toward the way the figure faces.
+- **The foot.** A foot on the ground is turned to lie on it, by up to 30
+  degrees.
+- **Locking.** A foot the clip has set down (low and slow) is locked where
+  it was set, whatever the body does over it, until the clip lifts it. It
+  is then let go over 0.15 s. No hand-made contact labels are needed.
+
+`set_weight` eases it out while the figure is in the air or ragdolled.
+
+`tests/test_feet.ae` runs on the box man (Mixamo's names), with no window:
+- on flat ground nothing moves;
+- on a 15-degree slope across the stance, each foot stands within 1e-14 m
+  of its height over the slope, the pelvis comes down 2.7 cm for the lower
+  foot, and the knees bend forward, never past straight;
+- stood on a 20 cm kerb with one foot off, that foot reaches the road and
+  the pelvis comes down 20 cm, 1 cm a frame at most;
+- a planted foot moves 2 mm while the body walks 6 cm over it, and is let
+  go when the clip lifts it.

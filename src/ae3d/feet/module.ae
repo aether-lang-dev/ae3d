@@ -1,0 +1,307 @@
+// ae3d.feet -- feet on the world (#577): a walking figure's feet on the
+// ground under them, wherever that is, after its clip has posed it.
+//
+//   f = feet.attach(e, figure_root, hips, l_hip, l_knee, l_ankle, r_hip, r_knee, r_ankle)
+//   feet.ground_physics(f, physics.of(e))       // or feet.ground_height(f, fn, state)
+//
+// A clip is made on a flat floor: the figure's root stands on it, and a
+// foot's height above the root is how high the clip lifts it. On the world
+// the floor is wherever the ground is under each foot. Every frame, in the
+// pose phase (after the clips, before the draw):
+//
+//   - each foot's target is its animated place, raised or lowered to the
+//     ground under it by what lies between that ground and the root's floor,
+//     so a swing over a kerb clears the kerb by what it cleared the floor;
+//   - the pelvis is lowered so the lower foot can reach its ground -- never
+//     raised -- eased toward that at no more than PELVIS_SPEED, so a kerb
+//     appearing under a foot does not snap the body down;
+//   - each leg is solved onto its target with the two-bone solver
+//     (ae3d.ik), its knee turned toward the way the figure faces;
+//   - a foot on the ground is turned to lie on it: its up toward the
+//     ground's normal, by no more than FOOT_TILT, so a slope does not leave
+//     it standing on its heel or toes;
+//   - a foot the clip has set down is locked: it stays where it was set,
+//     whatever the body does over it, until the clip lifts it, and is let go
+//     over UNLOCK_SECONDS. Contact comes from the clip -- a foot low and
+//     slow is down -- so no hand-made labels are needed.
+//
+// It eases out to nothing while the figure is in the air or ragdolled
+// (`set_weight`), and back.
+import std.heap
+import std.list
+import ae3d.core
+import ae3d.engine
+import ae3d.ik
+import ae3d.physics
+
+exports (
+    Feet, Leg,
+    attach, feet_free, ground_physics, ground_height, set_weight, solve,
+    pelvis_offset, leg, leg_count, leg_locked, leg_target, leg_ground, leg_ankle,
+    PELVIS_SPEED, FOOT_TILT, UNLOCK_SECONDS
+)
+
+// How fast the pelvis moves to its height, metres a second.
+const PELVIS_SPEED = 0.6
+// The most a foot is turned to lie on the ground, radians (30 degrees).
+const FOOT_TILT = 0.5236
+// How long a foot takes to leave the place it was locked to.
+const UNLOCK_SECONDS = 0.15
+// A foot is down while it is within this share of its standing height above
+// the floor (above that the clip is lifting it)...
+const CONTACT_LIFT = 1.35
+// ...and moving slower than this over the ground, metres a second.
+const CONTACT_SPEED = 0.6
+// How far above a foot the ground is looked for, and how far below.
+const LOOK_UP = 1.0
+const LOOK_DOWN = 2.0
+
+struct Leg {
+    hip: ptr                         // *Model
+    knee: ptr
+    ankle: ptr
+    standing: float                  // the ankle's height above the floor in the bind pose
+    locked: bool
+    lock_at: Vec3                    // where it was set down
+    release: float                   // seconds of letting go left
+    released_from: Vec3              // where it was let go from
+    last: Vec3                       // the animated ankle last frame
+    known: bool
+    target: Vec3                     // this frame's
+    ground: Vec3                     // the ground under it, and its normal
+    normal: Vec3
+}
+
+struct Feet {
+    engine: ptr
+    root: ptr                        // *Model the figure stands on: its floor is this one's height
+    hips: ptr                        // *Model lowered for the lower foot
+    legs: ptr                        // list of *Leg
+    pelvis: float                    // the pelvis's offset now, metres (negative, down)
+    weight: float                    // 1 on, 0 off
+    wanted_weight: float
+    // The ground: a physics world's static bodies, or a function of a place.
+    physics: ptr
+    height_fn: fn(ptr, float, float) -> float
+    height_state: ptr
+    behaviour: ptr
+}
+
+// Feet for a figure: `root` the model it stands on (the figure's group, or
+// its rig's root), `hips` the bone the legs hang from, and each leg's hip,
+// knee and ankle, from the figure's skeleton as it stands now (its bind
+// pose: each ankle's standing height is read from it). Solved every frame
+// in the engine's pose phase; the ground is flat at the root's height until
+// it is given.
+attach(e: *Engine, root: *Model, hips: *Model, l_hip: *Model, l_knee: *Model, l_ankle: *Model,
+       r_hip: *Model, r_knee: *Model, r_ankle: *Model) -> *Feet {
+    f = heap.new(Feet)
+    f.engine = e as ptr
+    f.root = root as ptr
+    f.hips = hips as ptr
+    f.legs = list.new()
+    f.weight = 1.0
+    f.wanted_weight = 1.0
+    add_leg(f, l_hip, l_knee, l_ankle)
+    add_leg(f, r_hip, r_knee, r_ankle)
+    if e != null {
+        b = engine.behaviour_new("feet", f as ptr)
+        b.pose = on_pose
+        b.update = on_update
+        engine.engine_add_behaviour(e, b)
+        f.behaviour = b as ptr
+    }
+    return f
+}
+
+add_leg(f: *Feet, hip: *Model, knee: *Model, ankle: *Model) {
+    l = heap.new(Leg)
+    l.hip = hip as ptr
+    l.knee = knee as ptr
+    l.ankle = ankle as ptr
+    core.model_sync_transform(ankle)
+    core.model_sync_transform(f.root as *Model)
+    l.standing = ankle.world_position.y - (f.root as *Model).world_position.y
+    if l.standing < 0.01 { l.standing = 0.01 }
+    list.add_raw(f.legs, l as ptr)
+}
+
+feet_free(f: *Feet) {
+    if f == null { return }
+    e = f.engine as *Engine
+    if e != null && f.behaviour != null { engine.engine_remove_behaviour(e, f.behaviour as *Behaviour) }
+    i = 0
+    while i < list.size(f.legs) {
+        heap.free(list.get_raw(f.legs, i) as *Leg)
+        i = i + 1
+    }
+    list.free(f.legs)
+    heap.free(f)
+}
+
+// The ground: the static bodies of a physics world, by a ray down.
+ground_physics(f: *Feet, p: *Physics) {
+    f.physics = p as ptr
+    f.height_fn = null
+}
+
+// The ground: a function of a place's x and z giving its height (the normal
+// is worked out from it), with its own state.
+ground_height(f: *Feet, height: fn(ptr, float, float) -> float, state: ptr) {
+    f.height_fn = height
+    f.height_state = state
+    f.physics = null
+}
+
+// On (1), off (0), or between: it eases to what is asked over a quarter
+// of a second. Off while the figure is in the air or a ragdoll has it.
+set_weight(f: *Feet, w: float) {
+    f.wanted_weight = w
+}
+
+leg_count(f: *Feet) -> int { return list.size(f.legs) }
+leg(f: *Feet, i: int) -> *Leg { return list.get_raw(f.legs, i) as *Leg }
+leg_locked(f: *Feet, i: int) -> bool { return leg(f, i).locked }
+leg_target(f: *Feet, i: int) -> Vec3 { return leg(f, i).target }
+leg_ground(f: *Feet, i: int) -> Vec3 { return leg(f, i).ground }
+leg_ankle(f: *Feet, i: int) -> *Model { return leg(f, i).ankle as *Model }
+pelvis_offset(f: *Feet) -> float { return f.pelvis }
+
+// The ground under a place: its height and its normal.
+ground_at(f: *Feet, x: float, z: float, from_y: float) -> (float, Vec3) {
+    if f.height_fn != null {
+        h = f.height_fn
+        y = h(f.height_state, x, z)
+        e = 0.05
+        dx = h(f.height_state, x + e, z) - h(f.height_state, x - e, z)
+        dz = h(f.height_state, x, z + e) - h(f.height_state, x, z - e)
+        return y, core.v3_normalize(core.vec3(0.0 - dx, 2.0 * e, 0.0 - dz))
+    }
+    if f.physics != null {
+        hit = physics.ray_static_hit(f.physics as *Physics, core.vec3(x, from_y + LOOK_UP, z), core.vec3(0.0, 0.0 - 1.0, 0.0), LOOK_UP + LOOK_DOWN)
+        if hit.hit { return hit.point.y, hit.normal }
+    }
+    return (f.root as *Model).world_position.y, core.vec3(0.0, 1.0, 0.0)
+}
+
+on_update(state: ptr, e: *Engine, delta: float) {
+    f = state as *Feet
+    f.weight = ease(f.weight, f.wanted_weight, delta * 4.0)
+}
+
+ease(now: float, wanted: float, step: float) -> float {
+    if now < wanted {
+        moved = now + step
+        if moved > wanted { return wanted }
+        return moved
+    }
+    moved = now - step
+    if moved < wanted { return wanted }
+    return moved
+}
+
+on_pose(state: ptr, e: *Engine) {
+    f = state as *Feet
+    solve(f, engine.engine_delta_time(e))
+}
+
+// The frame's feet, `delta` seconds on from the last: called by the
+// engine's pose phase, or by whatever poses the figure without one.
+solve(f: *Feet, delta: float) {
+    if f.weight <= 0.0 {
+        f.pelvis = ease(f.pelvis, 0.0, PELVIS_SPEED * delta)
+        return
+    }
+    root = f.root as *Model
+    core.model_sync_transform(root)
+    floor = root.world_position.y
+    n = list.size(f.legs)
+    // Where each foot goes, and how far the pelvis has to come down for the
+    // lowest of them.
+    drop = 0.0
+    i = 0
+    while i < n {
+        l = list.get_raw(f.legs, i) as *Leg
+        ankle = l.ankle as *Model
+        core.model_sync_transform(ankle)
+        a = ankle.world_position
+        above = a.y - floor
+        gy, normal = ground_at(f, a.x, a.z, floor)
+        l.ground = core.vec3(a.x, gy, a.z)
+        l.normal = normal
+        target = core.vec3(a.x, gy + above, a.z)
+        // Down and slow: the clip has set this foot down.
+        speed = 0.0
+        if l.known && delta > 0.0 {
+            dx = a.x - l.last.x
+            dz = a.z - l.last.z
+            speed = core.sqrt_of(dx * dx + dz * dz) / delta
+        }
+        l.last = a
+        l.known = true
+        down = above < l.standing * CONTACT_LIFT && speed < CONTACT_SPEED
+        if down && !l.locked {
+            l.locked = true
+            l.lock_at = target
+            l.release = 0.0
+        } else if !down && l.locked {
+            l.locked = false
+            l.release = UNLOCK_SECONDS
+            l.released_from = l.lock_at
+        }
+        if l.locked {
+            target = core.vec3(l.lock_at.x, target.y, l.lock_at.z)
+        } else if l.release > 0.0 {
+            l.release = l.release - delta
+            if l.release < 0.0 { l.release = 0.0 }
+            t = l.release / UNLOCK_SECONDS
+            target = core.vec3(target.x + (l.released_from.x - target.x) * t, target.y, target.z + (l.released_from.z - target.z) * t)
+        }
+        l.target = target
+        need = target.y - a.y
+        if need < drop { drop = need }
+        i = i + 1
+    }
+    // The pelvis eased to its height, never raised above the clip's.
+    f.pelvis = ease(f.pelvis, drop, PELVIS_SPEED * delta)
+    if delta <= 0.0 { f.pelvis = drop }
+    hips = f.hips as *Model
+    lowered = f.pelvis * f.weight
+    if lowered != 0.0 {
+        core.model_sync_transform(hips)
+        parent = core.model_parent(hips)
+        world = core.v3_add(hips.world_position, core.vec3(0.0, lowered, 0.0))
+        if parent == null {
+            core.model_set_position(hips, world.x, world.y, world.z)
+        } else {
+            core.model_sync_transform(parent)
+            local = core.mat4_transform_point(core.mat4_inverse(parent.model_matrix), world)
+            core.model_set_position(hips, local.x, local.y, local.z)
+        }
+    }
+    // Each leg onto its target, its knee toward the way the figure faces.
+    forward = core.quat_apply(root.world_rotation, core.vec3(0.0, 0.0, 1.0))
+    i = 0
+    while i < n {
+        l = list.get_raw(f.legs, i) as *Leg
+        ankle = l.ankle as *Model
+        knee = l.knee as *Model
+        core.model_sync_transform(ankle)
+        a = ankle.world_position
+        goal = core.v3_add(a, core.v3_mul(core.v3_sub(l.target, a), f.weight))
+        core.model_sync_transform(knee)
+        pole = core.v3_add(knee.world_position, core.v3_mul(forward, 0.5))
+        ik.solve_two_bone(l.hip as *Model, knee, ankle, goal, pole)
+        // A foot on the ground lies on it.
+        if l.locked {
+            up = core.vec3(0.0, 1.0, 0.0)
+            tilt = core.acos_of(core.v3_dot(up, l.normal))
+            if tilt > 0.0001 {
+                axis = core.v3_normalize(core.v3_cross(up, l.normal))
+                if tilt > FOOT_TILT { tilt = FOOT_TILT }
+                ik.turn_world(ankle, core.quat_rotate(tilt * f.weight, axis))
+            }
+        }
+        i = i + 1
+    }
+}
