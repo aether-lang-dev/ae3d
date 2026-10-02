@@ -57,11 +57,28 @@ behaviours on the engine, added and removed like any other.
    inverse kinematics and whatever else puts a bone where the frame needs
    it rather than where the clip left it. Both run on a held frame too,
    so an agent looking at a pose looks at a solved one.
-5. **The draw.** The backend renders the scene (below), and over it,
+5. **Interpolation.** What the fixed steps moved is drawn between its last two
+   steps, by the frame's share of the next (`engine_step_fraction`), in
+   world space under its parent as the parent is now. Without this, a body
+   drawn at 144 frames a second where its last step left it stands still on
+   most frames and jumps twice on some (#563). It is put there only for the
+   draw and taken back after, as Godot's physics interpolation is. Every
+   script reads where the steps left things, so the simulation never reads
+   a drawn pose. A camera that follows a body asks
+   `core.model_interpolated_position(m, engine_step_fraction(e))` and moves
+   with it on the screen. A transform written in `update` is drawn where it
+   was put. A teleport in a step is drawn where it lands
+   (`core.model_reset_interpolation`). It is off on a fixed tick
+   (`AE3D_TICK`), where every frame is one step, with `AE3D_INTERPOLATE=0`,
+   or with `engine_set_interpolation(e, false)`. `tests/test_interpolation`
+   runs the issue's falling ball: without interpolation 57 of 98 frames drew
+   it where the frame before had, the worst moving 6.1 times what its time
+   asked; with it, none of 101 did, the worst at 1.005 times.
+6. **The draw.** The backend renders the scene (below), and over it,
    after the post chain, the engine's overlay: the text and rectangles
    the frame's scripts asked for (`ae3d.hud`, [ui.md](ui.md)), which
    are then cleared for the next frame.
-6. **`late_update`** after the draw, for anything that wants the picture:
+7. **`late_update`** after the draw, for anything that wants the picture:
    reading the frame back, recording, the agent channel's snapshot.
 
 A phase left null is not taken part in. `AE3D_FRAMES=n` stops the loop
