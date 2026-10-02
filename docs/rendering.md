@@ -438,6 +438,22 @@ the lamps beyond the rays' reach each drawing the horde into their faces
 (the shadow stage 9.6 ms, from 2.3), until each lamp's faces draw only the
 figures within its reach (#505). At 400 it stays at 144.
 
+Where the frame traces, the lamps' faces now leave a crowd out (#498).
+Within the shadow distance the shader takes the ray over the cube, and
+the rays hold the crowd; past it a crowd casts nothing, as it casts
+nothing past it from the moon. The faces keep everything else -- the
+buildings, the skinned figures, the point streams -- so a lamp past the
+shadow distance still throws the street's shadows. The perf line's
+`sorts`, `rays` and `maps` split the shadow stage and found it: the sorts
+0.03 ms, the structure's build 0.2, the maps 9 to 13 -- the horde drawn
+into every face of every lamp. At 20,000 figures and the default near
+band (a fixed 1/30 s tick, 400 frames, the best of three runs
+alternating with the tree before), the shadow stage falls from 9.6 to
+0.4 ms and the frame from 32.9 to 48.1 fps, and the frame drawn is the
+tree before's to within what that tree differs from itself run to run
+(mean 0.161 against 0.159 of 255). On the map path (`AE3D_RAYS=0`) the
+horde still goes into every face, which #505 is about.
+
 What is left for the rays to do next: reflections by ray (#323).
 
 ### DLSS

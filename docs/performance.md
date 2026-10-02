@@ -12,13 +12,16 @@ builds, the cost of starting and not of a frame):
 
 ```
 perf backend=vulkan frames=110 fps=86 gpu_shadow_ms=0.03 gpu_scene_ms=7.25 gpu_post_ms=0.01 cpu_ms=0.14 draws=6 width=1280 height=800
-perf stages camdepth=0.03 sky=6.68 opaque=0.20 occlusion=0.06 transparent=0.28
+perf stages camdepth=0.03 sky=6.68 opaque=0.20 occlusion=0.06 transparent=0.28 sorts=0.00 rays=0.00 maps=0.03
 ```
 
-On Vulkan the frame is split by eight timestamps -- the start, and the end
-of the shadow pass, the camera-depth prepass, the sky, the opaque draws,
-the occlusion, the transparent draws and the post chain -- so the second
-line says which stage a frame's cost is in. The same split is in the
+On Vulkan the frame is split by ten timestamps -- the start, the crowds'
+sorts done, the rays' structure built, the end of the shadow work, the
+camera-depth prepass, the sky, the opaque draws, the occlusion, the
+transparent draws and the post chain -- so the second line says which
+stage a frame's cost is in: the scene's five, and the shadow work's three
+(the sorts, the rays' structure with the skinned figures posed into it,
+and the maps: the cascades and the lamps' faces). The same split is in the
 editor's stats bar and in the agent channel's `frame.stats`. `update_ms`
 is the behaviours' own time -- the fixed updates, the updates, the clips
 advancing: the simulation -- which is where a frame goes once the device
