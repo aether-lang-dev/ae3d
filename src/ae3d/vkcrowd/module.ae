@@ -29,7 +29,7 @@ import ae3d.vkspirv
 import ae3d.jobs
 
 exports (
-    start, stop, frame_start, create, destroy, count, set_tier, fill, sort, set_poses, set_near_poses, draw, shadow_draw
+    start, stop, frame_start, create, destroy, count, seen_count, set_tier, set_reach, fill, sort, set_poses, set_near_poses, draw, shadow_draw
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -45,20 +45,24 @@ const TIERS = 3
 const PARTS = 16
 // The indirect commands, five words each: the sort's own three, whose
 // instance counts it writes (offsets the shader knows), three the shadow
-// pass once read, and then a lit and a shadow command per part of every
-// tier, their counts copied from the sort's after it ran.
-const SORT_DRAWS = 6
-const DRAWS = 102
+// pass once read, the near band's figures in view (SEEN, counted by the
+// sort too), and then a lit and a shadow command per part of every tier,
+// their counts copied from the sort's after it ran.
+const SORT_DRAWS = 7
+const SEEN = 6
+const DRAWS = 103
 const COMMAND_BYTES = 20
 // The sort's push constants: the count and whether there are three tiers,
 // the camera, the tiers' squared distances and the rays' reach, the tiers'
 // scales, the rays' first slot, the pose structures' frames and whether
-// the near band has structures of its own mesh.
-const PARAMS_BYTES = 92
+// the near band has structures of its own mesh; then the view's cone (the
+// camera's front and the half angle round it that holds the frustum) and
+// the eye with a figure's reach: the 128 bytes every device gives.
+const PARAMS_BYTES = 128
 // The sort's storage buffers: the state, the three tiers, the draws, the
 // rays' instances, the far mesh's pose structures, the rays' count and the
 // near mesh's pose structures.
-const BINDINGS = 9
+const BINDINGS = 10
 
 // A crowd on the device: its state buffers, one a frame in flight, mapped;
 // the three tier streams the sort writes and the draws read; the draw
@@ -73,6 +77,12 @@ struct DeviceCrowdState {
     state_mapped: ptr              // void*[FRAMES]
     tier: ptr                      // VkBuffer[TIERS]
     tier_memory: ptr               // VkDeviceMemory[TIERS]
+    // The near band's figures in the view's cone, a stream of their own:
+    // the lit draws of the near tier read it, and the shadow draws and the
+    // rays the whole band, so a figure behind the camera still casts.
+    seen: ptr                      // VkBuffer
+    seen_memory: ptr               // VkDeviceMemory
+    reach: float                   // metres from a figure's feet that hold all of it, walking
     draws: ptr
     draws_memory: ptr
     draws_mapped: ptr
@@ -280,6 +290,8 @@ free_crowd(c: *DeviceCrowdState) {
         if (c.tier_memory as ptr[])[i] != null { vk.vkFreeMemory(d, (c.tier_memory as ptr[])[i], null) }
         i = i + 1
     }
+    if c.seen != null { vk.vkDestroyBuffer(d, c.seen, null) }
+    if c.seen_memory != null { vk.vkFreeMemory(d, c.seen_memory, null) }
     if c.draws_mapped != null { vk.vkUnmapMemory(d, c.draws_memory) }
     if c.draws != null { vk.vkDestroyBuffer(d, c.draws, null) }
     if c.draws_memory != null { vk.vkFreeMemory(d, c.draws_memory, null) }
@@ -380,6 +392,13 @@ create(capacity: int) -> int {
         }
         t = t + 1
     }
+    seen = vkhost.device_buffer(capacity * 80, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_VERTEX_BUFFER_BIT)
+    c.seen = seen.buffer
+    c.seen_memory = seen.memory
+    if seen.buffer == null {
+        free_crowd(c)
+        return 0
+    }
     draws = vkhost.buffer_of(DRAWS * COMMAND_BYTES,
                              vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                              vk.BUFFER_USAGE_TRANSFER_DST_BIT | vk.BUFFER_USAGE_TRANSFER_SRC_BIT, host)
@@ -423,6 +442,7 @@ create(capacity: int) -> int {
                 info.buffer = c.draws
                 if b == 0 { info.buffer = (c.state as ptr[])[i] }
                 if b >= 1 && b <= 3 { info.buffer = (c.tier as ptr[])[b - 1] }
+                if b == 9 { info.buffer = c.seen }
                 info.offset = 0
                 info.range = vk.WHOLE_SIZE
                 w = (writes + b * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
@@ -462,6 +482,23 @@ count(handle: int, tier: int) -> int {
     c = crowd_at(handle - 1)
     if c.draws_mapped == null { return 0 }
     return (c.draws_mapped as uint32[])[tier * 5 + 1] as int
+}
+
+// How many of the near band the sort last found in the view's cone, read
+// as count() is.
+seen_count(handle: int) -> int {
+    if !valid(handle) { return 0 }
+    c = crowd_at(handle - 1)
+    if c.draws_mapped == null { return 0 }
+    return (c.draws_mapped as uint32[])[SEEN * 5 + 1] as int
+}
+
+// How far from a figure's feet all of it reaches, walking: the sphere the
+// sort holds against the view's cone. 0 keeps the whole near band in the
+// lit draw.
+set_reach(handle: int, metres: float) {
+    if !valid(handle) { return }
+    crowd_at(handle - 1).reach = metres
 }
 
 // After the renderer has shut down there is no device and the record is
@@ -599,7 +636,12 @@ count_copy(at: int, tier: int, into: int) {
 // indirect read that follow.
 // `casts`: whether the crowd casts at all -- a crowd none of whose models
 // casts a shadow writes no instance into the rays.
-sort(handle: int, cx: float, cz: float, near_dist: float, mid_dist: float, cull_dist: float, casts: bool) -> bool {
+// The eye (ex, ey, ez), the front (fx, fy, fz, a unit vector) and `cone`
+// (radians, 0 for none) are the view's: a near figure whose sphere lies
+// outside the cone round the front is left out of the near tier's lit
+// draw, and kept in its shadow draw and the rays.
+sort(handle: int, cx: float, cz: float, near_dist: float, mid_dist: float, cull_dist: float, casts: bool,
+     ex: float, ey: float, ez: float, fx: float, fy: float, fz: float, cone: float) -> bool {
     if !vkframe.recording() || vkframe.pass_open() || !valid(handle) { return false }
     c = crowd_at(handle - 1)
     if c.count <= 0 || g_pipeline == null { return false }
@@ -641,6 +683,7 @@ sort(handle: int, cx: float, cz: float, near_dist: float, mid_dist: float, cull_
         // of one part a tier reads as it always did.
         words[t * 5] = lit[t * PARTS]
         words[(TIERS + t) * 5] = shade[t * PARTS]
+        if t == 0 { words[SEEN * 5] = lit[0] }
         p = 0
         while p < parts[t] {
             words[part_draw(t, p, 0) * 5] = lit[t * PARTS + p]
@@ -669,6 +712,15 @@ sort(handle: int, cx: float, cz: float, near_dist: float, mid_dist: float, cull_
     reals[7] = 0.0
     reach = vkrays.reach_now()
     if reach > 0.0 { reals[7] = (reach * reach) as f32 }
+    reals[24] = fx as f32
+    reals[25] = fy as f32
+    reals[26] = fz as f32
+    reals[27] = 0.0
+    if c.reach > 0.0 && cone > 0.0 { reals[27] = cone as f32 }
+    reals[28] = ex as f32
+    reals[29] = ey as f32
+    reals[30] = ez as f32
+    reals[31] = c.reach as f32
     scale = c.scale as f32[]
     k = 0
     while k < TIERS * 4 {
@@ -742,9 +794,12 @@ sort(handle: int, cx: float, cz: float, near_dist: float, mid_dist: float, cull_
     while t < TIERS {
         count_copy(copies, t, TIERS + t)
         copies = copies + 1
+        // The near tier's lit draws take the figures in view.
+        lit_from = t
+        if t == 0 { lit_from = SEEN }
         p = 0
         while p < parts[t] {
-            count_copy(copies, t, part_draw(t, p, 0))
+            count_copy(copies, lit_from, part_draw(t, p, 0))
             count_copy(copies + 1, t, part_draw(t, p, 1))
             copies = copies + 2
             p = p + 1
@@ -762,6 +817,8 @@ sort(handle: int, cx: float, cz: float, near_dist: float, mid_dist: float, cull_
                        vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.PIPELINE_STAGE_VERTEX_INPUT_BIT)
         t = t + 1
     }
+    buffer_barrier(commands, c.seen, vk.ACCESS_SHADER_WRITE_BIT, vk.ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
+                   vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.PIPELINE_STAGE_VERTEX_INPUT_BIT)
     if ray_written {
         // The instances the sort wrote and the count it added to, for the
         // structure's build.
@@ -799,7 +856,9 @@ draw(mesh: int, texture: int, handle: int, tier: int, part: int) {
     if !valid(handle) || tier < 0 || tier >= TIERS || part < 0 || part >= PARTS { return }
     c = crowd_at(handle - 1)
     if !c.sorted { return }
-    vkframe.draw_indirect(mesh, texture, (c.tier as ptr[])[tier], c.draws,
+    stream = (c.tier as ptr[])[tier]
+    if tier == 0 { stream = c.seen }
+    vkframe.draw_indirect(mesh, texture, stream, c.draws,
                           (part_draw(tier, part, 0) * COMMAND_BYTES) as long, false)
 }
 

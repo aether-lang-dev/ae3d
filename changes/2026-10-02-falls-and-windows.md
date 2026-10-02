@@ -22,3 +22,13 @@
   did. The committed .blend was repaired in place, so the rooftop clutter
   stays where it is, and 219 export files no manifest named are gone.
   `ci.sh` now checks that every pane faces out.
+
+### A crowd's near band drawn only where the camera looks (#498)
+
+- The device sort is given the camera's view cone. A near figure outside it
+  is left out of the near tier's lit draw, and stays in its shadow draw and
+  the rays (a second near stream, a seventh count; `device_crowd_seen`).
+- In zombie_city at 20,000 figures, the opaque pass falls from 45.2 to
+  29.7 ms with a 28 m near band (15.7 to 20.6 fps), and from 26.3 to
+  18.5 ms at the default band (22.5 to 27.1 fps). What is drawn on screen
+  is unchanged.

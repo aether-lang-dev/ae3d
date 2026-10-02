@@ -211,6 +211,25 @@ the draws. `device_crowd_count` reads the counts of the last frame the
 device finished, for a diagnostic. OpenGL 4.1 has no compute and keeps the
 CPU sort (`crowd_tiers`); `device_crowd_new` returns null there.
 
+The near tier's lit draw takes only the figures that can be in the frame
+(#498). The renderer passes the sort its camera's eye, front and the half
+angle of the cone through the frustum's corners. A near figure whose
+sphere -- its near mesh's bounds measured from its feet, and a quarter
+more for a walk's swing -- lies outside that cone is not written into the
+second near stream the lit draws read. The near tier's shadow draws and
+the rays still take the whole band, so a figure behind the camera casts
+into the frame as it did. `device_crowd_seen` reads how many were in view.
+In zombie_city at 20,000 figures (a fixed 1/30 s tick, 600 frames, the
+best of five runs alternating with the tree before, 720p, RTX 4070 Ti):
+with a 28 m near band, 1,275 + 1,600 of 2,211 + 2,371 near figures are in
+view, and the opaque pass falls from 45.2 to 29.7 ms (15.7 to 20.6 fps);
+at the default band (12 m at that count), from 26.3 to 18.5 ms (22.5 to
+27.1 fps). The shadow pass, 18 ms either way, is then the frame's
+largest; the crowd casts there by its far mesh, 168 triangles a figure.
+The frame the cone draws differs from the tree before's by what the tree
+before differs from itself run to run (mean 0.11 and 0.09 of 255, both
+along the lit windows' edges).
+
 ### Motion vectors
 
 Beside its colour, every scene draw writes where its pixel's surface was
