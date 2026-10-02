@@ -21,7 +21,9 @@
   No clear-colour pixel shows through a window from views 0 to 2, where 832
   did. The committed .blend was repaired in place, so the rooftop clutter
   stays where it is, and 219 export files no manifest named are gone.
-  `ci.sh` now checks that every pane faces out.
+  `ci.sh` now checks that every pane faces out. The frames are 5,536
+  triangles of the street's frame (54,422 to 59,958, its budget recorded
+  again); its draws and binds are as they were.
 
 ### A crowd's near band drawn only where the camera looks (#498)
 
