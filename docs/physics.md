@@ -125,7 +125,12 @@ the rig has no bone for is the foot's farthest point forward, and both
 shins end, by one length, where the lower fitted foot's underside meets
 the mesh's sole -- an IK rig's ankle bone can sit at the sole, and a foot
 hung below it stood the Adventurer 6.4 cm off the ground. An IK foot is
-carried by its calf from then on, so it goes where the shin goes. The rig's bind pose is then the
+carried by its calf from then on, so it goes where the shin goes.
+Measured in the bind pose, the figure is then left as it stood: the rig
+back in the pose it had -- a clip's frame, or the pose the file saved --
+the bodies put on it and the root riding the pelvis as the two stand
+there, so dressing moves no bone and a figure dressed mid-clip starts in
+the clip's stance (#542). The rig's bind pose is then the
 ragdoll's rest pose: each joint's spring and limits sit where the
 reference's did about its rest, and the rotation a body carries to its
 bone is a twist with no bend, so a spine that curves -- an MPFB human's
@@ -287,10 +292,11 @@ the rest, the figure faces its toes, and both stand five seconds
 `POWERED` and hold 90 N·s at the chest from behind, in front and the
 side. `tests/test_ragdoll_ik_rig.ae` dresses `ik_man.glb`, a box figure
 rigged as Blender exports an IK rig and saved off its bind pose: striking
-the bind pose makes the palette the identity, the figure faces its toes,
-the mesh's sole is the ragdoll's lowest point, the legs fit alike, the IK
-feet fall with the shins, and `POWERED` it stands a 40 N·s nudge without
-a step, holds 200 N·s from behind and 160 in front. The
+the bind pose makes the palette the identity; dressed in it the figure
+faces its toes, the mesh's sole is the ragdoll's lowest point and the
+legs fit alike; dressed as saved it keeps that pose to the degree; the IK
+feet fall with the shins; and `POWERED` it stands a 40 N·s nudge without
+a step, holds 280 N·s from behind and 200 in front. The
 physics engine's own suites (`scripts/test.sh` in the submodule) hold each
 layer to the reference.
 

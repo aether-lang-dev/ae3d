@@ -23,12 +23,18 @@
   which leaned the standing figure 22 to 29 degrees.
 - An IK foot is carried by its calf body after dressing, so it falls with
   the shin instead of staying under the root.
+- Measured in the bind pose, the figure is left as it stood (#542): the rig
+  back in the pose it had, the bodies put on it, and the root riding the
+  pelvis as the two stand there (a Body a clip turns 27 degrees between
+  them). Dressing moves no bone. Left in the T-pose, a figure dressed while
+  its Idle played had its bodies in one stance and its clip in another,
+  and walked 33 cm off in a second.
 - `core.quat_from_axes` (from the glTF loader) builds a rotation from its
   three axes.
-- The Adventurer, POWERED, pushed at the chest: from behind every push to
-  230 N·s holds with at most three steps (falls at 240), where 120 N·s fell
-  before; 40 N·s takes no step; in front it holds to 150. Standing it leans
-  6.6 degrees, against the synthetic rig's 1.1.
+- The Adventurer, POWERED, pushed at the chest, its Idle playing: it
+  stands at 1.1 degrees, takes 60 N·s from behind with no step (it took
+  six at 40 before), and holds every push to 260 N·s from behind (falls
+  at 300; 120 fell before) and 180 in front.
 - `tests/test_ragdoll_ik_rig.ae` holds it on `ik_man.glb`, a box figure
   rigged that way (written by `tools/make_gltf_fixture.ae`).
   `test_handover` and `test_net_handover` stand their hordes on the ground
