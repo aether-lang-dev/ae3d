@@ -53,13 +53,23 @@ A `POWERED` figure that leans more than 0.35 rad (20°) from its pose is falling
 - its arms reach toward where it is falling, 0.7 down to 1 along the fall and a little out to each side so the hands land apart, and straight, since a straight arm takes the landing through its joints where a bent one folds on its elbow's muscle;
 - its head tucks 0.5 rad away from the fall, as far as the neck goes.
 
-If it catches itself (leans less than half the threshold again), the reach and the tuck let go and the balance comes back. If it lands, meaning it leans past 1.2 rad (69°) and holds still for ten steps, it lets go and lies (`lying(body)`): the reach and the tuck release and the muscles keep 15% of their budget, so it lies instead of holding a pose on the ground.
+If it catches itself (leans less than half the threshold again), the reach and the tuck let go and the balance comes back. It has landed when it leans past 1.2 rad (69°) with its pelvis down, within 35 cm of its lowest point, for ten steps: the reach stops, and every joint holds the shape it landed in, the head still tucked, on 30% of its budget (`physics.ragdoll_hold_shape`). Once its pelvis and chest have been slower than 0.3 m/s for ten steps more, it lies (`lying(body)`).
+
+Each of those was measured over thirty falls each way. With the arms still reaching once the figure was down, they pushed it back off the ground, and it fell a second time. Held at full strength, the landed shape rocked, and the head met the ground again in most falls backwards and in every fall sideways. Below a fifth of its budget the shape sagged and crept, and from half upward the joints chattered against the ground, so few figures came to rest; 30% settled the most. Holding the shape takes its own drive. An aim holds a bone's rotation in the world, and every bone aimed where it lay wrenched the legs back toward those rotations as the body rolled.
 
 **In the street.** `street_drive`'s bystanders are active ragdolls. The ones that stand hold themselves up on their muscles, and the walkers walk by their animation until struck. The car's blow is about 60 N·s per m/s it was closing at, along its heading. Past 4 m/s it lands on the pelvis, which takes the balance with it, and the figure goes down reaching for the road. Below that it lands on the spine, and the figure is knocked back and recovers. On the autopilot's run the three bystanders in the road are struck at 7 to 10 m/s and all three go down. Before this they went limp the moment they were touched.
 
 The reach and tuck are **aims** (`physics.ragdoll_aim(ragdoll, bone, rotation)`): a bone's joint drives it to a rotation in the world, from wherever its parent is, instead of to the animation's pose. The bones below it keep the animation's pose relative to it. Any controller can aim a bone this way, for example to turn a head toward a threat. `ragdoll_clear_aim` and `ragdoll_clear_aims` hand the bones back to the animation.
 
-The settings were chosen by measurement. Each setting was tried on falls backward, forward and sideways, against a twin that does not protect itself, measuring the head's speed as it met the ground. The one chosen did better in all three directions, and so did its neighbours. Softening the knees in a fall, the obvious idea, made every direction worse.
+The reach, the tuck and the lean that starts them were chosen by one fall each way while two faults hid in them. The way of the fall was read from the pelvis body's +y, which points down because aephysics's pelvis rests a half turn about x, so the arms reached away from the fall and the head tucked into it. And one arm axis served both arms, though the left arm's capsules lie along +x and the right's along −x, so the left arm reached up. With both fixed, `tests/test_falls.ae` holds the protective fall over thirty falls each way, with blows from 376 to 424 N·s, a protected figure beside an unprotected twin each time:
+
+| way | protected head slower | head, protected / twin (average) | a second head impact | still within 3 s of landing |
+|---|---|---|---|---|
+| over backwards | 23 of 30 | 2.28 / 3.11 m/s | 5 | 20 |
+| forwards | 30 of 30 | 1.47 / 3.77 m/s | 1 | 15 |
+| sideways | 21 of 30 | 3.53 / 4.02 m/s | 0 | 30 |
+
+Before, on the same ensemble (the reference's figure, both faults), the protected head was the slower in 14, 23 and 21 falls, and over backwards it met the ground faster than its twin's on average (2.99 against 2.77 m/s). Forwards, its head met the ground a second time in 16 falls. #479 is the rest of the way: 29 in every direction, no second impact, and every figure still.
 
 ## Stepping to catch itself
 
@@ -87,18 +97,21 @@ Which foot moves:
   from the arms: the head met the ground at 5.3 m/s instead of 1.8.
 
 `tests/test_balance.ae` pushes figures at the chest, each push with and
-without stepping:
+without stepping, and sweeps the pushes from behind from 240 to 315 N·s
+for where standing still gives out:
 
 | push | without stepping | stepping |
 |---|---|---|
 | 60 N·s from behind | stands | stands, no step |
-| 270 N·s from behind | falls | stands, 4 steps |
+| 270 N·s from behind | stands | stands, 3 steps |
+| 285 N·s from behind | falls | stands, 3 steps |
+| 315 N·s from behind | falls | stands, 4 steps |
 | 180 N·s from the side | stands | stands, 1 step |
-| 150 N·s from in front | stands | stands, no step |
+| 150 N·s from in front | stands | stands, 1 step |
 
-A sweep from 60 to 270 N·s found how far each way holds:
-- **Forward:** 240 N·s without stepping, 270 or more with it.
-- **Sideways:** 210 N·s either way; stepping moves the feet rather than
+A sweep from 60 to 330 N·s found how far each way holds:
+- **Forward:** 270 N·s without stepping, 315 with it.
+- **Sideways:** 195 N·s either way; stepping moves the feet rather than
   holding the pose.
 - **Backward:** 150 N·s either way.
 
@@ -134,7 +147,7 @@ read in. A figure getting up is written as the mode it gets up to.
 naming, each turned a quarter turn by its object, and a two-bone rig:
 
 - both humanoids are known, and the two bones are not;
-- dressed, each faces within 3.7° of its object's turn;
+- dressed, each faces within 1.5° of its object's turn;
 - `POWERED`, both stand on their muscles for two seconds, the pelvis at
   1.0 m and leaning at most 1°;
 - the scene file brings back each one's mode, strength, protection and
@@ -256,17 +269,17 @@ A networked horde hands over too, on every peer (`ae3d.nethandover`, #466; [netw
 
 | Figure | Measured |
 |---|---|
-| the tracker, its rig bowing the chest 15° forward and back | the chest within 1.6° of its pose; the figure never leans more than 0.7° |
-| the shoved, 60 N·s to the chest | knocked 28.7° off its pose, back within 0.1° and upright three seconds later |
+| the tracker, its rig bowing the chest 15° forward and back | the chest within 1.6° of its pose; the figure never leans more than 1.2° |
+| the shoved, 60 N·s to the chest | knocked 23.6° off its pose, back within 0.1° and upright three seconds later |
 | the felled, 400 N·s to the chest | down |
 | the struck, 8 N·s to the right upper arm | its muscle at 5% (the forearm's at half), then back to full |
 | the limp | down |
-| three protected fallers, felled by 400 N·s from the front, from behind and from the side | the hands reach the ground first each time (6, 4 and 15 steps before the head); the head meets it at 1.82, 1.73 and 1.22 m/s |
-| their unprotected twins | the head meets it at 4.53, 3.68 and 2.01 m/s |
+| three protected fallers, felled by 400 N·s from the front, from behind and from the side | the hands reach the ground first each time (41, 9 and 20 steps before the head); the head meets it at 1.33, 3.47 and 2.75 m/s |
+| their unprotected twins | the head meets it at 2.60, 1.82 and 4.23 m/s |
 | the protected fallers, landed | each lets go and lies |
-| the felled, as drawn | its drawn hips at 0.19 m, with its pelvis body (a standing figure's are above 0.8 m) |
+| the felled, as drawn | its drawn hips at 0.18 m, with its pelvis body (a standing figure's are above 0.8 m) |
 
-The shoved never takes itself for falling. Hands and head are measured by their capsules' lowest points (the forearm's hand end, and the neck bone's capsule, which is the head).
+The shoved never takes itself for falling. Hands and head are measured by their capsules' lowest points (the forearm's, which reaches the hand, and the neck bone's, which is the head). One fall a way is one fall's chance: how the protected head compares with its twin's is `tests/test_falls.ae`'s, over thirty falls each way (above).
 
 Pose error is measured per joint (a bone against its parent), which is what a muscle answers for. The lean is the pelvis's up against the animation's. A figure turned about the vertical is still on its pose.
 
