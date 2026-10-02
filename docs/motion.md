@@ -77,13 +77,17 @@ Before, on the same ensemble (the reference's figure, all three faults), the pro
 Pushed, a `POWERED` figure steps to catch itself (`set_stepping`, on by
 default; `steps_taken` counts them). Every fixed step it watches its
 capture point: the centre of mass carried on by its velocity times
-√(height / g), where it would come to rest over a foot. When that point
-leaves the ground the two feet cover (heel to toe) by more than 8 cm, and
-the figure is moving over the ground at 0.25 m/s or more, a foot swings to
-put itself under it. The thigh reaches toward the spot with the knee let
-bend for 0.12 s, so the foot clears the ground, then the leg straightens
-onto it; the whole step takes 0.3 s. It lands 5 cm past the capture point,
-and at most half a metre from under the hip.
+√(height / g), where it would come to rest over a foot. A foot swings to
+put itself under that point when two things hold:
+- the point leaves the ground the two feet cover (heel under the ankle,
+  toe 0.2 m ahead) by more than 24 cm, which is as far as the balance the
+  pelvis keeps brings back without a step;
+- the figure is moving over the ground at 0.25 m/s or more.
+
+The thigh reaches toward the spot, within the hip's cone, with the knee
+bent 0.5 rad for the first 0.12 s so the foot clears the ground. Then the
+leg straightens onto it. The whole step takes 0.3 s, and lands 5 cm past
+the capture point, at most half a metre from under the hip.
 
 Which foot moves:
 - **Pushed forward:** the foot further behind swings through.
@@ -93,9 +97,10 @@ Which foot moves:
   extend (their cone sits forward of the leg), so a step back was too short
   to catch anything and took a foot from under a figure its balance would
   have held.
-- **A push past a stride and a half:** that's a fall, and the protective
-  fall has it. A leg swinging as the figure goes over only took the fall
-  from the arms: the head met the ground at 5.3 m/s instead of 1.8.
+- **A push past two strides:** that's a fall, and the protective fall has
+  it. At a stride and a half, the first step waited for the capture point
+  to come back within reach (0.28 s after a 330 N·s shove), and the figure
+  fell two steps later.
 
 `tests/test_balance.ae` pushes figures at the chest, each push with and
 without stepping, and sweeps the pushes from behind from 240 to 315 N·s
@@ -104,17 +109,107 @@ for where standing still gives out:
 | push | without stepping | stepping |
 |---|---|---|
 | 60 N·s from behind | stands | stands, no step |
-| 270 N·s from behind | stands | stands, 3 steps |
-| 285 N·s from behind | falls | stands, 3 steps |
-| 315 N·s from behind | falls | stands, 4 steps |
+| 270 N·s from behind | stands | stands, 2 steps |
+| 285 N·s from behind | falls | stands, 2 steps |
+| 315 N·s from behind | falls | stands, 3 steps |
 | 180 N·s from the side | stands | stands, 1 step |
-| 150 N·s from in front | stands | stands, 1 step |
+| 150 N·s from in front | stands | stands, no step |
 
-A sweep from 60 to 330 N·s found how far each way holds:
-- **Forward:** 270 N·s without stepping, 315 with it.
+How far each way holds:
+- **Forward:** 270 N·s without stepping, 360 staggering
+  (`tests/test_stagger.ae`).
 - **Sideways:** 195 N·s either way; stepping moves the feet rather than
-  holding the pose.
+  holding the pose. Catch steps that cross or close the feet are #481.
 - **Backward:** 150 N·s either way.
+
+## Staggering
+
+A shove one step does not catch, the figure staggers from
+(`staggering(body)`). Once a step has been taken and the capture point is
+still off the feet, the steps come in a run:
+- each goes to where the capture point is by then;
+- each is quicker than the first: 0.22 s long, 0.03 s apart;
+- the run goes on while the capture point is within three strides, and
+  ends the moment it is not.
+
+While it staggers, the protective fall waits until the figure leans past
+0.5 rad (29°) rather than 0.35. A figure still catching itself is not yet
+falling. It ends standing, or falls into the protective fall. Waiting to
+46°, as first tried, brought the arms too late in shoves from behind that
+the steps could not catch: over `tests/test_falls.ae`'s thirty falls
+forwards, the protected head was the slower in 28, against 29 now.
+
+`tests/test_stagger.ae` shoves figures from behind, each with and without
+stepping, and runs the whole twice:
+
+| shove | without stepping | stepping |
+|---|---|---|
+| 330 N·s | falls | staggers 4 steps (0.02, 0.35, 0.62 and 0.88 s after the shove) and stands |
+| 390 N·s | falls | staggers 3 steps (0.02, 0.52 and 0.78 s), then falls into the protective fall |
+
+It holds:
+- two or more steps for the 330 N·s shove, none more than 0.4 s after
+  the last;
+- the stagger over once it stands;
+- on the second run, the same steps at the same fixed steps, and the same
+  end to the bit.
+
+Swept from 120 to 450 N·s, stepping stands to 360 and falls from 390.
+
+## Writhing
+
+Down and hurt, a `POWERED` figure writhes (`set_writhing(body, seconds)`,
+off by default; `writhing(body)` says it is). It writhes for the seconds
+it is given after it lands, then lies still and settles, so `set_get_up`
+counts from then. A `LIMP` figure is past it.
+
+- **The legs** draw up together and let down, once every 1.7 s: the hips
+  bend forward 0.6 rad and the knees 0.2 at the top. The knees bent less
+  than the hips lift the feet off the ground; a foot dragged along it
+  pushed the figure across the ground.
+- **The arms** fold over its front, toward where it was last struck: the
+  shoulders forward 0.7 rad and in 0.3, the elbows 0.6, rocking 0.12 rad
+  every 1.1 s. The reference ragdoll's shoulders and elbows turn too little
+  for a hand to reach its own chest, so the fold is as far as they go.
+- **It fades:** full for the first half of its time, then less and less.
+- **Caught on its hands and knees**, as a figure not hurt is, it does not
+  stay there. It lets go, down to 15% of its muscle and no balance, and
+  goes down to writhe where it comes to lie.
+- **Face down**, it turns over onto its back first, and again whenever it
+  rolls onto its front. The arm on the side that is higher already pushes
+  the ground away, with its full muscle. The leg on that side draws up and
+  across toward the low side (the hip 0.5 rad up and 0.3 across, the knee
+  0.8). The trunk twists the way it rolls, 0.25 rad at each joint of the
+  spine. The other arm and leg let go, so the body rolls over them. Without
+  the twist and the crossing leg, it pushed for three seconds and never
+  rolled. Once it is on its back the legs' cycle starts again, so they
+  draw up as it comes to lie there.
+- **A limb a blow left weak**, or the struck arm, doesn't take part: shot in
+  the arm, it clutches with the other, and it turns over on the other side.
+
+The limbs that writhe have 45% of their muscle, and those turning it over
+all of it. The rest keep 15%: a limb not aimed drives toward the standing
+pose and, strong, would push the body over. Every bend is from the limb's
+rest place under its parent, within its joint's cone. The shape it landed
+in is let go while it writhes, since held it holds every joint whatever an
+aim asks. Done, it holds the shape it ends in.
+
+`tests/test_writhe.ae` knocks three figures down with 450 N·s from behind:
+one writhes for three seconds, a twin lies still, and a third is struck
+on the right forearm once down. The writhing two go down from their hands
+and knees onto their faces and turn over:
+
+| | Measured |
+|---|---|
+| the left hip's swing, 0.5 to 2.5 s after landing | 0.51 rad writhing, 0 still |
+| the left upper arm toward the chest's front (cosine) | 0.60 writhing, 0.60 struck on the right forearm, 0.01 at rest |
+| the pelvis's drift from 1.5 s down to the end of writhing | 0.08 m |
+| it stops | 3 s after landing, down 0.15 s later |
+| the struck arm | never aimed |
+| the same run twice | the same to the bit |
+
+Writhing in every way a figure lands, face up and on either side, from
+shoves in eight directions, is #480.
 
 ## On a figure
 
@@ -288,7 +383,7 @@ Pose error is measured per joint (a bone against its parent), which is what a mu
 
 As #414 lays out:
 - balance by feedback on the hips and the stance foot, stepping when the centre of mass leaves the feet;
-- stagger and writhe;
+- writhing in every way a figure lands (#480), and sideways staggers (#481);
 - get-up clips from the pipeline in place of the keyed ways up, once a figure has them;
 - the inspector's section, with a Hit button in the viewport;
 - drawing a powered figure's bodies each frame rather than each step, for an animation that plays on while its muscles track it.
