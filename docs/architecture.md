@@ -150,7 +150,10 @@ window, input and timing layer, which calls GLFW itself, and the image
 decoders (`ae3d.picture`, `ae3d.jpeg`, `ae3d.inflate`: every image in the
 repository and 87 fixtures the same bytes stb_image gave; a 2048 x 2048
 PNG in 62 ms against 63, a 2048 x 2048 JPEG in 34 ms against stb's SSE2
-path's 20, as fast as its scalar one's 37).
+path's 20, as fast as its scalar one's 37), and the compressor
+(`ae3d.deflate`, with `ae3d.checksum`: the PNGs and the scene's mesh
+files, zlib and gzip framed, within 0.3% of the size zlib makes and read
+by zlib's own inflate).
 
 There is no C API left to declare: the Aether modules bind the few entry
 points in `native/` by `extern` directly. Every C file compiles under
@@ -160,14 +163,15 @@ one alone to prove it.
 ## Dependencies
 
 - [Aether](https://github.com/aether-lang-dev/aether), the language and
-  its standard library (`std.list`, `std.heap`, `std.tcp`, `std.zlib`,
-  `std.dl`, `std.worker`, ...).
+  its standard library (`std.list`, `std.heap`, `std.tcp`, `std.dl`,
+  `std.worker`, ...).
 - [aephysics](https://github.com/aether-lang-dev/aephysics), the physics
   engine, as the submodule `deps/aephysics`; its scheduler is the engine's
   pool.
-- GLFW for the window, the Vulkan loader at run time, zlib through
-  `std.zlib` (for writing PNGs; reading them is `ae3d.inflate`);
-  Streamline when DLSS is built in. The editor adds [aether-ui](https://github.com/aether-lang-dev/aether-ui).
+- GLFW for the window, the Vulkan loader at run time; Streamline when
+  DLSS is built in. Compression is the engine's own (`ae3d.deflate`,
+  `ae3d.inflate`); `std.zlib` is only what `tests/test_deflate.ae` holds
+  them to. The editor adds [aether-ui](https://github.com/aether-lang-dev/aether-ui).
 
 ## Where a design decision lives
 
