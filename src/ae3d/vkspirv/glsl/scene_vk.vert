@@ -122,6 +122,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 woundData[96];
     vec4 woundLayers[4];
     float woundCore;
+    int damageOn;
+    vec4 damageColours[4];
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -191,6 +193,7 @@ layout(location = 7) in vec3 instanceColor; // Per-instance color (for voxels)
 layout(location = 8) in vec4 inJoints;   // The four bones this vertex hangs off
 layout(location = 9) in vec4 inWeights;  // How much of each, summing to one
 layout(location = 10) in float inOcclusion; // How much of the sky it can see
+layout(location = 12) in vec2 inMaskUV;  // the second UV set (#544), (-1, -1) for none
 
 
 
@@ -231,6 +234,7 @@ layout(location = 5) out float Occlusion;
 layout(location = 6) out vec4 ClipNow;
 layout(location = 7) out vec4 ClipPrev;
 layout(location = 8) out vec3 BindPos;
+layout(location = 10) out vec2 MaskUV;
 layout(location = 9) out float ClipLimb;
 
 // The joints a cut is kept to (#556), as three words of 32 bits: joint j is
@@ -257,6 +261,7 @@ float clipLimbOf(vec4 joints, vec4 weights) {
 void main() {
     BindPos = inPosition;
     ClipLimb = clipLimbOf(inJoints, inWeights);
+    MaskUV = inMaskUV.x < -0.5 ? inTexCoord : inMaskUV;
     Occlusion = inOcclusion;
     // Decide whether to use instanced or regular model matrix
     // For instanced rendering, we multiply the global model matrix by the instance matrix

@@ -629,6 +629,58 @@ old one. `tests/test_skinned_render` holds it on both renderers: blood where
 the splat is, nothing holed, none at opacity 0, and still there with the
 column bent.
 
+### Damage masks
+
+A damage mask (#544) keeps a model's hits in its UV space, past the 32
+wounds and splats it draws as ellipsoids: soaked blood, bruising, burning
+and a spare channel. These are the four channels of a texture laid over the
+model's second UV set, or its first when it has none.
+
+- **Enabling.** `core.model_enable_damage(m, size)` bakes a position map:
+  every triangle is rasterised into the mask's grid in UV space, each
+  texel keeping the bind-space point its centre lies on, then grown two
+  texels so a filtered read at a seam finds damage on both sides.
+- **A hit.** `core.model_damage_splat(m, centre, radius, channel, amount)`
+  is a pass over that map on the CPU. Each texel whose surface lies within
+  the radius of a bind-space point gains damage: full to two thirds of the
+  radius, thinning past it, with an edge ragged by value noise. Because it
+  is written in bind space, it stays on the skin however the figure moves.
+  `model_damage_fade` scales a channel (a bruise by the day), and
+  `model_clear_damage` empties the mask.
+- **Drawing.** The scene shader draws each channel's colour over the
+  surface by its value and the channel's strength
+  (`model_set_damage_colour`).
+- **The second UV set.** `mesh_set_uv1`, read from glTF's TEXCOORD_1, is
+  carried in the skin stream, which is now three vec4s a vertex: joints,
+  weights, then the UV set and two spare floats (the alignment the compute
+  skinning reads). A vertex without one reads (-1, -1), from the stride-zero
+  empty element on Vulkan and the generic attribute on OpenGL, and the
+  shader takes the first set. Give a figure whose first UVs are mirrored or
+  tiled a second set: a mask over overlapping UVs puts two places in one
+  texel.
+- **Sending it.** OpenGL writes a changed mask with `glTexSubImage2D`.
+  Vulkan copies it into its texture in the frame's command buffer, before
+  the passes, behind barriers that order it after the reads of the frames
+  in flight, with no wait on the device. It is bound at binding 9 of the
+  scene's set.
+
+There is no render target: the position map makes a hit a loop over
+texels, the same texels on both renderers. On a 256 x 256 mask a hit costs
+0.22 ms of CPU and the bake 0.7 ms for 512 triangles, once.
+
+`tests/test_damage.ae` checks the following:
+- **On the CPU:** a 0.5 m splat reaches 205 texels (201 for the disc),
+  full at its centre and none far off; fading by half leaves 0.498, and
+  clearing leaves none.
+- **On screen:** 339 blood pixels where the splat was put, 682 after a
+  second one, none faded, identical on both renderers.
+- **The second UV set:** on a skinned grid whose first UVs mirror its left
+  half onto its right, a splat on the right draws 517 blood pixels there and
+  none on the left (517 there too without the second set), and the blood
+  moves with the skin.
+- **Validation:** none under the Khronos layer with synchronisation
+  validation.
+
 ### Particles
 
 `ae3d.particles` is an emitter (#546): blood spraying from a hit and
