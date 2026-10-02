@@ -431,6 +431,19 @@ scene_parity() {   # scene_parity <program> <name> <port> [VAR=value ...]
     else
         fail "$parity_name"
         grep -E '^  |scene_parity:' "$parity_log" | sed 's/^/        /' | head -24
+        # Which scene went away, and its last words, before the logs go:
+        # "the connection closed while reading" says one of them stopped
+        # answering, not which, nor why (#547).
+        for parity_side in opengl vulkan; do
+            if [ "$parity_side" = opengl ]; then parity_pid="$parity_gl"; parity_side_log="$parity_gl_log"; else parity_pid="$parity_vk"; parity_side_log="$parity_vk_log"; fi
+            if kill -0 "$parity_pid" 2>/dev/null; then
+                echo "        $parity_side: still running; its last lines:"
+            else
+                wait "$parity_pid" 2>/dev/null
+                echo "        $parity_side: exited with status $?; its last lines:"
+            fi
+            tail -6 "$parity_side_log" | sed 's/^/          /'
+        done
     fi
     kill "$parity_gl" "$parity_vk" 2>/dev/null
     wait "$parity_gl" 2>/dev/null
