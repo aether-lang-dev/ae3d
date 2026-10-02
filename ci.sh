@@ -338,6 +338,20 @@ else
     done
 fi
 
+step "every window pane faces the street"
+# A pane is one sheet drawn from its front: one wound into its building is
+# culled from the street, and the window is a hole onto the hollow shell
+# behind it (#478). Read back from the committed export, so no Blender.
+if ! ./build.sh tools/check_panes.ae >/tmp/ae3d_panes.log 2>&1; then
+    fail "check_panes (build)"
+    sed 's/^/        /' /tmp/ae3d_panes.log | head -12
+elif ./build/check_panes resources/blender/zombie_street >/tmp/ae3d_panes.log 2>&1; then
+    pass "resources/blender/zombie_street's panes all face out"
+else
+    fail "resources/blender/zombie_street has panes facing into their buildings"
+    sed 's/^/        /' /tmp/ae3d_panes.log | head -12
+fi
+
 step "docs/agent.md matches the engine's command table"
 # A doc written by hand beside a protocol is a doc that describes last month's
 # protocol. This one is generated from the same table `help` answers with, so
