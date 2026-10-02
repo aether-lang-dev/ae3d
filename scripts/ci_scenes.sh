@@ -325,6 +325,63 @@ else
     frame_cost vulkan 7916
 fi
 
+# The horde at 20,000, held to its own budget (#498): zombie_city at a fixed
+# tick, held at frame 90 so the crowd stands where it stood when the budget
+# was recorded, its draw calls, triangles and binds compared exactly and its
+# passes' times on the card that recorded them. Twice: the default near band,
+# and the 28 m one, where the shadow stage once took 9.6 ms of a 7.6 fps
+# frame. On Vulkan, the renderer the engine is taken forward on.
+city_cost() {   # city_cost <name> <port> <baseline> [VAR=value ...]
+    city_name="zombie_city at 20,000 ($1, vulkan)"
+    city_port="$2"
+    city_baseline="$3"
+    shift 3
+    city_log="$(mktemp)"
+    city_scene_log="$(mktemp)"
+    env "$@" AE3D_API=vulkan AE3D_CROWD=20000 AE3D_TICK=60 AE3D_HOLD=90 AE3D_FRAMES=100000 \
+        AE3D_AGENT="$city_port" ./build/zombie_city >"$city_scene_log" 2>&1 &
+    city_scene=$!
+    # The bench waits for the hold itself (--hold): before it, the crowd is
+    # still walking to where the budget was recorded. Asked again while the
+    # scene has not opened its port and is alive.
+    costed=1
+    attempt=0
+    while [ "$attempt" -lt 300 ]; do
+        kill -0 "$city_scene" 2>/dev/null || break
+        bounded "$RUN_LIMIT" ./build/ae3d_bench "$city_port" --hold 90 --baseline "$city_baseline" >"$city_log" 2>&1
+        costed=$?
+        grep -q 'nothing answering' "$city_log" || break
+        attempt=$((attempt + 1))
+        sleep 0.2
+    done
+    if ! kill -0 "$city_scene" 2>/dev/null; then
+        if grep -q 'no Vulkan driver' "$city_scene_log"; then
+            skip "$city_name" "no Vulkan driver"
+        else
+            skip "$city_name" "the scene could not open a window"
+        fi
+    elif [ "$costed" -eq 0 ]; then
+        pass "$city_name"
+        sed 's/^/        /' "$city_log" | head -20
+    else
+        fail "$city_name"
+        sed 's/^/        /' "$city_log" | head -20
+    fi
+    kill "$city_scene" 2>/dev/null
+    wait "$city_scene" 2>/dev/null
+    rm -f "$city_log" "$city_scene_log"
+}
+if ! built_ok ae3d_bench || ! built_ok zombie_city; then
+    skip "zombie_city at 20,000 (frame cost)" "it did not build"
+elif ! have_display; then
+    skip "zombie_city at 20,000 (frame cost)" "no display"
+elif [ -n "${CI:-}" ]; then
+    skip "zombie_city at 20,000 (frame cost)" "20,000 figures on a software rasteriser is minutes a frame; a GPU's"
+else
+    city_cost "near band 12 m" 7917 resources/zombie_city.vulkan.budget.json
+    city_cost "near band 28 m" 7918 resources/zombie_city_near28.vulkan.budget.json AE3D_NEAR=28
+fi
+
 step "the scenes, drawn alike by both renderers"
 # The backend parity suite holds the renderers to each other on test scenes
 # of a few models; this holds them to each other on the scenes a person looks
