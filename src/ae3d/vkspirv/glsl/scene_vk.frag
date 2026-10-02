@@ -30,6 +30,9 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     mat4 prevViewProjection;
     bool isSkinned;
     mat4 bones[96];
+    int clipJoints0;
+    int clipJoints1;
+    int clipJoints2;
     vec2 jitter;
     vec2 screenSize;
     int lightCount;
@@ -113,6 +116,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int keyLampSlot;
     bool clipOn;
     vec4 clipPlane;
+    bool clipDetached;
     float clipNoise;
     float clipNoiseScale;
     int woundCount;
@@ -190,6 +194,7 @@ layout(location = 4) in vec4 FragPosLightSpace;
 layout(location = 6) in vec4 ClipNow;
 layout(location = 7) in vec4 ClipPrev;
 layout(location = 8) in vec3 BindPos;
+layout(location = 9) in float ClipLimb;
 layout(location = 1) out vec2 outVelocity;
 
 
@@ -1392,6 +1397,9 @@ vec2 velocity(vec4 now, vec4 prev, vec2 nudge) {
 // cut's silhouette and its shadow agree to the texel.
 
 
+// A severed limb's loose copy (#556): everything off the cut's joints is
+// gone too, and the plane, turned round, keeps the limb past the joint.
+
 
 
 
@@ -1411,9 +1419,14 @@ float clipValueNoise(vec3 p) {
                    mix(clipHash(i + vec3(0.0, 1.0, 1.0)), clipHash(i + vec3(1.0, 1.0, 1.0)), f.x), f.y), f.z);
 }
 
-// Whether the fragment lies past the cut.
+// Whether the fragment lies past the cut. Kept to joints, the plane cuts
+// only what hangs off them (ClipLimb past a half): a cut through the
+// shoulder takes the arm, not the leg below the same plane (#556).
 bool clippedAway(vec3 bindPos) {
     if (!clipOn) return false;
+    bool onLimb = ClipLimb >= 0.5;
+    if (clipDetached && !onLimb) return true;
+    if (!onLimb) return false;
     float side = dot(clipPlane.xyz, bindPos) - clipPlane.w;
     if (clipNoise > 0.0) side += clipNoise * (clipValueNoise(bindPos * clipNoiseScale) * 2.0 - 1.0);
     return side > 0.0;

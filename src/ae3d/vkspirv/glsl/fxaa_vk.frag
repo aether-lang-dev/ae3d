@@ -29,6 +29,9 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     mat4 prevViewProjection;
     bool isSkinned;
     mat4 bones[96];
+    int clipJoints0;
+    int clipJoints1;
+    int clipJoints2;
     vec2 jitter;
     vec2 screenSize;
     int lightCount;
@@ -112,6 +115,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int keyLampSlot;
     bool clipOn;
     vec4 clipPlane;
+    bool clipDetached;
     float clipNoise;
     float clipNoiseScale;
     int woundCount;
