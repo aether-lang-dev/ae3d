@@ -21,6 +21,22 @@
 // Underneath, a figure needs no engine: `figure_new` reads one under a
 // group, `advance` plays it on, `figure_free` lets it go, and whatever
 // draws it (the editor's viewport, a tool) adds its meshes itself.
+//
+// Changing clip (#574). `play` cuts: the new clip's first pose replaces the
+// last one in a frame. `play_blended` inertializes (Bollo, GDC 2018): every
+// node keeps the offset from where it was drawn to where the new clip puts
+// it, and the speed that offset was changing at, and the offset decays to
+// nothing over the blend time along a quintic that starts at that speed
+// and ends at rest. Nothing is averaged between two poses -- the new clip
+// plays from its first frame, under an offset that fades -- so a foot is
+// never dragged sideways by a mix of two strides, and the motion carries
+// on at the speed it had instead of stopping dead.
+//
+// Layers on top of the clip: `layer_play` plays another clip over the
+// bones under one bone (an upper body that aims and reloads over legs that
+// walk), at a weight; or as an additive, its change from its own first
+// frame added to whatever the clip and the layers under it posed
+// (breathing, a flinch).
 
 import std.list
 import std.string
@@ -37,6 +53,7 @@ exports (
     Figure,
     figure, attach, figure_of, play, stop, set_time, figures_free,
     figure_new, figure_free, advance, set_speed, set_looping, clip_index, keep_pose, put_pose, pose_free,
+    play_blended, blending, layer_play, layer_play_under, layer_set_weight, layer_stop, layer_count,
     path, clip, speed, looping, time, clip_count, clip_name, duration, skeleton, primitive_count, primitive,
     figure_kind, attach_figure, figure_component
 )
@@ -55,6 +72,38 @@ struct Figure {
     looping: bool
     time: float                      // seconds into the clip
     duration: float
+    // The pose each node was drawn in this frame and the frame before
+    // (POSE_FLOATS a node, gltf's model order): what a transition carries on.
+    drawn: ptr
+    drawn_before: ptr
+    nodes: int
+    pending: float                   // the frame's seconds, for the decay
+    frame_seconds: float             // the last frame's, for the speeds
+    // A transition: each node's offsets as quintics (INERTIA_FLOATS a node),
+    // how far into it, and how long it takes.
+    inertia: ptr
+    blend_t: float
+    blend_time: float
+    layers: ptr                      // list of *FigureLayer
+}
+
+const POSE_FLOATS = 7                // position, rotation
+// A node's transition: the rotation's axis (3), then four quintics -- the
+// rotation's angle and the position's x, y, z -- of QUINTIC floats each.
+const QUINTIC = 6                    // a, b, c, d (t^5..t^2), v0, x0
+const INERTIA_FLOATS = 3 + 4 * QUINTIC
+
+// A clip over part of the figure, or added to it.
+struct FigureLayer {
+    players: ptr                     // *Registry
+    root: ptr                        // *Model the masked bones hang from; null for every bone
+    weight: float
+    additive: bool
+    time: float
+    speed: float
+    looping: bool
+    duration: float
+    reference: ptr                   // POSE_FLOATS a node: the layer's first frame, for an additive
 }
 
 // Every figure an engine has, for the scene file's records.
@@ -124,6 +173,12 @@ figure_new(path: string, group: *Model) -> *Figure {
     f.speed = 1.0
     f.looping = true
     f.players = anim.registry_new() as ptr
+    f.nodes = gltf.model_count(file)
+    f.drawn = calloc(f.nodes * POSE_FLOATS + 1, 8)
+    f.drawn_before = calloc(f.nodes * POSE_FLOATS + 1, 8)
+    f.inertia = calloc(f.nodes * INERTIA_FLOATS + 1, 8)
+    f.layers = list.new()
+    f.frame_seconds = 1.0 / 60.0
     i = 0
     while i < gltf.root_count(file) {
         core.model_set_parent(gltf.root(file, i), group)
@@ -137,6 +192,17 @@ figure_new(path: string, group: *Model) -> *Figure {
 figure_free(f: *Figure) {
     if f == null { return }
     anim.registry_free(f.players as *Registry)
+    if f.drawn != null { free(f.drawn) }
+    if f.drawn_before != null { free(f.drawn_before) }
+    if f.inertia != null { free(f.inertia) }
+    if f.layers != null {
+        i = 0
+        while i < list.size(f.layers) {
+            layer_free(list.get_raw(f.layers, i) as *FigureLayer)
+            i = i + 1
+        }
+        list.free(f.layers)
+    }
     gltf.scene_destroy(f.file as *GltfScene)
     string.free(f.path)
     string.free(f.clip)
@@ -146,6 +212,8 @@ figure_free(f: *Figure) {
 // The clip on by `delta` seconds, at the figure's speed.
 advance(f: *Figure, delta: float) {
     if f == null || string.equals(f.clip, "") == 1 { return }
+    f.pending = delta
+    if delta > 0.0 { f.frame_seconds = delta }
     set_time(f, f.time + delta * f.speed)
 }
 
@@ -174,6 +242,9 @@ play(f: *Figure, name: string, rate: float, loops: bool) -> bool {
     f.looping = loops
     f.time = 0.0
     f.duration = gltf.animation_duration(f.file as *GltfScene, name)
+    // A cut ends any transition.
+    f.blend_time = 0.0
+    f.blend_t = 0.0
     return true
 }
 
@@ -228,6 +299,11 @@ set_time(f: *Figure, seconds: float) {
         i = i + 1
     }
     anim.registry_apply(r)
+    delta = f.pending
+    f.pending = 0.0
+    if f.blend_time > 0.0 { decay(f, delta) }
+    apply_layers(f, delta)
+    remember(f)
 }
 
 wrapped(f: *Figure, seconds: float) -> float {
@@ -439,4 +515,375 @@ set_time_value(p: ptr, share: float) {
     if p == null { return }
     f = p as *Figure
     set_time(f, share * f.duration)
+}
+
+// --- transitions (#574) --------------------------------------------------------------------------------
+
+// A node's local pose into `out` at `at`.
+read_node(m: *Model, out: float[], at: int) {
+    out[at] = m.position.x
+    out[at + 1] = m.position.y
+    out[at + 2] = m.position.z
+    out[at + 3] = m.rotation.x
+    out[at + 4] = m.rotation.y
+    out[at + 5] = m.rotation.z
+    out[at + 6] = m.rotation.w
+}
+
+node_quat(b: float[], at: int) -> Quat { return core.quat(b[at + 3], b[at + 4], b[at + 5], b[at + 6]) }
+node_pos(b: float[], at: int) -> Vec3 { return core.vec3(b[at], b[at + 1], b[at + 2]) }
+
+// This frame's pose kept, and the last frame's behind it.
+remember(f: *Figure) {
+    file = f.file as *GltfScene
+    now = f.drawn as float[]
+    before = f.drawn_before as float[]
+    i = 0
+    while i < f.nodes {
+        k = 0
+        while k < POSE_FLOATS {
+            before[i * POSE_FLOATS + k] = now[i * POSE_FLOATS + k]
+            k = k + 1
+        }
+        read_node(gltf.model(file, i), now, i * POSE_FLOATS)
+        i = i + 1
+    }
+}
+
+// Bollo's quintic for an offset of x0 changing at v0, to rest at t1: its
+// t^5..t^2 coefficients, v0 and x0 into `q` at `at`. An offset growing away
+// from rest is taken as still (it would overshoot); one falling fast reaches
+// rest no later than its own speed allows.
+quintic(q: float[], at: int, x0_in: float, v0_in: float, t1_in: float) {
+    x0 = x0_in
+    v0 = v0_in
+    flip = x0 < 0.0
+    if flip {
+        x0 = 0.0 - x0
+        v0 = 0.0 - v0
+    }
+    if v0 > 0.0 { v0 = 0.0 }
+    t1 = t1_in
+    if v0 < 0.0 {
+        limit = 0.0 - 5.0 * x0 / v0
+        if limit < t1 { t1 = limit }
+    }
+    if t1 <= 0.000001 || x0 <= 0.0 {
+        k = 0
+        while k < QUINTIC {
+            q[at + k] = 0.0
+            k = k + 1
+        }
+        return
+    }
+    a0 = (0.0 - 8.0 * v0 * t1 - 20.0 * x0) / (t1 * t1)
+    t2 = t1 * t1
+    t3 = t2 * t1
+    t4 = t3 * t1
+    t5 = t4 * t1
+    sign = 1.0
+    if flip { sign = 0.0 - 1.0 }
+    q[at] = sign * (0.0 - (a0 * t2 + 6.0 * v0 * t1 + 12.0 * x0) / (2.0 * t5))
+    q[at + 1] = sign * ((3.0 * a0 * t2 + 16.0 * v0 * t1 + 30.0 * x0) / (2.0 * t4))
+    q[at + 2] = sign * (0.0 - (3.0 * a0 * t2 + 12.0 * v0 * t1 + 20.0 * x0) / (2.0 * t3))
+    q[at + 3] = sign * (a0 * 0.5)
+    q[at + 4] = sign * v0
+    q[at + 5] = sign * x0
+}
+
+// A quintic's offset at t: nothing once it has come to rest.
+quintic_at(q: float[], at: int, t: float, t_end: float) -> float {
+    if t >= t_end { return 0.0 }
+    return (((q[at] * t + q[at + 1]) * t + q[at + 2]) * t + q[at + 3]) * t * t + q[at + 4] * t + q[at + 5]
+}
+
+// `name` from its first frame, carried on from where the figure was drawn:
+// each node's offset to the new clip, and the speed it was changing at,
+// decayed over `seconds` (#574). False, and the clip playing on, when the
+// file has no animation by that name.
+play_blended(f: *Figure, name: string, rate: float, loops: bool, seconds: float) -> bool {
+    if f == null { return false }
+    if seconds <= 0.0 { return play(f, name, rate, loops) }
+    if gltf.animation_duration(f.file as *GltfScene, name) <= 0.0 && !has_clip(f, name) { return false }
+    old_now = copy_pose(f, f.drawn)
+    old_before = copy_pose(f, f.drawn_before)
+    if !play(f, name, rate, loops) {
+        free(old_now)
+        free(old_before)
+        return false
+    }
+    anim.registry_apply(f.players as *Registry)
+    file = f.file as *GltfScene
+    dt = f.frame_seconds
+    if dt <= 0.0 { dt = 1.0 / 60.0 }
+    was = old_now as float[]
+    was_before = old_before as float[]
+    inertia = f.inertia as float[]
+    i = 0
+    while i < f.nodes {
+        m = gltf.model(file, i)
+        at = i * POSE_FLOATS
+        off = i * INERTIA_FLOATS
+        new_q = m.rotation
+        new_p = m.position
+        // The rotation's offset as an angle about an axis, and how fast it
+        // was turning about that axis.
+        q = core.quat_normalize(core.quat_mul(node_quat(was, at), core.quat_conjugate(new_q)))
+        if q.w < 0.0 { q = core.quat(0.0 - q.x, 0.0 - q.y, 0.0 - q.z, 0.0 - q.w) }
+        half_sin = core.sqrt_of(q.x * q.x + q.y * q.y + q.z * q.z)
+        angle = 2.0 * core.atan2_of(half_sin, q.w)
+        axis = core.vec3(0.0, 1.0, 0.0)
+        if half_sin > 0.0000001 { axis = core.vec3(q.x / half_sin, q.y / half_sin, q.z / half_sin) }
+        qb = core.quat_normalize(core.quat_mul(node_quat(was_before, at), core.quat_conjugate(new_q)))
+        if qb.w < 0.0 { qb = core.quat(0.0 - qb.x, 0.0 - qb.y, 0.0 - qb.z, 0.0 - qb.w) }
+        angle_before = 2.0 * core.atan2_of(qb.x * axis.x + qb.y * axis.y + qb.z * axis.z, qb.w)
+        inertia[off] = axis.x
+        inertia[off + 1] = axis.y
+        inertia[off + 2] = axis.z
+        quintic(inertia, off + 3, angle, (angle - angle_before) / dt, seconds)
+        // The position's, axis by axis.
+        p_was = node_pos(was, at)
+        p_before = node_pos(was_before, at)
+        quintic(inertia, off + 3 + QUINTIC, p_was.x - new_p.x, (p_was.x - p_before.x) / dt, seconds)
+        quintic(inertia, off + 3 + 2 * QUINTIC, p_was.y - new_p.y, (p_was.y - p_before.y) / dt, seconds)
+        quintic(inertia, off + 3 + 3 * QUINTIC, p_was.z - new_p.z, (p_was.z - p_before.z) / dt, seconds)
+        i = i + 1
+    }
+    free(old_now)
+    free(old_before)
+    f.blend_t = 0.0
+    f.blend_time = seconds
+    decay(f, 0.0)
+    apply_layers(f, 0.0)
+    remember(f)
+    return true
+}
+
+has_clip(f: *Figure, name: string) -> bool {
+    i = 0
+    while i < clip_count(f) {
+        if clip_name(f, i) == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+copy_pose(f: *Figure, source: ptr) -> ptr {
+    out = calloc(f.nodes * POSE_FLOATS + 1, 8)
+    a = out as float[]
+    b = source as float[]
+    k = 0
+    while k < f.nodes * POSE_FLOATS {
+        a[k] = b[k]
+        k = k + 1
+    }
+    return out
+}
+
+// Whether a transition is still decaying.
+blending(f: *Figure) -> bool { return f != null && f.blend_time > 0.0 }
+
+// The clip's pose, under the offsets as they are `delta` further on.
+decay(f: *Figure, delta: float) {
+    f.blend_t = f.blend_t + delta
+    t = f.blend_t
+    file = f.file as *GltfScene
+    inertia = f.inertia as float[]
+    i = 0
+    while i < f.nodes {
+        off = i * INERTIA_FLOATS
+        m = gltf.model(file, i)
+        angle = quintic_at(inertia, off + 3, t, f.blend_time)
+        if angle != 0.0 {
+            turn = core.quat_rotate(angle, core.vec3(inertia[off], inertia[off + 1], inertia[off + 2]))
+            core.model_set_rotation(m, core.quat_normalize(core.quat_mul(turn, m.rotation)))
+        }
+        dx = quintic_at(inertia, off + 3 + QUINTIC, t, f.blend_time)
+        dy = quintic_at(inertia, off + 3 + 2 * QUINTIC, t, f.blend_time)
+        dz = quintic_at(inertia, off + 3 + 3 * QUINTIC, t, f.blend_time)
+        if dx != 0.0 || dy != 0.0 || dz != 0.0 {
+            core.model_set_position(m, m.position.x + dx, m.position.y + dy, m.position.z + dz)
+        }
+        i = i + 1
+    }
+    if t >= f.blend_time {
+        f.blend_time = 0.0
+        f.blend_t = 0.0
+    }
+}
+
+// --- layers (#574) -------------------------------------------------------------------------------------
+
+// `name` over the bones under `bone_name` (and that bone) at `weight`, or,
+// `additive`, its change from its own first frame added to the pose
+// beneath: the layer's number, or -1 when the file has no such clip or no
+// such bone. A bone named "" is every bone.
+layer_play(f: *Figure, name: string, bone_name: string, weight: float, additive: bool, loops: bool) -> int {
+    if f == null { return 0 - 1 }
+    root = null as *Model
+    if bone_name != "" {
+        root = find_node(f, bone_name)
+        if root == null { return 0 - 1 }
+    }
+    return layer_play_under(f, name, root, weight, additive, loops)
+}
+
+find_node(f: *Figure, name: string) -> *Model {
+    file = f.file as *GltfScene
+    i = 0
+    while i < f.nodes {
+        m = gltf.model(file, i)
+        if core.text(m.name) == name { return m }
+        i = i + 1
+    }
+    return null
+}
+
+// As layer_play, its mask the bones under `root` (null for every bone).
+layer_play_under(f: *Figure, name: string, root: *Model, weight: float, additive: bool, loops: bool) -> int {
+    if f == null { return 0 - 1 }
+    r = anim.registry_new()
+    made = gltf.play(f.file as *GltfScene, name, r, loops)
+    if made == 0 {
+        anim.registry_free(r)
+        return 0 - 1
+    }
+    layer = calloc(1, sizeof(FigureLayer)) as *FigureLayer
+    layer.players = r as ptr
+    layer.root = root as ptr
+    layer.weight = weight
+    layer.additive = additive
+    layer.speed = 1.0
+    layer.looping = loops
+    layer.duration = gltf.animation_duration(f.file as *GltfScene, name)
+    // Its first frame, read and given back: what an additive layer is the
+    // change from.
+    layer.reference = calloc(f.nodes * POSE_FLOATS + 1, 8)
+    file = f.file as *GltfScene
+    base = calloc(f.nodes * POSE_FLOATS + 1, 8)
+    i = 0
+    while i < f.nodes {
+        read_node(gltf.model(file, i), base as float[], i * POSE_FLOATS)
+        i = i + 1
+    }
+    layer_pose(layer, 0.0)
+    i = 0
+    while i < f.nodes {
+        read_node(gltf.model(file, i), layer.reference as float[], i * POSE_FLOATS)
+        put_node(gltf.model(file, i), base as float[], i * POSE_FLOATS)
+        i = i + 1
+    }
+    free(base)
+    list.add_raw(f.layers, layer as ptr)
+    return list.size(f.layers) - 1
+}
+
+put_node(m: *Model, b: float[], at: int) {
+    core.model_set_position(m, b[at], b[at + 1], b[at + 2])
+    core.model_set_rotation(m, node_quat(b, at))
+}
+
+layer_set_weight(f: *Figure, index: int, weight: float) {
+    layer = layer_at(f, index)
+    if layer != null { layer.weight = weight }
+}
+
+// A layer off; the ones above it move down.
+layer_stop(f: *Figure, index: int) {
+    layer = layer_at(f, index)
+    if layer == null { return }
+    layer_free(layer)
+    list.remove(f.layers, index)
+}
+
+layer_count(f: *Figure) -> int {
+    if f == null || f.layers == null { return 0 }
+    return list.size(f.layers)
+}
+
+layer_at(f: *Figure, index: int) -> *FigureLayer {
+    if f == null || f.layers == null || index < 0 || index >= list.size(f.layers) { return null }
+    return list.get_raw(f.layers, index) as *FigureLayer
+}
+
+layer_free(layer: *FigureLayer) {
+    anim.registry_free(layer.players as *Registry)
+    free(layer.reference)
+    free(layer as ptr)
+}
+
+// A layer's clip at `seconds`, onto the nodes it animates.
+layer_pose(layer: *FigureLayer, seconds: float) {
+    r = layer.players as *Registry
+    i = 0
+    while i < anim.registry_count(r) {
+        anim.player_set_time(anim.binding_player(anim.registry_binding(r, i)), seconds)
+        i = i + 1
+    }
+    anim.registry_apply(r)
+}
+
+// Whether `m` is `root` or hangs under it.
+under(m: *Model, root: *Model) -> bool {
+    if root == null { return true }
+    at = m
+    while at != null {
+        if at == root { return true }
+        at = at.parent as *Model
+    }
+    return false
+}
+
+// Every layer on, `delta` further, over what the clip and the layers below
+// posed.
+apply_layers(f: *Figure, delta: float) {
+    if f.layers == null || list.size(f.layers) == 0 { return }
+    file = f.file as *GltfScene
+    base = calloc(f.nodes * POSE_FLOATS + 1, 8)
+    b = base as float[]
+    k = 0
+    while k < list.size(f.layers) {
+        layer = list.get_raw(f.layers, k) as *FigureLayer
+        layer.time = layer.time + delta * layer.speed
+        if layer.duration > 0.0 {
+            if layer.looping {
+                while layer.time >= layer.duration { layer.time = layer.time - layer.duration }
+            } else if layer.time > layer.duration {
+                layer.time = layer.duration
+            }
+        }
+        i = 0
+        while i < f.nodes {
+            read_node(gltf.model(file, i), b, i * POSE_FLOATS)
+            i = i + 1
+        }
+        layer_pose(layer, layer.time)
+        ref = layer.reference as float[]
+        w = layer.weight
+        i = 0
+        while i < f.nodes {
+            m = gltf.model(file, i)
+            at = i * POSE_FLOATS
+            base_q = node_quat(b, at)
+            base_p = node_pos(b, at)
+            if !under(m, layer.root as *Model) || w <= 0.0 {
+                put_node(m, b, at)
+            } else if layer.additive {
+                // The layer's change since its first frame, at the weight, on
+                // top of the pose beneath.
+                change = core.quat_normalize(core.quat_mul(m.rotation, core.quat_conjugate(node_quat(ref, at))))
+                turn = core.quat_slerp(core.quat_ident(), change, w)
+                moved = core.v3_mul(core.v3_sub(m.position, node_pos(ref, at)), w)
+                core.model_set_rotation(m, core.quat_normalize(core.quat_mul(turn, base_q)))
+                core.model_set_position(m, base_p.x + moved.x, base_p.y + moved.y, base_p.z + moved.z)
+            } else if w < 1.0 {
+                core.model_set_rotation(m, core.quat_slerp(base_q, m.rotation, w))
+                core.model_set_position(m, base_p.x + (m.position.x - base_p.x) * w, base_p.y + (m.position.y - base_p.y) * w,
+                                        base_p.z + (m.position.z - base_p.z) * w)
+            }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    free(base)
 }

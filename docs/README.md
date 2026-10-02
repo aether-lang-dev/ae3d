@@ -17,6 +17,7 @@ at the root is the front page; this is the map.
 | [The asset pipeline](pipeline.md) | Blender to engine: the exporter, the manifest, the critique, glTF from anywhere |
 | [The agent channel](agent.md) | The JSON channel a program, a test or an AI agent drives a running scene through |
 | [Audio](audio.md) | `ae3d.audio`: sources on game objects, the listener, distance, pan and Doppler, buses and ducking, held to numbers through a headless mix |
+| [Animation](animation.md) | Clips, inertialized transitions, layers, the crowd's and the player's locomotion, feet on the world, and what each is held to |
 | [Natural motion](motion.md) | `ae3d.motion`: active ragdolls -- the animation played by joint motors within a torque budget, balance, hits that weaken a limb, and what the test holds them to |
 | [Networking](networking.md) | `ae3d.net`: a host and its clients, the transports (loopback with simulated conditions, TCP), replication and interpolation, and the numbers they are held to |
 | [Components](components.md) | Game objects as their components, the scene as an object: the registry of kinds the inspector, the scene file and the agent read, and the engine's own kinds |
