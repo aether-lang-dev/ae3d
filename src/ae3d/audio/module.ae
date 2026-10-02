@@ -1,0 +1,558 @@
+// ae3d.audio -- sound in the world (#415): sources on game objects, a
+// listener on the camera, buses, over std.audio's mixer.
+//
+//   audio.attach(e)                                   // once, beside physics.attach
+//   src = audio.source(car, "sounds/engine.wav", audio.EFFECTS)
+//   audio.set_looping(src, true)
+//   audio.play(src)
+//   audio.set_bus_volume(e, audio.MUSIC, 0.6)
+//   audio.duck(e, audio.MUSIC, audio.VOICE, 0.35)     // music under dialogue
+//
+// An AudioSource is a component (Unity's AudioSource): it goes with its
+// object, and its sound with it. Every frame, after the updates, the engine
+// places each spatial source against the listener -- the camera, or an
+// object given to set_listener:
+//
+//   - distance: full volume within `min_distance`, then the inverse of the
+//     distance (min / d, the physical falloff and Unity's logarithmic
+//     rolloff), held at its value at `max_distance` beyond it;
+//   - pan: equal-power, from where the source lies across the listener's
+//     right: hard left at 90 degrees to the left, centred ahead and behind;
+//   - Doppler: the pitch of a source approaching or leaving, from the two
+//     velocities along the line between them and the speed of sound
+//     (f' = f (c - v_l.u) / (c - v_s.u), u from source to listener), each
+//     velocity the object's movement over the frame.
+//
+// Buses are std.audio groups: MUSIC, EFFECTS, AMBIENCE and VOICE, each with
+// a volume. A duck lowers one bus while another has a source playing, eased
+// in and out over `DUCK_SECONDS`.
+//
+// The engine opens the sound device; AE3D_AUDIO=headless opens one that only
+// advances when a test asks it to render, so a mix is held to numbers the way
+// a frame is held to pixels; AE3D_AUDIO=0 opens none and every call is
+// silent. A machine with no sound device runs as with AE3D_AUDIO=0.
+import std.audio as mix
+import std.bytes
+import std.fs
+import std.heap
+import std.list
+import std.os
+import std.string
+import ae3d.core
+import ae3d.platform
+import ae3d.engine
+import ae3d.behaviour
+
+exports (
+    Audio, AudioSource,
+    attach, attach_headless, of, audio_free, source, source_of, play, stop, is_playing,
+    set_volume, set_pitch, set_looping, set_spatial, set_distances, set_doppler,
+    set_listener, set_bus_volume, bus_volume, duck,
+    gain, pan, pitch, source_count, headless, update_seconds,
+    MUSIC, EFFECTS, AMBIENCE, VOICE, BUSES, SPEED_OF_SOUND, DUCK_SECONDS, KIND_AUDIO_SOURCE
+)
+
+extern free(p: ptr)
+
+const MUSIC = 0
+const EFFECTS = 1
+const AMBIENCE = 2
+const VOICE = 3
+const BUSES = 4
+
+// Metres a second, in air at 20 degrees.
+const SPEED_OF_SOUND = 343.0
+// How long a duck takes to settle, and to let go.
+const DUCK_SECONDS = 0.25
+// The pitch a Doppler shift may reach, either way: past it a source moving
+// near the speed of sound would squeal or stop.
+const DOPPLER_LOW = 0.5
+const DOPPLER_HIGH = 2.0
+
+// The component kind of an AudioSource, after physics' Rigidbody (9).
+const KIND_AUDIO_SOURCE = 10
+
+struct AudioSource {
+    audio: ptr                       // *Audio
+    object: ptr                      // *GameObject
+    sound: ptr                       // std.audio's source, or null when silent
+    bus: int
+    volume: float
+    pitch: float                     // asked for; the Doppler shift multiplies it
+    spatial: bool
+    doppler: float                   // how much of the shift is applied, 0 to 1
+    min_distance: float
+    max_distance: float
+    last: Vec3
+    known: bool
+    // What was last applied: the gain, the pan and the pitch.
+    applied_gain: float
+    applied_pan: float
+    applied_pitch: float
+}
+
+struct Audio {
+    engine: ptr
+    behaviour: ptr
+    sources: ptr                     // list of *AudioSource
+    groups: ptr                      // ptr[BUSES], std.audio groups
+    volumes: ptr                     // float[BUSES], asked for
+    ducks: ptr                       // float[BUSES]: the bus each is ducked under (-1 none), as int
+    duck_amount: ptr                 // float[BUSES]: the volume it is ducked to
+    duck_now: ptr                    // float[BUSES]: how far the duck is in, 0 to 1
+    listener: ptr                    // *GameObject, or null for the camera
+    listener_last: Vec3
+    listener_known: bool
+    opened: bool
+    is_headless: bool
+    clips: ptr                       // list of *SoundClip: encoded bytes by path, read once
+    update_seconds: float            // what the last frame's placing took
+}
+
+struct SoundClip {
+    path: string
+    data: string
+    length: int
+}
+
+var g_attached: ptr = null
+
+// The sound in an engine: the device opened (or a headless one, or none, by
+// AE3D_AUDIO), the buses made, and the sources placed after every frame's
+// updates. Once an engine.
+attach(e: *Engine) -> *Audio {
+    if env_is("AE3D_AUDIO", "headless") { return attach_mode(e, 2, 48000) }
+    if core.env_int("AE3D_AUDIO", 1) == 0 { return attach_mode(e, 0, 0) }
+    return attach_mode(e, 1, 0)
+}
+
+// The sound in an engine on a headless mix at `rate` frames a second: it
+// advances only when a test renders it (std.audio.render), so what it
+// plays is held to numbers.
+attach_headless(e: *Engine, rate: int) -> *Audio { return attach_mode(e, 2, rate) }
+
+// 0 none, 1 the device, 2 headless.
+attach_mode(e: *Engine, mode: int, rate: int) -> *Audio {
+    existing = of(e)
+    if existing != null { return existing }
+    a = heap.new(Audio)
+    a.engine = e as ptr
+    a.sources = list.new()
+    a.clips = list.new()
+    a.groups = calloc_ptrs(BUSES)
+    a.volumes = calloc_floats(BUSES)
+    a.ducks = calloc_floats(BUSES)
+    a.duck_amount = calloc_floats(BUSES)
+    a.duck_now = calloc_floats(BUSES)
+    if mode == 2 {
+        a.opened = mix.open_headless(rate, 2)
+        a.is_headless = a.opened
+    } else if mode == 1 {
+        a.opened = mix.open()
+    }
+    k = 0
+    while k < BUSES {
+        (a.volumes as float[])[k] = 1.0
+        (a.ducks as float[])[k] = 0.0 - 1.0
+        (a.duck_amount as float[])[k] = 1.0
+        if a.opened {
+            group, err = mix.group_new()
+            if err == "" { (a.groups as ptr[])[k] = group }
+        }
+        k = k + 1
+    }
+    b = engine.behaviour_new("audio", a as ptr)
+    b.late_update = on_frame
+    engine.engine_add_behaviour(e, b)
+    a.behaviour = b as ptr
+    engine.engine_on_free(e, audio_released, a as ptr)
+    if g_attached == null { g_attached = list.new() }
+    list.add_raw(g_attached, a as ptr)
+    return a
+}
+
+extern calloc(count: int, size: int) -> ptr
+
+calloc_ptrs(n: int) -> ptr { return calloc(n, 8) }
+calloc_floats(n: int) -> ptr { return calloc(n, 8) }
+
+// Whether an environment variable is set to exactly `value`.
+env_is(name: string, value: string) -> bool {
+    // The value comes back on the heap, the asker's to free.
+    raw = os.getenv(name)
+    if raw == null { return false }
+    same = raw == value
+    string.free(raw)
+    return same
+}
+
+// The sound attached to an engine, or null.
+of(e: *Engine) -> *Audio {
+    if g_attached == null { return null }
+    i = 0
+    while i < list.size(g_attached) {
+        a = list.get_raw(g_attached, i) as *Audio
+        if a.engine == e as ptr { return a }
+        i = i + 1
+    }
+    return null
+}
+
+headless(a: *Audio) -> bool { return a != null && a.is_headless }
+
+// What placing the sources took on the last frame, in seconds.
+update_seconds(a: *Audio) -> float {
+    if a == null { return 0.0 }
+    return a.update_seconds
+}
+
+// The engine's own release.
+audio_released(state: ptr) { audio_free(state as *Audio) }
+
+// Every source's sound, the buses and the device, gone.
+audio_free(a: *Audio) {
+    if a == null { return }
+    i = list.size(a.sources) - 1
+    while i >= 0 {
+        s = list.get_raw(a.sources, i) as *AudioSource
+        if s.sound != null { mix.unload(s.sound) }
+        s.sound = null
+        s.audio = null
+        i = i - 1
+    }
+    list.free(a.sources)
+    k = 0
+    while k < BUSES {
+        g = (a.groups as ptr[])[k]
+        if g != null { mix.group_free(g) }
+        k = k + 1
+    }
+    if a.opened { mix.close() }
+    i = 0
+    while i < list.size(a.clips) {
+        // heap.free takes the clip's path and bytes with it.
+        heap.free(list.get_raw(a.clips, i) as *SoundClip)
+        i = i + 1
+    }
+    list.free(a.clips)
+    free(a.groups)
+    free(a.volumes)
+    free(a.ducks)
+    free(a.duck_amount)
+    free(a.duck_now)
+    if g_attached != null {
+        i = 0
+        while i < list.size(g_attached) {
+            if list.get_raw(g_attached, i) == a as ptr {
+                list.remove(g_attached, i)
+                break
+            }
+            i = i + 1
+        }
+    }
+    e = a.engine as *Engine
+    if e != null && a.behaviour != null { engine.engine_remove_behaviour(e, a.behaviour as *Behaviour) }
+    heap.free(a)
+}
+
+// A clip's bytes, read once a path.
+clip(a: *Audio, path: string) -> *SoundClip {
+    i = 0
+    while i < list.size(a.clips) {
+        c = list.get_raw(a.clips, i) as *SoundClip
+        if c.path == path { return c }
+        i = i + 1
+    }
+    content, length, err = fs.read_binary(path)
+    if err != "" || length <= 0 {
+        println("ae3d: audio: ${path}: ${err}")
+        return null
+    }
+    c = heap.new(SoundClip)
+    c.path = string.copy(path)
+    c.data = content
+    c.length = length
+    list.add_raw(a.clips, c as ptr)
+    return c
+}
+
+// An AudioSource on `o` playing the clip at `path` (WAV, MP3, FLAC) through
+// `bus`, stopped, spatial, at full volume; null when the engine has no
+// sound attached. Taken off with its object, or with its component.
+source(o: *GameObject, path: string, bus: int) -> *AudioSource {
+    e = engine.of(o)
+    a = of(e)
+    if a == null { return null }
+    s = heap.new(AudioSource)
+    s.audio = a as ptr
+    s.object = o as ptr
+    s.bus = bus
+    if s.bus < 0 || s.bus >= BUSES { s.bus = EFFECTS }
+    s.volume = 1.0
+    s.pitch = 1.0
+    s.spatial = true
+    s.doppler = 1.0
+    s.min_distance = 1.0
+    s.max_distance = 100.0
+    s.applied_gain = 1.0
+    s.applied_pitch = 1.0
+    if a.opened {
+        c = clip(a, path)
+        if c != null {
+            sound, err = mix.load_wav(c.data, c.length)
+            if err != "" {
+                println("ae3d: audio: ${path}: ${err}")
+            } else {
+                s.sound = sound
+                mix.set_group(s.sound, (a.groups as ptr[])[s.bus])
+            }
+        }
+    }
+    comp = behaviour.component_new("AudioSource", KIND_AUDIO_SOURCE, s as ptr)
+    comp.destroy = source_gone
+    behaviour.object_add_component(o, comp)
+    list.add_raw(a.sources, s as ptr)
+    place(a, s, listener_position(a), listener_right(a), core.vec3(0.0, 0.0, 0.0), 0.0)
+    return s
+}
+
+// The AudioSource on an object, or null.
+source_of(o: *GameObject) -> *AudioSource {
+    c = behaviour.object_find_component(o, KIND_AUDIO_SOURCE)
+    if c == null { return null }
+    return c.state as *AudioSource
+}
+
+// The component's destroy hook: the sound stops and goes.
+source_gone(state: ptr, o: *GameObject) {
+    s = state as *AudioSource
+    a = s.audio as *Audio
+    if s.sound != null {
+        mix.stop(s.sound)
+        mix.unload(s.sound)
+    }
+    s.sound = null
+    if a != null {
+        i = 0
+        while i < list.size(a.sources) {
+            if list.get_raw(a.sources, i) == s as ptr {
+                list.remove(a.sources, i)
+                break
+            }
+            i = i + 1
+        }
+    }
+    heap.free(s)
+}
+
+play(s: *AudioSource) {
+    if s != null && s.sound != null { mix.play(s.sound) }
+}
+
+stop(s: *AudioSource) {
+    if s != null && s.sound != null { mix.stop(s.sound) }
+}
+
+is_playing(s: *AudioSource) -> bool {
+    if s == null || s.sound == null { return false }
+    return mix.is_playing(s.sound)
+}
+
+set_volume(s: *AudioSource, v: float) { if s != null { s.volume = v } }
+set_pitch(s: *AudioSource, p: float) { if s != null { s.pitch = p } }
+
+set_looping(s: *AudioSource, on: bool) {
+    if s != null && s.sound != null { mix.looping(s.sound, on) }
+}
+
+// A spatial source is placed against the listener; one that is not (music,
+// a voice in the player's head) plays centred at its volume.
+set_spatial(s: *AudioSource, on: bool) { if s != null { s.spatial = on } }
+
+set_distances(s: *AudioSource, min_distance: float, max_distance: float) {
+    if s == null { return }
+    s.min_distance = min_distance
+    if s.min_distance <= 0.0 { s.min_distance = 0.01 }
+    s.max_distance = max_distance
+    if s.max_distance < s.min_distance { s.max_distance = s.min_distance }
+}
+
+// How much of the Doppler shift is applied: 1 the physical one, 0 none.
+set_doppler(s: *AudioSource, amount: float) { if s != null { s.doppler = amount } }
+
+// What was last applied: the gain (volume and distance), the pan (-1 left
+// to 1 right) and the pitch (asked for, times the Doppler shift).
+gain(s: *AudioSource) -> float {
+    if s == null { return 0.0 }
+    return s.applied_gain
+}
+
+pan(s: *AudioSource) -> float {
+    if s == null { return 0.0 }
+    return s.applied_pan
+}
+
+pitch(s: *AudioSource) -> float {
+    if s == null { return 1.0 }
+    return s.applied_pitch
+}
+
+source_count(a: *Audio) -> int {
+    if a == null { return 0 }
+    return list.size(a.sources)
+}
+
+// The listener: an object (a player's head) instead of the camera, or null
+// for the camera again.
+set_listener(e: *Engine, o: *GameObject) {
+    a = of(e)
+    if a == null { return }
+    a.listener = o as ptr
+    a.listener_known = false
+}
+
+set_bus_volume(e: *Engine, bus: int, v: float) {
+    a = of(e)
+    if a == null || bus < 0 || bus >= BUSES { return }
+    (a.volumes as float[])[bus] = v
+    apply_bus(a, bus)
+}
+
+bus_volume(e: *Engine, bus: int) -> float {
+    a = of(e)
+    if a == null || bus < 0 || bus >= BUSES { return 0.0 }
+    return (a.volumes as float[])[bus]
+}
+
+// `bus` lowered to `amount` of its volume while any source on `under` is
+// playing, eased over DUCK_SECONDS: the music under a line of dialogue.
+// `under` -1 lets it go.
+duck(e: *Engine, bus: int, under: int, amount: float) {
+    a = of(e)
+    if a == null || bus < 0 || bus >= BUSES { return }
+    (a.ducks as float[])[bus] = under as float
+    (a.duck_amount as float[])[bus] = amount
+}
+
+apply_bus(a: *Audio, bus: int) {
+    g = (a.groups as ptr[])[bus]
+    if g == null { return }
+    v = (a.volumes as float[])[bus]
+    now = (a.duck_now as float[])[bus]
+    amount = (a.duck_amount as float[])[bus]
+    mix.group_volume(g, v * (1.0 - now + now * amount))
+}
+
+// --- the frame ---------------------------------------------------------------------------------------
+
+listener_position(a: *Audio) -> Vec3 {
+    if a.listener != null { return behaviour.object_world_position(a.listener as *GameObject) }
+    cam = engine.engine_camera(a.engine as *Engine)
+    if cam == null { return core.vec3(0.0, 0.0, 0.0) }
+    return cam.position
+}
+
+// The listener's right: the camera's, or the object's own +x in the world.
+listener_right(a: *Audio) -> Vec3 {
+    if a.listener != null {
+        q = behaviour.object_world_rotation(a.listener as *GameObject)
+        return core.quat_apply(q, core.vec3(1.0, 0.0, 0.0))
+    }
+    cam = engine.engine_camera(a.engine as *Engine)
+    if cam == null { return core.vec3(1.0, 0.0, 0.0) }
+    return cam.right
+}
+
+// One source against the listener: its gain, pan and pitch, applied.
+place(a: *Audio, s: *AudioSource, at: Vec3, right: Vec3, listener_velocity: Vec3, delta: float) {
+    gain = s.volume
+    pan_value = 0.0
+    shift = 1.0
+    position = behaviour.object_world_position(s.object as *GameObject)
+    velocity = core.vec3(0.0, 0.0, 0.0)
+    if s.known && delta > 0.0 { velocity = core.v3_mul(core.v3_sub(position, s.last), 1.0 / delta) }
+    s.last = position
+    s.known = true
+    if s.spatial {
+        offset = core.v3_sub(position, at)
+        d = core.v3_len(offset)
+        // The inverse of the distance past min_distance, held at max_distance.
+        reach = d
+        if reach < s.min_distance { reach = s.min_distance }
+        if reach > s.max_distance { reach = s.max_distance }
+        gain = gain * s.min_distance / reach
+        if d > 0.000001 {
+            towards = core.v3_mul(offset, 1.0 / d)
+            pan_value = core.v3_dot(towards, core.v3_normalize(right))
+            if pan_value > 1.0 { pan_value = 1.0 }
+            if pan_value < 0.0 - 1.0 { pan_value = 0.0 - 1.0 }
+            // u: from the source to the listener.
+            u = core.v3_mul(towards, 0.0 - 1.0)
+            vl = core.v3_dot(listener_velocity, u)
+            vs = core.v3_dot(velocity, u)
+            denominator = SPEED_OF_SOUND - vs
+            if denominator < 1.0 { denominator = 1.0 }
+            physical = (SPEED_OF_SOUND - vl) / denominator
+            shift = 1.0 + (physical - 1.0) * s.doppler
+            if shift < DOPPLER_LOW { shift = DOPPLER_LOW }
+            if shift > DOPPLER_HIGH { shift = DOPPLER_HIGH }
+        }
+    }
+    s.applied_gain = gain
+    s.applied_pan = pan_value
+    s.applied_pitch = s.pitch * shift
+    if s.sound != null {
+        mix.volume(s.sound, gain)
+        mix.pan(s.sound, pan_value)
+        mix.pitch(s.sound, s.applied_pitch)
+    }
+}
+
+// After the frame's updates: the listener's movement, every source placed,
+// the ducks eased.
+on_frame(state: ptr, e: *Engine, delta: float) {
+    a = state as *Audio
+    started = platform.time()
+    at = listener_position(a)
+    right = listener_right(a)
+    listener_velocity = core.vec3(0.0, 0.0, 0.0)
+    if a.listener_known && delta > 0.0 { listener_velocity = core.v3_mul(core.v3_sub(at, a.listener_last), 1.0 / delta) }
+    a.listener_last = at
+    a.listener_known = true
+    i = 0
+    while i < list.size(a.sources) {
+        place(a, list.get_raw(a.sources, i) as *AudioSource, at, right, listener_velocity, delta)
+        i = i + 1
+    }
+    k = 0
+    while k < BUSES {
+        under = ((a.ducks as float[])[k]) as int
+        target = 0.0
+        if under >= 0 && bus_playing(a, under) { target = 1.0 }
+        now = (a.duck_now as float[])[k]
+        step = 1.0
+        if DUCK_SECONDS > 0.0 { step = delta / DUCK_SECONDS }
+        if now < target {
+            now = now + step
+            if now > target { now = target }
+        } else if now > target {
+            now = now - step
+            if now < target { now = target }
+        }
+        (a.duck_now as float[])[k] = now
+        apply_bus(a, k)
+        k = k + 1
+    }
+    a.update_seconds = platform.time() - started
+}
+
+// Whether any source on a bus is playing.
+bus_playing(a: *Audio, bus: int) -> bool {
+    i = 0
+    while i < list.size(a.sources) {
+        s = list.get_raw(a.sources, i) as *AudioSource
+        if s.bus == bus && is_playing(s) { return true }
+        i = i + 1
+    }
+    return false
+}
