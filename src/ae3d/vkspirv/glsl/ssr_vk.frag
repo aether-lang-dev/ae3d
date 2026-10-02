@@ -115,7 +115,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float clipNoise;
     float clipNoiseScale;
     int woundCount;
-    vec4 woundData[48];
+    vec4 woundData[96];
     vec4 woundLayers[4];
     float woundCore;
     mat4 projection;
@@ -192,9 +192,16 @@ layout(location = 0) out vec4 FragColor;
 
 
 
+// A stored scene depth as clip-space z: OpenGL keeps depth in 0..1 for a
+// clip range of -1..1, Vulkan's clip range is the 0..1 it stores. The
+// generator rewrites this for the Vulkan build, as the occlusion's (#491).
+float ssr_depth_clip(float depth) {
+    return depth;
+}
+
 // The world position the depth at a screen UV was written from.
 vec3 worldFromDepth(vec2 uv) {
-    float d = texture(depthTexture, uv).r;
+    float d = ssr_depth_clip(texture(depthTexture, uv).r);
     vec4 clip = vec4(uv * 2.0 - 1.0, d, 1.0);
     vec4 world = invViewProjection * clip;
     return world.xyz / world.w;

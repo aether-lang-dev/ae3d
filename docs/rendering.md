@@ -77,7 +77,11 @@ The feature list in full, with the reasoning behind each. The [README](../README
   percent of the lamp is the streak every wet street has. The critique
   counts the reflection as the share of the road band the mirrored scene
   lifts by a visible step (13.6% in the street, wanted 5%), not as cells
-  that go white -- the mirror did that; a wet road does not.
+  that go white -- the mirror did that; a wet road does not. One pass on
+  both renderers, from the same shader, each reading its own scene depth
+  (OpenGL's since #491): street_drive's road band is 0.34 of 255 apart
+  across the two with it on, and the pass costs 0.12 ms on OpenGL and
+  0.11 on Vulkan at 1280 by 720.
 - **Models compose.** A model keeps its own transform and composes it onto its
   parent's, so bones are ordinary models: a clip exported from Blender drives a
   bone exactly as it drives a part, and `ae3d.ik` solves a limb of bones
@@ -594,6 +598,17 @@ block grew to 10,384 bytes. A wounded model draws on its own and keeps the
 shadow map, as a cut one does. `tests/test_skinned_render` holds the hole and
 the blood on both renderers, and `tests/test_shadows` the hole a wound
 through the sphere puts in its shadow.
+
+### Splats
+
+`core.model_set_splat(m, index, centre, radii, rotation, opacity)` is blood
+on the skin (#546): an ellipsoid of the model's bind space, in the same 32
+slots as the wounds, laid over whatever surface it covers in the outermost
+wound layer's colour, its edge ragged by value noise, carried by the skin as
+it moves. No hole and no layers: a splat is on the skin. `opacity` fades an
+old one. `tests/test_skinned_render` holds it on both renderers: blood where
+the splat is, nothing holed, none at opacity 0, and still there with the
+column bent.
 
 ### Particles
 
