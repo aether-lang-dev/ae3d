@@ -1,0 +1,458 @@
+// ae3d.locomotion -- a figure that walks and runs under a player's hand
+// (#576): a character controller for where it goes, a figure for how it
+// looks going there, and the motion between them.
+//
+//   c = physics.character_controller(player, 0.3, 1.8)
+//   l = locomotion.attach(e, player, c, "Idle", "Walk", "Run")
+//   locomotion.set_input(l, direction, running)        // every frame, from the input
+//
+// The body has momentum: the velocity asked for is reached at no more than
+// ACCELERATION and given up at no more than DECELERATION, metres a second
+// each second, so a start leans into its first steps and a stop settles
+// rather than the figure being set to speed and back.
+//
+// The clip follows the speed, and the speed the clip. Each clip's own
+// speed is what its feet cover over a cycle (read from the clip, as the
+// crowd's banks are: the root's travel, or the foot on the ground's for a
+// clip made in place), so playing a clip at the body's speed over its own
+// leaves the feet where they were set down. Below IDLE_BELOW the figure
+// idles; above the middle of the walk's and the run's speeds it runs.
+// Changing clip is inertialized (ae3d.figure.play_blended), never a cut.
+//
+// The facing turns toward the way the body goes at no more than TURN_RATE,
+// so a turn takes the figure round over a few steps instead of spinning it
+// on the spot. The hips lean: into a turn by how fast it turns at its speed
+// (at most LEAN_TURN), and forward into speeding up and back into slowing
+// down (at most LEAN_PITCH).
+//
+// A step the controller climbs at once, the body climbs over STEP_SPEED:
+// the hips are carried by the difference while the capsule is already up,
+// so a kerb is not a jump in the drawn figure. Feet on the world
+// (ae3d.feet) finish the job where the figure has them.
+import std.heap
+import std.list
+import std.string
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.gltf
+import ae3d.anim
+import ae3d.crowd
+import ae3d.posing
+import ae3d.figure
+import ae3d.skin
+import ae3d.ik
+import ae3d.physics
+
+exports (
+    Locomotion,
+    attach, locomotion_free, set_input, set_speeds, speed, heading, velocity, clip_now, clip_speed,
+    lean_roll, lean_pitch, hips_lift,
+    ACCELERATION, DECELERATION, TURN_RATE, IDLE_BELOW, LEAN_TURN, LEAN_PITCH, STEP_SPEED, BLEND_SECONDS
+)
+
+const ACCELERATION = 4.0              // metres a second, each second
+const DECELERATION = 6.0
+const TURN_RATE = 4.0                 // radians a second
+const IDLE_BELOW = 0.15               // metres a second
+const LEAN_TURN = 0.21                // radians (12 degrees)
+const LEAN_PITCH = 0.1                // radians (6 degrees)
+const STEP_SPEED = 1.2                // metres a second the drawn body climbs a step at
+const BLEND_SECONDS = 0.25
+const SAMPLES_PER_SECOND = 120       // a clip's speed read at twice a frame's rate
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+struct Locomotion {
+    engine: ptr
+    object: ptr                       // *GameObject
+    figure: ptr                       // *Figure
+    controller: ptr                   // *CharacterController
+    hips: ptr                         // *Model
+    idle: string
+    walk: string
+    run: string
+    walk_speed: float                 // metres a second the clip's feet cover at its own pace
+    run_speed: float
+    walk_max: float                   // the body's top speeds
+    run_max: float
+    input: Vec3                       // the way asked for, its length up to 1
+    running: bool
+    velocity: Vec3
+    heading: float                    // radians about up; 0 faces +z
+    playing: int                      // 0 idle, 1 walk, 2 run
+    roll: float
+    pitch: float
+    last_speed: float
+    facing: float                     // the way the clips walk, radians about up from +z, in the figure's own frame
+    drawn_y: float                    // where the drawn body stands
+    drawn_known: bool
+    lift: float                       // how far the hips are carried this frame
+    // The hips' own pose, before this frame's lift and lean, and what was
+    // written over it: a hips bone no clip poses keeps what was written, and
+    // is given its own back before the next frame's are applied.
+    hips_pos: Vec3
+    hips_rot: Quat
+    wrote_pos: Vec3
+    wrote_rot: Quat
+    wrote: bool
+    behaviour: ptr
+}
+
+// Locomotion for the figure on `o`, moved by `controller`, with its idle,
+// walk and run clips by name. The clips' speeds are read now: what each
+// clip's feet cover over a cycle, at the figure's scale.
+attach(e: *Engine, o: *GameObject, controller: *CharacterController, idle: string, walk: string, run: string) -> *Locomotion {
+    fig = figure.figure_of(o)
+    if fig == null || controller == null { return null }
+    l = heap.new(Locomotion)
+    l.engine = e as ptr
+    l.object = o as ptr
+    l.figure = fig as ptr
+    l.controller = controller as ptr
+    l.idle = string.copy(idle)
+    l.walk = string.copy(walk)
+    l.run = string.copy(run)
+    // Read off the figure's bones in the world, so at the object's scale.
+    l.walk_speed = clip_travel_speed(fig, walk)
+    l.run_speed = clip_travel_speed(fig, run)
+    l.facing = clip_facing(fig, o, walk)
+    if l.walk_speed <= 0.0 { l.walk_speed = 1.4 }
+    if l.run_speed <= l.walk_speed { l.run_speed = l.walk_speed * 2.5 }
+    l.walk_max = l.walk_speed
+    l.run_max = l.run_speed
+    l.hips = find_hips(fig, walk) as ptr
+    l.playing = 0
+    figure.play(fig, idle, 1.0, true)
+    b = engine.behaviour_new("locomotion", l as ptr)
+    b.fixed_update = on_step
+    b.update = on_frame
+    b.pose = on_pose
+    engine.engine_add_behaviour(e, b)
+    l.behaviour = b as ptr
+    return l
+}
+
+// A clip's speed at its own pace: what its feet cover over a cycle, over the
+// cycle's length.
+clip_travel_speed(fig: *Figure, name: string) -> float {
+    file = fig.file as *GltfScene
+    duration = gltf.animation_duration(file, name)
+    if duration <= 0.0 { return 0.0 }
+    // Finely: which foot is the lowest changes between samples, and a coarse
+    // bake puts the change a sample early or late and the speed off by it.
+    frames = (duration * SAMPLES_PER_SECOND) as int + 1
+    bank = gltf.bake_bank(file, name, frames)
+    if bank == null { return 0.0 }
+    speed = posing.posebank_travel(bank, frames) / duration
+    crowd.posebank_free(bank)
+    // The bake posed the figure; the clip that plays will pose it again.
+    return speed
+}
+
+// The way a clip walks, in the figure's own frame: radians about up from
+// +z. Its root's way over the ground where it carries travel; for a clip
+// made in place, against the way its foot on the ground goes back under it.
+clip_facing(fig: *Figure, o: *GameObject, name: string) -> float {
+    sk = figure.skeleton(fig)
+    if sk == null { return 0.0 }
+    bones = skin.skeleton_count(sk)
+    file = fig.file as *GltfScene
+    duration = gltf.animation_duration(file, name)
+    if duration <= 0.0 || bones <= 0 { return 0.0 }
+    reg = anim.registry_new()
+    gltf.play(file, name, reg, true)
+    samples = 48
+    at = calloc((samples + 1) * bones * 3, 8)
+    p = at as float[]
+    k = 0
+    while k <= samples {
+        t = (k as float) / (samples as float) * duration
+        i = 0
+        while i < anim.registry_count(reg) {
+            b = anim.registry_binding(reg, i)
+            anim.player_set_time(anim.binding_player(b), t)
+            anim.apply(anim.binding_player(b), anim.binding_model(b))
+            i = i + 1
+        }
+        j = 0
+        while j < bones {
+            bone = skin.skeleton_bone(sk, j)
+            core.model_sync_transform(bone)
+            p[(k * bones + j) * 3] = bone.world_position.x
+            p[(k * bones + j) * 3 + 1] = bone.world_position.y
+            p[(k * bones + j) * 3 + 2] = bone.world_position.z
+            j = j + 1
+        }
+        k = k + 1
+    }
+    anim.registry_free(reg)
+    // The root's way, if it goes anywhere.
+    way = core.vec3(p[samples * bones * 3] - p[0], 0.0, p[samples * bones * 3 + 2] - p[2])
+    if core.v3_len(way) < 0.0001 {
+        // Against the feet: the bones that rise and fall, the lowest of them
+        // each frame, its way back under the body summed.
+        top = 0.0 - 1000000000.0
+        bottom = 1000000000.0
+        j = 0
+        while j < bones {
+            if p[j * 3 + 1] > top { top = p[j * 3 + 1] }
+            if p[j * 3 + 1] < bottom { bottom = p[j * 3 + 1] }
+            j = j + 1
+        }
+        lift = (top - bottom) * 0.05
+        back = core.vec3(0.0, 0.0, 0.0)
+        k = 0
+        while k < samples {
+            lowest = 0 - 1
+            j = 0
+            while j < bones {
+                low = 1000000000.0
+                high = 0.0 - 1000000000.0
+                kk = 0
+                while kk <= samples {
+                    y = p[(kk * bones + j) * 3 + 1]
+                    if y < low { low = y }
+                    if y > high { high = y }
+                    kk = kk + 1
+                }
+                if high - low > lift && (lowest < 0 || p[(k * bones + j) * 3 + 1] < p[(k * bones + lowest) * 3 + 1]) { lowest = j }
+                j = j + 1
+            }
+            if lowest >= 0 {
+                from = (k * bones + lowest) * 3
+                to = ((k + 1) * bones + lowest) * 3
+                back = core.v3_add(back, core.vec3(p[to] - p[from], 0.0, p[to + 2] - p[from + 2]))
+            }
+            k = k + 1
+        }
+        way = core.v3_mul(back, 0.0 - 1.0)
+    }
+    free(at)
+    if core.v3_len(way) < 0.000001 { return 0.0 }
+    // Into the figure's own frame: the object's turn taken off.
+    local = core.quat_apply(core.quat_conjugate(behaviour.object_world_rotation(o)), way)
+    return core.atan2_of(local.x, local.z)
+}
+
+// The bone the legs hang from: by the names packs use, else the bone
+// nearest the root that the walk poses -- a skin's first joint is often a
+// still root above it.
+find_hips(fig: *Figure, walk: string) -> *Model {
+    sk = figure.skeleton(fig)
+    if sk == null { return null }
+    i = skin.skeleton_find(sk, "Hips")
+    if i < 0 { i = skin.skeleton_find(sk, "mixamorig:Hips") }
+    if i < 0 { i = skin.skeleton_find(sk, "hips") }
+    if i >= 0 { return skin.skeleton_bone(sk, i) }
+    reg = anim.registry_new()
+    gltf.play(fig.file as *GltfScene, walk, reg, true)
+    best = null as *Model
+    best_depth = 1000000
+    k = 0
+    while k < anim.registry_count(reg) {
+        m = anim.binding_model(anim.registry_binding(reg, k))
+        if m != null && skin_has(sk, m) {
+            depth = 0
+            up = m.parent as *Model
+            while up != null {
+                depth = depth + 1
+                up = up.parent as *Model
+            }
+            if depth < best_depth {
+                best_depth = depth
+                best = m
+            }
+        }
+        k = k + 1
+    }
+    anim.registry_free(reg)
+    if best != null { return best }
+    return skin.skeleton_bone(sk, 0)
+}
+
+skin_has(sk: *Skeleton, m: *Model) -> bool {
+    i = 0
+    while i < skin.skeleton_count(sk) {
+        if skin.skeleton_bone(sk, i) == m { return true }
+        i = i + 1
+    }
+    return false
+}
+
+locomotion_free(l: *Locomotion) {
+    if l == null { return }
+    e = l.engine as *Engine
+    if e != null && l.behaviour != null { engine.engine_remove_behaviour(e, l.behaviour as *Behaviour) }
+    heap.free(l)
+}
+
+// The way to go, in the world (its length 0 to 1, a stick's deflection),
+// and whether to run.
+set_input(l: *Locomotion, direction: Vec3, running: bool) {
+    if l == null { return }
+    d = core.vec3(direction.x, 0.0, direction.z)
+    n = core.v3_len(d)
+    if n > 1.0 { d = core.v3_mul(d, 1.0 / n) }
+    l.input = d
+    l.running = running
+}
+
+// The body's top walking and running speeds (the clips' own unless set).
+set_speeds(l: *Locomotion, walk: float, run: float) {
+    l.walk_max = walk
+    l.run_max = run
+}
+
+speed(l: *Locomotion) -> float { return core.v3_len(core.vec3(l.velocity.x, 0.0, l.velocity.z)) }
+heading(l: *Locomotion) -> float { return l.heading }
+velocity(l: *Locomotion) -> Vec3 { return l.velocity }
+clip_now(l: *Locomotion) -> int { return l.playing }
+lean_roll(l: *Locomotion) -> float { return l.roll }
+lean_pitch(l: *Locomotion) -> float { return l.pitch }
+hips_lift(l: *Locomotion) -> float { return l.lift }
+
+// A clip's own speed: 1 the walk, 2 the run.
+clip_speed(l: *Locomotion, which: int) -> float {
+    if which == 1 { return l.walk_speed }
+    if which == 2 { return l.run_speed }
+    return 0.0
+}
+
+clamp(x: float, low: float, high: float) -> float {
+    if x < low { return low }
+    if x > high { return high }
+    return x
+}
+
+toward(now: float, wanted: float, most: float) -> float {
+    if now < wanted {
+        moved = now + most
+        if moved > wanted { return wanted }
+        return moved
+    }
+    moved = now - most
+    if moved < wanted { return wanted }
+    return moved
+}
+
+// A fixed step: the velocity toward what is asked, within the body's
+// acceleration, and the controller moved by it.
+on_step(state: ptr, e: *Engine, step: float) {
+    l = state as *Locomotion
+    top = l.walk_max
+    if l.running { top = l.run_max }
+    wanted = core.v3_mul(l.input, top)
+    dx = wanted.x - l.velocity.x
+    dz = wanted.z - l.velocity.z
+    change = core.sqrt_of(dx * dx + dz * dz)
+    // Speeding up or slowing down: which limit holds.
+    now_speed = core.sqrt_of(l.velocity.x * l.velocity.x + l.velocity.z * l.velocity.z)
+    wanted_speed = core.sqrt_of(wanted.x * wanted.x + wanted.z * wanted.z)
+    limit = ACCELERATION
+    if wanted_speed < now_speed { limit = DECELERATION }
+    most = limit * step
+    if change > most && change > 0.0 {
+        dx = dx * most / change
+        dz = dz * most / change
+    }
+    l.velocity = core.vec3(l.velocity.x + dx, 0.0, l.velocity.z + dz)
+    physics.character_move(l.controller as *CharacterController, l.velocity, 0.0, step)
+}
+
+// A frame: the facing turned, the clip chosen and paced, the lean worked out.
+on_frame(state: ptr, e: *Engine, delta: float) {
+    l = state as *Locomotion
+    fig = l.figure as *Figure
+    o = l.object as *GameObject
+    sp = speed(l)
+    before = l.heading
+    if sp > IDLE_BELOW {
+        wanted = core.atan2_of(l.velocity.x, l.velocity.z)
+        d = wanted - l.heading
+        while d > 3.14159265 { d = d - 6.2831853 }
+        while d < 0.0 - 3.14159265 { d = d + 6.2831853 }
+        most = TURN_RATE * delta
+        if d > most { d = most }
+        if d < 0.0 - most { d = 0.0 - most }
+        l.heading = l.heading + d
+    }
+    // The figure turned so the way its clips walk is the heading.
+    behaviour.object_set_rotation(o, core.quat_rotate(l.heading - l.facing, core.vec3(0.0, 1.0, 0.0)))
+    // The clip for the speed, and its pace so its feet cover what the body does.
+    which = 0
+    if sp > IDLE_BELOW {
+        which = 1
+        if sp > (l.walk_speed + l.run_speed) * 0.5 { which = 2 }
+    }
+    if which != l.playing {
+        name = l.idle
+        if which == 1 { name = l.walk }
+        if which == 2 { name = l.run }
+        figure.play_blended(fig, name, 1.0, true, BLEND_SECONDS)
+        l.playing = which
+    }
+    if which == 1 { figure.set_speed(fig, sp / l.walk_speed) }
+    if which == 2 { figure.set_speed(fig, sp / l.run_speed) }
+    if which == 0 { figure.set_speed(fig, 1.0) }
+    // The lean: into the turn by how fast it turns at its speed, and with the
+    // change of speed.
+    if delta > 0.0 {
+        turning = (l.heading - before) / delta
+        roll_wanted = clamp(turning * sp * 0.08, 0.0 - LEAN_TURN, LEAN_TURN)
+        pitch_wanted = clamp((sp - l.last_speed) / delta * 0.04, 0.0 - LEAN_PITCH, LEAN_PITCH)
+        l.roll = toward(l.roll, roll_wanted, 1.5 * delta)
+        l.pitch = toward(l.pitch, pitch_wanted, 1.5 * delta)
+    }
+    l.last_speed = sp
+    // The drawn body eased up a step the capsule took at once.
+    y = behaviour.object_world_position(o).y
+    if !l.drawn_known {
+        l.drawn_y = y
+        l.drawn_known = true
+    }
+    l.drawn_y = toward(l.drawn_y, y, STEP_SPEED * delta)
+    if l.drawn_y < y - 0.5 || l.drawn_y > y + 0.5 { l.drawn_y = y }
+    l.lift = l.drawn_y - y
+}
+
+// The pose phase: the hips carried down to where the drawn body is and
+// leaned.
+on_pose(state: ptr, e: *Engine) {
+    l = state as *Locomotion
+    hips = l.hips as *Model
+    if hips == null { return }
+    // The hips' own pose: what the clip wrote this frame, or, where nothing
+    // did, what they had before last frame's lift and lean.
+    if l.wrote && same_v(hips.position, l.wrote_pos) && same_q(hips.rotation, l.wrote_rot) {
+        core.model_set_position(hips, l.hips_pos.x, l.hips_pos.y, l.hips_pos.z)
+        core.model_set_rotation(hips, l.hips_rot)
+    }
+    l.hips_pos = hips.position
+    l.hips_rot = hips.rotation
+    if l.lift != 0.0 {
+        core.model_sync_transform(hips)
+        world = core.v3_add(hips.world_position, core.vec3(0.0, l.lift, 0.0))
+        parent = core.model_parent(hips)
+        if parent == null {
+            core.model_set_position(hips, world.x, world.y, world.z)
+        } else {
+            core.model_sync_transform(parent)
+            local = core.mat4_transform_point(core.mat4_inverse(parent.model_matrix), world)
+            core.model_set_position(hips, local.x, local.y, local.z)
+        }
+    }
+    if l.roll != 0.0 || l.pitch != 0.0 {
+        forward = core.vec3(core.sin_of(l.heading), 0.0, core.cos_of(l.heading))
+        side = core.vec3(forward.z, 0.0, 0.0 - forward.x)
+        lean = core.quat_mul(core.quat_rotate(0.0 - l.roll, forward), core.quat_rotate(l.pitch, side))
+        ik.turn_world(hips, core.quat_normalize(lean))
+    }
+    l.wrote_pos = hips.position
+    l.wrote_rot = hips.rotation
+    l.wrote = true
+}
+
+same_v(a: Vec3, b: Vec3) -> bool { return a.x == b.x && a.y == b.y && a.z == b.z }
+same_q(a: Quat, b: Quat) -> bool { return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w }
