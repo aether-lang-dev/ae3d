@@ -578,6 +578,23 @@ and `tests/test_shadows` hold it on both renderers; on zombie_city's 20,000
 the depth shader's cut costs nothing measurable (shadow pass 0.31 ms, as
 recorded).
 
+### Wounds
+
+`core.model_set_wound(m, index, centre, radii, rotation)` puts a wound on a
+model (#543): an ellipsoid in its bind space, up to sixteen
+(`core.MAX_WOUNDS`), the way Left 4 Dead 2 cut its zombies (Vlachos, GDC
+2010). Inside it the skin is drawn cut down through layers -- blood at the
+rim, then fat, muscle and bone, each from the share of the wound's radius it
+starts at (`model_set_wound_layer`) -- and inside `model_set_wound_core` of
+the radius it is a hole, in the scene, its depth and every shadow alike; the
+game fills the cavity with a wound mesh on the bone. The wounds go to the
+shaders as three vec4s each (centre, radii, rotation), already 32-bit
+floats: `glUniform4fv` on OpenGL, one copy into the block on Vulkan, whose
+block grew to 10,384 bytes. A wounded model draws on its own and keeps the
+shadow map, as a cut one does. `tests/test_skinned_render` holds the hole and
+the blood on both renderers, and `tests/test_shadows` the hole a wound
+through the sphere puts in its shadow.
+
 ### Particles
 
 `ae3d.particles` is an emitter (#546): blood spraying from a hit and

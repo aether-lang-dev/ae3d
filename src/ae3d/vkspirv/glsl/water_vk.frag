@@ -114,6 +114,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 clipPlane;
     float clipNoise;
     float clipNoiseScale;
+    int woundCount;
+    vec4 woundData[48];
+    vec4 woundLayers[4];
+    float woundCore;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;

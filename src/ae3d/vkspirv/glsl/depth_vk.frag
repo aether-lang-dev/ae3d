@@ -114,6 +114,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 clipPlane;
     float clipNoise;
     float clipNoiseScale;
+    int woundCount;
+    vec4 woundData[48];
+    vec4 woundLayers[4];
+    float woundCore;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -211,10 +215,44 @@ bool clippedAway(vec3 bindPos) {
     return side > 0.0;
 }
 
+// Wounds (#543): up to 16 ellipsoids in the model's bind space, three vec4s
+// each -- the centre, the radii along its own axes, the rotation (a
+// quaternion) from those axes into bind space -- and the layers a wound
+// cuts down through, rgb and the share of its radius each starts at. Inside
+// woundCore of a wound's radius the skin is a hole. The same words are in
+// the scene's fragment shader and the depth one, so a hole is a hole in
+// the frame, its depth and its shadow alike.
+
+
+
+
+
+// `v` turned by the inverse of the rotation `q`.
+vec3 woundUnturn(vec4 q, vec3 v) {
+    vec3 u = -q.xyz;
+    vec3 t = 2.0 * cross(u, v);
+    return v + q.w * t + cross(u, t);
+}
+
+// How deep in the nearest wound a bind-space point is: the wound's
+// ellipsoid scaled to reach it, 1 at its surface and 0 at its centre;
+// 2 where it is in no wound.
+float woundDepth(vec3 p) {
+    float best = 2.0;
+    for (int i = 0; i < 16; i++) {
+        if (i >= woundCount) break;
+        vec3 r = max(woundData[i * 3 + 1].xyz, vec3(0.0001));
+        vec3 local = woundUnturn(woundData[i * 3 + 2], p - woundData[i * 3].xyz) / r;
+        best = min(best, length(local));
+    }
+    return best;
+}
+
 // Nothing to write. The depth attachment takes gl_FragCoord.z on its own, and
 // this used to put the same number into a colour buffer beside it: a second
 // full-resolution write per shadow texel that nothing read. A cut model's far
 // side is dropped, so it casts no shadow of what is not drawn.
 void main() {
     if (clippedAway(BindPos)) discard;
+    if (woundCount > 0 && woundDepth(BindPos) < woundCore) discard;
 }
