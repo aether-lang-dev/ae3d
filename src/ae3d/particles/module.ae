@@ -1,0 +1,437 @@
+// Particles (#546): an emitter that spawns at a rate or in bursts, each
+// particle thrown into a cone with a speed and a lifetime, pulled by
+// gravity and slowed by drag, landing on the static world -- the physics'
+// static colliders, where the engine has physics, and a ground height --
+// and saying where it landed, so a game turns a drop of blood into a stain
+// or a spark into a scorch. Blood spraying from a hit and dripping from a
+// wound, dust, sparks, debris.
+//
+// Drawn as the weather's particles are: one model an emitter, a quad turned
+// to the eye at every point instance (core.model_set_billboard, full), a
+// soft disc for a texture, a colour and a scale a point -- the scale
+// running from the size at birth to the size at death, which is the fade.
+// The particles are the emitter's arrays, uploaded whole each frame
+// (core.model_set_instance_positions, _scales); a dead one is the last one
+// moved into its place.
+//
+// Stepped on the engine's fixed step, with a generator of its own seeded by
+// the game: the same emitter does the same thing on every run, as a replay
+// or a networked game needs. A landing is found by a ray along the step's
+// move against the static world (physics.ray_static_hit), one a particle a
+// step: a thousand particles at 60 Hz are sixty thousand rays a second.
+
+import std.heap
+import ae3d.core
+import ae3d.engine
+import ae3d.png
+import ae3d.picture
+import ae3d.physics
+
+exports (
+    Emitter, emitter, emitter_free, emitter_step, burst,
+    set_position, set_direction, set_rate, set_speed, set_lifetime, set_gravity, set_drag,
+    set_size, set_color, set_ground, set_seed, on_land,
+    alive, landed, spawned, particle_position, particle_velocity, emitter_model
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern sqrt(x: float) -> float
+extern sin(x: float) -> float
+extern cos(x: float) -> float
+
+const DISC = 32                      // the soft disc's texels a side
+const PI = 3.14159265358979323846
+
+struct Emitter {
+    engine: ptr                      // *Engine
+    model: ptr                       // *Model, every particle a point instance of it
+    behaviour: ptr                   // *Behaviour, the fixed step
+    capacity: int
+    count: int                       // alive now
+    xyz: ptr                         // float[capacity * 3]
+    velocity: ptr                    // float[capacity * 3]
+    age: ptr                         // float[capacity]
+    life: ptr                        // float[capacity]
+    scales: ptr                      // float[capacity], uploaded
+    position: Vec3                   // where particles are born
+    direction: Vec3                  // the cone's axis, unit
+    cone: float                      // the cone's half angle, radians
+    rate: float                      // particles a second; 0 for bursts alone
+    owed: float                      // the fraction of a particle the rate owes
+    speed_low: float
+    speed_high: float
+    life_low: float
+    life_high: float
+    gravity: Vec3
+    drag: float                      // the share of its speed a particle loses a second
+    size_start: float
+    size_end: float
+    red: float
+    green: float
+    blue: float
+    has_ground: bool
+    ground: float                    // the height of a plane a particle lands on
+    seed: long
+    land: fn(ptr, Vec3, Vec3)        // where it landed and the surface's normal; null for none
+    land_context: ptr
+    landed_count: int
+    spawned_count: int
+}
+
+// An emitter of at most `capacity` particles at once, its model in the
+// engine and its step in the engine's loop: born at the origin, thrown up
+// into a cone of 15 degrees at 2 to 3 m/s, living two seconds, under
+// Earth's gravity, a tenth of a metre across, white. Set what differs.
+emitter(e: *Engine, capacity: int) -> *Emitter {
+    em = heap.new(Emitter)
+    em.engine = e as ptr
+    em.capacity = capacity
+    em.xyz = calloc(capacity * 3, 8)
+    em.velocity = calloc(capacity * 3, 8)
+    em.age = calloc(capacity, 8)
+    em.life = calloc(capacity, 8)
+    em.scales = calloc(capacity, 8)
+    em.position = core.vec3(0.0, 0.0, 0.0)
+    em.direction = core.vec3(0.0, 1.0, 0.0)
+    em.cone = 15.0 * PI / 180.0
+    em.speed_low = 2.0
+    em.speed_high = 3.0
+    em.life_low = 2.0
+    em.life_high = 2.0
+    em.gravity = core.vec3(0.0, 0.0 - 9.81, 0.0)
+    em.size_start = 0.1
+    em.size_end = 0.1
+    em.red = 1.0
+    em.green = 1.0
+    em.blue = 1.0
+    em.seed = 1 as long
+    m = quad()
+    core.model_set_texture(m, soft_disc())
+    core.model_set_casts_shadow(m, false)
+    core.model_enable_instancing(m, capacity)
+    core.model_enable_point_instancing(m)
+    core.model_enable_instance_colors(m)
+    core.model_set_billboard(m, 2)
+    // Added with every instance counted, since a renderer sets up an
+    // instanced model's buffers from the count it has when it is added;
+    // then drawn to none until there are particles.
+    engine.engine_add_model(e, m)
+    core.model_set_instance_draw_count(m, 0)
+    em.model = m as ptr
+    b = engine.behaviour_new("particles", em as ptr)
+    b.fixed_update = on_fixed
+    engine.engine_add_behaviour(e, b)
+    em.behaviour = b as ptr
+    return em
+}
+
+emitter_free(em: *Emitter) {
+    if em == null { return }
+    e = em.engine as *Engine
+    if em.behaviour != null {
+        engine.engine_remove_behaviour(e, em.behaviour as *Behaviour)
+        heap.free(em.behaviour as *Behaviour)
+    }
+    if em.model != null {
+        engine.engine_remove_model(e, em.model as *Model)
+        core.model_free(em.model as *Model)
+    }
+    free(em.xyz)
+    free(em.velocity)
+    free(em.age)
+    free(em.life)
+    free(em.scales)
+    heap.free(em)
+}
+
+on_fixed(state: ptr, e: *Engine, step: float) {
+    emitter_step(state as *Emitter, step)
+}
+
+// --- what a game sets ---------------------------------------------------------------------------------------
+
+set_position(em: *Emitter, at: Vec3) { em.position = at }
+
+// The cone particles are thrown into: its axis and its half angle in radians.
+set_direction(em: *Emitter, direction: Vec3, cone: float) {
+    if core.v3_len(direction) > 0.000001 { em.direction = core.v3_normalize(direction) }
+    em.cone = cone
+}
+
+set_rate(em: *Emitter, per_second: float) { em.rate = per_second }
+
+set_speed(em: *Emitter, low: float, high: float) {
+    em.speed_low = low
+    em.speed_high = high
+}
+
+set_lifetime(em: *Emitter, low: float, high: float) {
+    em.life_low = low
+    em.life_high = high
+}
+
+set_gravity(em: *Emitter, g: Vec3) { em.gravity = g }
+
+// The share of its speed a particle loses each second: 0 none, 1 all of
+// it in a second (taken a step at a time).
+set_drag(em: *Emitter, per_second: float) { em.drag = per_second }
+
+// Across, in metres, at birth and at death; between, as it ages.
+set_size(em: *Emitter, start: float, end: float) {
+    em.size_start = start
+    em.size_end = end
+}
+
+set_color(em: *Emitter, r: float, g: float, b: float) {
+    em.red = r
+    em.green = g
+    em.blue = b
+}
+
+// A plane at height `y` particles land on, as well as the static world.
+set_ground(em: *Emitter, y: float) {
+    em.has_ground = true
+    em.ground = y
+}
+
+set_seed(em: *Emitter, seed: long) {
+    em.seed = seed
+    if em.seed == (0 as long) { em.seed = 1 as long }
+}
+
+// Called for every particle that lands, with where and the surface's
+// normal; the particle is gone after.
+on_land(em: *Emitter, listener: fn(ptr, Vec3, Vec3), context: ptr) {
+    em.land = listener
+    em.land_context = context
+}
+
+// --- what a game reads ----------------------------------------------------------------------------------------
+
+alive(em: *Emitter) -> int { return em.count }
+landed(em: *Emitter) -> int { return em.landed_count }
+spawned(em: *Emitter) -> int { return em.spawned_count }
+emitter_model(em: *Emitter) -> *Model { return em.model as *Model }
+
+particle_position(em: *Emitter, index: int) -> Vec3 {
+    if index < 0 || index >= em.count { return core.vec3(0.0, 0.0, 0.0) }
+    x = em.xyz as float[]
+    return core.vec3(x[index * 3], x[index * 3 + 1], x[index * 3 + 2])
+}
+
+particle_velocity(em: *Emitter, index: int) -> Vec3 {
+    if index < 0 || index >= em.count { return core.vec3(0.0, 0.0, 0.0) }
+    v = em.velocity as float[]
+    return core.vec3(v[index * 3], v[index * 3 + 1], v[index * 3 + 2])
+}
+
+// --- the step -----------------------------------------------------------------------------------------------
+
+// `n` particles at once, as many as there is room for: a spray at a hit.
+burst(em: *Emitter, n: int) {
+    k = 0
+    while k < n && em.count < em.capacity {
+        emit_one(em)
+        k = k + 1
+    }
+    upload(em)
+}
+
+// One step: the rate's particles born, every particle aged, moved and
+// landed, the dead taken out, and the rest uploaded.
+emitter_step(em: *Emitter, step: float) {
+    if step <= 0.0 { return }
+    em.owed = em.owed + em.rate * step
+    while em.owed >= 1.0 {
+        em.owed = em.owed - 1.0
+        if em.count < em.capacity { emit_one(em) }
+    }
+    p = physics.of(em.engine as *Engine)
+    x = em.xyz as float[]
+    v = em.velocity as float[]
+    age = em.age as float[]
+    life = em.life as float[]
+    keep = 1.0 - em.drag * step
+    if keep < 0.0 { keep = 0.0 }
+    i = 0
+    while i < em.count {
+        age[i] = age[i] + step
+        if age[i] >= life[i] {
+            kill(em, i)
+        } else {
+            // Moved by the mean of the step's velocities, the one it had and
+            // the one gravity and drag leave it: under gravity alone that is
+            // where it truly is (a step's velocity alone fell short of the
+            // top of a throw by v dt / 2).
+            at = i * 3
+            vx = (v[at] + em.gravity.x * step) * keep
+            vy = (v[at + 1] + em.gravity.y * step) * keep
+            vz = (v[at + 2] + em.gravity.z * step) * keep
+            from = core.vec3(x[at], x[at + 1], x[at + 2])
+            to = core.vec3(from.x + (v[at] + vx) * 0.5 * step, from.y + (v[at + 1] + vy) * 0.5 * step, from.z + (v[at + 2] + vz) * 0.5 * step)
+            v[at] = vx
+            v[at + 1] = vy
+            v[at + 2] = vz
+            if lands(em, p, from, to) {
+                kill(em, i)
+            } else {
+                x[at] = to.x
+                x[at + 1] = to.y
+                x[at + 2] = to.z
+                i = i + 1
+            }
+        }
+    }
+    upload(em)
+}
+
+// Whether the move from `from` to `to` meets the static world or the
+// ground; said to the game where it does.
+lands(em: *Emitter, p: *Physics, from: Vec3, to: Vec3) -> bool {
+    move = core.v3_sub(to, from)
+    reach = core.v3_len(move)
+    best = 2.0
+    point = to
+    normal = core.vec3(0.0, 1.0, 0.0)
+    if p != null && reach > 0.000001 {
+        hit = physics.ray_static_hit(p, from, core.v3_mul(move, 1.0 / reach), reach)
+        if hit.hit {
+            best = hit.fraction
+            point = hit.point
+            normal = hit.normal
+        }
+    }
+    if em.has_ground && to.y <= em.ground && from.y > em.ground {
+        share = (from.y - em.ground) / (from.y - to.y)
+        if share < best {
+            best = share
+            point = core.vec3(from.x + move.x * share, em.ground, from.z + move.z * share)
+            normal = core.vec3(0.0, 1.0, 0.0)
+        }
+    }
+    if best > 1.0 { return false }
+    em.landed_count = em.landed_count + 1
+    if em.land != null {
+        said = em.land
+        said(em.land_context, point, normal)
+    }
+    return true
+}
+
+// A particle born at the emitter, thrown into the cone.
+emit_one(em: *Emitter) {
+    i = em.count
+    em.count = em.count + 1
+    em.spawned_count = em.spawned_count + 1
+    // A direction in the cone, uniform over its cap: a cosine between the
+    // cone's and 1, an angle round the axis.
+    cosine = 1.0 - random(em) * (1.0 - cos(em.cone))
+    sine = sqrt(1.0 - cosine * cosine)
+    turn = random(em) * 2.0 * PI
+    axis = em.direction
+    helper = core.vec3(1.0, 0.0, 0.0)
+    if axis.x * axis.x > 0.81 { helper = core.vec3(0.0, 1.0, 0.0) }
+    u = core.v3_normalize(core.v3_cross(axis, helper))
+    w = core.v3_cross(axis, u)
+    dir = core.v3_add(core.v3_mul(axis, cosine), core.v3_add(core.v3_mul(u, sine * cos(turn)), core.v3_mul(w, sine * sin(turn))))
+    speed = em.speed_low + (em.speed_high - em.speed_low) * random(em)
+    x = em.xyz as float[]
+    v = em.velocity as float[]
+    x[i * 3] = em.position.x
+    x[i * 3 + 1] = em.position.y
+    x[i * 3 + 2] = em.position.z
+    v[i * 3] = dir.x * speed
+    v[i * 3 + 1] = dir.y * speed
+    v[i * 3 + 2] = dir.z * speed
+    (em.age as float[])[i] = 0.0
+    (em.life as float[])[i] = em.life_low + (em.life_high - em.life_low) * random(em)
+}
+
+// The last particle moved into the place of the one that died.
+kill(em: *Emitter, i: int) {
+    last = em.count - 1
+    if i != last {
+        x = em.xyz as float[]
+        v = em.velocity as float[]
+        k = 0
+        while k < 3 {
+            x[i * 3 + k] = x[last * 3 + k]
+            v[i * 3 + k] = v[last * 3 + k]
+            k = k + 1
+        }
+        (em.age as float[])[i] = (em.age as float[])[last]
+        (em.life as float[])[i] = (em.life as float[])[last]
+    }
+    em.count = last
+}
+
+// The particles to the model: where each is, its size for its age, its colour.
+upload(em: *Emitter) {
+    m = em.model as *Model
+    scales = em.scales as float[]
+    age = em.age as float[]
+    life = em.life as float[]
+    i = 0
+    while i < em.count {
+        t = 0.0
+        if life[i] > 0.0 { t = age[i] / life[i] }
+        scales[i] = em.size_start + (em.size_end - em.size_start) * t
+        core.model_set_instance_color(m, i, em.red, em.green, em.blue)
+        i = i + 1
+    }
+    core.model_set_instance_positions(m, em.xyz, em.count)
+    core.model_set_instance_scales(m, em.scales, em.count)
+    core.model_set_instance_draw_count(m, em.count)
+}
+
+// The emitter's own generator: a 64-bit linear congruential one (Knuth's
+// MMIX constants, wrapping), its top 31 bits taken -- masked, since `>>`
+// on a long carries the sign. A uniform number in [0, 1).
+random(em: *Emitter) -> float {
+    em.seed = em.seed * (6364136223846793005 as long) + (1442695040888963407 as long)
+    bits = (em.seed >> 33) & (2147483647 as long)
+    return (bits as float) / 2147483648.0
+}
+
+// --- the look -----------------------------------------------------------------------------------------------
+
+// A disc white at its middle, clear at its rim.
+soft_disc() -> string {
+    name = "ae3d://particles/soft_disc"
+    pixels = calloc(DISC * DISC, 4)
+    y = 0
+    while y < DISC {
+        x = 0
+        while x < DISC {
+            dx = ((x as float) + 0.5) / (DISC as float) - 0.5
+            dy = ((y as float) + 0.5) / (DISC as float) - 0.5
+            r = sqrt(dx * dx + dy * dy) * 2.0
+            a = 1.0 - r * r
+            if a < 0.0 { a = 0.0 }
+            png.rgba_set(pixels, y * DISC + x, 1.0, 1.0, 1.0, a)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    ok = picture.register_rgba(name, pixels, DISC, DISC) == 1
+    free(pixels)
+    if !ok { return "" }
+    return name
+}
+
+// A unit quad in the XY plane facing +Z, one metre across, centred.
+quad() -> *Model {
+    m = core.model_new()
+    facing = core.vec3(0.0, 0.0, 1.0)
+    core.mesh_reserve(m.mesh, 4, 6)
+    core.mesh_push_vertex(m.mesh, core.vec3(0.0 - 0.5, 0.0 - 0.5, 0.0), 0.0, 0.0, facing)
+    core.mesh_push_vertex(m.mesh, core.vec3(0.5, 0.0 - 0.5, 0.0), 1.0, 0.0, facing)
+    core.mesh_push_vertex(m.mesh, core.vec3(0.5, 0.5, 0.0), 1.0, 1.0, facing)
+    core.mesh_push_vertex(m.mesh, core.vec3(0.0 - 0.5, 0.5, 0.0), 0.0, 1.0, facing)
+    core.mesh_push_triangle(m.mesh, 0, 1, 2)
+    core.mesh_push_triangle(m.mesh, 0, 2, 3)
+    core.model_update_matrix(m)
+    core.model_recalculate_bounds(m)
+    return m
+}

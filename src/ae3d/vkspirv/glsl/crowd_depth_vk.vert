@@ -110,6 +110,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float causticsTime;
     int lampShadowBase;
     int keyLampSlot;
+    bool clipOn;
+    vec4 clipPlane;
+    float clipNoise;
+    float clipNoiseScale;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -192,6 +196,8 @@ layout(location = 11) in float instancePhase;
 // the lamp.
 
 
+layout(location = 0) out vec3 BindPos;
+
 mat4 boneAt(int bone, int frame) {
     int x = bone * 4;
     return mat4(texelFetch(poseBank, ivec2(x + 0, frame), 0),
@@ -208,6 +214,7 @@ mat4 skinAt(int frame) {
 }
 
 void main() {
+    BindPos = inPosition;
     mat4 modelMatrix = model * instanceModel;
     if (shadowReach.w > 0.0 && distance(modelMatrix[3].xyz, shadowReach.xyz) > shadowReach.w) {
         // Outside every clip volume: the triangle is dropped.

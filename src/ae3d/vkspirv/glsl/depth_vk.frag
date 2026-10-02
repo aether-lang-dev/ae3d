@@ -110,6 +110,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float causticsTime;
     int lampShadowBase;
     int keyLampSlot;
+    bool clipOn;
+    vec4 clipPlane;
+    float clipNoise;
+    float clipNoiseScale;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -171,8 +175,46 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 shadowReach;
 };
 
+layout(location = 0) in vec3 BindPos;
+
+// The model's cut (#545): a plane in its bind space -- the vertex before it
+// was skinned, carried in BindPos -- past which nothing is drawn, wandering
+// by up to clipNoise metres as value noise of clipNoiseScale cells a metre.
+// The same words are in the scene's fragment shader and the depth one, so a
+// cut's silhouette and its shadow agree to the texel.
+
+
+
+
+
+float clipHash(vec3 p) {
+    p = fract(p * 0.3183099 + vec3(0.71, 0.113, 0.419));
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float clipValueNoise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(clipHash(i + vec3(0.0, 0.0, 0.0)), clipHash(i + vec3(1.0, 0.0, 0.0)), f.x),
+                   mix(clipHash(i + vec3(0.0, 1.0, 0.0)), clipHash(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),
+               mix(mix(clipHash(i + vec3(0.0, 0.0, 1.0)), clipHash(i + vec3(1.0, 0.0, 1.0)), f.x),
+                   mix(clipHash(i + vec3(0.0, 1.0, 1.0)), clipHash(i + vec3(1.0, 1.0, 1.0)), f.x), f.y), f.z);
+}
+
+// Whether the fragment lies past the cut.
+bool clippedAway(vec3 bindPos) {
+    if (!clipOn) return false;
+    float side = dot(clipPlane.xyz, bindPos) - clipPlane.w;
+    if (clipNoise > 0.0) side += clipNoise * (clipValueNoise(bindPos * clipNoiseScale) * 2.0 - 1.0);
+    return side > 0.0;
+}
+
 // Nothing to write. The depth attachment takes gl_FragCoord.z on its own, and
 // this used to put the same number into a colour buffer beside it: a second
-// full-resolution write per shadow texel that nothing read.
+// full-resolution write per shadow texel that nothing read. A cut model's far
+// side is dropped, so it casts no shadow of what is not drawn.
 void main() {
+    if (clippedAway(BindPos)) discard;
 }

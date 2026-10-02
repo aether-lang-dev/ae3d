@@ -111,6 +111,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float causticsTime;
     int lampShadowBase;
     int keyLampSlot;
+    bool clipOn;
+    vec4 clipPlane;
+    float clipNoise;
+    float clipNoiseScale;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -181,6 +185,7 @@ layout(location = 3) in vec3 InstanceColor;
 layout(location = 4) in vec4 FragPosLightSpace;
 layout(location = 6) in vec4 ClipNow;
 layout(location = 7) in vec4 ClipPrev;
+layout(location = 8) in vec3 BindPos;
 layout(location = 1) out vec2 outVelocity;
 
 
@@ -1375,7 +1380,45 @@ vec2 velocity(vec4 now, vec4 prev, vec2 nudge) {
     return uvNow - uvPrev;
 }
 
+
+// The model's cut (#545): a plane in its bind space -- the vertex before it
+// was skinned, carried in BindPos -- past which nothing is drawn, wandering
+// by up to clipNoise metres as value noise of clipNoiseScale cells a metre.
+// The same words are in the scene's fragment shader and the depth one, so a
+// cut's silhouette and its shadow agree to the texel.
+
+
+
+
+
+float clipHash(vec3 p) {
+    p = fract(p * 0.3183099 + vec3(0.71, 0.113, 0.419));
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float clipValueNoise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(clipHash(i + vec3(0.0, 0.0, 0.0)), clipHash(i + vec3(1.0, 0.0, 0.0)), f.x),
+                   mix(clipHash(i + vec3(0.0, 1.0, 0.0)), clipHash(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),
+               mix(mix(clipHash(i + vec3(0.0, 0.0, 1.0)), clipHash(i + vec3(1.0, 0.0, 1.0)), f.x),
+                   mix(clipHash(i + vec3(0.0, 1.0, 1.0)), clipHash(i + vec3(1.0, 1.0, 1.0)), f.x), f.y), f.z);
+}
+
+// Whether the fragment lies past the cut.
+bool clippedAway(vec3 bindPos) {
+    if (!clipOn) return false;
+    float side = dot(clipPlane.xyz, bindPos) - clipPlane.w;
+    if (clipNoise > 0.0) side += clipNoise * (clipValueNoise(bindPos * clipNoiseScale) * 2.0 - 1.0);
+    return side > 0.0;
+}
+
 void main() {
+    // A cut model's far side, not drawn (#545): nor its depth, which the
+    // occlusion, the reflections and the water read from this pass.
+    if (clippedAway(BindPos)) discard;
 
     vec4 texColor = texture(textureSampler, fragTexCoord);
     

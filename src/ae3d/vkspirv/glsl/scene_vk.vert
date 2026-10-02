@@ -110,6 +110,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float causticsTime;
     int lampShadowBase;
     int keyLampSlot;
+    bool clipOn;
+    vec4 clipPlane;
+    float clipNoise;
+    float clipNoiseScale;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -218,8 +222,10 @@ layout(location = 4) out vec4 FragPosLightSpace;
 layout(location = 5) out float Occlusion;
 layout(location = 6) out vec4 ClipNow;
 layout(location = 7) out vec4 ClipPrev;
+layout(location = 8) out vec3 BindPos;
 
 void main() {
+    BindPos = inPosition;
     Occlusion = inOcclusion;
     // Decide whether to use instanced or regular model matrix
     // For instanced rendering, we multiply the global model matrix by the instance matrix

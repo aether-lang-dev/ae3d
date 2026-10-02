@@ -110,6 +110,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float causticsTime;
     int lampShadowBase;
     int keyLampSlot;
+    bool clipOn;
+    vec4 clipPlane;
+    float clipNoise;
+    float clipNoiseScale;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -185,7 +189,10 @@ layout (location = 9) in vec4 inWeights;
 
 
 
+layout(location = 0) out vec3 BindPos;
+
 void main() {
+    BindPos = inPosition;
     // The same transform the lit pass builds. Reading instanceModel alone left
     // an instanced model casting its shadow from wherever its own transform was
     // not applied.
