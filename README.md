@@ -212,6 +212,7 @@ docs/         the documentation, docs/images/ its pictures
 [Agent channel](docs/agent.md) ·
 [Networking](docs/networking.md) ·
 [Natural motion](docs/motion.md) ·
+[Audio](docs/audio.md) ·
 [Editor](docs/editor.md) ·
 [Game UI](docs/ui.md) ·
 [Performance](docs/performance.md) ·

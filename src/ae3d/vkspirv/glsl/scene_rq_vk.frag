@@ -128,6 +128,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float woundCore;
     int damageOn;
     vec4 damageColours[4];
+    vec4 damageRect;
+    float damageClamp;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -1499,6 +1501,12 @@ float splatCover(vec3 p) {
 // stays where it was put however the figure moves, and keeps every hit.
 
 
+// Where the mask is read from (#560): its rectangle of the texture -- the
+// whole of a model's own, or its cell of an atlas page -- and how far in
+// from the cell's edges a read is clamped, so a filtered read never takes
+// a neighbour's.
+
+
 #ifdef VULKAN
 layout(set = 0, binding = 9) uniform sampler2D damageMask;
 #else
@@ -1575,7 +1583,8 @@ void main() {
     // Blood splashed on the skin (#546), the outermost layer's colour.
     if (woundCount > 0) albedo = mix(albedo, woundLayers[0].rgb, splatCover(BindPos));
     // The damage the mask has kept (#544).
-    vec4 damage = texture(damageMask, MaskUV);
+    vec2 maskAt = damageRect.xy + clamp(MaskUV, vec2(damageClamp), vec2(1.0 - damageClamp)) * damageRect.zw;
+    vec4 damage = texture(damageMask, maskAt);
     if (damageOn != 0) {
         for (int k = 0; k < 4; k++) {
             albedo = mix(albedo, damageColours[k].rgb, clamp(damage[k] * damageColours[k].a, 0.0, 1.0));

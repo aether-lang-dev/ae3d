@@ -664,6 +664,22 @@ model's second UV set, or its first when it has none.
   in flight, with no wait on the device. It is bound at binding 9 of the
   scene's set.
 
+**For a horde** (#560), `core.damage_atlas_new(page, cell)` makes one page
+cut into cells, and `core.model_enable_damage_in(m, atlas)` gives a model a
+cell instead of a texture of its own. The renderers write a changed cell
+into its square of the page and read the page through the cell's rectangle
+(`damageRect`). The read is clamped half a texel inside the cell
+(`damageClamp`) so filtering never takes a neighbour's. The page is made
+when its first cell is drawn and goes with the last model drawing from it.
+
+This matters on Vulkan. A mask apiece is a texture and a descriptor set
+apiece, and the renderer has 256 of each: in `tests/test_damage`, 300 damaged
+figures with masks of their own show their blood on 253, and as cells of
+one 2048 x 2048 page (64-texel cells, 1,024 of them) they show it on all
+300, on both renderers. The first frame copies all 300 cells in; the
+staging list a frame slot keeps for in-frame texture writes now grows as
+needed.
+
 There is no render target: the position map makes a hit a loop over
 texels, the same texels on both renderers. On a 256 x 256 mask a hit costs
 0.22 ms of CPU and the bake 0.7 ms for 512 triangles, once.
