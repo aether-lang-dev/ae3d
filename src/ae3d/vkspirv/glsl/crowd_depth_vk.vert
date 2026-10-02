@@ -29,6 +29,9 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     mat4 prevViewProjection;
     bool isSkinned;
     mat4 bones[96];
+    int clipJoints0;
+    int clipJoints1;
+    int clipJoints2;
     vec2 jitter;
     vec2 screenSize;
     int lightCount;
@@ -112,6 +115,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int keyLampSlot;
     bool clipOn;
     vec4 clipPlane;
+    bool clipDetached;
     float clipNoise;
     float clipNoiseScale;
     int woundCount;
@@ -201,6 +205,8 @@ layout(location = 11) in float instancePhase;
 
 
 layout(location = 0) out vec3 BindPos;
+// A crowd's cut is the whole figure's: no joints of its own (#556).
+layout(location = 1) out float ClipLimb;
 
 mat4 boneAt(int bone, int frame) {
     int x = bone * 4;
@@ -219,6 +225,7 @@ mat4 skinAt(int frame) {
 
 void main() {
     BindPos = inPosition;
+    ClipLimb = 1.0;
     mat4 modelMatrix = model * instanceModel;
     if (shadowReach.w > 0.0 && distance(modelMatrix[3].xyz, shadowReach.xyz) > shadowReach.w) {
         // Outside every clip volume: the triangle is dropped.

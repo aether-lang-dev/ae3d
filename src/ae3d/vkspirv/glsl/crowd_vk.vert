@@ -29,6 +29,9 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     mat4 prevViewProjection;
     bool isSkinned;
     mat4 bones[96];
+    int clipJoints0;
+    int clipJoints1;
+    int clipJoints2;
     vec2 jitter;
     vec2 screenSize;
     int lightCount;
@@ -112,6 +115,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int keyLampSlot;
     bool clipOn;
     vec4 clipPlane;
+    bool clipDetached;
     float clipNoise;
     float clipNoiseScale;
     int woundCount;
@@ -232,6 +236,8 @@ layout(location = 5) out float Occlusion;
 layout(location = 6) out vec4 ClipNow;
 layout(location = 7) out vec4 ClipPrev;
 layout(location = 8) out vec3 BindPos;
+// A crowd's cut is the whole figure's: no joints of its own (#556).
+layout(location = 9) out float ClipLimb;
 
 // The bone's matrix at a frame, read as its four columns from the bank.
 mat4 boneAt(int bone, int frame) {
@@ -267,6 +273,7 @@ mat4 skinAtPhase(float phase) {
 
 void main() {
     BindPos = inPosition;
+    ClipLimb = 1.0;
     Occlusion = inOcclusion;
     mat4 modelMatrix = model * instanceModel;
     // The way the figure faces, which is the way it walks.

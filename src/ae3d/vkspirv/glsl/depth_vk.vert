@@ -29,6 +29,9 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     mat4 prevViewProjection;
     bool isSkinned;
     mat4 bones[96];
+    int clipJoints0;
+    int clipJoints1;
+    int clipJoints2;
     vec2 jitter;
     vec2 screenSize;
     int lightCount;
@@ -112,6 +115,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int keyLampSlot;
     bool clipOn;
     vec4 clipPlane;
+    bool clipDetached;
     float clipNoise;
     float clipNoiseScale;
     int woundCount;
@@ -194,9 +198,32 @@ layout (location = 9) in vec4 inWeights;
 
 
 layout(location = 0) out vec3 BindPos;
+layout(location = 1) out float ClipLimb;
+
+// The joints a cut is kept to (#556), as three words of 32 bits: joint j is
+// bit j % 32 of word j / 32. None named, the cut is the whole model's.
+
+
+
+
+float clipJointOn(float joint) {
+    int j = int(joint + 0.5);
+    int word = j < 32 ? clipJoints0 : (j < 64 ? clipJoints1 : clipJoints2);
+    return float((word >> (j & 31)) & 1);
+}
+
+// The share of the vertex's weight on the cut's joints: 1 where none are
+// named or the model is not skinned. The fragment cuts where it is past
+// one half, so the cut's edge across the body is the limb's own weighting.
+float clipLimbOf(vec4 joints, vec4 weights) {
+    if (!isSkinned || (clipJoints0 | clipJoints1 | clipJoints2) == 0) return 1.0;
+    return weights.x * clipJointOn(joints.x) + weights.y * clipJointOn(joints.y)
+         + weights.z * clipJointOn(joints.z) + weights.w * clipJointOn(joints.w);
+}
 
 void main() {
     BindPos = inPosition;
+    ClipLimb = clipLimbOf(inJoints, inWeights);
     // The same transform the lit pass builds. Reading instanceModel alone left
     // an instanced model casting its shadow from wherever its own transform was
     // not applied.

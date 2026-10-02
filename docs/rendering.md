@@ -582,10 +582,29 @@ and `tests/test_shadows` hold it on both renderers; on zombie_city's 20,000
 the depth shader's cut costs nothing measurable (shadow pass 0.31 ms, as
 recorded).
 
+The plane is infinite, so on a figure it took whatever lay past it: past an
+upper-arm cut, 3,803 of 6,182 vertices were not the arm (#556).
+`core.model_clip_joint(m, joint)` keeps the cut to the vertices that hang off
+the named joints, and `skin.skeleton_clip_limb(s, m, bone)` names a bone and
+every bone below it. Each vertex shader hands its fragments the share of the
+vertex's skin weight on those joints (`ClipLimb`), and the plane cuts only
+where that is past one half, so the cut's edge across the body follows the
+limb's own weighting. `model_set_clip_detached(m, true)` is the loose copy:
+everything off the joints is gone too, so with the plane turned round only
+the limb is drawn, and the two draw the body once between them. The joints go
+to the shaders as three words of 32 bits (96, a skin's most). With none
+named, or on a model that is not skinned, the cut is the whole model's, as it
+was. `tests/test_skinned_render` cuts its column down the middle kept to the
+top five bones on both renderers. It keeps 72% of the column (half without
+the joints), the loose copy draws the rest within one pixel, and naming every
+joint is the plain cut to the channel. `tests/test_shadows` shows that a
+sphere skinned in two halves, cut the same way, still throws three quarters
+of its shadow.
+
 ### Wounds
 
 `core.model_set_wound(m, index, centre, radii, rotation)` puts a wound on a
-model (#543): an ellipsoid in its bind space, up to sixteen
+model (#543): an ellipsoid in its bind space, up to 32 with the splats
 (`core.MAX_WOUNDS`), the way Left 4 Dead 2 cut its zombies (Vlachos, GDC
 2010). Inside it the skin is drawn cut down through layers -- blood at the
 rim, then fat, muscle and bone, each from the share of the wound's radius it
@@ -627,9 +646,15 @@ puts its stain. Moved by the mean of a step's two velocities, a particle
 thrown up tops out where v^2/2g says (to 0.01%). The emitter has its own
 generator, seeded by the game, so the same emitter throws the same
 particles on every run. Drawn as the weather's particles are: a quad turned
-to the eye at every point instance, a soft disc for a texture.
-`tests/test_particles.ae` holds the flight, the landings on a plane and on a
-box, the lifetime, the rate, the cone and the seed.
+to the eye at every point instance, a soft disc for a texture, in the
+emitter's colour. A point carries its colour in its own record of the
+stream, and `model_set_instance_color` used to write it into the colour
+buffer, which a point stream never reads. Every particle drew white until
+#557. A blood colour (0.32, 0.02, 0.02) now draws (89, 17, 17) on both
+renderers. `tests/test_particles.ae` holds the flight, the landings on a
+plane and on a box, the lifetime, the rate, the cone, the seed and the
+colour. `tests/test_instance_streams` checks that a point recoloured on its
+own is drawn in its new colour.
 
 ### Rain on the surfaces
 
