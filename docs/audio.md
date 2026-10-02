@@ -117,6 +117,29 @@ hits play on EFFECTS, placed where they are.
 - the engine pitch is 1.31533 at 10.31 m/s, exactly 0.8 + 0.05 v;
 - twelve dropped crates are heard 29 times, never more than 4 in a frame.
 
+## In the editor
+
+`audio.register_kind()` makes **Audio Source** a component kind (#567).
+Its fields are the source's own: clip (a sound asset), bus, volume, pitch,
+loop, spatial, min and max distance, Doppler, and play on start. The
+inspector shows them, the scene file keeps them, and the agent's
+`component.get` and `.set` reach them. The component binds to the engine's
+sound in its start phase: the clip is loaded, the source is placed from then
+on, and it plays if it starts with the play. A field written through the
+registry applies at once.
+
+The editor registers the kind and attaches sound to its viewport engine,
+with the listener on the editor's camera. Every bus is muted
+(`audio.set_muted`) while the scene is edited and unmuted while Simulate
+runs.
+
+`tests/test_audio` adds an Audio Source as the inspector does and checks
+that it binds, plays and is placed (gain 0.5 at 4 m with min 2), that a
+volume write applies at once (0.25), and that its fields go through the
+scene file's JSON and back. The editor driver adds one to a cube through
+Add Component, checks it offers every bus, saves, and finds the component
+and its fields in the file.
+
 ## Not yet
 
-The editor's inspector section is #567. OGG Vorbis is aether#2364.
+OGG Vorbis is aether#2364.
