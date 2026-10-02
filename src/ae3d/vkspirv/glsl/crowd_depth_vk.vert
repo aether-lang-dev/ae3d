@@ -124,6 +124,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float woundCore;
     int damageOn;
     vec4 damageColours[4];
+    vec4 damageRect;
+    float damageClamp;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
