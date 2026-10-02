@@ -56,7 +56,7 @@ exports (
     env_int, env_float, resource_path, material_new, material_default, material_clone, material_equals, material_free,
     model_new, model_free,
     model_clone, model_set_casts_shadow, model_set_solid, SOLID_AUTO, SOLID_YES, SOLID_NO, model_set_billboard, model_set_depth_proxy, model_set_clip, model_clear_clip, model_clipped, model_clip_joint, model_clear_clip_joints, model_clip_joints_named, model_set_clip_detached, MAX_CLIP_JOINTS,
-    model_set_wound, model_set_splat, DamageMask, model_enable_damage, model_disable_damage, model_has_damage, model_set_damage_colour, model_damage_splat, model_damage_fade, model_clear_damage, model_damage_at, model_damage_size, model_damage_pixels, model_damage_colours, model_damage_serial, DAMAGE_BLOOD, DAMAGE_BRUISE, DAMAGE_BURN, DAMAGE_SPARE, model_set_wound_count, model_wound_count, model_clear_wounds, model_set_wound_layer, model_set_wound_core, MAX_WOUNDS, model_set_impostor, model_is_impostor,
+    model_set_wound, model_set_splat, interp_begin_step, interp_end_step, interp_apply, interp_restore, interp_count, model_reset_interpolation, model_interpolated_position, model_interpolated_rotation, DamageMask, model_enable_damage, model_disable_damage, model_has_damage, model_set_damage_colour, model_damage_splat, model_damage_fade, model_clear_damage, model_damage_at, model_damage_size, model_damage_pixels, model_damage_colours, model_damage_serial, DAMAGE_BLOOD, DAMAGE_BRUISE, DAMAGE_BURN, DAMAGE_SPARE, model_set_wound_count, model_wound_count, model_clear_wounds, model_set_wound_layer, model_set_wound_core, MAX_WOUNDS, model_set_impostor, model_is_impostor,
     DeviceCrowd, model_set_device_crowd, model_frame_done, model_prev_matrix, model_set_crowd_walk,
     model_set_position, model_set_scale, model_set_rotation, model_rotate,
     model_update_matrix, model_recalculate_bounds, model_mark_dirty, model_geometry_changed, model_set_diffuse,
@@ -436,6 +436,10 @@ struct Model {
     world_scale: Vec3
     world_rotation: Quat
     world_stamp: int
+    // Render interpolation (#563): the fixed step this model was last moved
+    // in, and its record (*Interp) while it is drawn between steps.
+    interp_mark: int
+    interp: ptr
     parent_stamp: int
     draw_stamp: int
     shadow_stamp: int
@@ -1582,6 +1586,7 @@ model_free(m: *Model) {
 
     if m.wounds != null { free(m.wounds) }
     model_disable_damage(m)
+    interp_forget(m)
     if m.wound_layers != null { free(m.wound_layers) }
 
     if m.uniforms != null {
@@ -1788,21 +1793,25 @@ model_geometry_changed(m: *Model) {
 }
 
 model_set_position(m: *Model, x: float, y: float, z: float) {
+    interp_note(m)
     m.position = vec3(x, y, z)
     model_update_matrix(m)
 }
 
 model_set_scale(m: *Model, x: float, y: float, z: float) {
+    interp_note(m)
     m.scale = vec3(x, y, z)
     model_update_matrix(m)
 }
 
 model_set_rotation(m: *Model, q: Quat) {
+    interp_note(m)
     m.rotation = q
     model_update_matrix(m)
 }
 
 model_rotate(m: *Model, degrees_x: float, degrees_y: float, degrees_z: float) {
+    interp_note(m)
     if quat_is_zero(m.rotation) { m.rotation = quat_ident() }
     rx = quat_rotate(deg_to_rad(degrees_x), vec3(1.0, 0.0, 0.0))
     ry = quat_rotate(deg_to_rad(degrees_y), vec3(0.0, 1.0, 0.0))
@@ -3073,6 +3082,300 @@ model_clip_joints_named(m: *Model) -> bool {
 // joint is drawn. The model left standing and its loose copy, the same
 // joints and the plane each way, draw the body once between them.
 model_set_clip_detached(m: *Model, on: bool) { m.clip_detached = on }
+
+// --- render interpolation (#563) ---
+
+// The world is stepped at a fixed rate and drawn at the display's: at 144
+// frames a second most frames take no step and some take two, and a body
+// drawn where its last step left it stands still, then moves twice. So a
+// model moved during a fixed step is put between where the step before
+// left it and where the last one did, by how far the frame's time is into
+// the next step (`interp_apply`, its alpha the accumulator over the step),
+// in world space and put back under its parent as the parent is now -- a
+// ragdoll's root placed at a step under a figure moved every frame does
+// not slide with the figure and snap back. As Godot's physics
+// interpolation is, it is put there for the draw alone (`interp_apply`
+// before it, `interp_restore` after): every script reads where the steps
+// left things, so nothing the simulation reads back is ever a drawn pose.
+// A script that wants the drawn pose -- a camera following a body -- asks
+// `model_interpolated_position` and `_rotation` at the frame's fraction.
+// A transform written after the steps (in `update`, continuous in time
+// already) is drawn where it was put. A model the steps stop moving is at
+// rest after one step more.
+//
+// The setters note a move while a step runs (`interp_begin_step`,
+// `interp_end_step`), so nothing is asked of a model nothing moves.
+struct Interp {
+    tracked: bool                // drawn between steps
+    moved: bool                  // moved in the step running
+    applied: bool                // drawn interpolated this frame
+    prev_position: Vec3          // world, at the step before
+    prev_rotation: Quat
+    prev_scale: Vec3
+    cur_position: Vec3           // world, at the last step
+    cur_rotation: Quat
+    cur_scale: Vec3
+    local_position: Vec3         // its own transform as the last step left it
+    local_rotation: Quat
+    local_scale: Vec3
+    shown_position: Vec3         // its own transform as interp_apply put it
+    shown_rotation: Quat
+    shown_scale: Vec3
+    reset: bool                  // a teleport: no drawing across the jump
+}
+
+var g_interp_active = false
+var g_interp_step = 0
+var g_interp_models: ptr = null  // list of *Model with a record, tracked or moved
+
+interp_list() -> ptr {
+    if g_interp_models == null { g_interp_models = list.new() }
+    return g_interp_models
+}
+
+// A move while a step runs: the model's world before it is the step
+// before's, when it was not already being drawn between steps.
+interp_note(m: *Model) {
+    if !g_interp_active || m == null || m.interp_mark == g_interp_step { return }
+    m.interp_mark = g_interp_step
+    if m.interp == null {
+        m.interp = heap.new(Interp) as ptr
+        list.add_raw(interp_list(), m as ptr)
+    }
+    r = m.interp as *Interp
+    if !r.tracked {
+        model_sync_transform(m)
+        r.prev_position = m.world_position
+        r.prev_rotation = m.world_rotation
+        r.prev_scale = m.world_scale
+    }
+    r.moved = true
+}
+
+// A step starts from where the steps left every model, not from where it
+// was drawn.
+interp_begin_step() {
+    interp_restore()
+    g_interp_step = g_interp_step + 1
+    g_interp_active = true
+}
+
+// The step done: each model it moved keeps its world before and after; one
+// it did not move has come to rest, and is let go.
+interp_end_step() {
+    g_interp_active = false
+    if g_interp_models == null { return }
+    i = list.size(g_interp_models) - 1
+    while i >= 0 {
+        m = list.get_raw(g_interp_models, i) as *Model
+        r = m.interp as *Interp
+        if r.moved {
+            if r.tracked {
+                r.prev_position = r.cur_position
+                r.prev_rotation = r.cur_rotation
+                r.prev_scale = r.cur_scale
+            }
+            model_sync_transform(m)
+            r.cur_position = m.world_position
+            r.cur_rotation = m.world_rotation
+            r.cur_scale = m.world_scale
+            r.local_position = m.position
+            r.local_rotation = m.rotation
+            r.local_scale = m.scale
+            if r.reset {
+                r.prev_position = r.cur_position
+                r.prev_rotation = r.cur_rotation
+                r.prev_scale = r.cur_scale
+                r.reset = false
+            }
+            r.tracked = true
+            r.moved = false
+        } else {
+            interp_drop(i)
+        }
+        i = i - 1
+    }
+}
+
+interp_drop(index: int) {
+    m = list.get_raw(g_interp_models, index) as *Model
+    heap.free(m.interp as *Interp)
+    m.interp = null
+    list.remove(g_interp_models, index)
+}
+
+// A model gone: its record with it.
+interp_forget(m: *Model) {
+    if m == null || m.interp == null || g_interp_models == null { return }
+    i = 0
+    while i < list.size(g_interp_models) {
+        if list.get_raw(g_interp_models, i) == m as ptr {
+            interp_drop(i)
+            return
+        }
+        i = i + 1
+    }
+}
+
+// A teleport (#563): the model is drawn where its next step puts it, not
+// swept across the jump from where it was.
+model_reset_interpolation(m: *Model) {
+    if m == null { return }
+    if m.interp == null {
+        if !g_interp_active { return }
+        interp_note(m)
+    }
+    (m.interp as *Interp).reset = true
+}
+
+same_vec(a: Vec3, b: Vec3) -> bool { return a.x == b.x && a.y == b.y && a.z == b.z }
+
+same_quat(a: Quat, b: Quat) -> bool { return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w }
+
+// How many parents up a model hangs.
+interp_depth(m: *Model) -> int {
+    depth = 0
+    p = m.parent as *Model
+    while p != null {
+        depth = depth + 1
+        p = p.parent as *Model
+    }
+    return depth
+}
+
+// Every tracked model drawn between its last two steps, `alpha` of the way
+// (0 at the step before, 1 at the last), parents before their children so a
+// child is put back under its parent as the parent is drawn. Their own
+// transforms are kept, for interp_restore.
+interp_apply(alpha: float) -> int {
+    if g_interp_models == null { return 0 }
+    a = alpha
+    if a < 0.0 { a = 0.0 }
+    if a > 1.0 { a = 1.0 }
+    n = list.size(g_interp_models)
+    applied = 0
+    depth = 0
+    deepest = 0
+    i = 0
+    while i < n {
+        d = interp_depth(list.get_raw(g_interp_models, i) as *Model)
+        if d > deepest { deepest = d }
+        i = i + 1
+    }
+    while depth <= deepest {
+        i = 0
+        while i < n {
+            m = list.get_raw(g_interp_models, i) as *Model
+            r = m.interp as *Interp
+            if r.tracked && interp_depth(m) == depth && interp_untouched(m, r) {
+                wp = v3_add(r.prev_position, v3_mul(v3_sub(r.cur_position, r.prev_position), a))
+                wr = quat_slerp(r.prev_rotation, r.cur_rotation, a)
+                ws = v3_add(r.prev_scale, v3_mul(v3_sub(r.cur_scale, r.prev_scale), a))
+                if m.parent == null {
+                    m.position = wp
+                    m.rotation = wr
+                    m.scale = ws
+                } else {
+                    p = m.parent as *Model
+                    model_sync_transform(p)
+                    m.position = mat4_transform_point(mat4_inverse(p.model_matrix), wp)
+                    m.rotation = quat_mul(quat_conjugate(p.world_rotation), wr)
+                    m.scale = vec3(ws.x / nonzero(p.world_scale.x), ws.y / nonzero(p.world_scale.y), ws.z / nonzero(p.world_scale.z))
+                }
+                model_update_matrix(m)
+                r.shown_position = m.position
+                r.shown_rotation = m.rotation
+                r.shown_scale = m.scale
+                r.applied = true
+                applied = applied + 1
+            }
+            i = i + 1
+        }
+        depth = depth + 1
+    }
+    return applied
+}
+
+// Where a model is drawn this frame, `alpha` of the way between its last
+// two steps (engine_step_fraction): its world position, or where it is when
+// the steps do not move it. What a camera following a body follows, so the
+// two move together on the screen.
+model_interpolated_position(m: *Model, alpha: float) -> Vec3 {
+    if m == null { return vec3(0.0, 0.0, 0.0) }
+    model_sync_transform(m)
+    if m.interp == null { return m.world_position }
+    r = m.interp as *Interp
+    if !r.tracked { return m.world_position }
+    return v3_add(r.prev_position, v3_mul(v3_sub(r.cur_position, r.prev_position), alpha))
+}
+
+model_interpolated_rotation(m: *Model, alpha: float) -> Quat {
+    if m == null { return quat_ident() }
+    model_sync_transform(m)
+    if m.interp == null { return m.world_rotation }
+    r = m.interp as *Interp
+    if !r.tracked { return m.world_rotation }
+    return quat_slerp(r.prev_rotation, r.cur_rotation, alpha)
+}
+
+// Whether a model is where the last step left it -- or where the last
+// interpolation put it, not yet taken back: anything else was written since
+// the step, and is drawn as written.
+interp_untouched(m: *Model, r: *Interp) -> bool {
+    if r.applied {
+        return same_vec(m.position, r.shown_position) && same_quat(m.rotation, r.shown_rotation) &&
+               same_vec(m.scale, r.shown_scale)
+    }
+    return same_vec(m.position, r.local_position) && same_quat(m.rotation, r.local_rotation) &&
+           same_vec(m.scale, r.local_scale)
+}
+
+nonzero(x: float) -> float {
+    if x == 0.0 { return 1.0 }
+    return x
+}
+
+// Every model interp_apply moved, back where its last step left it -- not
+// one a script wrote since, which keeps what it was given. Parents before
+// their children, as they were put, so no child is rebuilt against a parent
+// still where it was drawn.
+interp_restore() {
+    if g_interp_models == null { return }
+    n = list.size(g_interp_models)
+    deepest = 0
+    i = 0
+    while i < n {
+        d = interp_depth(list.get_raw(g_interp_models, i) as *Model)
+        if d > deepest { deepest = d }
+        i = i + 1
+    }
+    depth = 0
+    while depth <= deepest {
+        i = 0
+        while i < n {
+            m = list.get_raw(g_interp_models, i) as *Model
+            r = m.interp as *Interp
+            if r.applied && interp_depth(m) == depth {
+                if same_vec(m.position, r.shown_position) && same_quat(m.rotation, r.shown_rotation) &&
+                   same_vec(m.scale, r.shown_scale) {
+                    m.position = r.local_position
+                    m.rotation = r.local_rotation
+                    m.scale = r.local_scale
+                    model_update_matrix(m)
+                }
+                r.applied = false
+            }
+            i = i + 1
+        }
+        depth = depth + 1
+    }
+}
+
+// How many models are drawn between steps.
+interp_count() -> int {
+    if g_interp_models == null { return 0 }
+    return list.size(g_interp_models)
+}
 
 // --- damage masks (#544) ---
 
