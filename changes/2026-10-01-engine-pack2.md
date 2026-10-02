@@ -18,3 +18,7 @@
   light's back fill is no longer shadowed. At 22:00 the ground reads the same
   with shadows on and off on both renderers (it read 30 and 45), and turning
   the key light round no longer turns the sky to day (test_engine_skybox).
+- `test_script`'s reload check reads that the state was made again (its
+  unsaved clock back at the constructor's) instead of comparing addresses:
+  the old state is freed before the new one is made, the same size, and the
+  Windows runner's allocator handed the same block back.
