@@ -250,3 +250,51 @@ Windows machine of [performance.md](performance.md):
 
 Under the Khronos validation layer with synchronisation validation,
 `examples/game_hud.ae` on Vulkan (windowed, captured) reports no error.
+
+### Laid out
+
+A HUD has to keep its place when the window changes size and its size
+when the display is denser (#459). The engine tells the overlay the
+screen it is drawn over at the start of every frame (`hud.set_screen`):
+its size in pixels and the UI's scale. The scale is the window's content
+scale (2 on a display of twice the density, set by the system), unless the
+program sets one (`engine_set_ui_scale`, or `AE3D_UI_SCALE`).
+
+- **Anchors.** `hud.place(o, anchor, dx, dy, w, h)` gives the top-left, in
+  whole pixels, of a box of `w` x `h` points at one of nine anchors, offset
+  in points. The box's own point sits at the anchor: its bottom-right
+  corner at `BOTTOM_RIGHT`, its middle at `CENTRE`. `hud.px(o, points)` is
+  a length in pixels.
+- **Text.** `hud.text_box(o, x, y, width, size_px, text, colour, align)`
+  wraps text at its spaces to a width, starts a new line at each newline,
+  sets each line left, centred or right (`ALIGN_LEFT`, `_CENTRE`,
+  `_RIGHT`) and returns the height it took. A word wider than the width
+  gets a line of its own.
+- **Clipped panels.** `hud.push_clip(o, x, y, w, h)` and `hud.pop_clip(o)`
+  bound what is drawn to a panel, nested panels to where they meet. Each
+  quad is cut to the clip as it is added, and the glyph or image area it
+  shows is cut in proportion. Quads are upright, so the cut is exact,
+  nothing is drawn past the panel, and the overlay is still one draw with
+  no scissor state.
+- **Images.** `hud.image_load(o, path)` puts a picture (PNG, JPEG, TGA,
+  BMP, or a name given pixels by `picture.register_rgba`) on the overlay's
+  1024 x 1024 RGBA image page, once per path, with its edge texels
+  repeated one texel around it so filtering does not bleed into its
+  neighbours. `hud.image(o, id, x, y, w, h, tint)` draws it. The page is the
+  overlay shader's second texture (binding 1 on Vulkan, unit 1 on OpenGL),
+  sent again only when an image is added; a quad picks it by its threshold.
+
+`tests/test_hud_layout.ae` runs on both renderers at 320 x 180 (scale 1)
+and 400 x 240 (scale 1.5):
+
+| What | Number |
+|---|---|
+| Nine anchored boxes | each white to every pixel where the anchor's definition puts it, nothing white one pixel past its edge |
+| A rectangle and a word through an 80 x 40 clip | 3,200 pixels red inside, none inked outside |
+| A clip inside a clip | 800 pixels drawn, the 20 x 40 where the two meet |
+| A sentence wrapped to 130 px | inked from 16 to 134 (the box ends at 146), five lines, within the height returned |
+| Right-aligned and centred words | ending at the width's end; centred to within 1 px |
+| A four-colour image at four times its size | each quarter its own colour (255 in its channel, 0 in the others) |
+| The same image at half alpha | 137, half over the frame exactly |
+| Vulkan against OpenGL | 0 channels of the four frames apart |
+| The engine over a renderer | its overlay's screen and scale are the engine's |

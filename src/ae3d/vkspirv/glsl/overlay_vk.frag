@@ -7,11 +7,13 @@ layout(push_constant) uniform OverlayFrame {
     vec4 overlayStyle;
 };
 layout(set = 0, binding = 0) uniform sampler2D glyphAtlas;
+layout(set = 0, binding = 1) uniform sampler2D imagePage;
 #else
 #define VARYING(n)
 uniform vec4 overlayScreen;
 uniform vec4 overlayStyle;
 uniform sampler2D glyphAtlas;
+uniform sampler2D imagePage;
 #endif
 
 VARYING(0) in vec2 atlasCoord;
@@ -30,6 +32,13 @@ void main() {
     float w = max(fwidth(d) * 0.5, 1.0 / 255.0);
     float ink = edge < 0.0 ? 1.0 : smoothstep(edge - w, edge + w, d);
     vec3 rgb = colour.rgb;
+    // An image (#459), below -1.5: the page's texel, tinted -- display
+    // values, as the colours are.
+    vec4 picture = texture(imagePage, atlasCoord);
+    if (edge < -1.5) {
+        rgb = picture.rgb * colour.rgb;
+        ink = picture.a;
+    }
     // A target that encodes what it is given (an _SRGB swapchain) gets the
     // colour decoded first, so it shows as the display value asked for.
     if (overlayStyle.x > 0.5) rgb = pow(rgb, vec3(2.2));
