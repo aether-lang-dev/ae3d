@@ -77,6 +77,7 @@ exports (
     traffic, TRAFFIC_SNAPSHOTS, TRAFFIC_EVENTS, TRAFFIC_INPUTS, TRAFFIC_ACKS, TRAFFIC_HEADERS,
     TRAFFIC_ACK_PACKETS, TRAFFIC_RESENT, TRAFFIC_HANDSHAKE, datagrams_sent, largest_datagram, round_trip,
     NetPlayer, set_player_maker, host_play, player_input, my_player, player_of, player_count, prediction_error, input_sent,
+    set_player_object_maker, set_player_mover, command_axis, command_bits, player_command, seen_tick,
     commands_asked,
     NetCall, HOST, EVERYONE, on_event, send_event, send_event_bytes, on_join, on_leave,
     object_kind, create_object, destroy_object, object_of, id_of,
@@ -261,12 +262,18 @@ const EXTRAPOLATION = 0.1            // seconds a moving object is carried on pa
 const CARRIED_SPAN = 0.25            // seconds its last two samples may be apart for their motion to be carried on
 const KEPT = 33                      // snapshots each side keeps to delta against: the 32 newest, and the one being built
 const STATE = 4                      // numbers an object's quantised state: x y z in steps, the rotation's 48 bits
-const OWN = 5                        // numbers the client's own player: x y z, vy, grounded
+const OWN = 8                        // numbers a client's own player at most, as its mover keeps them (the controller's: x y z, vy, grounded)
+const CONTROLLER_OWN = 5             // the controller's own numbers
 const SAMPLE = 8                     // floats a sample: the host's time, x y z, qx qy qz qw
 const TCP_CHUNK = 65536
 const HUB_ENDPOINTS = 64
 const COMMANDS = 128                 // a client's commands kept until the host has applied them
-const COMMAND = 5                    // floats a command: seq, walk x, walk z, jump, the input messages it went in
+const CMD_FIELDS = 8                 // the fields a player's command has at most (#531)
+const COMMAND = 11                   // floats a command: seq, the tick its view had reached, the input messages it went in, then CMD_FIELDS values in steps
+const C_SEQ = 0
+const C_SEEN = 1
+const C_SENT = 2
+const C_VALUE = 3
 const INPUTS_MOST = 64               // the commands an input message carries at most, the oldest: a second of them
 const CARRIED = 3                    // the input messages a command goes in at least: it is lost only when all of them are
 const CARRIED_LOST = 0.000001        // at the link's measured loss, the share of commands every message of which may be lost
@@ -708,7 +715,8 @@ struct NetEvent {
 struct NetPlayer {
     client: int
     net_id: int
-    controller: *CharacterController
+    object: *GameObject              // the player's game object, whatever moves it
+    controller: *CharacterController // its controller, or null for a game's own mover
 }
 
 struct NetObject {
@@ -897,6 +905,22 @@ struct Net {
     // welcomes and on a client for every spawn it is told of.
     player_maker: fn(ptr, int) -> *CharacterController
     maker_context: ptr
+    // A game's own player (#531): made as a game object, moved by the
+    // game's mover from the game's commands; the controller's when none.
+    player_object_maker: fn(ptr, int) -> *GameObject
+    mover_apply: fn(ptr, *GameObject, ptr, float, int)
+    mover_save: fn(ptr, *GameObject, ptr) -> int
+    mover_restore: fn(ptr, *GameObject, ptr)
+    mover_context: ptr
+    mover_own: int                   // the numbers the mover keeps of a player, at most OWN
+    // The command's fields, in order: each one's step, 0 for a field of
+    // bits (actions, held or pressed); and scratch for one command's
+    // values in units, and for a player's numbers.
+    cmd_count: int
+    cmd_precision: ptr               // float[CMD_FIELDS]
+    cmd_values: ptr                  // float[CMD_FIELDS]
+    own_scratch: ptr                 // float[OWN]
+    encoded: ptr                     // long[CMD_FIELDS * 2]: the last value and its change, as a message codes them
     players: ptr                     // list of *NetPlayer
     mine: ptr                        // client: its own *NetPlayer, or null
     commands: ptr                    // client: float[COMMANDS * COMMAND], a ring of the unacknowledged
@@ -982,6 +1006,10 @@ net_new(role: int, kind: int) -> *Net {
     n.traffic = calloc(LINK_KINDS, 8)
     n.players = list.new()
     n.commands = calloc(COMMANDS * COMMAND, 8)
+    n.cmd_precision = calloc(CMD_FIELDS, 8)
+    n.cmd_values = calloc(CMD_FIELDS, 8)
+    n.own_scratch = calloc(OWN, 8)
+    n.encoded = calloc(CMD_FIELDS * 2, 8)
     n.next_seq = 1
     n.received = calloc(KEPT, 8)
     n.handlers = list.new()
@@ -2733,7 +2761,7 @@ view_due(n: *Net, now: float) -> bool {
 // one, its place in the world where it has none.
 eye_to_send(n: *Net) -> Vec3 {
     if n.mine == null { return n.view_eye }
-    at = behaviour.object_position((n.mine as *NetPlayer).controller.object as *GameObject)
+    at = behaviour.object_position((n.mine as *NetPlayer).object)
     return core.v3_sub(n.view_eye, at)
 }
 
@@ -2810,7 +2838,7 @@ take_view(n: *Net, p: *Peer, r: *NetReader, follows: bool) {
 // Host: a client's eye that follows its player, where the player is now.
 place_eye(p: *Peer) {
     if !p.eye_follows || p.player == null { return }
-    at = behaviour.object_position((p.player as *NetPlayer).controller.object as *GameObject)
+    at = behaviour.object_position((p.player as *NetPlayer).object)
     p.eye = core.v3_add(at, p.eye_offset)
 }
 
@@ -3014,24 +3042,23 @@ write_record(n: *Net, b: *NetBuf, base: *Snapshot, index: int, own: bool) {
 // The client's player at full precision, as the wire carries it: what it
 // reconciles against, so its prediction is not moved by a quantum.
 own_state(n: *Net, pl: *NetPlayer, into: *Snapshot) {
-    o = pl.controller.object as *GameObject
-    where = behaviour.object_position(o)
+    count = player_save(n, pl, n.own_scratch)
+    v = n.own_scratch as float[]
     own = into.own as float[]
-    own[0] = as_f32(n, where.x)
-    own[1] = as_f32(n, where.y)
-    own[2] = as_f32(n, where.z)
-    own[3] = as_f32(n, pl.controller.velocity.y)
-    own[4] = 0.0
-    if pl.controller.grounded { own[4] = 1.0 }
+    k = 0
+    while k < count {
+        own[k] = as_f32(n, v[k])
+        k = k + 1
+    }
     into.own_known = true
 }
 
-same_own(a: *Snapshot, b: *Snapshot) -> bool {
+same_own(n: *Net, a: *Snapshot, b: *Snapshot) -> bool {
     if !a.own_known || !b.own_known { return false }
     x = a.own as float[]
     y = b.own as float[]
     k = 0
-    while k < OWN {
+    while k < own_count(n) {
         if x[k] != y[k] { return false }
         k = k + 1
     }
@@ -3071,7 +3098,7 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
         own_state(n, pl, told)
     }
     place_eye(p)
-    send_own = told.own_known && (base == null || !same_own(told, base))
+    send_own = told.own_known && (base == null || !same_own(n, told, base))
     // The candidates: relevant, and not what the base already has. Every
     // one gathers priority for waiting, by what the client can see of it;
     // one that is not a candidate has nothing to wait for. They go most
@@ -3138,7 +3165,7 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
     room = 0
     if budget > 0 {
         room = budget_room(n, budget, count)
-        if send_own { room = room - 17 }
+        if send_own { room = room - 4 * own_count(n) }
         if send_previous { room = room - 4 }
         if lacked > 0 { room = room - 5 }
         room = room - gone_bytes
@@ -3240,11 +3267,11 @@ snapshot_to(n: *Net, p: *Peer, now: float) {
     put_u8(b, flags)
     if send_own {
         own = told.own as float[]
-        put_f32(b, own[0])
-        put_f32(b, own[1])
-        put_f32(b, own[2])
-        put_f32(b, own[3])
-        put_u8(b, (own[4]) as int)
+        k = 0
+        while k < own_count(n) {
+            put_f32(b, own[k])
+            k = k + 1
+        }
     }
     if (flags & SNAP_PREVIOUS) != 0 { put_f32(b, n.previous.time) }
     if lacked > 0 { put_varint(b, (lacked - p.last_input) as long) }
@@ -3357,11 +3384,11 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
     }
     own = shot.own as float[]
     if (flags & SNAP_OWN) != 0 {
-        own[0] = get_f32(r)
-        own[1] = get_f32(r)
-        own[2] = get_f32(r)
-        own[3] = get_f32(r)
-        own[4] = get_u8(r) as float
+        k = 0
+        while k < own_count(n) {
+            own[k] = get_f32(r)
+            k = k + 1
+        }
         shot.own_known = true
     } else if base != null && base.own_known {
         bo = base.own as float[]
@@ -3507,9 +3534,7 @@ take_snapshot(n: *Net, r: *NetReader, now: float) {
         j = j + 1
     }
     free(values)
-    if mine != null && shot.own_known {
-        reconcile(n, core.vec3(own[0], own[1], own[2]), own[3], own[4] > 0.5, ack)
-    }
+    if mine != null && shot.own_known { reconcile(n, shot.own, ack) }
     // Every field as this snapshot has it, and the hooks of those it
     // changed: in the order the snapshots are taken, which is never
     // backwards, so in tick order.
@@ -4063,7 +4088,7 @@ handle(n: *Net, ev: *NetEvent, now: float) {
         if (flags & 1) != 0 { take_view(n, p, &r, (flags & 2) != 0) }
         if !r.ok { return }
         take_ack(n, p, tick)
-        if p.player != null { apply_inputs(n, p, &r) }
+        if p.player != null { apply_inputs(n, p, &r, n.tick - ((n.tick - tick) & 65535)) }
         return
     }
     if n.role == ROLE_HOST && kind == MSG_ACK {
@@ -4144,6 +4169,68 @@ set_interpolation_delay(n: *Net, seconds: float) {
 set_player_maker(n: *Net, maker: fn(ptr, int) -> *CharacterController, context: ptr) {
     n.player_maker = maker
     n.maker_context = context
+    // The controller's command: a walk, in millimetres a second along x and
+    // z, and a jump in 64ths of a metre a second.
+    if n.cmd_count == 0 {
+        command_axis(n, 1.0 / WALK_STEPS)
+        command_axis(n, 1.0 / WALK_STEPS)
+        command_axis(n, 1.0 / JUMP_STEPS)
+    }
+}
+
+// A game's own player (#531): `maker(context, client)` makes its game
+// object, which the game's mover moves (set_player_mover) by the game's
+// own command (command_axis, command_bits, player_command). The host calls
+// it for every client it welcomes, a client for every player it is told
+// of, its own included.
+set_player_object_maker(n: *Net, maker: fn(ptr, int) -> *GameObject, context: ptr) {
+    n.player_object_maker = maker
+    n.maker_context = context
+}
+
+// How a game moves its player (#531), on the host by each client's
+// commands and on the client ahead of the host:
+//   apply(context, object, values, step, seen) moves the player by one
+//     command: `values` its fields in units (float[], in the order
+//     registered), `step` seconds, `seen` the tick the client's view had
+//     reached when it made the command -- where its actions were aimed --
+//     or 0 where the command carries no action;
+//   save(context, object, out) writes the player's movable state, at most
+//     OWN numbers, into `out` (float[]) and says how many;
+//   restore(context, object, values) puts it back.
+// The client puts its player where the host says it was and replays its
+// unacknowledged commands on top, so `apply` must give the same result
+// for the same start on both sides. After every command the state is
+// rounded through save and restore to the 32-bit floats the snapshot
+// carries, on both sides, so the replay starts from exactly the host's.
+set_player_mover(n: *Net, apply: fn(ptr, *GameObject, ptr, float, int), save: fn(ptr, *GameObject, ptr) -> int,
+                 restore: fn(ptr, *GameObject, ptr), own: int, context: ptr) {
+    n.mover_apply = apply
+    n.mover_save = save
+    n.mover_restore = restore
+    n.mover_own = own
+    if n.mover_own > OWN { n.mover_own = OWN }
+    n.mover_context = context
+}
+
+// A field of the player's command, a number in steps of `precision` (a
+// walk to a millimetre a second is 0.001), in the order of the calls; its
+// index, or -1 past CMD_FIELDS. Both sides register the same fields.
+command_axis(n: *Net, precision: float) -> int {
+    if n.cmd_count >= CMD_FIELDS || precision <= 0.0 { return 0 - 1 }
+    (n.cmd_precision as float[])[n.cmd_count] = precision
+    n.cmd_count = n.cmd_count + 1
+    return n.cmd_count - 1
+}
+
+// A field of bits, the player's actions: a swing, a shot, a guard held. A
+// command with any bit set carries the tick the client's view had reached
+// (`seen`), so the host can resolve the action where the client aimed it.
+command_bits(n: *Net) -> int {
+    if n.cmd_count >= CMD_FIELDS { return 0 - 1 }
+    (n.cmd_precision as float[])[n.cmd_count] = 0.0
+    n.cmd_count = n.cmd_count + 1
+    return n.cmd_count - 1
 }
 
 player_by_id(n: *Net, id: int) -> *NetPlayer {
@@ -4185,19 +4272,29 @@ input_sent(n: *Net) -> int { return n.inputs_sent }
 commands_asked(n: *Net) -> int { return n.asked }
 
 make_player(n: *Net, client: int, id: int) -> *NetPlayer {
-    maker = n.player_maker
-    if maker == null { return null }
-    controller = maker(n.maker_context, client)
-    if controller == null { return null }
-    // The session moves it -- by commands, by prediction, or by snapshots
-    // -- so the world does not also stand it where it is.
-    controller.driven = true
+    object = null as *GameObject
+    controller = null as *CharacterController
+    object_maker = n.player_object_maker
+    if object_maker != null {
+        object = object_maker(n.maker_context, client)
+    } else {
+        maker = n.player_maker
+        if maker == null { return null }
+        controller = maker(n.maker_context, client)
+        if controller == null { return null }
+        // The session moves it -- by commands, by prediction, or by
+        // snapshots -- so the world does not also stand it where it is.
+        controller.driven = true
+        object = controller.object as *GameObject
+    }
+    if object == null { return null }
     pl = calloc(1, sizeof(NetPlayer)) as *NetPlayer
     pl.client = client
     pl.net_id = id
+    pl.object = object
     pl.controller = controller
     list.add_raw(n.players, pl as ptr)
-    networked_at(n, controller.object as *GameObject, id)
+    networked_at(n, object, id)
     // A player is simulated where its commands are: on the host its own
     // (client 0), on a client its own; every other copy is remote.
     remote = client != n.my_id
@@ -4209,7 +4306,7 @@ make_player(n: *Net, client: int, id: int) -> *NetPlayer {
 // A welcomed client's player on the host, and every player told to every
 // client: the new one to all, the ones before it to the newcomer.
 host_player(n: *Net, p: *Peer, now: float) {
-    if n.player_maker == null { return }
+    if n.player_maker == null && n.player_object_maker == null { return }
     pl = make_player(n, p.id, list.size(n.objects) + 1)
     if pl == null { return }
     p.player = pl as ptr
@@ -4253,7 +4350,7 @@ client_spawn(n: *Net, id: int, owner: int) {
 
 // The host applies a client's commands it has not applied yet, oldest
 // first, a fixed step each: the same moves the client made ahead of it.
-apply_inputs(n: *Net, p: *Peer, r: *NetReader) {
+apply_inputs(n: *Net, p: *Peer, r: *NetReader, ack_tick: int) {
     if p.queued == null { p.queued = calloc(COMMANDS * COMMAND, 8) }
     q = p.queued as float[]
     first = get_u32(r)
@@ -4261,49 +4358,64 @@ apply_inputs(n: *Net, p: *Peer, r: *NetReader) {
     mask_at = r.at
     r.at = r.at + (count + 7) / 8
     if count == 0 || r.at > r.length { return }
-    sx = 0 as long
-    sz = 0 as long
-    dx = 0 as long
-    dz = 0 as long
-    jump = 0.0
+    // Each field the change of its change from the command before, as the
+    // client coded it (player_command); the first command as it is.
+    coded = n.encoded as long[]
+    f = 0
+    while f < CMD_FIELDS * 2 {
+        coded[f] = 0 as long
+        f = f + 1
+    }
+    seen = 0
     i = 0
     while i < count {
         seq = first + i
         if (mem.get_byte(r.data, mask_at + i / 8) & (1 << (i % 8))) != 0 {
-            // Each walk the one before it changed as much again, and the
-            // difference; the first as it is.
-            x = sx + dx + unzigzag(get_varint(r))
-            packed = get_varint(r)
-            z = sz + dz + unzigzag(packed / (2 as long))
-            jump = 0.0
-            if (packed & (1 as long)) != (0 as long) { jump = ((get_varint(r)) as float) / JUMP_STEPS }
-            if i > 0 {
-                dx = x - sx
-                dz = z - sz
+            f = 0
+            while f < n.cmd_count {
+                value = coded[f] + coded[CMD_FIELDS + f] + unzigzag(get_varint(r))
+                if i > 0 { coded[CMD_FIELDS + f] = value - coded[f] }
+                coded[f] = value
+                f = f + 1
             }
-            sx = x
-            sz = z
+            seen = 0
+            if command_acts_coded(n, coded) { seen = ack_tick - ((get_varint(r)) as int) }
         } else if i == 0 {
             return
         } else {
-            dx = 0 as long
-            dz = 0 as long
+            f = 0
+            while f < n.cmd_count {
+                coded[CMD_FIELDS + f] = 0 as long
+                f = f + 1
+            }
         }
         if !r.ok { return }
-        wx = (sx as float) / WALK_STEPS
-        wz = (sz as float) / WALK_STEPS
         // Not yet applied, and within the ring: kept at its place by
         // sequence, whatever came before it.
         if seq > p.last_input && seq <= p.last_input + COMMANDS {
             slot = (seq % COMMANDS) * COMMAND
-            q[slot] = (seq) as float
-            q[slot + 1] = wx
-            q[slot + 2] = wz
-            q[slot + 3] = jump
+            q[slot + C_SEQ] = seq as float
+            q[slot + C_SEEN] = seen as float
+            f = 0
+            while f < n.cmd_count {
+                q[slot + C_VALUE + f] = coded[f] as float
+                f = f + 1
+            }
             if seq > p.last_queued { p.last_queued = seq }
         }
         i = i + 1
     }
+}
+
+// Whether the command a message is decoding acts: any field of bits set.
+command_acts_coded(n: *Net, coded: long[]) -> bool {
+    precision = n.cmd_precision as float[]
+    f = 0
+    while f < n.cmd_count {
+        if precision[f] == 0.0 && coded[f] != (0 as long) { return true }
+        f = f + 1
+    }
+    return false
 }
 
 // A client's next command, applied to its player, and only that one: every
@@ -4317,10 +4429,10 @@ apply_queued(n: *Net, p: *Peer) {
     next = p.last_input + 1
     q = p.queued as float[]
     slot = (next % COMMANDS) * COMMAND
-    if (q[slot]) as int != next { return }
+    if (q[slot + C_SEQ]) as int != next { return }
     pl = p.player as *NetPlayer
-    physics.character_move(pl.controller, core.vec3(q[slot + 1], 0.0, q[slot + 2]), q[slot + 3], PLAYER_STEP)
-    settle(n, pl.controller)
+    player_apply(n, pl, command_units(n, q, slot), (q[slot + C_SEEN]) as int)
+    settle(n, pl)
     p.last_input = next
 }
 
@@ -4373,10 +4485,36 @@ host_play(n: *Net, now: float) -> *NetPlayer {
 // player, nothing. On the host, its own player (host_play) moves, and that
 // is all.
 player_input(n: *Net, walk: Vec3, jump: float, now: float) {
+    v = n.cmd_values as float[]
+    v[0] = walk.x
+    v[1] = walk.z
+    v[2] = jump
+    if jump < 0.0 { v[2] = 0.0 }
+    player_command(n, n.cmd_values, now)
+}
+
+// A client's command of the game's own (#531), its fields' values in
+// units in `values` (float[], in the order registered): its own player
+// moves by it now, ahead of the host, and it goes to the host with the few
+// before it, as player_input's does. A command that acts carries the tick
+// the client's view had reached. On the host, its own player (host_play)
+// moves, and that is all.
+player_command(n: *Net, values: ptr, now: float) {
     mine = n.mine as *NetPlayer
     if mine == null { return }
+    given = values as float[]
     if n.role == ROLE_HOST {
-        physics.character_move(mine.controller, core.vec3(walk.x, 0.0, walk.z), jump, PLAYER_STEP)
+        // The command as the wire would carry it, so the host's own player
+        // moves exactly as a client's would by the same command.
+        cmds = calloc(COMMAND, 8) as float[]
+        f = 0
+        while f < n.cmd_count {
+            cmds[C_VALUE + f] = (command_steps(n, f, given[f])) as float
+            f = f + 1
+        }
+        player_apply(n, mine, command_units(n, cmds, 0), n.tick)
+        free(cmds as ptr)
+        settle(n, mine)
         return
     }
     if n.command_count >= COMMANDS { return }
@@ -4384,33 +4522,39 @@ player_input(n: *Net, walk: Vec3, jump: float, now: float) {
     n.next_seq = n.next_seq + 1
     cmds = n.commands as float[]
     slot = ((n.command_first + n.command_count) % COMMANDS) * COMMAND
-    // The command as the wire carries it -- a millimetre a second of walk,
-    // a 64th of a metre a second of jump -- and predicted as that: the host
-    // applies the same numbers, so the two worlds take the same step.
-    cmds[slot] = (seq) as float
-    cmds[slot + 1] = (walk_steps(walk.x) as float) / WALK_STEPS
-    cmds[slot + 2] = (walk_steps(walk.z) as float) / WALK_STEPS
-    cmds[slot + 3] = (jump_steps(jump) as float) / JUMP_STEPS
-    cmds[slot + 4] = 0.0
+    // The command as the wire carries it, each field in its steps, and
+    // predicted as that: the host applies the same numbers, so the two
+    // worlds take the same step.
+    cmds[slot + C_SEQ] = seq as float
+    cmds[slot + C_SENT] = 0.0
+    f = 0
+    while f < n.cmd_count {
+        cmds[slot + C_VALUE + f] = (command_steps(n, f, given[f])) as float
+        f = f + 1
+    }
+    cmds[slot + C_SEEN] = 0.0
+    if command_acts(n, cmds, slot) { cmds[slot + C_SEEN] = seen_tick(n, now) as float }
     n.command_count = n.command_count + 1
-    physics.character_move(mine.controller, core.vec3(cmds[slot + 1], 0.0, cmds[slot + 2]), cmds[slot + 3], PLAYER_STEP)
-    settle(n, mine.controller)
+    player_apply(n, mine, command_units(n, cmds, slot), (cmds[slot + C_SEEN]) as int)
+    settle(n, mine)
     // Each command goes in as many messages from the one it is made in as
     // the link's loss asks (carried_for), so it is lost only when all of
     // them are; one the host still lacks while it holds a later one (a
     // snapshot says which) goes again, and every one after it, until the
     // host has it -- so no command is ever missing for good, and the host
     // applies every one, in order. A command is sent where it differs from
-    // the one before it, as its change from the change before: a walk
-    // turning or speeding up changes a little more each step, a byte an
-    // axis; a key held is the same command step after step, a bit each.
+    // the one before it, each field as its change from the change before:
+    // a walk turning or speeding up changes a little more each step, a
+    // byte an axis; a key held is the same command step after step, a bit
+    // each. A command that acts carries how far behind the message's tick
+    // its view was.
     carried = carried_for(n)
     start = 0
-    while start < n.command_count - 1 && cmds[((n.command_first + start) % COMMANDS) * COMMAND + 4] >= (carried as float) {
+    while start < n.command_count - 1 && cmds[((n.command_first + start) % COMMANDS) * COMMAND + C_SENT] >= (carried as float) {
         start = start + 1
     }
     if n.wanted > 0 {
-        lacked = n.wanted - (cmds[n.command_first * COMMAND]) as int
+        lacked = n.wanted - (cmds[n.command_first * COMMAND + C_SEQ]) as int
         if lacked >= 0 && lacked < start { start = lacked }
     }
     count = n.command_count - start
@@ -4420,7 +4564,7 @@ player_input(n: *Net, walk: Vec3, jump: float, now: float) {
     put_u8(b, MSG_INPUT)
     put_u16(b, n.newest_tick & 65535)
     put_view_flag(n, b, now)
-    put_u32(b, (cmds[((n.command_first + start) % COMMANDS) * COMMAND]) as int)
+    put_u32(b, (cmds[((n.command_first + start) % COMMANDS) * COMMAND + C_SEQ]) as int)
     put_u8(b, count)
     mask = 0
     k = 0
@@ -4432,39 +4576,144 @@ player_input(n: *Net, walk: Vec3, jump: float, now: float) {
         }
         k = k + 1
     }
-    sx = 0 as long
-    sz = 0 as long
-    dx = 0 as long
-    dz = 0 as long
+    coded = n.encoded as long[]
+    f = 0
+    while f < CMD_FIELDS * 2 {
+        coded[f] = 0 as long
+        f = f + 1
+    }
     k = 0
     while k < count {
         at = ((n.command_first + start + k) % COMMANDS) * COMMAND
         if command_differs(n, start + k, k == 0) {
-            x = walk_steps(cmds[at + 1])
-            z = walk_steps(cmds[at + 2])
-            leap = jump_steps(cmds[at + 3])
-            put_varint(b, zigzag(x - sx - dx))
-            // The z's lowest bit says whether a jump follows.
-            jumps = 0 as long
-            if leap > (0 as long) { jumps = 1 as long }
-            put_varint(b, zigzag(z - sz - dz) * (2 as long) + jumps)
-            if leap > (0 as long) { put_varint(b, leap) }
-            if k > 0 {
-                dx = x - sx
-                dz = z - sz
+            f = 0
+            while f < n.cmd_count {
+                value = (cmds[at + C_VALUE + f]) as long
+                put_varint(b, zigzag(value - coded[f] - coded[CMD_FIELDS + f]))
+                if k > 0 { coded[CMD_FIELDS + f] = value - coded[f] }
+                coded[f] = value
+                f = f + 1
             }
-            sx = x
-            sz = z
+            if command_acts(n, cmds, at) {
+                behind = n.newest_tick - (cmds[at + C_SEEN]) as int
+                if behind < 0 { behind = 0 }
+                put_varint(b, behind as long)
+            }
         } else {
-            dx = 0 as long
-            dz = 0 as long
+            f = 0
+            while f < n.cmd_count {
+                coded[CMD_FIELDS + f] = 0 as long
+                f = f + 1
+            }
         }
-        cmds[at + 4] = cmds[at + 4] + 1.0
+        cmds[at + C_SENT] = cmds[at + C_SENT] + 1.0
         k = k + 1
     }
     deliver(n, peer_by_id(n, 0), false, b.data, b.length, now)
     n.ack_due = false
     n.inputs_sent = n.inputs_sent + 1
+}
+
+// One command's values from their steps into units, in n.cmd_values.
+command_units(n: *Net, cmds: float[], at: int) -> ptr {
+    out = n.cmd_values as float[]
+    precision = n.cmd_precision as float[]
+    f = 0
+    while f < n.cmd_count {
+        if precision[f] > 0.0 {
+            out[f] = cmds[at + C_VALUE + f] * precision[f]
+        } else {
+            out[f] = cmds[at + C_VALUE + f]
+        }
+        f = f + 1
+    }
+    return n.cmd_values
+}
+
+// A value in its field's steps.
+command_steps(n: *Net, field: int, value: float) -> long {
+    precision = (n.cmd_precision as float[])[field]
+    if precision > 0.0 { return floor(value / precision + 0.5) as long }
+    return value as long
+}
+
+// Whether a command acts: any field of bits set.
+command_acts(n: *Net, cmds: float[], at: int) -> bool {
+    precision = n.cmd_precision as float[]
+    f = 0
+    while f < n.cmd_count {
+        if precision[f] == 0.0 && cmds[at + C_VALUE + f] != 0.0 { return true }
+        f = f + 1
+    }
+    return false
+}
+
+// A player moved by one command: the game's mover, or its controller by
+// the controller's command (a walk along x and z, a jump).
+player_apply(n: *Net, pl: *NetPlayer, values: ptr, seen: int) {
+    apply = n.mover_apply
+    if apply != null {
+        apply(n.mover_context, pl.object, values, PLAYER_STEP, seen)
+        return
+    }
+    if pl.controller == null { return }
+    v = values as float[]
+    physics.character_move(pl.controller, core.vec3(v[0], 0.0, v[1]), v[2], PLAYER_STEP)
+}
+
+// A player's movable state into `out` (float[OWN]); how many numbers.
+player_save(n: *Net, pl: *NetPlayer, out: ptr) -> int {
+    save = n.mover_save
+    if save != null { return save(n.mover_context, pl.object, out) }
+    v = out as float[]
+    where = behaviour.object_position(pl.object)
+    v[0] = where.x
+    v[1] = where.y
+    v[2] = where.z
+    v[3] = 0.0
+    v[4] = 0.0
+    if pl.controller != null {
+        v[3] = pl.controller.velocity.y
+        if pl.controller.grounded { v[4] = 1.0 }
+    }
+    return CONTROLLER_OWN
+}
+
+player_restore(n: *Net, pl: *NetPlayer, values: ptr) {
+    restore = n.mover_restore
+    if restore != null {
+        restore(n.mover_context, pl.object, values)
+        return
+    }
+    v = values as float[]
+    behaviour.object_set_position(pl.object, core.vec3(v[0], v[1], v[2]))
+    if pl.controller != null {
+        c = pl.controller
+        c.velocity = core.vec3(c.velocity.x, v[3], c.velocity.z)
+        c.grounded = v[4] > 0.5
+    }
+}
+
+// The numbers a player's state is: the mover's, or the controller's.
+own_count(n: *Net) -> int {
+    if n.mover_save != null { return n.mover_own }
+    return CONTROLLER_OWN
+}
+
+// The tick the client's view has reached: the newest snapshot it holds
+// whose time the view, `view_time`, is past. What it is drawing, and so
+// where a swing or a shot made now was aimed (#531, for #499).
+seen_tick(n: *Net, now: float) -> int {
+    view = view_time(n, now)
+    best = 0
+    slots = n.received as ptr[]
+    k = 0
+    while k < KEPT {
+        shot = slots[k] as *Snapshot
+        if shot != null && shot.used && shot.time <= view && shot.tick > best { best = shot.tick }
+        k = k + 1
+    }
+    return best
 }
 
 // A client's player after a move, as the snapshot carries it: its place
@@ -4474,22 +4723,20 @@ player_input(n: *Net, walk: Vec3, jump: float, now: float) {
 // wherever the player walks: where a hair of rounding would put it on the
 // other side of a seam between two floors, the correction was the floors'
 // difference, not a quantum.
-settle(n: *Net, c: *CharacterController) {
-    o = c.object as *GameObject
-    at = behaviour.object_position(o)
-    behaviour.object_set_position(o, core.vec3(as_f32(n, at.x), as_f32(n, at.y), as_f32(n, at.z)))
-    c.velocity = core.vec3(c.velocity.x, as_f32(n, c.velocity.y), c.velocity.z)
+settle(n: *Net, pl: *NetPlayer) {
+    count = player_save(n, pl, n.own_scratch)
+    v = n.own_scratch as float[]
+    k = 0
+    while k < count {
+        v[k] = as_f32(n, v[k])
+        k = k + 1
+    }
+    player_restore(n, pl, n.own_scratch)
+    return 0
 }
 
 // A walk in whole millimetres a second, a jump in 64ths of a metre a
 // second (none below 0): what a command is on the wire.
-walk_steps(v: float) -> long { return floor(v * WALK_STEPS + 0.5) as long }
-
-jump_steps(v: float) -> long {
-    if v <= 0.0 { return 0 as long }
-    return floor(v * JUMP_STEPS + 0.5) as long
-}
-
 // The input messages each command goes in: enough that every one of them
 // is lost for one command in a million (CARRIED_LOST) at the link's loss --
 // a ping's round trip, so at least either way's -- as the pings judged so
@@ -4524,7 +4771,14 @@ command_differs(n: *Net, k: int, first: bool) -> bool {
     cmds = n.commands as float[]
     at = ((n.command_first + k) % COMMANDS) * COMMAND
     was = ((n.command_first + k - 1) % COMMANDS) * COMMAND
-    return cmds[at + 1] != cmds[was + 1] || cmds[at + 2] != cmds[was + 2] || cmds[at + 3] != cmds[was + 3]
+    f = 0
+    while f < n.cmd_count {
+        if cmds[at + C_VALUE + f] != cmds[was + C_VALUE + f] { return true }
+        f = f + 1
+    }
+    // An action held is the same command again but for the tick it was
+    // aimed at, which the host needs for every one of them.
+    return command_acts(n, cmds, at) && cmds[at + C_SEEN] != cmds[was + C_SEEN]
 }
 
 // Host: the oldest command of a client's it lacks while it holds a later
@@ -4545,29 +4799,25 @@ wanted_command(p: *Peer) -> int {
 // replayed on top -- so the client stays ahead of the host and agrees with
 // it. How far that moved the player from where the client had it is the
 // prediction's error.
-reconcile(n: *Net, at: Vec3, vy: float, grounded: bool, ack: int) {
+reconcile(n: *Net, own: ptr, ack: int) {
     mine = n.mine as *NetPlayer
     if ack < n.acked { return }
     n.acked = ack
-    c = mine.controller
-    o = c.object as *GameObject
-    had = behaviour.object_position(o)
+    had = behaviour.object_position(mine.object)
     cmds = n.commands as float[]
-    while n.command_count > 0 && (cmds[n.command_first * COMMAND]) as int <= ack {
+    while n.command_count > 0 && (cmds[n.command_first * COMMAND + C_SEQ]) as int <= ack {
         n.command_first = (n.command_first + 1) % COMMANDS
         n.command_count = n.command_count - 1
     }
-    behaviour.object_set_position(o, at)
-    c.velocity = core.vec3(c.velocity.x, vy, c.velocity.z)
-    c.grounded = grounded
+    player_restore(n, mine, own)
     k = 0
     while k < n.command_count {
         slot = ((n.command_first + k) % COMMANDS) * COMMAND
-        physics.character_move(c, core.vec3(cmds[slot + 1], 0.0, cmds[slot + 2]), cmds[slot + 3], PLAYER_STEP)
-        settle(n, c)
+        player_apply(n, mine, command_units(n, cmds, slot), (cmds[slot + C_SEEN]) as int)
+        settle(n, mine)
         k = k + 1
     }
-    moved = core.v3_len(core.v3_sub(behaviour.object_position(o), had))
+    moved = core.v3_len(core.v3_sub(behaviour.object_position(mine.object), had))
     n.last_correction = moved
     if moved > n.worst_correction { n.worst_correction = moved }
 }
@@ -5831,6 +6081,10 @@ net_free(n: *Net) {
     }
     list.free(n.players)
     free(n.commands)
+    free(n.cmd_precision)
+    free(n.cmd_values)
+    free(n.own_scratch)
+    free(n.encoded)
     ring_free(n.received)
     snapshot_free(n.current)
     snapshot_free(n.previous)
