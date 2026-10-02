@@ -114,6 +114,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
+    vec3 skySun;
     int cloudFrame;
     int skyProcedural;
     float skyOvercast;
@@ -1279,7 +1280,7 @@ float wetMirror = 0.0;
 // One light's contribution. Everything here depends on which light is shading;
 // anything that does not stays in main and is computed once.
 vec3 direct_light(Light L, vec3 norm, vec3 viewDir, vec3 albedo, vec3 F0,
-                  float NdotV, float adjustedRoughness) {
+                  float NdotV, float adjustedRoughness, out vec3 backFill) {
     vec3 tempAdjustedLightColor = L.color * kelvinToRGB(L.temperature);
 
     vec3 lightDir;
@@ -1341,9 +1342,15 @@ vec3 direct_light(Light L, vec3 norm, vec3 viewDir, vec3 albedo, vec3 F0,
     specular = compensateEnergyLoss(specular, NdotV, roughness);
 
     // Hemisphere lighting: standard NdotL for front faces, a fill for the back
-    // so the terminator is not a hard cut.
+    // so the terminator is not a hard cut. The fill is handed back apart: it
+    // is the light's share of the sky's fill, and a shadow takes the direct
+    // light only. Multiplied by the shadow with the rest, it was the whole
+    // light a night ground had -- the sun under the horizon shadows
+    // everything from below -- and a shadow on put the ground at two thirds
+    // of its brightness with it off (#526).
     float hemisphereNdotL = max(NdotL_raw, 0.0);
     float fillLight = max(-NdotL_raw * 0.3, 0.0);
+    backFill = fillLight * tempAdjustedLightColor * albedo * 0.2 * attenuation;
 
     vec3 lit = applyEnergyConservation(
         kD * albedo / 3.14159265359 * radiance * hemisphereNdotL,
@@ -1352,7 +1359,7 @@ vec3 direct_light(Light L, vec3 norm, vec3 viewDir, vec3 albedo, vec3 F0,
         sheen * radiance * hemisphereNdotL
     ) + transmission;
 
-    return lit + fillLight * tempAdjustedLightColor * albedo * 0.2;
+    return lit;
 }
 
 
@@ -1513,8 +1520,9 @@ void main() {
             if (lights[i].isDirectional == 2 &&
                 dot(normalize(-gap), normalize(lights[i].direction)) < lights[i].spotCosOuter) continue;
         }
-        vec3 lit = direct_light(lights[i], norm, viewDir, albedo, F0, NdotV, adjustedRoughness);
-        Lo += i == 0 ? lit * sunlit * shaded : lit;
+        vec3 backFill;
+        vec3 lit = direct_light(lights[i], norm, viewDir, albedo, F0, NdotV, adjustedRoughness, backFill);
+        Lo += (i == 0 ? lit * sunlit * shaded : lit) + backFill;
     }
     if (clusterDims.w > 0.5) {
         int cell = cluster_of(FragPos);
@@ -1530,7 +1538,9 @@ void main() {
             if (L.isDirectional == 2 &&
                 dot(normalize(-gap), normalize(L.direction)) < L.spotCosOuter) continue;
             float fade = 1.0 - smoothstep(CLUSTER_FADE_START * reach, reach, sqrt(far2));
-            vec3 lit = direct_light(L, norm, viewDir, albedo, F0, NdotV, adjustedRoughness) * fade;
+            vec3 backFill;
+            vec3 lit = direct_light(L, norm, viewDir, albedo, F0, NdotV, adjustedRoughness, backFill) * fade;
+            Lo += backFill * fade;
             float shade = 1.0;
             if (lampSlot >= 0 && lampShadowBase >= 0 && enableShadows && dot(lit, vec3(0.333)) > 0.002) {
                 shade = lamp_shadow(lampSlot, normalize(Normal));

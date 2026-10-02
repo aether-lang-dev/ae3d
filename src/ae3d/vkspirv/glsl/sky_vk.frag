@@ -113,6 +113,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
+    vec3 skySun;
     int cloudFrame;
     int skyProcedural;
     float skyOvercast;
@@ -188,6 +189,10 @@ layout(location = 2) in vec4 ClipPrev;
 
 
 
+// Where the sun is for the hour, pointing at it: what the procedural sky is
+// drawn from. The key light may be the moon, at night; the sky is the
+// hour's whatever lights the scene (#526).
+
 // The frame, when a temporal pass folds frames (TAA, DLSS), else zero. The
 // march is dithered per pixel; turned by the frame, the dither is a
 // different set of steps every frame and the temporal pass averages them,
@@ -200,8 +205,9 @@ layout(location = 2) in vec4 ClipPrev;
 // shadows, so the march starts from the camera and not from the origin.
 
 // A sky drawn from the sun instead of read from the image: one, and the
-// image is ignored. The sun is cloudSun, the same sun the clouds are lit
-// by, so the sky, the clouds and the ground agree about where it is.
+// image is ignored. The sun is skySun, the hour's; at night the moon is
+// cloudSun, the key light the clouds and the ground are lit by, so the
+// sky, the clouds and the ground agree about where each is.
 
 // The overcast: how far the sky, painted or procedural, is pulled toward
 // a flat cast of skyOvercastColor at its own brightness -- the grey of a
@@ -497,6 +503,30 @@ vec3 proceduralSky(vec3 dir, vec3 sun, vec3 sunColor) {
     return sky;
 }
 
+// The night over the sky: the stars, fixed in the sky as the camera turns,
+// and the moon's disc and its glow where the key light is when the key
+// light is the moon. `night` is 0 by day and 1 once the sun is well under.
+vec3 nightSky(vec3 dir, vec3 moon, float night) {
+    if (night <= 0.0 || dir.y <= 0.0) return vec3(0.0);
+    vec3 add = vec3(0.0);
+    // A star in one cell of a fine grid over the sphere in a hundred and
+    // fifty: hashed from the cell, so it stays where it is.
+    vec3 cell = floor(dir * 420.0);
+    float h = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+    if (h > 0.9935) {
+        float bright = (h - 0.9935) / 0.0065;
+        vec3 centre = (cell + 0.5) / 420.0;
+        float near = 1.0 - smoothstep(0.0, 1.2 / 420.0, length(dir - centre));
+        add += vec3(0.85, 0.9, 1.0) * near * (0.25 + 0.75 * bright) * smoothstep(0.0, 0.15, dir.y);
+    }
+    if (moon.y > 0.0) {
+        float c = dot(dir, moon);
+        add += vec3(0.82, 0.86, 0.95) * smoothstep(0.99955, 0.99975, c) * 1.4;
+        add += vec3(0.30, 0.34, 0.45) * pow(max(c, 0.0), 60.0) * 0.18;
+    }
+    return add * night;
+}
+
 
 // Where this pixel's surface was last frame, for the temporal passes: the
 // clip positions the vertex stage carried, this frame's unnudged (the
@@ -525,7 +555,12 @@ void main() {
     // wherever the camera faced -X. A sky is a smooth gradient with nothing a
     // mip chain has to tame, so level 0 is right everywhere and seamless here.
     vec3 sky = textureLod(skybox, vec2(u, v), 0.0).rgb;
-    if (skyProcedural == 1) sky = proceduralSky(dir, normalize(cloudSun), cloudSunColor);
+    if (skyProcedural == 1) {
+        vec3 hourSun = normalize(skySun);
+        sky = proceduralSky(dir, hourSun, cloudSunColor);
+        float night = 1.0 - smoothstep(-0.14, -0.02, hourSun.y);
+        sky += nightSky(dir, normalize(cloudSun), night);
+    }
     if (skyOvercast > 0.0) {
         // The cast's brightness follows the sky's broad brightness, not the
         // pixel's: read from a coarse level of the painting, so a star -- a

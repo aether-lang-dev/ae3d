@@ -20,7 +20,13 @@ The feature list in full, with the reasoning behind each. The [README](../README
   the hour does and sets the key light, the fog and a sky drawn from the same
   sun -- blue at noon, gold and red at dusk, moonlit at night -- so the sky,
   the clouds and the light agree; the editor has it as a switch and a slider,
-  and the scene file carries the hour.
+  and the scene file carries the hour. Once the sun is 0.10 under the
+  horizon the key light is the moon, across the sky on the sun's arc, and
+  the night is lit and shadowed from above; the sky stays the hour's whatever
+  the key light is, with the stars and the moon's disc over it at night
+  (#526). A light's back fill, the light it lends the side turned from it,
+  is never shadowed: under the sun's map, cast up through the ground, it
+  had been a night's whole light, and a shadow took a third of it.
 - **Instances as matrices or as points.** An instanced model carries a
   matrix, a colour and a phase per instance, or -- `model_enable_point_instancing`
   -- a position, a scale, a colour and a phase in eight floats, with the

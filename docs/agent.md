@@ -55,7 +55,7 @@ interleaved with the first.
 | `light.list` |  | Every light: kind, position, direction, colour, intensity and ambient. |
 | `model.set` | `index, [position], [rotation], [scale], [diffuse], [metallic], [roughness], [reflectivity], [alpha], [visible], [casts_shadow], [name]` | Change a model. Only the fields present are written; answers with the model as it now is. |
 | `camera.set` | `[position], [look_at], [fov], [near], [far]` | Move or reframe the camera. |
-| `input.set` | `[key], [mouse], [button], [axis], [value], [down], [clear]` | Press or release a key, mouse button or pad button, hold a pad axis at a value, or clear every injection: what the engine's input reads next frame beside the real devices. |
+| `input.set` | `[key], [mouse], [button], [axis], [value], [down], [cursor], [scroll], [clear]` | Press or release a key, mouse button or pad button, hold a pad axis at a value, put the cursor at [x, y] in window coordinates (held until clear), turn the wheel by scroll notches (read for one frame), or clear every injection: what the engine's input reads next frame beside the real devices. |
 | `input.get` |  | Every bound action with its state this frame: down, pressed, released, value. |
 | `light.set` | `[index], [position], [direction], [color], [intensity], [ambient]` | Change a light. |
 | `object.list` | `[filter]` | The scene's game objects: index, name, tag, whether active, and the kinds of their components in order. The scene itself comes first as index -1, named Scene: its components are what is the scene's rather than any object's (Environment, Rendering, a script keeping the game's rules). With filter, only the objects whose name has the text. |
