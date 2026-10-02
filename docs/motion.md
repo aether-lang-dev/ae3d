@@ -54,7 +54,7 @@ A `POWERED` figure that leans more than 0.35 rad (20°) from its pose is falling
 - its head tucks 0.8 rad away from the fall, from where the chest carries it;
 - when the fall is toward its back, its spine bends away from the fall too, 0.5 rad at each of its two joints. Going over backwards, from the first lean, that rounds the back and tucks the chin, so the head comes down last. In a fall forwards or sideways the pelvis's front turns back along the fall once it passes level; face down, the bend arches the back and lifts the chest and head off the ground.
 
-If it catches itself (leans less than half the threshold again), the reach and the tuck let go and the balance comes back. It has landed when it leans past 1.2 rad (69°) with its pelvis down, within 25 cm of its lowest point, for ten steps: the reach stops, the balance lets go, and every joint holds the shape it landed in, the head still tucked, on 30% of its budget (`physics.ragdoll_hold_shape`). Once its pelvis and chest have been slower than 0.3 m/s for ten steps more, it lies (`lying(body)`). A fall caught on the hands and knees, or sitting, leans less or keeps its pelvis up. Its trunk still for half a second, it has landed as well, and holds the shape it was caught in at full strength, as a person on all fours does.
+If it catches itself (leans less than half the threshold again), the reach and the tuck let go and the balance comes back. It has landed when it leans past 1.2 rad (69°) with its pelvis down, within 25 cm of its lowest point, for ten steps: the reach stops, the balance lets go, and every joint holds the shape it landed in, the head still tucked, on 30% of its budget (`physics.ragdoll_hold_shape`). Once its pelvis and chest have been slower than 0.3 m/s for ten steps more, it lies (`lying(body)`). A fall caught on the hands and knees, or sitting, leans less or keeps its pelvis up. Its trunk still for a third of a second, it has landed as well, and holds the shape it was caught in at full strength with its balance kept, as a person on all fours does.
 
 Each of those was measured over thirty falls each way. With the arms still reaching once the figure was down, they pushed it back off the ground, and it fell a second time. Held at full strength, a figure lying flat rocked. Below a fifth of its budget the shape sagged and crept, and from half upward the joints chattered against the ground. A third settled the most. A caught figure let go to that share slumped onto its face. Holding the shape takes its own drive. An aim holds a bone's rotation in the world, and every bone aimed where it lay wrenched the legs back toward those rotations as the body rolled. Within 0.02 rad of a held shape the joints brake rather than chase it, or the calves creep along the ground for good.
 
@@ -67,10 +67,10 @@ The reach and the tuck were first chosen by one fall each way while three faults
 | way | protected head slower | head, protected / twin (average) | a second head impact | still within 3 s of landing |
 |---|---|---|---|---|
 | over backwards | 29 of 30 | 0.34 / 3.11 m/s | 0 | 30 |
-| forwards | 30 of 30 | 0.05 / 3.77 m/s | 0 | 21 |
+| forwards | 30 of 30 | 0 / 3.77 m/s (the head never touches) | 0 | 28 |
 | sideways | 30 of 30 | 0.97 / 4.02 m/s | 0 | 29 |
 
-Before, on the same ensemble (the reference's figure, all three faults), the protected head was the slower in 14, 23 and 21 falls, and over backwards it met the ground faster than its twin's on average (2.99 against 2.77 m/s). Forwards, its head met the ground a second time in 16 falls. What is left of #479 is the forward fallers caught on their hands and knees: 9 of them are still settling 3 s after landing.
+Before, on the same ensemble (the reference's figure, all three faults), the protected head was the slower in 14, 23 and 21 falls, and over backwards it met the ground faster than its twin's on average (2.99 against 2.77 m/s). Forwards, its head met the ground a second time in 16 falls. What is left of #479: two forward fallers and one sideways one come to rest at 3.25 and 3.3 s, a quarter of a second past the three.
 
 ## Stepping to catch itself
 
