@@ -105,12 +105,22 @@ what it struck.
 `skin.Skeleton` whose bones are named as the engine's Blender pipeline
 names them (`Hips`, `Spine`, `Chest`, `Neck`, `ThighL`, `KneeL`,
 `ShoulderL`, `ElbowL`, ...; `ragdoll_dress_named` takes another rig's
-names). The two rest poses are not the same figure, so at dressing each
-rig bone is first turned to point where the body's bone does -- from its
-joint toward its child's, or along its capsule -- after the figure has
-been faced the ragdoll's way from where each one's foot points; the
-rotation left between the body's frame and the bone's is what the body
-carries from then on. Every fixed step the root rides the pelvis and each
+names). Dressing builds the ragdoll again as the rig's own figure
+(#529): the rig is faced the ragdoll's way from where each one's feet
+point and stood on its pelvis, then every body's joint is put at its rig
+bone's head and every bone turned to run along the rig's line --
+pelvis to spine, spine to chest, chest to neck, each thigh to its knee,
+each arm to its elbow, and the neck, calves and forearms to their own
+child (head, ankle, wrist) -- its capsule stretched to the length
+(aephysics.human's `human_fit_shape`). The rig's bind pose is then the
+ragdoll's rest pose: each joint's spring and limits sit where the
+reference's did about its rest, and the rotation a body carries to its
+bone is a twist with no bend, so a spine that curves -- an MPFB human's
+leans 7 degrees forward, then 9 back, its neck's base 14 cm forward -- is
+held curved instead of driven straight. The figure is set down with its
+feet where the reference's were; a standing ragdoll stands again, its
+bodies new and its game objects the same. A ragdoll dresses once.
+Every fixed step the root rides the pelvis and each
 mapped bone takes its body's rotation, parents before children, and the
 unmapped bones (wrists, toes, the crown) follow their parents, so the
 mesh weighted to the rig stands, falls and lies as the ragdoll does with
@@ -256,7 +266,13 @@ does after the strike, its head down with the ragdoll's neck; a crate
 made from a scene record fell and rests like the one made by hand; the
 world written as a scene reads back with a record on every body; and
 after `physics_free` the objects are still the scene's, with no
-Rigidbody left on them. The
+Rigidbody left on them. `tests/test_ragdoll_fit.ae` dresses two rigs of
+one size, one straight up the spine and one curved as an MPFB human's
+is: every joint lands on its rig bone's head and every bone on the rig's
+line (each calf's shin, knee to ankle, not its foot), the bind pose is
+the rest, the figure faces its toes, and both stand five seconds
+`POWERED` and hold 90 N·s at the chest from behind, in front and the
+side. The
 physics engine's own suites (`scripts/test.sh` in the submodule) hold each
 layer to the reference.
 

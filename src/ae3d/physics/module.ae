@@ -57,7 +57,8 @@ exports (
     vehicle, vehicle_free, vehicle_drive, vehicle_speed, vehicle_chassis, vehicle_wheel,
     ragdoll, ragdoll_free, ragdoll_bone, ragdoll_human, ragdoll_set_velocity, ragdoll_kick,
     ragdoll_stand, ragdoll_release, ragdoll_is_standing, ragdoll_turn, ragdoll_of_shape, hit_event_count, hit_event,
-    ragdoll_dress, ragdoll_dress_named, ragdoll_is_dressed, humanoid_bone,
+    ragdoll_dress, ragdoll_dress_named, ragdoll_is_dressed, humanoid_bone, ragdoll_bone_axis, ragdoll_bone_speed,
+    ragdoll_hold_shape, ragdoll_let_go_shape, ragdoll_is_holding_shape,
     HUMANOID_ENGINE, HUMANOID_MIXAMO, HUMANOID_MIXAMO_BARE, humanoid_scheme, humanoid_scheme_bone, ragdoll_dress_humanoid,
     ragdoll_follow, ragdoll_is_following, ragdoll_power, ragdoll_is_powered, ragdoll_set_bone_drive,
     ragdoll_bone_drive_torque, ragdoll_set_balance_assist, ragdoll_aim, ragdoll_clear_aim, ragdoll_clear_aims, ragdoll_is_aimed, ragdoll_balance_assist,
@@ -130,6 +131,8 @@ struct Ragdoll {
     powered: bool                  // following through its joints' motors within a torque budget, the root free
     friction: float                // newton metres: the joints' motors' friction when not powered
     aims: ptr                      // float[BONE_COUNT * 5]: per bone, aimed (0/1) and a world rotation; null when none ever was
+    held: ptr                      // float[BONE_COUNT * 4]: each joint's relative rotation, held (ragdoll_hold_shape); null when none ever was
+    holding: bool
     // Powered, the rig is drawn as the bodies are; the animation's pose,
     // which the muscles track, is kept beside it: each mapped bone's local
     // rotation and the root's local position and rotation as the animation
@@ -151,6 +154,15 @@ struct Ragdoll {
     // Out of the world: every body and anchor disabled, and the step
     // passes it by (ragdoll_park).
     parked: bool
+    // What it was made with, so dressing can build it again as the rig's
+    // figure: its joints' springs, its filter group, and, standing, the
+    // ground its pelvis is sprung to and that spring's.
+    hertz: float
+    damping_ratio: float
+    group: int
+    stand_ground: BodyId
+    stand_hertz: float
+    stand_damping_ratio: float
 }
 
 // A skinned figure worn by a ragdoll: a rig bone per ragdoll bone, each
@@ -945,7 +957,10 @@ ragdoll(e: *Engine, name: string, position: Vec3, friction_torque: float, hertz:
     r.standing = false
     r.rig = null
     r.following = false
-    human.create_human(&r.human, p.world_id, position, friction_torque, hertz, damping_ratio, list.size(p.ragdolls) + 1, r as ptr)
+    r.hertz = hertz
+    r.damping_ratio = damping_ratio
+    r.group = list.size(p.ragdolls) + 1
+    human.create_human(&r.human, p.world_id, position, friction_torque, hertz, damping_ratio, r.group, r as ptr)
     r.friction = friction_torque
     r.bones = list.new()
     i = 0
@@ -979,6 +994,16 @@ bone_name(index: int) -> string {
 // body's frame, merged into one model.
 bone_model(body_id: BodyId, index: int) -> *Model {
     m = core.model_new()
+    push_bone_capsules(m.mesh, body_id)
+    core.model_update_matrix(m)
+    core.model_recalculate_bounds(m)
+    // Clothed rather than bare: a dull warm grey, the torso and limbs a shade apart.
+    tone = 0.58 - 0.05 * ((index % 4) as float)
+    core.model_matte(m, tone, tone * 0.92, tone * 0.85)
+    return m
+}
+
+push_bone_capsules(mesh: ptr, body_id: BodyId) {
     ids_block = calloc(4, sizeof(ShapeId))
     ids = ids_block as ShapeId[]
     count = dynamics.body_get_shapes(body_id, ids, 4)
@@ -986,17 +1011,11 @@ bone_model(body_id: BodyId, index: int) -> *Model {
     while i < count {
         if dynamics.shape_get_type(ids[i]) == shape.SHAPE_CAPSULE {
             c = dynamics.shape_get_capsule(ids[i])
-            loader.push_capsule(m.mesh, c.center1, c.center2, c.radius, 12, 6)
+            loader.push_capsule(mesh, c.center1, c.center2, c.radius, 12, 6)
         }
         i = i + 1
     }
     free(ids_block)
-    core.model_update_matrix(m)
-    core.model_recalculate_bounds(m)
-    // Clothed rather than bare: a dull warm grey, the torso and limbs a shade apart.
-    tone = 0.58 - 0.05 * ((index % 4) as float)
-    core.model_matte(m, tone, tone * 0.92, tone * 0.85)
-    return m
 }
 
 pull_ragdoll(r: *Ragdoll) {
@@ -1021,6 +1040,9 @@ ragdoll_stand(r: *Ragdoll, ground: *Rigidbody, hertz: float, damping_ratio: floa
     p = r.physics as *Physics
     human.human_align_spring(&r.human, p.world_id, ground.body_id, hertz, damping_ratio)
     human.human_create_parallel_anchors(&r.human, p.world_id)
+    r.stand_ground = ground.body_id
+    r.stand_hertz = hertz
+    r.stand_damping_ratio = damping_ratio
     r.standing = true
 }
 
@@ -1199,6 +1221,41 @@ ragdoll_aim(r: *Ragdoll, index: int, rotation: Quat) {
     aims[index * 5 + 4] = q.w
 }
 
+// The shape it has now held: every joint driven to the relative rotation
+// it has, whatever the rig or an aim asks, until ragdoll_let_go_shape. A
+// figure that has landed holds the shape it landed in; an aim instead
+// holds a bone's rotation in the world, and every bone aimed where it lay
+// wrenched the legs back toward it as the body rolled.
+ragdoll_hold_shape(r: *Ragdoll) {
+    if r.held == null { r.held = calloc(human.BONE_COUNT * 4, 8) }
+    held = r.held as float[]
+    i = 0
+    while i < human.BONE_COUNT {
+        bone = human.bone_at(&r.human, i)
+        if bone.parent_index >= 0 {
+            q = joint_relative(r, i)
+            held[i * 4] = q.x
+            held[i * 4 + 1] = q.y
+            held[i * 4 + 2] = q.z
+            held[i * 4 + 3] = q.w
+        }
+        i = i + 1
+    }
+    r.holding = true
+}
+
+ragdoll_let_go_shape(r: *Ragdoll) { r.holding = false }
+
+ragdoll_is_holding_shape(r: *Ragdoll) -> bool { return r.holding }
+
+// A joint's relative rotation now: its frame on the bone in its frame on the parent.
+joint_relative(r: *Ragdoll, index: int) -> Quat {
+    bone = human.bone_at(&r.human, index)
+    ha = core.quat_mul(dynamics.body_get_rotation(human.bone_at(&r.human, bone.parent_index).body_id), bone.local_frame_a.q)
+    hb = core.quat_mul(dynamics.body_get_rotation(bone.body_id), bone.local_frame_b.q)
+    return core.quat_normalize(core.quat_mul(core.quat_conjugate(ha), hb))
+}
+
 // Back to the rig's pose: one bone, or all.
 ragdoll_clear_aim(r: *Ragdoll, index: int) {
     if r.aims == null || index < 0 || index >= human.BONE_COUNT { return }
@@ -1251,6 +1308,10 @@ drive_joints(r: *Ragdoll, step: float) {
                 wb = core.quat_mul(ragdoll_aim_rotation(r, i), bone.local_frame_b.q)
             }
             want = core.quat_normalize(core.quat_mul(core.quat_conjugate(wa), wb))
+            if r.holding {
+                held = r.held as float[]
+                want = core.quat(held[i * 4], held[i * 4 + 1], held[i * 4 + 2], held[i * 4 + 3])
+            }
             ha = core.quat_mul(dynamics.body_get_rotation(parent_body), bone.local_frame_a.q)
             hb = core.quat_mul(dynamics.body_get_rotation(bone.body_id), bone.local_frame_b.q)
             have = core.quat_normalize(core.quat_mul(core.quat_conjugate(ha), hb))
@@ -1626,15 +1687,16 @@ ragdoll_restore_animation(r: *Ragdoll) {
     set_rig_locals(r, r.anim as float[])
 }
 
-// The lowest point of a pose: every bone's capsules where the pose puts
-// its body, the lowest of their ends less their radius.
+// The lowest point of a pose (of the bodies as they are, for null):
+// every bone's capsules where the pose puts its body, the lowest of
+// their ends less their radius.
 ragdoll_pose_lowest(r: *Ragdoll, pose: ptr) -> float {
     lowest = 1000000.0
     ids_block = calloc(4, sizeof(ShapeId))
     ids = ids_block as ShapeId[]
     i = 0
     while i < human.BONE_COUNT {
-        t = pose_get(pose as float[], i)
+        t = pose_or_body(r, pose, i)
         count = dynamics.body_get_shapes(human.bone_at(&r.human, i).body_id, ids, 4)
         k = 0
         while k < count {
@@ -1656,10 +1718,7 @@ ragdoll_pose_lowest(r: *Ragdoll, pose: ptr) -> float {
 // its joint (a calf's is the ankle, a forearm's the wrist).
 ragdoll_pose_end(r: *Ragdoll, pose: ptr, index: int) -> Vec3 {
     t = pose_get(pose as float[], index)
-    c = first_capsule(human.bone_at(&r.human, index).body_id)
-    far = c.center1
-    if core.v3_len(c.center2) > core.v3_len(c.center1) { far = c.center2 }
-    return core.v3_add(t.p, core.quat_apply(t.q, far))
+    return core.v3_add(t.p, core.quat_apply(t.q, bone_far_end(human.bone_at(&r.human, index))))
 }
 
 // A mapped rig bone's rotation in the world, as drawn now.
@@ -1937,6 +1996,11 @@ ragdoll_at(p: *Physics, origin: Vec3, direction: Vec3, reach: float) -> RagdollH
     return out
 }
 ragdoll_set_velocity(r: *Ragdoll, v: Vec3) { human.human_set_velocity(&r.human, v) }
+
+// How fast a bone's body moves, metres a second.
+ragdoll_bone_speed(r: *Ragdoll, index: int) -> float {
+    return core.v3_len(dynamics.body_get_linear_velocity(human.bone_at(&r.human, index).body_id))
+}
 ragdoll_kick(r: *Ragdoll, angular_impulse: Vec3) { human.human_apply_angular_impulse(&r.human, angular_impulse) }
 
 // The ragdoll out of the world; its bone objects stay the scene's to remove.
@@ -1959,6 +2023,7 @@ ragdoll_let_go(r: *Ragdoll) {
     human.destroy_human(&r.human)
     list.free(r.bones)
     if r.aims != null { free(r.aims) }
+    if r.held != null { free(r.held) }
     if r.anim != null { free(r.anim) }
     if r.written != null { free(r.written) }
     if r.targets != null { free(r.targets) }
@@ -2105,18 +2170,19 @@ ragdoll_is_dressed(r: *Ragdoll) -> bool { return r.rig != null }
 
 // With the rig's own names for the twelve bones (a glTF rig names them
 // its way). Answers false, dressing nothing, when a name is not in the
-// skeleton or the skeleton has no root.
+// skeleton, the skeleton has no root, or the ragdoll already wears a rig.
 //
-// The two rest poses are not the same figure: the rig is in its bind
-// pose, the ragdoll in the reference's. So at dressing each rig bone is
-// first turned so that it points where the body's bone does (from its
-// joint toward its child's, or along its capsule), and the rotation
-// between the body's frame and the bone's turned frame is what the body
-// carries from then on. The figure is faced the ragdoll's way first,
-// from where each one's foot points, so that turn is about a bone's own
-// length and not a half-turn of the whole figure.
+// The ragdoll is built again as the rig's figure. The rig is faced the
+// ragdoll's way first, from where each one's feet point, and stood on
+// its pelvis; then every body's joint is put at its rig bone's, every
+// bone turned to run along the rig's line and stretched to its length
+// (aephysics.human's human_fit_shape), and the figure set down with its
+// feet where they were. So the rig's bind pose is the ragdoll's rest
+// pose, and the rotation from a body to its bone carries no bend: a
+// spine that curves is held curved (#529). A standing ragdoll stands
+// again; its bodies are new, its game objects the same.
 ragdoll_dress_named(r: *Ragdoll, skeleton: *Skeleton, names: string[]) -> bool {
-    if r == null || skeleton == null || skin.skeleton_count(skeleton) == 0 { return false }
+    if r == null || r.rig != null || skeleton == null || skin.skeleton_count(skeleton) == 0 { return false }
     indices = calloc(human.BONE_COUNT, 4) as int[]
     i = 0
     while i < human.BONE_COUNT {
@@ -2136,8 +2202,7 @@ ragdoll_dress_named(r: *Ragdoll, skeleton: *Skeleton, names: string[]) -> bool {
     bones = rig.bones as RigBone[]
 
     // The figure faced as the ragdoll is, from the feet.
-    pelvis = human.bone_at(&r.human, human.BONE_PELVIS)
-    pelvis_t = dynamics.body_get_transform(pelvis.body_id)
+    pelvis_t = dynamics.body_get_transform(human.bone_at(&r.human, human.BONE_PELVIS).body_id)
     // Both feet, summed: a rest pose's feet splay, and the two splays cancel.
     rig_facing = core.v3_add(rig_foot_direction(skeleton, indices[human.BONE_CALF_L]), rig_foot_direction(skeleton, indices[human.BONE_CALF_R]))
     body_facing = core.v3_add(body_foot_direction(r, human.BONE_CALF_L), body_foot_direction(r, human.BONE_CALF_R))
@@ -2153,25 +2218,23 @@ ragdoll_dress_named(r: *Ragdoll, skeleton: *Skeleton, names: string[]) -> bool {
     core.model_set_position(root, root.position.x + shift.x, root.position.y + shift.y, root.position.z + shift.z)
     core.model_sync_transform(root)
 
-    // Each bone's offset from its body, with the bone turned to the body's direction.
+    fit_to_rig(r, skeleton, indices)
+
+    // Each bone's rotation and head from its body's: the body lies along
+    // the bone's line, so the rotation is the twist between their frames.
     i = 0
     while i < human.BONE_COUNT {
         bone = skin.skeleton_bone(skeleton, indices[i])
         core.model_sync_transform(bone)
-        body = human.bone_at(&r.human, i)
-        body_t = dynamics.body_get_transform(body.body_id)
-        along_body = body_bone_direction(r, i)
-        along_rig = rig_bone_direction(skeleton, indices[i])
-        aligned = bone.world_rotation
-        if core.v3_len(along_body) > 0.0001 && core.v3_len(along_rig) > 0.0001 {
-            aligned = core.quat_mul(core.quat_from_to(along_rig, along_body), bone.world_rotation)
-        }
+        body_t = dynamics.body_get_transform(human.bone_at(&r.human, i).body_id)
         bones[i].model = bone as ptr
-        bones[i].offset = core.quat_normalize(core.quat_mul(core.quat_conjugate(body_t.q), aligned))
+        bones[i].offset = core.quat_normalize(core.quat_mul(core.quat_conjugate(body_t.q), bone.world_rotation))
         bones[i].offset_p = core.quat_apply(core.quat_conjugate(body_t.q), core.v3_sub(bone.world_position, body_t.p))
         i = i + 1
     }
     // The root from the pelvis.
+    core.model_sync_transform(root)
+    pelvis_t = dynamics.body_get_transform(human.bone_at(&r.human, human.BONE_PELVIS).body_id)
     inverse_pelvis = core.quat_conjugate(pelvis_t.q)
     rig.root_offset_p = core.quat_apply(inverse_pelvis, core.v3_sub(root.world_position, pelvis_t.p))
     rig.root_offset_q = core.quat_normalize(core.quat_mul(inverse_pelvis, root.world_rotation))
@@ -2190,6 +2253,132 @@ ragdoll_dress_named(r: *Ragdoll, skeleton: *Skeleton, names: string[]) -> bool {
     return true
 }
 
+// The ragdoll built again as the figure the rig is, where it stands:
+// the reference's shape fitted to the rig's joints, lines and toes in
+// the figure's own space (the reference's, placed as the pelvis is now),
+// the old bodies destroyed and the fitted ones made, then set down so
+// its lowest point is where the old one's was. The bone objects keep
+// their names and take the new capsules; a standing figure is sprung
+// upright and anchored again.
+fit_to_rig(r: *Ragdoll, skeleton: *Skeleton, indices: int[]) {
+    p = r.physics as *Physics
+    shape = human.human_reference_shape()
+    rest = human.spec_at(shape, human.BONE_PELVIS).reference
+    pelvis_t = dynamics.body_get_transform(human.bone_at(&r.human, human.BONE_PELVIS).body_id)
+    place_q = core.quat_normalize(core.quat_mul(pelvis_t.q, core.quat_conjugate(rest.q)))
+    placement = Transform { p: core.v3_sub(pelvis_t.p, core.quat_apply(place_q, rest.p)), q: place_q }
+    block = calloc(2 * human.BONE_COUNT + 2, sizeof(Vec3))
+    v = block as Vec3[]
+    i = 0
+    while i < human.BONE_COUNT {
+        head = skin.skeleton_bone(skeleton, indices[i])
+        core.model_sync_transform(head)
+        v[i] = figure_point(placement, head.world_position)
+        v[human.BONE_COUNT + i] = figure_point(placement, rig_tail(skeleton, indices, i, shape, placement))
+        i = i + 1
+    }
+    toes = null as ptr
+    left = rig_toe(skeleton, indices[human.BONE_CALF_L])
+    right = rig_toe(skeleton, indices[human.BONE_CALF_R])
+    if left != null && right != null {
+        v[2 * human.BONE_COUNT] = figure_point(placement, left.world_position)
+        v[2 * human.BONE_COUNT + 1] = figure_point(placement, right.world_position)
+        toes = block + 2 * human.BONE_COUNT * sizeof(Vec3)
+    }
+    human.human_fit_shape(shape, block, block + human.BONE_COUNT * sizeof(Vec3), toes)
+    free(block)
+
+    lowest = ragdoll_pose_lowest(r, null)
+    standing = r.standing
+    r.standing = false
+    human.destroy_human(&r.human)
+    human.create_human_shaped(&r.human, p.world_id, placement, shape, r.friction, r.hertz, r.damping_ratio, r.group, r as ptr)
+    free(shape)
+    // Set down where the reference's feet were.
+    drop = lowest - ragdoll_pose_lowest(r, null)
+    i = 0
+    while i < human.BONE_COUNT {
+        id = human.bone_at(&r.human, i).body_id
+        t = dynamics.body_get_transform(id)
+        dynamics.body_set_transform(id, core.vec3(t.p.x, t.p.y + drop, t.p.z), t.q)
+        i = i + 1
+    }
+    root = rig_root(skeleton)
+    core.model_set_position(root, root.position.x, root.position.y + drop, root.position.z)
+    core.model_sync_transform(root)
+
+    // The bone objects draw the new capsules.
+    e = p.engine as *Engine
+    i = 0
+    while i < human.BONE_COUNT {
+        m = behaviour.object_model(list.get_raw(r.bones, i) as *GameObject)
+        if m != null {
+            mesh = geometry.mesh_create()
+            push_bone_capsules(mesh, human.bone_at(&r.human, i).body_id)
+            if e != null { engine.engine_remove_model(e, m) }
+            core.model_set_mesh(m, mesh)
+            if e != null { engine.engine_add_model(e, m) }
+        }
+        i = i + 1
+    }
+    pull_ragdoll(r)
+    if standing {
+        human.human_align_spring(&r.human, p.world_id, r.stand_ground, r.stand_hertz, r.stand_damping_ratio)
+        human.human_create_parallel_anchors(&r.human, p.world_id)
+        r.standing = true
+    }
+}
+
+// A point in the world in the figure's own space.
+figure_point(placement: Transform, at: Vec3) -> Vec3 {
+    return core.quat_apply(core.quat_conjugate(placement.q), core.v3_sub(at, placement.p))
+}
+
+// Where a mapped bone's line ends on the rig, in the world: its next
+// mapped bone's head along the chain the ragdoll is measured by (the
+// chest's runs to the neck's, not to whichever child the exporter listed
+// first: a clavicle, on a rig whose children sort by name); for the
+// neck, a calf or a forearm, its own first child's head (the head, the
+// ankle, the wrist); for a bone with none, the reference's line from
+// the bone's head.
+rig_tail(skeleton: *Skeleton, indices: int[], index: int, shape: ptr, placement: Transform) -> Vec3 {
+    head = skin.skeleton_bone(skeleton, indices[index])
+    next = human.human_chain_child(index)
+    if next >= 0 {
+        tail = skin.skeleton_bone(skeleton, indices[next])
+        core.model_sync_transform(tail)
+        return tail.world_position
+    }
+    child = rig_child(skeleton, head)
+    if child != null {
+        core.model_sync_transform(child)
+        return child.world_position
+    }
+    line = core.v3_sub(human.human_shape_tail(shape, index), human.human_shape_head(shape, index))
+    return core.v3_add(head.world_position, core.quat_apply(placement.q, line))
+}
+
+// A bone's first child in the skeleton, or null.
+rig_child(skeleton: *Skeleton, bone: *Model) -> *Model {
+    count = skin.skeleton_count(skeleton)
+    i = 0
+    while i < count {
+        other = skin.skeleton_bone(skeleton, i)
+        if other != null && core.model_parent(other) == bone { return other }
+        i = i + 1
+    }
+    return null
+}
+
+// A calf's toe: its child's (the ankle's) child, synced; null when the rig has none.
+rig_toe(skeleton: *Skeleton, calf_index: int) -> *Model {
+    ankle = rig_child(skeleton, skin.skeleton_bone(skeleton, calf_index))
+    if ankle == null { return null }
+    toe = rig_child(skeleton, ankle)
+    if toe != null { core.model_sync_transform(toe) }
+    return toe
+}
+
 // The rig's root: the bone with no parent among the skeleton's bones, or
 // the parent chain's top from the first bone.
 rig_root(skeleton: *Skeleton) -> *Model {
@@ -2200,75 +2389,19 @@ rig_root(skeleton: *Skeleton) -> *Model {
     return top
 }
 
-// Where a rig bone points: toward its first child in the skeleton, in the world.
-rig_bone_direction(skeleton: *Skeleton, index: int) -> Vec3 {
-    bone = skin.skeleton_bone(skeleton, index)
-    count = skin.skeleton_count(skeleton)
-    i = 0
-    while i < count {
-        other = skin.skeleton_bone(skeleton, i)
-        if other != null && core.model_parent(other) == bone {
-            core.model_sync_transform(other)
-            return core.v3_sub(other.world_position, bone.world_position)
-        }
-        i = i + 1
-    }
-    return core.vec3(0.0, 0.0, 0.0)
-}
-
 // Where the rig's foot points, along the ground: from the calf's child
 // (the ankle) to that one's child (the toe).
 rig_foot_direction(skeleton: *Skeleton, calf_index: int) -> Vec3 {
-    calf = skin.skeleton_bone(skeleton, calf_index)
-    count = skin.skeleton_count(skeleton)
-    ankle = null as *Model
-    i = 0
-    while i < count && ankle == null {
-        other = skin.skeleton_bone(skeleton, i)
-        if other != null && core.model_parent(other) == calf { ankle = other }
-        i = i + 1
-    }
-    if ankle == null { return core.vec3(0.0, 0.0, 0.0) }
-    i = 0
-    while i < count {
-        other = skin.skeleton_bone(skeleton, i)
-        if other != null && core.model_parent(other) == ankle {
-            core.model_sync_transform(other)
-            core.model_sync_transform(ankle)
-            d = core.v3_sub(other.world_position, ankle.world_position)
-            return core.vec3(d.x, 0.0, d.z)
-        }
-        i = i + 1
-    }
-    return core.vec3(0.0, 0.0, 0.0)
+    ankle = rig_child(skeleton, skin.skeleton_bone(skeleton, calf_index))
+    toe = rig_toe(skeleton, calf_index)
+    if ankle == null || toe == null { return core.vec3(0.0, 0.0, 0.0) }
+    core.model_sync_transform(ankle)
+    d = core.v3_sub(toe.world_position, ankle.world_position)
+    return core.vec3(d.x, 0.0, d.z)
 }
 
-// Where a ragdoll bone points, in the world: from its joint (the body's
-// origin) toward its child's joint, or, for a bone with no child, along
-// its capsule to the end farther from the joint.
-body_bone_direction(r: *Ragdoll, index: int) -> Vec3 {
-    body = human.bone_at(&r.human, index)
-    t = dynamics.body_get_transform(body.body_id)
-    local = core.vec3(0.0, 0.0, 0.0)
-    found = false
-    i = 0
-    while i < human.BONE_COUNT {
-        child = human.bone_at(&r.human, i)
-        if child.parent_index == index && found == false {
-            local = child.local_frame_a.p
-            found = true
-        }
-        i = i + 1
-    }
-    if found == false {
-        c = first_capsule(body.body_id)
-        if core.v3_len(c.center1) > core.v3_len(c.center2) { local = c.center1 } else { local = c.center2 }
-    }
-    return core.quat_apply(t.q, local)
-}
-
-// Where the ragdoll's foot points, along the ground: the calf's second
-// capsule is the foot, its end farther off the leg's line the toe.
+// Where the ragdoll's foot points, along the ground: the calf's foot
+// capsule, its end farther off the shin's line the toe.
 body_foot_direction(r: *Ragdoll, calf_index: int) -> Vec3 {
     return foot_direction_at(r, calf_index, dynamics.body_get_rotation(human.bone_at(&r.human, calf_index).body_id))
 }
@@ -2299,9 +2432,7 @@ knee_back(r: *Ragdoll, calf_index: int) -> Vec3 {
     if calf.twist_limit.y - angle < angle - calf.twist_limit.x { toward = 0.0 - 0.5 }
     axis = core.quat_apply(qa, core.vec3(0.0, 0.0, 1.0))
     knee = core.v3_add(thigh.reference_frame.p, core.quat_apply(thigh.reference_frame.q, calf.local_frame_a.p))
-    leg = first_capsule(calf.body_id)
-    far = leg.center1
-    if core.v3_len(leg.center2) > core.v3_len(leg.center1) { far = leg.center2 }
+    far = bone_far_end(calf)
     shin = core.v3_sub(core.v3_add(calf.reference_frame.p, core.quat_apply(calf.reference_frame.q, far)), knee)
     moved = core.quat_apply(core.quat_rotate(toward, axis), shin)
     d = core.v3_sub(moved, shin)
@@ -2311,33 +2442,31 @@ knee_back(r: *Ragdoll, calf_index: int) -> Vec3 {
 // Where a calf's foot points, along the ground, were the calf at `rotation`.
 foot_direction_at(r: *Ragdoll, calf_index: int, rotation: Quat) -> Vec3 {
     body = human.bone_at(&r.human, calf_index)
-    ids_block = calloc(4, sizeof(ShapeId))
-    ids = ids_block as ShapeId[]
-    count = dynamics.body_get_shapes(body.body_id, ids, 4)
-    direction = core.vec3(0.0, 0.0, 0.0)
-    if count >= 2 {
-        leg = dynamics.shape_get_capsule(ids[0])
-        foot = dynamics.shape_get_capsule(ids[1])
-        axis = core.v3_normalize(core.v3_sub(leg.center2, leg.center1))
-        off1 = core.v3_len(core.v3_sub(core.v3_sub(foot.center1, leg.center1), core.v3_mul(axis, core.v3_dot(core.v3_sub(foot.center1, leg.center1), axis))))
-        off2 = core.v3_len(core.v3_sub(core.v3_sub(foot.center2, leg.center1), core.v3_mul(axis, core.v3_dot(core.v3_sub(foot.center2, leg.center1), axis))))
-        local = core.v3_sub(foot.center1, foot.center2)
-        if off2 > off1 { local = core.v3_sub(foot.center2, foot.center1) }
-        d = core.quat_apply(rotation, local)
-        direction = core.vec3(d.x, 0.0, d.z)
-    }
-    free(ids_block)
-    return direction
+    if !dynamics.shape_is_valid(body.foot_shape_id) { return core.vec3(0.0, 0.0, 0.0) }
+    leg = dynamics.shape_get_capsule(body.shape_id)
+    foot = dynamics.shape_get_capsule(body.foot_shape_id)
+    axis = core.v3_normalize(core.v3_sub(leg.center2, leg.center1))
+    off1 = core.v3_len(core.v3_sub(core.v3_sub(foot.center1, leg.center1), core.v3_mul(axis, core.v3_dot(core.v3_sub(foot.center1, leg.center1), axis))))
+    off2 = core.v3_len(core.v3_sub(core.v3_sub(foot.center2, leg.center1), core.v3_mul(axis, core.v3_dot(core.v3_sub(foot.center2, leg.center1), axis))))
+    local = core.v3_sub(foot.center1, foot.center2)
+    if off2 > off1 { local = core.v3_sub(foot.center2, foot.center1) }
+    d = core.quat_apply(rotation, local)
+    return core.vec3(d.x, 0.0, d.z)
 }
 
-first_capsule(body_id: BodyId) -> Capsule {
-    ids_block = calloc(4, sizeof(ShapeId))
-    ids = ids_block as ShapeId[]
-    count = dynamics.body_get_shapes(body_id, ids, 4)
-    c = manifold.capsule(math.vec3(0.0, 0.0, 0.0), math.vec3(0.0, 0.0, 0.0), 0.0)
-    if count > 0 { c = dynamics.shape_get_capsule(ids[0]) }
-    free(ids_block)
-    return c
+// The way a bone runs from its joint, in its body's frame: a unit vector
+// toward its far end. The reference's left limbs run along their bodies'
+// +x and its right ones along -x, so nothing can take one axis for all.
+ragdoll_bone_axis(r: *Ragdoll, index: int) -> Vec3 {
+    return core.v3_normalize(bone_far_end(human.bone_at(&r.human, index)))
+}
+
+// A bone's far end in its body's frame: the end of its own capsule (a
+// calf's shin, not its foot) farther from its joint.
+bone_far_end(bone: *HumanBone) -> Vec3 {
+    c = dynamics.shape_get_capsule(bone.shape_id)
+    if core.v3_len(c.center2) > core.v3_len(c.center1) { return c.center2 }
+    return c.center1
 }
 
 // The rig after the step: the root where the pelvis carries it, every
