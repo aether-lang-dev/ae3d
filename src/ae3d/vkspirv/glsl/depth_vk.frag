@@ -115,7 +115,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float clipNoise;
     float clipNoiseScale;
     int woundCount;
-    vec4 woundData[48];
+    vec4 woundData[96];
     vec4 woundLayers[4];
     float woundCore;
     mat4 projection;
@@ -215,11 +215,13 @@ bool clippedAway(vec3 bindPos) {
     return side > 0.0;
 }
 
-// Wounds (#543): up to 16 ellipsoids in the model's bind space, three vec4s
-// each -- the centre, the radii along its own axes, the rotation (a
-// quaternion) from those axes into bind space -- and the layers a wound
+// Wounds (#543) and splats (#546): up to 32 ellipsoids in the model's bind
+// space, three vec4s each -- the centre and the kind (0 a wound, 1 a
+// splat), the radii along its own axes and a splat's opacity, the rotation
+// (a quaternion) from those axes into bind space -- and the layers a wound
 // cuts down through, rgb and the share of its radius each starts at. Inside
-// woundCore of a wound's radius the skin is a hole. The same words are in
+// woundCore of a wound's radius the skin is a hole. A splat is blood on the
+// skin, the outermost layer's colour, its edge ragged by the cut's noise. The same words are in
 // the scene's fragment shader and the depth one, so a hole is a hole in
 // the frame, its depth and its shadow alike.
 
@@ -239,8 +241,9 @@ vec3 woundUnturn(vec4 q, vec3 v) {
 // 2 where it is in no wound.
 float woundDepth(vec3 p) {
     float best = 2.0;
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 32; i++) {
         if (i >= woundCount) break;
+        if (woundData[i * 3].w > 0.5) continue;
         vec3 r = max(woundData[i * 3 + 1].xyz, vec3(0.0001));
         vec3 local = woundUnturn(woundData[i * 3 + 2], p - woundData[i * 3].xyz) / r;
         best = min(best, length(local));

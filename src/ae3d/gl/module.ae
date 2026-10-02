@@ -41,7 +41,7 @@ exports (
     renderer_set_target, renderer_set_overlay,
     renderer_set_bloom_params, renderer_set_bloom_intensity, renderer_bloom_intensity,
     renderer_set_post, renderer_set_fog, renderer_fog, renderer_set_clouds, renderer_set_sky_overcast, renderer_set_sky_sun,
-    renderer_set_ssao, renderer_ssao,
+    renderer_set_ssao, renderer_ssao, renderer_set_ssr, renderer_ssr, renderer_set_ssr_params,
     renderer_set_shadows, renderer_shadows, renderer_shadow_map, renderer_default_program,
     renderer_set_shadow_distance, renderer_shadow_distance,
     renderer_load_texture, renderer_release_texture, renderer_texture_count,
@@ -1657,6 +1657,15 @@ struct GLRenderer {
     cloud_shape_texture: int
     cloud_weather_texture: int
     cloud_textures_real: bool      // the noise, not the placeholders
+    // Screen-space reflections on the wet road (#491): the pass Vulkan runs,
+    // from the same shader, into a texture of the post buffer's size that
+    // the temporal pass and the composite then read.
+    ssr_program: int
+    ssr_enabled: bool
+    ssr_road_height: float
+    ssr_strength: float
+    ssr_fbo: int
+    ssr_texture: int
     ssao_program: int
     ssao_enabled: bool
     ssao_radius: float
@@ -2297,6 +2306,7 @@ renderer_init(r: *GLRenderer, window: ptr, width: int, height: int) -> int {
     r.bloom_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_BLOOM, "bloom")
     r.taa_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_TAA, "taa")
     r.ssao_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_SSAO, "ssao")
+    r.ssr_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_SSR, "ssr")
     r.passthrough_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_PASSTHROUGH, "passthrough")
 
     r.default_texture = create_default_texture(r)
@@ -2821,6 +2831,16 @@ renderer_set_ssao(r: *GLRenderer, on: bool, radius: float, intensity: float) {
 }
 
 renderer_ssao(r: *GLRenderer) -> bool { return r.ssao_enabled }
+
+// Screen-space reflections on or off, and the wet plane's height and how
+// strongly it reflects: the frame through the post chain, its reflection
+// pass between the scene and the temporal pass, as on Vulkan (#491).
+renderer_set_ssr(r: *GLRenderer, on: bool) { r.ssr_enabled = on }
+renderer_ssr(r: *GLRenderer) -> bool { return r.ssr_enabled }
+renderer_set_ssr_params(r: *GLRenderer, road_height: float, strength: float) {
+    r.ssr_road_height = road_height
+    r.ssr_strength = strength
+}
 
 renderer_set_fog(r: *GLRenderer, f: *Fog) {
     if f == null { r.fog = core.fog_none() ; return }
@@ -3873,7 +3893,7 @@ renderer_render(r: *GLRenderer, cam: *Camera, light: *Light) {
     // temporal pass to find each pixel's history by. Copied once, only
     // when something will read it.
     r.scene_depth = 0
-    if wants_scene_depth(r) || r.ssao_enabled || r.enable_taa { r.scene_depth = gl_scene_depth_capture() }
+    if wants_scene_depth(r) || r.ssao_enabled || r.enable_taa || r.ssr_enabled { r.scene_depth = gl_scene_depth_capture() }
     if r.ssao_enabled && r.scene_depth != 0 && r.capture_channel == 0 { draw_occlusion(r, cam) }
 
     count = list.size(r.models)
@@ -4912,6 +4932,45 @@ resize_post_processing(r: *GLRenderer, width: int, height: int) {
     r.bloom_texture = gl_fbo_attach_color(r.bloom_fbo, bloom_width, bloom_height, 1)
     gl_fbo_bind(0)
     resize_taa(r, clamped_width, clamped_height)
+    if r.ssr_fbo != 0 { resize_ssr(r, clamped_width, clamped_height) }
+}
+
+// The reflection's target at the post buffers' size.
+resize_ssr(r: *GLRenderer, width: int, height: int) {
+    if r.ssr_fbo == 0 { r.ssr_fbo = gl_fbo_create() }
+    if r.ssr_texture != 0 { gl_texture_delete(r.ssr_texture) }
+    r.ssr_texture = gl_fbo_attach_color(r.ssr_fbo, width, height, 0)
+    gl_fbo_bind(0)
+}
+
+// The reflection pass (#491): the scene (`source`) and its depth into the
+// reflection's target, the wet plane mirroring what the depth says is
+// above it. Returns the texture the passes after it read: the target, or
+// `source` when there is no reflection to draw.
+draw_ssr(r: *GLRenderer, source: int, cam: *Camera, view_projection: Mat4) -> int {
+    if !r.ssr_enabled || r.ssr_program == 0 || r.scene_depth == 0 || r.capture_channel != 0 { return source }
+    if r.ssr_fbo == 0 || r.ssr_texture == 0 { resize_ssr(r, r.post_width, r.post_height) }
+    if r.ssr_fbo == 0 || r.ssr_texture == 0 { return source }
+    gl_fbo_bind(r.ssr_fbo)
+    gl_fbo_set_color(r.ssr_fbo, r.ssr_texture)
+    gl_viewport(0, 0, r.post_width, r.post_height)
+    use_program(r, r.ssr_program)
+    gl_texture_bind(0, source)
+    gl_texture_bind(1, r.scene_depth)
+    r.bound_texture = 0 - 1
+    inverse = core.mat4_inverse(view_projection)
+    gl_uniform_int(gl_uniform_location(r.ssr_program, "screenTexture"), 0)
+    gl_uniform_int(gl_uniform_location(r.ssr_program, "depthTexture"), 1)
+    gl_uniform_mat4(gl_uniform_location(r.ssr_program, "viewProjection"), &view_projection)
+    gl_uniform_mat4(gl_uniform_location(r.ssr_program, "invViewProjection"), &inverse)
+    gl_uniform_vec3(gl_uniform_location(r.ssr_program, "viewPos"), cam.position.x, cam.position.y, cam.position.z)
+    gl_uniform_float(gl_uniform_location(r.ssr_program, "ssrRoadHeight"), r.ssr_road_height)
+    gl_uniform_float(gl_uniform_location(r.ssr_program, "ssrStrength"), r.ssr_strength)
+    gl_vao_bind(r.screen_vao)
+    gl_draw_arrays(0, 6)
+    gl_vao_bind(0)
+    r.last_draw_calls = r.last_draw_calls + 1
+    return r.ssr_texture
 }
 
 // The temporal pass's two history textures at the post buffers' size,
@@ -4932,12 +4991,12 @@ resize_taa(r: *GLRenderer, width: int, height: int) {
 // by the scene's depth and the last frame's view-projection, into the
 // other history texture, which the composite then reads and the next
 // frame reads back. Returns the texture the composite should read.
-draw_taa(r: *GLRenderer, cam: *Camera, view_projection: Mat4, unjittered: Mat4) -> int {
-    if !r.enable_taa || r.taa_program == 0 || r.scene_depth == 0 { return r.post_texture }
+draw_taa(r: *GLRenderer, source: int, cam: *Camera, view_projection: Mat4, unjittered: Mat4) -> int {
+    if !r.enable_taa || r.taa_program == 0 || r.scene_depth == 0 { return source }
     // Made the first time the pass runs, at the post buffers' size; a
     // resize of those remakes them.
     if r.taa_fbo == 0 || r.taa_texture0 == 0 || r.taa_texture1 == 0 { resize_taa(r, r.post_width, r.post_height) }
-    if r.taa_fbo == 0 || r.taa_texture0 == 0 || r.taa_texture1 == 0 { return r.post_texture }
+    if r.taa_fbo == 0 || r.taa_texture0 == 0 || r.taa_texture1 == 0 { return source }
     into = r.taa_texture0
     history = r.taa_texture1
     if r.taa_current == 1 { into = r.taa_texture1 ; history = r.taa_texture0 }
@@ -4945,7 +5004,7 @@ draw_taa(r: *GLRenderer, cam: *Camera, view_projection: Mat4, unjittered: Mat4) 
     gl_fbo_set_color(r.taa_fbo, into)
     gl_viewport(0, 0, r.post_width, r.post_height)
     use_program(r, r.taa_program)
-    gl_texture_bind(0, r.post_texture)
+    gl_texture_bind(0, source)
     gl_texture_bind(1, r.scene_depth)
     gl_texture_bind(2, history)
     gl_texture_bind(3, r.post_velocity)
@@ -4971,7 +5030,7 @@ begin_post_processing(r: *GLRenderer) -> bool {
     // A render scale below 1 is on its own a reason to draw into the offscreen
     // buffer, with or without an effect to run afterwards: resolve_post_processing
     // falls back to the passthrough program, so the composite becomes the upscale.
-    if !r.enable_fxaa && !r.enable_bloom && !r.enable_taa && r.render_scale > 0.999 { return false }
+    if !r.enable_fxaa && !r.enable_bloom && !r.enable_taa && !r.ssr_enabled && r.render_scale > 0.999 { return false }
     // A capture channel is the surfaces' own numbers: no effect over them.
     if r.capture_channel != 0 && r.render_scale > 0.999 { return false }
     if r.post_fbo == 0 || r.post_texture == 0 || r.screen_vao == 0 { return false }
@@ -5087,7 +5146,8 @@ resolve_post_processing(r: *GLRenderer, cam: *Camera, view_projection: Mat4, unj
     gl_set_depth_mask(0)
     set_blend(r, false)
     set_wireframe(r, false)
-    source = draw_taa(r, cam, view_projection, unjittered)
+    source = draw_ssr(r, r.post_texture, cam, view_projection)
+    source = draw_taa(r, source, cam, view_projection, unjittered)
     bind_output(r)
     // Back to the full frame for the composite: the scene pass may have been
     // drawn smaller, and this is the step that puts it back on the window.
@@ -5247,6 +5307,9 @@ renderer_cleanup(r: *GLRenderer) {
     if r.taa_texture1 != 0 { gl_texture_delete(r.taa_texture1) ; r.taa_texture1 = 0 }
     if r.taa_fbo != 0 { gl_fbo_delete(r.taa_fbo) ; r.taa_fbo = 0 }
     if r.taa_program != 0 { gl_program_delete(r.taa_program) ; r.taa_program = 0 }
+    if r.ssr_texture != 0 { gl_texture_delete(r.ssr_texture) ; r.ssr_texture = 0 }
+    if r.ssr_fbo != 0 { gl_fbo_delete(r.ssr_fbo) ; r.ssr_fbo = 0 }
+    if r.ssr_program != 0 { gl_program_delete(r.ssr_program) ; r.ssr_program = 0 }
     if r.shadow_map != 0 { gl_texture_delete(r.shadow_map) ; r.shadow_map = 0 }
     if r.shadow_fbo != 0 { gl_fbo_delete(r.shadow_fbo) ; r.shadow_fbo = 0 }
     if r.lamp_map != 0 { gl_texture_delete(r.lamp_map) ; r.lamp_map = 0 }
