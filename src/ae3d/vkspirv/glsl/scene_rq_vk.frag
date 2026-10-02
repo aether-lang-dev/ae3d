@@ -114,6 +114,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float causticsTime;
     int lampShadowBase;
     int keyLampSlot;
+    bool clipOn;
+    vec4 clipPlane;
+    float clipNoise;
+    float clipNoiseScale;
+    int woundCount;
+    vec4 woundData[48];
+    vec4 woundLayers[4];
+    float woundCore;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -184,6 +192,7 @@ layout(location = 3) in vec3 InstanceColor;
 layout(location = 4) in vec4 FragPosLightSpace;
 layout(location = 6) in vec4 ClipNow;
 layout(location = 7) in vec4 ClipPrev;
+layout(location = 8) in vec3 BindPos;
 layout(location = 1) out vec2 outVelocity;
 
 
@@ -1378,7 +1387,82 @@ vec2 velocity(vec4 now, vec4 prev, vec2 nudge) {
     return uvNow - uvPrev;
 }
 
+
+// The model's cut (#545): a plane in its bind space -- the vertex before it
+// was skinned, carried in BindPos -- past which nothing is drawn, wandering
+// by up to clipNoise metres as value noise of clipNoiseScale cells a metre.
+// The same words are in the scene's fragment shader and the depth one, so a
+// cut's silhouette and its shadow agree to the texel.
+
+
+
+
+
+float clipHash(vec3 p) {
+    p = fract(p * 0.3183099 + vec3(0.71, 0.113, 0.419));
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float clipValueNoise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(clipHash(i + vec3(0.0, 0.0, 0.0)), clipHash(i + vec3(1.0, 0.0, 0.0)), f.x),
+                   mix(clipHash(i + vec3(0.0, 1.0, 0.0)), clipHash(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),
+               mix(mix(clipHash(i + vec3(0.0, 0.0, 1.0)), clipHash(i + vec3(1.0, 0.0, 1.0)), f.x),
+                   mix(clipHash(i + vec3(0.0, 1.0, 1.0)), clipHash(i + vec3(1.0, 1.0, 1.0)), f.x), f.y), f.z);
+}
+
+// Whether the fragment lies past the cut.
+bool clippedAway(vec3 bindPos) {
+    if (!clipOn) return false;
+    float side = dot(clipPlane.xyz, bindPos) - clipPlane.w;
+    if (clipNoise > 0.0) side += clipNoise * (clipValueNoise(bindPos * clipNoiseScale) * 2.0 - 1.0);
+    return side > 0.0;
+}
+
+
+// Wounds (#543): up to 16 ellipsoids in the model's bind space, three vec4s
+// each -- the centre, the radii along its own axes, the rotation (a
+// quaternion) from those axes into bind space -- and the layers a wound
+// cuts down through, rgb and the share of its radius each starts at. Inside
+// woundCore of a wound's radius the skin is a hole. The same words are in
+// the scene's fragment shader and the depth one, so a hole is a hole in
+// the frame, its depth and its shadow alike.
+
+
+
+
+
+// `v` turned by the inverse of the rotation `q`.
+vec3 woundUnturn(vec4 q, vec3 v) {
+    vec3 u = -q.xyz;
+    vec3 t = 2.0 * cross(u, v);
+    return v + q.w * t + cross(u, t);
+}
+
+// How deep in the nearest wound a bind-space point is: the wound's
+// ellipsoid scaled to reach it, 1 at its surface and 0 at its centre;
+// 2 where it is in no wound.
+float woundDepth(vec3 p) {
+    float best = 2.0;
+    for (int i = 0; i < 16; i++) {
+        if (i >= woundCount) break;
+        vec3 r = max(woundData[i * 3 + 1].xyz, vec3(0.0001));
+        vec3 local = woundUnturn(woundData[i * 3 + 2], p - woundData[i * 3].xyz) / r;
+        best = min(best, length(local));
+    }
+    return best;
+}
+
 void main() {
+    // A cut model's far side, not drawn (#545): nor its depth, which the
+    // occlusion, the reflections and the water read from this pass.
+    if (clippedAway(BindPos)) discard;
+    // A wound's core is a hole (#543); around it, its layers.
+    float woundAt = woundCount > 0 ? woundDepth(BindPos) : 2.0;
+    if (woundAt < woundCore) discard;
 
     vec4 texColor = texture(textureSampler, fragTexCoord);
     
@@ -1439,6 +1523,15 @@ void main() {
 
     // Material properties
     vec3 albedo = diffuseColor * texColor.rgb * InstanceColor; // Apply per-instance color
+    // Inside a wound, the layer it has cut down to: blood at the rim, then
+    // fat, muscle, bone -- each from the share of the radius it starts at.
+    if (woundAt < 1.0) {
+        vec3 layer = woundLayers[0].rgb;
+        for (int k = 1; k < 4; k++) {
+            if (woundAt < woundLayers[k].w) layer = woundLayers[k].rgb;
+        }
+        albedo = mix(albedo, layer, smoothstep(1.0, 0.94, woundAt));
+    }
 
     // GPU Gems Chapter 5: Apply Perlin noise for surface detail if enabled
     if (enablePerlinNoise) {

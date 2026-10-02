@@ -110,6 +110,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float causticsTime;
     int lampShadowBase;
     int keyLampSlot;
+    bool clipOn;
+    vec4 clipPlane;
+    float clipNoise;
+    float clipNoiseScale;
+    int woundCount;
+    vec4 woundData[48];
+    vec4 woundLayers[4];
+    float woundCore;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -223,6 +231,7 @@ layout(location = 4) out vec4 FragPosLightSpace;
 layout(location = 5) out float Occlusion;
 layout(location = 6) out vec4 ClipNow;
 layout(location = 7) out vec4 ClipPrev;
+layout(location = 8) out vec3 BindPos;
 
 // The bone's matrix at a frame, read as its four columns from the bank.
 mat4 boneAt(int bone, int frame) {
@@ -257,6 +266,7 @@ mat4 skinAtPhase(float phase) {
 }
 
 void main() {
+    BindPos = inPosition;
     Occlusion = inOcclusion;
     mat4 modelMatrix = model * instanceModel;
     // The way the figure faces, which is the way it walks.

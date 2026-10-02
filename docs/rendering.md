@@ -557,6 +557,65 @@ a streak of rain stays a streak; or full (mode 2), tipped to face the eye
 as well, for a flake or a mote. The weather's particles are a quad with a
 soft disc for a texture, drawn this way.
 
+### A model cut by a plane
+
+`core.model_set_clip(m, normal, distance, noise, noise_scale)` cuts a model
+by a plane in its bind space -- a skinned model's pose before it was skinned,
+any other model's own space (#545): nothing on the side the normal points to
+is drawn, in the scene, in the depth the scene keeps for the occlusion, the
+reflections and the water, or in any shadow, cascade or lamp. A severed limb
+is the figure twice, the body cut by the plane and the loose copy by the same
+plane turned round (`-normal`, `-distance`), each with its cap. The cut is
+on the body, so it bends with it: a bent column cut down its middle keeps
+half of itself, on both renderers to the pixel. `noise` metres of value noise
+at `noise_scale` cells a metre wander the cut for a ragged edge; the same
+words of GLSL run in the scene's fragment shader and the depth one, so the
+edge and its shadow agree. Every vertex shader hands its fragments the vertex
+before skinning (`BindPos`). A cut model draws on its own (no merged draw,
+cast or lit), and on Vulkan its shadow is the map's even with ray-traced
+shadows on, since a ray would meet the whole mesh. `tests/test_skinned_render`
+and `tests/test_shadows` hold it on both renderers; on zombie_city's 20,000
+the depth shader's cut costs nothing measurable (shadow pass 0.31 ms, as
+recorded).
+
+### Wounds
+
+`core.model_set_wound(m, index, centre, radii, rotation)` puts a wound on a
+model (#543): an ellipsoid in its bind space, up to sixteen
+(`core.MAX_WOUNDS`), the way Left 4 Dead 2 cut its zombies (Vlachos, GDC
+2010). Inside it the skin is drawn cut down through layers -- blood at the
+rim, then fat, muscle and bone, each from the share of the wound's radius it
+starts at (`model_set_wound_layer`) -- and inside `model_set_wound_core` of
+the radius it is a hole, in the scene, its depth and every shadow alike; the
+game fills the cavity with a wound mesh on the bone. The wounds go to the
+shaders as three vec4s each (centre, radii, rotation), already 32-bit
+floats: `glUniform4fv` on OpenGL, one copy into the block on Vulkan, whose
+block grew to 10,384 bytes. A wounded model draws on its own and keeps the
+shadow map, as a cut one does. `tests/test_skinned_render` holds the hole and
+the blood on both renderers, and `tests/test_shadows` the hole a wound
+through the sphere puts in its shadow.
+
+### Particles
+
+`ae3d.particles` is an emitter (#546): blood spraying from a hit and
+dripping from a wound, dust, sparks, debris. `particles.emitter(e, capacity)`
+puts one in the engine -- its model and its fixed step -- and the game sets
+where it is (`set_position`), the cone it throws into (`set_direction`, an
+axis and a half angle), the speeds and lifetimes it picks between, gravity,
+drag (the share of its speed a particle loses a second), the size at birth
+and at death (the fade), the colour, and a rate a second; `burst(em, n)`
+throws `n` at once. A particle lands where its step's move meets the static
+world -- the physics' static colliders, by a ray along the move -- or a
+ground height the game gives (`set_ground`), and `on_land(em, listener,
+context)` hears where and the surface's normal there, which is where a game
+puts its stain. Moved by the mean of a step's two velocities, a particle
+thrown up tops out where v^2/2g says (to 0.01%). The emitter has its own
+generator, seeded by the game, so the same emitter throws the same
+particles on every run. Drawn as the weather's particles are: a quad turned
+to the eye at every point instance, a soft disc for a texture.
+`tests/test_particles.ae` holds the flight, the landings on a plane and on a
+box, the lifetime, the rate, the cone and the seed.
+
 ### Rain on the surfaces
 
 `engine_set_wetness(e, amount)` is rain on the scene: every surface that

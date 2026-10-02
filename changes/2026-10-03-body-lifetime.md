@@ -10,7 +10,7 @@
   destroyed from a fixed update.
 - `physics.rigidbody_remove(o)` takes the body off and keeps the object;
   `physics.collider_remove(o, shape)` takes one shape off, the body's mass
-  following. `physics.body_count`, `shape_count` and `rigidbody_count` say
+  following. `physics.physics_shape_count` (beside `physics_body_count`) and `rigidbody_count` say
   what the world holds.
 - Hulls and meshes are a body's now, not the world's until it is freed: an
   object made and destroyed over and over leaked one each time.
