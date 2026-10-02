@@ -195,6 +195,9 @@ DOOR_H = 2.45
 BAY = 2.6
 # The top of the plinth course, above the pavement.
 PLINTH = 0.48
+# A pane sits PANE_INSET inside its hole; the frame round it reaches FRAME in.
+PANE_INSET = 0.04
+FRAME = 0.045
 
 
 def _face(bm, corners):
@@ -210,6 +213,69 @@ def _slab(bm, low, high):
     _face(bm, [(x0, y1, z0), (x1, y1, z0), (x1, y1, z1), (x0, y1, z1)])
     _face(bm, [(x0, y0, z0), (x0, y1, z0), (x0, y1, z1), (x0, y0, z1)])
     _face(bm, [(x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1)])
+
+
+def _frame(bm, hole, at, sign):
+    """The frame a pane sits in, as one solid ring.
+
+    The pane stops PANE_INSET short of its hole on every side, and with
+    nothing in that ring a look up at a window's head saw past the glass
+    into the hollow shell behind it: the sky, through a sliver of every
+    window seen from below (#478). The ring reaches a centimetre into the
+    wall round it and five millimetres past the glazing bar's face and its
+    ends, so no face of it lies in another surface's plane.
+    """
+    hx0, hx1, hz0, hz1 = hole[:4]
+    outer = [(hx0 - 0.01, hz0 - 0.01), (hx1 + 0.01, hz0 - 0.01),
+             (hx1 + 0.01, hz1 + 0.01), (hx0 - 0.01, hz1 + 0.01)]
+    inner = [(hx0 + FRAME, hz0 + FRAME), (hx1 - FRAME, hz0 + FRAME),
+             (hx1 - FRAME, hz1 - FRAME), (hx0 + FRAME, hz1 - FRAME)]
+    near = at - sign * 0.035
+    far = at + sign * 0.01
+    for y in (near, far):
+        for k in range(4):
+            a, b = outer[k], outer[(k + 1) % 4]
+            c, d = inner[(k + 1) % 4], inner[k]
+            _face(bm, [(a[0], y, a[1]), (b[0], y, b[1]), (c[0], y, c[1]), (d[0], y, d[1])])
+    for ring in (outer, inner):
+        for k in range(4):
+            a, b = ring[k], ring[(k + 1) % 4]
+            _face(bm, [(a[0], near, a[1]), (b[0], near, b[1]), (b[0], far, b[1]), (a[0], far, a[1])])
+
+
+def _reveals_into_holes(obj, holes):
+    """Every face lining a hole turned to face into it.
+
+    recalc_face_normals works a solid's outside out, and a shell with holes
+    in its front has no outside to work from: it turned 48 of the street's
+    692 reveal faces away from their holes, culled from the street (#478).
+    A reveal is any face across the front (not along it) whose middle lies
+    in a hole; it faces the hole's middle along its own axis.
+    """
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.normal_update()
+    turn = []
+    for face in bm.faces:
+        normal = face.normal
+        if abs(normal.y) > 0.5:
+            continue
+        middle = face.calc_center_median()
+        for hx0, hx1, hz0, hz1 in (hole[:4] for hole in holes):
+            if hx0 - 1e-4 <= middle.x <= hx1 + 1e-4 and hz0 - 1e-4 <= middle.z <= hz1 + 1e-4:
+                if abs(normal.x) > abs(normal.z):
+                    want, have = (hx0 + hx1) * 0.5 - middle.x, normal.x
+                else:
+                    want, have = (hz0 + hz1) * 0.5 - middle.z, normal.z
+                if want * have < 0.0:
+                    turn.append(face)
+                break
+    if turn:
+        bmesh.ops.reverse_faces(bm, faces=turn)
+        bm.to_mesh(obj.data)
+        obj.data.update()
+    bm.free()
+    return len(turn)
 
 
 def _unit_uvs(bm):
@@ -338,6 +404,7 @@ def building(name, width, depth, height, base, surface, repeats, sign, trim,
     _face(shell, [(-half, 0.0, height), (half, 0.0, height), (half, far, height), (-half, far, height)])
     _face(shell, [(-half, 0.0, base), (half, 0.0, base), (half, far, base), (-half, far, base)])
     shell_obj = _finish(shell, name, surface, repeats)
+    _reveals_into_holes(shell_obj, holes)
 
     # What a facade is articulated by: a sill under every window, a band at
     # every floor line, and a cornice that throws the top of the wall into
@@ -389,11 +456,13 @@ def building(name, width, depth, height, base, surface, repeats, sign, trim,
         # Facing the street: these corners in this order face -y, out of a
         # building that runs back to +y (sign 1); one that runs back to -y
         # wants them the other way round. _finish keeps the winding.
-        corners = [(hx0 + 0.04, at, hz0 + 0.04), (hx1 - 0.04, at, hz0 + 0.04),
-                   (hx1 - 0.04, at, hz1 - 0.04), (hx0 + 0.04, at, hz1 - 0.04)]
+        inset = PANE_INSET
+        corners = [(hx0 + inset, at, hz0 + inset), (hx1 - inset, at, hz0 + inset),
+                   (hx1 - inset, at, hz1 - inset), (hx0 + inset, at, hz1 - inset)]
         if sign < 0:
             corners.reverse()
         _face(panes, corners)
+        _frame(band, (hx0, hx1, hz0, hz1), at, sign)
         if door:
             continue
         # The glazing bar is joinery and belongs to the frame, not to the
