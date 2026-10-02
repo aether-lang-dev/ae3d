@@ -187,7 +187,13 @@ The engine makes one overlay, hands it to its backend
 `update`, `pose` and a script's `late_update` ask for is that frame's.
 An engine behaviour's `late_update` runs after the draw, and what it asks
 for is the next frame's. `engine_over` -- the editor's engine over its own
-renderer -- has none; every call takes a null overlay as nothing to do.
+renderer -- makes one too. It is cleared at the start of each
+`engine_update`, so the owner's renders between two updates draw what the
+first asked for. It reaches the renderer once the owner calls
+`engine_show_overlay`, which the editor does for its viewport's engine
+(#460), so a HUD script can be seen and tuned there. A second engine over
+the same renderer (a play mode's client) keeps its overlay to itself.
+`tests/test_overlay` checks this path on both renderers.
 
 What is asked for becomes vertices at once: two triangles a quad, each
 vertex its pixel, its place in the atlas, its colour and the distance
