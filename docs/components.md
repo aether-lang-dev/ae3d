@@ -103,6 +103,7 @@ that position agree without anything syncing them.
 | Physics Body | the body record the scene file writes | body (static, kinematic, dynamic, character), collider (box, sphere, capsule, hull, mesh), friction, bounce, density; no body is no component |
 | Figure | the animated figure (ae3d.figure) | clip (by the file's name; none stops it), loop, speed, time (a share of the clip); made from its file, never added from a menu |
 | Natural Motion | the motion record the scene file writes with the figure | mode (animated, powered, limp), protective, strength, get up after; no natural motion is no component |
+| Audio Source | the source (ae3d.audio, registered by `audio.register_kind`) | clip, bus (music, effects, ambience, voice), volume, pitch, loop, spatial, min and max distance, Doppler, play on start; bound to the engine's sound in its start phase |
 | Environment | the engine | sky (an image, or none), sky color, sun by time, time of day, clouds, cloud wind, overcast and its color, fog, fog start, end, density and color |
 | Rendering | the engine | FXAA, bloom and its threshold and intensity, shadows and their distance, reflections and their height and strength, ambient occlusion and its radius and intensity, temporal antialiasing |
 

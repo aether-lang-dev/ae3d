@@ -323,6 +323,14 @@ the same, so a menu written for the game works unchanged in its viewport.
 - **Text.** A focused field takes the typed text, ae3d.input's code points
   from GLFW's character callback (or `inject_text`), stored as UTF-8.
   Backspace removes a whole character, not a byte.
+- **Rows that say what they are set to** (#568). A slider draws its label
+  on the left and its value right-aligned in a column of its own: the
+  number to its step's places, or words set with `set_value_text`
+  ("x1.4", "70 degrees"). Its bar and knob run in a strip under both, so
+  the knob never covers either. `choice(m, label, ..., "Clear|Rain|Dust
+  storm", start)` steps through named options with left and right
+  (wrapping) and moves on by a click or Enter. `set_label` changes any
+  widget's words.
 - **The game's input.** While a menu is open, the game's input reads at
   rest: no action down or pressed, no axis, no mouse movement, no wheel, no
   typed text. The menu reads the devices underneath (`input.raw_*`). The

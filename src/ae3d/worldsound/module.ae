@@ -1,0 +1,476 @@
+// ae3d.worldsound -- what the engine's own systems sound like (#566): the
+// weather's rain, wind and thunder, a car's engine, things striking each
+// other, over ae3d.audio.
+//
+//   audio.attach(e)
+//   ws = worldsound.attach(e)                     // after physics.attach, when there is physics
+//   worldsound.follow_weather(ws, w)              // rain, wind and thunder from ae3d.weather
+//   worldsound.car(ws, vehicle)                   // an engine on the chassis, its pitch the speed
+//   worldsound.hits(ws, true)                     // physics contacts, by how hard they strike
+//
+// The sounds are made, not read: seeded noise and a harmonic cycle in
+// Aether, so a program needs no files to have them and every run hears the
+// same. Each is shaped for what it stands for:
+//
+//   - rain, two seconds of noise a little smoothed, looped, its volume the
+//     rain's intensity;
+//   - wind, four seconds of noise smoothed hard and swelling twice, looped,
+//     its volume the wind's speed over 25 m/s;
+//   - thunder, three seconds of low noise that cracks in and rolls off,
+//     heard at the strike's distance over the speed of sound after its
+//     flash, louder the nearer it struck;
+//   - an engine, one exact cycle of a 50 Hz tone and its harmonics, looped
+//     and pitched by the car's speed (idle at 0.8, a twentieth more for
+//     each metre a second, at most 2.4);
+//   - a hit, an eighth of a second of noise that dies away, at the contact,
+//     its volume how fast the two met over 8 m/s, its pitch lower for a
+//     harder strike. At most MAX_HITS a frame start, the hardest first.
+//
+// Rain, wind and thunder are on AMBIENCE and not spatial; engines and hits
+// are EFFECTS, placed where they are.
+import std.heap
+import std.list
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.audio
+import ae3d.weather
+import ae3d.physics
+
+exports (
+    WorldSound,
+    attach, of, follow_weather, car, hits, worldsound_free,
+    rain_source, wind_source, thunder_pending, thunder_started, hits_started, engine_source,
+    RATE, MAX_HITS, HIT_VOICES, THUNDER_VOICES
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern exp(x: float) -> float
+extern sin(x: float) -> float
+
+const RATE = 48000
+const MAX_HITS = 4                   // hits that start in one frame
+const HIT_VOICES = 8                 // hits that sound at once
+const THUNDER_VOICES = 3
+const ENGINE_HZ = 50.0
+
+struct Thunder {
+    left: float                      // seconds to its first sound
+    volume: float
+}
+
+struct Car {
+    vehicle: ptr                     // *Vehicle
+    source: ptr                      // *AudioSource
+}
+
+struct WorldSound {
+    engine: ptr
+    holder: ptr                      // *GameObject the ambience is on
+    rain: ptr                        // *AudioSource
+    wind: ptr
+    weather: ptr                     // *Weather, or null
+    flashes: int                     // the weather's flash count heard so far
+    thunders: ptr                    // list of *Thunder waiting to be heard
+    thunder_voices: ptr              // ptr[THUNDER_VOICES] of *AudioSource
+    thunder_next: int
+    thunder_started: int
+    cars: ptr                        // list of *Car
+    hits_on: bool
+    hit_objects: ptr                 // ptr[HIT_VOICES] of *GameObject
+    hit_voices: ptr                  // ptr[HIT_VOICES] of *AudioSource
+    hit_next: int
+    hits_started: int
+    // This frame's strongest contacts, gathered over its fixed steps: the
+    // approach speed and the point, MAX_HITS of them.
+    pending_speed: ptr               // float[MAX_HITS]
+    pending_point: ptr               // float[MAX_HITS * 3]
+    pending_count: int
+    behaviour: ptr
+}
+
+var g_attached: ptr = null
+
+// --- the sounds, made ---------------------------------------------------------------------------------
+
+// A deterministic generator: a 64-bit linear congruential one, its top 31
+// bits, -1 to 1.
+struct Noise { seed: long }
+
+noise(n: *Noise) -> float {
+    n.seed = n.seed * (6364136223846793005 as long) + (1442695040888963407 as long)
+    bits = (n.seed >> 33) & (2147483647 as long)
+    return (bits as float) / 1073741824.0 - 1.0
+}
+
+// The samples' largest magnitude brought to `peak`.
+normalise(f: f32[], frames: int, peak: float) {
+    most = 0.0
+    i = 0
+    while i < frames {
+        v = f[i] as float
+        if v < 0.0 { v = 0.0 - v }
+        if v > most { most = v }
+        i = i + 1
+    }
+    if most <= 0.0 { return }
+    k = peak / most
+    i = 0
+    while i < frames {
+        f[i] = ((f[i] as float) * k) as f32
+        i = i + 1
+    }
+}
+
+make_rain(frames: int) -> ptr {
+    data = calloc(frames, 4)
+    f = data as f32[]
+    n = Noise { seed: 11 as long }
+    y = 0.0
+    i = 0
+    while i < frames {
+        y = y + (noise(&n) - y) * 0.6
+        f[i] = y as f32
+        i = i + 1
+    }
+    normalise(f, frames, 0.5)
+    return data
+}
+
+make_wind(frames: int) -> ptr {
+    data = calloc(frames, 4)
+    f = data as f32[]
+    n = Noise { seed: 23 as long }
+    y = 0.0
+    z = 0.0
+    i = 0
+    while i < frames {
+        y = y + (noise(&n) - y) * 0.02
+        z = z + (y - z) * 0.05
+        // Two swells over the loop, so it closes where it opened.
+        swell = 0.6 + 0.4 * sin(6.283185307 * 2.0 * (i as float) / (frames as float))
+        f[i] = (z * swell) as f32
+        i = i + 1
+    }
+    normalise(f, frames, 0.5)
+    return data
+}
+
+make_thunder(frames: int) -> ptr {
+    data = calloc(frames, 4)
+    f = data as f32[]
+    n = Noise { seed: 37 as long }
+    y = 0.0
+    i = 0
+    while i < frames {
+        t = (i as float) / (RATE as float)
+        y = y + (noise(&n) - y) * 0.05
+        attack = t / 0.02
+        if attack > 1.0 { attack = 1.0 }
+        roll = 1.0 + 0.5 * sin(t * 9.0)
+        f[i] = (y * attack * exp(0.0 - t / 0.9) * roll) as f32
+        i = i + 1
+    }
+    normalise(f, frames, 0.9)
+    return data
+}
+
+// One exact cycle at ENGINE_HZ: a tone and five harmonics, softer the higher.
+make_engine(frames: int) -> ptr {
+    data = calloc(frames, 4)
+    f = data as f32[]
+    i = 0
+    while i < frames {
+        phase = 6.283185307 * (i as float) / (frames as float)
+        v = 0.0
+        k = 1
+        while k <= 6 {
+            v = v + sin(phase * (k as float)) / (k as float)
+            k = k + 1
+        }
+        f[i] = v as f32
+        i = i + 1
+    }
+    normalise(f, frames, 0.5)
+    return data
+}
+
+make_hit(frames: int) -> ptr {
+    data = calloc(frames, 4)
+    f = data as f32[]
+    n = Noise { seed: 53 as long }
+    y = 0.0
+    i = 0
+    while i < frames {
+        t = (i as float) / (RATE as float)
+        y = y + (noise(&n) - y) * 0.3
+        f[i] = (y * exp(0.0 - t / 0.025)) as f32
+        i = i + 1
+    }
+    normalise(f, frames, 0.9)
+    return data
+}
+
+// A source of made samples on `o`, the samples freed after (the source
+// keeps its own copy).
+made(o: *GameObject, samples: ptr, frames: int, bus: int) -> *AudioSource {
+    s = audio.source_pcm(o, samples, frames, RATE, bus)
+    free(samples)
+    return s
+}
+
+// --- the world's sounds -------------------------------------------------------------------------------
+
+// The world's sounds in an engine with sound attached (ae3d.audio.attach
+// first): the rain and the wind made and waiting, silent, on AMBIENCE;
+// thunder and hit voices ready. Attach after physics, so the hits a step
+// reports are read after it. Once an engine.
+attach(e: *Engine) -> *WorldSound {
+    existing = of(e)
+    if existing != null { return existing }
+    if audio.of(e) == null { audio.attach(e) }
+    ws = heap.new(WorldSound)
+    ws.engine = e as ptr
+    holder = engine.object(e, "world sound", null)
+    ws.holder = holder as ptr
+    ws.rain = ambience(holder, make_rain(RATE * 2), RATE * 2) as ptr
+    ws.wind = ambience(holder, make_wind(RATE * 4), RATE * 4) as ptr
+    ws.thunders = list.new()
+    ws.thunder_voices = calloc(THUNDER_VOICES, 8)
+    k = 0
+    while k < THUNDER_VOICES {
+        s = made(holder, make_thunder(RATE * 3), RATE * 3, audio.AMBIENCE)
+        audio.set_spatial(s, false)
+        (ws.thunder_voices as ptr[])[k] = s as ptr
+        k = k + 1
+    }
+    ws.cars = list.new()
+    ws.hit_objects = calloc(HIT_VOICES, 8)
+    ws.hit_voices = calloc(HIT_VOICES, 8)
+    k = 0
+    while k < HIT_VOICES {
+        o = engine.object(e, "hit ${k}", null)
+        s = made(o, make_hit(RATE / 8), RATE / 8, audio.EFFECTS)
+        audio.set_distances(s, 2.0, 60.0)
+        (ws.hit_objects as ptr[])[k] = o as ptr
+        (ws.hit_voices as ptr[])[k] = s as ptr
+        k = k + 1
+    }
+    ws.pending_speed = calloc(MAX_HITS, 8)
+    ws.pending_point = calloc(MAX_HITS * 3, 8)
+    b = engine.behaviour_new("world sound", ws as ptr)
+    b.fixed_update = on_step
+    b.update = on_frame
+    engine.engine_add_behaviour(e, b)
+    ws.behaviour = b as ptr
+    engine.engine_on_free(e, worldsound_released, ws as ptr)
+    if g_attached == null { g_attached = list.new() }
+    list.add_raw(g_attached, ws as ptr)
+    return ws
+}
+
+// A looping, non-spatial ambience, playing at nothing until it is wanted.
+ambience(o: *GameObject, samples: ptr, frames: int) -> *AudioSource {
+    s = made(o, samples, frames, audio.AMBIENCE)
+    audio.set_spatial(s, false)
+    audio.set_looping(s, true)
+    audio.set_volume(s, 0.0)
+    audio.play(s)
+    return s
+}
+
+of(e: *Engine) -> *WorldSound {
+    if g_attached == null { return null }
+    i = 0
+    while i < list.size(g_attached) {
+        ws = list.get_raw(g_attached, i) as *WorldSound
+        if ws.engine == e as ptr { return ws }
+        i = i + 1
+    }
+    return null
+}
+
+worldsound_released(state: ptr) { worldsound_free(state as *WorldSound) }
+
+// The records gone; the sources go with their objects, which the engine's
+// scene frees.
+worldsound_free(ws: *WorldSound) {
+    if ws == null { return }
+    i = 0
+    while i < list.size(ws.thunders) {
+        heap.free(list.get_raw(ws.thunders, i) as *Thunder)
+        i = i + 1
+    }
+    list.free(ws.thunders)
+    i = 0
+    while i < list.size(ws.cars) {
+        heap.free(list.get_raw(ws.cars, i) as *Car)
+        i = i + 1
+    }
+    list.free(ws.cars)
+    free(ws.thunder_voices)
+    free(ws.hit_objects)
+    free(ws.hit_voices)
+    free(ws.pending_speed)
+    free(ws.pending_point)
+    if g_attached != null {
+        i = 0
+        while i < list.size(g_attached) {
+            if list.get_raw(g_attached, i) == ws as ptr {
+                list.remove(g_attached, i)
+                break
+            }
+            i = i + 1
+        }
+    }
+    heap.free(ws)
+}
+
+// Rain, wind and thunder from a weather from now on; null for none.
+follow_weather(ws: *WorldSound, w: *Weather) {
+    if ws == null { return }
+    ws.weather = w as ptr
+    ws.flashes = 0
+    if w != null { ws.flashes = weather.weather_flash_count(w) }
+}
+
+// An engine on a vehicle's chassis, pitched by its speed: its source.
+car(ws: *WorldSound, v: *Vehicle) -> *AudioSource {
+    if ws == null || v == null { return null }
+    chassis = physics.vehicle_chassis(v)
+    s = made(chassis.object as *GameObject, make_engine((RATE as float / ENGINE_HZ) as int), (RATE as float / ENGINE_HZ) as int, audio.EFFECTS)
+    audio.set_looping(s, true)
+    audio.set_distances(s, 3.0, 120.0)
+    audio.play(s)
+    c = heap.new(Car)
+    c.vehicle = v as ptr
+    c.source = s as ptr
+    list.add_raw(ws.cars, c as ptr)
+    return s
+}
+
+// Physics contacts heard, or not.
+hits(ws: *WorldSound, on: bool) { if ws != null { ws.hits_on = on } }
+
+rain_source(ws: *WorldSound) -> *AudioSource { return ws.rain as *AudioSource }
+wind_source(ws: *WorldSound) -> *AudioSource { return ws.wind as *AudioSource }
+thunder_pending(ws: *WorldSound) -> int { return list.size(ws.thunders) }
+thunder_started(ws: *WorldSound) -> int { return ws.thunder_started }
+hits_started(ws: *WorldSound) -> int { return ws.hits_started }
+
+engine_source(ws: *WorldSound, index: int) -> *AudioSource {
+    if ws == null || index < 0 || index >= list.size(ws.cars) { return null }
+    return (list.get_raw(ws.cars, index) as *Car).source as *AudioSource
+}
+
+// After each physics step: its strongest hits kept for the frame.
+on_step(state: ptr, e: *Engine, step: float) {
+    ws = state as *WorldSound
+    if !ws.hits_on { return }
+    p = physics.of(e)
+    if p == null { return }
+    n = physics.hit_event_count(p)
+    speeds = ws.pending_speed as float[]
+    points = ws.pending_point as float[]
+    i = 0
+    while i < n {
+        hit = physics.hit_event(p, i)
+        // Into the frame's list, or over its softest.
+        slot = 0 - 1
+        if ws.pending_count < MAX_HITS {
+            slot = ws.pending_count
+            ws.pending_count = ws.pending_count + 1
+        } else {
+            softest = 0
+            k = 1
+            while k < MAX_HITS {
+                if speeds[k] < speeds[softest] { softest = k }
+                k = k + 1
+            }
+            if hit.approach_speed > speeds[softest] { slot = softest }
+        }
+        if slot >= 0 {
+            speeds[slot] = hit.approach_speed
+            points[slot * 3] = hit.point.x
+            points[slot * 3 + 1] = hit.point.y
+            points[slot * 3 + 2] = hit.point.z
+        }
+        i = i + 1
+    }
+}
+
+// Every frame, before the sources are placed: the weather's volumes, the
+// thunder that has reached the listener, the engines' pitch, the frame's
+// hits started.
+on_frame(state: ptr, e: *Engine, delta: float) {
+    ws = state as *WorldSound
+    rain_gain = 0.0
+    wind_gain = 0.0
+    w = ws.weather as *Weather
+    if w != null {
+        kind = weather.weather_kind(w)
+        if kind == weather.RAIN || kind == weather.STORM { rain_gain = weather.weather_intensity(w) }
+        if kind != weather.CLEAR {
+            wind_gain = weather.weather_wind_speed(w) / 25.0
+            if wind_gain > 1.0 { wind_gain = 1.0 }
+        }
+        flashes = weather.weather_flash_count(w)
+        if flashes != ws.flashes {
+            ws.flashes = flashes
+            distance = weather.weather_strike_distance(w)
+            t = heap.new(Thunder)
+            t.left = distance / audio.SPEED_OF_SOUND
+            t.volume = 1000.0 / distance
+            if t.volume > 1.0 { t.volume = 1.0 }
+            if t.volume < 0.15 { t.volume = 0.15 }
+            list.add_raw(ws.thunders, t as ptr)
+        }
+    }
+    audio.set_volume(ws.rain as *AudioSource, rain_gain)
+    audio.set_volume(ws.wind as *AudioSource, wind_gain)
+    i = list.size(ws.thunders) - 1
+    while i >= 0 {
+        t = list.get_raw(ws.thunders, i) as *Thunder
+        t.left = t.left - delta
+        if t.left <= 0.0 {
+            voice = (ws.thunder_voices as ptr[])[ws.thunder_next] as *AudioSource
+            ws.thunder_next = (ws.thunder_next + 1) % THUNDER_VOICES
+            audio.stop(voice)
+            audio.set_volume(voice, t.volume)
+            audio.play(voice)
+            ws.thunder_started = ws.thunder_started + 1
+            heap.free(t)
+            list.remove(ws.thunders, i)
+        }
+        i = i - 1
+    }
+    i = 0
+    while i < list.size(ws.cars) {
+        c = list.get_raw(ws.cars, i) as *Car
+        speed = physics.vehicle_speed(c.vehicle as *Vehicle)
+        if speed < 0.0 { speed = 0.0 - speed }
+        pitch = 0.8 + speed * 0.05
+        if pitch > 2.4 { pitch = 2.4 }
+        audio.set_pitch(c.source as *AudioSource, pitch)
+        i = i + 1
+    }
+    speeds = ws.pending_speed as float[]
+    points = ws.pending_point as float[]
+    k = 0
+    while k < ws.pending_count {
+        o = (ws.hit_objects as ptr[])[ws.hit_next] as *GameObject
+        voice = (ws.hit_voices as ptr[])[ws.hit_next] as *AudioSource
+        ws.hit_next = (ws.hit_next + 1) % HIT_VOICES
+        behaviour.object_set_position(o, core.vec3(points[k * 3], points[k * 3 + 1], points[k * 3 + 2]))
+        loud = speeds[k] / 8.0
+        if loud > 1.0 { loud = 1.0 }
+        audio.stop(voice)
+        audio.set_volume(voice, loud)
+        audio.set_pitch(voice, 1.2 - 0.4 * loud)
+        audio.play(voice)
+        ws.hits_started = ws.hits_started + 1
+        k = k + 1
+    }
+    ws.pending_count = 0
+}
