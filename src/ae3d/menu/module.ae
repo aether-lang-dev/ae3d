@@ -1,0 +1,690 @@
+// ae3d.menu -- menus over the frame that can be pointed at, clicked and
+// typed into (#484, slice 4 of #449): a pause menu, settings, a lobby.
+//
+// A menu is widgets -- buttons, toggles, sliders, text fields, labels --
+// each a box laid out as the overlay lays a box out (#459): at an anchor,
+// offset and sized in points, so it holds its place at any window size and
+// its size on any display. Menus are pushed on a stack; the top one takes
+// the input and the ones under it are drawn and wait. While any is open the
+// game's own input is blocked (ae3d.input): every action reads at rest, so
+// the click that pressed Resume fires no shot.
+//
+//   pause = menu.menu_new("pause")
+//   resume = menu.button(pause, "Resume", hud.CENTRE, 0.0, -30.0, 200.0, 40.0)
+//   volume = menu.slider(pause, "Volume", hud.CENTRE, 0.0, 20.0, 200.0, 32.0, 0.0, 1.0, 0.8, 0.1)
+//   menu.push(engine.engine_menus(e), pause)          // when Escape is pressed
+//   ...
+//   if menu.activated(pause, resume) { menu.pop(engine.engine_menus(e)) }
+//   level = menu.value(pause, volume)
+//
+// The engine owns one stack (engine_menus), handles it before the frame's
+// updates -- so a widget activated this frame says so to every script in it
+// -- and draws it over the HUD after them; the editor's engine does the
+// same, so a menu written for the game works in the editor's viewport.
+//
+// Pointing: a click is a press and a release on the same widget, the
+// topmost under the cursor -- the last added, in the top menu, inside its
+// panel -- and never one under it. A press on a slider drags it. Keys:
+// Tab and Shift+Tab, the arrows up and down, a gamepad's d-pad move the
+// focus round the menu's widgets in the order they were added, wrapping;
+// left and right move a focused slider by its step and set a toggle;
+// Enter, Space or the gamepad's A activate the focused widget; Escape or B
+// pop a menu that may be closed. A focused text field takes the typed text
+// (ae3d.input's code points, as UTF-8), Backspace takes off the last
+// character, and Enter activates it.
+import std.heap
+import std.list
+import std.string
+import ae3d.core
+import ae3d.platform
+import ae3d.input
+import ae3d.hud
+
+exports (
+    Menu, Widget, MenuStack,
+    menu_new, menu_free, button, toggle, slider, field, label, set_panel, set_closable,
+    activated, changed, on, value, text, set_text, set_on, set_value, focus, set_focus, hovered, widget_count,
+    widget_rect,
+    stack_new, stack_free, push, pop, top, depth, is_open, popped, process, draw,
+    BUTTON, TOGGLE, SLIDER, FIELD, LABEL, FIELD_BYTES
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+extern aether_bytes_string_from_ptr(src: ptr, length: int) -> string @heap
+
+const BUTTON = 0
+const TOGGLE = 1
+const SLIDER = 2
+const FIELD = 3
+const LABEL = 4
+
+// A text field holds this many bytes of UTF-8.
+const FIELD_BYTES = 256
+
+// The keys and pad buttons whose edges the stack watches.
+const WATCHED = 13
+const W_TAB = 0
+const W_ENTER = 1
+const W_SPACE = 2
+const W_ESCAPE = 3
+const W_BACKSPACE = 4
+const W_UP = 5
+const W_DOWN = 6
+const W_LEFT = 7
+const W_RIGHT = 8
+const W_PAD_A = 9
+const W_PAD_B = 10
+const W_PAD_UP = 11
+const W_PAD_DOWN = 12
+
+struct Widget {
+    kind: int
+    label: string
+    anchor: int
+    x: float                 // offset from the anchor, points
+    y: float
+    w: float                 // size, points
+    h: float
+    on: bool                 // a toggle's
+    value: float             // a slider's, low to high
+    low: float
+    high: float
+    step: float
+    text: ptr                // a field's UTF-8, FIELD_BYTES
+    text_len: int
+    activated: bool          // this frame
+    changed: bool            // this frame
+}
+
+struct Menu {
+    name: string
+    widgets: ptr             // list of *Widget
+    focus: int               // the focused widget, -1 for none
+    armed: int               // the widget a press is on, -1 for none
+    dragging: int            // the slider being dragged, -1 for none
+    hover: int               // the widget under the cursor, -1 for none
+    closable: bool
+    has_panel: bool
+    panel_anchor: int
+    panel_x: float
+    panel_y: float
+    panel_w: float
+    panel_h: float
+}
+
+struct MenuStack {
+    menus: ptr               // list of *Menu, the top last
+    was: ptr                 // int[WATCHED]: down at the last process
+    mouse_was: bool
+    popped: ptr              // *Menu popped by Escape / B this frame, or null
+}
+
+// --- a menu and its widgets ------------------------------------------------------------------
+
+menu_new(name: string) -> *Menu {
+    m = heap.new(Menu)
+    m.name = string.copy(name)
+    m.widgets = list.new()
+    m.focus = 0 - 1
+    m.armed = 0 - 1
+    m.dragging = 0 - 1
+    m.hover = 0 - 1
+    m.closable = true
+    return m
+}
+
+// The menu and its widgets; off any stack first.
+menu_free(m: *Menu) {
+    if m == null { return }
+    i = 0
+    while i < list.size(m.widgets) {
+        w = list.get_raw(m.widgets, i) as *Widget
+        if w.text != null { free(w.text) }
+        // heap.free takes the label with it.
+        heap.free(w)
+        i = i + 1
+    }
+    list.free(m.widgets)
+    heap.free(m)
+}
+
+add(m: *Menu, kind: int, text: string, anchor: int, x: float, y: float, w: float, h: float) -> *Widget {
+    wd = heap.new(Widget)
+    wd.kind = kind
+    wd.label = string.copy(text)
+    wd.anchor = anchor
+    wd.x = x
+    wd.y = y
+    wd.w = w
+    wd.h = h
+    list.add_raw(m.widgets, wd as ptr)
+    return wd
+}
+
+// A button: activated when clicked, or Enter / Space / A while focused.
+button(m: *Menu, text: string, anchor: int, x: float, y: float, w: float, h: float) -> int {
+    add(m, BUTTON, text, anchor, x, y, w, h)
+    return list.size(m.widgets) - 1
+}
+
+// A toggle, `start` on or off: flipped by a click or Enter, set by left
+// (off) and right (on); changed the frame it is.
+toggle(m: *Menu, text: string, anchor: int, x: float, y: float, w: float, h: float, start: bool) -> int {
+    wd = add(m, TOGGLE, text, anchor, x, y, w, h)
+    wd.on = start
+    return list.size(m.widgets) - 1
+}
+
+// A slider from `low` to `high` at `start`, moved by `step` with left and
+// right, dragged with the cursor (snapped to the step, when there is one).
+slider(m: *Menu, text: string, anchor: int, x: float, y: float, w: float, h: float,
+       low: float, high: float, start: float, step: float) -> int {
+    wd = add(m, SLIDER, text, anchor, x, y, w, h)
+    wd.low = low
+    wd.high = high
+    wd.step = step
+    wd.value = clamp_value(wd, start)
+    return list.size(m.widgets) - 1
+}
+
+// A text field, empty: `text` is what it shows while it is.
+field(m: *Menu, text: string, anchor: int, x: float, y: float, w: float, h: float) -> int {
+    wd = add(m, FIELD, text, anchor, x, y, w, h)
+    wd.text = calloc(FIELD_BYTES, 1)
+    return list.size(m.widgets) - 1
+}
+
+// Words on the menu: drawn, never focused or clicked.
+label(m: *Menu, text: string, anchor: int, x: float, y: float, w: float, h: float) -> int {
+    add(m, LABEL, text, anchor, x, y, w, h)
+    return list.size(m.widgets) - 1
+}
+
+// A panel behind the widgets, laid out as they are; what is outside it is
+// neither drawn nor hit.
+set_panel(m: *Menu, anchor: int, x: float, y: float, w: float, h: float) {
+    m.has_panel = true
+    m.panel_anchor = anchor
+    m.panel_x = x
+    m.panel_y = y
+    m.panel_w = w
+    m.panel_h = h
+}
+
+// Whether Escape and B pop it (a title screen's may not be).
+set_closable(m: *Menu, closable: bool) { m.closable = closable }
+
+widget(m: *Menu, id: int) -> *Widget {
+    if m == null || id < 0 || id >= list.size(m.widgets) { return null }
+    return list.get_raw(m.widgets, id) as *Widget
+}
+
+widget_count(m: *Menu) -> int {
+    if m == null { return 0 }
+    return list.size(m.widgets)
+}
+
+// Whether it was clicked or activated this frame.
+activated(m: *Menu, id: int) -> bool {
+    w = widget(m, id)
+    if w == null { return false }
+    return w.activated
+}
+
+// Whether a toggle, a slider or a field changed this frame.
+changed(m: *Menu, id: int) -> bool {
+    w = widget(m, id)
+    if w == null { return false }
+    return w.changed
+}
+
+on(m: *Menu, id: int) -> bool {
+    w = widget(m, id)
+    if w == null { return false }
+    return w.on
+}
+
+value(m: *Menu, id: int) -> float {
+    w = widget(m, id)
+    if w == null { return 0.0 }
+    return w.value
+}
+
+// A field's text, the caller's to free.
+text(m: *Menu, id: int) -> string {
+    w = widget(m, id)
+    if w == null || w.text == null { return string.copy("") }
+    return aether_bytes_string_from_ptr(w.text, w.text_len)
+}
+
+set_text(m: *Menu, id: int, s: string) {
+    w = widget(m, id)
+    if w == null || w.text == null { return }
+    n = string.length(s)
+    if n > FIELD_BYTES { n = FIELD_BYTES }
+    k = 0
+    while k < n {
+        (w.text as byte[])[k] = string.char_at(s, k) & 255
+        k = k + 1
+    }
+    w.text_len = n
+}
+
+set_on(m: *Menu, id: int, state: bool) {
+    w = widget(m, id)
+    if w != null { w.on = state }
+}
+
+set_value(m: *Menu, id: int, v: float) {
+    w = widget(m, id)
+    if w != null { w.value = clamp_value(w, v) }
+}
+
+focus(m: *Menu) -> int {
+    if m == null { return 0 - 1 }
+    return m.focus
+}
+
+set_focus(m: *Menu, id: int) {
+    w = widget(m, id)
+    if w == null || w.kind == LABEL { return }
+    m.focus = id
+}
+
+// The widget under the cursor at the last process, -1 for none.
+hovered(m: *Menu) -> int {
+    if m == null { return 0 - 1 }
+    return m.hover
+}
+
+clamp_value(w: *Widget, v: float) -> float {
+    x = v
+    if w.step > 0.0 && w.high > w.low {
+        steps = (x - w.low) / w.step
+        whole = (steps + 0.5) as int
+        if steps < 0.0 { whole = 0 }
+        x = w.low + (whole as float) * w.step
+    }
+    if x < w.low { x = w.low }
+    if x > w.high { x = w.high }
+    return x
+}
+
+// Where a widget is on the screen this frame, in pixels: x, y, w, h.
+widget_rect(o: *Hud, m: *Menu, id: int) -> (float, float, float, float) {
+    w = widget(m, id)
+    if w == null { return 0.0, 0.0, 0.0, 0.0 }
+    x, y = hud.place(o, w.anchor, w.x, w.y, w.w, w.h)
+    return x, y, hud.px(o, w.w), hud.px(o, w.h)
+}
+
+panel_rect(o: *Hud, m: *Menu) -> (float, float, float, float) {
+    x, y = hud.place(o, m.panel_anchor, m.panel_x, m.panel_y, m.panel_w, m.panel_h)
+    return x, y, hud.px(o, m.panel_w), hud.px(o, m.panel_h)
+}
+
+// --- the stack -------------------------------------------------------------------------------
+
+stack_new() -> *MenuStack {
+    s = heap.new(MenuStack)
+    s.menus = list.new()
+    s.was = calloc(WATCHED, 4)
+    return s
+}
+
+// The stack; its menus are the game's, and are not freed with it.
+stack_free(s: *MenuStack) {
+    if s == null { return }
+    list.free(s.menus)
+    free(s.was)
+    heap.free(s)
+}
+
+// A menu on top: it takes the input from the next process. Its press state
+// starts clean, so a key or a button still down from what opened it is not
+// taken as a press on it.
+push(s: *MenuStack, m: *Menu) {
+    if s == null || m == null { return }
+    m.armed = 0 - 1
+    m.dragging = 0 - 1
+    list.add_raw(s.menus, m as ptr)
+}
+
+// The top menu off the stack (the caller's again), or null.
+pop(s: *MenuStack) -> *Menu {
+    if s == null || list.size(s.menus) == 0 { return null }
+    m = list.get_raw(s.menus, list.size(s.menus) - 1) as *Menu
+    list.remove(s.menus, list.size(s.menus) - 1)
+    return m
+}
+
+top(s: *MenuStack) -> *Menu {
+    if s == null || list.size(s.menus) == 0 { return null }
+    return list.get_raw(s.menus, list.size(s.menus) - 1) as *Menu
+}
+
+depth(s: *MenuStack) -> int {
+    if s == null { return 0 }
+    return list.size(s.menus)
+}
+
+is_open(s: *MenuStack) -> bool { return depth(s) > 0 }
+
+// The menu Escape or B popped this frame, or null: the game's to hear of.
+popped(s: *MenuStack) -> *Menu {
+    if s == null { return null }
+    return s.popped as *Menu
+}
+
+// --- the frame -------------------------------------------------------------------------------
+
+// Whether a watched key or button is down now.
+watched_down(inp: *Input, k: int) -> bool {
+    if k == W_TAB { return input.raw_key(inp, platform.KEY_TAB) }
+    if k == W_ENTER { return input.raw_key(inp, platform.KEY_ENTER) }
+    if k == W_SPACE { return input.raw_key(inp, platform.KEY_SPACE) }
+    if k == W_ESCAPE { return input.raw_key(inp, platform.KEY_ESCAPE) }
+    if k == W_BACKSPACE { return input.raw_key(inp, platform.KEY_BACKSPACE) }
+    if k == W_UP { return input.raw_key(inp, platform.KEY_UP) }
+    if k == W_DOWN { return input.raw_key(inp, platform.KEY_DOWN) }
+    if k == W_LEFT { return input.raw_key(inp, platform.KEY_LEFT) || input.raw_button(inp, input.PAD_LEFT) }
+    if k == W_RIGHT { return input.raw_key(inp, platform.KEY_RIGHT) || input.raw_button(inp, input.PAD_RIGHT) }
+    if k == W_PAD_A { return input.raw_button(inp, input.PAD_A) }
+    if k == W_PAD_B { return input.raw_button(inp, input.PAD_B) }
+    if k == W_PAD_UP { return input.raw_button(inp, input.PAD_UP) }
+    if k == W_PAD_DOWN { return input.raw_button(inp, input.PAD_DOWN) }
+    return false
+}
+
+// The next widget that takes focus from `from`, `direction` +1 or -1,
+// wrapping round the menu; -1 when none does.
+next_focus(m: *Menu, from: int, direction: int) -> int {
+    n = list.size(m.widgets)
+    if n == 0 { return 0 - 1 }
+    at = from
+    if at < 0 {
+        at = n - 1
+        if direction < 0 { at = 0 }
+    }
+    tries = 0
+    while tries < n {
+        at = (at + direction + n) % n
+        if (list.get_raw(m.widgets, at) as *Widget).kind != LABEL { return at }
+        tries = tries + 1
+    }
+    return 0 - 1
+}
+
+// The topmost widget at a pixel: the last added that contains it, inside
+// the panel; -1 for none.
+hit(o: *Hud, m: *Menu, px: float, py: float) -> int {
+    if m.has_panel {
+        x, y, w, h = panel_rect(o, m)
+        if px < x || py < y || px >= x + w || py >= y + h { return 0 - 1 }
+    }
+    i = list.size(m.widgets) - 1
+    while i >= 0 {
+        wd = list.get_raw(m.widgets, i) as *Widget
+        if wd.kind != LABEL {
+            x, y, w, h = widget_rect(o, m, i)
+            if px >= x && py >= y && px < x + w && py < y + h { return i }
+        }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+activate(w: *Widget) {
+    w.activated = true
+    if w.kind == TOGGLE {
+        w.on = !w.on
+        w.changed = true
+    }
+}
+
+slide_to(o: *Hud, m: *Menu, id: int, px: float) {
+    w = widget(m, id)
+    x, y, width, h = widget_rect(o, m, id)
+    if width <= 0.0 { return }
+    t = (px - x) / width
+    before = w.value
+    w.value = clamp_value(w, w.low + (w.high - w.low) * t)
+    if w.value != before { w.changed = true }
+}
+
+// One code point onto a field, as UTF-8, if there is room.
+type_point(w: *Widget, point: int) {
+    if point < 32 || point == 127 { return }
+    bytes = 1
+    if point >= 128 { bytes = 2 }
+    if point >= 2048 { bytes = 3 }
+    if point >= 65536 { bytes = 4 }
+    if w.text_len + bytes > FIELD_BYTES { return }
+    t = w.text as byte[]
+    at = w.text_len
+    if bytes == 1 {
+        t[at] = point
+    } else if bytes == 2 {
+        t[at] = 192 + point / 64
+        t[at + 1] = 128 + point % 64
+    } else if bytes == 3 {
+        t[at] = 224 + point / 4096
+        t[at + 1] = 128 + (point / 64) % 64
+        t[at + 2] = 128 + point % 64
+    } else {
+        t[at] = 240 + point / 262144
+        t[at + 1] = 128 + (point / 4096) % 64
+        t[at + 2] = 128 + (point / 64) % 64
+        t[at + 3] = 128 + point % 64
+    }
+    w.text_len = w.text_len + bytes
+    w.changed = true
+}
+
+// The last character off a field: back over its UTF-8 continuation bytes.
+backspace(w: *Widget) {
+    if w.text_len == 0 { return }
+    t = w.text as byte[]
+    at = w.text_len - 1
+    while at > 0 && (t[at] & 192) == 128 { at = at - 1 }
+    w.text_len = at
+    w.changed = true
+}
+
+// The frame's input to the top menu, before the updates: what is under the
+// cursor, a click, the focus moved, a widget activated, text typed, a menu
+// popped. The game's input blocked while any menu is open. `o` is the
+// overlay the menus are laid out on.
+process(s: *MenuStack, inp: *Input, o: *Hud) {
+    if s == null || inp == null { return }
+    s.popped = null
+    // Open at the start of the frame: the game's input stays blocked for the
+    // whole of it, so the key that closes the last menu is not also the
+    // game's -- Escape closing the pause menu does not open it again.
+    open_at_start = depth(s) > 0
+    // Last frame's activations and changes are over, on every menu.
+    k = 0
+    while k < list.size(s.menus) {
+        mm = list.get_raw(s.menus, k) as *Menu
+        i = 0
+        while i < list.size(mm.widgets) {
+            wd = list.get_raw(mm.widgets, i) as *Widget
+            wd.activated = false
+            wd.changed = false
+            i = i + 1
+        }
+        k = k + 1
+    }
+    was = s.was as int[]
+    down = calloc(WATCHED, 4) as int[]
+    k = 0
+    while k < WATCHED {
+        if watched_down(inp, k) { down[k] = 1 }
+        k = k + 1
+    }
+    mouse = input.raw_mouse(inp, platform.MOUSE_LEFT)
+    m = top(s)
+    if m != null {
+        px = input.mouse_frame_x(inp)
+        py = input.mouse_frame_y(inp)
+        m.hover = hit(o, m, px, py)
+        // The cursor: a press arms the widget under it and focuses it; a
+        // release on the same one clicks it; a press on a slider drags it.
+        if mouse && !s.mouse_was {
+            m.armed = m.hover
+            if m.hover >= 0 {
+                m.focus = m.hover
+                if widget(m, m.hover).kind == SLIDER {
+                    m.dragging = m.hover
+                    slide_to(o, m, m.hover, px)
+                }
+            }
+        }
+        if mouse && m.dragging >= 0 { slide_to(o, m, m.dragging, px) }
+        if !mouse && s.mouse_was {
+            if m.armed >= 0 && m.armed == m.hover && widget(m, m.armed).kind != SLIDER && widget(m, m.armed).kind != FIELD {
+                activate(widget(m, m.armed))
+            }
+            m.armed = 0 - 1
+            m.dragging = 0 - 1
+        }
+        shift = input.raw_key(inp, platform.KEY_LEFT_SHIFT) || input.raw_key(inp, platform.KEY_RIGHT_SHIFT)
+        if down[W_TAB] == 1 && was[W_TAB] == 0 {
+            if shift { m.focus = next_focus(m, m.focus, 0 - 1) } else { m.focus = next_focus(m, m.focus, 1) }
+        }
+        if (down[W_DOWN] == 1 && was[W_DOWN] == 0) || (down[W_PAD_DOWN] == 1 && was[W_PAD_DOWN] == 0) {
+            m.focus = next_focus(m, m.focus, 1)
+        }
+        if (down[W_UP] == 1 && was[W_UP] == 0) || (down[W_PAD_UP] == 1 && was[W_PAD_UP] == 0) {
+            m.focus = next_focus(m, m.focus, 0 - 1)
+        }
+        f = widget(m, m.focus)
+        if f != null {
+            left = down[W_LEFT] == 1 && was[W_LEFT] == 0
+            right = down[W_RIGHT] == 1 && was[W_RIGHT] == 0
+            if f.kind == SLIDER && (left || right) {
+                before = f.value
+                step = f.step
+                if step <= 0.0 { step = (f.high - f.low) / 10.0 }
+                if left { f.value = clamp_value(f, f.value - step) } else { f.value = clamp_value(f, f.value + step) }
+                if f.value != before { f.changed = true }
+            }
+            if f.kind == TOGGLE && (left || right) {
+                if f.on != right {
+                    f.on = right
+                    f.changed = true
+                }
+            }
+            enter = (down[W_ENTER] == 1 && was[W_ENTER] == 0) || (down[W_PAD_A] == 1 && was[W_PAD_A] == 0)
+            // Space is a character to a text field; to anything else it activates.
+            space = down[W_SPACE] == 1 && was[W_SPACE] == 0 && f.kind != FIELD
+            if (enter || space) && f.kind != SLIDER { activate(f) }
+            if f.kind == FIELD {
+                i = 0
+                while i < input.raw_typed_count(inp) {
+                    type_point(f, input.raw_typed_char(inp, i))
+                    i = i + 1
+                }
+                if down[W_BACKSPACE] == 1 && was[W_BACKSPACE] == 0 { backspace(f) }
+            }
+        }
+        if ((down[W_ESCAPE] == 1 && was[W_ESCAPE] == 0) || (down[W_PAD_B] == 1 && was[W_PAD_B] == 0)) && m.closable {
+            s.popped = pop(s) as ptr
+        }
+    }
+    k = 0
+    while k < WATCHED {
+        was[k] = down[k]
+        k = k + 1
+    }
+    free(down as ptr)
+    s.mouse_was = mouse
+    input.set_blocked(inp, open_at_start || depth(s) > 0)
+}
+
+// --- drawing ---------------------------------------------------------------------------------
+
+// Every menu on the stack over the frame, the bottom first, each under a
+// veil that dims what is below it.
+draw(s: *MenuStack, o: *Hud) {
+    if s == null || o == null || list.size(s.menus) == 0 { return }
+    k = 0
+    while k < list.size(s.menus) {
+        hud.rect(o, 0.0, 0.0, hud.screen_width(o), hud.screen_height(o), hud.rgba(0.0, 0.0, 0.0, 0.35))
+        draw_menu(o, list.get_raw(s.menus, k) as *Menu, k == list.size(s.menus) - 1)
+        k = k + 1
+    }
+}
+
+draw_menu(o: *Hud, m: *Menu, on_top: bool) {
+    clipped = false
+    if m.has_panel {
+        x, y, w, h = panel_rect(o, m)
+        hud.rect(o, x, y, w, h, hud.rgba(0.08, 0.09, 0.11, 0.92))
+        hud.rect_outline(o, x, y, w, h, hud.px(o, 1.0), hud.rgba(0.35, 0.37, 0.42, 1.0))
+        clipped = hud.push_clip(o, x, y, w, h)
+    }
+    i = 0
+    while i < list.size(m.widgets) {
+        draw_widget(o, m, i, on_top)
+        i = i + 1
+    }
+    if clipped { hud.pop_clip(o) }
+}
+
+draw_widget(o: *Hud, m: *Menu, id: int, on_top: bool) {
+    wd = widget(m, id)
+    x, y, w, h = widget_rect(o, m, id)
+    size = h * 0.5
+    text_y = y + (h - size) * 0.5 - size * 0.1
+    white = hud.rgba(0.94, 0.95, 0.97, 1.0)
+    dim = hud.rgba(0.55, 0.57, 0.62, 1.0)
+    face = hud.rgba(0.18, 0.2, 0.24, 1.0)
+    if on_top && m.hover == id { face = hud.rgba(0.25, 0.28, 0.34, 1.0) }
+    if on_top && m.armed == id && m.hover == id { face = hud.rgba(0.12, 0.13, 0.16, 1.0) }
+    accent = hud.rgba(0.95, 0.62, 0.2, 1.0)
+    if wd.kind == LABEL {
+        hud.text_box(o, x, text_y, w, size, wd.label, white, hud.ALIGN_LEFT)
+    } else if wd.kind == BUTTON {
+        hud.rect(o, x, y, w, h, face)
+        hud.text_box(o, x, text_y, w, size, wd.label, white, hud.ALIGN_CENTRE)
+    } else if wd.kind == TOGGLE {
+        box = h * 0.6
+        bx = x + h * 0.2
+        by = y + (h - box) * 0.5
+        hud.rect(o, x, y, w, h, face)
+        hud.rect_outline(o, bx, by, box, box, hud.px(o, 2.0), white)
+        if wd.on { hud.rect(o, bx + box * 0.25, by + box * 0.25, box * 0.5, box * 0.5, accent) }
+        hud.text_box(o, bx + box + h * 0.3, text_y, w - box - h * 0.6, size, wd.label, white, hud.ALIGN_LEFT)
+    } else if wd.kind == SLIDER {
+        hud.rect(o, x, y, w, h, face)
+        t = 0.0
+        if wd.high > wd.low { t = (wd.value - wd.low) / (wd.high - wd.low) }
+        hud.rect(o, x, y + h - hud.px(o, 4.0), w * t, hud.px(o, 4.0), accent)
+        hud.text_box(o, x + h * 0.3, text_y, w - h * 0.6, size, wd.label, white, hud.ALIGN_LEFT)
+        knob = hud.px(o, 6.0)
+        hud.rect(o, x + w * t - knob * 0.5, y, knob, h, white)
+    } else if wd.kind == FIELD {
+        hud.rect(o, x, y, w, h, hud.rgba(0.05, 0.05, 0.06, 1.0))
+        hud.rect_outline(o, x, y, w, h, hud.px(o, 1.0), dim)
+        shown = aether_bytes_string_from_ptr(wd.text, wd.text_len)
+        pad = h * 0.3
+        hud.push_clip(o, x + pad * 0.5, y, w - pad, h)
+        tw = 0.0
+        if wd.text_len > 0 {
+            tw = hud.text(o, x + pad, text_y, size, shown, white)
+        } else if !(on_top && m.focus == id) {
+            hud.text(o, x + pad, text_y, size, wd.label, dim)
+        }
+        if on_top && m.focus == id { hud.rect(o, x + pad + tw + hud.px(o, 1.0), y + h * 0.2, hud.px(o, 2.0), h * 0.6, white) }
+        hud.pop_clip(o)
+        string.free(shown)
+    }
+    // The focus, round the focused widget of the menu that has the input.
+    if on_top && m.focus == id {
+        ring = hud.px(o, 2.0)
+        hud.rect_outline(o, x - ring, y - ring, w + ring * 2.0, h + ring * 2.0, ring, accent)
+    }
+}
