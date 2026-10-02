@@ -28,7 +28,8 @@ import ae3d.vkhost
 exports (
     SCENE, RGBA, FLOATS,
     texture_create, texture_create_rgba, texture_create_float,
-    valid, view, sampler_of, image_of, memory_of, width_of, height_of, adopt, adopt_target, destroy, rebias, clear
+    valid, view, sampler_of, image_of, memory_of, width_of, height_of, adopt, adopt_target, destroy, rebias, clear,
+    update_in_frame, collect_slot
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -263,6 +264,62 @@ texture_create_float(width: int, height: int, rgba: ptr) -> int {
     return upload(width, height, 1, rgba, width * height * 16, vk.FORMAT_R32G32B32A32_SFLOAT, 1, FLOATS)
 }
 
+// --- textures written again, in the frame (#544) ---
+
+// A texture's level-0 texels replaced in place, recorded into `commands`
+// -- a frame's command buffer, ahead of its passes, outside any render
+// pass -- so the frames still in flight finish reading the old texels and
+// the next pass reads the new: the barriers order the copy after every
+// earlier read on the queue, and the passes after it. No wait on the
+// device, which a texture remade on every hit would cost. The staging
+// buffer goes when this frame slot comes round again (`collect_slot`,
+// called once the slot's fence has passed). An RGBA texture of one level:
+// a damage mask.
+const UPDATE_SLOTS = 4
+const UPDATES_A_SLOT = 64
+
+var g_updates: ptr = null          // *HostBuffer[UPDATE_SLOTS * UPDATES_A_SLOT]
+var g_update_count: ptr = null     // int[UPDATE_SLOTS]
+
+update_in_frame(handle: int, rgba: ptr, commands: ptr, slot: int) -> bool {
+    if !valid(handle) || rgba == null || commands == null || slot < 0 || slot >= UPDATE_SLOTS { return false }
+    if g_updates == null {
+        g_updates = calloc(UPDATE_SLOTS * UPDATES_A_SLOT, 8)
+        g_update_count = calloc(UPDATE_SLOTS, 4)
+    }
+    n = (g_update_count as int[])[slot]
+    if n >= UPDATES_A_SLOT { return false }
+    t = slot_at(handle)
+    bytes = t.width * t.height * 4
+    staging = vkhost.upload_buffer(bytes)
+    if staging == null { return false }
+    memcpy(staging.mapped, rgba, bytes as long)
+    turn(commands, t.image, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         vk.ACCESS_SHADER_READ_BIT, vk.ACCESS_TRANSFER_WRITE_BIT,
+         vk.PIPELINE_STAGE_VERTEX_SHADER_BIT | vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT, 0, 1)
+    copy_in(commands, staging, t.image, t.width, t.height, 1)
+    turn(commands, t.image, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+         vk.ACCESS_TRANSFER_WRITE_BIT, vk.ACCESS_SHADER_READ_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT,
+         vk.PIPELINE_STAGE_VERTEX_SHADER_BIT | vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1)
+    (g_updates as ptr[])[slot * UPDATES_A_SLOT + n] = staging as ptr
+    (g_update_count as int[])[slot] = n + 1
+    return true
+}
+
+// The staging buffers a frame slot's updates copied from, freed: its
+// fence has passed, so the copies are done.
+collect_slot(slot: int) {
+    if g_updates == null || slot < 0 || slot >= UPDATE_SLOTS { return }
+    n = (g_update_count as int[])[slot]
+    i = 0
+    while i < n {
+        vkhost.host_buffer_free((g_updates as ptr[])[slot * UPDATES_A_SLOT + i] as *HostBuffer)
+        (g_updates as ptr[])[slot * UPDATES_A_SLOT + i] = null
+        i = i + 1
+    }
+    (g_update_count as int[])[slot] = 0
+}
+
 // --- the table ---------------------------------------------------------------------------------------------------
 
 // The textures a draw binds by handle, slot + 1: 256 of them, as many as a
@@ -456,6 +513,11 @@ rebias(bias: float) -> bool {
 // starts with no bias.
 clear() {
     g_bias = 0.0
+    k = 0
+    while k < UPDATE_SLOTS {
+        collect_slot(k)
+        k = k + 1
+    }
     if g_table == null { return }
     d = vkhost.device()
     h = 1

@@ -122,6 +122,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 woundData[96];
     vec4 woundLayers[4];
     float woundCore;
+    int damageOn;
+    vec4 damageColours[4];
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -238,6 +240,7 @@ layout(location = 7) out vec4 ClipPrev;
 layout(location = 8) out vec3 BindPos;
 // A crowd's cut is the whole figure's: no joints of its own (#556).
 layout(location = 9) out float ClipLimb;
+layout(location = 10) out vec2 MaskUV;
 
 // The bone's matrix at a frame, read as its four columns from the bank.
 mat4 boneAt(int bone, int frame) {
@@ -274,6 +277,7 @@ mat4 skinAtPhase(float phase) {
 void main() {
     BindPos = inPosition;
     ClipLimb = 1.0;
+    MaskUV = inTexCoord;
     Occlusion = inOcclusion;
     mat4 modelMatrix = model * instanceModel;
     // The way the figure faces, which is the way it walks.

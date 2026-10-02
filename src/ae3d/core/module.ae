@@ -37,7 +37,7 @@ import ae3d.picture
 exports (
     mesh_push_skybox_cube, skybox_solid, skybox_texture, SKY_PROCEDURAL, mesh_normal,
     CLOUD_SHAPE_SIZE, CLOUD_WEATHER_SIZE, cloud_shape_bytes, cloud_weather_bytes,
-    mesh_set_skin, mesh_is_skinned, mesh_skin_joint, mesh_skin_weight, mesh_decimate,
+    mesh_set_skin, mesh_set_uv1, mesh_has_uv1, mesh_is_skinned, mesh_skin_joint, mesh_skin_weight, mesh_decimate,
     mesh_surface_area, mesh_uv_area, mesh_distinct_planes, mesh_size,
     palette_create, palette_destroy, palette_bones, palette_set, palette_get,
     palette_data, farr_create, farr_destroy, farr_set, farr_get, farr_count, skinrows_create, skinrows_destroy, skinrows_count, skinrows_set,
@@ -56,7 +56,7 @@ exports (
     env_int, env_float, resource_path, material_new, material_default, material_clone, material_equals, material_free,
     model_new, model_free,
     model_clone, model_set_casts_shadow, model_set_solid, SOLID_AUTO, SOLID_YES, SOLID_NO, model_set_billboard, model_set_depth_proxy, model_set_clip, model_clear_clip, model_clipped, model_clip_joint, model_clear_clip_joints, model_clip_joints_named, model_set_clip_detached, MAX_CLIP_JOINTS,
-    model_set_wound, model_set_splat, model_set_wound_count, model_wound_count, model_clear_wounds, model_set_wound_layer, model_set_wound_core, MAX_WOUNDS, model_set_impostor, model_is_impostor,
+    model_set_wound, model_set_splat, DamageMask, model_enable_damage, model_disable_damage, model_has_damage, model_set_damage_colour, model_damage_splat, model_damage_fade, model_clear_damage, model_damage_at, model_damage_size, model_damage_pixels, model_damage_colours, model_damage_serial, DAMAGE_BLOOD, DAMAGE_BRUISE, DAMAGE_BURN, DAMAGE_SPARE, model_set_wound_count, model_wound_count, model_clear_wounds, model_set_wound_layer, model_set_wound_core, MAX_WOUNDS, model_set_impostor, model_is_impostor,
     DeviceCrowd, model_set_device_crowd, model_frame_done, model_prev_matrix, model_set_crowd_walk,
     model_set_position, model_set_scale, model_set_rotation, model_rotate,
     model_update_matrix, model_recalculate_bounds, model_mark_dirty, model_geometry_changed, model_set_diffuse,
@@ -105,6 +105,7 @@ exports (
 )
 
 extern calloc(count: int, size: int) -> ptr
+extern memset(dst: ptr, value: int, n: long) -> ptr
 extern sqrt(x: float) -> float
 extern sin(x: float) -> float
 extern cos(x: float) -> float
@@ -524,6 +525,9 @@ struct Model {
     wounds: ptr                    // f32[MAX_WOUNDS * 12], or null
     wound_layers: ptr              // f32[16], or null
     wound_core: float
+    // A damage mask (#544), *DamageMask, or null: blood soaked in, bruises,
+    // burns, kept in the model's UV space.
+    damage: ptr
     // The model drawn in this one's place in the depth-only passes -- the
     // shadow map and the camera depth -- with this model's instances and
     // pose: a crowd's far tier standing in for its near one, where a
@@ -774,6 +778,14 @@ acos_of(x: float) -> float {
 
 sqrt_of(x: float) -> float {
     return sqrt(x)
+}
+
+// The largest whole number not above x. Not libm's floor: a bare extern
+// floor is resolved against a program's locals named floor (aether#2173).
+floor_of(x: float) -> float {
+    i = x as long
+    if (i as float) > x { i = i - (1 as long) }
+    return i as float
 }
 
 abs_of(x: float) -> float {
@@ -1569,6 +1581,7 @@ model_free(m: *Model) {
     }
 
     if m.wounds != null { free(m.wounds) }
+    model_disable_damage(m)
     if m.wound_layers != null { free(m.wound_layers) }
 
     if m.uniforms != null {
@@ -2697,6 +2710,14 @@ mesh_set_skin(mesh: ptr, i: int, j0: int, j1: int, j2: int, j3: int,
     return geometry.mesh_set_skin(mesh, i, j0, j1, j2, j3, w0, w1, w2, w3) != 0
 }
 
+// Vertex i's place in the mesh's second UV set (#544): what a damage mask
+// is laid out over (glTF's TEXCOORD_1).
+mesh_set_uv1(mesh: ptr, i: int, u: float, v: float) -> bool {
+    return geometry.mesh_set_uv1(mesh, i, u, v) != 0
+}
+
+mesh_has_uv1(mesh: ptr) -> bool { return geometry.mesh_has_uv1(mesh) != 0 }
+
 // The world area a mesh covers, its area in texture space, and how many ways
 // its faces point. Together these say whether a surface carries enough texture
 // to be looked at closely and whether a shape has a silhouette or is a box.
@@ -3052,6 +3073,328 @@ model_clip_joints_named(m: *Model) -> bool {
 // joint is drawn. The model left standing and its loose copy, the same
 // joints and the plane each way, draw the body once between them.
 model_set_clip_detached(m: *Model, on: bool) { m.clip_detached = on }
+
+// --- damage masks (#544) ---
+
+// Damage kept in a model's UV space: four channels of a texture -- blood
+// soaked in, bruising, burning, one spare -- over its second UV set, or its
+// first where it has none. A hit is a sphere in the model's bind space
+// (`model_damage_splat`), written into every texel whose surface lies in
+// it, so it stays on the skin however the figure moves and every hit is
+// kept, past the 32 wounds and splats a model draws as ellipsoids.
+//
+// The texels' surface is baked once, when the mask is enabled: each
+// triangle of the mesh drawn into the mask's grid in UV space, keeping the
+// bind-space point each texel's centre lies on (the position map), then
+// spread a texel outward so a filtered read at a seam finds damage on both
+// sides. A splat is then a pass over that map, on the CPU: no render
+// target, the same texels on both renderers, and a 256 x 256 mask is
+// 65,536 distances a hit. A mesh whose UVs overlap (mirrored halves) puts
+// two places in one texel and keeps the later; give it a second UV set.
+// The renderers upload the mask when it changed (its serial).
+struct DamageMask {
+    size: int
+    pixels: ptr                  // byte[size * size * 4]: RGBA, row y is v = (y + 0.5) / size
+    positions: ptr               // f32[size * size * 4]: the texel's bind-space point, w 1 where it has one
+    colours: ptr                 // f32[16]: each channel's colour and strength
+    serial: int                  // bumped at every change
+    texture: int                 // the renderer's texture, 0 for none yet
+    uploaded: int                // the serial the renderer last uploaded
+}
+
+const DAMAGE_BLOOD = 0
+const DAMAGE_BRUISE = 1
+const DAMAGE_BURN = 2
+const DAMAGE_SPARE = 3
+
+// A damage mask of `size` texels a side (64 to 1024, a power of two is not
+// needed), baked over the model's mesh. False when the model has no mesh.
+model_enable_damage(m: *Model, size: int) -> bool {
+    if m == null || m.mesh == null || size < 4 || size > 2048 { return false }
+    model_disable_damage(m)
+    d = heap.new(DamageMask)
+    d.size = size
+    d.pixels = calloc(size * size * 4, 1)
+    d.positions = calloc(size * size * 4, 4)
+    d.colours = calloc(16, 4)
+    d.serial = 1
+    m.damage = d as ptr
+    model_set_damage_colour(m, DAMAGE_BLOOD, 0.22, 0.015, 0.015, 0.92)
+    model_set_damage_colour(m, DAMAGE_BRUISE, 0.26, 0.13, 0.3, 0.7)
+    model_set_damage_colour(m, DAMAGE_BURN, 0.05, 0.04, 0.035, 0.95)
+    model_set_damage_colour(m, DAMAGE_SPARE, 0.0, 0.0, 0.0, 0.0)
+    damage_bake(d, m.mesh)
+    return true
+}
+
+model_disable_damage(m: *Model) {
+    if m == null || m.damage == null { return }
+    d = m.damage as *DamageMask
+    free(d.pixels)
+    free(d.positions)
+    free(d.colours)
+    heap.free(d)
+    m.damage = null
+}
+
+model_has_damage(m: *Model) -> bool { return m != null && m.damage != null }
+
+// What a channel draws the surface toward, and how far at full damage.
+model_set_damage_colour(m: *Model, channel: int, r: float, g: float, b: float, strength: float) {
+    if m == null || m.damage == null || channel < 0 || channel > 3 { return }
+    d = m.damage as *DamageMask
+    c = d.colours as f32[]
+    c[channel * 4] = r as f32
+    c[channel * 4 + 1] = g as f32
+    c[channel * 4 + 2] = b as f32
+    c[channel * 4 + 3] = strength as f32
+}
+
+// The position map: every triangle drawn into the grid in UV space, each
+// texel centre inside it keeping the bind-space point under it; then the
+// covered region grown by two texels.
+damage_bake(d: *DamageMask, mesh: ptr) {
+    n = d.size
+    pos = d.positions as f32[]
+    verts = geometry.mesh_vertex_data(mesh) as f32[]
+    idx = geometry.mesh_index_data(mesh) as int[]
+    count = geometry.mesh_index_count(mesh)
+    t = 0
+    while t + 2 < count {
+        a = idx[t]
+        b = idx[t + 1]
+        c = idx[t + 2]
+        au, av = geometry.mesh_uv1(mesh, a)
+        bu, bv = geometry.mesh_uv1(mesh, b)
+        cu, cv = geometry.mesh_uv1(mesh, c)
+        // In texel units.
+        ax = au * (n as float)
+        ay = av * (n as float)
+        bx = bu * (n as float)
+        by = bv * (n as float)
+        cx = cu * (n as float)
+        cy = cv * (n as float)
+        area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay)
+        if area > 0.000001 || area < 0.0 - 0.000001 {
+            x0 = clamp_int(floor_of(min3(ax, bx, cx)) as int, 0, n - 1)
+            x1 = clamp_int(floor_of(max3(ax, bx, cx)) as int, 0, n - 1)
+            y0 = clamp_int(floor_of(min3(ay, by, cy)) as int, 0, n - 1)
+            y1 = clamp_int(floor_of(max3(ay, by, cy)) as int, 0, n - 1)
+            y = y0
+            while y <= y1 {
+                py = (y as float) + 0.5
+                x = x0
+                while x <= x1 {
+                    px = (x as float) + 0.5
+                    w0 = ((bx - px) * (cy - py) - (cx - px) * (by - py)) / area
+                    w1 = ((cx - px) * (ay - py) - (ax - px) * (cy - py)) / area
+                    w2 = 1.0 - w0 - w1
+                    if w0 >= 0.0 - 0.0001 && w1 >= 0.0 - 0.0001 && w2 >= 0.0 - 0.0001 {
+                        at = (y * n + x) * 4
+                        k = 0
+                        while k < 3 {
+                            pos[at + k] = (w0 * (verts[a * 9 + k] as float) + w1 * (verts[b * 9 + k] as float) +
+                                           w2 * (verts[c * 9 + k] as float)) as f32
+                            k = k + 1
+                        }
+                        pos[at + 3] = 1.0 as f32
+                    }
+                    x = x + 1
+                }
+                y = y + 1
+            }
+        }
+        t = t + 3
+    }
+    damage_dilate(d)
+    damage_dilate(d)
+}
+
+// Every empty texel beside a covered one takes that one's point (marked
+// 0.5, so it is not grown from again in the same pass).
+damage_dilate(d: *DamageMask) {
+    n = d.size
+    pos = d.positions as f32[]
+    y = 0
+    while y < n {
+        x = 0
+        while x < n {
+            at = (y * n + x) * 4
+            if (pos[at + 3] as float) < 0.25 {
+                found = 0 - 1
+                dy = 0 - 1
+                while dy <= 1 && found < 0 {
+                    dx = 0 - 1
+                    while dx <= 1 && found < 0 {
+                        nx = x + dx
+                        ny = y + dy
+                        if nx >= 0 && ny >= 0 && nx < n && ny < n {
+                            other = (ny * n + nx) * 4
+                            if (pos[other + 3] as float) > 0.75 { found = other }
+                        }
+                        dx = dx + 1
+                    }
+                    dy = dy + 1
+                }
+                if found >= 0 {
+                    pos[at] = pos[found]
+                    pos[at + 1] = pos[found + 1]
+                    pos[at + 2] = pos[found + 2]
+                    pos[at + 3] = 0.5 as f32
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    i = 0
+    while i < n * n {
+        if (pos[i * 4 + 3] as float) > 0.25 { pos[i * 4 + 3] = 1.0 as f32 }
+        i = i + 1
+    }
+}
+
+// A hit (#544): `amount` (0 to 1) of `channel` -- DAMAGE_BLOOD,
+// _BRUISE, _BURN, _SPARE -- into every texel whose surface lies within
+// `radius` of `centre` (bind space), full to two thirds of the radius and
+// thinning to nothing at it, the edge wandering by a fifth of the radius
+// so no two are the same disc. Added to what is there, to full. The texels
+// it reached.
+model_damage_splat(m: *Model, centre: Vec3, radius: float, channel: int, amount: float) -> int {
+    if m == null || m.damage == null || radius <= 0.0 || channel < 0 || channel > 3 { return 0 }
+    d = m.damage as *DamageMask
+    n = d.size
+    pos = d.positions as f32[]
+    px = d.pixels as byte[]
+    reached = 0
+    i = 0
+    while i < n * n {
+        if (pos[i * 4 + 3] as float) > 0.5 {
+            dx = (pos[i * 4] as float) - centre.x
+            dy = (pos[i * 4 + 1] as float) - centre.y
+            dz = (pos[i * 4 + 2] as float) - centre.z
+            dist = sqrt_of(dx * dx + dy * dy + dz * dz) / radius
+            if dist < 1.2 {
+                edge = 1.0 + 0.2 * (damage_noise(dx / radius * 3.0, dy / radius * 3.0, dz / radius * 3.0) * 2.0 - 1.0)
+                t = (dist - 0.66 * edge) / (0.34 * edge)
+                cover = 1.0
+                if t > 0.0 { cover = 1.0 - t * t * (3.0 - 2.0 * t) }
+                if t >= 1.0 { cover = 0.0 }
+                if cover > 0.0 {
+                    at = i * 4 + channel
+                    v = (px[at] as int) + ((cover * amount * 255.0 + 0.5) as int)
+                    if v > 255 { v = 255 }
+                    px[at] = v
+                    reached = reached + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    if reached > 0 { d.serial = d.serial + 1 }
+    return reached
+}
+
+// A smooth value noise in 0..1 at a point, for a splat's ragged edge.
+damage_noise(x: float, y: float, z: float) -> float {
+    ix = floor_of(x)
+    iy = floor_of(y)
+    iz = floor_of(z)
+    fx = x - ix
+    fy = y - iy
+    fz = z - iz
+    fx = fx * fx * (3.0 - 2.0 * fx)
+    fy = fy * fy * (3.0 - 2.0 * fy)
+    fz = fz * fz * (3.0 - 2.0 * fz)
+    a = lerp_of(damage_hash(ix, iy, iz), damage_hash(ix + 1.0, iy, iz), fx)
+    b = lerp_of(damage_hash(ix, iy + 1.0, iz), damage_hash(ix + 1.0, iy + 1.0, iz), fx)
+    c = lerp_of(damage_hash(ix, iy, iz + 1.0), damage_hash(ix + 1.0, iy, iz + 1.0), fx)
+    e = lerp_of(damage_hash(ix, iy + 1.0, iz + 1.0), damage_hash(ix + 1.0, iy + 1.0, iz + 1.0), fx)
+    return lerp_of(lerp_of(a, b, fy), lerp_of(c, e, fy), fz)
+}
+
+damage_hash(x: float, y: float, z: float) -> float {
+    h = sin_of(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453
+    return h - floor_of(h)
+}
+
+lerp_of(a: float, b: float, t: float) -> float { return a + (b - a) * t }
+
+// A channel kept to `keep` of itself (0 to 1): a bruise fading by the day,
+// blood drying off.
+model_damage_fade(m: *Model, channel: int, keep: float) {
+    if m == null || m.damage == null || channel < 0 || channel > 3 { return }
+    d = m.damage as *DamageMask
+    px = d.pixels as byte[]
+    k = keep
+    if k < 0.0 { k = 0.0 }
+    if k > 1.0 { k = 1.0 }
+    i = 0
+    while i < d.size * d.size {
+        px[i * 4 + channel] = (((px[i * 4 + channel] as int) as float) * k) as int
+        i = i + 1
+    }
+    d.serial = d.serial + 1
+}
+
+// Every channel back to nothing.
+model_clear_damage(m: *Model) {
+    if m == null || m.damage == null { return }
+    d = m.damage as *DamageMask
+    memset(d.pixels, 0, (d.size * d.size * 4) as long)
+    d.serial = d.serial + 1
+}
+
+// A channel's damage (0 to 1) at a place in the mask's UV space.
+model_damage_at(m: *Model, u: float, v: float, channel: int) -> float {
+    if m == null || m.damage == null || channel < 0 || channel > 3 { return 0.0 }
+    d = m.damage as *DamageMask
+    x = clamp_int((u * (d.size as float)) as int, 0, d.size - 1)
+    y = clamp_int((v * (d.size as float)) as int, 0, d.size - 1)
+    return ((d.pixels as byte[])[(y * d.size + x) * 4 + channel] as int as float) / 255.0
+}
+
+// For the renderers: the mask's side, its RGBA texels, its colours (four
+// vec4s) and the count of its changes.
+model_damage_size(m: *Model) -> int {
+    if m == null || m.damage == null { return 0 }
+    return (m.damage as *DamageMask).size
+}
+
+model_damage_pixels(m: *Model) -> ptr {
+    if m == null || m.damage == null { return null }
+    return (m.damage as *DamageMask).pixels
+}
+
+model_damage_colours(m: *Model) -> ptr {
+    if m == null || m.damage == null { return null }
+    return (m.damage as *DamageMask).colours
+}
+
+model_damage_serial(m: *Model) -> int {
+    if m == null || m.damage == null { return 0 }
+    return (m.damage as *DamageMask).serial
+}
+
+min3(a: float, b: float, c: float) -> float {
+    x = a
+    if b < x { x = b }
+    if c < x { x = c }
+    return x
+}
+
+max3(a: float, b: float, c: float) -> float {
+    x = a
+    if b > x { x = b }
+    if c > x { x = c }
+    return x
+}
+
+clamp_int(v: int, low: int, high: int) -> int {
+    if v < low { return low }
+    if v > high { return high }
+    return v
+}
 
 // --- wounds (#543) ---
 

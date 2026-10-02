@@ -105,7 +105,7 @@ GPU_SUITES="test_agent test_agent_attached test_agent_components test_agent_expl
     test_agent_net test_agent_record test_backend_parity test_batching
     test_blackhole test_camera_collision test_caustics test_character
     test_crowd_ecs test_crowd_render test_crowd_render_scale
-    test_culling test_depth_clear test_depth_proxy test_device_crowd
+    test_culling test_damage test_depth_clear test_depth_proxy test_device_crowd
     test_dlss test_ecs_render test_engine_shadows test_engine_skybox
     test_figure test_fog test_gameobjects test_gltf_crowd test_hierarchy
     test_hud_layout test_impostor test_instance_colours test_instance_positions
@@ -570,7 +570,7 @@ step "Vulkan under the validation layer, synchronization included"
 # the layer reports fails the suite. The loader names every layer it inserts
 # when asked (VK_LOADER_DEBUG=layer): a run it did not insert the layer into
 # would pass having checked nothing, so that is a skip, never a pass.
-for name in test_fog test_overlay test_hud_layout test_backend_parity; do
+for name in test_fog test_overlay test_hud_layout test_damage test_backend_parity; do
     if ! built_ok "$name"; then
         skip "$name under the layer" "did not build"
         continue

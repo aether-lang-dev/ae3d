@@ -126,6 +126,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 woundData[96];
     vec4 woundLayers[4];
     float woundCore;
+    int damageOn;
+    vec4 damageColours[4];
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -198,6 +200,7 @@ layout(location = 6) in vec4 ClipNow;
 layout(location = 7) in vec4 ClipPrev;
 layout(location = 8) in vec3 BindPos;
 layout(location = 9) in float ClipLimb;
+layout(location = 10) in vec2 MaskUV;
 layout(location = 1) out vec2 outVelocity;
 
 
@@ -1489,6 +1492,19 @@ float splatCover(vec3 p) {
     return most;
 }
 
+// Damage (#544): a mask laid over the model's second UV set (or its
+// first), four channels -- soaked blood, bruising, burning, and one spare --
+// each drawing the surface toward its colour by its strength. Written on
+// the CPU by splats at bind-space points (core.model_damage_splat), so it
+// stays where it was put however the figure moves, and keeps every hit.
+
+
+#ifdef VULKAN
+layout(set = 0, binding = 9) uniform sampler2D damageMask;
+#else
+
+#endif
+
 void main() {
     // A cut model's far side, not drawn (#545): nor its depth, which the
     // occlusion, the reflections and the water read from this pass.
@@ -1558,6 +1574,13 @@ void main() {
     vec3 albedo = diffuseColor * texColor.rgb * InstanceColor; // Apply per-instance color
     // Blood splashed on the skin (#546), the outermost layer's colour.
     if (woundCount > 0) albedo = mix(albedo, woundLayers[0].rgb, splatCover(BindPos));
+    // The damage the mask has kept (#544).
+    vec4 damage = texture(damageMask, MaskUV);
+    if (damageOn != 0) {
+        for (int k = 0; k < 4; k++) {
+            albedo = mix(albedo, damageColours[k].rgb, clamp(damage[k] * damageColours[k].a, 0.0, 1.0));
+        }
+    }
     // Inside a wound, the layer it has cut down to: blood at the rim, then
     // fat, muscle, bone -- each from the share of the radius it starts at.
     if (woundAt < 1.0) {
