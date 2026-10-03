@@ -300,3 +300,33 @@ No bone turns more than 25 degrees a frame either way.
 When the search stays with the playing clip, the playing frame is still
 the one on screen. Before, it was taken for the best frame, and the next
 query's pose was a frame not being shown.
+
+## Standing still
+
+`ae3d.idle` (#592, part of #509) adds a standing figure's breath and its
+shifting weight over whatever its clip poses, in the pose phase.
+
+```aether
+d = idle.attach(e, figure_root, hips, chest, forward)
+idle.set_speed(d, speed)   // every frame: moving, it fades out
+```
+
+- **The breath.** The chest pitches back 2 degrees at the top of each
+  breath, about every 4.2 s. The pace drifts 15% either way over a 23 s
+  cycle, so no two breaths are alike.
+- **The weight.** The hips sway 2.5 cm across, from one foot to the other,
+  over 7.3 s. That period never falls in step with the breath's.
+- **Moving.** Both fade with speed, and are gone at 0.4 m/s.
+
+`tests/test_idle.ae`, 30 s of the box man playing its Idle:
+
+| Measure | Result |
+|---|---|
+| The chest's pitch | 0 to 0.035 rad |
+| Breaths | 7, from 3.7 to 4.9 s long |
+| The hips' sway | ±0.025 m |
+| How in step the breath and the sway are | correlation 0.009 |
+| The bones' own turn and shift against what the layer drew | under 1e-8 |
+| Moving at 0.4 m/s | the clip exactly |
+
+No other bone is touched.
