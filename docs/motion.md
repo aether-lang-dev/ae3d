@@ -52,6 +52,7 @@ A `POWERED` figure that leans more than 0.35 rad (20°) from its pose is falling
 - its balance keeps working against the fall until it is down: the pelvis's assist keeps its full torque. Let go at the first lean, the figure toppled from the hips like a plank;
 - its arms reach toward where it is falling, 0.7 down to 1 along the fall and a little out to each side so the hands land apart, and straight, since a straight arm takes the landing through its joints where a bent one folds on its elbow's muscle;
 - its head tucks 0.8 rad away from the fall, from where the chest carries it;
+- its knees give, 0.45 rad toward their bend (#578), so it comes down in stages, knees then hips then hands, rather than toppling from the ankles like a plank. Forwards, when it leans past 45 degrees its pelvis is 0.35 m down, against 0.20 for a twin that keeps its knees. The reference ragdoll's knees turn only 30 degrees from straight, which caps the bend;
 - when the fall is toward its back, its spine bends away from the fall too, 0.5 rad at each of its two joints. Going over backwards, from the first lean, that rounds the back and tucks the chin, so the head comes down last. In a fall forwards or sideways the pelvis's front turns back along the fall once it passes level; face down, the bend arches the back and lifts the chest and head off the ground.
 
 If it catches itself (leans less than half the threshold again), the reach and the tuck let go and the balance comes back. It has landed when it leans past 1.2 rad (69°) with its pelvis down, within 25 cm of its lowest point, for ten steps: the reach stops, the balance lets go, and every joint holds the shape it landed in, the head still tucked, on 40% of its budget (`physics.ragdoll_hold_shape`). Once its pelvis and chest have been slower than 0.3 m/s for ten steps more, it lies (`lying(body)`). A fall caught on the hands and knees, or sitting, leans less or keeps its pelvis up. Its trunk still for a third of a second, it has landed as well, and holds the shape it was caught in at full strength with its balance kept, as a person on all fours does. A caught figure can still go over -- kneeling, it tips onto its face -- and if its trunk moves faster than 0.3 m/s again after it has lain still, it falls again: the shape let go and the arms reaching, to land and lie as any fall does.
@@ -64,13 +65,40 @@ The reach, the tuck and the bend are **aims** (`physics.ragdoll_aim(ragdoll, bon
 
 The reach and the tuck were first chosen by one fall each way while three faults hid in them. The way of the fall was read from the pelvis body's +y, which points down because aephysics's pelvis rests a half turn about x, so the arms reached away from the fall and the head tucked into it. One arm axis served both arms, though the left arm's capsules lie along +x and the right's along −x, so the left arm reached up. And the pelvis's anchor, its assist set to nothing as the figure fell, kept applying its last impulse for as long as it lived (aephysics#58): an assist nobody had asked for, which every setting had been chosen on top of. With the three fixed, `tests/test_falls.ae` holds the protective fall over thirty falls each way, with blows from 376 to 424 N·s, a protected figure beside an unprotected twin each time. The settings were swept on it: a tuck of 0.5 to 1.2, a bend of 0 to 0.5, the assist from none to all of it, the reach 0.4 to 1.0 down, the fall's lean 0.25 to 0.45. Without the assist no setting kept the protected head slower in more than 18 falls backwards and 22 sideways.
 
-| way | protected head slower | head, protected / twin (average) | a second head impact | still within 3 s of landing |
-|---|---|---|---|---|
-| over backwards | 30 of 30 | 0.06 / 3.11 m/s | 0 | 30 (the slowest 1.3 s) |
-| forwards | 30 of 30 | 0 / 3.77 m/s (the head never touches) | 0 | 29 (3.13 s) |
-| sideways | 30 of 30 | 0.71 / 4.02 m/s | 0 | 30 (1.0 s) |
+| way | protected head slower | head, protected / twin (average) | a second head impact | still within 3 s of landing | knees going down |
+|---|---|---|---|---|---|
+| over backwards | 30 of 30 | 0.10 / 3.63 m/s | 0 | 30 (the slowest 1.25 s) | 0.45 rad |
+| forwards | 30 of 30 | 0.84 / 3.20 m/s | 0 | 30 (0.88 s) | 0.45 rad |
+| sideways | 30 of 30 | 0.18 / 3.29 m/s | 0 | 30 (1.52 s) | 0.48 rad |
 
-Before, on the same ensemble (the reference's figure, all three faults), the protected head was the slower in 14, 23 and 21 falls, and over backwards it met the ground faster than its twin's on average (2.99 against 2.77 m/s). Forwards, its head met the ground a second time in 16 falls. What is left of #479: one forward faller, caught kneeling, tips onto its face 0.4 s after it has lain still and comes to rest 3.13 s after landing.
+The knees giving took the forward head from 1.44 m/s to 0.84 and the forward count from 29 to 30.
+
+Forwards the blows run from 410 to 460 N·s: from behind, a figure that steps now staggers out of shoves up to 390 (below), and with 376 to 424 four of the thirty were caught and never fell. Every way meets #479: the protected head the slower in at least 29 of 30, no second impact, every figure still within 3 s of landing.
+
+Before, on the same ensemble (the reference's figure, all three faults), the protected head was the slower in 14, 23 and 21 falls, and over backwards it met the ground faster than its twin's on average (2.99 against 2.77 m/s). Forwards, its head met the ground a second time in 16 falls.
+
+## Struck while animated
+
+A figure stays `ANIMATED`, drawn from its clip, until something touches it,
+and goes `POWERED` the moment it is struck (#581). Its bodies trail a rig
+of other proportions by up to 2 cm at rest, so the drawing can't jump
+straight to them. At the change it keeps the offset the rig's pose had
+from the bodies, and that offset fades over 0.25 s. What the blow does to
+the bodies shows on the frame it lands.
+
+Before, the drawing blended from the rig's pose to the bodies' along a
+smoothstep, which starts flat. A blow showed late, and a second blow in
+those 0.25 s landed where the figure wasn't drawn.
+
+`tests/test_impact_shows.ae` strikes a figure 60 N·s at the chest as it
+goes `POWERED` from `ANIMATED`:
+
+| | before | now |
+|---|---|---|
+| the drawn hips' way against the pelvis body's, worst in 0.3 s | 3.4 cm | 0.9 cm |
+| how much of the body's 7.2 cm the drawing has gone, 0.2 s in | 79% | 91% |
+
+A twin `POWERED` all along draws its hips with its body to the millimetre.
 
 ## Stepping to catch itself
 
@@ -109,14 +137,14 @@ for where standing still gives out:
 | push | without stepping | stepping |
 |---|---|---|
 | 60 N·s from behind | stands | stands, no step |
-| 270 N·s from behind | stands | stands, 2 steps |
-| 285 N·s from behind | falls | stands, 2 steps |
+| 255 N·s from behind | stands | stands, 4 steps |
+| 270 N·s from behind | falls | stands, 4 steps |
 | 315 N·s from behind | falls | stands, 3 steps |
 | 180 N·s from the side | stands | stands, 1 step |
 | 150 N·s from in front | stands | stands, no step |
 
 How far each way holds:
-- **Forward:** 270 N·s without stepping, 360 staggering
+- **Forward:** 255 N·s without stepping, 360 staggering
   (`tests/test_stagger.ae`).
 - **Sideways:** 195 N·s either way; stepping moves the feet rather than
   holding the pose. Catch steps that cross or close the feet are #481.
@@ -129,6 +157,9 @@ A shove one step does not catch, the figure staggers from
 still off the feet, the steps come in a run:
 - each goes to where the capture point is by then;
 - each is quicker than the first: 0.22 s long, 0.03 s apart;
+- a step is backwards only when the capture point is behind the rear foot,
+  and the way the figure faces is its pelvis's (not its chest's, which a
+  shove from behind folds forward);
 - the run goes on while the capture point is within three strides, and
   ends the moment it is not.
 
@@ -144,17 +175,18 @@ stepping, and runs the whole twice:
 
 | shove | without stepping | stepping |
 |---|---|---|
-| 330 N·s | falls | staggers 4 steps (0.02, 0.35, 0.62 and 0.88 s after the shove) and stands |
-| 390 N·s | falls | staggers 3 steps (0.02, 0.52 and 0.78 s), then falls into the protective fall |
+| 330 N·s | falls | staggers 4 steps (0.02, 0.35, 0.62 and 0.88 s after the shove), stands, and brings its feet together at 1.32 s |
+| 390 N·s | falls | steps once at 0.2 s, then falls into the protective fall |
 
 It holds:
-- two or more steps for the 330 N·s shove, none more than 0.4 s after
-  the last;
+- two or more steps for the 330 N·s shove, none in the first second more
+  than 0.4 s after the last;
 - the stagger over once it stands;
 - on the second run, the same steps at the same fixed steps, and the same
   end to the bit.
 
 Swept from 120 to 450 N·s, stepping stands to 360 and falls from 390.
+Without stepping it holds 240.
 
 ## Writhing
 
@@ -175,41 +207,87 @@ counts from then. A `LIMP` figure is past it.
 - **Caught on its hands and knees**, as a figure not hurt is, it does not
   stay there. It lets go, down to 15% of its muscle and no balance, and
   goes down to writhe where it comes to lie.
-- **Face down**, it turns over onto its back first, and again whenever it
-  rolls onto its front. The arm on the side that is higher already pushes
-  the ground away, with its full muscle. The leg on that side draws up and
-  across toward the low side (the hip 0.5 rad up and 0.3 across, the knee
-  0.8). The trunk twists the way it rolls, 0.25 rad at each joint of the
-  spine. The other arm and leg let go, so the body rolls over them. Without
-  the twist and the crossing leg, it pushed for three seconds and never
-  rolled. Once it is on its back the legs' cycle starts again, so they
-  draw up as it comes to lie there.
+- **Where it lands**, it writhes. Face down its legs draw up under it, the
+  hips lifting off the ground as the knees come in, and its arms stay
+  tucked. It used to turn over onto its back first: the arm on the higher
+  side pushed the ground, the leg on that side crossed, the trunk twisted.
+  With the figure at rest (#579), that only braced it against the ground,
+  still for the whole of its writhing.
 - **A limb a blow left weak**, or the struck arm, doesn't take part: shot in
-  the arm, it clutches with the other, and it turns over on the other side.
+  the arm, it clutches with the other.
 
-The limbs that writhe have 45% of their muscle, and those turning it over
-all of it. The rest keep 15%: a limb not aimed drives toward the standing
-pose and, strong, would push the body over. Every bend is from the limb's
-rest place under its parent, within its joint's cone. The shape it landed
-in is let go while it writhes, since held it holds every joint whatever an
-aim asks. Done, it holds the shape it ends in.
+The limbs that writhe have all of their muscle: at less, with the figure
+at rest, the arms could not lift themselves over a chest lying on its
+back. The rest keep 15%: a limb not aimed drives toward the standing pose
+and, strong, would push the body over. Every bend is from the limb's rest
+place under its parent, within its joint's cone. The shape it landed in is
+let go while it writhes, since held it holds every joint whatever an aim
+asks. Done, it holds the shape it ends in.
 
-`tests/test_writhe.ae` knocks three figures down with 450 N·s from behind:
-one writhes for three seconds, a twin lies still, and a third is struck
-on the right forearm once down. The writhing two go down from their hands
-and knees onto their faces and turn over:
+`tests/test_writhe.ae` knocks four figures down with 450 N·s:
+- three from in front, onto their backs: one writhes for three seconds, a
+  twin lies still, and a third is struck on the right forearm once down;
+- a fourth from behind, onto its face, writhing where it lies.
 
 | | Measured |
 |---|---|
-| the left hip's swing, 0.5 to 2.5 s after landing | 0.51 rad writhing, 0 still |
-| the left upper arm toward the chest's front (cosine) | 0.60 writhing, 0.60 struck on the right forearm, 0.01 at rest |
-| the pelvis's drift from 1.5 s down to the end of writhing | 0.08 m |
+| the left hip's swing, 0.5 to 2.5 s after landing | 0.30 rad on its back, 0.43 on its face, 0 still |
+| the left upper arm toward the chest's front (cosine) | 0.70 writhing, 0.70 struck on the right forearm, 0.01 at rest |
+| the pelvis's drift from 1.5 s down to the end of writhing | 1.3 cm on its back, 1.0 cm on its face |
 | it stops | 3 s after landing, down 0.15 s later |
 | the struck arm | never aimed |
 | the same run twice | the same to the bit |
 
-Writhing in every way a figure lands, face up and on either side, from
-shoves in eight directions, is #480.
+The hip draws up 0.3 rad on its back and no further: the reference
+ragdoll's hip turns 30 degrees about a cone that is not centred ahead of
+the leg, and the knee 35 degrees about its rest. More of a person's curl
+waits on those limits (#578). Landing on either side, from shoves in eight
+directions, is the rest of #480.
+
+## Body parts
+
+A part of a figure can have a mode and a strength of its own (#573). The
+parts are the head, the spine, each arm and each leg (`PART_HEAD` to
+`PART_LEG_R`).
+
+```aether
+motion.set_part_mode(body, motion.PART_ARM_L, motion.LIMP)        // a crippled arm
+motion.set_part_strength(body, motion.PART_LEG_R, 0.3)            // a leg that will not hold
+motion.set_part_mode(body, motion.PART_ARM_L, motion.ANIMATED)    // taken back
+```
+
+- **A limp part** hangs and swings from its parent and collides, as the
+  ragdoll's arm does. On an `ANIMATED` figure the rest walks its clip on,
+  and the limp part is drawn as its bodies hang, after the clip in the pose
+  phase. On a `POWERED` one it has no muscle.
+  - A limp bone's anchor joint is destroyed, not set to nothing: at nothing,
+    its last spring impulse was still applied every sub-step, and it held an
+    arm out on its shoulder's limit (aephysics#76).
+  - It keeps a tenth of its joint's friction. At all of it (6.4 N·m at a
+    shoulder) an arm let go of stayed held out where it was.
+- **Taken back**, the part is drawn from where it hung to its clip over
+  0.3 s, under an offset that fades, as the drawing does when a figure is
+  struck (#581). Its anchors are made again where its bodies are.
+- **A part's strength** is a lasting share of its muscle. Every drive the
+  module sets goes through it, so a blow, a recovery or writhing never
+  restores an injury. A game that clamped its crippled arm after every
+  step no longer has to.
+
+`tests/test_motion_parts.ae` holds a rig's arms 0.6 rad ahead as a clip
+would:
+
+| | Measured |
+|---|---|
+| `ANIMATED`, the left arm let go | it comes down 0.39 rad from its clip, the right stays within 0.02 of its; drawn within 0.014 rad of its body; the figure still on its clip |
+| struck at the forearm, 8 N·s | the drawn arm swings 0.39 rad |
+| taken back | drawn to its clip with no more than 0.065 rad a frame, on it a second later; its body within 0.25 rad |
+| `POWERED`, the right arm at 3% | 3% of the left's muscle before a blow and after it and its recovery |
+| `POWERED`, the left arm limp | no muscle; it comes down 0.69 rad while the right holds |
+
+A following figure's joints' springs pull toward the reference pose
+against the anchors. A healthy arm held up ahead trails its clip by about
+0.14 rad, and an arm taken back by 0.25: #584. A `POWERED` part on an
+`ANIMATED` figure, and a limp part drawn during a get-up, are not there yet.
 
 ## On a figure
 
@@ -298,16 +376,50 @@ bowing so it stays awake, for 120 fixed steps once they have settled:
 
 | figures | the step | a figure | in a millisecond |
 |---|---|---|---|
-| 0 | 0.2 µs | | |
-| 4 | 142 µs | 35 µs | 28 |
-| 16 | 330 µs | 21 µs | 49 |
-| 32 | 636 µs | 20 µs | 50 |
+| 0 | 0.4 µs | | |
+| 4 | 236 µs | 59 µs | 17 |
+| 16 | 598 µs | 37 µs | 27 |
+| 32 | 1080 µs | 34 µs | 30 |
 
 A figure standing still falls asleep and costs nothing, which is why the
 figures bow: an awake figure is what the step pays for. A dozen awake
-figures cost about a quarter of a millisecond a step. The test holds a
-figure under 80 µs, a dozen within a millisecond, and every figure still
-standing at the end.
+figures cost about 0.45 ms a step. The test holds a figure under 80 µs, a
+dozen within a millisecond, and every figure still standing at the end.
+
+A world holding a powered figure steps in 8 sub-steps rather than 4 (see
+[At rest](#at-rest)): at 4 the same figures cost 23 µs each at 32.
+
+## At rest
+
+A powered figure standing untouched is still (#579). At 4 sub-steps a
+step, a joint's constraint, at its 60 Hz, sat on the solver's limit of a
+quarter of the sub-step rate, and against the motors' drive it rang. Every
+body of a figure standing untouched turned at 0.56 rad/s on average and
+1.6 at most, and every powered figure visibly trembled. A world holding a
+powered figure now steps in 8 sub-steps:
+
+| | on average | at most |
+|---|---|---|
+| 4 sub-steps | 0.56 rad/s | 1.59 rad/s |
+| 8 sub-steps | 0.0035 rad/s | 0.04 rad/s |
+
+What else was tried:
+- **A slower drive** (the motors closing the gap in 0.15 s, not 0.05)
+  quietened it to 0.14 and left five suites failing.
+- **Softer joints** (20 Hz at 4 sub-steps) quietened it to 0.001, but the
+  limbs went too soft to writhe or to catch a fall.
+
+`tests/test_motion_rest.ae` holds a figure standing from 1 s to 5 s under
+0.05 rad/s on average and 0.2 at most. Before, it measured 0.56 and 1.59.
+
+Some of what the stagger and writhing did had come from the trembling, and
+went with it:
+- **Balance read the chest for the way the figure faced.** A shove from
+  behind folds the spine forward, and leveled, the chest's front pointed
+  back the way the figure came. A stagger's second step was taken for a
+  step backwards. Balance now reads the pelvis.
+- **Writhing turned a face-down figure onto its back** with the trembling's
+  help. Without it, the push only braced the figure against the ground.
 
 ## Handing over from the horde
 
