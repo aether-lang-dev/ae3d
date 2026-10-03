@@ -52,6 +52,7 @@ A `POWERED` figure that leans more than 0.35 rad (20°) from its pose is falling
 - its balance keeps working against the fall until it is down: the pelvis's assist keeps its full torque. Let go at the first lean, the figure toppled from the hips like a plank;
 - its arms reach toward where it is falling, 0.7 down to 1 along the fall and a little out to each side so the hands land apart, and straight, since a straight arm takes the landing through its joints where a bent one folds on its elbow's muscle;
 - its head tucks 0.8 rad away from the fall, from where the chest carries it;
+- its knees give, 0.45 rad toward their bend (#578), so it comes down in stages, knees then hips then hands, rather than toppling from the ankles like a plank. Forwards, when it leans past 45 degrees its pelvis is 0.35 m down, against 0.20 for a twin that keeps its knees. The reference ragdoll's knees turn only 30 degrees from straight, which caps the bend;
 - when the fall is toward its back, its spine bends away from the fall too, 0.5 rad at each of its two joints. Going over backwards, from the first lean, that rounds the back and tucks the chin, so the head comes down last. In a fall forwards or sideways the pelvis's front turns back along the fall once it passes level; face down, the bend arches the back and lifts the chest and head off the ground.
 
 If it catches itself (leans less than half the threshold again), the reach and the tuck let go and the balance comes back. It has landed when it leans past 1.2 rad (69°) with its pelvis down, within 25 cm of its lowest point, for ten steps: the reach stops, the balance lets go, and every joint holds the shape it landed in, the head still tucked, on 40% of its budget (`physics.ragdoll_hold_shape`). Once its pelvis and chest have been slower than 0.3 m/s for ten steps more, it lies (`lying(body)`). A fall caught on the hands and knees, or sitting, leans less or keeps its pelvis up. Its trunk still for a third of a second, it has landed as well, and holds the shape it was caught in at full strength with its balance kept, as a person on all fours does. A caught figure can still go over -- kneeling, it tips onto its face -- and if its trunk moves faster than 0.3 m/s again after it has lain still, it falls again: the shape let go and the arms reaching, to land and lie as any fall does.
@@ -64,11 +65,13 @@ The reach, the tuck and the bend are **aims** (`physics.ragdoll_aim(ragdoll, bon
 
 The reach and the tuck were first chosen by one fall each way while three faults hid in them. The way of the fall was read from the pelvis body's +y, which points down because aephysics's pelvis rests a half turn about x, so the arms reached away from the fall and the head tucked into it. One arm axis served both arms, though the left arm's capsules lie along +x and the right's along −x, so the left arm reached up. And the pelvis's anchor, its assist set to nothing as the figure fell, kept applying its last impulse for as long as it lived (aephysics#58): an assist nobody had asked for, which every setting had been chosen on top of. With the three fixed, `tests/test_falls.ae` holds the protective fall over thirty falls each way, with blows from 376 to 424 N·s, a protected figure beside an unprotected twin each time. The settings were swept on it: a tuck of 0.5 to 1.2, a bend of 0 to 0.5, the assist from none to all of it, the reach 0.4 to 1.0 down, the fall's lean 0.25 to 0.45. Without the assist no setting kept the protected head slower in more than 18 falls backwards and 22 sideways.
 
-| way | protected head slower | head, protected / twin (average) | a second head impact | still within 3 s of landing |
-|---|---|---|---|---|
-| over backwards | 30 of 30 | 0 / 3.63 m/s (the head never touches) | 0 | 30 (the slowest 1.35 s) |
-| forwards | 29 of 30 | 1.44 / 3.20 m/s | 0 | 30 (1.12 s) |
-| sideways | 30 of 30 | 0 / 3.29 m/s (the head never touches) | 0 | 30 (0.97 s) |
+| way | protected head slower | head, protected / twin (average) | a second head impact | still within 3 s of landing | knees going down |
+|---|---|---|---|---|---|
+| over backwards | 30 of 30 | 0.10 / 3.63 m/s | 0 | 30 (the slowest 1.25 s) | 0.45 rad |
+| forwards | 30 of 30 | 0.84 / 3.20 m/s | 0 | 30 (0.88 s) | 0.45 rad |
+| sideways | 30 of 30 | 0.18 / 3.29 m/s | 0 | 30 (1.52 s) | 0.48 rad |
+
+The knees giving took the forward head from 1.44 m/s to 0.84 and the forward count from 29 to 30.
 
 Forwards the blows run from 410 to 460 N·s: from behind, a figure that steps now staggers out of shoves up to 390 (below), and with 376 to 424 four of the thirty were caught and never fell. Every way meets #479: the protected head the slower in at least 29 of 30, no second impact, every figure still within 3 s of landing.
 
