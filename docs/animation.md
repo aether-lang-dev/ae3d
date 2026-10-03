@@ -235,3 +235,37 @@ run, let go, sent to the side.
 
 #509 asks for 2,000 searches in a millisecond: a tree or SIMD over the
 features, and the job system, are its next step.
+
+## Looking
+
+`ae3d.lookat` (#587, part of #509) turns a figure's head to look at a
+point. It runs every frame in the pose phase, after the clips.
+
+```aether
+l = lookat.attach(e, figure_root, neck, head, forward)   // forward: the way the figure faces, in its root's frame
+lookat.set_target(l, point)
+lookat.clear(l)
+```
+
+- **The turn.** It runs from where the clip has the head facing to the
+  point: about the figure's up, then across. Each part is held within a
+  neck's reach: 80 degrees either side, 57 up and down.
+- **Eased.** A critically damped spring with a 0.12 s half-life moves the
+  turn toward what is asked, or back to none when cleared, so a head never
+  snaps round. `set_weight` fades it in and out.
+- **Shared.** The neck takes 40% of the turn and the head the rest. The
+  whole turn is made first and then shared: a yaw-and-pitch turn on the
+  neck and another on the head are not the whole one, and they left the
+  head 3 degrees off.
+- **Put back each frame.** The bones it turns are returned to their own
+  pose before each frame's turn, so a still pose is not turned further
+  frame after frame.
+
+`tests/test_lookat.ae`, on the box man playing its Idle:
+- **Within the limits.** A point 31 degrees aside and a little up is faced
+  to 2.8 degrees. The rest is the eased turn trailing the Idle's sway.
+- **Past the limits.** A point behind holds the turn at 1.4 rad.
+- **No snapping.** The head turns 5.7 degrees a frame at most, the clip
+  included.
+- **Cleared.** It is back on its clip, to 0.0001 rad.
+- **Nothing else moves.** No other bone moves.
