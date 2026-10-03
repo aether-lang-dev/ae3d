@@ -214,7 +214,11 @@ matching.step(m, delta)           // moves the root, searches, plays, advances t
 - **The spring.** Velocity and facing ease toward what is asked,
   critically damped with a 0.27 s half-life (Holden's). The spring is
   also the search's path ahead.
-- **The search.** Brute force. The current pose is the playing frame's own
+- **The search.** Runs of 16 and 64 frames each have a bounding box in
+  feature space; a run whose box is no nearer than the best found is
+  passed over, and a frame's cost stops adding once it passes the best,
+  with the playing frame as the first best (#588). It finds the same frame
+  as brute force. The current pose is the playing frame's own
   features, so it asks what continues best from here. It changes clip only
   when the best is a quarter better than carrying on: a jump to a phase
   that fitted a little better slid the feet. A clip that walks plays at the
@@ -231,10 +235,10 @@ run, let go, sent to the side.
 | The foot on the ground's drift along the way, whole cycles | 0.06% walking, 2.7% running |
 | The most a bone turns in a frame, at its clip's pace | 25 degrees |
 | The facing's turn in a frame | 2.8 degrees |
-| A search over 316 frames | 4 µs; 2,000 of them 8 ms |
+| 2,000 searches over 316 frames | 0.83 ms (brute force 7.8 ms), the same frame as brute force in all 777 searches checked |
 
-#509 asks for 2,000 searches in a millisecond: a tree or SIMD over the
-features, and the job system, are its next step.
+That is #509's 2,000 searches in a millisecond, on one thread, over the
+Fox's database. A larger database, or the job system, is the next step.
 
 ## Looking
 
