@@ -330,3 +330,25 @@ idle.set_speed(d, speed)   // every frame: moving, it fades out
 | Moving at 0.4 m/s | the clip exactly |
 
 No other bone is touched.
+
+### Foot contacts
+
+The database labels each frame's feet as down or up (#593). A foot is down
+when it is in the lowest 35% of its rise and fall, and going over the
+ground slower than 0.5 m/s. Its speed over the ground is its velocity in
+the root's frame plus the clip's own travel. `matching.contact(m, foot)`
+says whether the playing frame has a foot down, which is when foot locking
+may lock it.
+
+On the Fox, `tests/test_matching.ae` measures:
+
+| Measure | Result |
+|---|---|
+| Walking, each foot down | 30 to 42% of the time |
+| Walking, frames with every foot down | none |
+| A foot labelled down, from where it was set | 1.8 cm at most |
+| Standing, every foot down | all the time |
+
+In 24 of 128 walking frames no foot is down by these bounds. Those are the
+landings the Fox's own walk slides through; wider bounds took them in, but
+a foot labelled down then moved 6.8 cm.
