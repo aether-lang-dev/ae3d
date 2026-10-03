@@ -211,6 +211,7 @@ docs/         the documentation, docs/images/ its pictures
 [Pipeline](docs/pipeline.md) ·
 [Agent channel](docs/agent.md) ·
 [Networking](docs/networking.md) ·
+[Animation](docs/animation.md) ·
 [Natural motion](docs/motion.md) ·
 [Audio](docs/audio.md) ·
 [Editor](docs/editor.md) ·
