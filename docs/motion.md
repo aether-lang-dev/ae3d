@@ -140,14 +140,20 @@ for where standing still gives out:
 | 255 N·s from behind | stands | stands, 4 steps |
 | 270 N·s from behind | falls | stands, 4 steps |
 | 315 N·s from behind | falls | stands, 3 steps |
-| 180 N·s from the side | stands | stands, 1 step |
+| 180 N·s from the side | stands | stands, 2 steps |
+| 210 N·s from the side | falls | stands, 2 steps |
 | 150 N·s from in front | stands | stands, no step |
 
 How far each way holds:
 - **Forward:** 255 N·s without stepping, 360 staggering
   (`tests/test_stagger.ae`).
-- **Sideways:** 195 N·s either way; stepping moves the feet rather than
-  holding the pose. Catch steps that cross or close the feet are #481.
+- **Sideways:** 180 N·s standing still, 210 stepping. A step counts as
+  backwards only when the capture point is mostly behind the rear foot. A
+  side shove turns the figure a little and puts the capture point a little
+  behind, and taken for a step back, that had stopped every step after the
+  first. Catch steps that cross or close the feet are #481: tried, quicker
+  steps and a closing step did not catch more, against a hip that turns 30
+  degrees.
 - **Backward:** 150 N·s either way.
 
 ## Staggering
