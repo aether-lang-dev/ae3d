@@ -74,6 +74,29 @@ Forwards the blows run from 410 to 460 N·s: from behind, a figure that steps no
 
 Before, on the same ensemble (the reference's figure, all three faults), the protected head was the slower in 14, 23 and 21 falls, and over backwards it met the ground faster than its twin's on average (2.99 against 2.77 m/s). Forwards, its head met the ground a second time in 16 falls.
 
+## Struck while animated
+
+A figure stays `ANIMATED`, drawn from its clip, until something touches it,
+and goes `POWERED` the moment it is struck (#581). Its bodies trail a rig
+of other proportions by up to 2 cm at rest, so the drawing can't jump
+straight to them. At the change it keeps the offset the rig's pose had
+from the bodies, and that offset fades over 0.25 s. What the blow does to
+the bodies shows on the frame it lands.
+
+Before, the drawing blended from the rig's pose to the bodies' along a
+smoothstep, which starts flat. A blow showed late, and a second blow in
+those 0.25 s landed where the figure wasn't drawn.
+
+`tests/test_impact_shows.ae` strikes a figure 60 N·s at the chest as it
+goes `POWERED` from `ANIMATED`:
+
+| | before | now |
+|---|---|---|
+| the drawn hips' way against the pelvis body's, worst in 0.3 s | 3.4 cm | 0.9 cm |
+| how much of the body's 7.2 cm the drawing has gone, 0.2 s in | 79% | 91% |
+
+A twin `POWERED` all along draws its hips with its body to the millimetre.
+
 ## Stepping to catch itself
 
 Pushed, a `POWERED` figure steps to catch itself (`set_stepping`, on by
