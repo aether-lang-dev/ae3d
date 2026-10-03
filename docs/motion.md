@@ -246,9 +246,12 @@ asks. Done, it holds the shape it ends in.
 
 The hip draws up 0.3 rad on its back and no further: the reference
 ragdoll's hip turns 30 degrees about a cone that is not centred ahead of
-the leg, and the knee 35 degrees about its rest. More of a person's curl
-waits on those limits (#578). Landing on either side, from shoves in eight
-directions, is the rest of #480.
+the leg. More of a person's curl waits on that limit (#578).
+
+The same test shoves sixteen writhers from eight directions, at 450 and
+500 N·s (#480). All of them land, eight face up and eight face down. In
+every one the hip swings at least 0.30 rad, the pelvis drifts no more than
+7 cm, and the writhing stops when its time is up.
 
 ## Body parts
 
