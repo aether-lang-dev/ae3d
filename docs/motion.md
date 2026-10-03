@@ -244,6 +244,51 @@ the leg, and the knee 35 degrees about its rest. More of a person's curl
 waits on those limits (#578). Landing on either side, from shoves in eight
 directions, is the rest of #480.
 
+## Body parts
+
+A part of a figure can have a mode and a strength of its own (#573). The
+parts are the head, the spine, each arm and each leg (`PART_HEAD` to
+`PART_LEG_R`).
+
+```aether
+motion.set_part_mode(body, motion.PART_ARM_L, motion.LIMP)        // a crippled arm
+motion.set_part_strength(body, motion.PART_LEG_R, 0.3)            // a leg that will not hold
+motion.set_part_mode(body, motion.PART_ARM_L, motion.ANIMATED)    // taken back
+```
+
+- **A limp part** hangs and swings from its parent and collides, as the
+  ragdoll's arm does. On an `ANIMATED` figure the rest walks its clip on,
+  and the limp part is drawn as its bodies hang, after the clip in the pose
+  phase. On a `POWERED` one it has no muscle.
+  - A limp bone's anchor joint is destroyed, not set to nothing: at nothing,
+    its last spring impulse was still applied every sub-step, and it held an
+    arm out on its shoulder's limit (aephysics#76).
+  - It keeps a tenth of its joint's friction. At all of it (6.4 N·m at a
+    shoulder) an arm let go of stayed held out where it was.
+- **Taken back**, the part is drawn from where it hung to its clip over
+  0.3 s, under an offset that fades, as the drawing does when a figure is
+  struck (#581). Its anchors are made again where its bodies are.
+- **A part's strength** is a lasting share of its muscle. Every drive the
+  module sets goes through it, so a blow, a recovery or writhing never
+  restores an injury. A game that clamped its crippled arm after every
+  step no longer has to.
+
+`tests/test_motion_parts.ae` holds a rig's arms 0.6 rad ahead as a clip
+would:
+
+| | Measured |
+|---|---|
+| `ANIMATED`, the left arm let go | it comes down 0.39 rad from its clip, the right stays within 0.02 of its; drawn within 0.014 rad of its body; the figure still on its clip |
+| struck at the forearm, 8 N·s | the drawn arm swings 0.39 rad |
+| taken back | drawn to its clip with no more than 0.065 rad a frame, on it a second later; its body within 0.25 rad |
+| `POWERED`, the right arm at 3% | 3% of the left's muscle before a blow and after it and its recovery |
+| `POWERED`, the left arm limp | no muscle; it comes down 0.69 rad while the right holds |
+
+A following figure's joints' springs pull toward the reference pose
+against the anchors. A healthy arm held up ahead trails its clip by about
+0.14 rad, and an arm taken back by 0.25: #584. A `POWERED` part on an
+`ANIMATED` figure, and a limp part drawn during a get-up, are not there yet.
+
 ## On a figure
 
 `motion.on_figure(e, object)` gives an animated figure (`ae3d.figure`,
