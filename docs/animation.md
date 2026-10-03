@@ -273,3 +273,99 @@ lookat.clear(l)
   included.
 - **Cleared.** It is back on its clip, to 0.0001 rad.
 - **Nothing else moves.** No other bone moves.
+
+## A player's figure posed by matching
+
+`locomotion.use_matching(l, db)` (#591) poses a figure on a character
+controller by motion matching over a database of its clips, instead of
+idle, walk or run chosen by speed. The controller still moves the body,
+with its momentum, steps and capped turn.
+
+`matching.follow(m, position, velocity, wanted, heading, delta)` is told
+where the body is, how it moves and what is asked of it. It searches and
+plays and paces the clip, but moves nothing and leaves the figure for the
+engine to advance.
+
+`tests/test_locomotion.ae` runs its whole script both ways, to the same
+checks:
+
+| The foot on the ground's drift along the way | by speed | by matching |
+|---|---|---|
+| walking | 0.19% | 0.29% |
+| at half the stick | 1.7% | 0.17% |
+| running | 0.14% | 2.3% |
+
+No bone turns more than 25 degrees a frame either way.
+
+When the search stays with the playing clip, the playing frame is still
+the one on screen. Before, it was taken for the best frame, and the next
+query's pose was a frame not being shown.
+
+## Standing still
+
+`ae3d.idle` (#592, part of #509) adds a standing figure's breath and its
+shifting weight over whatever its clip poses, in the pose phase.
+
+```aether
+d = idle.attach(e, figure_root, hips, chest, forward)
+idle.set_speed(d, speed)   // every frame: moving, it fades out
+```
+
+- **The breath.** The chest pitches back 2 degrees at the top of each
+  breath, about every 4.2 s. The pace drifts 15% either way over a 23 s
+  cycle, so no two breaths are alike.
+- **The weight.** The hips sway 2.5 cm across, from one foot to the other,
+  over 7.3 s. That period never falls in step with the breath's.
+- **Moving.** Both fade with speed, and are gone at 0.4 m/s.
+
+`tests/test_idle.ae`, 30 s of the box man playing its Idle:
+
+| Measure | Result |
+|---|---|
+| The chest's pitch | 0 to 0.035 rad |
+| Breaths | 7, from 3.7 to 4.9 s long |
+| The hips' sway | ±0.025 m |
+| How in step the breath and the sway are | correlation 0.009 |
+| The bones' own turn and shift against what the layer drew | under 1e-8 |
+| Moving at 0.4 m/s | the clip exactly |
+
+No other bone is touched.
+
+### Foot contacts
+
+The database labels each frame's feet as down or up (#593). A foot is down
+when it is in the lowest 35% of its rise and fall, and going over the
+ground slower than 0.5 m/s. Its speed over the ground is its velocity in
+the root's frame plus the clip's own travel. `matching.contact(m, foot)`
+says whether the playing frame has a foot down, which is when foot locking
+may lock it.
+
+On the Fox, `tests/test_matching.ae` measures:
+
+| Measure | Result |
+|---|---|
+| Walking, each foot down | 30 to 42% of the time |
+| Walking, frames with every foot down | none |
+| A foot labelled down, from where it was set | 1.8 cm at most |
+| Standing, every foot down | all the time |
+
+In 24 of 128 walking frames no foot is down by these bounds. Those are the
+landings the Fox's own walk slides through; wider bounds took them in, but
+a foot labelled down then moved 6.8 cm.
+
+### Over the network
+
+What a host sends for a matched figure is the matcher's state, not the
+pose (#594). `matching.state_write(m, out)` writes the playing frame and
+its clock, the body's place, velocity, acceleration, heading and its
+rate, the input, and the time since the last search: 18 floats, 144
+bytes.
+
+`state_read` sets a client's matcher, over its own database of the same
+clips, to that state, and cuts its figure to the playing clip at that
+time. The state is written when the figure is between changes
+(`figure.blending` false), so there is no fading offset to carry over.
+
+`tests/test_matching.ae` reads a second Fox's matcher from the first's
+state and drives both alike through a walk, a run and a stop. All 24
+bones of the two match to the bit in every one of 240 frames.
