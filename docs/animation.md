@@ -273,3 +273,30 @@ lookat.clear(l)
   included.
 - **Cleared.** It is back on its clip, to 0.0001 rad.
 - **Nothing else moves.** No other bone moves.
+
+## A player's figure posed by matching
+
+`locomotion.use_matching(l, db)` (#591) poses a figure on a character
+controller by motion matching over a database of its clips, instead of
+idle, walk or run chosen by speed. The controller still moves the body,
+with its momentum, steps and capped turn.
+
+`matching.follow(m, position, velocity, wanted, heading, delta)` is told
+where the body is, how it moves and what is asked of it. It searches and
+plays and paces the clip, but moves nothing and leaves the figure for the
+engine to advance.
+
+`tests/test_locomotion.ae` runs its whole script both ways, to the same
+checks:
+
+| The foot on the ground's drift along the way | by speed | by matching |
+|---|---|---|
+| walking | 0.19% | 0.29% |
+| at half the stick | 1.7% | 0.17% |
+| running | 0.14% | 2.3% |
+
+No bone turns more than 25 degrees a frame either way.
+
+When the search stays with the playing clip, the playing frame is still
+the one on screen. Before, it was taken for the best frame, and the next
+query's pose was a frame not being shown.
