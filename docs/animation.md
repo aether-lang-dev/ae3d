@@ -352,3 +352,20 @@ On the Fox, `tests/test_matching.ae` measures:
 In 24 of 128 walking frames no foot is down by these bounds. Those are the
 landings the Fox's own walk slides through; wider bounds took them in, but
 a foot labelled down then moved 6.8 cm.
+
+### Over the network
+
+What a host sends for a matched figure is the matcher's state, not the
+pose (#594). `matching.state_write(m, out)` writes the playing frame and
+its clock, the body's place, velocity, acceleration, heading and its
+rate, the input, and the time since the last search: 18 floats, 144
+bytes.
+
+`state_read` sets a client's matcher, over its own database of the same
+clips, to that state, and cuts its figure to the playing clip at that
+time. The state is written when the figure is between changes
+(`figure.blending` false), so there is no fading offset to carry over.
+
+`tests/test_matching.ae` reads a second Fox's matcher from the first's
+state and drives both alike through a walk, a run and a stop. All 24
+bones of the two match to the bit in every one of 240 frames.
