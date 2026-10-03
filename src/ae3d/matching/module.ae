@@ -1,0 +1,807 @@
+// ae3d.matching -- motion matching (#586, part of #509): a figure moved by
+// a trajectory spring, and posed by whichever moment of its clips best
+// fits its pose now and the way it is asked to go.
+//
+//   db = matching.database_new(fig, root)
+//   matching.add_clip(db, "Idle")
+//   matching.add_clip(db, "Walk")
+//   matching.add_clip(db, "Run")
+//   matching.build(db)
+//   m = matching.matcher_new(db)
+//   matching.set_input(m, velocity)            // every frame: the way to go, metres a second
+//   matching.step(m, delta)                    // moves the root, searches, plays, advances the figure
+//
+// The database is the clips sampled SAMPLE_HZ times a second. Each frame
+// is known by its features, in the root's frame, with the way the clips
+// walk as +z:
+//   - each foot's place and velocity (the bones that rise and fall over the
+//     clips, the lowest of them first, up to FEET);
+//   - the hips' velocity;
+//   - the way ahead: where the root will be, and the way it will face,
+//     0.33, 0.66 and 1 s on. A clip made in place has no root that goes
+//     anywhere; its way ahead is its feet's travel along the way they go
+//     back, as the crowd's banks read it (#575).
+// Each feature is scaled by its spread over the database, and each group
+// by a weight, so a foot's centimetre and a second's metre count alike.
+//
+// The figure is moved by a spring, not by its clips (Holden's simulation
+// bone): its velocity eases toward the one asked for, critically damped
+// with a half-life of HALF_LIFE, and its facing toward the way it goes,
+// with FACING_HALF_LIFE. The spring is also the query: its own prediction
+// of the way ahead, against each frame's. The pose half of the query is
+// the playing frame's own features, so the search asks what continues
+// best from here. It runs every SEARCH_SECONDS and whenever the input
+// changes; the best frame is played, through an inertialized change, unless
+// it is where the playing clip already is. A clip that walks is played at
+// the body's speed over its own, so its feet stay where they were set.
+import std.heap
+import std.list
+import ae3d.core
+import ae3d.skin
+import ae3d.figure
+
+exports (
+    Database, Matcher, SAMPLE_HZ, FEET, FEATURES, HALF_LIFE, FACING_HALF_LIFE, SEARCH_SECONDS, BLEND_SECONDS,
+    database_new, add_clip, build, database_free, frames, feet_found, clip_speed, feature,
+    matcher_new, matcher_free, set_input, step, search, position, velocity, heading, playing_clip,
+    playing_time, searches, switches, last_cost
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern exp(x: float) -> float
+
+const SAMPLE_HZ = 60.0
+const FEET = 4
+const AHEAD = 3                      // 0.33, 0.66, 1 s
+// Features: FEET * (place 3 + velocity 3), the hips' velocity 3, the way
+// ahead's places (x, z) and facings (x, z).
+const FEATURES = 39
+const FOOT_WEIGHT = 0.75
+const HIPS_WEIGHT = 1.0
+const PLACE_WEIGHT = 3.0
+const FACING_WEIGHT = 1.5
+const HALF_LIFE = 0.27
+const FACING_HALF_LIFE = 0.27
+const SEARCH_SECONDS = 0.1
+const BLEND_SECONDS = 0.3
+// The best frame is not a change when it is the playing clip's, this near
+// the playing time; nor when it is better than the playing frame by less
+// than STAY_MARGIN of the playing frame's cost. A jump within a clip to a
+// phase that fits a little better slid the feet: running, the foot on the
+// ground drifted 6.6% of the body's way.
+const SAME_SECONDS = 0.2
+const STAY_MARGIN = 0.25
+const MAX_CLIPS = 16
+
+struct Database {
+    figure: ptr                      // *Figure
+    root: ptr                        // *Model: the figure's root, the frame the features are in
+    clips: ptr                       // int[MAX_CLIPS]: the file's animation indices
+    clip_count: int
+    speeds: ptr                      // float[MAX_CLIPS]: each clip's own speed, world units a second
+    frames: int
+    frame_clip: ptr                  // int[frames]: the clip slot a frame is of
+    frame_time: ptr                  // float[frames]
+    features: ptr                    // float[frames * FEATURES], normalized
+    mean: ptr                        // float[FEATURES]
+    spread: ptr                      // float[FEATURES]
+    weight: ptr                      // float[FEATURES]
+    feet: ptr                        // int[FEET]: skeleton indices, -1 for none
+    feet_found: int
+    hips: int                        // skeleton index
+    forward: Vec3                    // the way the clips walk, in the root's frame
+}
+
+struct Matcher {
+    db: ptr                          // *Database
+    position: Vec3                   // the root, level
+    velocity: Vec3
+    acceleration: Vec3
+    heading: float                   // radians about up, 0 facing the clips' way
+    turn_speed: float
+    input: Vec3                      // the velocity asked for
+    input_changed: bool
+    since_search: float
+    frame: int                       // the database frame playing, or -1
+    clock: float                     // seconds into the playing clip, as the database counts
+    searches: int
+    switches: int
+    last_cost: float
+    query: ptr                       // float[FEATURES]
+}
+
+// --- the database --------------------------------------------------------------------------------------
+
+database_new(fig: *Figure, root: *Model) -> *Database {
+    db = heap.new(Database)
+    db.figure = fig as ptr
+    db.root = root as ptr
+    db.clips = calloc(MAX_CLIPS, 4)
+    db.speeds = calloc(MAX_CLIPS, 8)
+    db.feet = calloc(FEET, 4)
+    db.mean = calloc(FEATURES, 8)
+    db.spread = calloc(FEATURES, 8)
+    db.weight = calloc(FEATURES, 8)
+    db.hips = 0 - 1
+    db.forward = core.vec3(0.0, 0.0, 1.0)
+    return db
+}
+
+// A clip of the figure's, by name, into the database: false when the file
+// has none of that name or the database is full.
+add_clip(db: *Database, name: string) -> bool {
+    if db.clip_count >= MAX_CLIPS { return false }
+    fig = db.figure as *Figure
+    i = 0
+    while i < figure.clip_count(fig) {
+        if figure.clip_name(fig, i) == name {
+            (db.clips as int[])[db.clip_count] = i
+            db.clip_count = db.clip_count + 1
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+database_free(db: *Database) {
+    if db == null { return }
+    free(db.clips)
+    free(db.speeds)
+    free(db.feet)
+    free(db.mean)
+    free(db.spread)
+    free(db.weight)
+    if db.frame_clip != null { free(db.frame_clip) }
+    if db.frame_time != null { free(db.frame_time) }
+    if db.features != null { free(db.features) }
+    heap.free(db)
+}
+
+frames(db: *Database) -> int { return db.frames }
+feet_found(db: *Database) -> int { return db.feet_found }
+clip_speed(db: *Database, slot: int) -> float { return (db.speeds as float[])[slot] }
+feature(db: *Database, frame: int, k: int) -> float { return (db.features as float[])[frame * FEATURES + k] }
+
+clip_name_of(db: *Database, slot: int) -> string {
+    return figure.clip_name(db.figure as *Figure, (db.clips as int[])[slot])
+}
+
+clip_frames(db: *Database, slot: int) -> int {
+    d = gltf_duration(db, slot)
+    n = (d * SAMPLE_HZ) as int
+    if n < 2 { n = 2 }
+    return n
+}
+
+gltf_duration(db: *Database, slot: int) -> float {
+    fig = db.figure as *Figure
+    figure.play(fig, clip_name_of(db, slot), 1.0, true)
+    return figure.duration(fig)
+}
+
+// Every bone's place in the root's frame, the figure posed at `t` of the
+// playing clip, into `out` from `base` (bones * 3 floats).
+read_bones(db: *Database, t: float, out: float[], base: int) {
+    fig = db.figure as *Figure
+    figure.set_time(fig, t)
+    root = db.root as *Model
+    core.model_sync_transform(root)
+    back = core.quat_conjugate(root.world_rotation)
+    sk = figure.skeleton(fig)
+    i = 0
+    while i < skin.skeleton_count(sk) {
+        b = skin.skeleton_bone(sk, i)
+        core.model_sync_transform(b)
+        p = core.quat_apply(back, core.v3_sub(b.world_position, root.world_position))
+        out[base + i * 3] = p.x
+        out[base + i * 3 + 1] = p.y
+        out[base + i * 3 + 2] = p.z
+        i = i + 1
+    }
+}
+
+// The database made: every clip sampled, its feet and hips found, its
+// travel read, every frame's features, then their scales.
+build(db: *Database) -> bool {
+    fig = db.figure as *Figure
+    sk = figure.skeleton(fig)
+    if sk == null || db.clip_count == 0 { return false }
+    bones = skin.skeleton_count(sk)
+    // Each clip's frames, one past the last for the loop back.
+    total = 0
+    c = 0
+    while c < db.clip_count {
+        total = total + clip_frames(db, c)
+        c = c + 1
+    }
+    db.frames = total
+    db.frame_clip = calloc(total, 4)
+    db.frame_time = calloc(total, 8)
+    places_block = calloc((total + db.clip_count) * bones * 3, 8)
+    places = places_block as float[]
+    // The places, clip by clip, and where each clip's run starts.
+    starts_block = calloc(db.clip_count + 1, 4)
+    starts = starts_block as int[]
+    slot_block = calloc(db.clip_count + 1, 4)
+    slots = slot_block as int[]
+    row = 0
+    frame = 0
+    c = 0
+    while c < db.clip_count {
+        n = clip_frames(db, c)
+        duration = gltf_duration(db, c)
+        starts[c] = frame
+        slots[c] = row
+        k = 0
+        while k <= n {
+            t = duration * (k as float) / (n as float)
+            read_bones(db, t, places, (row + k) * bones * 3)
+            if k < n {
+                (db.frame_clip as int[])[frame + k] = c
+                (db.frame_time as float[])[frame + k] = t
+            }
+            k = k + 1
+        }
+        row = row + n + 1
+        frame = frame + n
+        c = c + 1
+    }
+    starts[db.clip_count] = frame
+    slots[db.clip_count] = row
+    find_feet(db, places, row, bones)
+    find_hips(db, places, row, bones)
+    // Each clip's travel: the foot on the ground's step along the way the
+    // feet go back, summed, per sample; and the way they go back.
+    travel_block = calloc(row, 8)
+    travel = travel_block as float[]
+    back = core.vec3(0.0, 0.0, 0.0)
+    c = 0
+    while c < db.clip_count {
+        n = clip_frames(db, c)
+        at = slots[c]
+        k = 0
+        while k < n {
+            low = lowest_foot(db, places, at + k, bones)
+            if low >= 0 {
+                a = ((at + k) * bones + low) * 3
+                b = ((at + k + 1) * bones + low) * 3
+                back = core.v3_add(back, core.vec3(places[b] - places[a], 0.0, places[b + 2] - places[a + 2]))
+            }
+            k = k + 1
+        }
+        c = c + 1
+    }
+    if core.v3_len(back) > 0.000001 { db.forward = core.v3_normalize(core.v3_mul(back, 0.0 - 1.0)) }
+    speeds = db.speeds as float[]
+    c = 0
+    while c < db.clip_count {
+        n = clip_frames(db, c)
+        at = slots[c]
+        duration = gltf_duration(db, c)
+        walked = 0.0
+        travel[at] = 0.0
+        k = 0
+        while k < n {
+            low = lowest_foot(db, places, at + k, bones)
+            step = 0.0
+            if low >= 0 {
+                a = ((at + k) * bones + low) * 3
+                b = ((at + k + 1) * bones + low) * 3
+                // Along the way the clips walk, a foot going back is travel.
+                step = 0.0 - ((places[b] - places[a]) * db.forward.x + (places[b + 2] - places[a + 2]) * db.forward.z)
+            }
+            walked = walked + step
+            travel[at + k + 1] = walked
+            k = k + 1
+        }
+        speeds[c] = 0.0
+        if duration > 0.0 { speeds[c] = walked / duration }
+        if speeds[c] < 0.0 { speeds[c] = 0.0 }
+        c = c + 1
+    }
+    // The features.
+    db.features = calloc(total * FEATURES, 8)
+    f = db.features as float[]
+    c = 0
+    while c < db.clip_count {
+        n = clip_frames(db, c)
+        at = slots[c]
+        duration = gltf_duration(db, c)
+        dt = duration / (n as float)
+        k = 0
+        while k < n {
+            frame_features(db, places, travel, at, n, k, dt, bones, f, (starts[c] + k) * FEATURES)
+            k = k + 1
+        }
+        c = c + 1
+    }
+    normalize(db)
+    figure.stop(fig)
+    free(places_block)
+    free(starts_block)
+    free(slot_block)
+    free(travel_block)
+    return true
+}
+
+// The bones that rise and fall over the clips by more than a twentieth of
+// the figure's height, the lowest of them first, up to FEET.
+find_feet(db: *Database, places: float[], rows: int, bones: int) {
+    top = 0.0 - 1000000000.0
+    bottom = 1000000000.0
+    j = 0
+    while j < bones {
+        y = places[j * 3 + 1]
+        if y > top { top = y }
+        if y < bottom { bottom = y }
+        j = j + 1
+    }
+    lift = (top - bottom) * 0.05
+    lows_block = calloc(bones, 8)
+    lows = lows_block as float[]
+    rising_block = calloc(bones, 4)
+    rising = rising_block as int[]
+    j = 0
+    while j < bones {
+        low = 1000000000.0
+        high = 0.0 - 1000000000.0
+        k = 0
+        while k < rows {
+            y = places[(k * bones + j) * 3 + 1]
+            if y < low { low = y }
+            if y > high { high = y }
+            k = k + 1
+        }
+        lows[j] = low
+        if high - low > lift { rising[j] = 1 }
+        j = j + 1
+    }
+    feet = db.feet as int[]
+    found = 0
+    while found < FEET {
+        best = 0 - 1
+        j = 0
+        while j < bones {
+            if rising[j] == 1 && (best < 0 || lows[j] < lows[best]) { best = j }
+            j = j + 1
+        }
+        if best < 0 { break }
+        feet[found] = best
+        rising[best] = 0
+        found = found + 1
+    }
+    db.feet_found = found
+    while found < FEET {
+        feet[found] = 0 - 1
+        found = found + 1
+    }
+    free(lows_block)
+    free(rising_block)
+}
+
+// The hips: the bone that moves least up and down over the clips among
+// the upper half of the figure -- a body's middle, not a limb.
+find_hips(db: *Database, places: float[], rows: int, bones: int) {
+    top = 0.0 - 1000000000.0
+    bottom = 1000000000.0
+    j = 0
+    while j < bones {
+        y = places[j * 3 + 1]
+        if y > top { top = y }
+        if y < bottom { bottom = y }
+        j = j + 1
+    }
+    middle = (top + bottom) * 0.5
+    best = 0
+    best_range = 1000000000.0
+    j = 0
+    while j < bones {
+        if places[j * 3 + 1] > middle {
+            low = 1000000000.0
+            high = 0.0 - 1000000000.0
+            k = 0
+            while k < rows {
+                y = places[(k * bones + j) * 3 + 1]
+                if y < low { low = y }
+                if y > high { high = y }
+                k = k + 1
+            }
+            if high - low < best_range && high - low > 0.0 {
+                best_range = high - low
+                best = j
+            }
+        }
+        j = j + 1
+    }
+    db.hips = best
+}
+
+lowest_foot(db: *Database, places: float[], row: int, bones: int) -> int {
+    feet = db.feet as int[]
+    low = 0 - 1
+    i = 0
+    while i < db.feet_found {
+        j = feet[i]
+        if low < 0 || places[(row * bones + j) * 3 + 1] < places[(row * bones + low) * 3 + 1] { low = j }
+        i = i + 1
+    }
+    return low
+}
+
+// A frame's features: `k` of the clip whose samples start at row `at`, `n`
+// of them before the loop back, `dt` apart.
+frame_features(db: *Database, places: float[], travel: float[], at: int, n: int, k: int, dt: float, bones: int, out: float[], base: int) {
+    feet = db.feet as int[]
+    fwd = db.forward
+    side = core.vec3(fwd.z, 0.0, 0.0 - fwd.x)
+    o = base
+    i = 0
+    while i < FEET {
+        j = feet[i]
+        if j >= 0 {
+            a = ((at + k) * bones + j) * 3
+            b = ((at + k + 1) * bones + j) * 3
+            p = core.vec3(places[a], places[a + 1], places[a + 2])
+            v = core.v3_mul(core.vec3(places[b] - places[a], places[b + 1] - places[a + 1], places[b + 2] - places[a + 2]), 1.0 / dt)
+            out[o] = core.v3_dot(p, side)
+            out[o + 1] = p.y
+            out[o + 2] = core.v3_dot(p, fwd)
+            out[o + 3] = core.v3_dot(v, side)
+            out[o + 4] = v.y
+            out[o + 5] = core.v3_dot(v, fwd)
+        }
+        o = o + 6
+        i = i + 1
+    }
+    a = ((at + k) * bones + db.hips) * 3
+    b = ((at + k + 1) * bones + db.hips) * 3
+    hv = core.v3_mul(core.vec3(places[b] - places[a], places[b + 1] - places[a + 1], places[b + 2] - places[a + 2]), 1.0 / dt)
+    out[o] = core.v3_dot(hv, side)
+    out[o + 1] = hv.y
+    out[o + 2] = core.v3_dot(hv, fwd)
+    o = o + 3
+    // The way ahead: the clip walks along +z as far as it travels, and
+    // faces +z (no clip here turns).
+    q = 0
+    while q < AHEAD {
+        ahead = ((q + 1) as float) / (AHEAD as float)
+        out[o + q * 2] = 0.0
+        out[o + q * 2 + 1] = travel_over(travel, at, n, k, ahead / dt)
+        out[o + AHEAD * 2 + q * 2] = 0.0
+        out[o + AHEAD * 2 + q * 2 + 1] = 1.0
+        q = q + 1
+    }
+}
+
+// How far a clip travels from sample `k` over `samples` more, looping.
+travel_over(travel: float[], at: int, n: int, k: int, samples: float) -> float {
+    whole = travel[at + n]
+    end = (k as float) + samples
+    laps = 0.0
+    while end >= (n as float) {
+        end = end - (n as float)
+        laps = laps + 1.0
+    }
+    e = end as int
+    u = end - (e as float)
+    there = travel[at + e] + (travel[at + e + 1] - travel[at + e]) * u
+    return laps * whole + there - travel[at + k]
+}
+
+// Every feature scaled by its spread over the database, and weighted by
+// its group, the group's weight shared among its features.
+normalize(db: *Database) {
+    f = db.features as float[]
+    mean = db.mean as float[]
+    spread = db.spread as float[]
+    weight = db.weight as float[]
+    d = 0
+    while d < FEATURES {
+        sum = 0.0
+        i = 0
+        while i < db.frames {
+            sum = sum + f[i * FEATURES + d]
+            i = i + 1
+        }
+        mean[d] = sum / (db.frames as float)
+        d = d + 1
+    }
+    // A group's spread: the mean of its features' (so a foot's height and
+    // its reach are scaled alike).
+    d = 0
+    while d < FEATURES {
+        sum = 0.0
+        i = 0
+        while i < db.frames {
+            x = f[i * FEATURES + d] - mean[d]
+            sum = sum + x * x
+            i = i + 1
+        }
+        spread[d] = core.sqrt_of(sum / (db.frames as float))
+        d = d + 1
+    }
+    group_scale(db, 0, FEET * 6, FOOT_WEIGHT)
+    group_scale(db, FEET * 6, 3, HIPS_WEIGHT)
+    group_scale(db, FEET * 6 + 3, AHEAD * 2, PLACE_WEIGHT)
+    group_scale(db, FEET * 6 + 3 + AHEAD * 2, AHEAD * 2, FACING_WEIGHT)
+    i = 0
+    while i < db.frames {
+        d = 0
+        while d < FEATURES {
+            f[i * FEATURES + d] = (f[i * FEATURES + d] - mean[d]) / spread[d] * weight[d]
+            d = d + 1
+        }
+        i = i + 1
+    }
+}
+
+group_scale(db: *Database, first: int, count: int, w: float) {
+    spread = db.spread as float[]
+    weight = db.weight as float[]
+    sum = 0.0
+    d = first
+    while d < first + count {
+        sum = sum + spread[d]
+        d = d + 1
+    }
+    s = sum / (count as float)
+    if s < 0.000001 { s = 1.0 }
+    d = first
+    while d < first + count {
+        spread[d] = s
+        weight[d] = w
+        d = d + 1
+    }
+}
+
+// --- the matcher -----------------------------------------------------------------------------------------
+
+matcher_new(db: *Database) -> *Matcher {
+    m = heap.new(Matcher)
+    m.db = db as ptr
+    m.frame = 0 - 1
+    m.query = calloc(FEATURES, 8)
+    m.input_changed = true
+    return m
+}
+
+matcher_free(m: *Matcher) {
+    if m == null { return }
+    free(m.query)
+    heap.free(m)
+}
+
+// The velocity asked for, in the world, level: a stick's way and how far
+// it is pushed, times the speed wanted.
+set_input(m: *Matcher, velocity: Vec3) {
+    v = core.vec3(velocity.x, 0.0, velocity.z)
+    if core.v3_len(core.v3_sub(v, m.input)) > 0.05 { m.input_changed = true }
+    m.input = v
+}
+
+position(m: *Matcher) -> Vec3 { return m.position }
+velocity(m: *Matcher) -> Vec3 { return m.velocity }
+heading(m: *Matcher) -> float { return m.heading }
+searches(m: *Matcher) -> int { return m.searches }
+switches(m: *Matcher) -> int { return m.switches }
+last_cost(m: *Matcher) -> float { return m.last_cost }
+
+playing_clip(m: *Matcher) -> string {
+    db = m.db as *Database
+    if m.frame < 0 { return "" }
+    return clip_name_of(db, (db.frame_clip as int[])[m.frame])
+}
+
+playing_time(m: *Matcher) -> float { return m.clock }
+
+// The damping of a critically damped spring with this half-life.
+damping(half_life: float) -> float { return (4.0 * 0.69314718) / (half_life + 0.00001) }
+
+// Where the spring takes a velocity `v` with acceleration `a` toward
+// `goal` after `t`: its velocity, acceleration, and how far it moved.
+spring_velocity(v: float, a: float, goal: float, half_life: float, t: float) -> float {
+    y = damping(half_life) * 0.5
+    j0 = v - goal
+    j1 = a + j0 * y
+    return exp(0.0 - y * t) * (j0 + j1 * t) + goal
+}
+
+spring_acceleration(v: float, a: float, goal: float, half_life: float, t: float) -> float {
+    y = damping(half_life) * 0.5
+    j0 = v - goal
+    j1 = a + j0 * y
+    return exp(0.0 - y * t) * (a - j1 * y * t)
+}
+
+spring_moved(v: float, a: float, goal: float, half_life: float, t: float) -> float {
+    y = damping(half_life) * 0.5
+    j0 = v - goal
+    j1 = a + j0 * y
+    e = exp(0.0 - y * t)
+    return e * (((0.0 - j1) / (y * y)) + ((0.0 - j0 - j1 * t) / y)) + (j1 / (y * y)) + j0 / y + goal * t
+}
+
+// The heading the input asks for: the way it goes, or, standing, where it
+// faces now.
+wanted_heading(m: *Matcher) -> float {
+    if core.v3_len(m.input) < 0.05 { return m.heading }
+    return core.atan2_of(m.input.x, m.input.z)
+}
+
+wrap_angle(a: float) -> float {
+    x = a
+    while x > 3.14159265 { x = x - 6.2831853 }
+    while x < 0.0 - 3.14159265 { x = x + 6.2831853 }
+    return x
+}
+
+// The query: the playing frame's own pose features, and the spring's way
+// ahead in the figure's frame.
+make_query(m: *Matcher) {
+    db = m.db as *Database
+    q = m.query as float[]
+    f = db.features as float[]
+    mean = db.mean as float[]
+    spread = db.spread as float[]
+    weight = db.weight as float[]
+    d = 0
+    while d < FEET * 6 + 3 {
+        if m.frame >= 0 { q[d] = f[m.frame * FEATURES + d] } else { q[d] = 0.0 }
+        d = d + 1
+    }
+    goal_h = wanted_heading(m)
+    turn = wrap_angle(goal_h - m.heading)
+    c = core.cos_of(m.heading)
+    s = core.sin_of(m.heading)
+    k = 0
+    while k < AHEAD {
+        t = ((k + 1) as float) / (AHEAD as float)
+        dx = spring_moved(m.velocity.x, m.acceleration.x, m.input.x, HALF_LIFE, t)
+        dz = spring_moved(m.velocity.z, m.acceleration.z, m.input.z, HALF_LIFE, t)
+        // Into the figure's frame: +z the way it faces.
+        lx = dx * c - dz * s
+        lz = dx * s + dz * c
+        at = FEET * 6 + 3 + k * 2
+        q[at] = (lx - mean[at]) / spread[at] * weight[at]
+        q[at + 1] = (lz - mean[at + 1]) / spread[at + 1] * weight[at + 1]
+        // The facing then, against now.
+        ft = turn * (1.0 - exp(0.0 - damping(FACING_HALF_LIFE) * 0.5 * t) * (1.0 + damping(FACING_HALF_LIFE) * 0.5 * t))
+        fa = FEET * 6 + 3 + AHEAD * 2 + k * 2
+        q[fa] = (core.sin_of(ft) - mean[fa]) / spread[fa] * weight[fa]
+        q[fa + 1] = (core.cos_of(ft) - mean[fa + 1]) / spread[fa + 1] * weight[fa + 1]
+        k = k + 1
+    }
+}
+
+// A frame's cost against the query made last.
+cost_of(m: *Matcher, frame: int) -> float {
+    db = m.db as *Database
+    q = m.query as float[]
+    f = db.features as float[]
+    cost = 0.0
+    d = 0
+    while d < FEATURES {
+        x = f[frame * FEATURES + d] - q[d]
+        cost = cost + x * x
+        d = d + 1
+    }
+    return cost
+}
+
+// The best frame for the query, by brute force; its cost into last_cost.
+search(m: *Matcher) -> int {
+    db = m.db as *Database
+    make_query(m)
+    q = m.query as float[]
+    f = db.features as float[]
+    best = 0
+    best_cost = 1000000000.0
+    i = 0
+    while i < db.frames {
+        cost = 0.0
+        row = i * FEATURES
+        d = 0
+        while d < FEATURES {
+            x = f[row + d] - q[d]
+            cost = cost + x * x
+            d = d + 1
+        }
+        if cost < best_cost {
+            best_cost = cost
+            best = i
+        }
+        i = i + 1
+    }
+    m.last_cost = best_cost
+    m.searches = m.searches + 1
+    return best
+}
+
+// A frame: the spring moves the root, the search chooses, the clip plays
+// at the body's pace, the figure advances.
+step(m: *Matcher, delta: float) {
+    db = m.db as *Database
+    fig = db.figure as *Figure
+    // The spring.
+    nx = spring_velocity(m.velocity.x, m.acceleration.x, m.input.x, HALF_LIFE, delta)
+    nz = spring_velocity(m.velocity.z, m.acceleration.z, m.input.z, HALF_LIFE, delta)
+    mx = spring_moved(m.velocity.x, m.acceleration.x, m.input.x, HALF_LIFE, delta)
+    mz = spring_moved(m.velocity.z, m.acceleration.z, m.input.z, HALF_LIFE, delta)
+    ax = spring_acceleration(m.velocity.x, m.acceleration.x, m.input.x, HALF_LIFE, delta)
+    az = spring_acceleration(m.velocity.z, m.acceleration.z, m.input.z, HALF_LIFE, delta)
+    m.position = core.vec3(m.position.x + mx, 0.0, m.position.z + mz)
+    m.velocity = core.vec3(nx, 0.0, nz)
+    m.acceleration = core.vec3(ax, 0.0, az)
+    goal_h = m.heading + wrap_angle(wanted_heading(m) - m.heading)
+    h = spring_velocity(m.heading, m.turn_speed, goal_h, FACING_HALF_LIFE, delta)
+    w = spring_acceleration(m.heading, m.turn_speed, goal_h, FACING_HALF_LIFE, delta)
+    // (The heading spring is the same spring on an angle: "velocity" is the
+    // angle, "acceleration" its rate.)
+    m.heading = wrap_angle(h)
+    m.turn_speed = w
+    // The search.
+    m.since_search = m.since_search + delta
+    if m.frame < 0 || m.input_changed || m.since_search >= SEARCH_SECONDS {
+        m.since_search = 0.0
+        m.input_changed = false
+        best = search(m)
+        best_clip = (db.frame_clip as int[])[best]
+        best_time = (db.frame_time as float[])[best]
+        playing = 0 - 1
+        if m.frame >= 0 { playing = (db.frame_clip as int[])[m.frame] }
+        stay = m.frame >= 0 && m.last_cost >= cost_of(m, m.frame) * (1.0 - STAY_MARGIN)
+        if !stay && !(best_clip == playing && core.abs_of(best_time - m.clock) < SAME_SECONDS) {
+            figure.play_blended_at(fig, clip_name_of(db, best_clip), best_time, 1.0, true, BLEND_SECONDS)
+            m.clock = best_time
+            m.switches = m.switches + 1
+        }
+        m.frame = best
+    }
+    // The pace: a clip that walks, at the body's speed over its own.
+    slot = (db.frame_clip as int[])[m.frame]
+    own = (db.speeds as float[])[slot]
+    rate = 1.0
+    sp = core.v3_len(m.velocity)
+    if own > 0.05 {
+        rate = sp / own
+        if rate < 0.5 { rate = 0.5 }
+        if rate > 1.5 { rate = 1.5 }
+    }
+    figure.set_speed(fig, rate)
+    figure.advance(fig, delta)
+    m.clock = figure.time(fig)
+    // The playing frame, as the database counts.
+    m.frame = frame_at(db, slot, m.clock)
+    // The root where the spring has it, facing its heading.
+    root = db.root as *Model
+    core.model_set_position(root, m.position.x, root.position.y, m.position.z)
+    core.model_set_rotation(root, core.quat_rotate(m.heading - core.atan2_of(db.forward.x, db.forward.z), core.vec3(0.0, 1.0, 0.0)))
+}
+
+// The database frame of a clip slot at a time.
+frame_at(db: *Database, slot: int, t: float) -> int {
+    first = 0
+    c = 0
+    while c < slot {
+        first = first + clip_frames_known(db, c)
+        c = c + 1
+    }
+    n = clip_frames_known(db, slot)
+    k = (t * SAMPLE_HZ) as int
+    if k < 0 { k = 0 }
+    if k >= n { k = n - 1 }
+    return first + k
+}
+
+// A clip's frame count from the database, without posing the figure.
+clip_frames_known(db: *Database, slot: int) -> int {
+    n = 0
+    i = 0
+    while i < db.frames {
+        if (db.frame_clip as int[])[i] == slot { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}

@@ -182,3 +182,56 @@ The Fox's clips themselves carry a foot 14 cm (walk) and 32 cm (run) while
 it is the lowest, as it lands and lifts, played on the spot as much as
 under a body. Pacing cannot take that out; locking the feet (`ae3d.feet`)
 does, on a figure with legs to solve.
+
+## Motion matching
+
+`ae3d.matching` (#586, part of #509) moves a figure the way motion matching
+does. A spring moves the body. Every tenth of a second the figure's clips
+are searched for the moment whose pose and path ahead best fit where the
+body is going, and that moment is entered by inertialization.
+
+```aether
+db = matching.database_new(fig, root)
+matching.add_clip(db, "Idle")
+matching.add_clip(db, "Walk")
+matching.add_clip(db, "Run")
+matching.build(db)
+m = matching.matcher_new(db)
+matching.set_input(m, velocity)   // every frame
+matching.step(m, delta)           // moves the root, searches, plays, advances the figure
+```
+
+- **The database.** The clips are sampled 60 times a second. Each frame
+  stores, in the root's frame with the way the clips walk as +z:
+  - up to four feet's places and velocities (the bones that rise and fall);
+  - the hips' velocity;
+  - the path ahead: where the root is 0.33, 0.66 and 1 s on, and the way it
+    faces. A clip made in place takes its path from its feet's travel.
+
+  Each feature is scaled by its spread, and each group weighted: the path
+  ahead three times the feet. At equal weight a standing figure asked to
+  walk kept choosing to stand on.
+- **The spring.** Velocity and facing ease toward what is asked,
+  critically damped with a 0.27 s half-life (Holden's). The spring is
+  also the search's path ahead.
+- **The search.** Brute force. The current pose is the playing frame's own
+  features, so it asks what continues best from here. It changes clip only
+  when the best is a quarter better than carrying on: a jump to a phase
+  that fitted a little better slid the feet. A clip that walks plays at the
+  body's speed over its own, between half and one and a half times.
+- **`figure.play_blended_at`** enters a clip at a given time under an
+  inertialized offset.
+
+`tests/test_matching.ae` drives the Fox, a metre long: standing, a walk, a
+run, let go, sent to the side.
+
+| Measure | Result |
+|---|---|
+| The clip each stretch plays | Survey, Walk, Run, 100% each |
+| The foot on the ground's drift along the way, whole cycles | 0.06% walking, 2.7% running |
+| The most a bone turns in a frame, at its clip's pace | 25 degrees |
+| The facing's turn in a frame | 2.8 degrees |
+| A search over 316 frames | 4 µs; 2,000 of them 8 ms |
+
+#509 asks for 2,000 searches in a millisecond: a tree or SIMD over the
+features, and the job system, are its next step.
