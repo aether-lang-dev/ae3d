@@ -278,16 +278,21 @@ would:
 
 | | Measured |
 |---|---|
-| `ANIMATED`, the left arm let go | it comes down 0.39 rad from its clip, the right stays within 0.02 of its; drawn within 0.014 rad of its body; the figure still on its clip |
-| struck at the forearm, 8 N·s | the drawn arm swings 0.39 rad |
-| taken back | drawn to its clip with no more than 0.065 rad a frame, on it a second later; its body within 0.25 rad |
+| `ANIMATED`, the left arm let go | it comes down 0.58 rad from its clip, the right stays within 0.011 of its; drawn within 0.014 rad of its body; the figure still on its clip |
+| struck at the forearm, 8 N·s | the drawn arm swings over 0.2 rad |
+| taken back | drawn to its clip with no more than 0.062 rad a frame, on it a second later; its body within 0.11 rad (it comes up with its elbow straight on its limit) |
+| following, an arm held up ahead | 0.059 rad from its anchor, the sag the anchor's 5 Hz allows |
 | `POWERED`, the right arm at 3% | 3% of the left's muscle before a blow and after it and its recovery |
 | `POWERED`, the left arm limp | no muscle; it comes down 0.69 rad while the right holds |
 
-A following figure's joints' springs pull toward the reference pose
-against the anchors. A healthy arm held up ahead trails its clip by about
-0.14 rad, and an arm taken back by 0.25: #584. A `POWERED` part on an
-`ANIMATED` figure, and a limp part drawn during a get-up, are not there yet.
+While a figure follows its clip, each joint's spring pulls toward the
+clip's pose, with the anchors (#584). Its 8 Hz used to pull toward the
+reference pose against the anchors' 5 Hz: a healthy arm held up ahead
+trailed its clip by 0.14 rad, and an arm taken back stopped 0.25 short.
+Springs off instead, an arm sagged from its keys through a get-up, and
+when the figure went `POWERED` at the end it snapped up 8 degrees a step.
+A `POWERED` part on an `ANIMATED` figure, and a limp part drawn during a
+get-up, are not there yet.
 
 ## On a figure
 
