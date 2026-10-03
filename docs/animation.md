@@ -182,3 +182,94 @@ The Fox's clips themselves carry a foot 14 cm (walk) and 32 cm (run) while
 it is the lowest, as it lands and lifts, played on the spot as much as
 under a body. Pacing cannot take that out; locking the feet (`ae3d.feet`)
 does, on a figure with legs to solve.
+
+## Motion matching
+
+`ae3d.matching` (#586, part of #509) moves a figure the way motion matching
+does. A spring moves the body. Every tenth of a second the figure's clips
+are searched for the moment whose pose and path ahead best fit where the
+body is going, and that moment is entered by inertialization.
+
+```aether
+db = matching.database_new(fig, root)
+matching.add_clip(db, "Idle")
+matching.add_clip(db, "Walk")
+matching.add_clip(db, "Run")
+matching.build(db)
+m = matching.matcher_new(db)
+matching.set_input(m, velocity)   // every frame
+matching.step(m, delta)           // moves the root, searches, plays, advances the figure
+```
+
+- **The database.** The clips are sampled 60 times a second. Each frame
+  stores, in the root's frame with the way the clips walk as +z:
+  - up to four feet's places and velocities (the bones that rise and fall);
+  - the hips' velocity;
+  - the path ahead: where the root is 0.33, 0.66 and 1 s on, and the way it
+    faces. A clip made in place takes its path from its feet's travel.
+
+  Each feature is scaled by its spread, and each group weighted: the path
+  ahead three times the feet. At equal weight a standing figure asked to
+  walk kept choosing to stand on.
+- **The spring.** Velocity and facing ease toward what is asked,
+  critically damped with a 0.27 s half-life (Holden's). The spring is
+  also the search's path ahead.
+- **The search.** Runs of 16 and 64 frames each have a bounding box in
+  feature space; a run whose box is no nearer than the best found is
+  passed over, and a frame's cost stops adding once it passes the best,
+  with the playing frame as the first best (#588). It finds the same frame
+  as brute force. The current pose is the playing frame's own
+  features, so it asks what continues best from here. It changes clip only
+  when the best is a quarter better than carrying on: a jump to a phase
+  that fitted a little better slid the feet. A clip that walks plays at the
+  body's speed over its own, between half and one and a half times.
+- **`figure.play_blended_at`** enters a clip at a given time under an
+  inertialized offset.
+
+`tests/test_matching.ae` drives the Fox, a metre long: standing, a walk, a
+run, let go, sent to the side.
+
+| Measure | Result |
+|---|---|
+| The clip each stretch plays | Survey, Walk, Run, 100% each |
+| The foot on the ground's drift along the way, whole cycles | 0.06% walking, 2.7% running |
+| The most a bone turns in a frame, at its clip's pace | 25 degrees |
+| The facing's turn in a frame | 2.8 degrees |
+| 2,000 searches over 316 frames | 0.83 ms (brute force 7.8 ms), the same frame as brute force in all 777 searches checked |
+
+That is #509's 2,000 searches in a millisecond, on one thread, over the
+Fox's database. A larger database, or the job system, is the next step.
+
+## Looking
+
+`ae3d.lookat` (#587, part of #509) turns a figure's head to look at a
+point. It runs every frame in the pose phase, after the clips.
+
+```aether
+l = lookat.attach(e, figure_root, neck, head, forward)   // forward: the way the figure faces, in its root's frame
+lookat.set_target(l, point)
+lookat.clear(l)
+```
+
+- **The turn.** It runs from where the clip has the head facing to the
+  point: about the figure's up, then across. Each part is held within a
+  neck's reach: 80 degrees either side, 57 up and down.
+- **Eased.** A critically damped spring with a 0.12 s half-life moves the
+  turn toward what is asked, or back to none when cleared, so a head never
+  snaps round. `set_weight` fades it in and out.
+- **Shared.** The neck takes 40% of the turn and the head the rest. The
+  whole turn is made first and then shared: a yaw-and-pitch turn on the
+  neck and another on the head are not the whole one, and they left the
+  head 3 degrees off.
+- **Put back each frame.** The bones it turns are returned to their own
+  pose before each frame's turn, so a still pose is not turned further
+  frame after frame.
+
+`tests/test_lookat.ae`, on the box man playing its Idle:
+- **Within the limits.** A point 31 degrees aside and a little up is faced
+  to 2.8 degrees. The rest is the eased turn trailing the Idle's sway.
+- **Past the limits.** A point behind holds the turn at 1.4 rad.
+- **No snapping.** The head turns 5.7 degrees a frame at most, the clip
+  included.
+- **Cleared.** It is back on its clip, to 0.0001 rad.
+- **Nothing else moves.** No other bone moves.

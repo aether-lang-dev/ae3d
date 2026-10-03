@@ -52,7 +52,7 @@ A `POWERED` figure that leans more than 0.35 rad (20°) from its pose is falling
 - its balance keeps working against the fall until it is down: the pelvis's assist keeps its full torque. Let go at the first lean, the figure toppled from the hips like a plank;
 - its arms reach toward where it is falling, 0.7 down to 1 along the fall and a little out to each side so the hands land apart, and straight, since a straight arm takes the landing through its joints where a bent one folds on its elbow's muscle;
 - its head tucks 0.8 rad away from the fall, from where the chest carries it;
-- its knees give, 0.45 rad toward their bend (#578), so it comes down in stages, knees then hips then hands, rather than toppling from the ankles like a plank. Forwards, when it leans past 45 degrees its pelvis is 0.35 m down, against 0.20 for a twin that keeps its knees. The reference ragdoll's knees turn only 30 degrees from straight, which caps the bend;
+- its knees give, 0.45 rad toward their bend (#578), so it comes down in stages, knees then hips then hands, rather than toppling from the ankles like a plank. Forwards, when it leans past 45 degrees its pelvis is 0.35 m down, against 0.20 for a twin that keeps its knees. The knees bend 2.3 rad (130 degrees) from straight and no further than straight, as a person's do; the reference ragdoll's bent 60 degrees, with straight on one limit. With that range a fall's knees fold further on their own (a twin's reach 0.6 to 0.95 rad), though the protective fall's own bend stays 0.45: a deeper one, or a deeper step, has caught fewer falls and pushes;
 - when the fall is toward its back, its spine bends away from the fall too, 0.5 rad at each of its two joints. Going over backwards, from the first lean, that rounds the back and tucks the chin, so the head comes down last. In a fall forwards or sideways the pelvis's front turns back along the fall once it passes level; face down, the bend arches the back and lifts the chest and head off the ground.
 
 If it catches itself (leans less than half the threshold again), the reach and the tuck let go and the balance comes back. It has landed when it leans past 1.2 rad (69°) with its pelvis down, within 25 cm of its lowest point, for ten steps: the reach stops, the balance lets go, and every joint holds the shape it landed in, the head still tucked, on 40% of its budget (`physics.ragdoll_hold_shape`). Once its pelvis and chest have been slower than 0.3 m/s for ten steps more, it lies (`lying(body)`). A fall caught on the hands and knees, or sitting, leans less or keeps its pelvis up. Its trunk still for a third of a second, it has landed as well, and holds the shape it was caught in at full strength with its balance kept, as a person on all fours does. A caught figure can still go over -- kneeling, it tips onto its face -- and if its trunk moves faster than 0.3 m/s again after it has lain still, it falls again: the shape let go and the arms reaching, to land and lie as any fall does.
@@ -140,14 +140,20 @@ for where standing still gives out:
 | 255 N·s from behind | stands | stands, 4 steps |
 | 270 N·s from behind | falls | stands, 4 steps |
 | 315 N·s from behind | falls | stands, 3 steps |
-| 180 N·s from the side | stands | stands, 1 step |
+| 180 N·s from the side | stands | stands, 2 steps |
+| 210 N·s from the side | falls | stands, 2 steps |
 | 150 N·s from in front | stands | stands, no step |
 
 How far each way holds:
 - **Forward:** 255 N·s without stepping, 360 staggering
   (`tests/test_stagger.ae`).
-- **Sideways:** 195 N·s either way; stepping moves the feet rather than
-  holding the pose. Catch steps that cross or close the feet are #481.
+- **Sideways:** 180 N·s standing still, 210 stepping. A step counts as
+  backwards only when the capture point is mostly behind the rear foot. A
+  side shove turns the figure a little and puts the capture point a little
+  behind, and taken for a step back, that had stopped every step after the
+  first. Catch steps that cross or close the feet are #481: tried, quicker
+  steps and a closing step did not catch more, against a hip that turns 30
+  degrees.
 - **Backward:** 150 N·s either way.
 
 ## Staggering
@@ -240,9 +246,12 @@ asks. Done, it holds the shape it ends in.
 
 The hip draws up 0.3 rad on its back and no further: the reference
 ragdoll's hip turns 30 degrees about a cone that is not centred ahead of
-the leg, and the knee 35 degrees about its rest. More of a person's curl
-waits on those limits (#578). Landing on either side, from shoves in eight
-directions, is the rest of #480.
+the leg. More of a person's curl waits on that limit (#578).
+
+The same test shoves sixteen writhers from eight directions, at 450 and
+500 N·s (#480). All of them land, eight face up and eight face down. In
+every one the hip swings at least 0.30 rad, the pelvis drifts no more than
+7 cm, and the writhing stops when its time is up.
 
 ## Body parts
 
@@ -278,16 +287,21 @@ would:
 
 | | Measured |
 |---|---|
-| `ANIMATED`, the left arm let go | it comes down 0.39 rad from its clip, the right stays within 0.02 of its; drawn within 0.014 rad of its body; the figure still on its clip |
-| struck at the forearm, 8 N·s | the drawn arm swings 0.39 rad |
-| taken back | drawn to its clip with no more than 0.065 rad a frame, on it a second later; its body within 0.25 rad |
+| `ANIMATED`, the left arm let go | it comes down 0.58 rad from its clip, the right stays within 0.011 of its; drawn within 0.014 rad of its body; the figure still on its clip |
+| struck at the forearm, 8 N·s | the drawn arm swings over 0.2 rad |
+| taken back | drawn to its clip with no more than 0.062 rad a frame, on it a second later; its body within 0.11 rad (it comes up with its elbow straight on its limit) |
+| following, an arm held up ahead | 0.059 rad from its anchor, the sag the anchor's 5 Hz allows |
 | `POWERED`, the right arm at 3% | 3% of the left's muscle before a blow and after it and its recovery |
 | `POWERED`, the left arm limp | no muscle; it comes down 0.69 rad while the right holds |
 
-A following figure's joints' springs pull toward the reference pose
-against the anchors. A healthy arm held up ahead trails its clip by about
-0.14 rad, and an arm taken back by 0.25: #584. A `POWERED` part on an
-`ANIMATED` figure, and a limp part drawn during a get-up, are not there yet.
+While a figure follows its clip, each joint's spring pulls toward the
+clip's pose, with the anchors (#584). Its 8 Hz used to pull toward the
+reference pose against the anchors' 5 Hz: a healthy arm held up ahead
+trailed its clip by 0.14 rad, and an arm taken back stopped 0.25 short.
+Springs off instead, an arm sagged from its keys through a get-up, and
+when the figure went `POWERED` at the end it snapped up 8 degrees a step.
+A `POWERED` part on an `ANIMATED` figure, and a limp part drawn during a
+get-up, are not there yet.
 
 ## On a figure
 
