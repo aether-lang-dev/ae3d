@@ -19,3 +19,7 @@
 - Stepping now catches some forward shoves up to 335 N s, so `test_falls`
   shoves 345–395 forwards to keep every pair falling. `test_balance` holds
   the side case at 240.
+- `test_stagger` adds five side shoves, 200–240 N s. Each fells a figure
+  that can't step, and one that can stands out of it in three or four
+  steps. The widest gap between steps is 0.33 s, as in the forward
+  stagger, and the run repeats bit for bit.
