@@ -26,3 +26,9 @@
   | eight crossing a circle | 0.63 m | all eight arrive |
 
   Two figures walking side by side 3 m apart are never bent.
+- `locomotion.set_crowd(l, walkers)`: a figure under locomotion steps
+  aside for the others in a list it is given. The velocity asked for is
+  bent before the accelerations take it.
+  - In `test_locomotion`, two Foxes on controllers walk head on to where
+    the other started. They pass on opposite sides, 0.82 m apart at the
+    nearest, and both end within 5 cm of where they were going.
