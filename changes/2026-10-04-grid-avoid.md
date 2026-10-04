@@ -32,3 +32,7 @@
   - In `test_locomotion`, two Foxes on controllers walk head on to where
     the other started. They pass on opposite sides, 0.82 m apart at the
     nearest, and both end within 5 cm of where they were going.
+- `test_net_udp` drains until every honk and score has arrived, up to 3 s,
+  where it used to drain a flat second. With 10% of datagrams lost each
+  way, a score sent in the last moments needed more than the second (the
+  slowest delivery took 1.17 s), and the local gate failed on 70 of 71.
