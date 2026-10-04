@@ -35,3 +35,6 @@
   three; the box man stands 270 N s in three steps, not five. What rocks
   it is still open on #598: a stance leg driven to the clip's angles on a
   foot that grips.
+- `deps/aephysics` is at aephysics main 1409bf2: Box3D main's restitution
+  (aephysics #91) and the upstream sync (#87). Every motion and physics
+  suite holds unchanged on it.
