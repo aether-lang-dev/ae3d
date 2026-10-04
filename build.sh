@@ -123,6 +123,10 @@ if [ ! -f "$AEPHYSICS/aephysics/native/aephysics_native.c" ]; then
     exit 1
 fi
 NATIVE_SOURCES="$(ae3d_native_sources "$OBJ_DIR" "$AEPHYSICS")"
+# aephysics.native's @c_include header (the solver's inline helpers) is
+# found beside the module, as `ae build` finds it: the generated C of any
+# program that imports aephysics includes it.
+AETHER_COMPILE_FLAGS="$AETHER_COMPILE_FLAGS -I$AEPHYSICS/aephysics/native"
 
 # The Vulkan shaders are generated from the GLSL in src/ae3d/shaders and
 # compiled into ae3d.vkspirv; an edit to the GLSL without the generator run
