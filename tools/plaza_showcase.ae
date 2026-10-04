@@ -1,0 +1,336 @@
+// The plaza showcase (#509, part of): a crowd of box men wandering a plaza
+// with a ramp, steps and a kerb -- locomotion, its foot hold, the legs solved
+// onto the ground (ae3d.feet) and stepping aside for each other (ae3d.avoid)
+// -- for a person or the agent loop to watch, and measured as it runs. Not a
+// test and not an example: ci.sh never builds it.
+//
+//   ./build.sh tools/plaza_showcase.ae && ./build/plaza_showcase
+//   AE3D_FIGURES=n (24)   AE3D_FRAMES=n AE3D_SNAPSHOT=out.png (unattended)
+//   AE3D_WATCH=k (close on figure k, from its right)
+//   AE3D_STANCES=1 (every stance's slide, as it ends)   AE3D_FLAT=1 (feet on a
+//   flat floor, not the physics ground)   AE3D_TICK=60 (a frame a step)
+//
+// Each figure walks to a place on the plaza, and on getting there picks
+// another, some at a run. Measured, every few seconds and at the end: the
+// stances its feet took -- a foot held on the ground by ae3d.feet, from set
+// down to lifted -- and how far the toe slid over the ground in each, which
+// #509 holds under 1 cm; and the frame's time. The feet are read after the
+// frame is drawn (late_update), as drawn: read in update, before the pose
+// phase, they were the clip's, not where ae3d.feet put them.
+//
+// On an RTX 4070 Ti (Vulkan, vsync at 144 Hz), 15 s:
+//
+//   walkers   stances   slide, mean   at most   over 1 cm   frame
+//   1         20        0.006 cm      0.07      0           6.9 ms
+//   24        782       0.14 cm       6.5       23 (3%)     6.9 ms
+//   200       4,516     0.42 cm       11.7      561 (12%)   6.9 ms
+//
+// The stances over 1 cm come with the crowd: figures stepping aside for
+// each other and turning to new goals.
+import std.list
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.loader
+import ae3d.physics
+import ae3d.skin
+import ae3d.figure
+import ae3d.locomotion
+import ae3d.feet
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern clock_ns() -> long
+
+const PATH = "tests/fixtures/gltf/humanoid.glb"
+const HALF = 9.0                     // the plaza is 18 m square
+const ARRIVED = 0.8                  // metres from its goal a figure picks another
+const REPORT = 5.0                   // seconds between reports
+const SLID = 0.01                    // #509's bound on a stance's slide, metres
+
+struct Walker {
+    object: ptr                      // *GameObject
+    loco: ptr                        // *Locomotion
+    feet: ptr                        // *Feet
+    controller: ptr                  // *CharacterController
+    toes: ptr                        // *Model[2], left and right
+    goal: Vec3
+    running: bool
+    seed: int
+    held: ptr                        // int[2]: the foot held last frame
+    from: ptr                        // float[6]: where each toe was when its foot was set down
+    most: ptr                        // float[2]: the farthest each toe has slid in this stance
+    ankle_z: ptr                     // float[2]
+    ankle_most: ptr                  // float[2]: the same for the ankle
+    turned: ptr                      // float[2]: the heading when each foot was set down
+}
+
+struct Plaza {
+    walkers: ptr                     // *Walker[count]
+    count: int
+    crowd: ptr                       // list of *Locomotion
+    seconds: float
+    next_report: float
+    stances: int
+    over: int                        // stances that slid more than SLID
+    slid_sum: float
+    worst: float
+    frame_ns: long
+    frames: int
+    worst_frame_ns: long
+    last_ns: long
+    ankle_sum: float
+}
+
+// A number from a seed, the next seed with it: the same plaza every run.
+next_seed(seed: int) -> int { return (seed * 1103515245 + 12345) % 2147483647 }
+unit_of(seed: int) -> float {
+    s = seed
+    if s < 0 { s = 0 - s }
+    return ((s % 10000) as float) / 10000.0
+}
+
+pick_goal(w: *Walker) {
+    w.seed = next_seed(w.seed)
+    x = (unit_of(w.seed) * 2.0 - 1.0) * (HALF - 1.0)
+    w.seed = next_seed(w.seed)
+    z = (unit_of(w.seed) * 2.0 - 1.0) * (HALF - 1.0)
+    w.goal = core.vec3(x, 0.0, z)
+    w.seed = next_seed(w.seed)
+    w.running = unit_of(w.seed) < 0.25
+}
+
+block(e: *Engine, name: string, at: Vec3, half: Vec3, turn: Quat) {
+    o = engine.object(e, name, loader.cube(1.0))
+    behaviour.object_set_position(o, at)
+    behaviour.object_set_rotation(o, turn)
+    behaviour.object_set_scale(o, core.v3_mul(half, 2.0))
+    physics.box_collider(o, half, physics.material(0.8, 0.0))
+}
+
+bone(sk: *Skeleton, name: string) -> *Model { return skin.skeleton_bone(sk, skin.skeleton_find(sk, name)) }
+
+start(state: ptr, e: *Engine) {
+    p = state as *Plaza
+    physics.attach(e)
+    level = core.quat_rotate(0.0, core.vec3(0.0, 1.0, 0.0))
+    block(e, "Ground", core.vec3(0.0, 0.0 - 0.5, 0.0), core.vec3(HALF + 2.0, 0.5, HALF + 2.0), level)
+    // A ramp up to a 0.6 m deck in the far corner, three 0.15 m steps down
+    // from its side, and a kerb across the near half.
+    block(e, "Deck", core.vec3(6.0, 0.3, 0.0 - 6.0), core.vec3(2.0, 0.3, 2.0), level)
+    block(e, "Ramp", core.vec3(6.0, 0.15, 0.0 - 2.4), core.vec3(1.5, 0.05, 1.8), core.quat_rotate(0.0 - 0.17, core.vec3(1.0, 0.0, 0.0)))
+    k = 0
+    while k < 3 {
+        h = 0.15 * ((k + 1) as float)
+        block(e, "Step", core.vec3(2.9 + 0.35 * ((2 - k) as float), h * 0.5, 0.0 - 6.0), core.vec3(0.175, h * 0.5, 1.5), level)
+        k = k + 1
+    }
+    block(e, "Kerb", core.vec3(0.0 - 3.0, 0.075, 3.0), core.vec3(4.0, 0.075, 0.2), level)
+
+    ws = p.walkers as ptr[]
+    i = 0
+    while i < p.count {
+        w = ws[i] as *Walker
+        o = figure.figure(e, "Walker", PATH)
+        if o == null {
+            println("plaza_showcase: ${PATH} would not load")
+            return
+        }
+        w.seed = 7919 * (i + 1)
+        w.seed = next_seed(w.seed)
+        x = (unit_of(w.seed) * 2.0 - 1.0) * (HALF - 1.0)
+        w.seed = next_seed(w.seed)
+        z = (unit_of(w.seed) * 2.0 - 1.0) * (HALF - 1.0)
+        behaviour.object_set_position(o, core.vec3(x, 0.0, z))
+        c = physics.character_controller(o, 0.3, 1.8)
+        l = locomotion.attach(e, o, c, "Idle", "Walk", "Run")
+        locomotion.set_crowd(l, p.crowd)
+        list.add_raw(p.crowd, l as ptr)
+        sk = figure.skeleton(figure.figure_of(o))
+        f = feet.attach(e, o.model as *Model, bone(sk, "mixamorig:Hips"),
+                        bone(sk, "mixamorig:LeftUpLeg"), bone(sk, "mixamorig:LeftLeg"), bone(sk, "mixamorig:LeftFoot"),
+                        bone(sk, "mixamorig:RightUpLeg"), bone(sk, "mixamorig:RightLeg"), bone(sk, "mixamorig:RightFoot"))
+        if core.env_int("AE3D_FLAT", 0) == 0 { feet.ground_physics(f, physics.of(e)) }
+        toes = w.toes as ptr[]
+        toes[0] = bone(sk, "mixamorig:LeftToeBase") as ptr
+        toes[1] = bone(sk, "mixamorig:RightToeBase") as ptr
+        w.object = o as ptr
+        w.loco = l as ptr
+        w.feet = f as ptr
+        w.controller = c as ptr
+        pick_goal(w)
+        i = i + 1
+    }
+    p.next_report = REPORT
+}
+
+// A frame of a walker's feet: each stance's slide, from the toe's place
+// when the foot was set down to where it is now, over the ground.
+watch_feet(p: *Plaza, w: *Walker) {
+    f = w.feet as *Feet
+    toes = w.toes as ptr[]
+    held = w.held as int[]
+    from = w.from as float[]
+    most = w.most as float[]
+    ankle_z = w.ankle_z as float[]
+    ankle_most = w.ankle_most as float[]
+    turned = w.turned as float[]
+    k = 0
+    while k < 2 {
+        toe = toes[k] as *Model
+        core.model_sync_transform(toe)
+        at = toe.world_position
+        down = feet.leg_locked(f, k)
+        if down && held[k] == 0 {
+            turned[k] = locomotion.heading(w.loco as *Locomotion)
+            from[k * 3] = at.x
+            from[k * 3 + 2] = at.z
+            most[k] = 0.0
+        }
+        an = feet.leg_ankle(f, k)
+        core.model_sync_transform(an)
+        if down && held[k] == 0 {
+            from[k * 3 + 1] = an.world_position.x
+            ankle_z[k] = an.world_position.z
+            ankle_most[k] = 0.0
+        }
+        if down {
+            d = core.v3_len(core.vec3(at.x - from[k * 3], 0.0, at.z - from[k * 3 + 2]))
+            if d > most[k] { most[k] = d }
+            da = core.v3_len(core.vec3(an.world_position.x - from[k * 3 + 1], 0.0, an.world_position.z - ankle_z[k]))
+            if da > ankle_most[k] { ankle_most[k] = da }
+        }
+        if !down && held[k] == 1 {
+            if core.env_int("AE3D_STANCES", 0) == 1 {
+                println("stance ${k}: toe ${most[k] * 100.0} cm, ankle ${ankle_most[k] * 100.0} cm; turned ${(locomotion.heading(w.loco as *Locomotion) - turned[k]) * 57.3} deg; speed ${locomotion.speed(w.loco as *Locomotion)}")
+            }
+            p.stances = p.stances + 1
+            p.slid_sum = p.slid_sum + most[k]
+            if most[k] > p.worst { p.worst = most[k] }
+            if most[k] > SLID { p.over = p.over + 1 }
+            p.ankle_sum = p.ankle_sum + ankle_most[k]
+        }
+        held[k] = 0
+        if down { held[k] = 1 }
+        k = k + 1
+    }
+}
+
+update(state: ptr, e: *Engine, delta: float) {
+    p = state as *Plaza
+    started = clock_ns()
+    p.seconds = p.seconds + delta
+    ws = p.walkers as ptr[]
+    i = 0
+    while i < p.count {
+        w = ws[i] as *Walker
+        o = w.object as *GameObject
+        if o != null {
+            at = behaviour.object_world_position(o)
+            to = core.vec3(w.goal.x - at.x, 0.0, w.goal.z - at.z)
+            if core.v3_len(to) < ARRIVED { pick_goal(w) }
+            locomotion.set_input(w.loco as *Locomotion, core.v3_normalize(to), w.running)
+        }
+        i = i + 1
+    }
+    // The frame's time: from the last frame's update to this one's.
+    if p.last_ns > 0 && p.seconds > 1.0 {
+        took = started - p.last_ns
+        p.frame_ns = p.frame_ns + took
+        if took > p.worst_frame_ns { p.worst_frame_ns = took }
+        p.frames = p.frames + 1
+    }
+    p.last_ns = started
+    if p.seconds >= p.next_report {
+        report(p)
+        p.next_report = p.next_report + REPORT
+    }
+    camera(p, e)
+}
+
+// After the frame is drawn: the feet as they were drawn, the legs solved.
+late(state: ptr, e: *Engine, delta: float) {
+    p = state as *Plaza
+    ws = p.walkers as ptr[]
+    i = 0
+    while i < p.count {
+        w = ws[i] as *Walker
+        if w.object != null { watch_feet(p, w) }
+        i = i + 1
+    }
+}
+
+camera(p: *Plaza, e: *Engine) {
+    cam = engine.engine_camera(e)
+    watch = core.env_int("AE3D_WATCH", 0 - 1)
+    if watch >= 0 && watch < p.count {
+        w = (p.walkers as ptr[])[watch] as *Walker
+        at = behaviour.object_world_position(w.object as *GameObject)
+        core.camera_set_position(cam, core.vec3(at.x + 3.0, at.y + 1.3, at.z + 0.8))
+        core.camera_look_at(cam, core.vec3(at.x, at.y + 0.7, at.z))
+        return
+    }
+    core.camera_set_position(cam, core.vec3(0.0, 11.0, 16.0))
+    core.camera_look_at(cam, core.vec3(0.0, 0.0, 0.0 - 1.0))
+}
+
+report(p: *Plaza) {
+    mean = 0.0
+    if p.stances > 0 { mean = p.slid_sum / (p.stances as float) }
+    frame = 0.0
+    if p.frames > 0 { frame = (p.frame_ns as float) / (p.frames as float) / 1000000.0 }
+    println("plaza ${p.seconds as int} s: ${p.count} walkers; ${p.stances} stances, a toe slid ${mean * 100.0} cm on average, ${p.worst * 100.0} at most, over ${SLID * 100.0} cm in ${p.over}; the ankle ${p.ankle_sum / (p.stances as float) * 100.0} cm on average; frame ${frame} ms on average, ${(p.worst_frame_ns as float) / 1000000.0} at most")
+}
+
+main() {
+    e = engine.engine_new()
+    engine.engine_set_size(e, 1280, 720)
+    engine.engine_set_title(e, "ae3d - plaza showcase")
+    engine.engine_set_fixed_step(e, 1.0 / 60.0)
+    engine.engine_set_light(e, core.light_sun(core.vec3(0.4, 0.8, 0.3)))
+    count = core.env_int("AE3D_FIGURES", 24)
+    block_ws = calloc(count, 8)
+    ws = block_ws as ptr[]
+    i = 0
+    while i < count {
+        w = calloc(1, sizeof(Walker)) as *Walker
+        w.toes = calloc(2, 8)
+        w.held = calloc(2, 4)
+        w.from = calloc(6, 8)
+        w.most = calloc(2, 8)
+        w.ankle_z = calloc(2, 8)
+        w.ankle_most = calloc(2, 8)
+        w.turned = calloc(2, 8)
+        ws[i] = w as ptr
+        i = i + 1
+    }
+    p = Plaza { walkers: block_ws, count: count, crowd: list.new(), seconds: 0.0, next_report: REPORT, stances: 0, over: 0,
+                slid_sum: 0.0, worst: 0.0, frame_ns: 0 as long, frames: 0, worst_frame_ns: 0 as long, last_ns: 0 as long, ankle_sum: 0.0 }
+    b = engine.behaviour_new("plaza", (&p) as ptr)
+    b.start = start
+    b.update = update
+    b.late_update = late
+    engine.engine_add_behaviour(e, b)
+    engine.engine_run(e)
+    report(&p)
+    i = 0
+    while i < count {
+        w = ws[i] as *Walker
+        if w.feet != null { feet.feet_free(w.feet as *Feet) }
+        if w.loco != null { locomotion.locomotion_free(w.loco as *Locomotion) }
+        if w.controller != null { physics.character_free(w.controller as *CharacterController) }
+        free(w.toes)
+        free(w.held)
+        free(w.from)
+        free(w.most)
+        free(w.ankle_z)
+        free(w.ankle_most)
+        free(w.turned)
+        free(w as ptr)
+        i = i + 1
+    }
+    free(block_ws)
+    list.free(p.crowd)
+    physics.physics_free(physics.of(e))
+    figure.figures_free(e)
+}
