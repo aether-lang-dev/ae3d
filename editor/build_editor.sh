@@ -122,6 +122,9 @@ if [ ! -f "$AEPHYSICS/aephysics/native/aephysics_native.c" ]; then
     exit 1
 fi
 NATIVE_SOURCES="$(ae3d_native_sources "$OBJ_DIR" "$AEPHYSICS")"
+# aephysics.native's @c_include header, found beside the module, as in
+# build.sh.
+AETHER_COMPILE_FLAGS="$AETHER_COMPILE_FLAGS -I$AEPHYSICS/aephysics/native"
 
 # Every header, not a list of three: the generated ones carry the shaders and
 # the uniform offsets, so leaving them out linked the previous shaders.
