@@ -31,6 +31,7 @@ it moves at 2.89.
 `test_ragdoll_mass` holds this (7 checks), including the box man set to
 75 kg standing POWERED for three seconds, leaning 0.012 rad at most.
 
-Nothing is reweighed by default yet. The muscles, the balance assist and
-the push tables are tuned against the heavy reference, and retuning them
-against a person's mass is #626's next step.
+A dressed figure now weighs what a person of its height does: `fit_to_rig`
+calls `ragdoll_set_mass(r, person_mass(ragdoll_height(r)))`, about 86 kg for
+the 1.93 m rig. The motion that retunes against it is in
+`2026-10-05-person-weight-motion.md`.
