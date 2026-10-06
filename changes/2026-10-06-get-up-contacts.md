@@ -27,3 +27,12 @@ planned on the figure's contacts (#414).
   A rise from the front takes 3.6 s and from the back 2.6 s.
   `tests/test_get_up.ae` holds every bone under 6 degrees a step and the
   hand-over to the animation seamless.
+- **On the ground under each contact.** Each hand, knee and foot is set
+  on the ground under it, found by a ray down onto the world's static
+  shapes, and the trunk is held over the ground under the hips. Planned
+  on one flat floor at the figure's lowest point, a figure tripped onto a
+  kerb (legs below, chest on it) ended its rise 0.71 rad off upright and
+  went down again. `tests/test_get_up_kerb.ae` covers kerbs from 0 to
+  2 m ahead: every rise ends within 0.07 rad of upright and stands. With
+  the chest landing right across the kerb's edge, it still gets up
+  leaning (#643).
