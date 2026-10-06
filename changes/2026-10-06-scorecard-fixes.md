@@ -29,3 +29,10 @@ walked through. Measured over 20 s with 20 walkers, four fixes:
 - **Handed back on the ground.** A struck walker taken back by its
   locomotion stands on the ground under its body, not at the height the
   ragdoll had carried its root to.
+- **Handed back, the hips go back to the animation's place.** Restoring
+  the animation's pose now sets the pelvis bone's position as well as the
+  root's. Left where the bodies had put it, a clip that keys no hips
+  translation drew a walker handed back with its hips under the ground.
+  Its bodies, woken by a body thrown nearby, followed them through the
+  floor: one walker was 202 m below the plaza a minute on. None fall
+  through now.
