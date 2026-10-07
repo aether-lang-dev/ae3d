@@ -33,3 +33,41 @@
   once, not eased out. Each puts back its last turn of the legs, or of
   the neck and head. Eased out over a quarter second after a walker was
   struck, they went on turning what the bodies had drawn.
+- **Risen over its own feet (#643).** The last stage of a way up, from
+  kneeling over the front foot to standing, is now planned on contacts
+  like the stages before it:
+  - the planted foot stays where it is;
+  - the back foot is lifted and set down beside it;
+  - by the end the limbs are eased onto the animation's own turns.
+
+  Before, the stage was eased bone by bone, and the back foot was dragged
+  a metre along the ground. Then the figure settles before it is handed
+  to its balance:
+  - the stance is brought over the foot nearer its spot, at 0.3 m/s;
+  - a foot still more than 2 cm off its spot takes one short step to it,
+    lifted 5 cm;
+  - it is handed over once it is upright, still, its centre of mass over
+    its feet and the feet come to rest, or after a second at the most.
+
+  Handed over on the clock instead, a figure risen onto a kerb's edge
+  had its feet 20 cm behind its hips. Righting itself, it rocked 20 to
+  30 cm back and stepped off the kerb. Now:
+  - every kerb from 0 to 2 m ahead stands, the edges (1.2 to 1.6 m) among
+    them (`tests/test_get_up_kerb.ae`, three new cases);
+  - each moves under 1 cm in the second after it rises (3.9 cm risen
+    beside the kerb, past its end);
+  - the hand-over is seamless: 0 degrees and 0 mm.
+
+  The stand point is no longer shifted off the edge (`clear_ahead`). That
+  dragged the planted foot after it.
+- **People are not ground (#654).** A character's ground ray skips
+  ragdoll bones, its own figure's and anyone else's. A walker whose way
+  crossed a figure lying in the street used to climb onto it, its
+  capsule 0.3 to 0.4 m up while its feet were set on the street.
+  `tests/test_character_bodies.ae` walks a character across a lying box
+  man: its feet stayed at 0 cm over the ground, against 29 cm before.
+- **aephysics at its latest main (a5d9940).** aephysics#120, the macOS
+  cost reading, measured as runner noise and is closed. a5d9940's
+  eight-lane contact solver is written on std.lanes' `f32x8`, so CI's
+  Aether goes to v0.788.0 with it. Measured alone, POWERED figures cost
+  68 us a step each at sixteen and 44 at thirty-two.
