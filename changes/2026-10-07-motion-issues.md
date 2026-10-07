@@ -71,3 +71,8 @@
   eight-lane contact solver is written on std.lanes' `f32x8`, so CI's
   Aether goes to v0.788.0 with it. Measured alone, POWERED figures cost
   68 us a step each at sixteen and 44 at thirty-two.
+- **A manifest's markers freed once.** Since Aether 0.788 (aether#2366)
+  a marker's name, destructured from `json.object_entry`, is its field's,
+  and `heap.free` frees it; `assets.manifest_free` freed it by hand as
+  well. street_drive, zombie_city, net_street and check_panes aborted on
+  the double free.
