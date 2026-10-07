@@ -36,3 +36,14 @@ walked through. Measured over 20 s with 20 walkers, four fixes:
   Its bodies, woken by a body thrown nearby, followed them through the
   floor: one walker was 202 m below the plaza a minute on. None fall
   through now.
+- **A drawn toe stays on the ground.** When physics draws a figure from
+  its bodies, a drawn toe that would go under the ground has its foot
+  turned up about the ankle: the ankle the bodies lack, since a calf's
+  body carries its foot rigidly. The ankle gets its own turn back when
+  the animation's pose is restored. Without that, a zombie given back to
+  the horde kept a foot 305 mm off its pose. Feet sunk in the ground:
+  673 s to 534 s a minute over 20, 24 and 28 walkers. Most of what is
+  left is a clip held under a struck walker re-posing the drawn legs
+  after physics draws them. Stopping the held clip takes it to 24 s, but
+  then 60% of struck walkers walk again instead of 96%, so the clip is
+  held for now.
