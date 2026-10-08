@@ -96,7 +96,7 @@ that position agree without anything syncing them.
 | Transform | the object's model | position, rotation, scale |
 | Mesh Renderer | the object's model | visible, casts shadow |
 | Material | the model's material | color, metallic, roughness, reflectivity, exposure, opacity, texture, normal map |
-| Light | the light it carries | type (point, directional, spot), color, intensity, ambient, temperature, range, direction, inner and outer angle |
+| Light | the light it carries | type (point, directional, spot), color, intensity, temperature, range, direction, inner and outer angle |
 | Camera | the camera it carries | field of view, near, far, speed, sensitivity, invert mouse |
 | Water | the surface's simulation | wave height, speed, scale and randomness, color, opacity, foam and its intensity, shore fade and foam, reflection, sky color, sky, caustics and their intensity and scale, shadow, distortion, normal strength |
 | Terrain | the terrain's voxel world | biome, seed, style (blocks or smooth); each write fills and draws the world again on its model |

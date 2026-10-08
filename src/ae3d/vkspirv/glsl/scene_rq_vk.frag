@@ -8,7 +8,6 @@ struct Light {
     vec3 position;
     vec3 color;
     float intensity;
-    float ambientStrength;
     float temperature;
     int isDirectional;
     vec3 direction;
@@ -58,7 +57,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float reflectivity;
     float wetness;
-    float frameExposure;
     bool hasNormalMap;
     float normalStrength;
     float occlusionStrength;
@@ -74,20 +72,15 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableEnergyConservation;
     bool enableImageBasedLighting;
     float iblIntensity;
+    int giOff;
     bool enableVolumetricLighting;
     float volumetricIntensity;
     int volumetricSteps;
     float volumetricScattering;
-    bool enableGlobalIllumination;
-    float giIntensity;
-    int giBounces;
-    bool enableBloom;
-    float bloomThreshold;
-    float bloomIntensity;
     bool enableFog;
     float fogStart;
     float fogEnd;
-    vec3 fogColor;
+    vec3 fogRadiance;
     float fogIntensity;
     bool enableShadows;
     bool hasShadowMap;
@@ -131,6 +124,12 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 damageColours[4];
     vec4 damageRect;
     float damageClamp;
+    int occlusionHistory;
+    int ddgiOn;
+    vec4 ddgiDims;
+    vec4 ddgiBase[2];
+    vec4 ddgiSpacing;
+    vec4 ddgiAtlas;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -139,10 +138,21 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int skyProcedural;
     float skyOvercast;
     vec3 skyOvercastColor;
+    vec3 skyFlat;
+    float skyTurbidity;
+    float skyLevelSize;
+    float skyRoughness;
+    float frameExposure;
+    bool enableBloom;
+    float bloomIntensity;
     vec2 texelSize;
+    int bloomFirst;
+    float bloomThreshold;
+    int bloomTop;
     float edgeThreshold;
     float edgeThresholdMin;
     float subpixelQuality;
+    int colorSampleCount;
     mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
@@ -293,7 +303,6 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
     L.temperature = d.w;
     L.spotCosOuter = e.x;
     L.spotCosInner = e.y;
-    L.ambientStrength = 0.0;
     // The lamp's own shadow's slot (ae3d.lampshadows), or -1: -1.0 read
     // back rounds toward zero, so it is rounded from below.
     shadowSlot = int(floor(e.z + 0.5));
@@ -337,11 +346,6 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 // it in full, walls hardly at all: water runs off them. Set by the
 // weather; a scene without one is dry.
 
-// The frame's exposure, over the material's: what an exposure that follows
-// the frame (the engine's eye adaptation) scales the light by before the
-// tone curve. 1 is the scene as lit.
-
-
 // Modern PBR Extensions
 // The surface's shape rather than its colour. The tangent frame is worked out
 // per pixel from the derivatives of the position and the UVs, so no tangent has
@@ -369,6 +373,9 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 
 
 
+// No light but the direct (the global illumination off, core.GI_OFF): no
+// sky's light and no bounce, what a surface the lights miss shows as.
+
 
 // Volumetric Lighting
 
@@ -376,19 +383,11 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 
 
 
-// Global Illumination
-
-
-
-
-// Bloom and HDR
-
-
-
-
-// Distance haze. The same four names the water shader uses, because one scene
+// Distance haze. The same names the water shader uses, because one scene
 // has one atmosphere: a street that fades into the dark has to fade the water
-// running down it by the same amount.
+// running down it by the same amount. The fog is light in the scene, so it
+// is a radiance: the colour the scene was given, as it shows at an exposure
+// of one, taken back through the tone curve on the CPU (core.display_radiance).
 
 
 
@@ -663,12 +662,14 @@ float lamp_shadow(int slot, vec3 surface) {
 // One ray toward the sun from just off the surface: lit, or the shadow's
 // share of the light. The origin steps out along the normal by a little
 // more than the surface's own tessellation error, so a face does not
-// shadow itself, and the ray is opaque-only and stops at its first hit.
+// shadow itself, and the ray is opaque-only and stops at its first hit. It
+// meets what casts a shadow (mask bit 1: ae3d.vkrays' RAY_SHADOW), not what
+// only the probes see.
 bool ray_blocked_to(vec3 origin, vec3 direction, float far) {
     rayQueryEXT query;
     rayQueryInitializeEXT(query, sceneAS,
                           gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-                          0xFF, origin, 0.01, direction, far);
+                          0x01, origin, 0.01, direction, far);
     rayQueryProceedEXT(query);
     return rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
@@ -735,7 +736,7 @@ float ray_occlusion_factor() {
         rayQueryEXT query;
         rayQueryInitializeEXT(query, sceneAS,
                               gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-                              0xFF, origin, 0.12, direction, rayOcclusion);
+                              0x01, origin, 0.12, direction, rayOcclusion);
         rayQueryProceedEXT(query);
         if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT) blocked += 1.0;
     }
@@ -937,58 +938,6 @@ vec3 calculateVolumetricLighting(vec3 worldPos, vec3 lightPos, vec3 viewPos) {
     return tint * scatter * volumetricIntensity;
 }
 
-// Global Illumination approximation with distance-based optimization
-vec3 calculateGlobalIllumination(vec3 position, vec3 normal, vec3 albedo, float distanceToCamera) {
-    if (!enableGlobalIllumination) return vec3(0.0);
-    
-    // Adaptive sample count based on distance (CRITICAL for voxel performance)
-    int baseSamples = giBounces * 4;
-    int samples = baseSamples;
-    
-    if (distanceToCamera < viewDistance * 0.5) {
-        // Very close: minimal GI (too expensive for dense voxels)
-        samples = max(2, baseSamples / 8);
-    } else if (distanceToCamera < viewDistance * 2.0) {
-        samples = max(4, baseSamples / 4);
-    } else if (distanceToCamera < viewDistance * 5.0) {
-        samples = max(6, baseSamples / 2);
-    }
-    
-    samples = min(samples, 16);
-    
-    // Very simple GI approximation using hemisphere sampling
-    vec3 gi = vec3(0.0);
-    
-    for (int i = 0; i < samples; i++) {
-        float angle = float(i) * 3.14159 * 2.0 / float(samples);
-        vec3 sampleDir = vec3(cos(angle), sin(angle), 1.0);
-        sampleDir = normalize(normal + sampleDir * 0.5);
-        
-        // Simple indirect lighting approximation
-        float indirectLight = max(0.0, dot(normal, sampleDir)) * 0.1;
-        gi += albedo * indirectLight;
-    }
-    
-    return gi * giIntensity / float(samples);
-}
-
-// Environment reflections (skybox-based) - simplified to avoid artifacts
-vec3 calculateEnvironmentReflection(vec3 N, vec3 V, float roughness, float metallic) {
-    // Calculate reflection direction
-    vec3 R = reflect(-V, N);
-    
-    // Simple uniform environment color to avoid the "two halves" effect
-    vec3 envColor = vec3(0.6, 0.7, 0.9); // Uniform sky-like color
-    
-    // Roughness affects reflection clarity
-    float reflectionStrength = (1.0 - roughness * 0.9) * 0.5; // Reduced strength
-    
-    // Metallic materials reflect more environment
-    float envContribution = mix(0.05, 0.3, metallic) * reflectionStrength; // Much reduced
-    
-    return envColor * envContribution;
-}
-
 // Simple inter-object reflections approximation
 vec3 calculateInterObjectReflections(vec3 worldPos, vec3 N, vec3 V, float roughness, float metallic) {
     // Only apply to metallic surfaces with low roughness
@@ -1012,16 +961,6 @@ vec3 calculateInterObjectReflections(vec3 worldPos, vec3 N, vec3 V, float roughn
     reflectionColor = envSample * reflectionStrength;
     
     return reflectionColor;
-}
-
-// ACES tone mapping for HDR
-vec3 ACESFilm(vec3 x) {
-    float a = 2.51;
-    float b = 0.03;
-    float c = 2.43;
-    float d = 0.59;
-    float e = 0.14;
-    return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);
 }
 
 // GPU Gems Chapter 5: Improved Perlin Noise Implementation
@@ -1514,6 +1453,280 @@ layout(set = 0, binding = 9) uniform sampler2D damageMask;
 
 #endif
 
+// The light from the sky (#655), what arrives from every direction: its
+// reflections from the octahedral map prefiltered into roughness levels,
+// the split-sum table that scales them by F0 (ae3d.skylight), and its
+// irradiance onto every normal, an octahedral map of its own.
+#ifdef VULKAN
+layout(set = 0, binding = 10) uniform sampler2D skyLight;
+layout(set = 0, binding = 11) uniform sampler2D brdfLut;
+layout(set = 0, binding = 12) uniform sampler2D skyIrradiance;
+layout(set = 0, binding = 13) uniform sampler2D occlusionMap;
+#else
+
+
+
+
+#endif
+// Whether the occlusion map holds the last frame's (FRAGMENT_SSAO): one
+// when the screen's occlusion is on and a frame has been drawn to find it.
+
+
+// The screen's occlusion at this surface: found in the last frame's image
+// where the surface was then (ClipPrev), if the depth found there is this
+// surface's -- what the last frame did not show of it (a corner just come
+// round, a figure just stepped aside), and a surface in front of the one
+// that was there, is not occluded by what the map says.
+float screen_occlusion() {
+    if (occlusionHistory == 0 || ClipPrev.w <= 0.0) return 1.0;
+    vec2 uv = ClipPrev.xy / ClipPrev.w * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
+    vec2 found = texture(occlusionMap, uv).rg;
+    if (abs(found.g - ClipPrev.w) > 0.05 * ClipPrev.w) return 1.0;
+    return found.r;
+}
+// The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
+// the upper hemisphere in the square's inner diamond, the lower folded into
+// its corners, one texel of gutter around each level holding the sky just
+// across the fold, so a filtered read at an edge is still the sky.
+#define SKY_SIZE 256.0
+#define SKY_LEVELS 6.0
+#define SKY_IRRADIANCE_SIZE 16.0
+vec3 oct_decode(vec2 p) {
+    vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0) {
+        vec2 folded = (1.0 - abs(d.zx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = folded.x;
+        d.z = folded.y;
+    }
+    return normalize(d);
+}
+vec2 oct_encode(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p;
+}
+// Where direction d is read in a level `size` texels a side.
+vec2 oct_uv(vec3 d, float size) {
+    return ((oct_encode(d) * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
+// The direction a texel of a level `size` a side stands for, at texture
+// coordinate uv: a gutter texel's folded back across the edge it lies past.
+vec3 oct_texel_direction(vec2 uv, float size) {
+    vec2 p = ((uv * size - 1.0) / (size - 2.0)) * 2.0 - 1.0;
+    if (p.x > 1.0) { p.x = 2.0 - p.x; p.y = -p.y; }
+    if (p.x < -1.0) { p.x = -2.0 - p.x; p.y = -p.y; }
+    if (p.y > 1.0) { p.y = 2.0 - p.y; p.x = -p.x; }
+    if (p.y < -1.0) { p.y = -2.0 - p.y; p.x = -p.x; }
+    return oct_decode(p);
+}
+
+vec3 sky_irradiance(vec3 n) {
+    return texture(skyIrradiance, oct_uv(n, SKY_IRRADIANCE_SIZE)).rgb;
+}
+#ifdef AE3D_RAY_QUERY
+// The probes' irradiance, where the device traces and the probes are on
+// (#537): what the sky's light and every bounce of it bring to this point,
+// in place of the sky's irradiance alone.
+layout(set = 0, binding = 14) uniform sampler2D ddgiIrradiance;
+layout(set = 0, binding = 15) uniform sampler2D ddgiDistance;
+layout(set = 0, binding = 16, std430) readonly buffer DdgiState { vec4 ddgiProbeState[]; };
+
+
+
+
+
+#define DDGI_DIMS ddgiDims
+#define DDGI_BASE(c) ddgiBase[(c)].xyz
+#define DDGI_SPACING(c) ddgiSpacing[(c)]
+#define DDGI_ATLAS ddgiAtlas
+#define DDGI_IRRADIANCE ddgiIrradiance
+#define DDGI_DISTANCE ddgiDistance
+#define DDGI_STATE(i) ddgiProbeState[(i)]
+// v wrapped into 0 to d-1 on each axis (GLSL's % is undefined for a
+// negative operand, and a grid west of the origin has negative cells).
+ivec3 ddgi_wrap(ivec3 v, ivec3 d) {
+    return v - d * ivec3(floor(vec3(v) / vec3(d)));
+}
+
+// The probe volume (#537, ae3d.vkddgi, whose layout this must match):
+// DDGI_CASCADES grids of probes around the camera, each DDGI_DIMS probes
+// DDGI_SPACING(c) apart, addressed toroidally -- a probe's slot is its
+// world cell modulo the grid -- so the grid scrolls with the camera by whole
+// cells and what a probe knows stays where it was learned. Each probe keeps
+// its irradiance and its distance moments in octahedral texels in two
+// atlases, a one-texel gutter round each, and its state -- the offset that
+// moves it out of a wall, whether it is on -- in the state buffer.
+//
+// What a shader including this defines first: DDGI_DIMS (vec4: probes a
+// side, x y z, and probes a cascade), DDGI_BASE(c) (vec3: the world cell of
+// cascade c's first probe), DDGI_SPACING(c), DDGI_ATLAS (vec4: the
+// irradiance atlas's size, then the distance atlas's), DDGI_IRRADIANCE and
+// DDGI_DISTANCE (the atlases' samplers) and DDGI_STATE(i) (vec4 i of the
+// state buffer).
+#define DDGI_CASCADES 2
+#define DDGI_IRR 6
+#define DDGI_DIST 14
+
+// A probe's index from its cascade and its slot in the grid.
+int ddgi_index(int c, ivec3 slot) {
+    ivec3 d = ivec3(DDGI_DIMS.xyz);
+    return c * int(DDGI_DIMS.w) + (slot.z * d.y + slot.y) * d.x + slot.x;
+}
+
+// The slot of the probe at grid coordinate g of cascade c (0 to DDGI_DIMS-1
+// from the cascade's first cell).
+ivec3 ddgi_slot(int c, ivec3 g) {
+    return ddgi_wrap(ivec3(DDGI_BASE(c)) + g, ivec3(DDGI_DIMS.xyz));
+}
+
+// Whether probe `index`, at grid coordinate g of cascade c, is on: traced
+// since it came to its cell, and not inside anything.
+bool ddgi_on(int c, ivec3 g, int index) {
+    vec4 stamp = DDGI_STATE(index * 2 + 1);
+    return DDGI_STATE(index * 2).w > 0.5 && stamp.w > 0.5 && all(equal(stamp.xyz, DDGI_BASE(c) + vec3(g)));
+}
+
+// Where the probe at grid coordinate g of cascade c belongs: its cell's
+// centre, not its corner, so a floor or a wall at a whole number of cells
+// does not run through a row of probes.
+vec3 ddgi_home(int c, ivec3 g) {
+    return (DDGI_BASE(c) + vec3(g) + 0.5) * DDGI_SPACING(c);
+}
+
+// Where probe `index` stands: its home and the offset its state keeps.
+vec3 ddgi_probe_position(int c, ivec3 g, int index) {
+    return ddgi_home(c, g) + DDGI_STATE(index * 2).xyz;
+}
+
+// Point P in cascade c's grid coordinates, a probe at each whole number.
+vec3 ddgi_grid(int c, vec3 P) {
+    return P / DDGI_SPACING(c) - DDGI_BASE(c) - 0.5;
+}
+
+// The atlas texel a probe's octahedron starts at (its gutter's corner).
+vec2 ddgi_corner(int index, float side) {
+    int c = index / int(DDGI_DIMS.w);
+    int local = index - c * int(DDGI_DIMS.w);
+    ivec3 d = ivec3(DDGI_DIMS.xyz);
+    int x = local % d.x;
+    int y = (local / d.x) % d.y;
+    int z = local / (d.x * d.y);
+    return vec2(float(x + y * d.x), float(z + c * d.z)) * (side + 2.0);
+}
+
+// Where direction n is read in probe `index`'s octahedron of `side` texels.
+vec2 ddgi_uv(int index, vec3 n, float side, vec2 atlas) {
+    vec2 o = oct_encode(n) * 0.5 + 0.5;
+    return (ddgi_corner(index, side) + 1.0 + o * side) / atlas;
+}
+
+// The irradiance onto a surface at P facing N, seen from V's side, from
+// the eight probes of cascade c's cell around it: trilinear, each weighed
+// by whether it faces the surface and by whether, by its distance moments,
+// it can see it (Chebyshev). The irradiance the probes keep is the cosine
+// average of the radiance, so pi times it is the irradiance; a weight sum of
+// nothing returns -1, for the caller to take what lies beyond.
+vec3 ddgi_cascade(int c, vec3 P, vec3 N, vec3 V, out float total) {
+    float spacing = DDGI_SPACING(c);
+    vec3 biased = P + (N * 0.2 + V * 0.8) * (0.3 * spacing);
+    vec3 gridPos = ddgi_grid(c, biased);
+    ivec3 g0 = ivec3(floor(gridPos));
+    vec3 alpha = clamp(gridPos - vec3(g0), 0.0, 1.0);
+    vec3 sum = vec3(0.0);
+    total = 0.0;
+    for (int i = 0; i < 8; i++) {
+        ivec3 offset = ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        ivec3 g = clamp(g0 + offset, ivec3(0), ivec3(DDGI_DIMS.xyz) - 1);
+        int index = ddgi_index(c, ddgi_slot(c, g));
+        if (!ddgi_on(c, g, index)) continue;
+        vec3 probe = ddgi_probe_position(c, g, index);
+        vec3 tri = mix(1.0 - alpha, alpha, vec3(offset));
+        float weight = tri.x * tri.y * tri.z;
+        vec3 toProbe = probe - P;
+        vec3 dirToProbe = normalize(toProbe);
+        float facing = (dot(dirToProbe, N) + 1.0) * 0.5;
+        weight *= facing * facing + 0.2;
+        vec3 fromProbe = biased - probe;
+        float dist = length(fromProbe);
+        vec2 moments = textureLod(DDGI_DISTANCE, ddgi_uv(index, fromProbe / max(dist, 1e-4), float(DDGI_DIST), DDGI_ATLAS.zw), 0.0).rg;
+        float variance = abs(moments.x * moments.x - moments.y);
+        float visible = 1.0;
+        if (dist > moments.x) {
+            float d = dist - moments.x;
+            visible = variance / (variance + d * d);
+            visible = max(visible * visible * visible, 0.0);
+        }
+        weight *= max(visible, 0.05);
+        // Small weights crushed, so a probe that barely sees the point does
+        // not tint it (Majercik et al.'s threshold).
+        if (weight < 0.2) weight *= weight * weight / 0.04;
+        vec3 irradiance = textureLod(DDGI_IRRADIANCE, ddgi_uv(index, N, float(DDGI_IRR), DDGI_ATLAS.xy), 0.0).rgb;
+        sum += irradiance * weight;
+        total += weight;
+    }
+    if (total <= 0.0) return vec3(0.0);
+    return sum / total * 3.14159265;
+}
+
+// How far inside cascade c point P is, in cells from its nearest face: past
+// one the cascade is whole; under it, the next one out takes over.
+float ddgi_inside(int c, vec3 P) {
+    vec3 gridPos = ddgi_grid(c, P);
+    vec3 edge = min(gridPos, (DDGI_DIMS.xyz - 1.0) - gridPos);
+    return min(edge.x, min(edge.y, edge.z));
+}
+
+// The probes' irradiance at P onto N, the nearest cascade that holds it
+// blending into the next over its last cell, and beyond the last the
+// `beyond` irradiance (the sky's) over the far cascade's last cell. From
+// the near cascade out, so a point the near one holds whole reads its
+// eight probes and no more.
+vec3 ddgi_irradiance(vec3 P, vec3 N, vec3 V, vec3 beyond) {
+    vec3 result = vec3(0.0);
+    float left = 1.0;
+    for (int c = 0; c < DDGI_CASCADES; c++) {
+        float inside = ddgi_inside(c, P);
+        if (inside <= 0.0) continue;
+        float total;
+        vec3 e = ddgi_cascade(c, P, N, V, total);
+        if (total <= 0.0) continue;
+        float share = clamp(inside, 0.0, 1.0) * left;
+        result += e * share;
+        left -= share;
+        if (left <= 0.0) return result;
+    }
+    return result + beyond * left;
+}
+#endif
+
+// The sky mirrored along r off a surface of `rough`: one read between the
+// two levels it lies between. Every level is laid out as level 0 is (as a
+// mip of it would be), so one coordinate is right at all of them.
+vec3 sky_reflection(vec3 r, float rough) {
+    float level = clamp(rough, 0.0, 1.0) * (SKY_LEVELS - 1.0);
+    return textureLod(skyLight, oct_uv(r, SKY_SIZE), level).rgb;
+}
+
+// What the sky gives a surface: its diffuse, Lambert over the irradiance,
+// and its reflection, prefiltered by the roughness and scaled by the split
+// sum. A material that turns image-based lighting off keeps the diffuse.
+vec3 sky_light(vec3 N, vec3 V, vec3 albedo, vec3 F0, float rough, float metal, float NdotV) {
+    if (giOff != 0) return vec3(0.0);
+    vec3 F = F0 + (max(vec3(1.0 - rough), F0) - F0) * pow(1.0 - NdotV, 5.0);
+    vec3 kD = (vec3(1.0) - F) * (1.0 - metal);
+    vec3 irradiance = sky_irradiance(N);
+#ifdef AE3D_RAY_QUERY
+    if (ddgiOn != 0) irradiance = ddgi_irradiance(FragPos, N, V, irradiance);
+#endif
+    vec3 diffuse = kD * albedo * irradiance / 3.14159265;
+    if (!enableImageBasedLighting) return diffuse;
+    vec2 ab = texture(brdfLut, vec2(NdotV, rough)).rg;
+    vec3 specular = sky_reflection(reflect(-V, N), rough) * (F0 * ab.x + ab.y);
+    return diffuse + specular * iblIntensity;
+}
+
 void main() {
     // A cut model's far side, not drawn (#545): nor its depth, which the
     // occlusion, the reflections and the water read from this pass.
@@ -1521,6 +1734,12 @@ void main() {
     // A wound's core is a hole (#543); around it, its layers.
     float woundAt = woundCount > 0 ? woundDepth(BindPos) : 2.0;
     if (woundAt < woundCore) discard;
+
+    // Before any branch returns: every surface drawn carries its motion,
+    // the glowing ones and a capture channel's frame too. An emissive
+    // surface that returned without it left the vector undefined, and the
+    // temporal pass dragged its history by whatever the driver left there.
+    outVelocity = velocity(ClipNow, ClipPrev, jitter);
 
     vec4 texColor = texture(textureSampler, fragTexCoord);
     
@@ -1531,18 +1750,15 @@ void main() {
     // An accretion disc whose whole point is that its inner edge is blue-white
     // and its rim is red came out uniformly white.
     //
-    // It also skipped tone mapping and gamma, so an emissive surface sat in a
-    // different colour space from every lit surface beside it. Both now run,
-    // which is also what lets a colour brighter than 1.0 (an instance colour is
-    // a float attribute, so it can carry one) roll off to white through ACES
-    // instead of clipping per channel and shifting hue on the way.
+    // It is radiance like every lit surface beside it, so a colour brighter
+    // than 1.0 (an instance colour is a float attribute, so it can carry one)
+    // reaches the frame's one tone curve and rolls off to white there instead
+    // of clipping per channel and shifting hue.
     //
     // exposure is the emissive strength, scaled so the 10.0 that opens this
     // branch means 1x. Below that the surface is lit normally.
     if (exposure > 10.0) {
-        vec3 emissive = diffuseColor * texColor.rgb * InstanceColor * (exposure * 0.1) * frameExposure;
-        emissive = ACESFilm(emissive);
-        FragColor = vec4(pow(emissive, vec3(1.0 / 2.2)), 1.0);
+        FragColor = vec4(diffuseColor * texColor.rgb * InstanceColor * (exposure * 0.1), 1.0);
         return;
     }
 
@@ -1560,9 +1776,6 @@ void main() {
     } else if (hasNormalMap) {
         norm = mapped_normal(norm, FragPos, fragTexCoord);
     }
-    // Before the capture channels return: a channel's frame carries the
-    // motion too.
-    outVelocity = velocity(ClipNow, ClipPrev, jitter);
     if (captureChannel == 1) {
         FragColor = vec4(diffuseColor * texColor.rgb * InstanceColor, texColor.a);
         return;
@@ -1721,25 +1934,16 @@ void main() {
         }
     }
 
-    // Ambient belongs to the scene rather than to each light, so it comes from
-    // the key light alone; summing it per light would wash the image out as
-    // lights were added.
-    vec3 keyColor = lights[0].color * kelvinToRGB(lights[0].temperature);
-    // Ambient is light arriving from every direction, so what a point can see
-    // of the sky is exactly what scales it. This is the term occlusion belongs
-    // to and the only one: darkening the direct light as well would put a
-    // shadow where a lamp is plainly shining.
-    float shut = mix(1.0, Occlusion, occlusionStrength);
-    vec3 ambient = lights[0].ambientStrength * keyColor * albedo * 0.8 * shut;
-    vec3 fillLightContrib = vec3(0.0);
-
-    // The direct light, under the clouds' shadow where a cloud drifts over.
-    vec3 color = ambient + fillLightContrib + Lo;
+    // The sky's light arrives from every direction, so what a point can see
+    // of the sky is exactly what scales it: the occlusion, baked, on the
+    // screen and by ray,
+    // belongs to this term and no other -- darkening the direct light as
+    // well would put a shadow where a lamp is plainly shining.
+    float shut = mix(1.0, Occlusion, occlusionStrength) * screen_occlusion();
 #ifdef AE3D_RAY_QUERY
-    // The occlusion by ray darkens what the screen-space pass would have,
-    // the whole of the lit surface, so the two pictures agree.
-    if (traced && rayOcclusion > 0.0) color *= ray_occlusion_factor();
+    if (traced && rayOcclusion > 0.0) shut *= ray_occlusion_factor();
 #endif
+    vec3 color = sky_light(norm, viewDir, albedo, F0, adjustedRoughness, metallic, NdotV) * shut + Lo;
 
 	// Calculate distance for performance scaling (CRITICAL for voxel terrain performance)
 	float distanceToCamera = length(FragPos - viewPos);
@@ -1750,46 +1954,22 @@ void main() {
 	vec3 volumetric = calculateVolumetricLighting(FragPos, lights[0].position, viewPos);
 	color += volumetric;
     
-	// Global Illumination (with distance LOD built-in)
-	vec3 gi = calculateGlobalIllumination(FragPos, norm, albedo, distanceToCamera);
-	color += gi;
-    
-	// Environment reflections (skybox-based), which is what image based lighting
-	// means here: light arriving from the surroundings rather than from a lamp.
-    if (enableImageBasedLighting) {
-        vec3 envReflection = calculateEnvironmentReflection(norm, viewDir, roughness, metallic);
-        color += envReflection * 0.3 * iblIntensity;
-    }
-    
     color += caustic_light(FragPos, norm) * albedo;
 
     
-    // HDR exposure and tone mapping for normal objects
-    color = color * exposure * frameExposure;
-    // Apply bloom effect
-    if (enableBloom) {
-        // Extract bright areas for bloom
-        vec3 brightColor = max(color - bloomThreshold, vec3(0.0));
-        float brightness = dot(brightColor, vec3(0.2126, 0.7152, 0.0722));
-        
-        if (brightness > 0.0) {
-            // Simple bloom approximation
-            vec3 bloom = brightColor * bloomIntensity;
-            color += bloom * 0.3; // Blend bloom back into the image
-        }
-    }
-    
-    color = ACESFilm(color);
-    
-    // Gamma correction (sRGB)
-    color = pow(color, vec3(1.0/2.2));
-    
-    // The air between the eye and the surface. After tone mapping and gamma,
-    // because fog is what is seen rather than another light in the scene: put
-    // in before them and the tone curve pulls the horizon back out again.
+    // The material's own exposure: how much light it gives back for what
+    // reaches it (a particle's glow, a dimmed decal). The frame's exposure,
+    // the bloom and the tone curve are the post pass's, once for the whole
+    // frame, so the colour written here is radiance.
+    color = color * exposure;
+
+    // The air between the eye and the surface: the light the haze scatters
+    // toward the eye in place of the surface's. Its radiance is the fog colour
+    // as it shows at an exposure of one, so a scene fogged to a colour still
+    // fades to that colour on the screen.
     if (enableFog) {
         float haze = smoothstep(fogStart, fogEnd, distanceToCamera) * fogIntensity;
-        color = mix(color, fogColor, clamp(haze, 0.0, 1.0));
+        color = mix(color, fogRadiance, clamp(haze, 0.0, 1.0));
     }
 
     // Use material alpha for transparency

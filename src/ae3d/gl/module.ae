@@ -21,6 +21,7 @@ import ae3d.lightgrid
 import ae3d.cascades
 import ae3d.lampshadows
 import ae3d.shaders
+import ae3d.skylight
 import ae3d.skin
 import ae3d.posing
 import ae3d.geometry
@@ -39,9 +40,9 @@ exports (
     renderer_set_clear_color, renderer_set_fxaa, renderer_set_bloom, renderer_set_msaa, renderer_set_taa, renderer_taa,
     renderer_set_render_scale, renderer_render_scale,
     renderer_set_target, renderer_set_overlay,
-    renderer_set_bloom_params, renderer_set_bloom_intensity, renderer_bloom_intensity,
-    renderer_set_post, renderer_set_fog, renderer_fog, renderer_set_clouds, renderer_set_sky_overcast, renderer_set_sky_sun,
-    renderer_set_ssao, renderer_ssao, renderer_set_ssr, renderer_ssr, renderer_set_ssr_params,
+    renderer_set_bloom_params, renderer_set_bloom_intensity, renderer_bloom_intensity, renderer_sky_irradiance,
+    renderer_set_post, renderer_set_fog, renderer_fog, renderer_set_clouds, renderer_set_sky_overcast, renderer_set_sky_turbidity, renderer_set_sky_sun,
+    renderer_set_ssao, renderer_ssao, renderer_set_gi, renderer_gi, renderer_indirect_irradiance, renderer_set_ssr, renderer_ssr, renderer_set_ssr_params,
     renderer_set_shadows, renderer_shadows, renderer_shadow_map, renderer_default_program,
     renderer_set_shadow_distance, renderer_shadow_distance,
     renderer_load_texture, renderer_release_texture, renderer_texture_count,
@@ -57,6 +58,8 @@ extern glfwGetCurrentContext() -> ptr
 extern strlen(s: ptr) -> int
 extern pow(x: float, y: float) -> float
 extern free(p: ptr)
+extern memcmp(a: ptr, b: ptr, n: long) -> int
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
 
 // --- pass timers, framebuffers, readback and the meter, in Aether (#398) ---------------------
 
@@ -382,8 +385,28 @@ gl_max_samples() -> int {
     return 0
 }
 
+// A multisampled texture of `width` x `height`, `samples` a pixel, attached
+// to `fbo` at `attachment`: what the scene draws into and a resolve shader
+// reads sample by sample.
+attach_multisample_texture(fbo: int, attachment: int, width: int, height: int, samples: int, internal: int) -> int {
+    w = width
+    h = height
+    if w < 1 { w = 1 }
+    if h < 1 { h = 1 }
+    texture = gl_name(NAME_TEXTURE)
+    glapi.glBindTexture(glapi.TEXTURE_2D_MULTISAMPLE as uint32, texture as uint32)
+    glapi.glTexImage2DMultisample(glapi.TEXTURE_2D_MULTISAMPLE as uint32, samples, internal, w, h, glapi.TRUE)
+    glapi.glBindTexture(glapi.TEXTURE_2D_MULTISAMPLE as uint32, 0)
+    glapi.glBindFramebuffer(glapi.FRAMEBUFFER as uint32, fbo as uint32)
+    glapi.glFramebufferTexture2D(glapi.FRAMEBUFFER as uint32, attachment as uint32,
+                                 glapi.TEXTURE_2D_MULTISAMPLE as uint32, texture as uint32, 0)
+    return texture
+}
+
+// The scene's multisampled colour, in half floats as the scene is light,
+// resolved by FRAGMENT_COLOR_RESOLVE, each sample weighed by how it shows.
 gl_fbo_attach_color_multisample(fbo: int, width: int, height: int, samples: int) -> int {
-    return attach_renderbuffer(fbo, glapi.COLOR_ATTACHMENT0, width, height, samples, glapi.RGBA8)
+    return attach_multisample_texture(fbo, glapi.COLOR_ATTACHMENT0, width, height, samples, glapi.RGBA16F)
 }
 
 gl_fbo_attach_depth_multisample(fbo: int, width: int, height: int, samples: int) -> int {
@@ -395,25 +418,6 @@ gl_fbo_attach_depth(fbo: int, width: int, height: int) -> int {
 }
 
 gl_renderbuffer_delete(rbo: int) { gl_drop(NAME_RENDERBUFFER, rbo) }
-
-// What the driver made of the blit, rather than leaving a rejected one to
-// show up as a black frame. A multisample resolve has more ways to be
-// refused than most calls: the two framebuffers have to agree about format
-// and size, and drivers differ in how much they will forgive.
-gl_fbo_resolve(source: int, destination: int, width: int, height: int) -> int {
-    drain_errors()
-    glapi.glBindFramebuffer(glapi.READ_FRAMEBUFFER as uint32, source as uint32)
-    glapi.glBindFramebuffer(glapi.DRAW_FRAMEBUFFER as uint32, destination as uint32)
-    status = (glapi.glCheckFramebufferStatus(glapi.READ_FRAMEBUFFER as uint32)) as int
-    if status != glapi.FRAMEBUFFER_COMPLETE {
-        glapi.glBindFramebuffer(glapi.FRAMEBUFFER as uint32, 0)
-        return status
-    }
-    glapi.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, glapi.COLOR_BUFFER_BIT as uint32, glapi.NEAREST as uint32)
-    status = (glapi.glGetError()) as int
-    glapi.glBindFramebuffer(glapi.FRAMEBUFFER as uint32, 0)
-    return status
-}
 
 gl_fbo_complete() -> int {
     if (glapi.glCheckFramebufferStatus(glapi.FRAMEBUFFER as uint32)) as int == glapi.FRAMEBUFFER_COMPLETE { return 1 }
@@ -518,6 +522,7 @@ const READ_FRAMEBUFFER_BINDING = 36010 // 0x8CAA
 struct GLMeter {
     texture: int
     framebuffer: int
+    source_framebuffer: int          // the light measured, attached each time
     level_framebuffer: int
     packs: ptr                       // int[METER_PACKS], pixel pack buffers
     width: int
@@ -527,7 +532,7 @@ struct GLMeter {
     level_height: int
     index: int
     filled: int
-    linear: ptr                      // float[256]: an sRGB byte's linear light
+    exposures: ptr                   // float[METER_PACKS]: what each read's frame was drawn at
 }
 
 var g_meter: ptr = null
@@ -536,14 +541,7 @@ the_meter() -> *GLMeter {
     if g_meter == null {
         m = calloc(1, sizeof(GLMeter)) as *GLMeter
         m.packs = calloc(METER_PACKS, 4)
-        m.linear = calloc(256, 8)
-        table = m.linear as float[]
-        i = 0
-        while i < 256 {
-            v = (i as float) / 255.0
-            if v <= 0.04045 { table[i] = v / 12.92 } else { table[i] = pow((v + 0.055) / 1.055, 2.4) }
-            i = i + 1
-        }
+        m.exposures = calloc(METER_PACKS, 8)
         g_meter = m as ptr
     }
     return g_meter as *GLMeter
@@ -552,6 +550,7 @@ the_meter() -> *GLMeter {
 meter_free(m: *GLMeter) {
     gl_drop(NAME_TEXTURE, m.texture)
     gl_drop(NAME_FRAMEBUFFER, m.framebuffer)
+    gl_drop(NAME_FRAMEBUFFER, m.source_framebuffer)
     gl_drop(NAME_FRAMEBUFFER, m.level_framebuffer)
     packs = m.packs as int[]
     if packs[0] != 0 { glapi.glDeleteBuffers(METER_PACKS, m.packs) }
@@ -562,6 +561,7 @@ meter_free(m: *GLMeter) {
     }
     m.texture = 0
     m.framebuffer = 0
+    m.source_framebuffer = 0
     m.level_framebuffer = 0
     m.width = 0
     m.height = 0
@@ -583,13 +583,14 @@ meter_make(m: *GLMeter, width: int, height: int) {
     }
     m.texture = gl_name(NAME_TEXTURE)
     glapi.glBindTexture(glapi.TEXTURE_2D as uint32, m.texture as uint32)
-    glapi.glTexImage2D(glapi.TEXTURE_2D as uint32, 0, glapi.RGBA, width, height, 0, glapi.RGBA as uint32,
-                       glapi.UNSIGNED_BYTE as uint32, null)
+    glapi.glTexImage2D(glapi.TEXTURE_2D as uint32, 0, glapi.RGBA16F, width, height, 0, glapi.RGBA as uint32,
+                       glapi.FLOAT as uint32, null)
     texture_param(glapi.TEXTURE_2D, TEXTURE_MAX_LEVEL, level)
     glapi.glGenerateMipmap(glapi.TEXTURE_2D as uint32)
     glapi.glBindTexture(glapi.TEXTURE_2D as uint32, 0)
     m.framebuffer = gl_name(NAME_FRAMEBUFFER)
     attach_texture(m.framebuffer, glapi.COLOR_ATTACHMENT0, m.texture, 0)
+    m.source_framebuffer = gl_name(NAME_FRAMEBUFFER)
     m.level_framebuffer = gl_name(NAME_FRAMEBUFFER)
     attach_texture(m.level_framebuffer, glapi.COLOR_ATTACHMENT0, m.texture, level)
     glapi.glGenBuffers(METER_PACKS, m.packs)
@@ -597,7 +598,7 @@ meter_make(m: *GLMeter, width: int, height: int) {
     i = 0
     while i < METER_PACKS {
         glapi.glBindBuffer(glapi.PIXEL_PACK_BUFFER as uint32, packs[i] as uint32)
-        glapi.glBufferData(glapi.PIXEL_PACK_BUFFER as uint32, (w * h * 4) as long, null, glapi.STREAM_READ as uint32)
+        glapi.glBufferData(glapi.PIXEL_PACK_BUFFER as uint32, (w * h * 16) as long, null, glapi.STREAM_READ as uint32)
         i = i + 1
     }
     glapi.glBindBuffer(glapi.PIXEL_PACK_BUFFER as uint32, 0)
@@ -608,16 +609,21 @@ meter_make(m: *GLMeter, width: int, height: int) {
     m.level_height = h
 }
 
-gl_meter(source: int, width: int, height: int, out: ptr) -> int {
-    if width < 1 || height < 1 || out == null { return 0 }
+// The light the composite read, `source` (`width` by `height`, before the
+// frame's exposure and tone curve), copied, halved by its mip chain to no
+// wider than 320 texels and read back two frames late; each texel then taken
+// through the exposure its frame was drawn at, `exposure` for this one, and
+// the tone curve: the mean linear luminance as it showed and the share of it
+// near white into out[0] and out[1]. Light averages where shown values do
+// not, so the halving is of the light and the curve comes after.
+gl_meter(source: int, width: int, height: int, exposure: float, out: ptr) -> int {
+    if source == 0 || width < 1 || height < 1 || out == null { return 0 }
     m = the_meter()
     if width != m.width || height != m.height || m.texture == 0 { meter_make(m, width, height) }
     previous_read = gl_integer(READ_FRAMEBUFFER_BINDING, 0, 1)
     previous_draw = gl_integer(glapi.DRAW_FRAMEBUFFER_BINDING, 0, 1)
-    // -1: whatever the frame was drawn into, the window or a target.
-    from = source
-    if from < 0 { from = previous_draw }
-    glapi.glBindFramebuffer(glapi.READ_FRAMEBUFFER as uint32, from as uint32)
+    attach_texture(m.source_framebuffer, glapi.COLOR_ATTACHMENT0, source, 0)
+    glapi.glBindFramebuffer(glapi.READ_FRAMEBUFFER as uint32, m.source_framebuffer as uint32)
     glapi.glBindFramebuffer(glapi.DRAW_FRAMEBUFFER as uint32, m.framebuffer as uint32)
     glapi.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, glapi.COLOR_BUFFER_BIT as uint32, glapi.NEAREST as uint32)
     glapi.glBindTexture(glapi.TEXTURE_2D as uint32, m.texture as uint32)
@@ -627,7 +633,8 @@ gl_meter(source: int, width: int, height: int, out: ptr) -> int {
     glapi.glPixelStorei(glapi.PACK_ALIGNMENT as uint32, 1)
     packs = m.packs as int[]
     glapi.glBindBuffer(glapi.PIXEL_PACK_BUFFER as uint32, packs[m.index] as uint32)
-    glapi.glReadPixels(0, 0, m.level_width, m.level_height, glapi.RGBA as uint32, glapi.UNSIGNED_BYTE as uint32, null)
+    glapi.glReadPixels(0, 0, m.level_width, m.level_height, glapi.RGBA as uint32, glapi.FLOAT as uint32, null)
+    (m.exposures as float[])[m.index] = exposure
     m.filled = m.filled + 1
     got = 0
     // The one read two frames ago, when there has been one.
@@ -636,15 +643,16 @@ gl_meter(source: int, width: int, height: int, out: ptr) -> int {
         glapi.glBindBuffer(glapi.PIXEL_PACK_BUFFER as uint32, packs[ready] as uint32)
         texels = glapi.glMapBuffer(glapi.PIXEL_PACK_BUFFER as uint32, glapi.READ_ONLY as uint32)
         if texels != null {
-            table = m.linear as float[]
+            e = (m.exposures as float[])[ready]
+            light = texels as f32[]
             count = m.level_width * m.level_height
             sum = 0.0
             white = 0
             i = 0
             while i < count {
                 at = i * 4
-                luma = 0.2126 * table[mem.get_uint8(texels, at)] + 0.7152 * table[mem.get_uint8(texels, at + 1)] +
-                       0.0722 * table[mem.get_uint8(texels, at + 2)]
+                luma = 0.2126 * core.aces_of(e * (light[at] as float)) + 0.7152 * core.aces_of(e * (light[at + 1] as float)) +
+                       0.0722 * core.aces_of(e * (light[at + 2] as float))
                 sum = sum + luma
                 if luma > 0.8 { white = white + 1 }
                 i = i + 1
@@ -905,6 +913,11 @@ gl_texture_delete(texture: int) {
 gl_texture_bind(unit: int, texture: int) {
     glapi.glActiveTexture((glapi.TEXTURE0 + unit) as uint32)
     glapi.glBindTexture(glapi.TEXTURE_2D as uint32, texture as uint32)
+}
+
+gl_texture_bind_multisample(unit: int, texture: int) {
+    glapi.glActiveTexture((glapi.TEXTURE0 + unit) as uint32)
+    glapi.glBindTexture(glapi.TEXTURE_2D_MULTISAMPLE as uint32, texture as uint32)
 }
 
 // --- geometry, attributes and draws, in Aether (#398) ---------------------------------------
@@ -1411,21 +1424,20 @@ gl_set_face_culling(on: int) {
     }
 }
 
+// Blending is the colour's alone. The motion vectors in the second draw
+// buffer are a surface's, never a mix: a vec2 output has no alpha of its
+// own to blend by, and blended they were whatever the driver made of that
+// -- on one, the scene's light read back as its motion.
 gl_set_blend(on: int) {
     if on != 0 {
         glapi.glEnable(glapi.BLEND as uint32)
+        glapi.glDisablei(glapi.BLEND as uint32, 1 as uint32)
         glapi.glBlendFunc(glapi.SRC_ALPHA as uint32, glapi.ONE_MINUS_SRC_ALPHA as uint32)
     } else {
         glapi.glDisable(glapi.BLEND as uint32)
     }
 }
 
-// What is drawn scales what is there: the occlusion pass darkening the
-// opaque scene under it. gl_set_blend(1) puts the ordinary blend back.
-gl_set_blend_multiply() {
-    glapi.glEnable(glapi.BLEND as uint32)
-    glapi.glBlendFunc(glapi.DST_COLOR as uint32, glapi.ZERO as uint32)
-}
 
 gl_set_multisample(on: int) {
     if on != 0 { glapi.glEnable(glapi.MULTISAMPLE as uint32) } else { glapi.glDisable(glapi.MULTISAMPLE as uint32) }
@@ -1489,7 +1501,7 @@ gl_buffer_delete(buffer: int) {
 
 const MAX_FBO_DIMENSION = 8192
 const MAX_LIGHTS = 16
-const LIGHT_SLOTS = 12
+const LIGHT_SLOTS = 11
 
 struct ProgramSlots {
     program: int
@@ -1567,6 +1579,14 @@ struct ProgramSlots {
     damage_on: int                 // a model's damage mask (#544)
     damage_colours: int
     damage_mask: int
+    // The sky's light (#655): its reflections, the split-sum table and its
+    // irradiance, on SKY_LIGHT_UNIT and the two after.
+    sky_light: int
+    brdf_lut: int
+    sky_irradiance: int
+    occlusion_map: int
+    occlusion_history: int
+    gi_off: int
     damage_rect: int
     damage_clamp: int
     impostor_cols: int
@@ -1579,7 +1599,6 @@ struct ProgramSlots {
     occlusion_strength: int
     capture_channel: int
     wetness: int
-    frame_exposure: int
     caustics_time: int
     fog_enabled: int
     shadow_direction: int
@@ -1588,7 +1607,7 @@ struct ProgramSlots {
     shadow_softness: int
     fog_start: int
     fog_end: int
-    fog_color: int
+    fog_radiance: int
     fog_intensity: int
     volumetric_enabled: int
     volumetric_intensity: int
@@ -1600,6 +1619,7 @@ struct ProgramSlots {
 
 struct TextureEntry {
     path: string
+    srgb: bool                         // a colour, decoded to light as it is sampled
     id: int
     refs: int
     width: int
@@ -1640,12 +1660,55 @@ struct GLRenderer {
     default_program: int
     crowd_program: int
     fxaa_program: int
-    bloom_program: int
+    // The frame's tone curve over the scene's light, with the bloom; and the
+    // multisampled scene's resolve, each sample weighed by how it shows.
+    composite_program: int
+    colour_resolve_program: int
+    // The sky's light (#655): the sky captured into an octahedral map (a
+    // Skybox record holds the capture program's uniforms, as the sky's own
+    // does), its irradiance, its reflections prefiltered a level each, and
+    // the split-sum table.
+    // The screen's occlusion (#655): found before the scene from the last
+    // frame's depth, kept with the size it was captured at.
+    occlusion_fbo: int
+    occlusion_texture: int
+    occlusion_history: int
+    // The global illumination asked for (core.GI_*; AE3D_GI's, or GI_AUTO).
+    gi: int
+    last_scene_depth: int
+    last_depth_width: int
+    last_depth_height: int
+    sky_capture: ptr
+    // What the last capture was drawn from (sky_inputs_now), and whether
+    // there was one: the sky is captured again only when something moved.
+    sky_inputs: ptr
+    sky_inputs_now: ptr
+    sky_captured: bool
+    sky_capture_texture: int
+    sky_capture_fbo: int
+    sky_irradiance_program: int
+    sky_irradiance_texture: int
+    sky_irradiance_fbo: int
+    sky_filter_program: int
+    sky_light_texture: int
+    sky_light_fbos: ptr            // int[SKY_LEVELS]
+    brdf_lut_texture: int
     // Temporal anti-aliasing: the program, two history textures written
     // in turn with a framebuffer each, the frame's count for the jitter
     // sequence, the last frame's view-projection, and whether the history
     // holds a frame yet.
     taa_program: int
+    // The bloom pyramid (FRAGMENT_BLOOM_DOWN, FRAGMENT_BLOOM_UP): its two
+    // programs, and its levels' framebuffers and textures, a level's down
+    // then its up, made for the post buffers' size (bloom_for).
+    bloom_down_program: int
+    bloom_up_program: int
+    bloom_levels: int
+    bloom_fbos: ptr                    // int[BLOOM_LEVELS * 2]
+    bloom_textures: ptr                // int[BLOOM_LEVELS * 2]
+    bloom_sizes: ptr                   // int[BLOOM_LEVELS * 2]: a level's width and height
+    bloom_made_width: int
+    bloom_made_height: int
     enable_taa: bool
     taa_fbo: int
     taa_texture0: int
@@ -1677,7 +1740,6 @@ struct GLRenderer {
     ssao_enabled: bool
     ssao_radius: float
     ssao_intensity: float
-    passthrough_program: int
     current_program: int
     default_texture: int
 
@@ -1765,6 +1827,12 @@ struct GLRenderer {
 
     post_fbo: int
     post_texture: int
+    // What the composite wrote when FXAA follows it, at the window's size,
+    // in the display's bytes; and the texture the composite read this frame,
+    // the scene's light before the tone curve, which the meter measures.
+    ldr_fbo: int
+    ldr_texture: int
+    composited: int
     post_ms_fbo: int
     post_ms_color: int
     post_ms_depth: int
@@ -1776,10 +1844,11 @@ struct GLRenderer {
     last_scene_time: float
     frame_seconds: float
     post_samples: int
+    post_resolve_reported: bool
     post_width: int
     post_height: int
     render_scale: float
-    post_resolve_reported: bool
+    post_incomplete_reported: bool
 
     scene_start: float
     scene_time: float
@@ -1790,11 +1859,10 @@ struct GLRenderer {
     sky_sun: Vec3
     sky_sun_set: bool
     sky_overcast: float
+    sky_turbidity: float           // the daylight sky's haze (#655)
     sky_overcast_color: Vec3
     defaults: ptr
     post_depth: int
-    bloom_fbo: int
-    bloom_texture: int
     screen_vao: int
     screen_vbo: int
     screen_mesh: ptr
@@ -1828,6 +1896,7 @@ const PASS_POST = 2
 
 renderer_new() -> *GLRenderer {
     r = heap.new(GLRenderer)
+    r.gi = core.gi_from_env(core.GI_AUTO)
     r.models = list.new()
     r.lights = list.new()
     r.programs = list.new()
@@ -1845,6 +1914,7 @@ renderer_new() -> *GLRenderer {
     r.capture_channel = 0
     r.wetness = 0.0
     r.frame_exposure = 1.0
+    r.sky_turbidity = core.SKY_TURBIDITY
     r.bound_normal = 0 - 1
     r.fog = core.fog_none()
     r.clear_r = 0.0
@@ -1978,15 +2048,14 @@ slots_for(r: *GLRenderer, program: int) -> *ProgramSlots {
         slots_of[base] = gl_uniform_location(program, "lights[${n}].position")
         slots_of[base + 1] = gl_uniform_location(program, "lights[${n}].color")
         slots_of[base + 2] = gl_uniform_location(program, "lights[${n}].intensity")
-        slots_of[base + 3] = gl_uniform_location(program, "lights[${n}].ambientStrength")
-        slots_of[base + 4] = gl_uniform_location(program, "lights[${n}].temperature")
-        slots_of[base + 5] = gl_uniform_location(program, "lights[${n}].isDirectional")
-        slots_of[base + 6] = gl_uniform_location(program, "lights[${n}].direction")
-        slots_of[base + 7] = gl_uniform_location(program, "lights[${n}].constantAtten")
-        slots_of[base + 8] = gl_uniform_location(program, "lights[${n}].linearAtten")
-        slots_of[base + 9] = gl_uniform_location(program, "lights[${n}].quadraticAtten")
-        slots_of[base + 10] = gl_uniform_location(program, "lights[${n}].spotCosOuter")
-        slots_of[base + 11] = gl_uniform_location(program, "lights[${n}].spotCosInner")
+        slots_of[base + 3] = gl_uniform_location(program, "lights[${n}].temperature")
+        slots_of[base + 4] = gl_uniform_location(program, "lights[${n}].isDirectional")
+        slots_of[base + 5] = gl_uniform_location(program, "lights[${n}].direction")
+        slots_of[base + 6] = gl_uniform_location(program, "lights[${n}].constantAtten")
+        slots_of[base + 7] = gl_uniform_location(program, "lights[${n}].linearAtten")
+        slots_of[base + 8] = gl_uniform_location(program, "lights[${n}].quadraticAtten")
+        slots_of[base + 9] = gl_uniform_location(program, "lights[${n}].spotCosOuter")
+        slots_of[base + 10] = gl_uniform_location(program, "lights[${n}].spotCosInner")
         n = n + 1
     }
     s.light_count = gl_uniform_location(program, "lightCount")
@@ -2038,6 +2107,12 @@ slots_for(r: *GLRenderer, program: int) -> *ProgramSlots {
     s.damage_on = gl_uniform_location(program, "damageOn")
     s.damage_colours = gl_uniform_location(program, "damageColours")
     s.damage_mask = gl_uniform_location(program, "damageMask")
+    s.sky_light = gl_uniform_location(program, "skyLight")
+    s.brdf_lut = gl_uniform_location(program, "brdfLut")
+    s.sky_irradiance = gl_uniform_location(program, "skyIrradiance")
+    s.occlusion_map = gl_uniform_location(program, "occlusionMap")
+    s.occlusion_history = gl_uniform_location(program, "occlusionHistory")
+    s.gi_off = gl_uniform_location(program, "giOff")
     s.damage_rect = gl_uniform_location(program, "damageRect")
     s.damage_clamp = gl_uniform_location(program, "damageClamp")
     s.impostor_cols = gl_uniform_location(program, "impostorCols")
@@ -2059,7 +2134,6 @@ slots_for(r: *GLRenderer, program: int) -> *ProgramSlots {
     s.occlusion_strength = gl_uniform_location(program, "occlusionStrength")
     s.capture_channel = gl_uniform_location(program, "captureChannel")
     s.wetness = gl_uniform_location(program, "wetness")
-    s.frame_exposure = gl_uniform_location(program, "frameExposure")
     s.caustics_time = gl_uniform_location(program, "causticsTime")
     s.shadow_direction = gl_uniform_location(program, "shadowDirection")
     s.enable_shadows = gl_uniform_location(program, "enableShadows")
@@ -2068,7 +2142,7 @@ slots_for(r: *GLRenderer, program: int) -> *ProgramSlots {
     s.fog_enabled = gl_uniform_location(program, "enableFog")
     s.fog_start = gl_uniform_location(program, "fogStart")
     s.fog_end = gl_uniform_location(program, "fogEnd")
-    s.fog_color = gl_uniform_location(program, "fogColor")
+    s.fog_radiance = gl_uniform_location(program, "fogRadiance")
     s.fog_intensity = gl_uniform_location(program, "fogIntensity")
     s.volumetric_enabled = gl_uniform_location(program, "enableVolumetricLighting")
     s.volumetric_intensity = gl_uniform_location(program, "volumetricIntensity")
@@ -2460,11 +2534,16 @@ renderer_init(r: *GLRenderer, window: ptr, width: int, height: int) -> int {
     // walking shadow, not a bind-pose one. Same fragment (depth only).
     r.crowd_shadow_program = compile_program(shaders.VERTEX_CROWD_DEPTH, shaders.FRAGMENT_DEPTH, "crowd_depth")
     r.fxaa_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_FXAA, "fxaa")
-    r.bloom_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_BLOOM, "bloom")
+    r.composite_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_COMPOSITE, "composite")
     r.taa_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_TAA, "taa")
+    r.bloom_down_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_BLOOM_DOWN, "bloom down")
+    r.bloom_up_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_BLOOM_UP, "bloom up")
     r.ssao_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_SSAO, "ssao")
     r.ssr_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_SSR, "ssr")
-    r.passthrough_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_PASSTHROUGH, "passthrough")
+    r.colour_resolve_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_COLOR_RESOLVE, "colour resolve")
+    // The scene is light and the composite is what makes it a frame: without
+    // either there is no frame to show.
+    if r.composite_program == 0 || r.colour_resolve_program == 0 { return 0 }
 
     r.default_texture = create_default_texture(r)
 
@@ -2485,6 +2564,8 @@ renderer_init(r: *GLRenderer, window: ptr, width: int, height: int) -> int {
     r.wireframe_state = false
 
     init_post_processing(r, width, height)
+    if !init_sky_light(r) { return 0 }
+    ensure_cloud_textures(r, false)
 
     r.initialized = true
     if r.shadow_enabled { renderer_set_shadows(r, true) }
@@ -2502,14 +2583,21 @@ create_default_texture(r: *GLRenderer) -> int {
     return id
 }
 
-renderer_load_texture(r: *GLRenderer, path: string) -> int {
+// A colour from a file -- a surface's albedo, what a texture id names --
+// stored as sRGB and sampled as light.
+renderer_load_texture(r: *GLRenderer, path: string) -> int { return load_texture_as(r, path, true) }
+
+// A file's texture, through the cache: a colour (`srgb`), or data -- a
+// normal map, a painted sky, which the sky's shader takes to light itself --
+// read as its bytes say. The same file as both is two textures.
+load_texture_as(r: *GLRenderer, path: string, srgb: bool) -> int {
     if path == "" { return 0 }
 
     count = list.size(r.textures)
     i = 0
     while i < count {
         entry = list.get_raw(r.textures, i) as *TextureEntry
-        if entry != null && string.equals(entry.path, path) == 1 {
+        if entry != null && entry.srgb == srgb && string.equals(entry.path, path) == 1 {
             entry.refs = entry.refs + 1
             return entry.id
         }
@@ -2526,7 +2614,9 @@ renderer_load_texture(r: *GLRenderer, path: string) -> int {
     // textures stop at 16,384): drawn at the most it has, not refused.
     halvings = picture.fit(image, gl_max_texture_size())
     if halvings > 0 { println("ae3d: ${path} is larger than this device's textures; halved ${halvings} time(s) to fit") }
-    id = gl_texture_from_image(image, 0, 1)
+    as_srgb = 0
+    if srgb { as_srgb = 1 }
+    id = gl_texture_from_image(image, as_srgb, 1)
     // Read before the image is released. How many pixels an image has is half
     // of what decides whether a surface carries enough detail to be looked at
     // closely; the other half is how far its UVs stretch, and neither is
@@ -2538,6 +2628,7 @@ renderer_load_texture(r: *GLRenderer, path: string) -> int {
 
     entry = heap.new(TextureEntry)
     texture_entry_set_path(entry, path)
+    entry.srgb = srgb
     entry.id = id
     entry.refs = 1
     entry.width = width
@@ -2591,12 +2682,12 @@ renderer_set_frame_exposure(r: *GLRenderer, exposure: float) {
     if r != null { r.frame_exposure = exposure }
 }
 
-// The finished frame's mean and brightest linear luminance into out[0] and
-// out[1], two frames late: false until the first measure is back. Called
-// after the frame is drawn, with its framebuffer still bound.
+// The frame's mean linear luminance as it showed and the share of it near
+// white into out[0] and out[1], two frames late: false until the first
+// measure is back. Called after the frame is drawn.
 renderer_meter(r: *GLRenderer, out: ptr) -> bool {
     if r == null { return false }
-    return gl_meter(0 - 1, r.viewport_width, r.viewport_height, out) == 1
+    return gl_meter(r.composited, r.post_width, r.post_height, r.frame_exposure, out) == 1
 }
 
 renderer_set_occlusion_strength(r: *GLRenderer, strength: float) {
@@ -2749,7 +2840,7 @@ resolve_material_texture(r: *GLRenderer, material: *Material) {
 resolve_material_normal(r: *GLRenderer, material: *Material) {
     material.normal_stale = false
     if core.text(material.normal_path) == "" || material.normal_id != 0 { return }
-    material.normal_id = renderer_load_texture(r, material.normal_path)
+    material.normal_id = load_texture_as(r, material.normal_path, false)
 }
 
 normal_for(r: *GLRenderer, material: *Material) -> int {
@@ -2929,6 +3020,12 @@ renderer_set_clouds(r: *GLRenderer, cover: float, wind: float) {
     r.cloud_wind = wind
 }
 
+// How hazy the daylight sky's air is (Preetham's turbidity: 2 a clear
+// blue day, 6 a hazy one).
+renderer_set_sky_turbidity(r: *GLRenderer, turbidity: float) {
+    if r != null { r.sky_turbidity = turbidity }
+}
+
 renderer_set_sky_overcast(r: *GLRenderer, amount: float, color: Vec3) {
     r.sky_overcast = amount
     r.sky_overcast_color = color
@@ -2989,6 +3086,22 @@ renderer_set_ssao(r: *GLRenderer, on: bool, radius: float, intensity: float) {
 }
 
 renderer_ssao(r: *GLRenderer) -> bool { return r.ssao_enabled }
+
+// The global illumination asked for (core.GI_*). OpenGL does not trace:
+// GI_RT and GI_AUTO are the sky's light (#655), GI_OFF the direct light
+// only. What is in effect: GI_SKY or GI_OFF.
+renderer_set_gi(r: *GLRenderer, mode: int) { r.gi = mode }
+renderer_gi(r: *GLRenderer) -> int {
+    if r.gi == core.GI_OFF { return core.GI_OFF }
+    return core.GI_SKY
+}
+
+// The light that is not the lights' onto a surface at `p` facing `n`, seen
+// along `v`: the sky's, or none under GI_OFF.
+renderer_indirect_irradiance(r: *GLRenderer, p: Vec3, n: Vec3, v: Vec3) -> Vec3 {
+    if r.gi == core.GI_OFF { return core.vec3(0.0, 0.0, 0.0) }
+    return renderer_sky_irradiance(r, n)
+}
 
 // Screen-space reflections on or off, and the wet plane's height and how
 // strongly it reflects: the frame through the post chain, its reflection
@@ -3831,7 +3944,7 @@ skybox_create(r: *GLRenderer, path: string) -> *Skybox {
     // since the shader reads one whether or not it is used.
     procedural = string.equals(path, core.SKY_PROCEDURAL) == 1
     texture = r.default_texture
-    if !procedural { texture = renderer_load_texture(r, path) }
+    if !procedural { texture = load_texture_as(r, path, false) }
     if texture == 0 {
         println("ae3d: skybox texture unavailable, falling back to a solid sky")
         return core.skybox_solid(0.5, 0.7, 1.0)
@@ -3846,24 +3959,8 @@ skybox_create(r: *GLRenderer, path: string) -> *Skybox {
         sky.texture = 0
         return sky
     }
-    sky.u_sky_procedural = gl_uniform_location(sky.program, "skyProcedural")
-    sky.u_cloud_weather = gl_uniform_location(sky.program, "cloudWeather")
-    sky.u_cloud_shape = gl_uniform_location(sky.program, "cloudShape")
+    sky_slots(sky)
     ensure_cloud_textures(r, r.cloud_cover > 0.0)
-
-    sky.u_view = gl_uniform_location(sky.program, "view")
-    sky.u_projection = gl_uniform_location(sky.program, "projection")
-    sky.u_prev_view_projection = gl_uniform_location(sky.program, "prevViewProjection")
-    sky.u_sampler = gl_uniform_location(sky.program, "skybox")
-    sky.u_cloud_cover = gl_uniform_location(sky.program, "cloudCover")
-    sky.u_sky_overcast = gl_uniform_location(sky.program, "skyOvercast")
-    sky.u_sky_overcast_color = gl_uniform_location(sky.program, "skyOvercastColor")
-    sky.u_cloud_time = gl_uniform_location(sky.program, "cloudTime")
-    sky.u_cloud_frame = gl_uniform_location(sky.program, "cloudFrame")
-    sky.u_cloud_sun = gl_uniform_location(sky.program, "cloudSun")
-    sky.u_cloud_sun_color = gl_uniform_location(sky.program, "cloudSunColor")
-    sky.u_sky_sun = gl_uniform_location(sky.program, "skySun")
-    sky.u_cloud_eye = gl_uniform_location(sky.program, "viewPos")
 
     sky.mesh = core.mesh_create()
     core.mesh_push_skybox_cube(sky.mesh, sky.size)
@@ -3890,12 +3987,62 @@ skybox_free(r: *GLRenderer, sky: *Skybox) {
 
 // The sky must sit behind everything, so its translation is stripped from the
 // view matrix and it is drawn with depth writes off.
+// Where `sky.program` reads what the sky is drawn from: the sky's own
+// program, or its capture's.
+sky_slots(sky: *Skybox) {
+    sky.u_sky_procedural = gl_uniform_location(sky.program, "skyProcedural")
+    sky.u_sky_flat = gl_uniform_location(sky.program, "skyFlat")
+    sky.u_sky_turbidity = gl_uniform_location(sky.program, "skyTurbidity")
+    sky.u_cloud_weather = gl_uniform_location(sky.program, "cloudWeather")
+    sky.u_cloud_shape = gl_uniform_location(sky.program, "cloudShape")
+    sky.u_view = gl_uniform_location(sky.program, "view")
+    sky.u_projection = gl_uniform_location(sky.program, "projection")
+    sky.u_prev_view_projection = gl_uniform_location(sky.program, "prevViewProjection")
+    sky.u_sampler = gl_uniform_location(sky.program, "skybox")
+    sky.u_cloud_cover = gl_uniform_location(sky.program, "cloudCover")
+    sky.u_sky_overcast = gl_uniform_location(sky.program, "skyOvercast")
+    sky.u_sky_overcast_color = gl_uniform_location(sky.program, "skyOvercastColor")
+    sky.u_cloud_time = gl_uniform_location(sky.program, "cloudTime")
+    sky.u_cloud_frame = gl_uniform_location(sky.program, "cloudFrame")
+    sky.u_cloud_sun = gl_uniform_location(sky.program, "cloudSun")
+    sky.u_cloud_sun_color = gl_uniform_location(sky.program, "cloudSunColor")
+    sky.u_sky_sun = gl_uniform_location(sky.program, "skySun")
+    sky.u_cloud_eye = gl_uniform_location(sky.program, "viewPos")
+}
+
 render_skybox(r: *GLRenderer, cam: *Camera, light: *Light) {
     sky = r.skybox as *Skybox
     if sky == null || sky.texture == 0 || sky.vao == 0 { return }
 
     use_program(r, sky.program)
     gl_uniform_int(sky.u_sky_procedural, flag_int(sky.procedural))
+    sky_inputs(r, sky, cam, light, sky.texture)
+
+    view = core.camera_view(cam)
+    view.m12 = 0.0
+    view.m13 = 0.0
+    view.m14 = 0.0
+    projection = core.camera_projection(cam)
+
+    gl_uniform_mat4(sky.u_view, &view)
+    gl_uniform_mat4(sky.u_projection, &projection)
+    // Last frame's view, for the sky's motion vector: the camera's turn.
+    previous = core.camera_view_projection(cam)
+    if r.prev_vp_valid { previous = r.prev_vp }
+    gl_uniform_mat4(sky.u_prev_view_projection, &previous)
+
+    gl_set_depth_mask(0)
+    gl_vao_bind(sky.vao)
+    gl_draw_arrays(0, 36)
+    gl_vao_bind(0)
+    gl_set_depth_mask(1)
+    r.last_draw_calls = r.last_draw_calls + 1
+}
+
+// What the sky is drawn from, into the program `sky` names (in use): the
+// clouds and the sun that lights them, the hour's sun, the eye, and the
+// sky's image with the clouds' textures on units 0 to 2.
+sky_inputs(r: *GLRenderer, sky: *Skybox, cam: *Camera, light: *Light, texture: int) {
     // The clouds over the image, lit by the scene's key light.
     gl_uniform_float(sky.u_cloud_cover, r.cloud_cover)
     gl_uniform_float(sky.u_sky_overcast, r.sky_overcast)
@@ -3922,34 +4069,282 @@ render_skybox(r: *GLRenderer, cam: *Camera, light: *Light) {
     } else {
         gl_uniform_vec3(sky.u_sky_sun, 0.0, 1.0, 0.0)
     }
-
-    view = core.camera_view(cam)
-    view.m12 = 0.0
-    view.m13 = 0.0
-    view.m14 = 0.0
-    projection = core.camera_projection(cam)
-
-    gl_uniform_mat4(sky.u_view, &view)
-    gl_uniform_mat4(sky.u_projection, &projection)
-    // Last frame's view, for the sky's motion vector: the camera's turn.
-    previous = core.camera_view_projection(cam)
-    if r.prev_vp_valid { previous = r.prev_vp }
-    gl_uniform_mat4(sky.u_prev_view_projection, &previous)
+    gl_uniform_float(sky.u_sky_turbidity, r.sky_turbidity)
     gl_uniform_int(sky.u_sampler, 0)
-
     if r.cloud_cover > 0.0 { ensure_cloud_textures(r, true) }
-    gl_set_depth_mask(0)
-    gl_texture_bind(0, sky.texture)
     gl_uniform_int(sky.u_cloud_weather, 1)
-    gl_texture_bind(1, r.cloud_weather_texture)
     gl_uniform_int(sky.u_cloud_shape, 2)
+    // Unit 2 and 1 first, so the active unit is left at 0.
     gl_texture3d_bind(2, r.cloud_shape_texture)
+    gl_texture_bind(1, r.cloud_weather_texture)
+    gl_texture_bind(0, texture)
     r.bound_texture = 0 - 1
-    gl_vao_bind(sky.vao)
-    gl_draw_arrays(0, 36)
+}
+
+// The capture and its filters drawn: the sky into the octahedral map, its
+// mips, its irradiance, its reflections a level at a time.
+draw_sky_capture(r: *GLRenderer, capture: *Skybox, cam: *Camera, light: *Light, texture: int, kind: int) {
+    set_depth_test(r, false)
+    gl_set_depth_mask(0)
+    set_blend(r, false)
+    set_wireframe(r, false)
+    use_program(r, capture.program)
+    gl_uniform_int(capture.u_sky_procedural, kind)
+    gl_uniform_vec3(capture.u_sky_flat, r.clear_r, r.clear_g, r.clear_b)
+    sky_inputs(r, capture, cam, light, texture)
+    gl_vao_bind(r.screen_vao)
+    gl_fbo_bind(r.sky_capture_fbo)
+    gl_viewport(0, 0, skylight.SIZE, skylight.SIZE)
+    gl_draw_arrays(0, 6)
+    glapi.glBindTexture(glapi.TEXTURE_2D as uint32, r.sky_capture_texture as uint32)
+    glapi.glGenerateMipmap(glapi.TEXTURE_2D as uint32)
+
+    gl_fbo_bind(r.sky_irradiance_fbo)
+    gl_viewport(0, 0, skylight.IRRADIANCE_SIZE, skylight.IRRADIANCE_SIZE)
+    use_program(r, r.sky_irradiance_program)
+    gl_uniform_int(gl_uniform_location(r.sky_irradiance_program, "skyCapture"), 0)
+    gl_draw_arrays(0, 6)
+
+    use_program(r, r.sky_filter_program)
+    gl_uniform_int(gl_uniform_location(r.sky_filter_program, "skyCapture"), 0)
+    k = 0
+    while k < skylight.LEVELS {
+        size = skylight.SIZE >> k
+        gl_fbo_bind((r.sky_light_fbos as int[])[k])
+        gl_viewport(0, 0, size, size)
+        gl_uniform_float(gl_uniform_location(r.sky_filter_program, "skyLevelSize"), size as float)
+        gl_uniform_float(gl_uniform_location(r.sky_filter_program, "skyRoughness"), (k as float) / ((skylight.LEVELS - 1) as float))
+        gl_draw_arrays(0, 6)
+        k = k + 1
+    }
     gl_vao_bind(0)
+}
+
+// What the capture is drawn from, into r.sky_inputs_now -- the sky's image
+// and kind, its flat colour, the sun's direction and light, the overcast,
+// the turbidity and, where there are clouds, their cover, drift, dither and
+// the eye -- and whether it differs from what the last capture was drawn
+// from (or there has been none), kept as the last when it does.
+sky_inputs_now(r: *GLRenderer, cam: *Camera, light: *Light, texture: int, kind: int) -> bool {
+    if r.sky_inputs == null {
+        r.sky_inputs = calloc(SKY_INPUTS, 4)
+        r.sky_inputs_now = calloc(SKY_INPUTS, 4)
+    }
+    v = r.sky_inputs_now as f32[]
+    v[0] = texture as f32
+    v[1] = kind as f32
+    v[2] = r.clear_r as f32
+    v[3] = r.clear_g as f32
+    v[4] = r.clear_b as f32
+    v[5] = r.sky_overcast as f32
+    v[6] = r.sky_overcast_color.x as f32
+    v[7] = r.sky_overcast_color.y as f32
+    v[8] = r.sky_overcast_color.z as f32
+    v[9] = r.sky_turbidity as f32
+    v[10] = r.cloud_cover as f32
+    sun = key_light(r.lights, light)
+    toward = core.vec3(0.0, 1.0, 0.0)
+    shine = core.vec3(1.0, 1.0, 1.0)
+    if sun != null {
+        toward = sun.direction
+        shine = core.v3_mul(sun.color, sun.intensity)
+    }
+    hour = toward
+    if r.sky_sun_set { hour = r.sky_sun }
+    v[11] = toward.x as f32
+    v[12] = toward.y as f32
+    v[13] = toward.z as f32
+    v[14] = shine.x as f32
+    v[15] = shine.y as f32
+    v[16] = shine.z as f32
+    v[17] = hour.x as f32
+    v[18] = hour.y as f32
+    v[19] = hour.z as f32
+    k = 20
+    while k < SKY_INPUTS {
+        v[k] = 0.0 as f32
+        k = k + 1
+    }
+    if r.cloud_cover > 0.0 {
+        v[20] = (r.scene_time * r.cloud_wind) as f32
+        if r.enable_taa { v[21] = (r.taa_frame % 64 + 1) as f32 }
+        v[22] = cam.position.x as f32
+        v[23] = cam.position.y as f32
+        v[24] = cam.position.z as f32
+        v[25] = r.cloud_weather_texture as f32
+        v[26] = r.cloud_shape_texture as f32
+    }
+    if r.sky_captured && memcmp(r.sky_inputs, r.sky_inputs_now, (SKY_INPUTS * 4) as long) == 0 { return false }
+    memcpy(r.sky_inputs, r.sky_inputs_now, (SKY_INPUTS * 4) as long)
+    r.sky_captured = true
+    return true
+}
+
+// The sky this frame is lit by (#655), drawn before the scene: the scene's
+// sky, painted or from the sun, or with none the clear colour all round,
+// captured into the octahedral map; its mips by glGenerateMipmap; its
+// irradiance; its reflections, a level at a time. The sky's light is left
+// bound on SKY_LIGHT_UNIT and the two after it.
+capture_sky(r: *GLRenderer, cam: *Camera, light: *Light) {
+    // The frame's size is read from the viewport after this: kept, and put
+    // back.
+    frame_width = gl_viewport_width()
+    frame_height = gl_viewport_height()
+    capture = r.sky_capture as *Skybox
+    sky = r.skybox as *Skybox
+    texture = r.default_texture
+    kind = 2
+    if sky != null && sky.texture != 0 {
+        texture = sky.texture
+        kind = 0
+        if sky.procedural { kind = 1 }
+    }
+    if sky_inputs_now(r, cam, light, texture, kind) {
+        draw_sky_capture(r, capture, cam, light, texture, kind)
+    }
+    gl_viewport(0, 0, frame_width, frame_height)
+    // Units 12 and 11 first, so the active unit is left at 10 and then 0.
+    gl_texture_bind(SKY_LIGHT_UNIT + 2, r.sky_irradiance_texture)
+    gl_texture_bind(SKY_LIGHT_UNIT + 1, r.brdf_lut_texture)
+    gl_texture_bind(SKY_LIGHT_UNIT, r.sky_light_texture)
+    glapi.glActiveTexture(glapi.TEXTURE0 as uint32)
+    r.bound_texture = 0 - 1
+    set_depth_test(r, core.depth_test())
     gl_set_depth_mask(1)
-    r.last_draw_calls = r.last_draw_calls + 1
+    set_blend(r, true)
+}
+
+// The sky's irradiance onto a surface facing `n`, read back from the
+// device: what the agent explains a surface's light by. Waits for the frame
+// that made it.
+renderer_sky_irradiance(r: *GLRenderer, n: Vec3) -> Vec3 {
+    if r == null || r.sky_irradiance_texture == 0 { return core.vec3(0.0, 0.0, 0.0) }
+    texels = calloc(skylight.IRRADIANCE_SIZE * skylight.IRRADIANCE_SIZE * 4, 4)
+    glapi.glActiveTexture(glapi.TEXTURE0 as uint32)
+    glapi.glBindTexture(glapi.TEXTURE_2D as uint32, r.sky_irradiance_texture as uint32)
+    glapi.glGetTexImage(glapi.TEXTURE_2D as uint32, 0, glapi.RGBA as uint32, glapi.FLOAT as uint32, texels)
+    glapi.glBindTexture(glapi.TEXTURE_2D as uint32, 0)
+    r.bound_texture = 0 - 1
+    e = skylight.irradiance_at(texels, n)
+    free(texels)
+    return e
+}
+
+// The units the sky's light is bound on, past the damage mask's, and the
+// screen's occlusion after them.
+const SKY_LIGHT_UNIT = 10
+const OCCLUSION_UNIT = 13
+// The bloom's levels at most, as the Vulkan backend has them (vktargets).
+const BLOOM_LEVELS = 6
+// The values a sky capture is drawn from (sky_inputs_now).
+const SKY_INPUTS = 27
+
+// A texture of `levels` levels from `size` texels a side, half floats,
+// clamped, read between its texels and with `min` between its levels.
+sky_texture(size: int, levels: int, min: int) -> int {
+    texture = gl_name(NAME_TEXTURE)
+    glapi.glActiveTexture(glapi.TEXTURE0 as uint32)
+    glapi.glBindTexture(glapi.TEXTURE_2D as uint32, texture as uint32)
+    level = 0
+    while level < levels {
+        side = size >> level
+        if side < 1 { side = 1 }
+        glapi.glTexImage2D(glapi.TEXTURE_2D as uint32, level, glapi.RGBA16F, side, side, 0, glapi.RGBA as uint32,
+                           glapi.FLOAT as uint32, null)
+        level = level + 1
+    }
+    texture_param(glapi.TEXTURE_2D, TEXTURE_MAX_LEVEL, levels - 1)
+    texture_params(glapi.TEXTURE_2D, glapi.CLAMP_TO_EDGE, false, glapi.LINEAR, min)
+    glapi.glBindTexture(glapi.TEXTURE_2D as uint32, 0)
+    return texture
+}
+
+// A framebuffer over level `level` of `texture`.
+level_fbo(texture: int, level: int) -> int {
+    fbo = gl_fbo_create()
+    attach_texture(fbo, glapi.COLOR_ATTACHMENT0, texture, level)
+    gl_fbo_bind(0)
+    return fbo
+}
+
+// The sky's light, made at start: its programs, its textures and their
+// framebuffers, the split-sum table. False when one would not make.
+init_sky_light(r: *GLRenderer) -> bool {
+    capture = core.skybox_solid(0.0, 0.0, 0.0)
+    source = string.replace(shaders.FRAGMENT_SKYBOX, "#version 330 core\n", "#version 330 core\n#define AE3D_SKY_CAPTURE 1\n")
+    capture.program = compile_program(shaders.VERTEX_SCREEN, source, "sky capture")
+    string.free(source)
+    if capture.program == 0 { return false }
+    sky_slots(capture)
+    r.sky_capture = capture as ptr
+    r.sky_irradiance_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_SKY_IRRADIANCE, "sky irradiance")
+    r.sky_filter_program = compile_program(shaders.VERTEX_SCREEN, shaders.FRAGMENT_SKY_FILTER, "sky filter")
+    if r.sky_irradiance_program == 0 || r.sky_filter_program == 0 { return false }
+
+    capture_levels = 9
+    r.sky_capture_texture = sky_texture(skylight.SIZE, capture_levels, glapi.LINEAR_MIPMAP_LINEAR)
+    r.sky_capture_fbo = level_fbo(r.sky_capture_texture, 0)
+    r.sky_irradiance_texture = sky_texture(skylight.IRRADIANCE_SIZE, 1, glapi.LINEAR)
+    r.sky_irradiance_fbo = level_fbo(r.sky_irradiance_texture, 0)
+    r.sky_light_texture = sky_texture(skylight.SIZE, skylight.LEVELS, glapi.LINEAR_MIPMAP_LINEAR)
+    r.sky_light_fbos = calloc(skylight.LEVELS, 4)
+    k = 0
+    while k < skylight.LEVELS {
+        (r.sky_light_fbos as int[])[k] = level_fbo(r.sky_light_texture, k)
+        k = k + 1
+    }
+
+    table = skylight.brdf_lut()
+    count = skylight.LUT_SIZE * skylight.LUT_SIZE * 2
+    values = calloc(count, 4)
+    i = 0
+    while i < count {
+        (values as f32[])[i] = ((table as float[])[i]) as f32
+        i = i + 1
+    }
+    free(table)
+    r.brdf_lut_texture = gl_name(NAME_TEXTURE)
+    glapi.glActiveTexture(glapi.TEXTURE0 as uint32)
+    glapi.glBindTexture(glapi.TEXTURE_2D as uint32, r.brdf_lut_texture as uint32)
+    glapi.glTexImage2D(glapi.TEXTURE_2D as uint32, 0, glapi.RG16F, skylight.LUT_SIZE, skylight.LUT_SIZE, 0,
+                       glapi.RG as uint32, glapi.FLOAT as uint32, values)
+    texture_params(glapi.TEXTURE_2D, glapi.CLAMP_TO_EDGE, false, glapi.LINEAR, glapi.LINEAR)
+    glapi.glBindTexture(glapi.TEXTURE_2D as uint32, 0)
+    free(values)
+    return true
+}
+
+free_sky_light(r: *GLRenderer) {
+    if r.sky_capture != null {
+        capture = r.sky_capture as *Skybox
+        if capture.program != 0 { gl_program_delete(capture.program) }
+        heap.free(capture)
+        r.sky_capture = null
+    }
+    if r.sky_irradiance_program != 0 { gl_program_delete(r.sky_irradiance_program) ; r.sky_irradiance_program = 0 }
+    if r.sky_filter_program != 0 { gl_program_delete(r.sky_filter_program) ; r.sky_filter_program = 0 }
+    if r.sky_light_fbos != null {
+        k = 0
+        while k < skylight.LEVELS {
+            gl_fbo_delete((r.sky_light_fbos as int[])[k])
+            k = k + 1
+        }
+        free(r.sky_light_fbos)
+        r.sky_light_fbos = null
+    }
+    gl_fbo_delete(r.sky_capture_fbo)
+    gl_fbo_delete(r.sky_irradiance_fbo)
+    gl_texture_delete(r.sky_capture_texture)
+    gl_texture_delete(r.sky_irradiance_texture)
+    gl_texture_delete(r.sky_light_texture)
+    gl_texture_delete(r.brdf_lut_texture)
+    r.sky_capture_fbo = 0
+    r.sky_captured = false
+    r.sky_irradiance_fbo = 0
+    r.sky_capture_texture = 0
+    r.sky_irradiance_texture = 0
+    r.sky_light_texture = 0
+    r.brdf_lut_texture = 0
 }
 
 renderer_update_viewport(r: *GLRenderer, width: int, height: int) {
@@ -4026,9 +4421,20 @@ renderer_render(r: *GLRenderer, cam: *Camera, light: *Light) {
     gl_passtimer_end(r.pass_timer)
 
     gl_passtimer_begin(r.pass_timer, PASS_SCENE)
+    capture_sky(r, cam, active_light)
     bind_output(r)
     post_active = begin_post_processing(r)
     r.last_post_active = post_active
+    // The screen's occlusion from the last frame's depth, before the scene
+    // draws into the buffers it was found for.
+    r.occlusion_history = 0
+    if post_active && occlusion_pass(r, cam) {
+        r.occlusion_history = 1
+        begin_post_processing(r)
+    }
+    gl_texture_bind(OCCLUSION_UNIT, r.occlusion_texture)
+    glapi.glActiveTexture(glapi.TEXTURE0 as uint32)
+    r.bound_texture = 0 - 1
 
     set_wireframe(r, core.debug_enabled())
 
@@ -4041,7 +4447,9 @@ renderer_render(r: *GLRenderer, cam: *Camera, light: *Light) {
     // was nearer a moment ago. render_shadow_pass already guards its own clear
     // for this reason.
     gl_set_depth_mask(1)
-    gl_clear_color(r.clear_r, r.clear_g, r.clear_b, 1.0)
+    // The clear colour is given as it shows; the scene it clears is light.
+    clear = core.display_radiance(core.vec3(r.clear_r, r.clear_g, r.clear_b))
+    gl_clear_color(clear.x, clear.y, clear.z, 1.0)
     gl_clear(1, 1)
     // The motion vectors start at zero, whatever the clear colour is.
     if post_active && r.post_velocity != 0 { gl_clear_attachment(1, 0.0, 0.0, 0.0, 0.0) }
@@ -4076,7 +4484,10 @@ renderer_render(r: *GLRenderer, cam: *Camera, light: *Light) {
     // when something will read it.
     r.scene_depth = 0
     if wants_scene_depth(r) || r.ssao_enabled || r.enable_taa || r.ssr_enabled { r.scene_depth = gl_scene_depth_capture() }
-    if r.ssao_enabled && r.scene_depth != 0 && r.capture_channel == 0 { draw_occlusion(r, cam) }
+    // Kept for the next frame's occlusion, with the size it was captured at.
+    r.last_scene_depth = r.scene_depth
+    r.last_depth_width = r.post_width
+    r.last_depth_height = r.post_height
 
     count = list.size(r.models)
     i = 0
@@ -4416,14 +4827,18 @@ wants_scene_depth(r: *GLRenderer) -> bool {
     return false
 }
 
-// The occlusion over the opaque scene: the depth just captured, read by a
-// fullscreen draw that multiplies what is there by how much of the
-// hemisphere over each pixel the depth says is filled. Before the
-// transparent pass, so the water is not darkened by the ground it hides.
-draw_occlusion(r: *GLRenderer, cam: *Camera) {
-    if r.ssao_program == 0 || r.screen_vao == 0 { return }
+// The screen's occlusion found before the scene (#655): from the last
+// frame's captured depth into the occlusion map, which the scene shader
+// reads where each surface was then; false when there is no last frame's
+// depth at the post buffers' present size. Leaves the scene's framebuffer
+// for the caller to bind again.
+occlusion_pass(r: *GLRenderer, cam: *Camera) -> bool {
+    if !r.ssao_enabled || r.ssao_program == 0 || r.screen_vao == 0 || r.capture_channel != 0 { return false }
+    if r.occlusion_fbo == 0 || r.last_scene_depth == 0 { return false }
+    if r.last_depth_width != r.post_width || r.last_depth_height != r.post_height { return false }
     use_program(r, r.ssao_program)
-    gl_texture_bind(1, r.scene_depth)
+    gl_texture_bind(1, r.last_scene_depth)
+    glapi.glActiveTexture(glapi.TEXTURE0 as uint32)
     r.bound_texture = 0 - 1
     gl_uniform_int(gl_uniform_location(r.ssao_program, "depthTexture"), 1)
     gl_uniform_int(gl_uniform_location(r.ssao_program, "screenTexture"), 0)
@@ -4433,28 +4848,25 @@ draw_occlusion(r: *GLRenderer, cam: *Camera) {
     gl_uniform_mat4(gl_uniform_location(r.ssao_program, "invViewProjection"), &inverse)
     gl_uniform_vec3(gl_uniform_location(r.ssao_program, "viewPos"),
                          cam.position.x, cam.position.y, cam.position.z)
-    gl_uniform_vec2(gl_uniform_location(r.ssao_program, "screenSize"),
-                         gl_viewport_width() * 1.0, gl_viewport_height() * 1.0)
+    gl_uniform_vec2(gl_uniform_location(r.ssao_program, "screenSize"), r.post_width * 1.0, r.post_height * 1.0)
     gl_uniform_float(gl_uniform_location(r.ssao_program, "ssaoRadius"), r.ssao_radius)
     gl_uniform_float(gl_uniform_location(r.ssao_program, "ssaoIntensity"), r.ssao_intensity)
-
     set_depth_test(r, false)
     gl_set_depth_mask(0)
+    set_blend(r, false)
     set_wireframe(r, false)
-    // AE3D_SSAO_SHOW=1 draws the occlusion itself in place of the scene,
-    // for looking at what the pass found.
-    if core.env_int("AE3D_SSAO_SHOW", 0) == 1 { gl_set_blend(0) } else { gl_set_blend_multiply() }
+    gl_fbo_bind(r.occlusion_fbo)
+    gl_viewport(0, 0, r.post_width, r.post_height)
     gl_vao_bind(r.screen_vao)
     gl_draw_arrays(0, 6)
     gl_vao_bind(0)
-    r.last_draw_calls = r.last_draw_calls + 1
-
-    // The ordinary blend back, whatever the cache says it was.
-    gl_set_blend(1)
-    r.blend_state = true
+    // The frame's viewport back: the scene's buffers are sized from it.
+    gl_viewport(0, 0, r.viewport_width, r.viewport_height)
+    set_blend(r, true)
     gl_set_depth_mask(1)
     set_depth_test(r, core.depth_test())
     set_wireframe(r, core.debug_enabled())
+    return true
 }
 
 // The scene's depth on texture unit 4 for a program that reads it, with
@@ -4621,7 +5033,6 @@ set_frame_uniforms(r: *GLRenderer, slots: *ProgramSlots, view_projection: *Mat4,
     gl_uniform_float(slots.occlusion_strength, r.occlusion_strength)
     gl_uniform_int(slots.capture_channel, r.capture_channel)
     gl_uniform_float(slots.wetness, r.wetness)
-    gl_uniform_float(slots.frame_exposure, r.frame_exposure)
 
     upload_lights(slots, lights, light)
     cluster_uniforms(r, slots)
@@ -4649,7 +5060,16 @@ set_frame_uniforms(r: *GLRenderer, slots: *ProgramSlots, view_projection: *Mat4,
     gl_uniform_int(slots.fog_enabled, enabled)
     gl_uniform_float(slots.fog_start, r.fog.start)
     gl_uniform_float(slots.fog_end, r.fog.end)
-    gl_uniform_vec3(slots.fog_color, r.fog.color.x, r.fog.color.y, r.fog.color.z)
+    fog = core.display_radiance(r.fog.color)
+    gl_uniform_vec3(slots.fog_radiance, fog.x, fog.y, fog.z)
+    gl_uniform_int(slots.sky_light, SKY_LIGHT_UNIT)
+    gl_uniform_int(slots.brdf_lut, SKY_LIGHT_UNIT + 1)
+    gl_uniform_int(slots.sky_irradiance, SKY_LIGHT_UNIT + 2)
+    gl_uniform_int(slots.occlusion_map, OCCLUSION_UNIT)
+    gl_uniform_int(slots.occlusion_history, r.occlusion_history)
+    gi_off = 0
+    if r.gi == core.GI_OFF { gi_off = 1 }
+    gl_uniform_int(slots.gi_off, gi_off)
     gl_uniform_float(slots.fog_intensity, r.fog.intensity)
     // The lamp's haze rides on the fog (rendering.set_frame_haze). It was
     // Vulkan's alone, and the same street drew a fifth brighter there (#494).
@@ -4792,20 +5212,19 @@ upload_light(slots_of: int[], index: int, l: *Light) {
     gl_uniform_vec3(slots_of[base], l.position.x, l.position.y, l.position.z)
     gl_uniform_vec3(slots_of[base + 1], l.color.x, l.color.y, l.color.z)
     gl_uniform_float(slots_of[base + 2], l.intensity)
-    gl_uniform_float(slots_of[base + 3], l.ambient_strength)
-    gl_uniform_float(slots_of[base + 4], l.temperature)
+    gl_uniform_float(slots_of[base + 3], l.temperature)
 
     kind = 0
     if l.mode == core.MODE_DIRECTIONAL { kind = 1 }
     if l.mode == core.MODE_SPOT { kind = 2 }
-    gl_uniform_int(slots_of[base + 5], kind)
+    gl_uniform_int(slots_of[base + 4], kind)
 
-    gl_uniform_vec3(slots_of[base + 6], l.direction.x, l.direction.y, l.direction.z)
-    gl_uniform_float(slots_of[base + 7], l.constant_atten)
-    gl_uniform_float(slots_of[base + 8], l.linear_atten)
-    gl_uniform_float(slots_of[base + 9], l.quadratic_atten)
-    gl_uniform_float(slots_of[base + 10], l.spot_cos_outer)
-    gl_uniform_float(slots_of[base + 11], l.spot_cos_inner)
+    gl_uniform_vec3(slots_of[base + 5], l.direction.x, l.direction.y, l.direction.z)
+    gl_uniform_float(slots_of[base + 6], l.constant_atten)
+    gl_uniform_float(slots_of[base + 7], l.linear_atten)
+    gl_uniform_float(slots_of[base + 8], l.quadratic_atten)
+    gl_uniform_float(slots_of[base + 9], l.spot_cos_outer)
+    gl_uniform_float(slots_of[base + 10], l.spot_cos_inner)
 }
 
 // Unit 1, because unit 0 is the material's own texture and changes per group.
@@ -5039,7 +5458,7 @@ set_model_uniforms(m: *Model, program: int) {
 
 init_post_processing(r: *GLRenderer, width: int, height: int) {
     r.post_fbo = gl_fbo_create()
-    r.post_texture = gl_fbo_attach_color(r.post_fbo, width, height, 0)
+    r.post_texture = gl_fbo_attach_color(r.post_fbo, width, height, 1)
     r.post_velocity = gl_fbo_attach_velocity(r.post_fbo, width, height)
     r.post_depth = gl_fbo_attach_depth(r.post_fbo, width, height)
     if gl_fbo_complete() != 1 {
@@ -5047,8 +5466,15 @@ init_post_processing(r: *GLRenderer, width: int, height: int) {
     }
     gl_fbo_bind(0)
 
-    // An effect otherwise runs over a frame with no antialiasing, since the
-    // scene goes into this framebuffer rather than the multisampled default.
+    r.ldr_fbo = gl_fbo_create()
+    r.ldr_texture = gl_fbo_attach_color(r.ldr_fbo, width, height, 0)
+    gl_fbo_bind(0)
+    r.occlusion_fbo = gl_fbo_create()
+    r.occlusion_texture = gl_fbo_attach_color(r.occlusion_fbo, width, height, 1)
+    gl_fbo_bind(0)
+
+    // The scene is drawn into these rather than the window, so they carry
+    // the multisampling the window would have.
     r.post_width = width
     r.post_height = height
     r.post_samples = gl_max_samples()
@@ -5056,13 +5482,6 @@ init_post_processing(r: *GLRenderer, width: int, height: int) {
         r.post_ms_fbo = gl_fbo_create()
         attach_multisample_post(r, width, height)
     }
-
-    r.bloom_fbo = gl_fbo_create()
-    r.bloom_texture = gl_fbo_attach_color(r.bloom_fbo, width / 4, height / 4, 1)
-    if gl_fbo_complete() != 1 {
-        println("ae3d: bloom framebuffer incomplete")
-    }
-    gl_fbo_bind(0)
 
     r.screen_mesh = core.mesh_create()
     core.mesh_push_screen_quad(r.screen_mesh)
@@ -5074,7 +5493,7 @@ init_post_processing(r: *GLRenderer, width: int, height: int) {
     gl_vao_bind(0)
 
     if r.post_samples > 0 && !multisample_resolve_works(r) {
-        println("ae3d: this driver does not resolve a multisampled framebuffer, effects will run without it")
+        println("ae3d: this driver does not resolve a multisampled framebuffer, the scene is drawn without multisampling")
         drop_multisample_post(r)
     }
 }
@@ -5097,28 +5516,27 @@ resize_post_processing(r: *GLRenderer, width: int, height: int) {
     if r.post_texture != 0 { gl_texture_delete(r.post_texture) }
     if r.post_velocity != 0 { gl_texture_delete(r.post_velocity) }
     if r.post_depth != 0 { gl_renderbuffer_delete(r.post_depth) }
-    if r.bloom_texture != 0 { gl_texture_delete(r.bloom_texture) }
+    if r.ldr_texture != 0 { gl_texture_delete(r.ldr_texture) }
 
     r.post_width = clamped_width
     r.post_height = clamped_height
-    r.post_texture = gl_fbo_attach_color(r.post_fbo, clamped_width, clamped_height, 0)
+    r.post_texture = gl_fbo_attach_color(r.post_fbo, clamped_width, clamped_height, 1)
     r.post_velocity = gl_fbo_attach_velocity(r.post_fbo, clamped_width, clamped_height)
     r.post_depth = gl_fbo_attach_depth(r.post_fbo, clamped_width, clamped_height)
+    // FXAA's input is the frame's, at the window's size.
+    r.ldr_texture = gl_fbo_attach_color(r.ldr_fbo, width, height, 0)
+    gl_fbo_bind(0)
+    if r.occlusion_texture != 0 { gl_texture_delete(r.occlusion_texture) }
+    r.occlusion_texture = gl_fbo_attach_color(r.occlusion_fbo, clamped_width, clamped_height, 1)
     gl_fbo_bind(0)
 
     if r.post_ms_fbo != 0 {
-        if r.post_ms_color != 0 { gl_renderbuffer_delete(r.post_ms_color) }
+        if r.post_ms_color != 0 { gl_texture_delete(r.post_ms_color) }
         if r.post_ms_velocity != 0 { gl_renderbuffer_delete(r.post_ms_velocity) }
         if r.post_ms_depth != 0 { gl_renderbuffer_delete(r.post_ms_depth) }
         attach_multisample_post(r, clamped_width, clamped_height)
     }
 
-    bloom_width = clamped_width / 4
-    bloom_height = clamped_height / 4
-    if bloom_width < 1 { bloom_width = 1 }
-    if bloom_height < 1 { bloom_height = 1 }
-    r.bloom_texture = gl_fbo_attach_color(r.bloom_fbo, bloom_width, bloom_height, 1)
-    gl_fbo_bind(0)
     resize_taa(r, clamped_width, clamped_height)
     if r.ssr_fbo != 0 { resize_ssr(r, clamped_width, clamped_height) }
 }
@@ -5127,7 +5545,7 @@ resize_post_processing(r: *GLRenderer, width: int, height: int) {
 resize_ssr(r: *GLRenderer, width: int, height: int) {
     if r.ssr_fbo == 0 { r.ssr_fbo = gl_fbo_create() }
     if r.ssr_texture != 0 { gl_texture_delete(r.ssr_texture) }
-    r.ssr_texture = gl_fbo_attach_color(r.ssr_fbo, width, height, 0)
+    r.ssr_texture = gl_fbo_attach_color(r.ssr_fbo, width, height, 1)
     gl_fbo_bind(0)
 }
 
@@ -5168,8 +5586,8 @@ resize_taa(r: *GLRenderer, width: int, height: int) {
     if r.taa_fbo == 0 { r.taa_fbo = gl_fbo_create() }
     if r.taa_texture0 != 0 { gl_texture_delete(r.taa_texture0) }
     if r.taa_texture1 != 0 { gl_texture_delete(r.taa_texture1) }
-    r.taa_texture0 = gl_fbo_attach_color(r.taa_fbo, width, height, 0)
-    r.taa_texture1 = gl_fbo_attach_color(r.taa_fbo, width, height, 0)
+    r.taa_texture0 = gl_fbo_attach_color(r.taa_fbo, width, height, 1)
+    r.taa_texture1 = gl_fbo_attach_color(r.taa_fbo, width, height, 1)
     gl_fbo_bind(0)
     r.taa_history_valid = false
     r.taa_current = 0
@@ -5180,7 +5598,7 @@ resize_taa(r: *GLRenderer, width: int, height: int) {
 // other history texture, which the composite then reads and the next
 // frame reads back. Returns the texture the composite should read.
 draw_taa(r: *GLRenderer, source: int, cam: *Camera, view_projection: Mat4, unjittered: Mat4) -> int {
-    if !r.enable_taa || r.taa_program == 0 || r.scene_depth == 0 { return source }
+    if !r.enable_taa || r.taa_program == 0 || r.scene_depth == 0 || r.capture_channel != 0 { return source }
     // Made the first time the pass runs, at the post buffers' size; a
     // resize of those remakes them.
     if r.taa_fbo == 0 || r.taa_texture0 == 0 || r.taa_texture1 == 0 { resize_taa(r, r.post_width, r.post_height) }
@@ -5205,6 +5623,7 @@ draw_taa(r: *GLRenderer, source: int, cam: *Camera, view_projection: Mat4, unjit
     blend = 1.0
     if r.taa_history_valid { blend = 0.1 }
     gl_uniform_float(gl_uniform_location(r.taa_program, "taaBlend"), blend)
+    gl_uniform_float(gl_uniform_location(r.taa_program, "frameExposure"), r.frame_exposure)
     gl_vao_bind(r.screen_vao)
     gl_draw_arrays(0, 6)
     gl_vao_bind(0)
@@ -5214,13 +5633,122 @@ draw_taa(r: *GLRenderer, source: int, cam: *Camera, view_projection: Mat4, unjit
     return into
 }
 
+// The bloom's levels made for the post buffers' size: from half of it,
+// halved down to BLOOM_LEVELS or to eight texels on the short side, a
+// half-float framebuffer for each level's way down and another for its way
+// up. False when there is no room for two.
+bloom_for(r: *GLRenderer) -> bool {
+    if r.bloom_levels >= 2 && r.bloom_made_width == r.post_width && r.bloom_made_height == r.post_height { return true }
+    free_bloom(r)
+    if r.bloom_fbos == null {
+        r.bloom_fbos = calloc(BLOOM_LEVELS * 2, 4)
+        r.bloom_textures = calloc(BLOOM_LEVELS * 2, 4)
+        r.bloom_sizes = calloc(BLOOM_LEVELS * 2, 4)
+    }
+    fbos = r.bloom_fbos as int[]
+    textures = r.bloom_textures as int[]
+    sizes = r.bloom_sizes as int[]
+    w = r.post_width / 2
+    h = r.post_height / 2
+    while r.bloom_levels < BLOOM_LEVELS && w >= 8 && h >= 8 {
+        k = r.bloom_levels
+        sizes[k * 2] = w
+        sizes[k * 2 + 1] = h
+        side = 0
+        while side < 2 {
+            fbo = gl_fbo_create()
+            fbos[k * 2 + side] = fbo
+            textures[k * 2 + side] = gl_fbo_attach_color(fbo, w, h, 1)
+            side = side + 1
+        }
+        r.bloom_levels = r.bloom_levels + 1
+        w = w / 2
+        h = h / 2
+    }
+    r.bloom_made_width = r.post_width
+    r.bloom_made_height = r.post_height
+    return r.bloom_levels >= 2
+}
+
+free_bloom(r: *GLRenderer) {
+    if r.bloom_fbos == null { return }
+    fbos = r.bloom_fbos as int[]
+    textures = r.bloom_textures as int[]
+    k = 0
+    while k < BLOOM_LEVELS * 2 {
+        if textures[k] != 0 { gl_texture_delete(textures[k]) }
+        if fbos[k] != 0 { gl_fbo_delete(fbos[k]) }
+        textures[k] = 0
+        fbos[k] = 0
+        k = k + 1
+    }
+    r.bloom_levels = 0
+}
+
+// One level of the bloom drawn: `program` from `from` (`from_w` by `from_h`
+// texels), with `level` beside it on the way up, into level `k`'s target.
+bloom_pass(r: *GLRenderer, program: int, k: int, up: int, from: int, from_w: int, from_h: int, level: int) {
+    gl_fbo_bind((r.bloom_fbos as int[])[k * 2 + up])
+    gl_viewport(0, 0, (r.bloom_sizes as int[])[k * 2], (r.bloom_sizes as int[])[k * 2 + 1])
+    use_program(r, program)
+    gl_texture_bind(0, from)
+    gl_texture_bind(1, level)
+    r.bound_texture = 0 - 1
+    gl_uniform_int(gl_uniform_location(program, "screenTexture"), 0)
+    gl_uniform_int(gl_uniform_location(program, "bloomLevel"), 1)
+    gl_uniform_vec2(gl_uniform_location(program, "texelSize"), 1.0 / (from_w * 1.0), 1.0 / (from_h * 1.0))
+    gl_draw_arrays(0, 6)
+}
+
+// The bloom pyramid over `source`, the post buffers' size: down the levels,
+// the first taking only the light past the threshold, then back up, each
+// its own and a tent of the coarser one's sum. The top's sum, which the
+// composite adds; 0 where the pyramid could not be made.
+draw_bloom(r: *GLRenderer, source: int) -> int {
+    if r.bloom_down_program == 0 || r.bloom_up_program == 0 || !bloom_for(r) { return 0 }
+    textures = r.bloom_textures as int[]
+    sizes = r.bloom_sizes as int[]
+    gl_vao_bind(r.screen_vao)
+    down = r.bloom_down_program
+    use_program(r, down)
+    gl_uniform_float(gl_uniform_location(down, "bloomThreshold"), r.bloom_threshold)
+    gl_uniform_float(gl_uniform_location(down, "frameExposure"), r.frame_exposure)
+    from = source
+    from_w = r.post_width
+    from_h = r.post_height
+    k = 0
+    while k < r.bloom_levels {
+        use_program(r, down)
+        first = 0
+        if k == 0 { first = 1 }
+        gl_uniform_int(gl_uniform_location(down, "bloomFirst"), first)
+        bloom_pass(r, down, k, 0, from, from_w, from_h, 0)
+        from = textures[k * 2]
+        from_w = sizes[k * 2]
+        from_h = sizes[k * 2 + 1]
+        k = k + 1
+    }
+    up = r.bloom_up_program
+    k = r.bloom_levels - 2
+    while k >= 0 {
+        use_program(r, up)
+        top = 0
+        if k == 0 { top = r.bloom_levels }
+        gl_uniform_int(gl_uniform_location(up, "bloomTop"), top)
+        bloom_pass(r, up, k, 1, from, from_w, from_h, textures[k * 2])
+        from = textures[k * 2 + 1]
+        from_w = sizes[k * 2]
+        from_h = sizes[k * 2 + 1]
+        k = k - 1
+    }
+    gl_vao_bind(0)
+    return from
+}
+
+// The scene is light, and the composite is where it becomes the frame, so
+// the scene is always drawn into the post buffers: the multisampled ones
+// with MSAA on, resolved after.
 begin_post_processing(r: *GLRenderer) -> bool {
-    // A render scale below 1 is on its own a reason to draw into the offscreen
-    // buffer, with or without an effect to run afterwards: resolve_post_processing
-    // falls back to the passthrough program, so the composite becomes the upscale.
-    if !r.enable_fxaa && !r.enable_bloom && !r.enable_taa && !r.ssr_enabled && r.render_scale > 0.999 { return false }
-    // A capture channel is the surfaces' own numbers: no effect over them.
-    if r.capture_channel != 0 && r.render_scale > 0.999 { return false }
     if r.post_fbo == 0 || r.post_texture == 0 || r.screen_vao == 0 { return false }
 
     width = gl_viewport_width()
@@ -5234,9 +5762,13 @@ begin_post_processing(r: *GLRenderer) -> bool {
     }
 
     target_fbo = r.post_fbo
-    if r.post_samples > 0 && r.post_ms_fbo != 0 { target_fbo = r.post_ms_fbo }
+    if multisampled(r) { target_fbo = r.post_ms_fbo }
     gl_fbo_bind(target_fbo)
     if gl_fbo_complete() != 1 {
+        if !r.post_incomplete_reported {
+            println("ae3d: the scene's framebuffer is incomplete; frames cannot be composited")
+            r.post_incomplete_reported = true
+        }
         bind_output(r)
         return false
     }
@@ -5248,46 +5780,91 @@ begin_post_processing(r: *GLRenderer) -> bool {
     return true
 }
 
-// Some drivers accept a multisample resolve, report no error, and copy nothing.
-// Asking once at startup, with a colour that cannot be confused for an empty
-// buffer, is the only way to know: the alternative is a black frame every time
-// an effect runs. A driver that cannot do it gets the effect chain without
-// multisampling rather than nothing at all.
-multisample_resolve_works(r: *GLRenderer) -> bool {
-    if r.post_ms_fbo == 0 || r.post_fbo == 0 { return false }
-    if r.screen_vao == 0 || r.passthrough_program == 0 { return false }
+// Whether the scene is drawn multisampled this frame: MSAA asked for, and
+// the buffers for it made.
+multisampled(r: *GLRenderer) -> bool {
+    return r.enable_msaa && r.post_samples > 0 && r.post_ms_fbo != 0 && r.post_ms_color != 0 && r.post_ms_velocity != 0
+}
 
-    // Drawn, not just cleared. A driver was found that resolves a buffer it
-    // only had to clear and produces nothing from one that was drawn into,
-    // which is the case that matters and the one that was coming out black.
+// Some drivers accept a multisample resolve, report no error, and copy
+// nothing. Asking once at startup, with values that cannot be confused for
+// an empty buffer or for each other, is the only way to know: the
+// alternative is a black frame every frame. Drawn, not just cleared -- a
+// driver was found that resolves a buffer it only had to clear and produces
+// nothing from one that was drawn into. White into the vectors alone, then
+// into the colour, each resolved as a frame resolves them: the vectors by a
+// blit, the colour by its shader. A driver that cannot do it gets the scene
+// without multisampling rather than nothing at all.
+multisample_resolve_works(r: *GLRenderer) -> bool {
+    if r.post_ms_fbo == 0 || r.post_fbo == 0 || r.post_ms_color == 0 || r.post_ms_velocity == 0 { return false }
+    if r.screen_vao == 0 || r.composite_program == 0 || r.colour_resolve_program == 0 { return false }
     gl_fbo_bind(r.post_ms_fbo)
     gl_viewport(0, 0, r.post_width, r.post_height)
+    gl_draw_buffers(2)
     gl_clear_color(0.0, 0.0, 0.0, 1.0)
     gl_clear(1, 1)
     set_depth_test(r, false)
     gl_set_depth_mask(0)
     set_blend(r, false)
-    use_program(r, r.passthrough_program)
-    gl_uniform_int(gl_uniform_location(r.passthrough_program, "screenTexture"), 0)
-    gl_vao_bind(r.screen_vao)
+    use_program(r, r.composite_program)
+    gl_uniform_int(gl_uniform_location(r.composite_program, "screenTexture"), 0)
+    gl_uniform_int(gl_uniform_location(r.composite_program, "captureChannel"), 1)
     gl_texture_bind(0, r.default_texture)
     r.bound_texture = r.default_texture
+    gl_vao_bind(r.screen_vao)
+    glapi.glDrawBuffer(glapi.COLOR_ATTACHMENT1 as uint32)
     gl_draw_arrays(0, 6)
+    glapi.glDrawBuffer(glapi.COLOR_ATTACHMENT0 as uint32)
     gl_vao_bind(0)
 
-    refused = gl_fbo_resolve(r.post_ms_fbo, r.post_fbo, r.post_width, r.post_height)
-    gl_fbo_bind(r.post_fbo)
-    centre = gl_read_pixel(r.post_width / 2, r.post_height / 2)
+    refused = resolve_scene(r, 1.0)
+    dark = gl_read_pixel(r.post_width / 2, r.post_height / 2)
+    glapi.glReadBuffer(glapi.COLOR_ATTACHMENT1 as uint32)
+    vectors = gl_read_pixel(r.post_width / 2, r.post_height / 2)
+    glapi.glReadBuffer(glapi.COLOR_ATTACHMENT0 as uint32)
+
+    gl_fbo_bind(r.post_ms_fbo)
+    use_program(r, r.composite_program)
+    gl_texture_bind(0, r.default_texture)
+    gl_vao_bind(r.screen_vao)
+    gl_draw_arrays(0, 6)
+    gl_vao_bind(0)
+    if refused == 0 { refused = resolve_scene(r, 1.0) }
+    colour = gl_read_pixel(r.post_width / 2, r.post_height / 2)
     gl_fbo_bind(0)
 
     set_depth_test(r, true)
     gl_set_depth_mask(1)
     set_blend(r, true)
-    return refused == 0 && centre == 0xFFFFFF
+    // The vectors are two channels: red and green, no blue.
+    return refused == 0 && dark == 0 && vectors == 0xFFFF00 && colour == 0xFFFFFF
+}
+
+// The multisampled scene resolved into the post buffer: the vectors by a
+// blit (the mean of a pixel's samples is its motion), the colour by its
+// shader, each sample weighed by how bright it shows at `exposure`. At the
+// size the buffers were made at, not whatever the viewport says: a resolve
+// of the wrong rectangle leaves the passes after reading a frame nothing was
+// written into. The post buffer is left bound; what the driver made of the
+// blit is returned, 0 when it took it.
+resolve_scene(r: *GLRenderer, exposure: float) -> int {
+    refused = gl_fbo_resolve_attachment(r.post_ms_fbo, r.post_fbo, r.post_width, r.post_height, 1)
+    gl_fbo_bind(r.post_fbo)
+    gl_viewport(0, 0, r.post_width, r.post_height)
+    use_program(r, r.colour_resolve_program)
+    gl_texture_bind_multisample(0, r.post_ms_color)
+    gl_uniform_int(gl_uniform_location(r.colour_resolve_program, "colorSamples"), 0)
+    gl_uniform_int(gl_uniform_location(r.colour_resolve_program, "colorSampleCount"), r.post_samples)
+    gl_uniform_float(gl_uniform_location(r.colour_resolve_program, "frameExposure"), exposure)
+    gl_vao_bind(r.screen_vao)
+    gl_draw_arrays(0, 6)
+    gl_vao_bind(0)
+    gl_texture_bind_multisample(0, 0)
+    return refused
 }
 
 drop_multisample_post(r: *GLRenderer) {
-    if r.post_ms_color != 0 { gl_renderbuffer_delete(r.post_ms_color) ; r.post_ms_color = 0 }
+    if r.post_ms_color != 0 { gl_texture_delete(r.post_ms_color) ; r.post_ms_color = 0 }
     if r.post_ms_velocity != 0 { gl_renderbuffer_delete(r.post_ms_velocity) ; r.post_ms_velocity = 0 }
     if r.post_ms_depth != 0 { gl_renderbuffer_delete(r.post_ms_depth) ; r.post_ms_depth = 0 }
     if r.post_ms_fbo != 0 { gl_fbo_delete(r.post_ms_fbo) ; r.post_ms_fbo = 0 }
@@ -5302,7 +5879,7 @@ attach_multisample_post(r: *GLRenderer, width: int, height: int) {
     r.post_ms_depth = gl_fbo_attach_depth_multisample(r.post_ms_fbo, width, height,
                                                            r.post_samples)
     if gl_fbo_complete() != 1 {
-        gl_renderbuffer_delete(r.post_ms_color)
+        gl_texture_delete(r.post_ms_color)
         gl_renderbuffer_delete(r.post_ms_velocity)
         gl_renderbuffer_delete(r.post_ms_depth)
         r.post_ms_color = 0
@@ -5316,65 +5893,70 @@ attach_multisample_post(r: *GLRenderer, width: int, height: int) {
 resolve_post_processing(r: *GLRenderer, cam: *Camera, view_projection: Mat4, unjittered: Mat4) {
     // The scene is drawn; the passes after it write the colour alone.
     if r.post_velocity != 0 { gl_draw_buffers(1) }
-    if r.post_samples > 0 && r.post_ms_fbo != 0 {
-        // The size the buffers were made at, not whatever the viewport says.
-        // A resolve of the wrong rectangle leaves the effect reading a frame
-        // nothing was written into.
-        refused = gl_fbo_resolve(r.post_ms_fbo, r.post_fbo, r.post_width, r.post_height)
-        if refused == 0 && r.post_ms_velocity != 0 {
-            refused = gl_fbo_resolve_attachment(r.post_ms_fbo, r.post_fbo, r.post_width, r.post_height, 1)
-        }
-        if refused != 0 && !r.post_resolve_reported {
-            println("ae3d: the driver refused the multisample resolve (0x${refused}), effects will run without it")
-            r.post_resolve_reported = true
-            r.post_samples = 0
-        }
-    }
     set_depth_test(r, false)
     gl_set_depth_mask(0)
     set_blend(r, false)
     set_wireframe(r, false)
+    if multisampled(r) {
+        refused = resolve_scene(r, r.frame_exposure)
+        if refused != 0 && !r.post_resolve_reported {
+            println("ae3d: the driver refused the multisample resolve (0x${refused}), the scene is drawn without multisampling from now on")
+            r.post_resolve_reported = true
+            r.post_samples = 0
+        }
+    }
     source = draw_ssr(r, r.post_texture, cam, view_projection)
     source = draw_taa(r, source, cam, view_projection, unjittered)
-    bind_output(r)
-    // Back to the full frame for the composite: the scene pass may have been
-    // drawn smaller, and this is the step that puts it back on the window.
-    gl_viewport(0, 0, r.viewport_width, r.viewport_height)
-
-    gl_clear(1, 0)
-    gl_vao_bind(r.screen_vao)
-    gl_texture_bind(0, source)
-
-
-    // A texel of the texture being sampled, which is the post buffer, not the
-    // window. The two are the same size only at a render scale of 1.
-    texel_x = 1.0 / (r.post_width * 1.0)
-    texel_y = 1.0 / (r.post_height * 1.0)
-
-    if r.enable_bloom && r.bloom_program != 0 {
-        use_program(r, r.bloom_program)
-        gl_uniform_int(gl_uniform_location(r.bloom_program, "screenTexture"), 0)
-        gl_uniform_vec2(gl_uniform_location(r.bloom_program, "texelSize"), texel_x, texel_y)
-        gl_uniform_float(gl_uniform_location(r.bloom_program, "bloomThreshold"), r.bloom_threshold)
-        gl_uniform_float(gl_uniform_location(r.bloom_program, "bloomIntensity"), r.bloom_intensity)
-    } else if r.enable_fxaa && r.fxaa_program != 0 {
-        use_program(r, r.fxaa_program)
-        gl_uniform_int(gl_uniform_location(r.fxaa_program, "screenTexture"), 0)
-        gl_uniform_vec2(gl_uniform_location(r.fxaa_program, "texelSize"), texel_x, texel_y)
-        gl_uniform_float(gl_uniform_location(r.fxaa_program, "edgeThreshold"), 0.125)
-        gl_uniform_float(gl_uniform_location(r.fxaa_program, "edgeThresholdMin"), 0.0625)
-        gl_uniform_float(gl_uniform_location(r.fxaa_program, "subpixelQuality"), 0.75)
-    } else {
-        use_program(r, r.passthrough_program)
-        gl_uniform_int(gl_uniform_location(r.passthrough_program, "screenTexture"), 0)
-    }
-
-    gl_draw_arrays(0, 6)
-    gl_vao_bind(0)
+    bloom = 0
+    if r.enable_bloom && r.capture_channel == 0 { bloom = draw_bloom(r, source) }
+    draw_composite(r, source, bloom)
 
     set_depth_test(r, true)
     gl_set_depth_mask(1)
     set_blend(r, true)
+}
+
+// The composite: the frame's tone curve over `source` -- the scene, or what
+// the reflection or the temporal pass made of it -- into the window (or the
+// target), at the window's size: the scene drawn smaller is scaled up by the
+// sampling here. With FXAA on, into the display-format texture FXAA reads,
+// and FXAA into the window.
+draw_composite(r: *GLRenderer, source: int, bloom: int) {
+    r.composited = source
+    fxaa = r.enable_fxaa && r.fxaa_program != 0 && r.ldr_fbo != 0 && r.capture_channel == 0
+    if fxaa { gl_fbo_bind(r.ldr_fbo) } else { bind_output(r) }
+    gl_viewport(0, 0, r.viewport_width, r.viewport_height)
+    gl_vao_bind(r.screen_vao)
+    gl_texture_bind(0, source)
+    gl_texture_bind(1, bloom)
+    r.bound_texture = 0 - 1
+    enabled = 0
+    if bloom != 0 { enabled = 1 }
+    p = r.composite_program
+    use_program(r, p)
+    gl_uniform_int(gl_uniform_location(p, "screenTexture"), 0)
+    gl_uniform_int(gl_uniform_location(p, "bloomTexture"), 1)
+    gl_uniform_float(gl_uniform_location(p, "frameExposure"), r.frame_exposure)
+    gl_uniform_int(gl_uniform_location(p, "captureChannel"), r.capture_channel)
+    gl_uniform_int(gl_uniform_location(p, "enableBloom"), enabled)
+    gl_uniform_float(gl_uniform_location(p, "bloomIntensity"), r.bloom_intensity)
+    gl_draw_arrays(0, 6)
+    if fxaa {
+        // FXAA over what the composite made, which shows as the screen
+        // does: the edges it finds are the ones a viewer sees.
+        bind_output(r)
+        gl_viewport(0, 0, r.viewport_width, r.viewport_height)
+        gl_texture_bind(0, r.ldr_texture)
+        use_program(r, r.fxaa_program)
+        gl_uniform_int(gl_uniform_location(r.fxaa_program, "screenTexture"), 0)
+        gl_uniform_vec2(gl_uniform_location(r.fxaa_program, "texelSize"), 1.0 / (r.viewport_width * 1.0),
+                        1.0 / (r.viewport_height * 1.0))
+        gl_uniform_float(gl_uniform_location(r.fxaa_program, "edgeThreshold"), 0.125)
+        gl_uniform_float(gl_uniform_location(r.fxaa_program, "edgeThresholdMin"), 0.0625)
+        gl_uniform_float(gl_uniform_location(r.fxaa_program, "subpixelQuality"), 0.75)
+        gl_draw_arrays(0, 6)
+    }
+    gl_vao_bind(0)
 }
 
 free_batches(batches: ptr) {
@@ -5484,18 +6066,23 @@ renderer_cleanup(r: *GLRenderer) {
     if r.screen_vao != 0 { gl_vao_delete(r.screen_vao) ; r.screen_vao = 0 }
     if r.screen_vbo != 0 { gl_buffer_delete(r.screen_vbo) ; r.screen_vbo = 0 }
     if r.post_texture != 0 { gl_texture_delete(r.post_texture) ; r.post_texture = 0 }
-    if r.bloom_texture != 0 { gl_texture_delete(r.bloom_texture) ; r.bloom_texture = 0 }
+    if r.ldr_texture != 0 { gl_texture_delete(r.ldr_texture) ; r.ldr_texture = 0 }
     if r.post_depth != 0 { gl_renderbuffer_delete(r.post_depth) ; r.post_depth = 0 }
-    if r.post_ms_color != 0 { gl_renderbuffer_delete(r.post_ms_color) ; r.post_ms_color = 0 }
+    if r.post_ms_color != 0 { gl_texture_delete(r.post_ms_color) ; r.post_ms_color = 0 }
     if r.post_ms_velocity != 0 { gl_renderbuffer_delete(r.post_ms_velocity) ; r.post_ms_velocity = 0 }
     if r.post_ms_depth != 0 { gl_renderbuffer_delete(r.post_ms_depth) ; r.post_ms_depth = 0 }
     if r.post_ms_fbo != 0 { gl_fbo_delete(r.post_ms_fbo) ; r.post_ms_fbo = 0 }
     if r.post_fbo != 0 { gl_fbo_delete(r.post_fbo) ; r.post_fbo = 0 }
-    if r.bloom_fbo != 0 { gl_fbo_delete(r.bloom_fbo) ; r.bloom_fbo = 0 }
+    if r.ldr_fbo != 0 { gl_fbo_delete(r.ldr_fbo) ; r.ldr_fbo = 0 }
+    if r.occlusion_texture != 0 { gl_texture_delete(r.occlusion_texture) ; r.occlusion_texture = 0 }
+    if r.occlusion_fbo != 0 { gl_fbo_delete(r.occlusion_fbo) ; r.occlusion_fbo = 0 }
     if r.taa_texture0 != 0 { gl_texture_delete(r.taa_texture0) ; r.taa_texture0 = 0 }
     if r.taa_texture1 != 0 { gl_texture_delete(r.taa_texture1) ; r.taa_texture1 = 0 }
     if r.taa_fbo != 0 { gl_fbo_delete(r.taa_fbo) ; r.taa_fbo = 0 }
     if r.taa_program != 0 { gl_program_delete(r.taa_program) ; r.taa_program = 0 }
+    free_bloom(r)
+    if r.bloom_down_program != 0 { gl_program_delete(r.bloom_down_program) ; r.bloom_down_program = 0 }
+    if r.bloom_up_program != 0 { gl_program_delete(r.bloom_up_program) ; r.bloom_up_program = 0 }
     if r.ssr_texture != 0 { gl_texture_delete(r.ssr_texture) ; r.ssr_texture = 0 }
     if r.ssr_fbo != 0 { gl_fbo_delete(r.ssr_fbo) ; r.ssr_fbo = 0 }
     if r.ssr_program != 0 { gl_program_delete(r.ssr_program) ; r.ssr_program = 0 }
@@ -5510,12 +6097,10 @@ renderer_cleanup(r: *GLRenderer) {
     if r.shadow_program != 0 { gl_program_delete(r.shadow_program) ; r.shadow_program = 0 }
     if r.crowd_shadow_program != 0 { gl_program_delete(r.crowd_shadow_program) ; r.crowd_shadow_program = 0 }
     if r.fxaa_program != 0 { gl_program_delete(r.fxaa_program) ; r.fxaa_program = 0 }
-    if r.bloom_program != 0 { gl_program_delete(r.bloom_program) ; r.bloom_program = 0 }
-    if r.passthrough_program != 0 {
-        gl_program_delete(r.passthrough_program)
-        r.passthrough_program = 0
-    }
+    if r.composite_program != 0 { gl_program_delete(r.composite_program) ; r.composite_program = 0 }
+    if r.colour_resolve_program != 0 { gl_program_delete(r.colour_resolve_program) ; r.colour_resolve_program = 0 }
     overlay_cleanup(r)
+    free_sky_light(r)
 
     r.initialized = false
 }

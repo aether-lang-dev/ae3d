@@ -61,7 +61,8 @@ The feature list in full, with the reasoning behind each. The [README](../README
   both backends), the key light's shadow in four cascades that a moving camera does not
   move ([Shadows](#shadows), both
   backends), volumetric clouds and their shadows, a sky drawn from the sun by
-  the hour or a painted one, fog applied after tone mapping and the key
+  the hour or a painted one, fog mixed in as light before the frame's one
+  tone curve and the key
   lamp's light scattered in the fogged air (the haze stands around a lamp
   and thins away from it, marched along the view ray; both backends,
   `rendering.set_frame_haze`), MSAA, FXAA and bloom. Screen-space
@@ -72,9 +73,11 @@ The feature list in full, with the reasoning behind each. The [README](../README
   the road's own metres: still water in the puddles mirrors sharply, the
   damp tarmac between them dimmer and blurred by a cone over the distance
   the ray travelled (eight taps on a disc turned per pixel). The base
-  reflectance sits above water's 0.02 because the frame is display values:
-  a lamp is white in it, and two percent of white is nothing where two
-  percent of the lamp is the streak every wet street has. The critique
+  reflectance is water's 0.02: the frame is light, so a lamp is the thousand
+  times its tarmac it is, and two percent of it is the streak every wet
+  street has. Which pixels are the road is read from the depth with a
+  tolerance of what one pixel spans there, since a multisampled frame's
+  depth is a sample's and not the pixel centre's. The critique
   counts the reflection as the share of the road band the mirrored scene
   lifts by a visible step (13.6% in the street, wanted 5%), not as cells
   that go white -- the mirror did that; a wet road does not. One pass on
@@ -90,8 +93,9 @@ The feature list in full, with the reasoning behind each. The [README](../README
   as one physically based surface: Schlick fresnel between the body of the
   water and the reflected sky (the scene's own skybox image, where it has
   one), GGX glitter from the sun, light through the crests, whitecaps on the
-  steep faces, ripples finer than the mesh from scrolling noise slopes, tone
-  mapped and fogged the same way as the shore beside it. The shore itself
+  steep faces, ripples finer than the mesh from scrolling noise slopes,
+  fogged the same way as the shore beside it and tone mapped with the rest
+  of the frame. The shore itself
   comes from the scene's depth, captured after the opaque pass on both
   backends: shallows go clear over the sand and a foam line runs along the
   waterline. From underneath, the
@@ -234,14 +238,169 @@ The frame the cone draws differs from the tree before's by what the tree
 before differs from itself run to run (mean 0.11 and 0.09 of 255, both
 along the lit windows' edges).
 
+### Light and the frame
+
+The scene is drawn as light, into half floats (RGBA16F on both backends),
+and becomes a picture once, in the composite: the frame's exposure, the
+bloom, the ACES curve (Narkowicz's fit), the exact sRGB encoding and half
+a step of dither so a dark gradient is grain and not bands. Everything
+before it works in light: the multisample resolve weighs each sample by
+how bright it shows (Karis), so a lamp at an edge does not alias as hard
+as one sample would; the reflection adds two percent of a lamp, not of
+white; the temporal pass clamps in the same weighting. FXAA, when it is
+on, runs after the composite over what shows.
+
+The bloom is a pyramid of the frame's light (Jimenez, "Next Generation
+Post Processing in Call of Duty", 2014), on both backends: from half the
+scene's size, halved down to six levels, each a 13-tap filter of the one
+above; the first takes only the light past the threshold
+(`engine_set_post`'s, in light at the frame's exposure, eased in over a
+knee half its width) and averages its taps by brightness, so one fiery
+pixel does not flicker its glow. Back up, each level is its own and a tent
+of the coarser one's sum, the six averaged at the top: a lamp's halo and
+the haze round it at once, carrying the light past the threshold and no
+more. The composite adds it, by the intensity, before the curve. The
+critique (`tools/critique_scene`) holds it to what a bloom does: the ring of
+cells round the street's lights is 17% lighter with it, and half again as
+many cells burn bright. Colour textures are stored
+sRGB and sampled as light, data textures (normal maps, masks, the pose
+bank, the clouds' noise) as their bytes. Colours given as they should
+look -- the clear colour, the fog, the sky, the overcast -- are taken
+back through the curve to the light that shows as them
+(`core.display_radiance`), so a fog of mid grey still shows mid grey at an
+exposure of one. A capture channel passes through the composite
+untouched: the surfaces' own numbers. `tests/test_hdr` holds both
+backends to these, the curve's numbers against the frame's pixels.
+
+### The sky's light
+
+The sky lights the scene (#655), as bright as it is drawn and from the
+directions it is in. Each frame, before the scene, the sky is drawn into an
+octahedral map (256 texels a side, half floats, a texel of gutter round each
+level so a filtered read at a fold is still the sky) without the sun's and
+the moon's discs -- the key light is them -- and halved down its mips; from
+it, on the device, two things the lit shader reads:
+
+- the irradiance onto every normal, a 16-texel octahedral map, every texel
+  of the capture's 16-texel mip weighed by the cosine and by the solid angle
+  it covers (`dA / |q|^3` on the octahedron), so a surface takes the light of
+  the whole sky over it and none of what is under it;
+- the reflections, the capture prefiltered by GGX into six roughness levels,
+  48 samples a texel read from the mip whose texels cover each sample's share
+  of the lobe (filtered importance sampling), scaled by the split-sum table
+  `ae3d.skylight` makes at start (Karis).
+
+A surface's indirect light is its albedo over pi times the irradiance, by
+`(1 - F)` and its metalness, and its F0 times the reflection; the occlusion,
+baked and by ray, scales this term alone. A scene with no sky of its own is
+surrounded by its clear colour: a white matte surface under a flat sky shows
+the sky's colour, and a black glossy one four percent of it
+(`tests/test_sky_light`, both backends). A material that turns image-based
+lighting off keeps the diffuse and loses the reflections.
+
+The screen's occlusion (`engine_set_ssao`) is found before the scene, from
+the last frame's depth, into an occlusion map: the positions rebuilt with
+this frame's matrices, which is the last frame's geometry moved rigidly by
+the camera's step, so each sample still lands on the image it was drawn in;
+beside each pixel's occlusion, the depth it was found at. A surface reads
+the map where it was last frame (its motion vector's other end) and takes
+it only if the depth there is its own -- a corner just come round, a figure
+just stepped aside, a pane of glass in front of what was there are not
+occluded by what the map says -- and the occlusion darkens its sky's light
+and nothing else: a lamp shining into a corner shines into it. It shows
+from the second frame on, as the temporal pass's history does.
+
+The sky drawn from the sun is light, not a colour: by day it is Preetham,
+Shirley and Smits' analytic sky, its luminance and colour in each direction
+from the sun's height and the air's turbidity (`renderer_set_sky_turbidity`,
+2.5 a clear day), at `core.SKY_PHOTOMETRIC` of the engine's radiance a
+candela a square metre -- the scale at which an 18% grey card under the
+noon sun shows mid-grey at an exposure of one. The sun is the same day's:
+the clear-sky beam of the ESRA model through the air mass at its height
+(`core.sun_light`, which `light_sun` and the hour's sun take their strength
+from). At the day's noon, the sun 66 degrees up, the sky gives 0.547 onto
+the ground and the sun 1.77, three and a quarter to one, the sky's light
+two and a half times bluer than red, the same on both renderers to the
+third place. Low down the daylight hands over to the dusk gradient the sky
+had, where the analytic model is weakest; the night keeps a moon's light a
+game needs.
+
+### The probes' light
+
+`engine_set_gi(e, mode)`, or `AE3D_GI=auto|rt|sky|off` on any program, picks
+the light that is not straight from a light (#537): `core.GI_RT`, the
+probes', the sky's light and every bounce of it, traced; `GI_SKY`, the sky's
+light alone, above; `GI_OFF`, none, the direct light only. `GI_AUTO`, the
+default, is the probes on a GPU that offers them and the sky's light
+elsewhere: on OpenGL, on a device without `VK_KHR_ray_query` or without the
+extended storage formats, and on a software rasterizer, which would trace a
+frame's probes in seconds. `engine_gi(e)` says what is in effect.
+
+The probes (Majercik et al., "Dynamic Diffuse Global Illumination with
+Ray-Traced Irradiance Fields", 2019) stand in two cascades round the
+camera, 32 by 8 by 32 each, 2 m and 8 m apart
+(`renderer_set_gi_probes`), each at its cell's centre, so a floor or a wall
+at a whole number of metres does not run through a row of them. A probe's
+slot is its world cell modulo the grid: the grid scrolls with the camera by
+whole cells and what a probe has learned stays where it learned it; a probe
+come to a new cell starts over and counts as off until it has traced.
+
+Each frame a quarter of the probes trace 128 rays each, spherical Fibonacci
+directions turned by a rotation of the frame's, through the frame's
+acceleration structure (`ae3d.vkddgi`, a compute pass after the sky's
+capture and before the scene). The structure holds every static mesh shown
+when the probes are on, not only what casts a shadow -- a floor that casts
+none still bounces the light that falls on it -- each instance's mask
+saying which it is, and the crowd's figures by their pose frames and the
+skinned figures as they are posed. A ray that meets nothing brings the
+sky's light back from its sharpest level. One that meets a surface reads
+its triangle by the instance's record -- the device addresses of its
+vertices and indices, its materials' colour by their textures' mean light,
+less what a metal mirrors, and its glow -- and lights it as the scene
+shader lights a diffuse surface: its glow, the directional lights and the
+frame's lamps through rays of their own toward each, and the probes' own
+light of the frame before at that point, so the light bounces on, a bounce
+a frame. A ray that meets a back is a probe inside something.
+
+The rays are folded into each probe's two octahedra, a texel of gutter
+round each: its irradiance, 6 texels a side, half floats (`RGBA16F`), every
+ray by its cosine to the texel's direction; and its distances, 14 a side,
+the mean and the mean square (`RG16F`), by the cosine to the fiftieth. A
+texel keeps 97% of what it had, all of it new when the probe has just come
+to its cell. A probe a quarter of whose rays met backs is off, and moves
+out through the nearest back; one nearer a face than 15% of its spacing
+moves toward the open side, never past its cell's 45%.
+
+The lit shader reads the eight probes round a point, at the point moved off
+the surface toward its normal and the eye: trilinear, each weighed by
+whether it faces the surface and whether, by its distances, it can see it
+(Chebyshev), small weights crushed. The near cascade blends into the far
+one over its last cell, the far one into the sky's light over its own. The
+result is the irradiance the sky's light was, so the rest of the shading --
+the occlusion on it, the reflections -- is as it was.
+
+What it costs: 128 rays for each of 4,096 probes a frame, and a shadow ray
+from each hit toward each directional light and each lamp in reach; the
+two atlases and the rays take 8 MiB, 16 MiB and 16 MiB, the state 512 KiB.
+`tests/test_gi` (lavapipe) holds the tiers to what they are for: a white
+wall over a red floor, lit only by the sun off the floor, takes it red
+(158 against 0 on the sky's tier); a sealed room under a grey sky stays
+dark inside (3 against the sky tier's 134) and a glowing panel inside it
+lights its far wall green; asked about the wall, the engine answers with
+the probes' reading (ae3d.agent's explain), not the sky's. The ray suites
+run again with the probes on, their crowds and posed figures read by the
+probes' rays (`ci.sh`).
+
 ### Motion vectors
 
 Beside its colour, every scene draw writes where its pixel's surface was
 last frame: a second colour attachment of the scene pass (R16G16, texture
 space, this frame's unnudged position less last frame's; multisampled and
-resolved like the colour on Vulkan, a second draw buffer of the post
-framebuffers on OpenGL), cleared to zero, so a pixel nothing drew has not
-moved. The vertex stage carries the vertex's clip position now and then:
+resolved by the scene pass on Vulkan, a second draw buffer of the post
+framebuffers on OpenGL resolved by a blit), cleared to zero, so a pixel
+nothing drew has not moved. Every surface writes it before any branch of
+its shader returns, and it is never blended: a vector is a surface's, not
+a mix. The vertex stage carries the vertex's clip position now and then:
 a model from its own matrix of last frame (`model_frame_done` keeps it at
 every frame's end) and the last frame's view-projection, unjittered; a
 merged batch or an instance stream, which carries no history, from the
@@ -395,7 +554,8 @@ Occlusion by ray: `engine_set_ray_occlusion(e, on)`, or `AE3D_RAY_AO=1`,
 with the rays and the occlusion (`engine_set_ssao`) both on. The scene
 shader traces four cosine-weighted rays into the hemisphere over every
 lit pixel, each stopped at the occlusion's reach, on the same turned
-spiral as the sun's taps, and darkens by the share that hit -- the share
+spiral as the sun's taps, and darkens the sky's light by the share that
+hit -- the share
 of the sky the point does not see, from the scene itself, with no screen
 edge or hidden surface for a depth-based estimate to miss -- and the
 screen-space pass is not drawn. The rays start a hand's breadth out,
@@ -477,7 +637,8 @@ DLSS reconstructs from, and with no multisampling, since a resolved sample
 has none of that detail left -- and DLSS makes the frame from the scene's
 colour, its resolved depth and its motion vectors, in the temporal pass's
 place, with the same nudged projection (more phases: eight times the
-square of the scale). The composite samples what it wrote.
+square of the scale). The colour it is handed is the scene's light, so it
+is told the buffers are HDR; the composite tones what it wrote.
 
 How it is wired (`native/dlss/streamline.cpp`, C++ against the SDK's headers,
 behind the C surface of `native/dlss/streamline.h`): the Streamline runtime is
@@ -515,8 +676,11 @@ and a temporal pass folds each frame into a history: each pixel's motion
 vector says where its surface was on the screen last frame -- the
 camera's motion, the model's, the figure's walk -- and the history read
 there is held to the range of colours the pixel's neighbourhood has this
-frame, so what the vector does not know of trails no ghost. An edge that
-was a staircase is a ramp, and the shading's own aliasing goes with it.
+frame, so what the vector does not know of trails no ghost. The history
+is clamped and blended with each colour over one plus how bright it shows
+(Karis), so a lamp hundreds of times its neighbours does not decide every
+pixel it reaches. An edge that was a staircase is a ramp, and the
+shading's own aliasing goes with it.
 On both backends; the pass runs between the reflection and the composite,
 and the two history textures are written in turn.
 
@@ -529,29 +693,47 @@ next scene all over again (#378). With `engine_set_eye_adaptation(e, true)`
 (`AE3D_EYE=1` for any program) the renderer measures what it drew and the
 frame's exposure is steered from it, the way an eye adapts:
 
-- the measure: the finished frame blitted into a texture and mip-chained
-  down to 320 texels across (OpenGL: a blit and `glGenerateMipmap`; Vulkan:
-  a blit chain after the last pass), read back two frames late through a
-  ring of buffers, so nothing waits on the frame just drawn -- its mean
-  linear luminance and the share of it near white;
+- the measure: the light the composite read -- before the frame's exposure
+  and tone curve -- blitted into a half-float texture and mip-chained down
+  to 320 texels across (OpenGL: a blit and `glGenerateMipmap`; Vulkan: a
+  blit chain after the composite), read back two frames late through a
+  ring of buffers, so nothing waits on the frame just drawn; each texel
+  then taken through the exposure its frame was drawn at and the tone
+  curve, for the frame's mean linear luminance as it showed and the share
+  of it near white (light averages where shown values do not, so the
+  halving is of the light);
 - the steering (`ae3d.exposure`, arithmetic a test drives by numbers): part
   of the way toward a mid-grey key (a night street stays night), down half a
   stop for every doubling of the near-white share past 0.2% of the frame,
   never up while lamps or a lit face are in view, faster down (0.4 s) than
   up (1.2 s), between two stops under and one and a half over;
-- the result, `frameExposure`, multiplies every material's exposure before
-  the tone curve, in the default shader and the sea's.
+- the result, `frameExposure`, scales the scene's light in the composite,
+  before the tone curve; the resolve and the temporal pass weigh brightness
+  by it too.
 
-The street's chase frame, 240 frames in, 1280x720:
+A scene lit by physical light needs an exposure as a camera does: a night
+street under its lamps is stops darker than a noon square.
+`engine_set_exposure(e, stops)` (the Rendering component's `exposure`,
+saved with the scene) draws the frame at 2 to that, and with the
+adaptation on moves the key it settles toward and its range by as much.
+The zombie street is shown 1.5 stops up.
 
-| | clipped pixels (>= 250) | mean |
+The street's chase frame, 240 frames in, drawn at 2560x1440 (a 1280x720
+window on a 2x display, M1 Pro); a frame of a simulation stepped by the
+clock, so the two renderers' are not the same moment:
+
+| | pixels with a channel at 250 or more | mean |
 |---|---|---|
-| Vulkan, fixed | 1,076 | 57.9 |
-| Vulkan, adapting | 10 | 35.9 |
-| OpenGL, fixed | 1,016 | 42.4 |
-| OpenGL, adapting | 454 | 32.4 |
+| Vulkan, fixed | 0 | 11.7 |
+| Vulkan, adapting | 1,529 | 22.7 |
+| OpenGL, fixed | 0 | 7.2 |
+| OpenGL, adapting | 530 | 18.6 |
 
-It costs nothing a frame can see (Vulkan 142.5 fps against 142.6). The
+The frame is tone mapped from its light (#656), so at the street's own
+exposure nothing clips: the night street sits under the mid-grey key and
+the adaptation lifts it until the lamps begin to near white. It costs
+nothing a frame can see (Vulkan 19.53 fps against 19.50 without, at that
+size). The
 meter's buffer is in cached memory: read from the write-combined kind, the
 quarter megabyte it is halved the frame rate. `street_drive` and
 `zombie_city` run with it; it is off by default, so a scene lit for its

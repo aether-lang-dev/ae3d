@@ -1,0 +1,411 @@
+// ae3d.vksky -- the sky's light on the Vulkan backend (#655).
+//
+// Each frame, before the scene pass, the sky is drawn into an octahedral
+// map (shaders.FRAGMENT_SKYBOX, captured: the sky in every direction, the
+// sun's and the moon's discs left to the key light), halved down its mips
+// by blits, and from it two things the scene shader reads:
+//
+//   - the irradiance onto every normal, a small octahedral map, the
+//     capture's mip of that size cosine-convolved (FRAGMENT_SKY_IRRADIANCE);
+//   - the reflections, the capture prefiltered by GGX into roughness levels
+//     (FRAGMENT_SKY_FILTER), one pass a level.
+//
+// With the split-sum table (ae3d.skylight, made once) they are bindings 10,
+// 11 and 12 of every set (ae3d.vkdesc). All in the frame, so the first
+// frame drawn is lit by its own sky.
+
+import contrib.vulkan.vk
+import std.mem
+import ae3d.core
+import ae3d.skylight
+import ae3d.vkdevice
+import ae3d.vkhost
+import ae3d.vktexture
+import ae3d.vktargets
+import ae3d.vkframe
+import ae3d.vkdesc
+import ae3d.vkpipes
+import ae3d.vkscene
+
+exports (
+    start, stop, capture, irradiance_at, reflections_view, reflections_sampler
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memcmp(a: ptr, b: ptr, n: long) -> int
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+
+// ae3d.skylight's SIZE, LEVELS and IRRADIANCE_SIZE, which the shaders are
+// written for; the capture's levels run from SIZE down to one texel.
+const SIZE = 256
+const LEVELS = 6
+const IRRADIANCE = 16
+const CAPTURE_LEVELS = 9
+// The words a capture is drawn from (inputs_now).
+const INPUT_WORDS = 27
+
+var g_capture = 0                    // the capture, in the texture table: all its levels
+// What the last capture was drawn from (inputs_now), and whether there was
+// one: the sky is captured again only when something it is drawn from moved.
+var g_inputs: ptr = null
+var g_inputs_now: ptr = null
+var g_captured = false
+var g_capture_image: ptr = null
+var g_capture_view: ptr = null       // its level 0, drawn into
+var g_capture_framebuffer: ptr = null
+var g_lit_image: ptr = null
+var g_lit_memory: ptr = null
+var g_lit_view: ptr = null           // all its levels, sampled
+var g_lit_sampler: ptr = null
+var g_lit_views: ptr = null          // VkImageView[LEVELS]
+var g_lit_framebuffers: ptr = null   // VkFramebuffer[LEVELS]
+var g_irradiance_image: ptr = null
+var g_irradiance_memory: ptr = null
+var g_irradiance_view: ptr = null
+var g_irradiance_sampler: ptr = null
+var g_irradiance_framebuffer: ptr = null
+var g_table = 0                      // the split-sum table, in the texture table
+
+// A view of one level of `image`.
+level_view(image: ptr, level: int) -> ptr {
+    info = calloc(1, sizeof(VkImageViewCreateInfo)) as *VkImageViewCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+    info.image = image
+    info.viewType = vk.IMAGE_VIEW_TYPE_2D
+    info.format = vktargets.scene_format()
+    info.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    info.subresourceRange.baseMipLevel = level
+    info.subresourceRange.levelCount = 1
+    info.subresourceRange.layerCount = 1
+    cell = calloc(1, 8)
+    r = vk.vkCreateImageView(vkhost.device(), info as ptr, null, cell)
+    view = (cell as ptr[])[0]
+    free(cell)
+    free(info as ptr)
+    if r != vk.SUCCESS { return null }
+    return view
+}
+
+// A framebuffer of the HDR screen pass over `view`, `size` a side.
+framebuffer(view: ptr, size: int) -> ptr {
+    views = calloc(1, 8)
+    (views as ptr[])[0] = view
+    info = calloc(1, sizeof(VkFramebufferCreateInfo)) as *VkFramebufferCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+    info.renderPass = vktargets.hdr_pass()
+    info.attachmentCount = 1
+    info.pAttachments = views
+    info.width = size
+    info.height = size
+    info.layers = 1
+    cell = calloc(1, 8)
+    r = vk.vkCreateFramebuffer(vkhost.device(), info as ptr, null, cell)
+    made = (cell as ptr[])[0]
+    free(cell)
+    free(info as ptr)
+    free(views)
+    if r != vk.SUCCESS { return null }
+    return made
+}
+
+// A layout change of levels `base` on (`count` of them) of `image`.
+turn(commands: ptr, image: ptr, base: int, count: int, from: int, to: int, src_access: int, dst_access: int,
+     src_stage: int, dst_stage: int) {
+    b = calloc(1, sizeof(VkImageMemoryBarrier)) as *VkImageMemoryBarrier
+    b.sType = vk.STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+    b.oldLayout = from
+    b.newLayout = to
+    b.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.image = image
+    b.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    b.subresourceRange.baseMipLevel = base
+    b.subresourceRange.levelCount = count
+    b.subresourceRange.layerCount = 1
+    b.srcAccessMask = src_access
+    b.dstAccessMask = dst_access
+    vk.vkCmdPipelineBarrier(commands, src_stage, dst_stage, 0, 0, null, 0, null, 1, b as ptr)
+    free(b as ptr)
+}
+
+// Every level of `image` cleared to black and left shader-readable, so a
+// set naming it before its first capture reads a defined image.
+blacked(commands: ptr, image: ptr, levels: int) {
+    turn(commands, image, 0, levels, vk.IMAGE_LAYOUT_UNDEFINED, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         0, vk.ACCESS_TRANSFER_WRITE_BIT, vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT)
+    colour = calloc(4, 4)              // a VkClearColorValue: black
+    range = calloc(1, sizeof(VkImageSubresourceRange)) as *VkImageSubresourceRange
+    range.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    range.levelCount = levels
+    range.layerCount = 1
+    vk.vkCmdClearColorImage(commands, image, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, colour, 1, range as ptr)
+    free(colour)
+    free(range as ptr)
+    turn(commands, image, 0, levels, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+         vk.ACCESS_TRANSFER_WRITE_BIT, vk.ACCESS_SHADER_READ_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT,
+         vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+}
+
+// The split-sum table as half floats, in the texture table.
+table() -> int {
+    values = skylight.brdf_lut() as float[]
+    count = skylight.LUT_SIZE * skylight.LUT_SIZE * 2
+    halves = calloc(count, 2)
+    i = 0
+    while i < count {
+        mem.set_uint16(halves, i * 2, core.half_bits(values[i]))
+        i = i + 1
+    }
+    handle = vktexture.texture_create_table(skylight.LUT_SIZE, skylight.LUT_SIZE, halves)
+    free(halves)
+    free(values as ptr)
+    return handle
+}
+
+// The images, their views and framebuffers, the table, and the sets told
+// of them. False, with the reason in the backend's last error, when one
+// would not make.
+start() -> bool {
+    format = vktargets.scene_format()
+    usage = vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT | vk.IMAGE_USAGE_TRANSFER_DST_BIT
+    capture = vkhost.image(SIZE, SIZE, CAPTURE_LEVELS, format, vk.SAMPLE_COUNT_1_BIT,
+                           usage | vk.IMAGE_USAGE_TRANSFER_SRC_BIT, vk.IMAGE_ASPECT_COLOR_BIT)
+    if capture.image == null { return false }
+    // The filter reads the capture between its mips (filtered importance
+    // sampling), clamped: the gutter is what holds the far side of an edge.
+    sampler = vkhost.sampler(vk.FILTER_LINEAR, vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, vk.SAMPLER_MIPMAP_MODE_LINEAR,
+                             CAPTURE_LEVELS as float, 0.0)
+    if sampler == null {
+        vkhost.image_free(capture)
+        vkdevice.fail("sky capture vkCreateSampler failed")
+        return false
+    }
+    g_capture = vktexture.adopt_target(capture, sampler, SIZE, SIZE)
+    if g_capture == 0 { return false }
+    g_capture_image = capture.image
+    g_capture_view = level_view(capture.image, 0)
+    if g_capture_view == null { return failed("sky capture vkCreateImageView failed") }
+    g_capture_framebuffer = framebuffer(g_capture_view, SIZE)
+    if g_capture_framebuffer == null { return failed("sky capture vkCreateFramebuffer failed") }
+
+    lit = vkhost.image(SIZE, SIZE, LEVELS, format, vk.SAMPLE_COUNT_1_BIT, usage, vk.IMAGE_ASPECT_COLOR_BIT)
+    if lit.image == null { return false }
+    g_lit_image = lit.image
+    g_lit_memory = lit.memory
+    g_lit_view = lit.view
+    // Read between its levels: the roughness falls between them.
+    g_lit_sampler = vkhost.sampler(vk.FILTER_LINEAR, vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                   vk.SAMPLER_MIPMAP_MODE_LINEAR, LEVELS as float, 0.0)
+    if g_lit_sampler == null { return failed("sky light vkCreateSampler failed") }
+    g_lit_views = calloc(LEVELS, 8)
+    g_lit_framebuffers = calloc(LEVELS, 8)
+    k = 0
+    while k < LEVELS {
+        view = level_view(g_lit_image, k)
+        if view == null { return failed("sky light vkCreateImageView failed") }
+        (g_lit_views as ptr[])[k] = view
+        fb = framebuffer(view, SIZE >> k)
+        if fb == null { return failed("sky light vkCreateFramebuffer failed") }
+        (g_lit_framebuffers as ptr[])[k] = fb
+        k = k + 1
+    }
+
+    // Copyable, for the agent to read back (irradiance_at).
+    irradiance = vkhost.image(IRRADIANCE, IRRADIANCE, 1, format, vk.SAMPLE_COUNT_1_BIT,
+                              usage | vk.IMAGE_USAGE_TRANSFER_SRC_BIT, vk.IMAGE_ASPECT_COLOR_BIT)
+    if irradiance.image == null { return false }
+    g_irradiance_image = irradiance.image
+    g_irradiance_memory = irradiance.memory
+    g_irradiance_view = irradiance.view
+    g_irradiance_sampler = vkhost.sampler(vk.FILTER_LINEAR, vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                          vk.SAMPLER_MIPMAP_MODE_NEAREST, 0.0, 0.0)
+    if g_irradiance_sampler == null { return failed("sky irradiance vkCreateSampler failed") }
+    g_irradiance_framebuffer = framebuffer(g_irradiance_view, IRRADIANCE)
+    if g_irradiance_framebuffer == null { return failed("sky irradiance vkCreateFramebuffer failed") }
+
+    g_table = table()
+    if g_table == 0 { return failed("the split-sum table would not upload") }
+
+    commands = vkhost.once_begin()
+    blacked(commands, g_capture_image, CAPTURE_LEVELS)
+    blacked(commands, g_lit_image, LEVELS)
+    blacked(commands, g_irradiance_image, 1)
+    vkhost.once_end(commands)
+
+    vkdesc.set_sky_light(g_lit_view, g_lit_sampler, vktexture.view(g_table), vktexture.sampler_of(g_table),
+                         g_irradiance_view, g_irradiance_sampler)
+    return true
+}
+
+failed(why: string) -> bool {
+    vkdevice.fail(why)
+    return false
+}
+
+// Everything start made, gone; the device idle first.
+stop() {
+    d = vkhost.device()
+    if d == null { return }
+    vk.vkDeviceWaitIdle(d)
+    if g_capture_framebuffer != null { vk.vkDestroyFramebuffer(d, g_capture_framebuffer, null) }
+    if g_capture_view != null { vk.vkDestroyImageView(d, g_capture_view, null) }
+    if g_capture != 0 { vkdesc.texture_destroy(g_capture) }
+    if g_lit_framebuffers != null {
+        k = 0
+        while k < LEVELS {
+            fb = (g_lit_framebuffers as ptr[])[k]
+            if fb != null { vk.vkDestroyFramebuffer(d, fb, null) }
+            view = (g_lit_views as ptr[])[k]
+            if view != null { vk.vkDestroyImageView(d, view, null) }
+            k = k + 1
+        }
+        free(g_lit_framebuffers)
+        free(g_lit_views)
+    }
+    if g_lit_sampler != null { vk.vkDestroySampler(d, g_lit_sampler, null) }
+    vkhost.image_free(vkhost.VKImage { image: g_lit_image, memory: g_lit_memory, view: g_lit_view })
+    if g_irradiance_framebuffer != null { vk.vkDestroyFramebuffer(d, g_irradiance_framebuffer, null) }
+    if g_irradiance_sampler != null { vk.vkDestroySampler(d, g_irradiance_sampler, null) }
+    vkhost.image_free(vkhost.VKImage { image: g_irradiance_image, memory: g_irradiance_memory, view: g_irradiance_view })
+    if g_table != 0 { vkdesc.texture_destroy(g_table) }
+    vkdesc.set_sky_light(null, null, null, null, null, null)
+    g_capture = 0
+    g_captured = false
+    g_capture_image = null
+    g_capture_view = null
+    g_capture_framebuffer = null
+    g_lit_image = null
+    g_lit_memory = null
+    g_lit_view = null
+    g_lit_sampler = null
+    g_lit_views = null
+    g_lit_framebuffers = null
+    g_irradiance_image = null
+    g_irradiance_memory = null
+    g_irradiance_view = null
+    g_irradiance_sampler = null
+    g_irradiance_framebuffer = null
+    g_table = 0
+}
+
+// This frame's sky captured and turned into its light, recorded before the
+// scene pass: `sky` the sky's image (the default texture for a procedural
+// or flat sky), `weather` and `shape` the clouds' textures, the sky's own
+// uniforms already in the scene block.
+// The words the capture is drawn from, into g_inputs_now: the sky's image
+// and the clouds', and the block's sky values -- what the capture shader
+// reads -- with the clouds' drift, dither and the eye only where there are
+// clouds to draw.
+inputs_now(sky: int, weather: int, shape: int) {
+    if g_inputs == null {
+        g_inputs = calloc(INPUT_WORDS, 4)
+        g_inputs_now = calloc(INPUT_WORDS, 4)
+    }
+    words = g_inputs_now as int[]
+    block = vkdesc.block(vkdesc.PROGRAM_SCENE)
+    words[0] = sky
+    words[1] = weather
+    words[2] = shape
+    at = 3
+    offsets = [vkscene.OFF_SKYPROCEDURAL, vkscene.OFF_SKYOVERCAST, vkscene.OFF_SKYTURBIDITY, vkscene.OFF_CLOUDCOVER]
+    k = 0
+    while k < 4 {
+        words[at] = ((block + offsets[k]) as int[])[0]
+        at = at + 1
+        k = k + 1
+    }
+    vectors = [vkscene.OFF_SKYFLAT, vkscene.OFF_SKYSUN, vkscene.OFF_CLOUDSUN, vkscene.OFF_CLOUDSUNCOLOR, vkscene.OFF_SKYOVERCASTCOLOR]
+    k = 0
+    while k < 5 {
+        c = 0
+        while c < 3 {
+            words[at] = ((block + vectors[k] + c * 4) as int[])[0]
+            at = at + 1
+            c = c + 1
+        }
+        k = k + 1
+    }
+    clouded = ((block + vkscene.OFF_CLOUDCOVER) as f32[])[0] > (0.0 as f32)
+    cloudy = [vkscene.OFF_CLOUDTIME, vkscene.OFF_CLOUDFRAME, vkscene.OFF_VIEWPOS, vkscene.OFF_VIEWPOS + 4, vkscene.OFF_VIEWPOS + 8]
+    k = 0
+    while k < 5 {
+        words[at] = 0
+        if clouded { words[at] = ((block + cloudy[k]) as int[])[0] }
+        at = at + 1
+        k = k + 1
+    }
+}
+
+capture(sky: int, weather: int, shape: int) {
+    if g_capture == 0 { return }
+    inputs_now(sky, weather, shape)
+    if g_captured && memcmp(g_inputs, g_inputs_now, (INPUT_WORDS * 4) as long) == 0 { return }
+    memcpy(g_inputs, g_inputs_now, (INPUT_WORDS * 4) as long)
+    g_captured = true
+    commands = vkframe.frame_commands()
+    pass = vktargets.hdr_pass()
+    // The levels under the first are remade from it: what they held goes.
+    turn(commands, g_capture_image, 1, CAPTURE_LEVELS - 1, vk.IMAGE_LAYOUT_UNDEFINED,
+         vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, vk.ACCESS_TRANSFER_WRITE_BIT,
+         vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT)
+    vkframe.screen_pass(pass, g_capture_framebuffer, SIZE, SIZE, vkpipes.sky_capture(), sky, weather, shape)
+    turn(commands, g_capture_image, 0, 1, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+         vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+         vk.ACCESS_TRANSFER_READ_BIT | vk.ACCESS_TRANSFER_WRITE_BIT,
+         vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT)
+    vktexture.mip_chain(commands, g_capture_image, SIZE, SIZE, CAPTURE_LEVELS)
+
+    vkframe.screen_pass(pass, g_irradiance_framebuffer, IRRADIANCE, IRRADIANCE, vkpipes.sky_irradiance(), g_capture, 0, 0)
+    k = 0
+    while k < LEVELS {
+        size = SIZE >> k
+        vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+        vkdesc.set_float(vkscene.OFF_SKYLEVELSIZE, size as float)
+        vkdesc.set_float(vkscene.OFF_SKYROUGHNESS, (k as float) / ((LEVELS - 1) as float))
+        vkframe.screen_pass(pass, (g_lit_framebuffers as ptr[])[k], size, size, vkpipes.sky_filter(), g_capture, 0, 0)
+        k = k + 1
+    }
+}
+
+// The prefiltered map, every level, and its sampler: what a probe's ray
+// that meets nothing reads the sky's light from (ae3d.vkddgi).
+reflections_view() -> ptr { return g_lit_view }
+reflections_sampler() -> ptr { return g_lit_sampler }
+
+// The sky's irradiance onto a surface facing `n`, read back from the
+// device: what the agent explains a surface's light by. Waits for the
+// device, so it is for a question asked now and then, not for a frame.
+irradiance_at(n: Vec3) -> Vec3 {
+    if g_irradiance_image == null { return core.vec3(0.0, 0.0, 0.0) }
+    vk.vkDeviceWaitIdle(vkhost.device())
+    count = IRRADIANCE * IRRADIANCE
+    buffer = vkhost.host_buffer(count * 8)
+    if buffer == null { return core.vec3(0.0, 0.0, 0.0) }
+    commands = vkhost.once_begin()
+    read = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    turn(commands, g_irradiance_image, 0, 1, read, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, vk.ACCESS_TRANSFER_READ_BIT,
+         vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT)
+    region = calloc(1, sizeof(VkBufferImageCopy)) as *VkBufferImageCopy
+    region.imageSubresource.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    region.imageSubresource.layerCount = 1
+    region.imageExtent.width = IRRADIANCE
+    region.imageExtent.height = IRRADIANCE
+    region.imageExtent.depth = 1
+    vk.vkCmdCopyImageToBuffer(commands, g_irradiance_image, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.buffer, 1, region as ptr)
+    free(region as ptr)
+    turn(commands, g_irradiance_image, 0, 1, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, read, 0, vk.ACCESS_SHADER_READ_BIT,
+         vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+    vkhost.once_end(commands)
+    texels = calloc(count * 4, 4)
+    out = texels as f32[]
+    i = 0
+    while i < count * 4 {
+        out[i] = core.half_value(mem.get_uint8(buffer.mapped, i * 2) | (mem.get_uint8(buffer.mapped, i * 2 + 1) << 8)) as f32
+        i = i + 1
+    }
+    vkhost.host_buffer_free(buffer)
+    e = skylight.irradiance_at(texels, n)
+    free(texels)
+    return e
+}

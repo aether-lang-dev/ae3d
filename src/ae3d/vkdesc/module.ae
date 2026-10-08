@@ -30,11 +30,11 @@ import std.io
 
 exports (
     FRAMES, MAX_SETS, PROGRAM_SCENE, PROGRAM_WATER, PROGRAM_COUNT, AUX_SCENE_DEPTH,
-    clusters_reserve, clusters_lights, clusters_words,
+    clusters_reserve, clusters_lights, clusters_words, clusters_buffer,
     start, stop, set_layout, pool, reset, forget_all, forget_texture, forget_aux, texture_destroy,
     program, set_program, block, set_float, set_int, set_vec3, set_mat4, set_mat4v, set_vec4v, set_mat4_floats, set_clip_mat4,
     set_inv_viewproj, set_float_array, set_vec3_array, offset, clip_correct, mat4_mul, mat4_invert,
-    ring_begin, ring_push, ring_buffer, set_for, allocate, rewrite_shadow
+    ring_begin, ring_push, ring_buffer, set_for, allocate, rewrite_shadow, set_sky_light, set_occlusion, set_probes
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -53,6 +53,8 @@ const AUX_SCENE_DEPTH = 0 - 1
 // A cached set whose texture has been destroyed. Not zero: zero is a
 // texture handle nothing uses, and not -1 alone, which reads as an error.
 const SET_FREE = 0 - 2
+// The scene set's bindings where the device traces (13 elsewhere).
+const BINDINGS = 17
 // Draws a frame: its ring holds as many blocks.
 const DRAWS_PER_FRAME = 4096
 // What a slot's cluster buffers start at: enough for a street of lamps
@@ -85,6 +87,26 @@ var g_set_count: ptr = null        // int[FRAMES]
 // scene needs more, once the slot's fence has passed.
 var g_lights: ptr = null           // VKCluster[FRAMES]
 var g_words: ptr = null            // VKCluster[FRAMES]
+// The sky's light (#655), the same in every set: its prefiltered
+// reflections at 10, the split-sum table at 11, its irradiance at 12
+// (ae3d.vksky makes them before the first draw and names them here).
+var g_sky_views: ptr = null        // VkImageView[3]
+var g_sky_samplers: ptr = null     // VkSampler[3]
+// The screen's occlusion found from the last frame (#655) at 13, or none
+// yet: the default texture's white, nothing occluded.
+var g_occlusion_view: ptr = null
+var g_occlusion_sampler: ptr = null
+// The probes' light (#537), where the device traces: their irradiance at
+// 14, their distance at 15 and their state at 16 (ae3d.vkddgi), or with
+// the probes off the default texture and a zeroed buffer of one probe's
+// state, which the shader never reads past its ddgiOn.
+var g_probe_irradiance: ptr = null
+var g_probe_distance: ptr = null
+var g_probe_sampler: ptr = null
+var g_probe_state: ptr = null
+var g_probe_state_bytes = 0
+var g_no_probes: ptr = null
+var g_no_probes_memory: ptr = null
 
 struct VKCluster {
     buffer: ptr
@@ -119,8 +141,10 @@ start() -> bool {
         g_set_bank = calloc(FRAMES * MAX_SETS, 4)
         g_set_mask = calloc(FRAMES * MAX_SETS, 4)
         g_set_count = calloc(FRAMES, 4)
-        g_writes = calloc(9, sizeof(VkWriteDescriptorSet))
-        g_infos = calloc(9, sizeof(VkDescriptorImageInfo))
+        g_writes = calloc(BINDINGS, sizeof(VkWriteDescriptorSet))
+        g_infos = calloc(BINDINGS, sizeof(VkDescriptorImageInfo))
+        g_sky_views = calloc(3, 8)
+        g_sky_samplers = calloc(3, 8)
         g_lights = calloc(FRAMES, sizeof(VKCluster))
         g_words = calloc(FRAMES, sizeof(VKCluster))
         g_structure = calloc(1, sizeof(VkWriteDescriptorSetAccelerationStructureKHR))
@@ -132,12 +156,14 @@ start() -> bool {
     g_program = PROGRAM_SCENE
 
     // In the order the layout lists them: 0 to 4, the lamps at 6 and 7 and
-    // their atlas at 8, a model's damage mask at 9 (#544), and the
-    // structure at 5 last, so it can be left off.
-    order = [0, 1, 2, 3, 4, 6, 7, 8, 9, 5]
-    bindings = calloc(10, sizeof(VkDescriptorSetLayoutBinding))
+    // their atlas at 8, a model's damage mask at 9 (#544), the sky's light
+    // at 10 to 12 and the screen's occlusion at 13 (#655), and last what
+    // only a device that traces has, so it can be left off: the structure at
+    // 5 and the probes' light at 14 to 16 (#537).
+    order = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 5, 14, 15, 16]
+    bindings = calloc(BINDINGS, sizeof(VkDescriptorSetLayoutBinding))
     i = 0
-    while i < 10 {
+    while i < BINDINGS {
         b = (bindings + i * sizeof(VkDescriptorSetLayoutBinding)) as *VkDescriptorSetLayoutBinding
         n = order[i]
         b.binding = n
@@ -155,7 +181,7 @@ start() -> bool {
         if n == 4 { b.stageFlags = vk.SHADER_STAGE_VERTEX_BIT | vk.SHADER_STAGE_FRAGMENT_BIT }
         // The clustered lamps: storage buffers the scene fragment shader
         // indexes.
-        if n == 6 || n == 7 { b.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER }
+        if n == 6 || n == 7 || n == 16 { b.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER }
         // The scene's acceleration structure, for the rays the fragment
         // traces; only where the device traces, since a layout naming a
         // descriptor type the device has no extension for is refused.
@@ -164,8 +190,8 @@ start() -> bool {
     }
     info = calloc(1, sizeof(VkDescriptorSetLayoutCreateInfo)) as *VkDescriptorSetLayoutCreateInfo
     info.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
-    info.bindingCount = 9
-    if rays { info.bindingCount = 10 }
+    info.bindingCount = 13
+    if rays { info.bindingCount = BINDINGS }
     info.pBindings = bindings
     r = vk.vkCreateDescriptorSetLayout(d, info as ptr, null, g_cell)
     g_set_layout = (g_cell as ptr[])[0]
@@ -183,10 +209,10 @@ start() -> bool {
     s0.descriptorCount = FRAMES * MAX_SETS
     s1 = (sizes + sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
     s1.type = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-    s1.descriptorCount = FRAMES * MAX_SETS * 6
+    s1.descriptorCount = FRAMES * MAX_SETS * 12
     s2 = (sizes + 2 * sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
     s2.type = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
-    s2.descriptorCount = FRAMES * MAX_SETS * 2
+    s2.descriptorCount = FRAMES * MAX_SETS * 3
     s3 = (sizes + 3 * sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
     s3.type = vk.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
     s3.descriptorCount = FRAMES * MAX_SETS
@@ -233,6 +259,18 @@ start() -> bool {
             return false
         }
         f = f + 1
+    }
+    if rays {
+        zeros = vkhost.device_buffer(32, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_TRANSFER_DST_BIT)
+        g_no_probes = zeros.buffer
+        g_no_probes_memory = zeros.memory
+        if g_no_probes == null {
+            vkdevice.fail("probe state vkCreateBuffer failed")
+            return false
+        }
+        commands = vkhost.once_begin()
+        vk.vkCmdFillBuffer(commands, g_no_probes, 0, vk.WHOLE_SIZE, 0)
+        vkhost.once_end(commands)
     }
     return true
 }
@@ -330,6 +368,8 @@ clusters_reserve(frame: int, light_bytes: long, word_bytes: long) -> bool {
 
 // Where frame slot `frame`'s lamps and lists are written.
 clusters_lights(frame: int) -> ptr { return cluster_at(g_lights, frame).mapped }
+// The buffer frame slot `frame`'s lamps are in, for the probes' hits.
+clusters_buffer(frame: int) -> ptr { return cluster_at(g_lights, frame).buffer }
 clusters_words(frame: int) -> ptr { return cluster_at(g_words, frame).mapped }
 
 // Everything made here destroyed, the device idle: at shutdown.
@@ -349,6 +389,9 @@ stop() {
         cluster_destroy(cluster_at(g_words, f))
         f = f + 1
     }
+    vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: g_no_probes, memory: g_no_probes_memory })
+    g_no_probes = null
+    g_no_probes_memory = null
     if g_pool != null { vk.vkDestroyDescriptorPool(d, g_pool, null) }
     if g_set_layout != null { vk.vkDestroyDescriptorSetLayout(d, g_set_layout, null) }
     g_pool = null
@@ -732,6 +775,10 @@ set_for(frame: int, texture: int, normal: int, bank: int, default_texture: int,
     }
     if reuse < 0 && n >= MAX_SETS { return null }
     if !vktexture.valid(texture) { return null }
+    if g_sky_views == null || (g_sky_views as ptr[])[0] == null {
+        vkdevice.fail("a descriptor set was asked for before the sky's light was made")
+        return null
+    }
 
     set = null
     if reuse >= 0 {
@@ -800,9 +847,22 @@ set_for(frame: int, texture: int, normal: int, bank: int, default_texture: int,
     count = count + 1
     image_write(count, set, 9, vktexture.view(mask_handle), vktexture.sampler_of(mask_handle), read)
     count = count + 1
+    k = 0
+    while k < 3 {
+        image_write(count, set, 10 + k, (g_sky_views as ptr[])[k], (g_sky_samplers as ptr[])[k], read)
+        count = count + 1
+        k = k + 1
+    }
+    if g_occlusion_view != null {
+        image_write(count, set, 13, g_occlusion_view, g_occlusion_sampler, read)
+    } else {
+        image_write(count, set, 13, vktexture.view(default_texture), vktexture.sampler_of(default_texture), read)
+    }
+    count = count + 1
     vk.vkUpdateDescriptorSets(vkhost.device(), count, g_writes, 0, null)
     free(buffer as ptr)
     write_clusters(set, frame)
+    if vkdevice.ray_query() { write_probes(set, default_texture) }
 
     index = reuse
     if reuse < 0 {
@@ -816,6 +876,72 @@ set_for(frame: int, texture: int, normal: int, bank: int, default_texture: int,
     (g_set_bank as int[])[c] = bank_handle
     (g_set_mask as int[])[c] = mask_handle
     return set
+}
+
+// The sky's light every set binds from now on: the prefiltered reflections,
+// the split-sum table and the irradiance, each a view and its sampler.
+// Named once, before the first set; the images are written in place each
+// frame and keep their views.
+set_sky_light(reflections: ptr, reflections_sampler: ptr, table: ptr, table_sampler: ptr,
+              irradiance: ptr, irradiance_sampler: ptr) {
+    v = g_sky_views as ptr[]
+    s = g_sky_samplers as ptr[]
+    v[0] = reflections
+    s[0] = reflections_sampler
+    v[1] = table
+    s[1] = table_sampler
+    v[2] = irradiance
+    s[2] = irradiance_sampler
+}
+
+// The probes' atlases (in the general layout they are written in) and
+// state every set binds at 14 to 16 from now on, or none (nulls): with the
+// device idle, since every cached set is let go and written again.
+set_probes(irradiance: ptr, distance: ptr, sampler: ptr, state: ptr, state_bytes: int) {
+    g_probe_irradiance = irradiance
+    g_probe_distance = distance
+    g_probe_sampler = sampler
+    g_probe_state = state
+    g_probe_state_bytes = state_bytes
+    forget_all()
+}
+
+write_probes(set: ptr, default_texture: int) {
+    general = vk.IMAGE_LAYOUT_GENERAL
+    if g_probe_irradiance != null {
+        image_write(0, set, 14, g_probe_irradiance, g_probe_sampler, general)
+        image_write(1, set, 15, g_probe_distance, g_probe_sampler, general)
+    } else {
+        read = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        image_write(0, set, 14, vktexture.view(default_texture), vktexture.sampler_of(default_texture), read)
+        image_write(1, set, 15, vktexture.view(default_texture), vktexture.sampler_of(default_texture), read)
+    }
+    state = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+    state.buffer = g_no_probes
+    state.range = 32
+    if g_probe_state != null {
+        state.buffer = g_probe_state
+        state.range = g_probe_state_bytes
+    }
+    w = (g_writes + 2 * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+    memset(w as ptr, 0, sizeof(VkWriteDescriptorSet) as long)
+    w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    w.dstSet = set
+    w.dstBinding = 16
+    w.descriptorCount = 1
+    w.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+    w.pBufferInfo = state as ptr
+    vk.vkUpdateDescriptorSets(vkhost.device(), 3, g_writes, 0, null)
+    free(state as ptr)
+}
+
+// The screen's occlusion map every set binds at 13 from now on, or none
+// (null). It changes with the camera depth, the device idle: every cached
+// set is let go and written again with it when next asked for.
+set_occlusion(view: ptr, sampler: ptr) {
+    g_occlusion_view = view
+    g_occlusion_sampler = sampler
+    forget_all()
 }
 
 // Every cached set's binding 2 rewritten to `view`: shadows turned on or

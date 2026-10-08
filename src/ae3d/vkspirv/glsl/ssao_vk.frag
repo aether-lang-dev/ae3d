@@ -4,7 +4,6 @@ struct Light {
     vec3 position;
     vec3 color;
     float intensity;
-    float ambientStrength;
     float temperature;
     int isDirectional;
     vec3 direction;
@@ -54,7 +53,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float reflectivity;
     float wetness;
-    float frameExposure;
     bool hasNormalMap;
     float normalStrength;
     float occlusionStrength;
@@ -70,20 +68,15 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableEnergyConservation;
     bool enableImageBasedLighting;
     float iblIntensity;
+    int giOff;
     bool enableVolumetricLighting;
     float volumetricIntensity;
     int volumetricSteps;
     float volumetricScattering;
-    bool enableGlobalIllumination;
-    float giIntensity;
-    int giBounces;
-    bool enableBloom;
-    float bloomThreshold;
-    float bloomIntensity;
     bool enableFog;
     float fogStart;
     float fogEnd;
-    vec3 fogColor;
+    vec3 fogRadiance;
     float fogIntensity;
     bool enableShadows;
     bool hasShadowMap;
@@ -127,6 +120,12 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 damageColours[4];
     vec4 damageRect;
     float damageClamp;
+    int occlusionHistory;
+    int ddgiOn;
+    vec4 ddgiDims;
+    vec4 ddgiBase[2];
+    vec4 ddgiSpacing;
+    vec4 ddgiAtlas;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -135,10 +134,21 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int skyProcedural;
     float skyOvercast;
     vec3 skyOvercastColor;
+    vec3 skyFlat;
+    float skyTurbidity;
+    float skyLevelSize;
+    float skyRoughness;
+    float frameExposure;
+    bool enableBloom;
+    float bloomIntensity;
     vec2 texelSize;
+    int bloomFirst;
+    float bloomThreshold;
+    int bloomTop;
     float edgeThreshold;
     float edgeThresholdMin;
     float subpixelQuality;
+    int colorSampleCount;
     mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
@@ -193,14 +203,16 @@ layout(set = 0, binding = 2) uniform sampler2D depthTexture;
 layout(location = 0) in vec2 TexCoords;
 layout(location = 0) out vec4 FragColor;
 
-// Ambient occlusion from the scene's own depth, drawn over the opaque pass
-// as a multiply before anything transparent: the corners, the feet of
-// things and the ground under a canopy go darker by how much of the
-// hemisphere over them the depth says is filled. It replaces a term in
-// the scene shader that took no depth at all -- it sampled a hemisphere
-// against its own surface, which came out the same number everywhere,
-// and darkened everything drawn with it by two and a half times while
-// leaving what was drawn without it alone.
+// Ambient occlusion from the scene's own depth: the corners, the feet of
+// things and the ground under a canopy, by how much of the hemisphere over
+// them the depth says is filled. Drawn before the scene from the last
+// frame's depth (#655), into the occlusion map the scene shader reads: the
+// occlusion in red, and in green the depth it was found at (clip w, the
+// last frame's view depth) for a surface to tell it is the one that was
+// there. The positions are rebuilt with this frame's matrices: the last
+// frame's geometry moved rigidly by the camera's step, so every sample
+// still lands on the image it was drawn in. It darkens the light from the
+// sky and nothing else; a lamp shining into a corner shines into it.
 
 
 
@@ -241,7 +253,7 @@ void main() {
     vec2 uv = gl_FragCoord.xy / screenSize;
     float depth;
     vec3 P = worldAt(uv, depth);
-    if (depth >= 0.99999 || ssaoIntensity <= 0.0) { FragColor = vec4(1.0); return; }
+    if (depth >= 0.99999 || ssaoIntensity <= 0.0) { FragColor = vec4(1.0, 0.0, 0.0, 1.0); return; }
 
     // The surface's normal from the slope of its own depth: the neighbour
     // a pixel over on each axis, whichever of the two sides is nearer in
@@ -314,5 +326,5 @@ void main() {
     // Gone in the distance, where the radius is a few pixels and the depth
     // has no room left to tell a corner from a plane.
     ao = mix(ao, 1.0, smoothstep(ssaoRadius * 40.0, ssaoRadius * 120.0, eyeDist));
-    FragColor = vec4(ao, ao, ao, 1.0);
+    FragColor = vec4(ao, (viewProjection * vec4(P, 1.0)).w, 0.0, 1.0);
 }

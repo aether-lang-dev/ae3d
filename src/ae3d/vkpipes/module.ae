@@ -19,7 +19,7 @@ import ae3d.vkspirv
 exports (
     create, destroy, layout,
     scene, scene_blend, skinned, skinned_blend, crowd, crowd_blend, points, points_blend, water, water_blend,
-    shadow, skinned_shadow, crowd_shadow, point_shadow, sky, post, ssao, depth_resolve, taa
+    shadow, skinned_shadow, crowd_shadow, point_shadow, sky, post, ssao, bloom_down, bloom_up, depth_resolve, taa, sky_capture, sky_filter, sky_irradiance
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -53,10 +53,18 @@ var g_skinned_shadow: ptr = null
 var g_crowd_shadow: ptr = null
 var g_point_shadow: ptr = null
 var g_sky: ptr = null
-var g_post: ptr = null             // VkPipeline[4]: passthrough, fxaa, bloom, the reflection
+var g_post: ptr = null             // VkPipeline[4]: the composite, fxaa, the colour resolve, the reflection
 var g_ssao: ptr = null
+// The bloom's way down and its way up, a level a draw (vkframe.bloom_chain).
+var g_bloom_down: ptr = null
+var g_bloom_up: ptr = null
 var g_depth_resolve: ptr = null
 var g_taa: ptr = null
+// The sky captured into the octahedral map the scene is lit from, and that
+// capture prefiltered into its reflections' levels (#655).
+var g_sky_capture: ptr = null
+var g_sky_filter: ptr = null
+var g_sky_irradiance: ptr = null
 
 layout() -> ptr { return g_layout }
 scene(cull: int) -> ptr { return (g_scene as ptr[])[cull] }
@@ -76,8 +84,13 @@ point_shadow() -> ptr { return g_point_shadow }
 sky() -> ptr { return g_sky }
 post(index: int) -> ptr { return (g_post as ptr[])[index] }
 ssao() -> ptr { return g_ssao }
+bloom_down() -> ptr { return g_bloom_down }
+bloom_up() -> ptr { return g_bloom_up }
 depth_resolve() -> ptr { return g_depth_resolve }
 taa() -> ptr { return g_taa }
+sky_capture() -> ptr { return g_sky_capture }
+sky_filter() -> ptr { return g_sky_filter }
+sky_irradiance() -> ptr { return g_sky_irradiance }
 
 // A shader module from ae3d.vkspirv's words; null when it would not make.
 shader(which: int) -> ptr {
@@ -210,17 +223,17 @@ build(vertex: ptr, fragment: ptr, blend: int, depth_test: bool, depth_write: boo
     raster.frontFace = vk.FRONT_FACE_COUNTER_CLOCKWISE
     raster.lineWidth = 1.0
 
-    // Every pass but the scene's draws single-sampled: the post passes (the
-    // composite, and the one the reflection and the temporal pass share),
-    // the shadow map and the camera depth. The temporal pass's pipeline,
+    // Every pass but the scene's draws single-sampled: the screen passes (the
+    // composite, the one the resolve, the reflection and the temporal pass
+    // share, and the one FXAA reads), the shadow map and the camera depth. The temporal pass's pipeline,
     // made against the reflection's pass with the scene's four samples,
     // drew into a one-sample target on every frame the validation layer
     // watched (#405).
     multisample = calloc(1, sizeof(VkPipelineMultisampleStateCreateInfo)) as *VkPipelineMultisampleStateCreateInfo
     multisample.sType = vk.STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO
     multisample.rasterizationSamples = vktargets.samples()
-    single = pass == vktargets.post_pass() || pass == vktargets.ssr_pass() || pass == vktargets.shadow_pass() ||
-             pass == vktargets.camdepth_pass()
+    screen = pass == vktargets.post_pass() || pass == vktargets.hdr_pass() || pass == vktargets.ldr_pass()
+    single = screen || pass == vktargets.shadow_pass() || pass == vktargets.camdepth_pass()
     if single { multisample.rasterizationSamples = vk.SAMPLE_COUNT_1_BIT }
 
     depth = calloc(1, sizeof(VkPipelineDepthStencilStateCreateInfo)) as *VkPipelineDepthStencilStateCreateInfo
@@ -261,7 +274,7 @@ build(vertex: ptr, fragment: ptr, blend: int, depth_test: bool, depth_write: boo
     colour_blend = calloc(1, sizeof(VkPipelineColorBlendStateCreateInfo)) as *VkPipelineColorBlendStateCreateInfo
     colour_blend.sType = vk.STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO
     colour_blend.attachmentCount = 1
-    if pass == vktargets.render_pass() { colour_blend.attachmentCount = 2 }
+    if pass == vktargets.scene_pass() { colour_blend.attachmentCount = 2 }
     if pass == vktargets.shadow_pass() || pass == vktargets.camdepth_pass() { colour_blend.attachmentCount = 0 }
     colour_blend.pAttachments = blends
 
@@ -282,8 +295,8 @@ build(vertex: ptr, fragment: ptr, blend: int, depth_test: bool, depth_write: boo
     info.pViewportState = viewport as ptr
     info.pRasterizationState = raster as ptr
     info.pMultisampleState = multisample as ptr
-    // The composite has no depth at all.
-    if pass != vktargets.post_pass() { info.pDepthStencilState = depth as ptr }
+    // The screen passes have no depth at all.
+    if !screen { info.pDepthStencilState = depth as ptr }
     info.pColorBlendState = colour_blend as ptr
     info.pDynamicState = dynamic as ptr
     info.layout = g_layout
@@ -330,23 +343,32 @@ pass_pipeline(vert: int, frag: int, blend: int, depth_test: bool, depth_write: b
 }
 
 // The sky is drawn behind everything with depth writes off, and the
-// composite passes have no depth at all, matching what the OpenGL backend
-// sets by hand. Only the passthrough composite is required: an effect that
-// fails to build falls back to it and the scene still reaches the screen,
-// which is what the OpenGL backend does when one of its effect programs
-// fails to compile.
+// screen passes have no depth at all, matching what the OpenGL backend
+// sets by hand. The composite is required, being the frame's tone curve and
+// the pass that writes the frame; so is the colour resolve when the scene is
+// multisampled, since nothing else turns its samples into pixels. FXAA, the
+// reflection and the temporal pass are effects: one that fails to build is
+// left out of the frame, which is what the OpenGL backend does when one of
+// its effect programs fails to compile.
 create_pass_pipelines() -> bool {
-    render = vktargets.render_pass()
+    render = vktargets.scene_pass()
     shadow_pass = vktargets.shadow_pass()
     post_pass = vktargets.post_pass()
+    hdr_pass = vktargets.hdr_pass()
     g_sky = pass_pipeline(vkspirv.SKY_VERT, vkspirv.SKY_FRAG, 0, true, false, render, false, false)
-    (g_post as ptr[])[0] = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.PASSTHROUGH_FRAG, 0, false, false, post_pass, false, false)
+    (g_post as ptr[])[0] = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.COMPOSITE_FRAG, 0, false, false, post_pass, false, false)
     if (g_post as ptr[])[0] == null {
-        vkdevice.fail("pass vkCreateGraphicsPipelines failed")
+        vkdevice.fail("composite vkCreateGraphicsPipelines failed")
         return false
     }
     (g_post as ptr[])[1] = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.FXAA_FRAG, 0, false, false, post_pass, false, false)
-    (g_post as ptr[])[2] = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.BLOOM_FRAG, 0, false, false, post_pass, false, false)
+    if vktargets.samples() != vk.SAMPLE_COUNT_1_BIT {
+        (g_post as ptr[])[2] = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.COLOR_RESOLVE_FRAG, 0, false, false, hdr_pass, false, false)
+        if (g_post as ptr[])[2] == null {
+            vkdevice.fail("colour resolve vkCreateGraphicsPipelines failed")
+            return false
+        }
+    }
     g_shadow = pass_pipeline(vkspirv.DEPTH_VERT, vkspirv.DEPTH_FRAG, 0, true, true, shadow_pass, false, false)
     if g_shadow == null {
         vkdevice.fail("pass vkCreateGraphicsPipelines failed")
@@ -381,9 +403,11 @@ create_pass_pipelines() -> bool {
         vkdevice.fail("pass vkCreateGraphicsPipelines failed")
         return false
     }
-    (g_post as ptr[])[3] = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.SSR_FRAG, 0, false, false, post_pass, false, false)
+    (g_post as ptr[])[3] = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.SSR_FRAG, 0, false, false, hdr_pass, false, false)
     g_crowd_shadow = pass_pipeline(vkspirv.CROWD_DEPTH_VERT, vkspirv.DEPTH_FRAG, 0, true, true, shadow_pass, true, false)
-    g_ssao = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.SSAO_FRAG, 2, false, false, render, false, false)
+    g_ssao = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.SSAO_FRAG, 0, false, false, hdr_pass, false, false)
+    g_bloom_down = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.BLOOM_DOWN_FRAG, 0, false, false, hdr_pass, false, false)
+    g_bloom_up = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.BLOOM_UP_FRAG, 0, false, false, hdr_pass, false, false)
     g_point_shadow = pass_pipeline(vkspirv.DEPTH_VERT, vkspirv.DEPTH_FRAG, 0, true, true, shadow_pass, false, true)
     // The depth resolve draws into the camera-depth pass, depth only, from
     // the frame's multisampled depth -- or a plain copy of it when the frame
@@ -391,7 +415,14 @@ create_pass_pipelines() -> bool {
     resolve = vkspirv.DEPTH_RESOLVE_FRAG
     if vktargets.samples() == vk.SAMPLE_COUNT_1_BIT { resolve = vkspirv.DEPTH_COPY_FRAG }
     g_depth_resolve = pass_pipeline(vkspirv.SCREEN_VERT, resolve, 0, true, true, vktargets.camdepth_pass(), false, false)
-    g_taa = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.TAA_FRAG, 0, false, false, vktargets.ssr_pass(), false, false)
+    g_taa = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.TAA_FRAG, 0, false, false, hdr_pass, false, false)
+    g_sky_capture = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.SKY_CAPTURE_FRAG, 0, false, false, hdr_pass, false, false)
+    g_sky_filter = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.SKY_FILTER_FRAG, 0, false, false, hdr_pass, false, false)
+    g_sky_irradiance = pass_pipeline(vkspirv.SCREEN_VERT, vkspirv.SKY_IRRADIANCE_FRAG, 0, false, false, hdr_pass, false, false)
+    if g_sky_capture == null || g_sky_filter == null || g_sky_irradiance == null {
+        vkdevice.fail("sky light vkCreateGraphicsPipelines failed")
+        return false
+    }
     return true
 }
 
@@ -438,7 +469,7 @@ create() -> bool {
         vkdevice.fail("vkCreatePipelineLayout failed")
         return false
     }
-    render = vktargets.render_pass()
+    render = vktargets.scene_pass()
     // A transparent surface is never culled: you see through it to its own
     // far side, so removing that side removes something the frame should
     // show. The OpenGL backend turns culling off for the transparent pass
@@ -519,8 +550,13 @@ destroy() {
     gone(g_point_shadow)
     gone(g_sky)
     gone(g_ssao)
+    gone(g_bloom_down)
+    gone(g_bloom_up)
     gone(g_depth_resolve)
     gone(g_taa)
+    gone(g_sky_capture)
+    gone(g_sky_filter)
+    gone(g_sky_irradiance)
     i = 0
     while i < 4 {
         gone((g_post as ptr[])[i])
@@ -545,6 +581,11 @@ destroy() {
     g_point_shadow = null
     g_sky = null
     g_ssao = null
+    g_bloom_down = null
+    g_bloom_up = null
     g_depth_resolve = null
     g_taa = null
+    g_sky_capture = null
+    g_sky_filter = null
+    g_sky_irradiance = null
 }

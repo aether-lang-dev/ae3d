@@ -4,7 +4,6 @@ struct Light {
     vec3 position;
     vec3 color;
     float intensity;
-    float ambientStrength;
     float temperature;
     int isDirectional;
     vec3 direction;
@@ -54,7 +53,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float reflectivity;
     float wetness;
-    float frameExposure;
     bool hasNormalMap;
     float normalStrength;
     float occlusionStrength;
@@ -70,20 +68,15 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableEnergyConservation;
     bool enableImageBasedLighting;
     float iblIntensity;
+    int giOff;
     bool enableVolumetricLighting;
     float volumetricIntensity;
     int volumetricSteps;
     float volumetricScattering;
-    bool enableGlobalIllumination;
-    float giIntensity;
-    int giBounces;
-    bool enableBloom;
-    float bloomThreshold;
-    float bloomIntensity;
     bool enableFog;
     float fogStart;
     float fogEnd;
-    vec3 fogColor;
+    vec3 fogRadiance;
     float fogIntensity;
     bool enableShadows;
     bool hasShadowMap;
@@ -127,6 +120,12 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 damageColours[4];
     vec4 damageRect;
     float damageClamp;
+    int occlusionHistory;
+    int ddgiOn;
+    vec4 ddgiDims;
+    vec4 ddgiBase[2];
+    vec4 ddgiSpacing;
+    vec4 ddgiAtlas;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -135,10 +134,21 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int skyProcedural;
     float skyOvercast;
     vec3 skyOvercastColor;
+    vec3 skyFlat;
+    float skyTurbidity;
+    float skyLevelSize;
+    float skyRoughness;
+    float frameExposure;
+    bool enableBloom;
+    float bloomIntensity;
     vec2 texelSize;
+    int bloomFirst;
+    float bloomThreshold;
+    int bloomTop;
     float edgeThreshold;
     float edgeThresholdMin;
     float subpixelQuality;
+    int colorSampleCount;
     mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
@@ -192,11 +202,17 @@ layout(set = 0, binding = 2) uniform sampler2D shadowMap;
 layout(set = 0, binding = 3) uniform sampler2D cloudWeather;
 layout(set = 0, binding = 4) uniform sampler3D cloudShape;
 layout(location = 0) out vec4 FragColor;
+// AE3D_SKY_CAPTURE: the sky drawn into the octahedral map the scene is lit
+// from (#655), each texel the sky in its direction, without the sun's and
+// the moon's discs -- the key light is them, and counted twice it would
+// light everything again.
+#ifndef AE3D_SKY_CAPTURE
 layout(location = 1) out vec2 outVelocity;
 
 layout(location = 0) in vec3 TexCoords;
 layout(location = 1) in vec4 ClipNow;
 layout(location = 2) in vec4 ClipPrev;
+#endif
 
 
 // The clouds over the painted sky: how much of it they cover (zero is a
@@ -231,6 +247,12 @@ layout(location = 2) in vec4 ClipPrev;
 // rainy day, the ochre of a dust storm -- which the clouds' ambient then
 // takes too, since they are lit by the sky behind them.
 
+
+// A flat sky, the clear colour (skyProcedural 2): what surrounds a scene
+// with no sky of its own, as it shows.
+
+// How hazy the air is (Preetham's turbidity: 2 a clear blue day, 6 a hazy
+// one): what the daylight sky is drawn from with the sun.
 
 
 // Clouds, shared by the sky that draws them and the ground they shadow.
@@ -483,13 +505,82 @@ vec4 cloudsAlong(vec3 dir, vec3 sky, float cover, float t, float dither) {
     return vec4(colour * horizon, alpha * horizon);
 }
 
-// A clear sky from the sun's position alone. Blue overhead and pale at the
-// horizon by day; the horizon goes gold and then red as the sun nears it,
-// most on the sun's side; a glow around the sun from the air's forward
-// scattering, and the disc itself; a deep blue-grey once the sun is under,
-// with the moon's worth of light the scenes keep. Not a measurement of an
-// atmosphere -- the shapes a clear sky makes, at the cost of a gradient.
+// The daylight sky as light (#655): Preetham, Shirley and Smits' analytic
+// model, the sky's luminance and colour in every direction from the sun's
+// height and the air's turbidity (Perez's distribution over the zenith's
+// value), in cd/m2 and then in the engine's units -- SKY_PHOTOMETRIC
+// radiance a candela a square metre, the scale at which an 18% grey card
+// under the noon sun shows mid-grey at an exposure of one (core.sun_light
+// is the sun's light at the same scale). Below the horizon, the horizon's
+// light through the haze the ground would be seen through.
+#define SKY_PHOTOMETRIC 2.0e-5
+float perez(float cosTheta, float gamma, float A, float B, float C, float D, float E) {
+    return (1.0 + A * exp(B / max(cosTheta, 0.01))) * (1.0 + C * exp(D * gamma) + E * cos(gamma) * cos(gamma));
+}
+vec3 daylight(vec3 dir, vec3 sun, float T) {
+    float thetaS = acos(clamp(sun.y, 0.0, 1.0));
+    float below = 1.0;
+    if (dir.y < 0.0) {
+        below = mix(1.0, 0.6, clamp(-dir.y * 4.0, 0.0, 1.0));
+        dir = normalize(vec3(dir.x, 0.0, dir.z));
+    }
+    float cosTheta = dir.y;
+    float gamma = acos(clamp(dot(dir, sun), -1.0, 1.0));
+    float chi = (4.0 / 9.0 - T / 120.0) * (3.14159265 - 2.0 * thetaS);
+    float Yz = ((4.0453 * T - 4.9710) * tan(chi) - 0.2155 * T + 2.4192) * 1000.0;
+    float t1 = thetaS, t2 = thetaS * thetaS, t3 = t2 * thetaS;
+    float xz = T * T * (0.00166 * t3 - 0.00375 * t2 + 0.00209 * t1) +
+               T * (-0.02903 * t3 + 0.06377 * t2 - 0.03202 * t1 + 0.00394) +
+               (0.11693 * t3 - 0.21196 * t2 + 0.06052 * t1 + 0.25886);
+    float yz = T * T * (0.00275 * t3 - 0.00610 * t2 + 0.00317 * t1) +
+               T * (-0.04214 * t3 + 0.08970 * t2 - 0.04153 * t1 + 0.00516) +
+               (0.15346 * t3 - 0.26756 * t2 + 0.06670 * t1 + 0.26688);
+    float Y = Yz * perez(cosTheta, gamma, 0.1787 * T - 1.4630, -0.3554 * T + 0.4275, -0.0227 * T + 5.3251, 0.1206 * T - 2.5771, -0.0670 * T + 0.3703) /
+                   perez(1.0, thetaS, 0.1787 * T - 1.4630, -0.3554 * T + 0.4275, -0.0227 * T + 5.3251, 0.1206 * T - 2.5771, -0.0670 * T + 0.3703);
+    float x = xz * perez(cosTheta, gamma, -0.0193 * T - 0.2592, -0.0665 * T + 0.0008, -0.0004 * T + 0.2125, -0.0641 * T - 0.8989, -0.0033 * T + 0.0452) /
+                   perez(1.0, thetaS, -0.0193 * T - 0.2592, -0.0665 * T + 0.0008, -0.0004 * T + 0.2125, -0.0641 * T - 0.8989, -0.0033 * T + 0.0452);
+    float y = yz * perez(cosTheta, gamma, -0.0167 * T - 0.2608, -0.0950 * T + 0.0092, -0.0079 * T + 0.2102, -0.0441 * T - 1.6537, -0.0109 * T + 0.0529) /
+                   perez(1.0, thetaS, -0.0167 * T - 0.2608, -0.0950 * T + 0.0092, -0.0079 * T + 0.2102, -0.0441 * T - 1.6537, -0.0109 * T + 0.0529);
+    vec3 XYZ = vec3(x / y * Y, Y, (1.0 - x - y) / y * Y);
+    vec3 rgb = vec3(3.2406 * XYZ.x - 1.5372 * XYZ.y - 0.4986 * XYZ.z,
+                    -0.9689 * XYZ.x + 1.8758 * XYZ.y + 0.0415 * XYZ.z,
+                    0.0557 * XYZ.x - 0.2040 * XYZ.y + 1.0570 * XYZ.z);
+    return max(rgb, vec3(0.0)) * (SKY_PHOTOMETRIC * below);
+}
+
+// Light as it shows at an exposure of one: the frame's tone curve, which
+// display_radiance takes back. The clouds, the overcast and the stars are
+// laid over the sky in what shows, as they always were.
+float shown_channel(float x) {
+    float t = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+    return t <= 0.0031308 ? t * 12.92 : 1.055 * pow(t, 1.0 / 2.4) - 0.055;
+}
+vec3 shown_of(vec3 c) { return vec3(shown_channel(c.r), shown_channel(c.g), shown_channel(c.b)); }
+
+// A clear sky from the sun's position: by day the daylight model above, as
+// it shows; through the dusk and the night the shapes a clear sky makes --
+// the horizon gold and then red as the sun nears it, most on the sun's
+// side, a glow around the sun, a deep blue-grey once it is under with the
+// moon's worth of light the scenes keep -- which the daylight hands over to
+// as the sun goes low, where the analytic model is weakest. The disc
+// itself over both.
+vec3 duskSky(vec3 dir, vec3 sun, vec3 sunColor);
 vec3 proceduralSky(vec3 dir, vec3 sun, vec3 sunColor) {
+    vec3 dusk = duskSky(dir, sun, sunColor);
+    float dayShare = smoothstep(0.0, 0.25, sun.y);
+    vec3 sky = dusk;
+    if (dayShare > 0.0) sky = mix(dusk, shown_of(daylight(dir, sun, skyTurbidity)), dayShare);
+    float cosAngle = dot(dir, sun);
+    float day = smoothstep(-0.14, 0.06, sun.y);
+#ifndef AE3D_SKY_CAPTURE
+    float disc = smoothstep(0.9993, 0.9997, cosAngle);
+    sky += sunColor * disc * (0.6 + 1.4 * day);
+#endif
+    return sky;
+}
+
+// The dusk and night sky, as it shows: a gradient from the sun's position.
+vec3 duskSky(vec3 dir, vec3 sun, vec3 sunColor) {
     float elevation = sun.y;
     // Day lasts until the sun is well under: the sky at sunset is still
     // bright, and goes dark through the twilight after.
@@ -515,8 +606,6 @@ vec3 proceduralSky(vec3 dir, vec3 sun, vec3 sunColor) {
     float cosAngle = dot(dir, sun);
     float glow = pow(max(cosAngle, 0.0), 4.0) * 0.16 + pow(max(cosAngle, 0.0), 40.0) * 0.5;
     sky += sunColor * glow * (0.3 + 0.7 * day) * (1.0 + low * 1.6);
-    float disc = smoothstep(0.9993, 0.9997, cosAngle);
-    sky += sunColor * disc * (0.6 + 1.4 * day);
     return sky;
 }
 
@@ -538,12 +627,34 @@ vec3 nightSky(vec3 dir, vec3 moon, float night) {
     }
     if (moon.y > 0.0) {
         float c = dot(dir, moon);
+#ifndef AE3D_SKY_CAPTURE
         add += vec3(0.82, 0.86, 0.95) * smoothstep(0.99955, 0.99975, c) * 1.4;
+#endif
         add += vec3(0.30, 0.34, 0.45) * pow(max(c, 0.0), 60.0) * 0.18;
     }
     return add * night;
 }
 
+
+// The sky is given as it shows -- a painting, the hour's gradient, the
+// clouds' own roll-off -- and drawn as the radiance that shows as it: the
+// frame's tone curve (ACES, then the sRGB encoding) taken back, the same
+// curve the post pass applies, so at an exposure of one the sky appears as
+// it was given, and under an exposure that follows the frame it brightens
+// and darkens with everything else. See core.display_radiance.
+float srgb_decode(float c) {
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+float aces_inverse(float y) {
+    y = clamp(y, 0.0, 0.9999);
+    float a = 2.51 - 2.43 * y;
+    float b = 0.03 - 0.59 * y;
+    return (-b + sqrt(b * b + 4.0 * a * 0.14 * y)) / (2.0 * a);
+}
+vec3 display_radiance(vec3 shown) {
+    vec3 c = clamp(shown, 0.0, 1.0);
+    return vec3(aces_inverse(srgb_decode(c.r)), aces_inverse(srgb_decode(c.g)), aces_inverse(srgb_decode(c.b)));
+}
 
 // Where this pixel's surface was last frame, for the temporal passes: the
 // clip positions the vertex stage carried, this frame's unnudged (the
@@ -557,8 +668,51 @@ vec2 velocity(vec4 now, vec4 prev, vec2 nudge) {
     return uvNow - uvPrev;
 }
 
+#ifdef AE3D_SKY_CAPTURE
+// The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
+// the upper hemisphere in the square's inner diamond, the lower folded into
+// its corners, one texel of gutter around each level holding the sky just
+// across the fold, so a filtered read at an edge is still the sky.
+#define SKY_SIZE 256.0
+#define SKY_LEVELS 6.0
+#define SKY_IRRADIANCE_SIZE 16.0
+vec3 oct_decode(vec2 p) {
+    vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0) {
+        vec2 folded = (1.0 - abs(d.zx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = folded.x;
+        d.z = folded.y;
+    }
+    return normalize(d);
+}
+vec2 oct_encode(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p;
+}
+// Where direction d is read in a level `size` texels a side.
+vec2 oct_uv(vec3 d, float size) {
+    return ((oct_encode(d) * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
+// The direction a texel of a level `size` a side stands for, at texture
+// coordinate uv: a gutter texel's folded back across the edge it lies past.
+vec3 oct_texel_direction(vec2 uv, float size) {
+    vec2 p = ((uv * size - 1.0) / (size - 2.0)) * 2.0 - 1.0;
+    if (p.x > 1.0) { p.x = 2.0 - p.x; p.y = -p.y; }
+    if (p.x < -1.0) { p.x = -2.0 - p.x; p.y = -p.y; }
+    if (p.y > 1.0) { p.y = 2.0 - p.y; p.x = -p.x; }
+    if (p.y < -1.0) { p.y = -2.0 - p.y; p.x = -p.x; }
+    return oct_decode(p);
+}
+#endif
+
 void main() {
+#ifdef AE3D_SKY_CAPTURE
+    vec3 dir = oct_texel_direction(gl_FragCoord.xy / SKY_SIZE, SKY_SIZE);
+#else
     vec3 dir = normalize(TexCoords);
+#endif
 
     float theta = atan(dir.z, dir.x);
     float phi = asin(dir.y);
@@ -578,6 +732,7 @@ void main() {
         float night = 1.0 - smoothstep(-0.14, -0.02, hourSun.y);
         sky += nightSky(dir, normalize(cloudSun), night);
     }
+    if (skyProcedural == 2) sky = skyFlat;
     if (skyOvercast > 0.0) {
         // The cast's brightness follows the sky's broad brightness, not the
         // pixel's: read from a coarse level of the painting, so a star -- a
@@ -592,6 +747,8 @@ void main() {
     if (cloudFrame > 0) grain += 5.588238 * float(cloudFrame % 64);
     vec4 clouds = cloudsAlong(dir, sky, cloudCover, cloudTime, cloudDither(grain));
     sky = sky * (1.0 - clouds.a) + clouds.rgb;
-    FragColor = vec4(sky, 1.0);
+    FragColor = vec4(display_radiance(sky), 1.0);
+#ifndef AE3D_SKY_CAPTURE
     outVelocity = velocity(ClipNow, ClipPrev, vec2(0.0));
+#endif
 }

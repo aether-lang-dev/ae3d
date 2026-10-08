@@ -1,0 +1,833 @@
+// ae3d.vkddgi -- the probes' global illumination on the Vulkan backend
+// (#537), where the device traces rays.
+//
+// Two cascades of probes around the camera, each a grid of probes a few
+// metres apart, keep the light that reaches them from every direction: each
+// frame a share of them trace rays through the frame's acceleration
+// structure (ae3d.vkrays), every hit shaded by the sun and the lamps that
+// reach it and by the probes' own light of the frame before, every miss the
+// sky (ae3d.vksky); the rays are folded into each probe's irradiance and
+// distance, an octahedron of texels each in two atlases. The scene shader
+// reads the eight probes round a point for its light from every direction
+// (shaders, "The probe volume"), the sky's and every bounce of it.
+//
+// A probe's slot is its world cell modulo the grid, so the grid scrolls
+// with the camera by whole cells and a probe's light stays where it was
+// learned; a probe come to a new cell starts over. A probe that finds
+// itself inside geometry moves out of it, or goes dark.
+//
+// The hits are known by their instance's record, which the renderer writes
+// each frame beside the instances (record): the instance's vertex and
+// index buffers' addresses, how many floats a vertex spans, and its albedo
+// and emission.
+
+import std.list
+import contrib.vulkan.vk
+import ae3d.core
+import ae3d.lightgrid
+import ae3d.vkdevice
+import ae3d.vkhost
+import ae3d.vkspirv
+import ae3d.vkrays
+import ae3d.vkdesc
+
+exports (
+    CASCADES, offered, start, stop, ready, set_grid, set_share, begin, record, dispatch, irradiance_at,
+    dims, base_cell, spacing, atlas_size, irradiance_view, distance_view, sampler, state_buffer, state_bytes
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memset(p: ptr, value: int, n: long) -> ptr
+extern floor(x: float) -> float
+extern sin(x: float) -> float
+extern cos(x: float) -> float
+extern sqrt(x: float) -> float
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+
+const CASCADES = 2
+const FRAMES = 2
+const RAYS = 128
+const IRR = 6                         // texels a side, the gutter not counted
+const DIST = 14
+const BINDINGS = 11
+const PARAMS_BYTES = 512              // DDGI_PARAMS vec4s (the shaders' DdgiParams)
+const DIRECTIONALS = 4                // the directional lights a hit is lit by: the sun, the moon
+const RECORD_BYTES = 64               // four uvec4s
+const PUSH_BYTES = 48                 // a batch's first probe and count; a query's point, normal and view
+const HYSTERESIS = 0.97
+const IRRADIANCE = 0
+const DISTANCE = 1
+const RAY_IMAGE = 2
+
+// The grid: probes a side, and each cascade's spacing.
+var g_x = 32
+var g_y = 8
+var g_z = 32
+var g_spacing: ptr = null            // float[CASCADES]
+var g_share = 4                      // a frame updates a probe in this many
+
+var g_ready = false
+// The images, by IRRADIANCE, DISTANCE and RAYS: the two atlases and the
+// rays the last trace brought back.
+var g_images: ptr = null             // VKImage[3]
+var g_sampler: ptr = null
+var g_state: ptr = null              // VkBuffer: two vec4s a probe
+var g_state_memory: ptr = null
+var g_params: ptr = null             // *HostBuffer[FRAMES]
+var g_records: ptr = null            // *HostBuffer[FRAMES]
+var g_record_room = 0                // records a frame's buffer holds
+var g_record_count = 0
+
+var g_set_layout: ptr = null
+var g_pool: ptr = null
+var g_layout: ptr = null
+var g_trace: ptr = null
+var g_update_irradiance: ptr = null
+var g_update_distance: ptr = null
+var g_query: ptr = null
+var g_answer: ptr = null             // *HostBuffer: a query's answer
+var g_last_frame = 0 - 1             // the frame slot the last dispatch was recorded in
+var g_sets: ptr = null               // VkDescriptorSet[FRAMES * 3]: the trace's, the irradiance's, the distance's
+var g_cursor = 0                     // the next probe the round of updates reaches
+var g_turn = 0                       // frames since start, for the rays' rotation
+var g_bases: ptr = null              // float[CASCADES * 3]: each cascade's first cell
+
+cell() -> ptr { return calloc(1, 8) }
+
+taken(c: ptr) -> ptr {
+    v = (c as ptr[])[0]
+    free(c)
+    return v
+}
+
+probes() -> int { return g_x * g_y * g_z }
+image_at(k: int) -> *VKImage { return (g_images + k * sizeof(VKImage)) as *VKImage }
+keep_image(k: int, made: vkhost.VKImage) {
+    i = image_at(k)
+    i.image = made.image
+    i.memory = made.memory
+    i.view = made.view
+}
+
+// The grid's size and its two spacings, in metres; the resources made again
+// at the next start. Before start, or with the device idle.
+set_grid(x: int, y: int, z: int, near: float, far: float) {
+    g_x = x
+    g_y = y
+    g_z = z
+    if g_spacing == null { g_spacing = calloc(CASCADES, 8) }
+    (g_spacing as float[])[0] = near
+    (g_spacing as float[])[1] = far
+}
+
+// A frame updates one probe in `share`: four by default; one updates every
+// probe every frame.
+set_share(share: int) {
+    g_share = share
+    if g_share < 1 { g_share = 1 }
+}
+
+ready() -> bool { return g_ready }
+dims() -> Vec4 { return Vec4 { x: g_x as float, y: g_y as float, z: g_z as float, w: probes() as float } }
+base_cell(c: int) -> Vec3 {
+    b = g_bases as float[]
+    return core.vec3(b[c * 3], b[c * 3 + 1], b[c * 3 + 2])
+}
+spacing(c: int) -> float { return (g_spacing as float[])[c] }
+irr_width() -> int { return g_x * g_y * (IRR + 2) }
+irr_height() -> int { return g_z * CASCADES * (IRR + 2) }
+dist_width() -> int { return g_x * g_y * (DIST + 2) }
+dist_height() -> int { return g_z * CASCADES * (DIST + 2) }
+atlas_size() -> Vec4 {
+    return Vec4 { x: irr_width() as float, y: irr_height() as float, z: dist_width() as float, w: dist_height() as float }
+}
+irradiance_view() -> ptr { return image_at(IRRADIANCE).view }
+distance_view() -> ptr { return image_at(DISTANCE).view }
+sampler() -> ptr { return g_sampler }
+state_buffer() -> ptr { return g_state }
+state_bytes() -> int { return probes() * CASCADES * 32 }
+
+// A storage image of `format`, cleared and left in the general layout, the
+// one it is written and read in.
+storage_image(w: int, h: int, format: int, sampled: bool) -> vkhost.VKImage {
+    usage = vk.IMAGE_USAGE_STORAGE_BIT | vk.IMAGE_USAGE_TRANSFER_DST_BIT
+    if sampled { usage = usage | vk.IMAGE_USAGE_SAMPLED_BIT }
+    return vkhost.image(w, h, 1, format, vk.SAMPLE_COUNT_1_BIT, usage, vk.IMAGE_ASPECT_COLOR_BIT)
+}
+
+cleared(commands: ptr, image: ptr) {
+    b = calloc(1, sizeof(VkImageMemoryBarrier)) as *VkImageMemoryBarrier
+    b.sType = vk.STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+    b.oldLayout = vk.IMAGE_LAYOUT_UNDEFINED
+    b.newLayout = vk.IMAGE_LAYOUT_GENERAL
+    b.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.image = image
+    b.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    b.subresourceRange.levelCount = 1
+    b.subresourceRange.layerCount = 1
+    b.dstAccessMask = vk.ACCESS_TRANSFER_WRITE_BIT
+    vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, b as ptr)
+    colour = calloc(4, 4)
+    range = calloc(1, sizeof(VkImageSubresourceRange)) as *VkImageSubresourceRange
+    range.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    range.levelCount = 1
+    range.layerCount = 1
+    vk.vkCmdClearColorImage(commands, image, vk.IMAGE_LAYOUT_GENERAL, colour, 1, range as ptr)
+    free(colour)
+    free(range as ptr)
+    free(b as ptr)
+}
+
+failed(why: string) -> bool {
+    vkdevice.fail(why)
+    return false
+}
+
+// A compute pipeline over the set layout from shader `id`.
+pipeline(id: int, what: string) -> ptr {
+    d = vkdevice.device()
+    code = vkspirv.code(id)
+    info = calloc(1, sizeof(VkShaderModuleCreateInfo)) as *VkShaderModuleCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+    info.codeSize = vkspirv.bytes(id)
+    info.pCode = code
+    out = cell()
+    r = vk.vkCreateShaderModule(d, info as ptr, null, out)
+    shader = taken(out)
+    free(info as ptr)
+    free(code)
+    if r != vk.SUCCESS {
+        vkdevice.fail("${what} vkCreateShaderModule failed")
+        return null
+    }
+    compute = calloc(1, sizeof(VkComputePipelineCreateInfo)) as *VkComputePipelineCreateInfo
+    compute.sType = vk.STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+    compute.stage.sType = vk.STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+    compute.stage.stage = vk.SHADER_STAGE_COMPUTE_BIT
+    compute.stage.module = shader
+    compute.stage.pName = "main"
+    compute.layout = g_layout
+    out = cell()
+    r = vk.vkCreateComputePipelines(d, null, 1, compute as ptr, null, out)
+    made = taken(out)
+    free(compute as ptr)
+    vk.vkDestroyShaderModule(d, shader, null)
+    if r != vk.SUCCESS {
+        vkdevice.fail("${what} vkCreateComputePipelines failed")
+        return null
+    }
+    return made
+}
+
+// The set layout: 0 the structure, 1 the parameters, 2 the records, 3 the
+// lamps, 4 the probes' state, 5 the rays, 6 the sky, 7 and 8 the atlases
+// read, 9 the atlas written, 10 a query's answer.
+make_layouts() -> bool {
+    d = vkdevice.device()
+    bindings = calloc(BINDINGS, sizeof(VkDescriptorSetLayoutBinding))
+    i = 0
+    while i < BINDINGS {
+        b = (bindings + i * sizeof(VkDescriptorSetLayoutBinding)) as *VkDescriptorSetLayoutBinding
+        b.binding = i
+        b.descriptorCount = 1
+        b.stageFlags = vk.SHADER_STAGE_COMPUTE_BIT
+        b.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+        if i == 0 { b.descriptorType = vk.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR }
+        if i == 1 { b.descriptorType = vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER }
+        if i == 5 || i == 9 { b.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_IMAGE }
+        if i >= 6 && i <= 8 { b.descriptorType = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER }
+        i = i + 1
+    }
+    info = calloc(1, sizeof(VkDescriptorSetLayoutCreateInfo)) as *VkDescriptorSetLayoutCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    info.bindingCount = BINDINGS
+    info.pBindings = bindings
+    out = cell()
+    r = vk.vkCreateDescriptorSetLayout(d, info as ptr, null, out)
+    g_set_layout = taken(out)
+    free(info as ptr)
+    free(bindings)
+    if r != vk.SUCCESS { return failed("probes vkCreateDescriptorSetLayout failed") }
+
+    sets = FRAMES * 3
+    sizes = calloc(5, sizeof(VkDescriptorPoolSize))
+    kinds = [vk.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER, vk.DESCRIPTOR_TYPE_STORAGE_BUFFER,
+             vk.DESCRIPTOR_TYPE_STORAGE_IMAGE, vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER]
+    counts = [1, 1, 4, 2, 3]
+    k = 0
+    while k < 5 {
+        size = (sizes + k * sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
+        size.type = kinds[k]
+        size.descriptorCount = counts[k] * sets
+        k = k + 1
+    }
+    pool = calloc(1, sizeof(VkDescriptorPoolCreateInfo)) as *VkDescriptorPoolCreateInfo
+    pool.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+    pool.maxSets = sets
+    pool.poolSizeCount = 5
+    pool.pPoolSizes = sizes
+    out = cell()
+    r = vk.vkCreateDescriptorPool(d, pool as ptr, null, out)
+    g_pool = taken(out)
+    free(pool as ptr)
+    free(sizes)
+    if r != vk.SUCCESS { return failed("probes vkCreateDescriptorPool failed") }
+
+    range = calloc(1, sizeof(VkPushConstantRange)) as *VkPushConstantRange
+    range.stageFlags = vk.SHADER_STAGE_COMPUTE_BIT
+    range.size = PUSH_BYTES
+    layouts = cell()
+    (layouts as ptr[])[0] = g_set_layout
+    pl = calloc(1, sizeof(VkPipelineLayoutCreateInfo)) as *VkPipelineLayoutCreateInfo
+    pl.sType = vk.STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+    pl.setLayoutCount = 1
+    pl.pSetLayouts = layouts
+    pl.pushConstantRangeCount = 1
+    pl.pPushConstantRanges = range as ptr
+    out = cell()
+    r = vk.vkCreatePipelineLayout(d, pl as ptr, null, out)
+    g_layout = taken(out)
+    free(pl as ptr)
+    free(layouts)
+    free(range as ptr)
+    if r != vk.SUCCESS { return failed("probes vkCreatePipelineLayout failed") }
+
+    g_sets = calloc(sets, 8)
+    all = calloc(sets, 8)
+    k = 0
+    while k < sets {
+        (all as ptr[])[k] = g_set_layout
+        k = k + 1
+    }
+    alloc = calloc(1, sizeof(VkDescriptorSetAllocateInfo)) as *VkDescriptorSetAllocateInfo
+    alloc.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+    alloc.descriptorPool = g_pool
+    alloc.descriptorSetCount = sets
+    alloc.pSetLayouts = all
+    r = vk.vkAllocateDescriptorSets(d, alloc as ptr, g_sets)
+    free(alloc as ptr)
+    free(all)
+    if r != vk.SUCCESS { return failed("probes vkAllocateDescriptorSets failed") }
+    return true
+}
+
+// The record buffers made `room` records long, what they held gone: before
+// the frame's first record, the device idle.
+records_sized(room: int) -> bool {
+    f = 0
+    while f < FRAMES {
+        vkhost.host_buffer_free((g_records as ptr[])[f] as *HostBuffer)
+        made = vkhost.mapped_buffer(room * RECORD_BYTES, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        if made == null { return failed("probes record buffer failed") }
+        (g_records as ptr[])[f] = made as ptr
+        f = f + 1
+    }
+    g_record_room = room
+    return true
+}
+
+// Whether the device can have the probes: it traces, and its shaders write
+// the extended storage formats.
+offered() -> bool { return vkdevice.ray_query() && vkdevice.storage_formats() }
+
+// Everything the probes need, where they are offered. False, with the
+// reason in the backend's last error, when one would not make; nothing to
+// make where they are not offered.
+start() -> bool {
+    g_ready = false
+    if !offered() { return true }
+    if g_spacing == null { set_grid(g_x, g_y, g_z, 2.0, 8.0) }
+    if g_bases == null { g_bases = calloc(CASCADES * 3, 8) }
+    if !make_layouts() { return false }
+    g_trace = pipeline(vkspirv.DDGI_TRACE_RQ_COMP, "probe trace")
+    g_update_irradiance = pipeline(vkspirv.DDGI_IRRADIANCE_COMP, "probe irradiance")
+    g_update_distance = pipeline(vkspirv.DDGI_DISTANCE_COMP, "probe distance")
+    g_query = pipeline(vkspirv.DDGI_QUERY_COMP, "probe query")
+    if g_trace == null || g_update_irradiance == null || g_update_distance == null || g_query == null { return false }
+    g_answer = vkhost.mapped_buffer(16, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT)
+    if g_answer == null { return failed("probes answer buffer failed") }
+
+    g_images = calloc(3, sizeof(VKImage))
+    // The irradiance a colour, the distance its mean and mean square (a
+    // two-channel image, which the extended storage formats let the update
+    // write), a ray its radiance and its distance.
+    half4 = vk.FORMAT_R16G16B16A16_SFLOAT
+    keep_image(IRRADIANCE, storage_image(irr_width(), irr_height(), half4, true))
+    keep_image(DISTANCE, storage_image(dist_width(), dist_height(), vk.FORMAT_R16G16_SFLOAT, true))
+    keep_image(RAY_IMAGE, storage_image(RAYS, probes() * CASCADES, half4, false))
+    k = 0
+    while k < 3 {
+        if image_at(k).image == null { return failed("probes vkCreateImage failed") }
+        k = k + 1
+    }
+    g_sampler = vkhost.sampler(vk.FILTER_LINEAR, vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, vk.SAMPLER_MIPMAP_MODE_NEAREST, 0.0, 0.0)
+    if g_sampler == null { return failed("probes vkCreateSampler failed") }
+    state = vkhost.device_buffer(state_bytes(), vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_TRANSFER_DST_BIT)
+    g_state = state.buffer
+    g_state_memory = state.memory
+    if g_state == null { return failed("probes state buffer failed") }
+    g_params = calloc(FRAMES, 8)
+    g_records = calloc(FRAMES, 8)
+    f = 0
+    while f < FRAMES {
+        p = vkhost.mapped_buffer(PARAMS_BYTES, vk.BUFFER_USAGE_UNIFORM_BUFFER_BIT)
+        if p == null { return failed("probes parameter buffer failed") }
+        (g_params as ptr[])[f] = p as ptr
+        f = f + 1
+    }
+    if !records_sized(1024) { return false }
+
+    commands = vkhost.once_begin()
+    k = 0
+    while k < 3 {
+        cleared(commands, image_at(k).image)
+        k = k + 1
+    }
+    vk.vkCmdFillBuffer(commands, g_state, 0, vk.WHOLE_SIZE, 0)
+    vkhost.once_end(commands)
+    write_static_sets()
+    g_cursor = 0
+    g_turn = 0
+    g_last_frame = 0 - 1
+    g_ready = true
+    vkdesc.set_probes(irradiance_view(), distance_view(), g_sampler, g_state, state_bytes())
+    return true
+}
+
+stop() {
+    d = vkdevice.device()
+    if d == null { return }
+    vk.vkDeviceWaitIdle(d)
+    vkdesc.set_probes(null, null, null, null, 0)
+    if g_trace != null { vk.vkDestroyPipeline(d, g_trace, null) }
+    if g_update_irradiance != null { vk.vkDestroyPipeline(d, g_update_irradiance, null) }
+    if g_update_distance != null { vk.vkDestroyPipeline(d, g_update_distance, null) }
+    if g_query != null { vk.vkDestroyPipeline(d, g_query, null) }
+    vkhost.host_buffer_free(g_answer as *HostBuffer)
+    if g_layout != null { vk.vkDestroyPipelineLayout(d, g_layout, null) }
+    if g_pool != null { vk.vkDestroyDescriptorPool(d, g_pool, null) }
+    if g_set_layout != null { vk.vkDestroyDescriptorSetLayout(d, g_set_layout, null) }
+    if g_sampler != null { vk.vkDestroySampler(d, g_sampler, null) }
+    if g_images != null {
+        k = 0
+        while k < 3 {
+            i = image_at(k)
+            vkhost.image_free(vkhost.VKImage { image: i.image, memory: i.memory, view: i.view })
+            k = k + 1
+        }
+        free(g_images)
+    }
+    vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: g_state, memory: g_state_memory })
+    if g_params != null {
+        f = 0
+        while f < FRAMES {
+            vkhost.host_buffer_free((g_params as ptr[])[f] as *HostBuffer)
+            vkhost.host_buffer_free((g_records as ptr[])[f] as *HostBuffer)
+            f = f + 1
+        }
+        free(g_params)
+        free(g_records)
+    }
+    if g_sets != null { free(g_sets) }
+    g_trace = null
+    g_update_irradiance = null
+    g_update_distance = null
+    g_query = null
+    g_answer = null
+    g_last_frame = 0 - 1
+    g_layout = null
+    g_pool = null
+    g_set_layout = null
+    g_sampler = null
+    g_images = null
+    g_state = null
+    g_state_memory = null
+    g_params = null
+    g_records = null
+    g_sets = null
+    g_record_room = 0
+    g_ready = false
+}
+
+set_at(frame: int, which: int) -> ptr { return (g_sets as ptr[])[frame * 3 + which] }
+
+image_write(w: *VkWriteDescriptorSet, set: ptr, binding: int, info: *VkDescriptorImageInfo, kind: int) {
+    w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    w.dstSet = set
+    w.dstBinding = binding
+    w.descriptorCount = 1
+    w.descriptorType = kind
+    w.pImageInfo = info as ptr
+}
+
+buffer_write(w: *VkWriteDescriptorSet, set: ptr, binding: int, info: *VkDescriptorBufferInfo, kind: int) {
+    w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    w.dstSet = set
+    w.dstBinding = binding
+    w.descriptorCount = 1
+    w.descriptorType = kind
+    w.pBufferInfo = info as ptr
+}
+
+// What every set binds for good: the state, the rays, the atlases, and the
+// atlas each update writes.
+write_static_sets() {
+    d = vkdevice.device()
+    general = vk.IMAGE_LAYOUT_GENERAL
+    state = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+    state.buffer = g_state
+    state.range = vk.WHOLE_SIZE
+    rays = calloc(1, sizeof(VkDescriptorImageInfo)) as *VkDescriptorImageInfo
+    rays.imageView = image_at(RAY_IMAGE).view
+    rays.imageLayout = general
+    irr_read = calloc(1, sizeof(VkDescriptorImageInfo)) as *VkDescriptorImageInfo
+    irr_read.imageView = irradiance_view()
+    irr_read.sampler = g_sampler
+    irr_read.imageLayout = general
+    dist_read = calloc(1, sizeof(VkDescriptorImageInfo)) as *VkDescriptorImageInfo
+    dist_read.imageView = distance_view()
+    dist_read.sampler = g_sampler
+    dist_read.imageLayout = general
+    irr_write = calloc(1, sizeof(VkDescriptorImageInfo)) as *VkDescriptorImageInfo
+    irr_write.imageView = irradiance_view()
+    irr_write.imageLayout = general
+    dist_write = calloc(1, sizeof(VkDescriptorImageInfo)) as *VkDescriptorImageInfo
+    dist_write.imageView = distance_view()
+    dist_write.imageLayout = general
+    answer = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+    answer.buffer = (g_answer as *HostBuffer).buffer
+    answer.range = vk.WHOLE_SIZE
+    writes = calloc(6, sizeof(VkWriteDescriptorSet))
+    s = 0
+    while s < FRAMES * 3 {
+        set = (g_sets as ptr[])[s]
+        memset(writes, 0, (6 * sizeof(VkWriteDescriptorSet)) as long)
+        w = writes as *VkWriteDescriptorSet
+        buffer_write(w, set, 4, state, vk.DESCRIPTOR_TYPE_STORAGE_BUFFER)
+        image_write((writes + sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet, set, 5, rays, vk.DESCRIPTOR_TYPE_STORAGE_IMAGE)
+        image_write((writes + 2 * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet, set, 7, irr_read, vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+        image_write((writes + 3 * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet, set, 8, dist_read, vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+        target = irr_write
+        if s % 3 == 2 { target = dist_write }
+        image_write((writes + 4 * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet, set, 9, target, vk.DESCRIPTOR_TYPE_STORAGE_IMAGE)
+        buffer_write((writes + 5 * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet, set, 10, answer, vk.DESCRIPTOR_TYPE_STORAGE_BUFFER)
+        vk.vkUpdateDescriptorSets(d, 6, writes, 0, null)
+        s = s + 1
+    }
+    free(writes)
+    free(answer as ptr)
+    free(state as ptr)
+    free(rays as ptr)
+    free(irr_read as ptr)
+    free(dist_read as ptr)
+    free(irr_write as ptr)
+    free(dist_write as ptr)
+}
+
+// The frame's records begin: none yet.
+begin() { g_record_count = 0 }
+
+// An instance's record for this frame, its index the custom index its
+// instances carry: the addresses of its vertices and its indices, the floats
+// a vertex spans (positions first), its albedo and its emission, linear. The
+// buffers double when a frame wants more than they hold, the device idle;
+// -1 before start.
+record(vertices: long, indices: long, stride: int, albedo: Vec3, emission: Vec3) -> int {
+    if !g_ready { return 0 - 1 }
+    if g_record_count >= g_record_room {
+        vk.vkDeviceWaitIdle(vkdevice.device())
+        kept = calloc(g_record_count * RECORD_BYTES, 1)
+        frame = vkhost.frame_slot()
+        memcpy(kept, ((g_records as ptr[])[frame] as *HostBuffer).mapped, (g_record_count * RECORD_BYTES) as long)
+        if !records_sized(g_record_room * 2) {
+            free(kept)
+            return 0 - 1
+        }
+        memcpy(((g_records as ptr[])[frame] as *HostBuffer).mapped, kept, (g_record_count * RECORD_BYTES) as long)
+        free(kept)
+    }
+    frame = vkhost.frame_slot()
+    at = ((g_records as ptr[])[frame] as *HostBuffer).mapped + g_record_count * RECORD_BYTES
+    words = at as uint32[]
+    words[0] = (vertices & 4294967295) as uint32
+    words[1] = (vertices >> 32) as uint32
+    words[2] = (indices & 4294967295) as uint32
+    words[3] = (indices >> 32) as uint32
+    words[4] = stride as uint32
+    words[5] = 0
+    words[6] = 0
+    words[7] = 0
+    floats = at as f32[]
+    floats[8] = albedo.x as f32
+    floats[9] = albedo.y as f32
+    floats[10] = albedo.z as f32
+    floats[11] = 0.0 as f32
+    floats[12] = emission.x as f32
+    floats[13] = emission.y as f32
+    floats[14] = emission.z as f32
+    floats[15] = 0.0 as f32
+    g_record_count = g_record_count + 1
+    return g_record_count - 1
+}
+
+// A rotation by `angle` about the unit axis (x, y, z), its columns into
+// params at vec4 `first`.
+rotation(params: f32[], first: int, x: float, y: float, z: float, angle: float) {
+    c = cos(angle)
+    s = sin(angle)
+    t = 1.0 - c
+    m = [t * x * x + c, t * x * y + s * z, t * x * z - s * y,
+         t * x * y - s * z, t * y * y + c, t * y * z + s * x,
+         t * x * z + s * y, t * y * z - s * x, t * z * z + c]
+    col = 0
+    while col < 3 {
+        params[(first + col) * 4] = m[col * 3] as f32
+        params[(first + col) * 4 + 1] = m[col * 3 + 1] as f32
+        params[(first + col) * 4 + 2] = m[col * 3 + 2] as f32
+        params[(first + col) * 4 + 3] = 0.0 as f32
+        col = col + 1
+    }
+}
+
+// Directional light `l` as the `index`th the hits are lit by: the direction
+// toward it and its temperature, then its colour by its intensity.
+directional(p: f32[], index: int, l: *Light) {
+    at = 40 + index * 8
+    dir = core.v3_normalize(l.direction)
+    p[at] = dir.x as f32
+    p[at + 1] = dir.y as f32
+    p[at + 2] = dir.z as f32
+    p[at + 3] = l.temperature as f32
+    p[at + 4] = (l.color.x * l.intensity) as f32
+    p[at + 5] = (l.color.y * l.intensity) as f32
+    p[at + 6] = (l.color.z * l.intensity) as f32
+}
+
+// A fraction from the frame's count, the same on every run.
+hashed(n: int, k: int) -> float {
+    v = (n * 2654435761 + k * 40503) & 16777215
+    return (v as float) / 16777216.0
+}
+
+memory_barrier(commands: ptr, src_stage: int, dst_stage: int, src_access: int, dst_access: int) {
+    b = calloc(1, sizeof(VkMemoryBarrier)) as *VkMemoryBarrier
+    b.sType = vk.STRUCTURE_TYPE_MEMORY_BARRIER
+    b.srcAccessMask = src_access
+    b.dstAccessMask = dst_access
+    vk.vkCmdPipelineBarrier(commands, src_stage, dst_stage, 0, 1, b as ptr, 0, null, 0, null)
+    free(b as ptr)
+}
+
+// This frame's share of the probes traced and folded in, recorded after the
+// frame's structure is built and the sky captured, before the scene pass:
+// the grid placed round `eye`; a hit lit by the directional lights of
+// `lights` (the key light `key` first), by the frame's clustered lamps
+// (`lamps`, their buffer, `lamp_count` of them) and by `key` where it is a
+// lamp, which the clusters leave out; a miss the sky's light at `sky_view`
+// read by `sky_sampler`.
+dispatch(eye: Vec3, lights: ptr, key: *Light, lamps: ptr, lamp_count: int, sky_view: ptr, sky_sampler: ptr) {
+    if !g_ready || !vkhost.recording() || vkhost.pass_open() { return }
+    frame = vkhost.frame_slot()
+    commands = vkhost.frame_commands()
+    d = vkdevice.device()
+    structure = vkrays.structure(frame)
+    if structure == null { return }
+
+    // The grid round the eye, in whole cells.
+    bases = g_bases as float[]
+    c = 0
+    while c < CASCADES {
+        s = spacing(c)
+        bases[c * 3] = floor(eye.x / s) - floor((g_x as float) / 2.0)
+        bases[c * 3 + 1] = floor(eye.y / s) - floor((g_y as float) / 2.0)
+        bases[c * 3 + 2] = floor(eye.z / s) - floor((g_z as float) / 2.0)
+        c = c + 1
+    }
+    p = ((g_params as ptr[])[frame] as *HostBuffer).mapped as f32[]
+    memset(p as ptr, 0, PARAMS_BYTES as long)
+    p[0] = g_x as f32
+    p[1] = g_y as f32
+    p[2] = g_z as f32
+    p[3] = probes() as f32
+    c = 0
+    while c < CASCADES {
+        p[(1 + c) * 4] = bases[c * 3] as f32
+        p[(1 + c) * 4 + 1] = bases[c * 3 + 1] as f32
+        p[(1 + c) * 4 + 2] = bases[c * 3 + 2] as f32
+        p[12 + c] = spacing(c) as f32
+        c = c + 1
+    }
+    p[16] = irr_width() as f32
+    p[17] = irr_height() as f32
+    p[18] = dist_width() as f32
+    p[19] = dist_height() as f32
+    // This frame's turn of the rays: a random axis, a random angle.
+    ax = hashed(g_turn, 1) * 2.0 - 1.0
+    ay = hashed(g_turn, 2) * 2.0 - 1.0
+    az = hashed(g_turn, 3) * 2.0 - 1.0
+    al = sqrt(ax * ax + ay * ay + az * az)
+    if al < 0.001 {
+        ax = 0.0
+        ay = 1.0
+        az = 0.0
+        al = 1.0
+    }
+    rotation(p, 5, ax / al, ay / al, az / al, hashed(g_turn, 4) * 6.28318531)
+    p[32] = lamp_count as f32
+    p[33] = RAYS as f32
+    p[34] = g_turn as f32
+    p[36] = HYSTERESIS as f32
+    p[37] = HYSTERESIS as f32
+    count = 0
+    if key != null && key.mode == core.MODE_DIRECTIONAL {
+        directional(p, count, key)
+        count = count + 1
+    }
+    i = 0
+    while lights != null && i < list.size(lights) && count < DIRECTIONALS {
+        l = list.get_raw(lights, i) as *Light
+        if l != null && l != key && l.mode == core.MODE_DIRECTIONAL {
+            directional(p, count, l)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    p[35] = count as f32
+    if key != null && key.mode != core.MODE_DIRECTIONAL {
+        lightgrid.pack((p as ptr) + 72 * 4, key, spacing(CASCADES - 1) * (g_x as float))
+        p[38] = 1.0 as f32
+    }
+
+    // The frame's bindings: the structure, its parameters, its records, its
+    // lamps, the sky.
+    as_info = calloc(1, sizeof(VkWriteDescriptorSetAccelerationStructureKHR)) as *VkWriteDescriptorSetAccelerationStructureKHR
+    handle = cell()
+    (handle as ptr[])[0] = structure
+    as_info.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR
+    as_info.accelerationStructureCount = 1
+    as_info.pAccelerationStructures = handle
+    params_info = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+    params_info.buffer = ((g_params as ptr[])[frame] as *HostBuffer).buffer
+    params_info.range = PARAMS_BYTES
+    records_info = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+    records_info.buffer = ((g_records as ptr[])[frame] as *HostBuffer).buffer
+    records_info.range = vk.WHOLE_SIZE
+    lamps_info = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+    lamps_info.buffer = lamps
+    lamps_info.range = vk.WHOLE_SIZE
+    sky_info = calloc(1, sizeof(VkDescriptorImageInfo)) as *VkDescriptorImageInfo
+    sky_info.imageView = sky_view
+    sky_info.sampler = sky_sampler
+    sky_info.imageLayout = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    writes = calloc(5, sizeof(VkWriteDescriptorSet))
+    k = 0
+    while k < 3 {
+        set = set_at(frame, k)
+        memset(writes, 0, (5 * sizeof(VkWriteDescriptorSet)) as long)
+        w0 = writes as *VkWriteDescriptorSet
+        w0.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+        w0.pNext = as_info as ptr
+        w0.dstSet = set
+        w0.dstBinding = 0
+        w0.descriptorCount = 1
+        w0.descriptorType = vk.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
+        buffer_write((writes + sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet, set, 1, params_info, vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+        buffer_write((writes + 2 * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet, set, 2, records_info, vk.DESCRIPTOR_TYPE_STORAGE_BUFFER)
+        buffer_write((writes + 3 * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet, set, 3, lamps_info, vk.DESCRIPTOR_TYPE_STORAGE_BUFFER)
+        image_write((writes + 4 * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet, set, 6, sky_info, vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+        vk.vkUpdateDescriptorSets(d, 5, writes, 0, null)
+        k = k + 1
+    }
+    free(writes)
+    free(as_info as ptr)
+    free(handle)
+    free(params_info as ptr)
+    free(records_info as ptr)
+    free(lamps_info as ptr)
+    free(sky_info as ptr)
+
+    // This frame's share, in a run from the cursor round the probes.
+    total = probes() * CASCADES
+    batch = (total + g_share - 1) / g_share
+    first = g_cursor
+    if first + batch > total { batch = total - first }
+    push = calloc(1, 8) as uint32[]
+    push[0] = first as uint32
+    push[1] = batch as uint32
+    cell_set = cell()
+
+    // After the structure's build, the sky's capture and the last frame's
+    // reads of the atlases and the state.
+    memory_barrier(commands,
+                   vk.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                   vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                   vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                   vk.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT | vk.ACCESS_SHADER_WRITE_BIT,
+                   vk.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_SHADER_WRITE_BIT)
+    vk.vkCmdBindPipeline(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_trace)
+    (cell_set as ptr[])[0] = set_at(frame, 0)
+    vk.vkCmdBindDescriptorSets(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_layout, 0, 1, cell_set, 0, null)
+    vk.vkCmdPushConstants(commands, g_layout, vk.SHADER_STAGE_COMPUTE_BIT, 0, 8, push as ptr)
+    vk.vkCmdDispatch(commands, (RAYS + 63) / 64, batch, 1)
+    memory_barrier(commands, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                   vk.ACCESS_SHADER_WRITE_BIT, vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_SHADER_WRITE_BIT)
+    // The distance first: the irradiance pass rewrites the state the
+    // distance pass would read the probe's freshness from.
+    vk.vkCmdBindPipeline(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_update_distance)
+    (cell_set as ptr[])[0] = set_at(frame, 2)
+    vk.vkCmdBindDescriptorSets(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_layout, 0, 1, cell_set, 0, null)
+    vk.vkCmdPushConstants(commands, g_layout, vk.SHADER_STAGE_COMPUTE_BIT, 0, 8, push as ptr)
+    vk.vkCmdDispatch(commands, batch, 1, 1)
+    memory_barrier(commands, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                   vk.ACCESS_SHADER_WRITE_BIT, vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_SHADER_WRITE_BIT)
+    vk.vkCmdBindPipeline(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_update_irradiance)
+    (cell_set as ptr[])[0] = set_at(frame, 1)
+    vk.vkCmdBindDescriptorSets(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_layout, 0, 1, cell_set, 0, null)
+    vk.vkCmdPushConstants(commands, g_layout, vk.SHADER_STAGE_COMPUTE_BIT, 0, 8, push as ptr)
+    vk.vkCmdDispatch(commands, batch, 1, 1)
+    // The scene reads what the updates wrote.
+    memory_barrier(commands, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                   vk.ACCESS_SHADER_WRITE_BIT, vk.ACCESS_SHADER_READ_BIT)
+    free(cell_set)
+    free(push as ptr)
+    g_cursor = (first + batch) % total
+    g_turn = g_turn + 1
+    g_last_frame = frame
+}
+
+// The probes' irradiance at `p` onto a surface facing `n`, seen along `v`
+// (toward the eye), as the scene shader reads it from the last frame's
+// probes: the irradiance, and in w the share of it that lies beyond the
+// volume, for the asker to fill with the sky's (all of it before the first
+// frame). Recorded and waited for on its own, the device idle: for a
+// question about a surface, not a frame.
+irradiance_at(p: Vec3, n: Vec3, v: Vec3) -> Vec4 {
+    if !g_ready || g_last_frame < 0 { return Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 } }
+    vk.vkDeviceWaitIdle(vkdevice.device())
+    push = calloc(1, PUSH_BYTES) as f32[]
+    push[0] = p.x as f32
+    push[1] = p.y as f32
+    push[2] = p.z as f32
+    push[4] = n.x as f32
+    push[5] = n.y as f32
+    push[6] = n.z as f32
+    push[8] = v.x as f32
+    push[9] = v.y as f32
+    push[10] = v.z as f32
+    commands = vkhost.once_begin()
+    vk.vkCmdBindPipeline(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_query)
+    cell_set = cell()
+    (cell_set as ptr[])[0] = set_at(g_last_frame, 0)
+    vk.vkCmdBindDescriptorSets(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_layout, 0, 1, cell_set, 0, null)
+    free(cell_set)
+    vk.vkCmdPushConstants(commands, g_layout, vk.SHADER_STAGE_COMPUTE_BIT, 0, PUSH_BYTES, push as ptr)
+    vk.vkCmdDispatch(commands, 1, 1, 1)
+    memory_barrier(commands, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.PIPELINE_STAGE_HOST_BIT,
+                   vk.ACCESS_SHADER_WRITE_BIT, vk.ACCESS_HOST_READ_BIT)
+    vkhost.once_end(commands)
+    free(push as ptr)
+    a = (g_answer as *HostBuffer).mapped as f32[]
+    return Vec4 { x: a[0] as float, y: a[1] as float, z: a[2] as float, w: a[3] as float }
+}

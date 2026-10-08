@@ -227,6 +227,7 @@ to read them.
 | `AE3D_RAY_SKINNED=n` | how many skinned figures the rays pose a frame, the nearest first (32; 0 leaves them to the shadow map) |
 | `AE3D_SUN_SIZE=n` | the sun's size for the rays' penumbra, in tenths of a degree (5 is the sun; 0, the default, a point) |
 | `AE3D_RAY_AO=1` | ambient occlusion by ray in the screen-space pass's place |
+| `AE3D_GI=auto\|rt\|sky\|off` | the global illumination: the probes' (`rt`, where the GPU traces), the sky's light alone, none; `auto` the most the device does |
 | `AE3D_DLSS=n` | DLSS at mode `n` (1 performance, 2 balanced, 3 quality, 6 DLAA) |
 | `AE3D_RENDER_SCALE=50` | draw the scene at half the window's size, the composite scaling it up |
 | `AE3D_TIME=HHMM` | the time of day, where a scene takes one |

@@ -1,0 +1,363 @@
+// The probes' rays (#537): each a thread, a probe's DDGI_RAYS rays a row of
+// the ray image -- the radiance the ray brings back and how far it went (a
+// back face, which only a probe inside geometry sees, a fifth of its
+// distance and negative). Spherical Fibonacci directions turned by this
+// frame's random rotation, so over frames each probe sees every direction.
+// At a hit the surface is shaded as the scene shader would light its
+// diffuse: its emission, the sun and the lamps in reach through rays of
+// their own, and the light the probes gathered last frame at that point --
+// the bounce after this one, so the light bounces on over frames. A miss is
+// the sky, the sky's light's sharpest level.
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+layout(local_size_x = 64) in;
+#define DDGI_PARAMS 32
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
+layout(set = 0, binding = 1, std140) uniform DdgiParams { vec4 params[DDGI_PARAMS]; };
+// An instance's record, by its custom index: its vertex and index buffers'
+// addresses, the floats a vertex spans, and its albedo and emission.
+layout(set = 0, binding = 2, std430) readonly buffer Records { uvec4 records[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Lamps { vec4 lamps[]; };
+layout(set = 0, binding = 4, std430) readonly buffer State { vec4 probeState[]; };
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D rayImage;
+layout(set = 0, binding = 6) uniform sampler2D skyLight;
+layout(set = 0, binding = 7) uniform sampler2D irradianceAtlas;
+layout(set = 0, binding = 8) uniform sampler2D distanceAtlas;
+layout(push_constant) uniform Batch { uint first; uint count; } batch;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Floats { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint v[]; };
+
+#define DDGI_DIMS params[0]
+#define DDGI_BASE(c) params[1 + (c)].xyz
+#define DDGI_SPACING(c) params[3][(c)]
+#define DDGI_ATLAS params[4]
+#define DDGI_DIRECTIONALS 10
+#define DDGI_KEY_LAMP 18
+#define DDGI_IRRADIANCE irradianceAtlas
+#define DDGI_DISTANCE distanceAtlas
+#define DDGI_STATE(i) probeState[(i)]
+// The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
+// the upper hemisphere in the square's inner diamond, the lower folded into
+// its corners, one texel of gutter around each level holding the sky just
+// across the fold, so a filtered read at an edge is still the sky.
+#define SKY_SIZE 256.0
+#define SKY_LEVELS 6.0
+#define SKY_IRRADIANCE_SIZE 16.0
+vec3 oct_decode(vec2 p) {
+    vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0) {
+        vec2 folded = (1.0 - abs(d.zx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = folded.x;
+        d.z = folded.y;
+    }
+    return normalize(d);
+}
+vec2 oct_encode(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p;
+}
+// Where direction d is read in a level `size` texels a side.
+vec2 oct_uv(vec3 d, float size) {
+    return ((oct_encode(d) * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
+// The direction a texel of a level `size` a side stands for, at texture
+// coordinate uv: a gutter texel's folded back across the edge it lies past.
+vec3 oct_texel_direction(vec2 uv, float size) {
+    vec2 p = ((uv * size - 1.0) / (size - 2.0)) * 2.0 - 1.0;
+    if (p.x > 1.0) { p.x = 2.0 - p.x; p.y = -p.y; }
+    if (p.x < -1.0) { p.x = -2.0 - p.x; p.y = -p.y; }
+    if (p.y > 1.0) { p.y = 2.0 - p.y; p.x = -p.x; }
+    if (p.y < -1.0) { p.y = -2.0 - p.y; p.x = -p.x; }
+    return oct_decode(p);
+}
+
+// v wrapped into 0 to d-1 on each axis (GLSL's % is undefined for a
+// negative operand, and a grid west of the origin has negative cells).
+ivec3 ddgi_wrap(ivec3 v, ivec3 d) {
+    return v - d * ivec3(floor(vec3(v) / vec3(d)));
+}
+
+// The probe volume (#537, ae3d.vkddgi, whose layout this must match):
+// DDGI_CASCADES grids of probes around the camera, each DDGI_DIMS probes
+// DDGI_SPACING(c) apart, addressed toroidally -- a probe's slot is its
+// world cell modulo the grid -- so the grid scrolls with the camera by whole
+// cells and what a probe knows stays where it was learned. Each probe keeps
+// its irradiance and its distance moments in octahedral texels in two
+// atlases, a one-texel gutter round each, and its state -- the offset that
+// moves it out of a wall, whether it is on -- in the state buffer.
+//
+// What a shader including this defines first: DDGI_DIMS (vec4: probes a
+// side, x y z, and probes a cascade), DDGI_BASE(c) (vec3: the world cell of
+// cascade c's first probe), DDGI_SPACING(c), DDGI_ATLAS (vec4: the
+// irradiance atlas's size, then the distance atlas's), DDGI_IRRADIANCE and
+// DDGI_DISTANCE (the atlases' samplers) and DDGI_STATE(i) (vec4 i of the
+// state buffer).
+#define DDGI_CASCADES 2
+#define DDGI_IRR 6
+#define DDGI_DIST 14
+
+// A probe's index from its cascade and its slot in the grid.
+int ddgi_index(int c, ivec3 slot) {
+    ivec3 d = ivec3(DDGI_DIMS.xyz);
+    return c * int(DDGI_DIMS.w) + (slot.z * d.y + slot.y) * d.x + slot.x;
+}
+
+// The slot of the probe at grid coordinate g of cascade c (0 to DDGI_DIMS-1
+// from the cascade's first cell).
+ivec3 ddgi_slot(int c, ivec3 g) {
+    return ddgi_wrap(ivec3(DDGI_BASE(c)) + g, ivec3(DDGI_DIMS.xyz));
+}
+
+// Whether probe `index`, at grid coordinate g of cascade c, is on: traced
+// since it came to its cell, and not inside anything.
+bool ddgi_on(int c, ivec3 g, int index) {
+    vec4 stamp = DDGI_STATE(index * 2 + 1);
+    return DDGI_STATE(index * 2).w > 0.5 && stamp.w > 0.5 && all(equal(stamp.xyz, DDGI_BASE(c) + vec3(g)));
+}
+
+// Where the probe at grid coordinate g of cascade c belongs: its cell's
+// centre, not its corner, so a floor or a wall at a whole number of cells
+// does not run through a row of probes.
+vec3 ddgi_home(int c, ivec3 g) {
+    return (DDGI_BASE(c) + vec3(g) + 0.5) * DDGI_SPACING(c);
+}
+
+// Where probe `index` stands: its home and the offset its state keeps.
+vec3 ddgi_probe_position(int c, ivec3 g, int index) {
+    return ddgi_home(c, g) + DDGI_STATE(index * 2).xyz;
+}
+
+// Point P in cascade c's grid coordinates, a probe at each whole number.
+vec3 ddgi_grid(int c, vec3 P) {
+    return P / DDGI_SPACING(c) - DDGI_BASE(c) - 0.5;
+}
+
+// The atlas texel a probe's octahedron starts at (its gutter's corner).
+vec2 ddgi_corner(int index, float side) {
+    int c = index / int(DDGI_DIMS.w);
+    int local = index - c * int(DDGI_DIMS.w);
+    ivec3 d = ivec3(DDGI_DIMS.xyz);
+    int x = local % d.x;
+    int y = (local / d.x) % d.y;
+    int z = local / (d.x * d.y);
+    return vec2(float(x + y * d.x), float(z + c * d.z)) * (side + 2.0);
+}
+
+// Where direction n is read in probe `index`'s octahedron of `side` texels.
+vec2 ddgi_uv(int index, vec3 n, float side, vec2 atlas) {
+    vec2 o = oct_encode(n) * 0.5 + 0.5;
+    return (ddgi_corner(index, side) + 1.0 + o * side) / atlas;
+}
+
+// The irradiance onto a surface at P facing N, seen from V's side, from
+// the eight probes of cascade c's cell around it: trilinear, each weighed
+// by whether it faces the surface and by whether, by its distance moments,
+// it can see it (Chebyshev). The irradiance the probes keep is the cosine
+// average of the radiance, so pi times it is the irradiance; a weight sum of
+// nothing returns -1, for the caller to take what lies beyond.
+vec3 ddgi_cascade(int c, vec3 P, vec3 N, vec3 V, out float total) {
+    float spacing = DDGI_SPACING(c);
+    vec3 biased = P + (N * 0.2 + V * 0.8) * (0.3 * spacing);
+    vec3 gridPos = ddgi_grid(c, biased);
+    ivec3 g0 = ivec3(floor(gridPos));
+    vec3 alpha = clamp(gridPos - vec3(g0), 0.0, 1.0);
+    vec3 sum = vec3(0.0);
+    total = 0.0;
+    for (int i = 0; i < 8; i++) {
+        ivec3 offset = ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        ivec3 g = clamp(g0 + offset, ivec3(0), ivec3(DDGI_DIMS.xyz) - 1);
+        int index = ddgi_index(c, ddgi_slot(c, g));
+        if (!ddgi_on(c, g, index)) continue;
+        vec3 probe = ddgi_probe_position(c, g, index);
+        vec3 tri = mix(1.0 - alpha, alpha, vec3(offset));
+        float weight = tri.x * tri.y * tri.z;
+        vec3 toProbe = probe - P;
+        vec3 dirToProbe = normalize(toProbe);
+        float facing = (dot(dirToProbe, N) + 1.0) * 0.5;
+        weight *= facing * facing + 0.2;
+        vec3 fromProbe = biased - probe;
+        float dist = length(fromProbe);
+        vec2 moments = textureLod(DDGI_DISTANCE, ddgi_uv(index, fromProbe / max(dist, 1e-4), float(DDGI_DIST), DDGI_ATLAS.zw), 0.0).rg;
+        float variance = abs(moments.x * moments.x - moments.y);
+        float visible = 1.0;
+        if (dist > moments.x) {
+            float d = dist - moments.x;
+            visible = variance / (variance + d * d);
+            visible = max(visible * visible * visible, 0.0);
+        }
+        weight *= max(visible, 0.05);
+        // Small weights crushed, so a probe that barely sees the point does
+        // not tint it (Majercik et al.'s threshold).
+        if (weight < 0.2) weight *= weight * weight / 0.04;
+        vec3 irradiance = textureLod(DDGI_IRRADIANCE, ddgi_uv(index, N, float(DDGI_IRR), DDGI_ATLAS.xy), 0.0).rgb;
+        sum += irradiance * weight;
+        total += weight;
+    }
+    if (total <= 0.0) return vec3(0.0);
+    return sum / total * 3.14159265;
+}
+
+// How far inside cascade c point P is, in cells from its nearest face: past
+// one the cascade is whole; under it, the next one out takes over.
+float ddgi_inside(int c, vec3 P) {
+    vec3 gridPos = ddgi_grid(c, P);
+    vec3 edge = min(gridPos, (DDGI_DIMS.xyz - 1.0) - gridPos);
+    return min(edge.x, min(edge.y, edge.z));
+}
+
+// The probes' irradiance at P onto N, the nearest cascade that holds it
+// blending into the next over its last cell, and beyond the last the
+// `beyond` irradiance (the sky's) over the far cascade's last cell. From
+// the near cascade out, so a point the near one holds whole reads its
+// eight probes and no more.
+vec3 ddgi_irradiance(vec3 P, vec3 N, vec3 V, vec3 beyond) {
+    vec3 result = vec3(0.0);
+    float left = 1.0;
+    for (int c = 0; c < DDGI_CASCADES; c++) {
+        float inside = ddgi_inside(c, P);
+        if (inside <= 0.0) continue;
+        float total;
+        vec3 e = ddgi_cascade(c, P, N, V, total);
+        if (total <= 0.0) continue;
+        float share = clamp(inside, 0.0, 1.0) * left;
+        result += e * share;
+        left -= share;
+        if (left <= 0.0) return result;
+    }
+    return result + beyond * left;
+}
+vec3 kelvinToRGB(float kelvin) {
+    kelvin = clamp(kelvin, 1000.0, 12000.0);
+    
+    // Fast approximation for common temperatures (avoids expensive pow/log)
+    if (kelvin < 3000.0) {
+        return mix(vec3(1.0, 0.4, 0.0), vec3(1.0, 0.7, 0.3), (kelvin - 1000.0) / 2000.0);
+    } else if (kelvin < 6500.0) {
+        return mix(vec3(1.0, 0.7, 0.3), vec3(1.0, 1.0, 1.0), (kelvin - 3000.0) / 3500.0);
+    } else {
+        return mix(vec3(1.0, 1.0, 1.0), vec3(0.7, 0.8, 1.0), (kelvin - 6500.0) / 5500.0);
+    }
+}
+// The i-th of n directions spread evenly over the sphere (spherical
+// Fibonacci).
+vec3 fibonacci_direction(uint i, uint n) {
+    float golden = 2.39996323;
+    float y = 1.0 - (float(i) + 0.5) * (2.0 / float(n));
+    float r = sqrt(max(1.0 - y * y, 0.0));
+    float phi = float(i) * golden;
+    return vec3(cos(phi) * r, y, sin(phi) * r);
+}
+
+// Whether anything that casts a shadow (mask bit 1) lies within `far` of
+// `from` along `dir`.
+bool blocked(vec3 from, vec3 dir, float far) {
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, scene, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0x01, from, 0.0, dir, far);
+    while (rayQueryProceedEXT(q)) { }
+    return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// The light a lamp (packed as the clusters pack it, ae3d.lightgrid) brings
+// to `hit` facing n, through a ray of its own.
+vec3 lamp_light(vec4 a, vec4 b, vec4 cone, vec4 att, vec4 e, vec3 hit, vec3 n) {
+    vec3 toLamp = a.xyz - hit;
+    float dist = length(toLamp);
+    if (dist >= a.w || dist <= 0.0) return vec3(0.0);
+    vec3 l = toLamp / dist;
+    float facing = dot(n, l);
+    if (facing <= 0.0) return vec3(0.0);
+    float attenuation = 1.0 / (att.x + att.y * dist + att.z * dist * dist);
+    if (int(cone.w + 0.5) == 2) attenuation *= smoothstep(e.x, e.y, dot(-l, normalize(cone.xyz)));
+    if (attenuation <= 0.0 || blocked(hit, l, dist)) return vec3(0.0);
+    return b.rgb * kelvinToRGB(att.w) * b.a * attenuation * facing;
+}
+
+vec3 vertex_at(uvec2 address, uint stride, uint index, mat4x3 toWorld) {
+    Floats f = Floats(address);
+    uint at = index * stride;
+    return toWorld * vec4(f.v[at], f.v[at + 1u], f.v[at + 2u], 1.0);
+}
+
+void main() {
+    uint ray = gl_GlobalInvocationID.x;
+    uint rays = uint(params[8].y);
+    uint probe = batch.first + gl_WorkGroupID.y;
+    if (ray >= rays || gl_WorkGroupID.y >= batch.count) return;
+    int index = int(probe);
+    int c = index / int(DDGI_DIMS.w);
+    int local = index - c * int(DDGI_DIMS.w);
+    ivec3 d = ivec3(DDGI_DIMS.xyz);
+    ivec3 slot = ivec3(local % d.x, (local / d.x) % d.y, local / (d.x * d.y));
+    // The grid coordinate this slot holds now: the slot less the cascade's
+    // first cell, wrapped.
+    ivec3 g = ddgi_wrap(slot - ivec3(DDGI_BASE(c)), d);
+    // A probe just come to its cell starts from its home: the offset it
+    // keeps was for the cell it left.
+    vec4 stamp = probeState[index * 2 + 1];
+    bool fresh = stamp.w < 0.5 || any(notEqual(stamp.xyz, DDGI_BASE(c) + vec3(g)));
+    vec3 origin = fresh ? ddgi_home(c, g) : ddgi_probe_position(c, g, index);
+    mat3 turn = mat3(params[5].xyz, params[6].xyz, params[7].xyz);
+    vec3 dir = normalize(turn * fibonacci_direction(ray, rays));
+    float far = DDGI_SPACING(c) * float(DDGI_DIMS.x) * 0.5;
+
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, scene, gl_RayFlagsOpaqueEXT, 0x02, origin, 0.0, dir, far);
+    while (rayQueryProceedEXT(q)) { }
+    if (rayQueryGetIntersectionTypeEXT(q, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        vec3 sky = textureLod(skyLight, oct_uv(dir, SKY_SIZE), 0.0).rgb;
+        imageStore(rayImage, ivec2(ray, probe), vec4(sky, 1e4));
+        return;
+    }
+    float t = rayQueryGetIntersectionTEXT(q, true);
+    uint record = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(q, true)) * 4u;
+    uint primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(q, true));
+    mat4x3 toWorld = rayQueryGetIntersectionObjectToWorldEXT(q, true);
+    uvec4 addresses = records[record];
+    uvec4 shape = records[record + 1u];
+    vec3 albedo = uintBitsToFloat(records[record + 2u].xyz);
+    vec3 emission = uintBitsToFloat(records[record + 3u].xyz);
+    Words indices = Words(addresses.zw);
+    vec3 p0 = vertex_at(addresses.xy, shape.x, indices.v[primitive * 3u], toWorld);
+    vec3 p1 = vertex_at(addresses.xy, shape.x, indices.v[primitive * 3u + 1u], toWorld);
+    vec3 p2 = vertex_at(addresses.xy, shape.x, indices.v[primitive * 3u + 2u], toWorld);
+    vec3 wound = normalize(cross(p1 - p0, p2 - p0));
+    // Its back: a probe that sees backs is inside something.
+    if (dot(wound, dir) > 0.0 && shape.y == 0u) {
+        imageStore(rayImage, ivec2(ray, probe), vec4(0.0, 0.0, 0.0, -0.2 * t));
+        return;
+    }
+    vec3 n = dot(wound, dir) > 0.0 ? -wound : wound;
+    vec3 hit = origin + dir * t + n * 0.02;
+
+    // The directional lights (the sun, the moon): each a direction toward
+    // it and its temperature, then its colour by its intensity.
+    vec3 direct = vec3(0.0);
+    int directionals = int(params[8].w);
+    for (int i = 0; i < directionals; i++) {
+        vec4 toward = params[DDGI_DIRECTIONALS + i * 2];
+        vec4 light = params[DDGI_DIRECTIONALS + i * 2 + 1];
+        float facing = dot(n, toward.xyz);
+        if (facing > 0.0 && !blocked(hit, toward.xyz, 1e4)) {
+            direct += light.rgb * kelvinToRGB(toward.w) * facing;
+        }
+    }
+    int lampCount = int(params[8].x);
+    for (int i = 0; i < lampCount; i++) {
+        direct += lamp_light(lamps[i * 5], lamps[i * 5 + 1], lamps[i * 5 + 2], lamps[i * 5 + 3], lamps[i * 5 + 4], hit, n);
+    }
+    // A key light that is a lamp, which the clusters leave out.
+    if (params[9].z > 0.5) {
+        direct += lamp_light(params[DDGI_KEY_LAMP], params[DDGI_KEY_LAMP + 1], params[DDGI_KEY_LAMP + 2],
+                             params[DDGI_KEY_LAMP + 3], params[DDGI_KEY_LAMP + 4], hit, n);
+    }
+    // The light gathered here last frame, the bounce after this one.
+    vec3 bounce = ddgi_irradiance(hit, n, -dir, vec3(0.0));
+    vec3 radiance = emission + albedo * (direct + bounce) / 3.14159265;
+    imageStore(rayImage, ivec2(ray, probe), vec4(radiance, t));
+}

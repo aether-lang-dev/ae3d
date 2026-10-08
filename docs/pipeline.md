@@ -120,7 +120,7 @@ sets, every light, the shadow and fog settings, the camera, each tile's props
 and tint, each material's texture and normal map with the GPU id it resolved
 to, and a per-60-frame check that no zombie ever moved further than it can
 walk. The knobs it exposes (`AE3D_VIEW`, `AE3D_CAMX/Y/Z`, `AE3D_CROWD`,
-`AE3D_NEAR`, `AE3D_MOON`, `AE3D_LAMP`, `AE3D_AMBIENT`, ...) are how the scene
+`AE3D_NEAR`, `AE3D_MOON`, `AE3D_LAMP`, ...) are how the scene
 is swept from many camera positions and lighting states, because a single
 still is blind to a zombie vanishing on a zoom or a shadow sliding with the
 camera.

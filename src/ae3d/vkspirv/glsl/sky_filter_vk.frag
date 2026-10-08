@@ -4,7 +4,6 @@ struct Light {
     vec3 position;
     vec3 color;
     float intensity;
-    float ambientStrength;
     float temperature;
     int isDirectional;
     vec3 direction;
@@ -54,7 +53,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float reflectivity;
     float wetness;
-    float frameExposure;
     bool hasNormalMap;
     float normalStrength;
     float occlusionStrength;
@@ -70,20 +68,15 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableEnergyConservation;
     bool enableImageBasedLighting;
     float iblIntensity;
+    int giOff;
     bool enableVolumetricLighting;
     float volumetricIntensity;
     int volumetricSteps;
     float volumetricScattering;
-    bool enableGlobalIllumination;
-    float giIntensity;
-    int giBounces;
-    bool enableBloom;
-    float bloomThreshold;
-    float bloomIntensity;
     bool enableFog;
     float fogStart;
     float fogEnd;
-    vec3 fogColor;
+    vec3 fogRadiance;
     float fogIntensity;
     bool enableShadows;
     bool hasShadowMap;
@@ -127,6 +120,12 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 damageColours[4];
     vec4 damageRect;
     float damageClamp;
+    int occlusionHistory;
+    int ddgiOn;
+    vec4 ddgiDims;
+    vec4 ddgiBase[2];
+    vec4 ddgiSpacing;
+    vec4 ddgiAtlas;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -135,10 +134,21 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int skyProcedural;
     float skyOvercast;
     vec3 skyOvercastColor;
+    vec3 skyFlat;
+    float skyTurbidity;
+    float skyLevelSize;
+    float skyRoughness;
+    float frameExposure;
+    bool enableBloom;
+    float bloomIntensity;
     vec2 texelSize;
+    int bloomFirst;
+    float bloomThreshold;
+    int bloomTop;
     float edgeThreshold;
     float edgeThresholdMin;
     float subpixelQuality;
+    int colorSampleCount;
     mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
@@ -187,39 +197,94 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float crowdPhaseStep;
     vec4 shadowReach;
 };
-layout(set = 0, binding = 1) uniform sampler2D screenTexture;
-
-layout(location = 0) in vec2 TexCoords;
+layout(set = 0, binding = 1) uniform sampler2D skyCapture;
 layout(location = 0) out vec4 FragColor;
 
 
 
 
 
+// The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
+// the upper hemisphere in the square's inner diamond, the lower folded into
+// its corners, one texel of gutter around each level holding the sky just
+// across the fold, so a filtered read at an edge is still the sky.
+#define SKY_SIZE 256.0
+#define SKY_LEVELS 6.0
+#define SKY_IRRADIANCE_SIZE 16.0
+vec3 oct_decode(vec2 p) {
+    vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0) {
+        vec2 folded = (1.0 - abs(d.zx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = folded.x;
+        d.z = folded.y;
+    }
+    return normalize(d);
+}
+vec2 oct_encode(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p;
+}
+// Where direction d is read in a level `size` texels a side.
+vec2 oct_uv(vec3 d, float size) {
+    return ((oct_encode(d) * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
+// The direction a texel of a level `size` a side stands for, at texture
+// coordinate uv: a gutter texel's folded back across the edge it lies past.
+vec3 oct_texel_direction(vec2 uv, float size) {
+    vec2 p = ((uv * size - 1.0) / (size - 2.0)) * 2.0 - 1.0;
+    if (p.x > 1.0) { p.x = 2.0 - p.x; p.y = -p.y; }
+    if (p.x < -1.0) { p.x = -2.0 - p.x; p.y = -p.y; }
+    if (p.y > 1.0) { p.y = 2.0 - p.y; p.x = -p.x; }
+    if (p.y < -1.0) { p.y = -2.0 - p.y; p.x = -p.x; }
+    return oct_decode(p);
+}
+
+#define FILTER_SAMPLES 48
+
+float radical_inverse(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
 
 void main() {
-    vec3 color = texture(screenTexture, TexCoords).rgb;
-    
-    // Calculate luminance
-    float luma = dot(color, vec3(0.299, 0.587, 0.114));
-    
-    // Extract bright parts only
-    vec3 brightColor = vec3(0.0);
-    if (luma > bloomThreshold) {
-        brightColor = color * (luma - bloomThreshold) / (1.0 - bloomThreshold + 0.001);
+    // Laid out as level 0 is, whatever this level's size, so the scene
+    // reads every level at one coordinate (sky_reflection).
+    vec3 N = oct_texel_direction(gl_FragCoord.xy / skyLevelSize, SKY_SIZE);
+    if (skyRoughness <= 0.0) {
+        FragColor = vec4(textureLod(skyCapture, oct_uv(N, SKY_SIZE), 0.0).rgb, 1.0);
+        return;
     }
-    
-    // Simple 4-tap box blur on bright areas only (very fast)
-    vec3 blur = brightColor;
-    float offset = 2.0;
-    blur += texture(screenTexture, TexCoords + vec2(texelSize.x * offset, 0.0)).rgb;
-    blur += texture(screenTexture, TexCoords - vec2(texelSize.x * offset, 0.0)).rgb;
-    blur += texture(screenTexture, TexCoords + vec2(0.0, texelSize.y * offset)).rgb;
-    blur += texture(screenTexture, TexCoords - vec2(0.0, texelSize.y * offset)).rgb;
-    blur *= 0.2; // Average of 5 samples
-    
-    // Combine: original + bloom glow
-    vec3 finalColor = color + blur * bloomIntensity;
-    
-    FragColor = vec4(finalColor, 1.0);
+    float a = skyRoughness * skyRoughness;
+    vec3 up = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, N));
+    vec3 B = cross(N, T);
+    // A texel of the capture's level 0, as solid angle: the whole sphere
+    // over its inner texels.
+    float texel = 4.0 * 3.14159265 / ((SKY_SIZE - 2.0) * (SKY_SIZE - 2.0));
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (int i = 0; i < FILTER_SAMPLES; i++) {
+        vec2 xi = vec2((float(i) + 0.5) / float(FILTER_SAMPLES), radical_inverse(uint(i)));
+        float phi = 6.28318531 * xi.y;
+        float cosTheta = sqrt((1.0 - xi.x) / (1.0 + (a * a - 1.0) * xi.x));
+        float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+        vec3 H = T * (sinTheta * cos(phi)) + B * (sinTheta * sin(phi)) + N * cosTheta;
+        vec3 L = 2.0 * dot(N, H) * H - N;
+        float NdotL = dot(N, L);
+        if (NdotL <= 0.0) continue;
+        // With the view along the normal, the pdf of L is D(H) / 4.
+        float d = (cosTheta * cosTheta * (a * a - 1.0) + 1.0);
+        float pdf = (a * a) / (3.14159265 * d * d) / 4.0;
+        float sampleAngle = 1.0 / (float(FILTER_SAMPLES) * pdf + 1e-6);
+        float lod = max(0.5 * log2(sampleAngle / texel) + 1.0, 0.0);
+        sum += textureLod(skyCapture, oct_uv(L, SKY_SIZE), lod).rgb * NdotL;
+        weight += NdotL;
+    }
+    FragColor = vec4(sum / max(weight, 1e-6), 1.0);
 }

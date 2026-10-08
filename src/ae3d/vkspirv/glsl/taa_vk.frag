@@ -4,7 +4,6 @@ struct Light {
     vec3 position;
     vec3 color;
     float intensity;
-    float ambientStrength;
     float temperature;
     int isDirectional;
     vec3 direction;
@@ -54,7 +53,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float reflectivity;
     float wetness;
-    float frameExposure;
     bool hasNormalMap;
     float normalStrength;
     float occlusionStrength;
@@ -70,20 +68,15 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableEnergyConservation;
     bool enableImageBasedLighting;
     float iblIntensity;
+    int giOff;
     bool enableVolumetricLighting;
     float volumetricIntensity;
     int volumetricSteps;
     float volumetricScattering;
-    bool enableGlobalIllumination;
-    float giIntensity;
-    int giBounces;
-    bool enableBloom;
-    float bloomThreshold;
-    float bloomIntensity;
     bool enableFog;
     float fogStart;
     float fogEnd;
-    vec3 fogColor;
+    vec3 fogRadiance;
     float fogIntensity;
     bool enableShadows;
     bool hasShadowMap;
@@ -127,6 +120,12 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 damageColours[4];
     vec4 damageRect;
     float damageClamp;
+    int occlusionHistory;
+    int ddgiOn;
+    vec4 ddgiDims;
+    vec4 ddgiBase[2];
+    vec4 ddgiSpacing;
+    vec4 ddgiAtlas;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -135,10 +134,21 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int skyProcedural;
     float skyOvercast;
     vec3 skyOvercastColor;
+    vec3 skyFlat;
+    float skyTurbidity;
+    float skyLevelSize;
+    float skyRoughness;
+    float frameExposure;
+    bool enableBloom;
+    float bloomIntensity;
     vec2 texelSize;
+    int bloomFirst;
+    float bloomThreshold;
+    int bloomTop;
     float edgeThreshold;
     float edgeThresholdMin;
     float subpixelQuality;
+    int colorSampleCount;
     mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
@@ -202,6 +212,19 @@ layout(location = 0) out vec4 FragColor;
 
 
 
+
+// The frame is radiance, and a lamp is hundreds of times its neighbours: held
+// and blended as it is, one bright pixel decides every pixel it reaches and
+// the edge it sits on flickers. So the history is kept, clamped and blended
+// in a space that shows as the screen does -- each colour over one plus how
+// bright it shows (Karis) -- and taken back out after.
+vec3 fold(vec3 c) {
+    return c / (1.0 + dot(c * frameExposure, vec3(0.2126, 0.7152, 0.0722)));
+}
+vec3 unfold(vec3 c) {
+    return c / max(1.0 - dot(c * frameExposure, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+}
+
 void main() {
     vec2 uv = TexCoords;
     vec2 px = 1.0 / screenSize;
@@ -221,14 +244,15 @@ void main() {
         FragColor = vec4(current, 1.0);
         return;
     }
-    vec3 history = texture(historyTexture, prevUV).rgb;
+    vec3 history = fold(texture(historyTexture, prevUV).rgb);
+    vec3 now = fold(current);
 
     // The neighbourhood's range this frame, and the history held to it.
-    vec3 low = current;
-    vec3 high = current;
+    vec3 low = now;
+    vec3 high = now;
     for (int y = -1; y <= 1; y++) {
         for (int x = -1; x <= 1; x++) {
-            vec3 c = texture(screenTexture, uv + vec2(float(x), float(y)) * px).rgb;
+            vec3 c = fold(texture(screenTexture, uv + vec2(float(x), float(y)) * px).rgb);
             low = min(low, c);
             high = max(high, c);
         }
@@ -237,5 +261,5 @@ void main() {
     // A history that had to be moved far -- a fast pan -- is trusted less.
     float travel = length((prevUV - uv) * screenSize);
     float blend = clamp(taaBlend + travel * 0.02, taaBlend, 1.0);
-    FragColor = vec4(mix(history, current, blend), 1.0);
+    FragColor = vec4(unfold(mix(history, now, blend)), 1.0);
 }

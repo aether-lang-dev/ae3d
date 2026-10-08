@@ -45,11 +45,11 @@ exports (
     offscreen_width, offscreen_height, draw, draw_range, draw_indirect, draw_sky, set_screen_quad, set_blend, set_normal_map, set_pose_bank, set_damage_mask,
     set_face_culling, set_shadows, shadows, shadow_begin, shadow_draw, shadow_end, shadow_viewport, shadow_done,
     lamp_shadow_begin, lamp_shadow_tile, lamp_static_begin, lamp_copy, lamp_shadow_generation,
-    clusters_reserve, clusters_lights, clusters_words, set_post, post_active,
+    clusters_reserve, clusters_lights, clusters_words, set_post, post_active, set_frame_exposure, frame_exposure, composited, screen_pass,
     set_bloom_intensity, bloom_intensity, draw_calls, pass_ms, pipeline_binds, set_binds, sample_count,
     set_samples, set_scene_depth, scene_depth_ready, resolve_scene_depth, velocity_texture, set_render_scale,
     render_scale, set_taa, taa, taa_history, set_ssr, ssr, set_ssr_params, ssr_road_height, ssr_strength, set_ssao, ssao, ssao_radius,
-    ssao_intensity, draw_ssao, mark_sky_done, mark_opaque_done, set_capture_bypass, default_texture,
+    ssao_intensity, occlusion_pass, mark_sky_done, mark_opaque_done, set_capture_bypass, default_texture,
     max_texture_size, texture_destroy, dlss_available, set_dlss, dlss, dlss_failed, dlss_camera, clip_correct
 )
 
@@ -139,9 +139,19 @@ var g_empty_skin_memory: ptr = null
 var g_in_shadow_pass = false
 var g_depth_split = false
 var g_depth_resolved = false
+// Whether the camera depth holds the last frame's, at its present size: the
+// occlusion is found from it before the scene.
+var g_occlusion_history = false
+var g_occlusion_serial = 0 - 1
 var g_scene_clear: ptr = null      // f32[4]
 var g_post_active = false
 var g_capture_bypass = false
+// The texture the composite read this frame: the scene's light as the post
+// chain left it, before the tone curve -- what the meter measures.
+var g_composited = 0
+// A nearest, clamped sampler for what is read by the texel: the multisampled
+// colour the resolve reads sample by sample.
+var g_nearest_sampler: ptr = null
 
 // Settings a program makes before the device exists as often as after:
 // kept across a start.
@@ -150,6 +160,7 @@ var g_fxaa = false
 var g_bloom = false
 var g_bloom_threshold = 0.0
 var g_bloom_intensity = 0.0
+var g_frame_exposure = 1.0
 var g_render_scale = 0.0
 var g_samples_wanted = 4
 var g_ssr_enabled = false
@@ -166,6 +177,7 @@ var g_scene_depth_wanted = false
 var g_ssr_sets: ptr = null         // VkDescriptorSet[FRAMES]
 var g_ssao_sets: ptr = null
 var g_resolve_sets: ptr = null
+var g_colour_resolve_sets: ptr = null
 var g_taa_sets: ptr = null         // VkDescriptorSet[2 * FRAMES]
 var g_show_sets: ptr = null
 var g_sets_serial = 0 - 1
@@ -229,6 +241,7 @@ scratch() {
     g_ssr_sets = calloc(FRAMES, 8)
     g_ssao_sets = calloc(FRAMES, 8)
     g_resolve_sets = calloc(FRAMES, 8)
+    g_colour_resolve_sets = calloc(FRAMES, 8)
     g_taa_sets = calloc(2 * FRAMES, 8)
     g_show_sets = calloc(FRAMES, 8)
     g_dlss_camera = calloc(1, DLSS_CAMERA_BYTES)
@@ -490,10 +503,16 @@ create_defaults() -> bool {
     (white as byte[])[1] = 255
     (white as byte[])[2] = 255
     (white as byte[])[3] = 255
-    g_default_texture = vktexture.texture_create(1, 1, white)
+    g_default_texture = vktexture.texture_create(1, 1, white, false)
     free(white)
     if g_default_texture == 0 {
         vkdevice.fail("could not create the default texture")
+        return false
+    }
+    g_nearest_sampler = vkhost.sampler(vk.FILTER_NEAREST, vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                       vk.SAMPLER_MIPMAP_MODE_NEAREST, 1.0, 0.0)
+    if g_nearest_sampler == null {
+        vkdevice.fail("nearest vkCreateSampler failed")
         return false
     }
     identity = calloc(20, 4)
@@ -618,6 +637,8 @@ shutdown() {
     }
     vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: g_identity_buffer, memory: g_identity_memory })
     vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: g_empty_skin_buffer, memory: g_empty_skin_memory })
+    if g_nearest_sampler != null { vk.vkDestroySampler(d, g_nearest_sampler, null) }
+    g_nearest_sampler = null
     g_identity_buffer = null
     g_identity_memory = null
     g_empty_skin_buffer = null
@@ -665,6 +686,7 @@ post_sets_current() {
     memset(g_ssr_sets, 0, (FRAMES * 8) as long)
     memset(g_ssao_sets, 0, (FRAMES * 8) as long)
     memset(g_resolve_sets, 0, (FRAMES * 8) as long)
+    memset(g_colour_resolve_sets, 0, (FRAMES * 8) as long)
     memset(g_taa_sets, 0, (2 * FRAMES * 8) as long)
 }
 
@@ -799,7 +821,8 @@ begin_pass(pass: ptr, framebuffer: ptr, w: int, h: int, clear_count: int) {
 
 // The scene pass, opened by the first scene draw: the whole of it, or its
 // first half when something reads the scene's depth, or its second after
-// the resolve; into the post chain's texture, or straight into the frame.
+// the resolve; into the scene texture (or the multisampled colour the
+// resolve then reads), never the frame: the composite writes that.
 // The third clear is the motion vectors', zero: a pixel nothing draws has
 // not moved.
 open_scene_pass() {
@@ -819,19 +842,12 @@ open_scene_pass() {
     c[2] = clear[2]
     c[3] = clear[3]
     c[4] = 1.0
-    pass = vktargets.render_pass()
-    if g_post_active { pass = vktargets.scene_pass() }
+    pass = vktargets.scene_pass()
     if g_depth_split {
-        if g_depth_resolved {
-            pass = vktargets.render_pass_rest()
-            if g_post_active { pass = vktargets.scene_pass_rest() }
-        } else {
-            pass = vktargets.render_pass_first()
-            if g_post_active { pass = vktargets.scene_pass_first() }
-        }
+        pass = vktargets.scene_pass_first()
+        if g_depth_resolved { pass = vktargets.scene_pass_rest() }
     }
-    framebuffer = vktargets.framebuffer(g_image_index)
-    if g_post_active { framebuffer = vktargets.scene_framebuffer() }
+    framebuffer = vktargets.scene_framebuffer()
     w = vktargets.render_width()
     h = vktargets.render_height()
     begin_pass(pass, framebuffer, w, h, 3)
@@ -895,17 +911,22 @@ frame_begin(r: float, g: float, b: float, a: float) -> bool {
     clear[2] = b as f32
     clear[3] = a as f32
 
-    // A capture channel is the surfaces' own numbers -- albedo, normals,
-    // motion -- and no effect over them: the post chain, the reflections
-    // and the occlusion stand down while one is read.
-    effects = !g_capture_bypass && (g_fxaa || g_bloom || g_ssr_enabled || g_taa_enabled)
-    g_post_active = (vktargets.scaled() || effects) && g_screen_quad > 0 && vktargets.post_texture() > 0
+    // The scene is light, and the composite is where it becomes the frame,
+    // so the post chain runs every frame. A capture channel is the
+    // surfaces' own numbers -- albedo, normals, motion -- and no effect
+    // over them: the reflections, the temporal pass, the bloom, FXAA and the
+    // occlusion stand down while one is read, and the composite passes it
+    // through.
+    g_post_active = g_screen_quad > 0 && vktargets.post_texture() > 0
+    g_composited = 0
     vkhost.set_pass_open(false)
     g_in_shadow_pass = false
     // Two halves when something reads the scene's depth this frame: the
     // renderer says what wants it before the frame (set_scene_depth, the
     // occlusion, the reflection), and the target is made at the size of the
     // scene, here, so the first frame that needs it has it.
+    g_occlusion_history = g_depth_resolved && g_occlusion_serial == vktargets.camdepth_serial()
+    g_occlusion_serial = vktargets.camdepth_serial()
     g_depth_split = false
     g_depth_resolved = false
     wanted = g_ssr_enabled || g_scene_depth_wanted || g_ssao_enabled || g_taa_enabled || g_dlss_mode != 0
@@ -1123,6 +1144,31 @@ draw_sky(handle: int, texture: int, weather: int, shape: int) {
     g_normal_map = normal_was
     g_pose_bank = bank_was
     stamp_through(5)
+}
+
+// One draw of `pipeline` over the screen quad, in a pass of its own:
+// `pass` over `framebuffer`, `w` by `h`, `texture` at binding 1 and, when
+// past zero, `extra3` and `extra4` at 3 and 4 (the sky's clouds read their
+// weather and shape there). Outside the scene pass, which it must not be
+// recorded in; the scene program's block is what the draw reads.
+screen_pass(pass: ptr, framebuffer: ptr, w: int, h: int, pipeline: ptr, texture: int, extra3: int, extra4: int) {
+    if !vkhost.recording() || vkhost.pass_open() || pipeline == null || framebuffer == null { return }
+    normal_was = g_normal_map
+    bank_was = g_pose_bank
+    if extra3 > 0 { g_normal_map = extra3 }
+    if extra4 > 0 { g_pose_bank = extra4 }
+    vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+    begin_pass(pass, framebuffer, w, h, 0)
+    vkhost.set_pass_open(true)
+    viewport(w, h)
+    // A pass of the frame's own, not one of the scene's draws: not counted.
+    counted = g_draw_calls
+    draw_pipeline(pipeline, g_screen_quad, texture, 0, 1)
+    g_draw_calls = counted
+    vk.vkCmdEndRenderPass(commands_now())
+    vkhost.set_pass_open(false)
+    g_normal_map = normal_was
+    g_pose_bank = bank_was
 }
 
 // The sky is done, drawn or not: the renderer says so before the opaque
@@ -1377,7 +1423,7 @@ scene_depth_ready() -> bool {
 // every draw because both images are remade on resize.
 draw_screen_with(pipeline: ptr, sets: ptr, slot: int, view: ptr, sampler: ptr, layout: int, third: ptr, third_sampler: ptr) {
     if pipeline == null || !vkmesh.drawable(g_screen_quad) { return }
-    if vktargets.camdepth_view() == null || view == null || sampler == null { return }
+    if view == null || sampler == null { return }
     if vkmesh.index_count(g_screen_quad) == 0 { return }
     post_sets_current()
     set = (sets as ptr[])[slot]
@@ -1396,7 +1442,13 @@ draw_screen_with(pipeline: ptr, sets: ptr, slot: int, view: ptr, sampler: ptr, l
     writes = calloc(5, sizeof(VkWriteDescriptorSet))
     read = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
     screen_image(images, 0, view, sampler, layout)
-    screen_image(images, 1, vktargets.camdepth_view(), vktargets.camdepth_sampler(), read)
+    // The camera depth at 2 where the frame has one; the colour resolve runs
+    // whether or not anything made it, and reads nothing there.
+    if vktargets.camdepth_view() != null {
+        screen_image(images, 1, vktargets.camdepth_view(), vktargets.camdepth_sampler(), read)
+    } else {
+        screen_image(images, 1, vktexture.view(g_default_texture), vktexture.sampler_of(g_default_texture), read)
+    }
     if third != null {
         screen_image(images, 2, third, third_sampler, read)
     } else {
@@ -1496,6 +1548,15 @@ set_post(fxaa: bool, bloom: bool, threshold: float, intensity: float) {
 }
 post_active() -> bool { return g_post_active }
 
+// The frame's exposure, the eye adaptation's: what the composite scales the
+// scene's light by before the tone curve, and what the resolve and the
+// temporal pass weigh brightness by.
+set_frame_exposure(exposure: float) { g_frame_exposure = (exposure as f32) as float }
+frame_exposure() -> float { return g_frame_exposure }
+// The texture the composite read this frame, 0 before it has run: the
+// scene's light before the tone curve, the meter's source.
+composited() -> int { return g_composited }
+
 // The bloom intensity on its own, so a caller can read it, dial it out to
 // see what the bloom is worth, and put it back, without knowing the other
 // post parameters the scene set. Every bloom term scales by it, so zero is
@@ -1557,18 +1618,25 @@ taa() -> bool { return g_taa_enabled }
 // frame as it is: what the blend uniform is set from.
 taa_history() -> bool { return g_taa_enabled && vktargets.taa_history_valid() }
 
-// The occlusion, over the opaque scene: a multiply drawn inside the scene
-// pass with depth off, reading the camera depth the resolve wrote. Nothing
-// when the occlusion is off, the depth was not resolved, or the pipeline
-// did not build; the scene is then simply not darkened.
-draw_ssao() {
-    if !vkhost.recording() || !g_ssao_enabled || vkpipes.ssao() == null || g_capture_bypass { return }
-    if vktargets.camdepth_view() == null || vktargets.camdepth_framebuffer() == null || g_default_texture <= 0 { return }
-    open_scene_pass()
+// The screen's occlusion found before the scene pass (#655): from the last
+// frame's camera depth into the occlusion map, which the scene shader reads
+// where each surface was then. Only where there is a last frame's depth of
+// the camera depth's present size; true when the map holds this frame's.
+occlusion_pass() -> bool {
+    if !vkhost.recording() || vkhost.pass_open() || !g_ssao_enabled || vkpipes.ssao() == null || g_capture_bypass { return false }
+    if !g_occlusion_history || vktargets.occlusion_framebuffer() == null || vktargets.camdepth_view() == null { return false }
     block_float(vkscene.OFF_SSAORADIUS, g_ssao_radius)
     block_float(vkscene.OFF_SSAOINTENSITY, g_ssao_intensity)
+    vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+    w = vktargets.render_width()
+    h = vktargets.render_height()
+    begin_pass(vktargets.hdr_pass(), vktargets.occlusion_framebuffer(), w, h, 0)
+    vkhost.set_pass_open(true)
+    viewport(w, h)
     draw_screen(vkpipes.ssao(), g_ssao_sets, g_frame, g_default_texture)
-    stamp_through(7)
+    vk.vkCmdEndRenderPass(commands_now())
+    vkhost.set_pass_open(false)
+    return true
 }
 
 // A float into the scene program's block, which the sky, the shadow pass
@@ -1587,10 +1655,20 @@ set_texel(w: int, h: int) {
     if h != 0 { t[1] = (1.0 as f32) / (h as f32) }
 }
 
-// The post uniforms live in the shared scene block, so both the reflective
-// composite and the ordinary one read them; set once before either draws.
+// A whole number into the scene program's block.
+block_int(offset: int, value: int) {
+    ((vkdesc.block(vkdesc.PROGRAM_SCENE) + offset) as int[])[0] = value
+}
+
+// The post uniforms live in the shared scene block, so every screen pass
+// reads them; set once before the first draws.
 setup_post_uniforms() {
     set_texel(vktargets.render_width(), vktargets.render_height())
+    block_float(vkscene.OFF_FRAMEEXPOSURE, g_frame_exposure)
+    bloom = 0
+    if g_bloom && !g_capture_bypass { bloom = 1 }
+    block_int(vkscene.OFF_ENABLEBLOOM, bloom)
+    block_int(vkscene.OFF_COLORSAMPLECOUNT, vktargets.samples())
     block_float(vkscene.OFF_BLOOMTHRESHOLD, g_bloom_threshold)
     block_float(vkscene.OFF_BLOOMINTENSITY, g_bloom_intensity)
     block_float(vkscene.OFF_EDGETHRESHOLD, 0.125)
@@ -1601,22 +1679,120 @@ setup_post_uniforms() {
     vkdesc.set_program(vkdesc.PROGRAM_SCENE)
 }
 
-// The ordinary composite: bloom, else fxaa, else a straight copy, reading
-// the given colour source -- the scene directly, or the reflected
-// intermediate when the reflection ran a stage before it. AE3D_VK_SHOW_DEPTH
-// set composites the resolved scene depth in place of the frame: what the
-// occlusion, the reflection and the water read, looked at.
-draw_composite(source: int) {
-    index = 0
-    if g_fxaa && vkpipes.post(1) != null { index = 1 }
-    if g_bloom && vkpipes.post(2) != null { index = 2 }
-    if getenv("AE3D_VK_SHOW_DEPTH") != null && vktargets.camdepth_view() != null && vktargets.camdepth_sampler() != null &&
-       vkpipes.post(0) != null {
+// The composite: the frame's tone curve over `source` -- the scene, or what
+// the reflection, the temporal pass or DLSS made of it -- written into the
+// frame, or into the display-format texture FXAA then reads when FXAA is on.
+// AE3D_VK_SHOW_DEPTH set composites the resolved scene depth in place of the
+// frame: what the occlusion, the reflection and the water read, looked at.
+draw_composite(source: int, bloom: int) {
+    commands = commands_now()
+    fw = vktargets.width()
+    fh = vktargets.height()
+    if getenv("AE3D_VK_SHOW_DEPTH") != null && vktargets.camdepth_view() != null && vktargets.camdepth_sampler() != null {
+        begin_pass(vktargets.post_pass(), vktargets.post_framebuffer(g_image_index), fw, fh, 0)
+        vkhost.set_pass_open(true)
+        viewport(fw, fh)
+        // The depth is data: passed through the composite as a capture is.
+        channel = (vkdesc.block(vkdesc.PROGRAM_SCENE) + vkscene.OFF_CAPTURECHANNEL) as int[]
+        kept = channel[0]
+        channel[0] = 9
         draw_screen_with(vkpipes.post(0), g_show_sets, g_frame, vktargets.camdepth_view(), vktargets.camdepth_sampler(),
                          vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, null, null)
+        channel[0] = kept
+        vk.vkCmdEndRenderPass(commands)
+        vkhost.set_pass_open(false)
         return
     }
-    draw_pipeline(vkpipes.post(index), g_screen_quad, source, 0, 1)
+    g_composited = source
+    fxaa = g_fxaa && !g_capture_bypass && vkpipes.post(1) != null && vktargets.ldr_framebuffer() != null
+    if fxaa {
+        begin_pass(vktargets.ldr_pass(), vktargets.ldr_framebuffer(), fw, fh, 0)
+    } else {
+        begin_pass(vktargets.post_pass(), vktargets.post_framebuffer(g_image_index), fw, fh, 0)
+    }
+    vkhost.set_pass_open(true)
+    viewport(fw, fh)
+    // The bloom at binding 3, where a screen draw keeps its third image.
+    normal_was = g_normal_map
+    if bloom > 0 { g_normal_map = bloom }
+    enabled = 0
+    if bloom > 0 { enabled = 1 }
+    block_int(vkscene.OFF_ENABLEBLOOM, enabled)
+    draw_pipeline(vkpipes.post(0), g_screen_quad, source, 0, 1)
+    g_normal_map = normal_was
+    vk.vkCmdEndRenderPass(commands)
+    vkhost.set_pass_open(false)
+    if !fxaa { return }
+    // FXAA over what the composite made, which shows as the screen does:
+    // the edges it finds are the ones a viewer sees.
+    set_texel(fw, fh)
+    begin_pass(vktargets.post_pass(), vktargets.post_framebuffer(g_image_index), fw, fh, 0)
+    vkhost.set_pass_open(true)
+    viewport(fw, fh)
+    draw_pipeline(vkpipes.post(1), g_screen_quad, vktargets.ldr_texture(), 0, 1)
+    vk.vkCmdEndRenderPass(commands)
+    vkhost.set_pass_open(false)
+}
+
+// The bloom pyramid over `source`, `sw` by `sh` texels: down the levels,
+// the first taking only the light past the threshold, then back up, each
+// its own and a tent of the coarser one's sum. The top's sum, which the
+// composite adds; 0 where there are no levels to draw it in.
+bloom_chain(source: int, sw: int, sh: int) -> int {
+    levels = vktargets.bloom_levels()
+    down = vkpipes.bloom_down()
+    up = vkpipes.bloom_up()
+    if levels < 2 || down == null || up == null || source <= 0 { return 0 }
+    hdr = vktargets.hdr_pass()
+    from = source
+    from_w = sw
+    from_h = sh
+    k = 0
+    while k < levels {
+        set_texel(from_w, from_h)
+        first = 0
+        if k == 0 { first = 1 }
+        block_int(vkscene.OFF_BLOOMFIRST, first)
+        w = vktargets.bloom_width(k)
+        h = vktargets.bloom_height(k)
+        screen_pass(hdr, vktargets.bloom_framebuffer(k, false), w, h, down, from, 0, 0)
+        from = vktargets.bloom_texture(k, false)
+        from_w = w
+        from_h = h
+        k = k + 1
+    }
+    k = levels - 2
+    while k >= 0 {
+        set_texel(from_w, from_h)
+        top = 0
+        if k == 0 { top = levels }
+        block_int(vkscene.OFF_BLOOMTOP, top)
+        w = vktargets.bloom_width(k)
+        h = vktargets.bloom_height(k)
+        screen_pass(hdr, vktargets.bloom_framebuffer(k, true), w, h, up, from, vktargets.bloom_texture(k, false), 0)
+        from = vktargets.bloom_texture(k, true)
+        from_w = w
+        from_h = h
+        k = k - 1
+    }
+    return from
+}
+
+// The multisampled scene resolved into the scene texture by the resolve
+// shader, each sample weighed by how bright it shows. Nothing when the frame
+// has one sample: the scene was drawn into the scene texture itself.
+resolve_scene_colour() {
+    if vktargets.samples() == vk.SAMPLE_COUNT_1_BIT || vkpipes.post(2) == null { return }
+    if vktargets.resolve_framebuffer() == null || vktargets.colour_samples_view() == null { return }
+    rw = vktargets.render_width()
+    rh = vktargets.render_height()
+    begin_pass(vktargets.hdr_pass(), vktargets.resolve_framebuffer(), rw, rh, 0)
+    vkhost.set_pass_open(true)
+    viewport(rw, rh)
+    draw_screen_with(vkpipes.post(2), g_colour_resolve_sets, g_frame, vktargets.colour_samples_view(), g_nearest_sampler,
+                     vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, null, null)
+    vk.vkCmdEndRenderPass(commands_now())
+    vkhost.set_pass_open(false)
 }
 
 // --- the frame's end ---------------------------------------------------------------------------------------------
@@ -1643,15 +1819,16 @@ frame_end() -> bool {
         post_sets_current()
         rw = vktargets.render_width()
         rh = vktargets.render_height()
+        setup_post_uniforms()
+        resolve_scene_colour()
         // The reflective stage runs when the reflection is on and its
         // targets are made. It mirrors the scene into the intermediate; the
-        // ordinary composite then reads that instead of the scene colour,
-        // so the bloom it does picks up the mirrored lamps as well.
-        ssr_now = g_ssr_enabled && vkpipes.post(3) != null && vktargets.ssr_framebuffer() != null &&
+        // composite then reads that instead of the scene colour, so the
+        // bloom it does picks up the mirrored lamps as well.
+        ssr_now = g_ssr_enabled && !g_capture_bypass && vkpipes.post(3) != null && vktargets.ssr_framebuffer() != null &&
                   vktargets.camdepth_framebuffer() != null && vktargets.ssr_reflect_texture() > 0
-        setup_post_uniforms()
         if ssr_now {
-            begin_pass(vktargets.ssr_pass(), vktargets.ssr_framebuffer(), rw, rh, 0)
+            begin_pass(vktargets.hdr_pass(), vktargets.ssr_framebuffer(), rw, rh, 0)
             vkhost.set_pass_open(true)
             viewport(rw, rh)
             draw_screen(vkpipes.post(3), g_ssr_sets, slot, vktargets.post_texture())
@@ -1660,22 +1837,24 @@ frame_end() -> bool {
         }
         source = vktargets.post_texture()
         if ssr_now { source = vktargets.ssr_reflect_texture() }
+        source_w = rw
+        source_h = rh
 
         // DLSS, in the temporal pass's place: the scene at its size, its
         // depth and its motion vectors into the frame at the frame's.
-        if g_dlss_mode != 0 {
+        if g_dlss_mode != 0 && !g_capture_bypass {
             upscaled = run_dlss(source)
             if upscaled != 0 {
                 source = upscaled
-                // The composite samples the frame-size output now.
-                set_texel(vktargets.width(), vktargets.height())
+                source_w = vktargets.width()
+                source_h = vktargets.height()
             }
         }
 
         // The temporal pass: this frame folded into the history, written
         // into the other history texture, which the composite then reads and
         // the next frame reads back as its history.
-        if g_dlss_mode == 0 && g_taa_enabled && vkpipes.taa() != null && vktargets.taa_framebuffer(0) != null &&
+        if g_dlss_mode == 0 && g_taa_enabled && !g_capture_bypass && vkpipes.taa() != null && vktargets.taa_framebuffer(0) != null &&
            vktargets.taa_framebuffer(1) != null && vktargets.camdepth_framebuffer() != null && source > 0 {
             cur = vktargets.taa_current()
             old = 1 - cur
@@ -1683,7 +1862,7 @@ frame_end() -> bool {
             blend = 1.0
             if vktargets.taa_history_valid() { blend = 0.1 }
             block_float(vkscene.OFF_TAABLEND, blend)
-            begin_pass(vktargets.ssr_pass(), vktargets.taa_framebuffer(cur), rw, rh, 0)
+            begin_pass(vktargets.hdr_pass(), vktargets.taa_framebuffer(cur), rw, rh, 0)
             vkhost.set_pass_open(true)
             viewport(rw, rh)
             // With no history yet (the first frame, or after a resize) the
@@ -1701,16 +1880,12 @@ frame_end() -> bool {
             vktargets.set_taa_current(old)
         }
 
-        // The composite, at the frame's own size: the scene drawn smaller
-        // is scaled up by the sampling here.
-        fw = vktargets.width()
-        fh = vktargets.height()
-        begin_pass(vktargets.post_pass(), vktargets.post_framebuffer(g_image_index), fw, fh, 0)
-        vkhost.set_pass_open(true)
-        viewport(fw, fh)
-        draw_composite(source)
-        vk.vkCmdEndRenderPass(commands)
-        vkhost.set_pass_open(false)
+        // The bloom over what the composite will show, and the composite, at
+        // the frame's own size: the scene drawn smaller is scaled up by the
+        // sampling here.
+        bloom = 0
+        if g_bloom && !g_capture_bypass { bloom = bloom_chain(source, source_w, source_h) }
+        draw_composite(source, bloom)
     }
 
     // The Aether modules' parts, by stage: its light measured (ae3d.vkmeter),
@@ -1991,9 +2166,9 @@ run_dlss(source: int) -> int {
     dlss_image(1, vktexture.image_of(velocity), vktexture.memory_of(velocity), vktexture.view(velocity), read, rw, rh,
                vktargets.velocity_format(), vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT)
     dlss_image(2, vktexture.image_of(source), vktexture.memory_of(source), vktexture.view(source), read, rw, rh,
-               vktargets.color_format(), vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT)
+               vktargets.scene_format(), vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT)
     dlss_image(3, vktexture.image_of(output), vktexture.memory_of(output), vktexture.view(output), read,
-               vktargets.width(), vktargets.height(), vk.FORMAT_R8G8B8A8_UNORM,
+               vktargets.width(), vktargets.height(), vktargets.scene_format(),
                vk.IMAGE_USAGE_STORAGE_BIT | vk.IMAGE_USAGE_SAMPLED_BIT | vk.IMAGE_USAGE_TRANSFER_SRC_BIT |
                vk.IMAGE_USAGE_TRANSFER_DST_BIT)
     tagged = ae3d_dlss_tag(g_dlss_images, g_dlss_images + DLSS_IMAGE_BYTES, g_dlss_images + 2 * DLSS_IMAGE_BYTES,

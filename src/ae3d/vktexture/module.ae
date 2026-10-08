@@ -11,7 +11,9 @@
 //   - an RGBA texture of two dimensions or three (the clouds' weather and
 //     their tileable noise): linear, repeating, no mips;
 //   - a float texture, four floats a texel (a pose bank): fetched by exact
-//     texel, so nearest and clamped.
+//     texel, so nearest and clamped;
+//   - a table, two half floats a texel (the sky light's split-sum table):
+//     read between its entries, so linear, and clamped at its edges.
 //
 // This module makes the image, its memory and its view, stages the texels
 // through a host buffer (ae3d.vkhost's) and records the upload, the mip
@@ -25,11 +27,12 @@ import std.list
 import contrib.vulkan.vk
 import ae3d.vkdevice
 import ae3d.vkhost
+import ae3d.core
 
 exports (
-    SCENE, RGBA, FLOATS,
-    texture_create, texture_create_rgba, texture_create_float,
-    valid, view, sampler_of, image_of, memory_of, width_of, height_of, adopt, adopt_target, destroy, rebias, clear,
+    SCENE, RGBA, FLOATS, TABLE,
+    texture_create, texture_create_rgba, texture_create_float, texture_create_table, mip_chain,
+    valid, view, sampler_of, image_of, memory_of, width_of, height_of, mean_of, adopt, adopt_target, destroy, rebias, clear,
     update_in_frame, update_region_in_frame, collect_slot
 )
 
@@ -42,6 +45,7 @@ extern memset(p: ptr, value: int, n: long) -> ptr
 const SCENE = 0
 const RGBA = 1
 const FLOATS = 2
+const TABLE = 3
 
 // What an image was made into: its handles, or nulls when it could not be.
 struct Made {
@@ -154,6 +158,9 @@ offset_of_dst_far() -> int { return 2 * sizeof(VkImageSubresourceLayers) + 3 * s
 // Each level a filtered halving of the one above, and every level left
 // readable by the shaders: level 0 arrives written by the copy, every
 // level in transfer-destination layout.
+// Each level below the first a filtered halving of the one above, by blits
+// recorded into `commands`: every level in transfer-destination layout
+// first, all of them shader-readable after.
 mip_chain(commands: ptr, image: ptr, width: int, height: int, levels: int) {
     w = width
     h = height
@@ -198,9 +205,9 @@ mip_chain(commands: ptr, image: ptr, width: int, height: int, levels: int) {
 
 // Whether RGBA bytes can be filtered in the device's optimal tiling: what a
 // blitted mip chain needs.
-filterable() -> bool {
+filterable(format: int) -> bool {
     props = calloc(1, sizeof(VkFormatProperties)) as *VkFormatProperties
-    vk.vkGetPhysicalDeviceFormatProperties(vkdevice.physical(), vk.FORMAT_R8G8B8A8_UNORM, props as ptr)
+    vk.vkGetPhysicalDeviceFormatProperties(vkdevice.physical(), format, props as ptr)
     ok = ((props.optimalTilingFeatures) as int & vk.FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0
     free(props as ptr)
     return ok
@@ -240,10 +247,14 @@ upload(width: int, height: int, depth: int, texels: ptr, bytes: int, format: int
 }
 
 // A scene texture from RGBA bytes, with its mip chain where the format can
-// be filtered.
-texture_create(width: int, height: int, rgba: ptr) -> int {
+// be filtered: sRGB when the bytes are a colour (`srgb`), so a sample -- and
+// every mip level, filtered as light -- is the colour's light; the bytes as
+// they are when they are data.
+texture_create(width: int, height: int, rgba: ptr, srgb: bool) -> int {
+    format = vk.FORMAT_R8G8B8A8_UNORM
+    if srgb { format = vk.FORMAT_R8G8B8A8_SRGB }
     levels = 1
-    if filterable() {
+    if filterable(format) {
         extent = width
         if height > extent { extent = height }
         while extent > 1 {
@@ -251,7 +262,39 @@ texture_create(width: int, height: int, rgba: ptr) -> int {
             levels = levels + 1
         }
     }
-    return upload(width, height, 1, rgba, width * height * 4, vk.FORMAT_R8G8B8A8_UNORM, levels, SCENE)
+    handle = upload(width, height, 1, rgba, width * height * 4, format, levels, SCENE)
+    if handle != 0 && srgb { slot_at(handle).mean = texel_mean(width, height, rgba) }
+    return handle
+}
+
+// The mean light of sRGB bytes, each texel weighed by its cover (alpha), so
+// a cut-out leaf's transparent texels do not tint it: from a grid of at
+// most 64 by 64 of them, what the probes' rays take a surface's colour as
+// (ae3d.vkddgi).
+texel_mean(width: int, height: int, rgba: ptr) -> Vec3 {
+    bytes = rgba as uint8[]
+    step_x = (width + 63) / 64
+    step_y = (height + 63) / 64
+    r = 0.0
+    g = 0.0
+    b = 0.0
+    cover = 0.0
+    y = step_y / 2
+    while y < height {
+        x = step_x / 2
+        while x < width {
+            at = (y * width + x) * 4
+            a = (bytes[at + 3] as float) / 255.0
+            r = r + core.srgb_decode_of((bytes[at] as float) / 255.0) * a
+            g = g + core.srgb_decode_of((bytes[at + 1] as float) / 255.0) * a
+            b = b + core.srgb_decode_of((bytes[at + 2] as float) / 255.0) * a
+            cover = cover + a
+            x = x + step_x
+        }
+        y = y + step_y
+    }
+    if cover <= 0.0 { return core.vec3(1.0, 1.0, 1.0) }
+    return core.vec3(r / cover, g / cover, b / cover)
 }
 
 // RGBA bytes of two dimensions or, with `depth` past one, three: linear,
@@ -263,6 +306,12 @@ texture_create_rgba(width: int, height: int, depth: int, rgba: ptr) -> int {
 // Four floats a texel, fetched by exact texel.
 texture_create_float(width: int, height: int, rgba: ptr) -> int {
     return upload(width, height, 1, rgba, width * height * 16, vk.FORMAT_R32G32B32A32_SFLOAT, 1, FLOATS)
+}
+
+// Two half floats a texel (their bits, `halves` int16 pairs), read between
+// entries and clamped: a table.
+texture_create_table(width: int, height: int, halves: ptr) -> int {
+    return upload(width, height, 1, halves, width * height * 4, vk.FORMAT_R16G16_SFLOAT, 1, TABLE)
 }
 
 // --- textures written again, in the frame (#544) ---
@@ -371,6 +420,7 @@ struct VKTexture {
     height: int
     in_use: bool
     mip_levels: int                  // a scene texture with a mip chain: its sampler takes the LOD bias
+    mean: Vec3                       // a colour texture's mean light, by its texels' cover (white for data)
 }
 
 var g_table: ptr = null            // VKTexture[MAX_TEXTURES]
@@ -409,6 +459,13 @@ width_of(handle: int) -> int {
     if !valid(handle) { return 0 }
     return slot_at(handle).width
 }
+// What texture_create measured of a colour texture: its mean light; white
+// for data, a target, or no texture.
+mean_of(handle: int) -> Vec3 {
+    if !valid(handle) { return core.vec3(1.0, 1.0, 1.0) }
+    return slot_at(handle).mean
+}
+
 height_of(handle: int) -> int {
     if !valid(handle) { return 0 }
     return slot_at(handle).height
@@ -466,6 +523,7 @@ adopt(image: ptr, memory: ptr, view: ptr, width: int, height: int, mip_levels: i
     t.view = view
     t.width = width
     t.height = height
+    t.mean = core.vec3(1.0, 1.0, 1.0)
     if kind == SCENE {
         t.mip_levels = mip_levels
         if !scene_sampler(t) {
@@ -480,6 +538,7 @@ adopt(image: ptr, memory: ptr, view: ptr, width: int, height: int, mip_levels: i
             filter = vk.FILTER_NEAREST
             address = vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
         }
+        if kind == TABLE { address = vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE }
         t.sampler = vkhost.sampler(filter, address, vk.SAMPLER_MIPMAP_MODE_NEAREST, 0.0, 0.0)
         if t.sampler == null {
             vkdevice.fail("vkCreateSampler failed")
@@ -510,6 +569,7 @@ adopt_target(made: vkhost.VKImage, sampler: ptr, width: int, height: int) -> int
     t.sampler = sampler
     t.width = width
     t.height = height
+    t.mean = core.vec3(1.0, 1.0, 1.0)
     t.in_use = true
     return handle
 }
