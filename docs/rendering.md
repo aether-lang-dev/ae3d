@@ -277,11 +277,25 @@ shadow passes fall from 109.18 to 108.64 ms on an M1 Pro at 2560 by 1440
 (the city is bound by its pixels there, not its triangles); the frame is
 the same but for the horde's animation, which differs run to run.
 
+A crowd's near tier is cut too, figure by figure, since its figures are
+where a crowd's triangles are. The cut runs over the figures the crowd's
+sort kept for the tier, as many as it counted on the device, and writes
+each index as the figure's slot in the tier's stream above the mesh's
+vertex; the crowd's vertex shader in its pulling variant
+(`crowd_pull_vk.vert`) reads the vertex, its skin and the figure from
+storage, so the whole tier, however many figures and at whatever detail
+each, is one draw. In zombie_city each of the horde's 400 figures is
+30,364 triangles up close and every one within 600 m is drawn by the near
+tier; cut, the horde and the trim draw 380,703 triangles a frame, and the
+scene and shadow passes fall from 109.17 to 53.56 ms on the M1 Pro at 2560
+by 1440 (8.8 to 17.1 fps).
+
 `AE3D_CLUSTERS=auto|on|off` (`core.CLUSTERS_*`, `renderer_set_clusters`)
 picks it: `auto`, the default, wherever the device has `multiDrawIndirect`
-and `drawIndirectFirstInstance`. A skinned mesh, a crowd's, a stream of
-points or a model with a program of its own is drawn whole, as is a mesh
-once it is edited, and the shadow pass draws every mesh whole. OpenGL 4.1
+and `drawIndirectFirstInstance`. A skinned mesh outside a crowd, a crowd's
+far tiers, a stream of points or a model with a program of its own is
+drawn whole, as is a mesh once it is edited, and the shadow pass draws
+every mesh whole (a crowd casts by its far mesh, as before). OpenGL 4.1
 has no compute and draws every mesh whole. `AE3D_PERF=1` says what the
 last frame's cut kept (`perf cut`).
 

@@ -29,12 +29,13 @@ import ae3d.vkhost
 import ae3d.vkdevice
 import ae3d.vkframe
 import ae3d.vkspirv
+import ae3d.vkpipes
 import ae3d.clusterlod
 import ae3d.geometry
 import ae3d.core
 
 exports (
-    start, stop, started, acquire, release, materials, clusters_of, frame_start, queue, cull,
+    start, stop, started, acquire, release, materials, clusters_of, frame_start, queue, queue_pulled, pull_set, cull,
     index_buffer, command_buffer, COMMAND_BYTES, kept_last, indices_last
 )
 
@@ -49,10 +50,11 @@ extern memset(p: ptr, value: int, n: long) -> ptr
 const COMMAND_BYTES = 20
 // The passes' push constants: the model's matrix, then its first cluster,
 // its clusters, its first instance in this dispatch, whether it is
-// instanced, its first command, its materials, and the frame's commands,
-// index budget and kept clusters' room.
-const PARAMS_BYTES = 100
-const BINDINGS = 9
+// instanced, its first command, its materials, the frame's commands, index
+// budget and kept clusters' room, and for a pulled draw where its count of
+// instances is, that it is pulled and its vertices' bits.
+const PARAMS_BYTES = 112
+const BINDINGS = 10
 const VIEW_BYTES = 128
 const COUNTERS_BYTES = 32
 // A dispatch's most groups along one side the spec promises.
@@ -90,13 +92,21 @@ struct Graph {
 
 // A clustered draw queued for the frame: its graph, its model's matrix, its
 // instances (a buffer of the draws' twenty floats each, or null for the
-// model alone) and how many, and its first command.
+// model alone) and how many, and its first command. A pulled one (a crowd's
+// tier) has room for `count` instances, as many of them as the word at
+// `count_at` in `counted` says this frame, its mesh's buffers and its
+// vertices' bits, and its set of them for the draw.
 struct Queued {
     graph: int
     model: ptr                     // f32[16], column-major
     instances: ptr
     count: int
     first_command: int
+    pulled: bool
+    counted: ptr
+    count_at: int
+    bits: int
+    pull_set: ptr
 }
 
 var g_started = false
@@ -731,13 +741,74 @@ queue(handle: int, model: ptr, instances: ptr, count: int) -> int {
     q.instances = instances
     q.count = count
     q.first_command = g_command_count
+    q.pulled = false
+    q.counted = null
+    q.count_at = 0
+    q.bits = 0
+    q.pull_set = null
     g_queue_count = g_queue_count + 1
     g_command_count = g_command_count + count * graph_at(handle).materials
     return q.first_command
 }
 
-// A set from this frame's pools, a fresh pool where they are spent.
-take_set() -> ptr {
+// A pulled draw for the frame (a crowd's tier): graph `handle` at `model`
+// over the instances in `instances` -- room for `capacity`, as many as the
+// word `count_at` bytes into `counted` says when the cut runs -- its mesh's
+// `vertices` and `skin` read by the draw with each index the instance's
+// slot above `bits` bits of vertex. One command a material. Its first
+// command, or -1.
+queue_pulled(handle: int, model: ptr, instances: ptr, capacity: int, counted: ptr, count_at: int,
+             vertices: ptr, skin: ptr, bits: int) -> int {
+    if !g_started || !valid(handle) || capacity <= 0 || instances == null || counted == null { return 0 - 1 }
+    if vertices == null || skin == null || vkpipes.pull_set_layout() == null { return 0 - 1 }
+    set = take_set(vkpipes.pull_set_layout())
+    if set == null { return 0 - 1 }
+    write_set(set, 0, vertices)
+    write_set(set, 1, skin)
+    write_set(set, 2, instances)
+    first = queue(handle, model, instances, capacity)
+    if first < 0 { return first }
+    q = queued_at(g_queue_count - 1)
+    q.pulled = true
+    q.counted = counted
+    q.count_at = count_at
+    q.bits = bits
+    q.pull_set = set
+    g_command_count = first + graph_at(handle).materials
+    return first
+}
+
+// The vertices' set of the pulled draw whose first command is `first`.
+pull_set(first: int) -> ptr {
+    i = 0
+    while i < g_queue_count {
+        q = queued_at(i)
+        if q.pulled && q.first_command == first { return q.pull_set }
+        i = i + 1
+    }
+    return null
+}
+
+// One storage buffer into `set` at `binding`.
+write_set(set: ptr, binding: int, buffer: ptr) {
+    info = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+    info.buffer = buffer
+    info.range = vk.WHOLE_SIZE
+    w = calloc(1, sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+    w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    w.dstSet = set
+    w.dstBinding = binding
+    w.descriptorCount = 1
+    w.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+    w.pBufferInfo = info as ptr
+    vk.vkUpdateDescriptorSets(vkdevice.device(), 1, w as ptr, 0, null)
+    free(w as ptr)
+    free(info as ptr)
+}
+
+// A set of `layout` from this frame's pools, a fresh pool where they are
+// spent.
+take_set(layout: ptr) -> ptr {
     d = vkdevice.device()
     slot = vkframe.frame_slot()
     used = (g_pool_used as int[])[slot]
@@ -753,7 +824,7 @@ take_set() -> ptr {
     }
     pool = (g_pools as ptr[])[slot * g_pool_slots + (g_pool_used as int[])[slot] - 1]
     layouts = cell()
-    (layouts as ptr[])[0] = g_set_layout
+    (layouts as ptr[])[0] = layout
     ai = calloc(1, sizeof(VkDescriptorSetAllocateInfo)) as *VkDescriptorSetAllocateInfo
     ai.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
     ai.descriptorPool = pool
@@ -812,10 +883,11 @@ make_pool() -> ptr {
     return pool
 }
 
-// A set of the frame's buffers, `instances` at binding 1 (the view where
-// there are none: the cull reads it only for an instanced draw).
-set_for(instances: ptr, view: ptr) -> ptr {
-    set = take_set()
+// A set of the frame's buffers, `instances` at binding 1 and a pulled
+// draw's `counted` at 9 (the view where there are none: the cull reads
+// them only for a draw that has them).
+set_for(instances: ptr, counted: ptr, view: ptr) -> ptr {
+    set = take_set(g_set_layout)
     if set == null { return null }
     buffers = calloc(BINDINGS, sizeof(VkDescriptorBufferInfo))
     writes = calloc(BINDINGS, sizeof(VkWriteDescriptorSet))
@@ -834,6 +906,10 @@ set_for(instances: ptr, view: ptr) -> ptr {
         if b == 6 { info.buffer = g_ref_buffer }
         if b == 7 { info.buffer = g_tri_buffer }
         if b == 8 { info.buffer = g_indices }
+        if b == 9 {
+            info.buffer = counted
+            if counted == null { info.buffer = view }
+        }
         info.range = vk.WHOLE_SIZE
         w = (writes + b * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
         w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
@@ -913,12 +989,14 @@ cull(frustum: ptr, ex: float, ey: float, ez: float, pixels: float, tau: float, n
     v[31] = 0.0
 
     // The frame before's draws read the commands and the indices this cut
-    // writes over, and its passes wrote them.
+    // writes over, and its passes wrote them; and a crowd's sort, just
+    // before, wrote the counts of figures a pulled draw reads, by a copy.
     barrier(commands, vk.PIPELINE_STAGE_DRAW_INDIRECT_BIT | vk.PIPELINE_STAGE_VERTEX_INPUT_BIT |
-                      vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT | vk.PIPELINE_STAGE_TRANSFER_BIT,
+                      vk.PIPELINE_STAGE_VERTEX_SHADER_BIT | vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                      vk.PIPELINE_STAGE_TRANSFER_BIT,
             vk.PIPELINE_STAGE_TRANSFER_BIT | vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             vk.ACCESS_INDIRECT_COMMAND_READ_BIT | vk.ACCESS_INDEX_READ_BIT | vk.ACCESS_SHADER_WRITE_BIT |
-            vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_TRANSFER_READ_BIT,
+            vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_TRANSFER_READ_BIT | vk.ACCESS_TRANSFER_WRITE_BIT,
             vk.ACCESS_TRANSFER_WRITE_BIT | vk.ACCESS_SHADER_WRITE_BIT | vk.ACCESS_SHADER_READ_BIT)
     vk.vkCmdFillBuffer(commands, g_commands, 0, (g_command_count * COMMAND_BYTES) as long, 0)
     vk.vkCmdFillBuffer(commands, g_counters, 0, COUNTERS_BYTES as long, 0)
@@ -934,7 +1012,7 @@ cull(frustum: ptr, ex: float, ey: float, ez: float, pixels: float, tau: float, n
     while i < g_queue_count {
         q = queued_at(i)
         g = graph_at(q.graph)
-        set = set_for(q.instances, view.buffer)
+        set = set_for(q.instances, q.counted, view.buffer)
         if set == null { return false }
         if first_set == null { first_set = set }
         bind(commands, g_cull, set)
@@ -944,6 +1022,10 @@ cull(frustum: ptr, ex: float, ey: float, ez: float, pixels: float, tau: float, n
         params[19] = 0
         if q.instances != null { params[19] = 1 }
         params[21] = g.materials
+        params[25] = q.count_at
+        params[26] = 0
+        if q.pulled { params[26] = 1 }
+        params[27] = q.bits
         // A dispatch's instances along its second side, as many as a side
         // may have, and the rest in dispatches after.
         done = 0
@@ -952,6 +1034,7 @@ cull(frustum: ptr, ex: float, ey: float, ez: float, pixels: float, tau: float, n
             if n > MOST_GROUPS { n = MOST_GROUPS }
             params[18] = done
             params[20] = q.first_command + done * g.materials
+            if q.pulled { params[20] = q.first_command }
             push(commands)
             vk.vkCmdDispatch(commands, (g.count + CULL_GROUP - 1) / CULL_GROUP, n, 1)
             done = done + n
@@ -969,10 +1052,14 @@ cull(frustum: ptr, ex: float, ey: float, ez: float, pixels: float, tau: float, n
     bind(commands, g_emit, first_set)
     push(commands)
     vk.vkCmdDispatchIndirect(commands, g_counters, 16)
+    // The commands and the indices for the draws; and the streams a crowd's
+    // sort wrote, which a pulled draw reads in its vertex shader.
     barrier(commands, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            vk.PIPELINE_STAGE_DRAW_INDIRECT_BIT | vk.PIPELINE_STAGE_VERTEX_INPUT_BIT | vk.PIPELINE_STAGE_TRANSFER_BIT,
+            vk.PIPELINE_STAGE_DRAW_INDIRECT_BIT | vk.PIPELINE_STAGE_VERTEX_INPUT_BIT | vk.PIPELINE_STAGE_VERTEX_SHADER_BIT |
+            vk.PIPELINE_STAGE_TRANSFER_BIT,
             vk.ACCESS_SHADER_WRITE_BIT,
-            vk.ACCESS_INDIRECT_COMMAND_READ_BIT | vk.ACCESS_INDEX_READ_BIT | vk.ACCESS_TRANSFER_READ_BIT)
+            vk.ACCESS_INDIRECT_COMMAND_READ_BIT | vk.ACCESS_INDEX_READ_BIT | vk.ACCESS_SHADER_READ_BIT |
+            vk.ACCESS_TRANSFER_READ_BIT)
     // The counters, for the budgets of the frame that next has this slot.
     region = calloc(1, sizeof(VkBufferCopy)) as *VkBufferCopy
     region.size = 8
