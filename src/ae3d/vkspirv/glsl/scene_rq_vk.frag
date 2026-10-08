@@ -1582,10 +1582,12 @@ ivec3 ddgi_slot(int c, ivec3 g) {
 }
 
 // Whether probe `index`, at grid coordinate g of cascade c, is on: traced
-// since it came to its cell, and not inside anything.
+// since it came to its cell (its stamp's w 1, not 0, nor 2 for woken with
+// its texels not yet replaced), and neither inside anything (its state's w
+// 0) nor asleep, with nothing near it to light (w 2).
 bool ddgi_on(int c, ivec3 g, int index) {
     vec4 stamp = DDGI_STATE(index * 2 + 1);
-    return DDGI_STATE(index * 2).w > 0.5 && stamp.w > 0.5 && all(equal(stamp.xyz, DDGI_BASE(c) + vec3(g)));
+    return abs(DDGI_STATE(index * 2).w - 1.0) < 0.5 && abs(stamp.w - 1.0) < 0.5 && all(equal(stamp.xyz, DDGI_BASE(c) + vec3(g)));
 }
 
 // Where the probe at grid coordinate g of cascade c belongs: its cell's

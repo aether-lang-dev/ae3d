@@ -72,7 +72,11 @@ The feature list in full, with the reasoning behind each. The [README](../README
   looking down at the road, most at a grazing look -- over a puddle mask in
   the road's own metres: still water in the puddles mirrors sharply, the
   damp tarmac between them dimmer and blurred by a cone over the distance
-  the ray travelled (eight taps on a disc turned per pixel). The base
+  the ray travelled (eight taps on a disc turned per pixel; a cone wider
+  than eight pixels takes its taps from a quarter-size copy of the frame,
+  each the light of the texels it stands for, out of an image that stays
+  in the cache -- across the full frame the scattered taps missed it at
+  every one, 1.3 of the city's 4.3 ms of reflection). The base
   reflectance is water's 0.02: the frame is light, so a lamp is the thousand
   times its tarmac it is, and two percent of it is the streak every wet
   street has. Which pixels are the road is read from the depth with a
@@ -379,7 +383,18 @@ one over its last cell, the far one into the sky's light over its own. The
 result is the irradiance the sky's light was, so the rest of the shading --
 the occlusion on it, the reflections -- is as it was.
 
-What it costs: 128 rays for each of 4,096 probes a frame, and a shadow ray
+A probe with nothing within its reach -- the box one and a half cells out
+each way, where the surfaces it can light are -- is asleep, and a probe
+inside something is off: neither is read by the shading, and each traces
+one ray in four, spread over the sphere, enough to see geometry come near
+or to find its way out. A probe that wakes keeps where it stands and has
+its texels replaced whole at its next turn. In the city a little over half
+the probes are asleep or inside buildings (301,424 rays a frame against
+524,288 all awake); in the narrow street three quarters sleep over the
+roofs (220,256). `AE3D_PERF=1` says how they stand (`perf gi probes_on=...
+asleep=... inside=... untraced=... rays_per_frame=...`).
+
+What it costs: 128 rays for each of up to 4,096 probes a frame, and a shadow ray
 from each hit toward each directional light and each lamp in reach; the
 two atlases and the rays take 8 MiB, 16 MiB and 16 MiB, the state 512 KiB.
 `tests/test_gi` (lavapipe) holds the tiers to what they are for: a white
