@@ -248,7 +248,21 @@ before it works in light: the multisample resolve weighs each sample by
 how bright it shows (Karis), so a lamp at an edge does not alias as hard
 as one sample would; the reflection adds two percent of a lamp, not of
 white; the temporal pass clamps in the same weighting. FXAA, when it is
-on, runs after the composite over what shows. Colour textures are stored
+on, runs after the composite over what shows.
+
+The bloom is a pyramid of the frame's light (Jimenez, "Next Generation
+Post Processing in Call of Duty", 2014), on both backends: from half the
+scene's size, halved down to six levels, each a 13-tap filter of the one
+above; the first takes only the light past the threshold
+(`engine_set_post`'s, in light at the frame's exposure, eased in over a
+knee half its width) and averages its taps by brightness, so one fiery
+pixel does not flicker its glow. Back up, each level is its own and a tent
+of the coarser one's sum, the six averaged at the top: a lamp's halo and
+the haze round it at once, carrying the light past the threshold and no
+more. The composite adds it, by the intensity, before the curve. The
+critique (`tools/critique_scene`) holds it to what a bloom does: the ring of
+cells round the street's lights is 17% lighter with it, and half again as
+many cells burn bright. Colour textures are stored
 sRGB and sampled as light, data textures (normal maps, masks, the pose
 bank, the clouds' noise) as their bytes. Colours given as they should
 look -- the clear colour, the fog, the sky, the overcast -- are taken
@@ -697,16 +711,29 @@ frame's exposure is steered from it, the way an eye adapts:
   before the tone curve; the resolve and the temporal pass weigh brightness
   by it too.
 
-The street's chase frame, 240 frames in, 1280x720:
+A scene lit by physical light needs an exposure as a camera does: a night
+street under its lamps is stops darker than a noon square.
+`engine_set_exposure(e, stops)` (the Rendering component's `exposure`,
+saved with the scene) draws the frame at 2 to that, and with the
+adaptation on moves the key it settles toward and its range by as much.
+The zombie street is shown 1.5 stops up.
 
-| | clipped pixels (>= 250) | mean |
+The street's chase frame, 240 frames in, drawn at 2560x1440 (a 1280x720
+window on a 2x display, M1 Pro); a frame of a simulation stepped by the
+clock, so the two renderers' are not the same moment:
+
+| | pixels with a channel at 250 or more | mean |
 |---|---|---|
-| Vulkan, fixed | 1,076 | 57.9 |
-| Vulkan, adapting | 10 | 35.9 |
-| OpenGL, fixed | 1,016 | 42.4 |
-| OpenGL, adapting | 454 | 32.4 |
+| Vulkan, fixed | 0 | 11.7 |
+| Vulkan, adapting | 1,529 | 22.7 |
+| OpenGL, fixed | 0 | 7.2 |
+| OpenGL, adapting | 530 | 18.6 |
 
-It costs nothing a frame can see (Vulkan 142.5 fps against 142.6). The
+The frame is tone mapped from its light (#656), so at the street's own
+exposure nothing clips: the night street sits under the mid-grey key and
+the adaptation lifts it until the lamps begin to near white. It costs
+nothing a frame can see (Vulkan 19.53 fps against 19.50 without, at that
+size). The
 meter's buffer is in cached memory: read from the write-combined kind, the
 quarter megabyte it is halved the frame rate. `street_drive` and
 `zombie_city` run with it; it is off by default, so a scene lit for its

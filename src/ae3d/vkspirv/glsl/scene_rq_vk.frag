@@ -142,11 +142,13 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float skyTurbidity;
     float skyLevelSize;
     float skyRoughness;
-    vec2 texelSize;
     float frameExposure;
     bool enableBloom;
-    float bloomThreshold;
     float bloomIntensity;
+    vec2 texelSize;
+    int bloomFirst;
+    float bloomThreshold;
+    int bloomTop;
     float edgeThreshold;
     float edgeThresholdMin;
     float subpixelQuality;

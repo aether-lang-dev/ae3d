@@ -197,22 +197,61 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float crowdPhaseStep;
     vec4 shadowReach;
 };
-layout (location = 0) in vec3 inPosition;
+layout(set = 0, binding = 1) uniform sampler2D screenTexture;
 
-layout(location = 0) out vec3 TexCoords;
-layout(location = 1) out vec4 ClipNow;
-layout(location = 2) out vec4 ClipPrev;
-
+layout(location = 0) in vec2 TexCoords;
+layout(location = 0) out vec4 FragColor;
 
 
-// Last frame's view-projection, for the sky's motion vector: a direction,
-// so the camera's translation drops out and only its turn moves the sky.
 
+
+
+
+
+vec3 tap(vec2 offset) {
+    return texture(screenTexture, TexCoords + offset * texelSize).rgb;
+}
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// A group of four taps, by brightness on the first level, plainly after.
+vec3 group(vec3 a, vec3 b, vec3 c, vec3 d) {
+    if (bloomFirst == 0) return (a + b + c + d) * 0.25;
+    float wa = 1.0 / (1.0 + luma(a));
+    float wb = 1.0 / (1.0 + luma(b));
+    float wc = 1.0 / (1.0 + luma(c));
+    float wd = 1.0 / (1.0 + luma(d));
+    return (a * wa + b * wb + c * wc + d * wd) / (wa + wb + wc + wd);
+}
+
+// What of a colour's light is past the threshold, at the frame's exposure,
+// eased in over a knee half the threshold wide below it.
+vec3 past_threshold(vec3 c) {
+    float light = luma(c) * frameExposure;
+    float knee = max(bloomThreshold * 0.5, 0.0001);
+    float soft = clamp(light - bloomThreshold + knee, 0.0, 2.0 * knee);
+    soft = soft * soft / (4.0 * knee);
+    float over = max(soft, light - bloomThreshold) / max(light, 0.0001);
+    return c * over;
+}
 
 void main() {
-    TexCoords = inPosition;
-    vec4 pos = projection * view * vec4(inPosition, 1.0);
-    ClipNow = pos;
-    ClipPrev = prevViewProjection * vec4(inPosition, 0.0);
-    gl_Position = pos.xyww; // Ensure skybox is always at max depth
+    vec3 a = tap(vec2(-2.0, -2.0));
+    vec3 b = tap(vec2( 0.0, -2.0));
+    vec3 c = tap(vec2( 2.0, -2.0));
+    vec3 d = tap(vec2(-1.0, -1.0));
+    vec3 e = tap(vec2( 1.0, -1.0));
+    vec3 f = tap(vec2(-2.0,  0.0));
+    vec3 g = tap(vec2( 0.0,  0.0));
+    vec3 h = tap(vec2( 2.0,  0.0));
+    vec3 i = tap(vec2(-1.0,  1.0));
+    vec3 j = tap(vec2( 1.0,  1.0));
+    vec3 k = tap(vec2(-2.0,  2.0));
+    vec3 l = tap(vec2( 0.0,  2.0));
+    vec3 m = tap(vec2( 2.0,  2.0));
+    vec3 sum = group(d, e, i, j) * 0.5
+             + group(a, b, f, g) * 0.125 + group(b, c, g, h) * 0.125
+             + group(f, g, k, l) * 0.125 + group(g, h, l, m) * 0.125;
+    if (bloomFirst != 0) sum = past_threshold(sum);
+    FragColor = vec4(sum, 1.0);
 }

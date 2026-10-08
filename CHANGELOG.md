@@ -22,6 +22,13 @@
   default, takes the probes on a GPU that offers them and the sky's light
   elsewhere (OpenGL, MoltenVK, software rasterizers). Scene files and the
   editor carry the setting.
+- Bloom is an HDR pyramid on both backends (six levels down by a 13-tap
+  filter, back up by a tent), its threshold in light; the critique holds it
+  to the glow round the lights, not to a lighter frame.
+- `engine_set_exposure(e, stops)`: an exposure compensation, fixed or moving
+  the eye adaptation's key; scene files carry it. The zombie street is
+  re-lit for the physical light: 1.5 stops up, its bloom from 0.25.
+- The sky is captured only when what it is drawn from moves.
 - The per-model "global illumination" shading knob, a constant tint, is
   gone (`Config.global_illumination`, `gi_intensity`, `gi_bounces`).
 - The agent's explain names what lights a surface besides the lights: the

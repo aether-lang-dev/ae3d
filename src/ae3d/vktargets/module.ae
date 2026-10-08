@@ -35,6 +35,7 @@ exports (
     camdepth_create, camdepth_destroy, camdepth_ready, camdepth_fits, camdepth_serial, camdepth_framebuffer,
     camdepth_view, camdepth_sampler, camdepth_image, camdepth_memory, ssr_framebuffer, ssr_reflect_texture,
     occlusion_texture, occlusion_framebuffer,
+    bloom_levels, bloom_texture, bloom_framebuffer, bloom_width, bloom_height,
     taa_framebuffer, taa_texture, taa_history_valid, set_taa_history, taa_current, set_taa_current,
     dlss_output, dlss_output_create, dlss_output_destroy, dlss_output_fresh, set_dlss_output_fresh,
     lod_bias_for_scale
@@ -44,6 +45,16 @@ extern calloc(count: int, size: int) -> ptr
 extern free(p: ptr)
 extern memset(p: ptr, value: int, n: long) -> ptr
 extern log(x: float) -> float
+
+// The bloom's levels (FRAGMENT_BLOOM_DOWN, FRAGMENT_BLOOM_UP): from half the
+// scene's size, halved down to BLOOM_LEVELS of them or to eight texels on
+// the short side; each a downsampled target and, but the coarsest, a
+// summed one, made and remade with the scene's size.
+const BLOOM_LEVELS = 6
+var g_bloom_count = 0
+var g_bloom_textures: ptr = null     // int[BLOOM_LEVELS * 2]: a level's down, then its up
+var g_bloom_framebuffers: ptr = null // ptr[BLOOM_LEVELS * 2]
+var g_bloom_sizes: ptr = null        // int[BLOOM_LEVELS * 2]: a level's width and height
 
 // The shadow atlas: four cascades of 2048 texels, two by two (ae3d.cascades'
 // ATLAS and SIZE, #469).
@@ -939,6 +950,33 @@ cleared_far(image: ptr, dst_access: int, dst_stages: int) -> bool {
     return true
 }
 
+// A colour target just made moved to the layout the fragment shaders read
+// it in, its texels left as they are. False when there was no command
+// buffer.
+readable(image: ptr) -> bool {
+    commands = vkhost.once_begin()
+    if commands == null {
+        vkdevice.fail("no command buffer to ready a target with")
+        return false
+    }
+    b = calloc(1, sizeof(VkImageMemoryBarrier)) as *VkImageMemoryBarrier
+    b.sType = vk.STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+    b.oldLayout = vk.IMAGE_LAYOUT_UNDEFINED
+    b.newLayout = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    b.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.image = image
+    b.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    b.subresourceRange.levelCount = 1
+    b.subresourceRange.layerCount = 1
+    b.dstAccessMask = vk.ACCESS_SHADER_READ_BIT
+    vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT, vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                            0, 0, null, 0, null, 1, b as ptr)
+    vkhost.once_end(commands)
+    free(b as ptr)
+    return true
+}
+
 // One of the lamps' two atlases: its image, drawn into by the lamps' pass
 // and copied from and to a tile at a time, and its framebuffer (into
 // `framebuffer_out`); cleared to the far plane and left readable. The kept
@@ -1132,8 +1170,78 @@ create_post_target() -> bool {
 // The frame's targets past its images: the shadow map and the post chain's.
 create_framebuffers() -> bool {
     if !create_shadow_target() { return false }
-    return create_post_target()
+    return create_post_target() && create_bloom_target()
 }
+
+create_bloom_target() -> bool {
+    if g_bloom_textures == null {
+        g_bloom_textures = calloc(BLOOM_LEVELS * 2, 4)
+        g_bloom_framebuffers = calloc(BLOOM_LEVELS * 2, 8)
+        g_bloom_sizes = calloc(BLOOM_LEVELS * 2, 4)
+    }
+    views = calloc(1, 8)
+    w = g_render_width / 2
+    h = g_render_height / 2
+    g_bloom_count = 0
+    while g_bloom_count < BLOOM_LEVELS && w >= 8 && h >= 8 {
+        k = g_bloom_count
+        (g_bloom_sizes as int[])[k * 2] = w
+        (g_bloom_sizes as int[])[k * 2 + 1] = h
+        side = 0
+        while side < 2 {
+            texture = colour_texture(w, h, "bloom")
+            if texture == 0 {
+                free(views)
+                return false
+            }
+            (g_bloom_textures as int[])[k * 2 + side] = texture
+            (views as ptr[])[0] = vktexture.view(texture)
+            fb = made_framebuffer(g_hdr_pass, views, 1, w, h)
+            if fb == null {
+                free(views)
+                vkdevice.fail("bloom vkCreateFramebuffer failed")
+                return false
+            }
+            (g_bloom_framebuffers as ptr[])[k * 2 + side] = fb
+            side = side + 1
+        }
+        g_bloom_count = g_bloom_count + 1
+        w = w / 2
+        h = h / 2
+    }
+    free(views)
+    return true
+}
+
+destroy_bloom_target() {
+    d = vkhost.device()
+    if g_bloom_textures == null || d == null { return }
+    k = 0
+    while k < BLOOM_LEVELS * 2 {
+        fb = (g_bloom_framebuffers as ptr[])[k]
+        if fb != null { vk.vkDestroyFramebuffer(d, fb, null) }
+        texture = (g_bloom_textures as int[])[k]
+        if texture != 0 { vkdesc.texture_destroy(texture) }
+        (g_bloom_framebuffers as ptr[])[k] = null
+        (g_bloom_textures as int[])[k] = 0
+        k = k + 1
+    }
+    g_bloom_count = 0
+}
+
+// How many levels the bloom has, and level `k`'s downsampled target (`up`
+// false) or its summed one, and its size.
+bloom_levels() -> int { return g_bloom_count }
+bloom_texture(k: int, up: bool) -> int {
+    if up { return (g_bloom_textures as int[])[k * 2 + 1] }
+    return (g_bloom_textures as int[])[k * 2]
+}
+bloom_framebuffer(k: int, up: bool) -> ptr {
+    if up { return (g_bloom_framebuffers as ptr[])[k * 2 + 1] }
+    return (g_bloom_framebuffers as ptr[])[k * 2]
+}
+bloom_width(k: int) -> int { return (g_bloom_sizes as int[])[k * 2] }
+bloom_height(k: int) -> int { return (g_bloom_sizes as int[])[k * 2 + 1] }
 
 // --- the camera depth --------------------------------------------------------------------------------------------
 
@@ -1197,6 +1305,13 @@ camdepth_create(w: int, h: int, taa: bool) -> bool {
     if g_occlusion_framebuffer == null {
         free(views)
         vkdevice.fail("occlusion vkCreateFramebuffer failed")
+        return false
+    }
+    // Every scene set binds it from now on, though the scene reads it only
+    // once a frame's occlusion pass has written it: until then it is in the
+    // layout it is read in, its texels unread.
+    if !readable(vktexture.image_of(g_occlusion_texture)) {
+        free(views)
         return false
     }
     vkdesc.set_occlusion(vktexture.view(g_occlusion_texture), vktexture.sampler_of(g_occlusion_texture))
@@ -1343,6 +1458,7 @@ destroy_frame() {
     g_post_texture = 0
     if g_ldr_texture != 0 { vkdesc.texture_destroy(g_ldr_texture) }
     g_ldr_texture = 0
+    destroy_bloom_target()
     unkept(g_colour)
     g_colour = null
     unkept(g_velocity)

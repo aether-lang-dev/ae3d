@@ -197,22 +197,27 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float crowdPhaseStep;
     vec4 shadowReach;
 };
-layout (location = 0) in vec3 inPosition;
+layout(set = 0, binding = 1) uniform sampler2D screenTexture;
+layout(set = 0, binding = 2) uniform sampler2D shadowMap;
+layout(set = 0, binding = 3) uniform sampler2D bloomLevel;
 
-layout(location = 0) out vec3 TexCoords;
-layout(location = 1) out vec4 ClipNow;
-layout(location = 2) out vec4 ClipPrev;
+layout(location = 0) in vec2 TexCoords;
+layout(location = 0) out vec4 FragColor;
 
 
 
-// Last frame's view-projection, for the sky's motion vector: a direction,
-// so the camera's translation drops out and only its turn moves the sky.
 
+
+
+vec3 tap(vec2 offset) {
+    return texture(screenTexture, TexCoords + offset * texelSize).rgb;
+}
 
 void main() {
-    TexCoords = inPosition;
-    vec4 pos = projection * view * vec4(inPosition, 1.0);
-    ClipNow = pos;
-    ClipPrev = prevViewProjection * vec4(inPosition, 0.0);
-    gl_Position = pos.xyww; // Ensure skybox is always at max depth
+    vec3 tent = tap(vec2(0.0)) * 4.0
+              + (tap(vec2(-1.0, 0.0)) + tap(vec2(1.0, 0.0)) + tap(vec2(0.0, -1.0)) + tap(vec2(0.0, 1.0))) * 2.0
+              + tap(vec2(-1.0, -1.0)) + tap(vec2(1.0, -1.0)) + tap(vec2(-1.0, 1.0)) + tap(vec2(1.0, 1.0));
+    vec3 sum = texture(bloomLevel, TexCoords).rgb + tent / 16.0;
+    if (bloomTop > 0) sum /= float(bloomTop);
+    FragColor = vec4(sum, 1.0);
 }
