@@ -90,6 +90,22 @@ Before, the drawing blended from the rig's pose to the bodies' along a
 smoothstep, which starts flat. A blow showed late, and a second blow in
 those 0.25 s landed where the figure wasn't drawn.
 
+The offset is taken each frame along what then lies between the bodies and
+the pose shown, and never more than that (#665). Kept as it was on the
+frame of the change, it went on top of bodies already moving the pose's
+way, and counted twice. A risen walker whose get-up had keyed its knee
+straighter than its bodies had its knee drawn 7 to 11 degrees past straight
+as the bodies straightened it. `tests/test_handover_gap.ae` hands a box man
+over with its bodies' knee bent and the pose shown straight: the drawn
+knee never passes straight, and a quarter second on it is the bodies'.
+
+Hand the figure over (`set_mode(m, POWERED)`) before letting go of whatever
+else writes its rig, the feet's solved legs or a look's turned head. The
+pose shown is the rig as it is at the call. Let go first, the rig was back
+on the clip, the drawing started there while the bodies had just been put
+on the solved legs, and a nearly straight knee the feet had bent was drawn
+backwards 6 to 14 degrees as the plaza's car struck.
+
 `tests/test_impact_shows.ae` strikes a figure 60 N·s at the chest as it
 goes `POWERED` from `ANIMATED`:
 
