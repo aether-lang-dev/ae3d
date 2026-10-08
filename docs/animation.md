@@ -339,7 +339,11 @@ lookat.clear(l)
   head 3 degrees off.
 - **Put back each frame.** The bones it turns are returned to their own
   pose before each frame's turn, so a still pose is not turned further
-  frame after frame.
+  frame after frame. `lookat.set_figure(l, figure)` tells it the figure,
+  and where the figure didn't put a bone's turn back it takes its own turn
+  off on the node's side, as the feet and locomotion do (#673). Without
+  that, a change of clip whose offset still fell on the neck and head left
+  the look's turn on, and the next went on top.
 
 `tests/test_lookat.ae`, on the box man playing its Idle:
 - **Within the limits.** A point 31 degrees aside and a little up is faced
@@ -349,6 +353,9 @@ lookat.clear(l)
   included.
 - **Cleared.** It is back on its clip, to 0.0001 rad.
 - **Nothing else moves.** No other bone moves.
+- **Through a change of clip.** Looking aside from the Idle into a clip
+  keying the neck and head and back four frames later, then cleared, the
+  head is 7e-5 rad from a twin that never looked (1.71 rad before).
 
 ## A player's figure posed by matching
 
