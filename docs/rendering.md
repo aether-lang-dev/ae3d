@@ -250,10 +250,15 @@ its own from frame to frame, since the sort reorders -- from where its
 walk puts it: `model_set_crowd_walk(m, seconds)` names the cycle, and the
 figure's previous pose is its phase a frame earlier, its previous
 position a frame's travel back along its facing, from the pose bank's own
-travel; an impostor the same; the sky from the camera's turn. A skinned
-palette's previous pose is not carried (a second palette is the OpenGL
-uniform budget over); a skinned model's motion is its model's and the
-camera's. Capture channel 3 (`engine_set_capture_channel(e, 3)`,
+travel; an impostor the same; the sky from the camera's turn; a skinned
+model from its palette as last frame drew it as well as its matrix
+(#639). The skeleton keeps that palette at each frame's end
+(`skin.skeleton_frame_done`), and it goes to the shader as each bone's
+matrix's top three rows (`prevBoneRows`), so both palettes fit the vertex
+stage's uniform budget, which two whole ones were over; on Vulkan the
+scene block is 15,872 bytes, inside the 16,384 every device gives.
+Without it, a limb that swung 20 cm in a frame read as still, and the
+temporal pass smeared it into a ghost of where it had been. Capture channel 3 (`engine_set_capture_channel(e, 3)`,
 `AE3D_CAPTURE=3`) draws the vector in pixels, a hundred either way across
 the byte and 128 for still, and `tests/test_velocity` holds it against the
 camera's own projection to the pixel. On Vulkan `vkframe.velocity_texture`
