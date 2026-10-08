@@ -57,7 +57,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float reflectivity;
     float wetness;
-    float frameExposure;
     bool hasNormalMap;
     float normalStrength;
     float occlusionStrength;
@@ -80,13 +79,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableGlobalIllumination;
     float giIntensity;
     int giBounces;
-    bool enableBloom;
-    float bloomThreshold;
-    float bloomIntensity;
     bool enableFog;
     float fogStart;
     float fogEnd;
-    vec3 fogColor;
+    vec3 fogRadiance;
     float fogIntensity;
     bool enableShadows;
     bool hasShadowMap;
@@ -139,9 +135,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float skyOvercast;
     vec3 skyOvercastColor;
     vec2 texelSize;
+    float frameExposure;
+    bool enableBloom;
+    float bloomThreshold;
+    float bloomIntensity;
     float edgeThreshold;
     float edgeThresholdMin;
     float subpixelQuality;
+    int colorSampleCount;
     mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
@@ -336,11 +337,6 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 // it in full, walls hardly at all: water runs off them. Set by the
 // weather; a scene without one is dry.
 
-// The frame's exposure, over the material's: what an exposure that follows
-// the frame (the engine's eye adaptation) scales the light by before the
-// tone curve. 1 is the scene as lit.
-
-
 // Modern PBR Extensions
 // The surface's shape rather than its colour. The tangent frame is worked out
 // per pixel from the derivatives of the position and the UVs, so no tangent has
@@ -380,14 +376,11 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 
 
 
-// Bloom and HDR
-
-
-
-
-// Distance haze. The same four names the water shader uses, because one scene
+// Distance haze. The same names the water shader uses, because one scene
 // has one atmosphere: a street that fades into the dark has to fade the water
-// running down it by the same amount.
+// running down it by the same amount. The fog is light in the scene, so it
+// is a radiance: the colour the scene was given, as it shows at an exposure
+// of one, taken back through the tone curve on the CPU (core.display_radiance).
 
 
 
@@ -1013,16 +1006,6 @@ vec3 calculateInterObjectReflections(vec3 worldPos, vec3 N, vec3 V, float roughn
     return reflectionColor;
 }
 
-// ACES tone mapping for HDR
-vec3 ACESFilm(vec3 x) {
-    float a = 2.51;
-    float b = 0.03;
-    float c = 2.43;
-    float d = 0.59;
-    float e = 0.14;
-    return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);
-}
-
 // GPU Gems Chapter 5: Improved Perlin Noise Implementation
 // Simplified GLSL version of the improved Perlin noise with quintic interpolation
 
@@ -1521,6 +1504,12 @@ void main() {
     float woundAt = woundCount > 0 ? woundDepth(BindPos) : 2.0;
     if (woundAt < woundCore) discard;
 
+    // Before any branch returns: every surface drawn carries its motion,
+    // the glowing ones and a capture channel's frame too. An emissive
+    // surface that returned without it left the vector undefined, and the
+    // temporal pass dragged its history by whatever the driver left there.
+    outVelocity = velocity(ClipNow, ClipPrev, jitter);
+
     vec4 texColor = texture(textureSampler, fragTexCoord);
     
     // An emissive surface is its own light source, so it skips shading. It does
@@ -1530,18 +1519,15 @@ void main() {
     // An accretion disc whose whole point is that its inner edge is blue-white
     // and its rim is red came out uniformly white.
     //
-    // It also skipped tone mapping and gamma, so an emissive surface sat in a
-    // different colour space from every lit surface beside it. Both now run,
-    // which is also what lets a colour brighter than 1.0 (an instance colour is
-    // a float attribute, so it can carry one) roll off to white through ACES
-    // instead of clipping per channel and shifting hue on the way.
+    // It is radiance like every lit surface beside it, so a colour brighter
+    // than 1.0 (an instance colour is a float attribute, so it can carry one)
+    // reaches the frame's one tone curve and rolls off to white there instead
+    // of clipping per channel and shifting hue.
     //
     // exposure is the emissive strength, scaled so the 10.0 that opens this
     // branch means 1x. Below that the surface is lit normally.
     if (exposure > 10.0) {
-        vec3 emissive = diffuseColor * texColor.rgb * InstanceColor * (exposure * 0.1) * frameExposure;
-        emissive = ACESFilm(emissive);
-        FragColor = vec4(pow(emissive, vec3(1.0 / 2.2)), 1.0);
+        FragColor = vec4(diffuseColor * texColor.rgb * InstanceColor * (exposure * 0.1), 1.0);
         return;
     }
 
@@ -1559,9 +1545,6 @@ void main() {
     } else if (hasNormalMap) {
         norm = mapped_normal(norm, FragPos, fragTexCoord);
     }
-    // Before the capture channels return: a channel's frame carries the
-    // motion too.
-    outVelocity = velocity(ClipNow, ClipPrev, jitter);
     if (captureChannel == 1) {
         FragColor = vec4(diffuseColor * texColor.rgb * InstanceColor, texColor.a);
         return;
@@ -1763,32 +1746,19 @@ void main() {
     color += caustic_light(FragPos, norm) * albedo;
 
     
-    // HDR exposure and tone mapping for normal objects
-    color = color * exposure * frameExposure;
-    // Apply bloom effect
-    if (enableBloom) {
-        // Extract bright areas for bloom
-        vec3 brightColor = max(color - bloomThreshold, vec3(0.0));
-        float brightness = dot(brightColor, vec3(0.2126, 0.7152, 0.0722));
-        
-        if (brightness > 0.0) {
-            // Simple bloom approximation
-            vec3 bloom = brightColor * bloomIntensity;
-            color += bloom * 0.3; // Blend bloom back into the image
-        }
-    }
-    
-    color = ACESFilm(color);
-    
-    // Gamma correction (sRGB)
-    color = pow(color, vec3(1.0/2.2));
-    
-    // The air between the eye and the surface. After tone mapping and gamma,
-    // because fog is what is seen rather than another light in the scene: put
-    // in before them and the tone curve pulls the horizon back out again.
+    // The material's own exposure: how much light it gives back for what
+    // reaches it (a particle's glow, a dimmed decal). The frame's exposure,
+    // the bloom and the tone curve are the post pass's, once for the whole
+    // frame, so the colour written here is radiance.
+    color = color * exposure;
+
+    // The air between the eye and the surface: the light the haze scatters
+    // toward the eye in place of the surface's. Its radiance is the fog colour
+    // as it shows at an exposure of one, so a scene fogged to a colour still
+    // fades to that colour on the screen.
     if (enableFog) {
         float haze = smoothstep(fogStart, fogEnd, distanceToCamera) * fogIntensity;
-        color = mix(color, fogColor, clamp(haze, 0.0, 1.0));
+        color = mix(color, fogRadiance, clamp(haze, 0.0, 1.0));
     }
 
     // Use material alpha for transparency

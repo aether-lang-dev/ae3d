@@ -53,7 +53,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float reflectivity;
     float wetness;
-    float frameExposure;
     bool hasNormalMap;
     float normalStrength;
     float occlusionStrength;
@@ -76,13 +75,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableGlobalIllumination;
     float giIntensity;
     int giBounces;
-    bool enableBloom;
-    float bloomThreshold;
-    float bloomIntensity;
     bool enableFog;
     float fogStart;
     float fogEnd;
-    vec3 fogColor;
+    vec3 fogRadiance;
     float fogIntensity;
     bool enableShadows;
     bool hasShadowMap;
@@ -135,9 +131,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float skyOvercast;
     vec3 skyOvercastColor;
     vec2 texelSize;
+    float frameExposure;
+    bool enableBloom;
+    float bloomThreshold;
+    float bloomIntensity;
     float edgeThreshold;
     float edgeThresholdMin;
     float subpixelQuality;
+    int colorSampleCount;
     mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;

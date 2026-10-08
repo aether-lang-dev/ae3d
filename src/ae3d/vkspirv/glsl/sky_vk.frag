@@ -53,7 +53,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float reflectivity;
     float wetness;
-    float frameExposure;
     bool hasNormalMap;
     float normalStrength;
     float occlusionStrength;
@@ -76,13 +75,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableGlobalIllumination;
     float giIntensity;
     int giBounces;
-    bool enableBloom;
-    float bloomThreshold;
-    float bloomIntensity;
     bool enableFog;
     float fogStart;
     float fogEnd;
-    vec3 fogColor;
+    vec3 fogRadiance;
     float fogIntensity;
     bool enableShadows;
     bool hasShadowMap;
@@ -135,9 +131,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float skyOvercast;
     vec3 skyOvercastColor;
     vec2 texelSize;
+    float frameExposure;
+    bool enableBloom;
+    float bloomThreshold;
+    float bloomIntensity;
     float edgeThreshold;
     float edgeThresholdMin;
     float subpixelQuality;
+    int colorSampleCount;
     mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
@@ -544,6 +545,26 @@ vec3 nightSky(vec3 dir, vec3 moon, float night) {
 }
 
 
+// The sky is given as it shows -- a painting, the hour's gradient, the
+// clouds' own roll-off -- and drawn as the radiance that shows as it: the
+// frame's tone curve (ACES, then the sRGB encoding) taken back, the same
+// curve the post pass applies, so at an exposure of one the sky appears as
+// it was given, and under an exposure that follows the frame it brightens
+// and darkens with everything else. See core.display_radiance.
+float srgb_decode(float c) {
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+float aces_inverse(float y) {
+    y = clamp(y, 0.0, 0.9999);
+    float a = 2.51 - 2.43 * y;
+    float b = 0.03 - 0.59 * y;
+    return (-b + sqrt(b * b + 4.0 * a * 0.14 * y)) / (2.0 * a);
+}
+vec3 display_radiance(vec3 shown) {
+    vec3 c = clamp(shown, 0.0, 1.0);
+    return vec3(aces_inverse(srgb_decode(c.r)), aces_inverse(srgb_decode(c.g)), aces_inverse(srgb_decode(c.b)));
+}
+
 // Where this pixel's surface was last frame, for the temporal passes: the
 // clip positions the vertex stage carried, this frame's unnudged (the
 // frame is drawn through the jittered projection; the jitter is taken back
@@ -591,6 +612,6 @@ void main() {
     if (cloudFrame > 0) grain += 5.588238 * float(cloudFrame % 64);
     vec4 clouds = cloudsAlong(dir, sky, cloudCover, cloudTime, cloudDither(grain));
     sky = sky * (1.0 - clouds.a) + clouds.rgb;
-    FragColor = vec4(sky, 1.0);
+    FragColor = vec4(display_radiance(sky), 1.0);
     outVelocity = velocity(ClipNow, ClipPrev, vec2(0.0));
 }

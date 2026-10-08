@@ -188,8 +188,9 @@ static void fill_options(sl::DLSSOptions &options, int mode, unsigned out_w, uns
     options.mode = mode_of(mode);
     options.outputWidth = out_w;
     options.outputHeight = out_h;
-    /* The scene's colour is the tone-mapped, gamma-encoded picture. */
-    options.colorBuffersHDR = sl::Boolean::eFalse;
+    /* The scene's colour is light, before the frame's tone curve: DLSS
+       weighs it by its own exposure, which it measures. */
+    options.colorBuffersHDR = sl::Boolean::eTrue;
     options.useAutoExposure = sl::Boolean::eTrue;
 }
 

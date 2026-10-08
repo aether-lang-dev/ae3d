@@ -53,7 +53,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float reflectivity;
     float wetness;
-    float frameExposure;
     bool hasNormalMap;
     float normalStrength;
     float occlusionStrength;
@@ -76,13 +75,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableGlobalIllumination;
     float giIntensity;
     int giBounces;
-    bool enableBloom;
-    float bloomThreshold;
-    float bloomIntensity;
     bool enableFog;
     float fogStart;
     float fogEnd;
-    vec3 fogColor;
+    vec3 fogRadiance;
     float fogIntensity;
     bool enableShadows;
     bool hasShadowMap;
@@ -135,9 +131,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float skyOvercast;
     vec3 skyOvercastColor;
     vec2 texelSize;
+    float frameExposure;
+    bool enableBloom;
+    float bloomThreshold;
+    float bloomIntensity;
     float edgeThreshold;
     float edgeThresholdMin;
     float subpixelQuality;
+    int colorSampleCount;
     mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
@@ -195,30 +196,45 @@ layout(location = 0) out vec4 FragColor;
 
 
 
+// A glow around what shows bright: the share of each pixel that shows past
+// the threshold (0..1, in what the screen shows), blurred and added.
+
+
+
+
+vec3 aces(vec3 x) {
+    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+float srgb_encode(float c) {
+    return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+// The part of a pixel's light that shows past the threshold.
+vec3 bright(vec2 uv) {
+    vec3 c = texture(screenTexture, uv).rgb * frameExposure;
+    float shown = aces(vec3(dot(c, vec3(0.2126, 0.7152, 0.0722)))).r;
+    float over = max(shown - bloomThreshold, 0.0) / max(1.0 - bloomThreshold, 0.001);
+    return c * over;
+}
 
 void main() {
-    vec3 color = texture(screenTexture, TexCoords).rgb;
-    
-    // Calculate luminance
-    float luma = dot(color, vec3(0.299, 0.587, 0.114));
-    
-    // Extract bright parts only
-    vec3 brightColor = vec3(0.0);
-    if (luma > bloomThreshold) {
-        brightColor = color * (luma - bloomThreshold) / (1.0 - bloomThreshold + 0.001);
+    vec3 radiance = texture(screenTexture, TexCoords).rgb;
+    if (captureChannel != 0) { FragColor = vec4(radiance, 1.0); return; }
+    vec3 c = radiance * frameExposure;
+    if (enableBloom) {
+        vec3 glow = bright(TexCoords);
+        vec2 r = texelSize * 2.0;
+        glow += bright(TexCoords + vec2(r.x, 0.0));
+        glow += bright(TexCoords - vec2(r.x, 0.0));
+        glow += bright(TexCoords + vec2(0.0, r.y));
+        glow += bright(TexCoords - vec2(0.0, r.y));
+        c += glow * 0.2 * bloomIntensity;
     }
-    
-    // Simple 4-tap box blur on bright areas only (very fast)
-    vec3 blur = brightColor;
-    float offset = 2.0;
-    blur += texture(screenTexture, TexCoords + vec2(texelSize.x * offset, 0.0)).rgb;
-    blur += texture(screenTexture, TexCoords - vec2(texelSize.x * offset, 0.0)).rgb;
-    blur += texture(screenTexture, TexCoords + vec2(0.0, texelSize.y * offset)).rgb;
-    blur += texture(screenTexture, TexCoords - vec2(0.0, texelSize.y * offset)).rgb;
-    blur *= 0.2; // Average of 5 samples
-    
-    // Combine: original + bloom glow
-    vec3 finalColor = color + blur * bloomIntensity;
-    
-    FragColor = vec4(finalColor, 1.0);
+    vec3 shown = aces(c);
+    shown = vec3(srgb_encode(shown.r), srgb_encode(shown.g), srgb_encode(shown.b));
+    // Half a step of an 8-bit target, in a pattern that does not repeat
+    // across the screen, so a gradient in the dark is a grain and not bands.
+    float noise = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+    FragColor = vec4(shown + noise / 255.0, 1.0);
 }

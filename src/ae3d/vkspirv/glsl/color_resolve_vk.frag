@@ -53,7 +53,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float reflectivity;
     float wetness;
-    float frameExposure;
     bool hasNormalMap;
     float normalStrength;
     float occlusionStrength;
@@ -76,13 +75,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableGlobalIllumination;
     float giIntensity;
     int giBounces;
-    bool enableBloom;
-    float bloomThreshold;
-    float bloomIntensity;
     bool enableFog;
     float fogStart;
     float fogEnd;
-    vec3 fogColor;
+    vec3 fogRadiance;
     float fogIntensity;
     bool enableShadows;
     bool hasShadowMap;
@@ -135,9 +131,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float skyOvercast;
     vec3 skyOvercastColor;
     vec2 texelSize;
+    float frameExposure;
+    bool enableBloom;
+    float bloomThreshold;
+    float bloomIntensity;
     float edgeThreshold;
     float edgeThresholdMin;
     float subpixelQuality;
+    int colorSampleCount;
     mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
@@ -186,13 +187,24 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float crowdPhaseStep;
     vec4 shadowReach;
 };
-layout(set = 0, binding = 1) uniform sampler2D screenTexture;
+layout(set = 0, binding = 1) uniform sampler2DMS colorSamples;
 
 layout(location = 0) in vec2 TexCoords;
 layout(location = 0) out vec4 FragColor;
 
 
 
+
+
 void main() {
-    FragColor = texture(screenTexture, TexCoords);
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    vec4 sum = vec4(0.0);
+    float weights = 0.0;
+    for (int s = 0; s < colorSampleCount; s++) {
+        vec4 c = texelFetch(colorSamples, pixel, s);
+        float w = 1.0 / (1.0 + dot(c.rgb * frameExposure, vec3(0.2126, 0.7152, 0.0722)));
+        sum += c * w;
+        weights += w;
+    }
+    FragColor = sum / max(weights, 1e-6);
 }

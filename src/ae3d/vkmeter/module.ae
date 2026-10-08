@@ -1,13 +1,17 @@
 // ae3d.vkmeter -- the frame's light, measured on the Vulkan backend (#402),
 // on Aether's own Vulkan bindings (contrib.vulkan.vk).
 //
-// After the frame's last pass the finished image is blitted into an image
-// of its own at half size, halved level by level (each blit a box filter)
-// to no wider than 320 texels, and the last level copied into a buffer the
-// host can read -- one per frame in flight. When a frame slot's fence has
-// passed, the texels of its buffer are the measurement: their mean linear
-// luminance, and the share of them near white. Auto exposure reads it
-// (ae3d.exposure).
+// After the composite, the light it read -- the scene, or what the
+// reflection, the temporal pass or DLSS made of it, before the frame's
+// exposure and tone curve -- is blitted into an image of its own at half
+// size, halved level by level (each blit a box filter) to no wider than 320
+// texels, and the last level copied into a buffer the host can read -- one
+// per frame in flight. When a frame slot's fence has passed, the texels of
+// its buffer, taken through the exposure that frame was drawn at and the
+// tone curve, are the measurement: the frame's mean linear luminance as it
+// showed, and the share of it near white. Auto exposure reads it
+// (ae3d.exposure). Light averages where shown values do not, so the halving
+// is of the light and the curve comes after.
 //
 // The frame (ae3d.vkframe) owns the device's frame, its command buffer and
 // its image; this module owns the meter's image, its memory, and its
@@ -21,6 +25,9 @@ import ae3d.vkdevice
 import std.mem
 import ae3d.vkhost
 import ae3d.vkframe
+import ae3d.vktexture
+import ae3d.vktargets
+import ae3d.core
 
 exports (
     set_on, is_on, measured
@@ -32,11 +39,12 @@ extern ae3d_vkmeter_collect(context: ptr)
 extern ae3d_vkmeter_release(context: ptr)
 extern calloc(count: int, size: int) -> ptr
 extern free(p: ptr)
-extern pow(x: float, y: float) -> float
+extern ldexp(x: float, e: int) -> float
 
 const SMALLEST = 320                 // texels: the widest the last level may be
 const MAX_FRAMES = 4                 // at least ae3d.vkframe's FRAMES
 const NEAR_WHITE = 0.8               // linear luminance counted as near white
+const TEXEL = 8                      // bytes: four half floats
 
 struct Meter {
     on: bool
@@ -45,16 +53,18 @@ struct Meter {
     image: ptr                       // VkImage, the halving chain
     memory: ptr                      // VkDeviceMemory
     levels: int
-    width: int                       // level 0: half the frame
+    source_width: int                // the light measured
+    source_height: int
+    width: int                       // level 0: half the light's
     height: int
     small_width: int                 // the last level
     small_height: int
     buffers: ptr                     // *HostBuffer[MAX_FRAMES]
     written: ptr                     // int[MAX_FRAMES]
+    exposures: ptr                   // float[MAX_FRAMES]: what each slot's frame was drawn at
     have: bool
     mean: float
     white: float
-    linear: ptr                      // float[256]: an sRGB byte's linear light
 }
 
 var g_meter: ptr = null
@@ -64,18 +74,7 @@ meter() -> *Meter {
         m = calloc(1, sizeof(Meter)) as *Meter
         m.buffers = calloc(MAX_FRAMES, 8)
         m.written = calloc(MAX_FRAMES, 8)
-        m.linear = calloc(256, 8)
-        table = m.linear as float[]
-        i = 0
-        while i < 256 {
-            v = (i as float) / 255.0
-            if v <= 0.04045 {
-                table[i] = v / 12.92
-            } else {
-                table[i] = pow((v + 0.055) / 1.055, 2.4)
-            }
-            i = i + 1
-        }
+        m.exposures = calloc(MAX_FRAMES, 8)
         g_meter = m as ptr
     }
     return g_meter as *Meter
@@ -101,7 +100,7 @@ make_image(m: *Meter, w: int, h: int, levels: int) -> bool {
     ci = calloc(1, sizeof(VkImageCreateInfo)) as *VkImageCreateInfo
     ci.sType = vk.STRUCTURE_TYPE_IMAGE_CREATE_INFO
     ci.imageType = vk.IMAGE_TYPE_2D
-    ci.format = vk.FORMAT_R8G8B8A8_UNORM
+    ci.format = vktargets.scene_format()
     ci.extent.width = w
     ci.extent.height = h
     ci.extent.depth = 1
@@ -145,17 +144,21 @@ release(m: *Meter) {
         (m.written as int[])[f] = 0
         f = f + 1
     }
+    m.source_width = 0
+    m.source_height = 0
     m.width = 0
     m.height = 0
     m.device = null
 }
 
-// The chain and the buffers for this frame's size.
-make_meter(m: *Meter) -> bool {
+// The chain and the buffers for light of `source_w` by `source_h`.
+make_meter(m: *Meter, source_w: int, source_h: int) -> bool {
     release(m)
     m.device = vkhost.device()
-    w = half(vkframe.frame_width())
-    h = half(vkframe.frame_height())
+    m.source_width = source_w
+    m.source_height = source_h
+    w = half(source_w)
+    h = half(source_h)
     levels = 1
     // A level is half the one above it, rounded down, never under one.
     sw = w
@@ -177,7 +180,7 @@ make_meter(m: *Meter) -> bool {
     frames = vkframe.FRAMES
     f = 0
     while f < frames && f < MAX_FRAMES {
-        b = vkhost.host_buffer(sw * sh * 4)
+        b = vkhost.host_buffer(sw * sh * TEXEL)
         if b == null {
             release(m)
             return false
@@ -260,32 +263,31 @@ blit(commands: ptr, m: *Meter, from: ptr, from_level: int, fw: int, fh: int, to_
 offset_of_src_far() -> int { return sizeof(VkImageSubresourceLayers) + sizeof(VkOffset3D) }
 offset_of_dst_far() -> int { return 2 * sizeof(VkImageSubresourceLayers) + 3 * sizeof(VkOffset3D) }
 
-// Recorded after the frame's last pass: the finished image into the chain,
-// halved level by level, the last level into this frame's buffer. A
-// windowed frame's image is moved from presenting to transfer-source and
-// back; an offscreen frame's already is transfer-source.
+// Recorded after the frame's last pass: the light the composite read into
+// the chain, halved level by level, the last level into this frame's
+// buffer. The light is a post texture, readable by a shader between
+// passes: moved to transfer-source for the blit and back.
 @c_callback("ae3d_vkmeter_record")
 record_hook(context: ptr) {
     m = meter()
-    if !m.on || !vkframe.frame_copyable() { return }
-    frame_w = vkframe.frame_width()
-    frame_h = vkframe.frame_height()
-    if m.image == null || m.width != half(frame_w) || m.height != half(frame_h) || m.device != vkdevice.device() {
-        if !make_meter(m) { return }
+    source_texture = vkframe.composited()
+    if !m.on || source_texture == 0 { return }
+    source = vktexture.image_of(source_texture)
+    source_w = vktexture.width_of(source_texture)
+    source_h = vktexture.height_of(source_texture)
+    if m.image == null || m.source_width != source_w || m.source_height != source_h || m.device != vkdevice.device() {
+        if !make_meter(m, source_w, source_h) { return }
     }
     commands = vkframe.frame_commands()
     slot = vkframe.frame_slot()
-    source = vkframe.frame_image()
-    offscreen = vkframe.frame_offscreen()
-    if !offscreen {
-        barrier(commands, source, 0, vk.IMAGE_LAYOUT_PRESENT_SRC_KHR, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                0, vk.ACCESS_TRANSFER_READ_BIT, vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)
-    }
+    read = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    barrier(commands, source, 0, read, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            0, vk.ACCESS_TRANSFER_READ_BIT, vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
     // After the last frame's blits read the levels this one writes, not
     // merely after nothing (#410).
     barrier(commands, m.image, 0 - 1, vk.IMAGE_LAYOUT_UNDEFINED, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             0, vk.ACCESS_TRANSFER_WRITE_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT)
-    blit(commands, m, source, 0, frame_w, frame_h, 0, m.width, m.height)
+    blit(commands, m, source, 0, source_w, source_h, 0, m.width, m.height)
     w = m.width
     h = m.height
     level = 1
@@ -317,27 +319,52 @@ record_hook(context: ptr) {
     free(region as ptr)
     memory_barrier(commands, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_HOST_BIT,
                    vk.ACCESS_TRANSFER_WRITE_BIT, vk.ACCESS_HOST_READ_BIT)
-    if !offscreen {
-        back = calloc(1, sizeof(VkImageMemoryBarrier)) as *VkImageMemoryBarrier
-        back.sType = vk.STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
-        back.oldLayout = vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-        back.newLayout = vk.IMAGE_LAYOUT_PRESENT_SRC_KHR
-        back.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
-        back.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
-        back.image = source
-        back.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
-        back.subresourceRange.levelCount = 1
-        back.subresourceRange.layerCount = 1
-        back.srcAccessMask = vk.ACCESS_TRANSFER_READ_BIT
-        vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                                0, 0, null, 0, null, 1, back as ptr)
-        free(back as ptr)
-    }
+    // Back to readable, before the next frame's passes read it or draw over
+    // it.
+    back = calloc(1, sizeof(VkImageMemoryBarrier)) as *VkImageMemoryBarrier
+    back.sType = vk.STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+    back.oldLayout = vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+    back.newLayout = read
+    back.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    back.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    back.image = source
+    back.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    back.subresourceRange.levelCount = 1
+    back.subresourceRange.layerCount = 1
+    back.srcAccessMask = 0
+    back.dstAccessMask = vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+    vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_TRANSFER_BIT,
+                            vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT | vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            0, 0, null, 0, null, 1, back as ptr)
+    free(back as ptr)
     (m.written as int[])[slot] = 1
+    (m.exposures as float[])[slot] = vkframe.frame_exposure()
 }
 
-// This frame slot's measurement, its fence having passed: the mean linear
-// luminance of the last level's texels and the share of them near white.
+// A half float's value. Infinity is the largest a half holds; a texel that
+// is not a number is taken as black, which is what the composite's clamp
+// makes of it.
+half_float(texels: ptr, at: int) -> float {
+    bits = mem.get_uint8(texels, at) | (mem.get_uint8(texels, at + 1) << 8)
+    exponent = (bits >> 10) & 31
+    fraction = bits & 1023
+    value = 0.0
+    if exponent == 0 {
+        value = ldexp(fraction as float, 0 - 24)
+    } else if exponent == 31 {
+        if fraction != 0 { return 0.0 }
+        value = 65504.0
+    } else {
+        value = ldexp((fraction + 1024) as float, exponent - 25)
+    }
+    if (bits & 32768) != 0 { return 0.0 - value }
+    return value
+}
+
+// This frame slot's measurement, its fence having passed: each texel of the
+// last level as it showed -- its light times the exposure it was drawn at,
+// through the tone curve -- and the mean linear luminance of those and the
+// share of them near white.
 @c_callback("ae3d_vkmeter_collect")
 collect_hook(context: ptr) {
     m = meter()
@@ -350,14 +377,14 @@ collect_hook(context: ptr) {
     written[slot] = 0
     count = m.small_width * m.small_height
     if count <= 0 { return }
-    table = m.linear as float[]
+    e = (m.exposures as float[])[slot]
     sum = 0.0
     white = 0
     i = 0
     while i < count {
-        at = i * 4
-        luma = 0.2126 * table[mem.get_uint8(texels, at)] + 0.7152 * table[mem.get_uint8(texels, at + 1)] +
-               0.0722 * table[mem.get_uint8(texels, at + 2)]
+        at = i * TEXEL
+        luma = 0.2126 * core.aces_of(e * half_float(texels, at)) + 0.7152 * core.aces_of(e * half_float(texels, at + 2)) +
+               0.0722 * core.aces_of(e * half_float(texels, at + 4))
         sum = sum + luma
         if luma > NEAR_WHITE { white = white + 1 }
         i = i + 1
@@ -378,8 +405,6 @@ set_on(on: bool) {
     m.on = on
     if on && !m.hooked {
         m.hooked = true
-        // Recorded before the overlay is drawn, so a menu over the scene
-        // does not set the scene's exposure.
         vkframe.add_hooks(vkframe.STAGE_MEASURE, (&ae3d_vkmeter_record) as ptr, (&ae3d_vkmeter_collect) as ptr,
                           (&ae3d_vkmeter_release) as ptr, null)
     }

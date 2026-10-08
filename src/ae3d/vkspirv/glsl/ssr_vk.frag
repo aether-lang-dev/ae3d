@@ -53,7 +53,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float reflectivity;
     float wetness;
-    float frameExposure;
     bool hasNormalMap;
     float normalStrength;
     float occlusionStrength;
@@ -76,13 +75,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableGlobalIllumination;
     float giIntensity;
     int giBounces;
-    bool enableBloom;
-    float bloomThreshold;
-    float bloomIntensity;
     bool enableFog;
     float fogStart;
     float fogEnd;
-    vec3 fogColor;
+    vec3 fogRadiance;
     float fogIntensity;
     bool enableShadows;
     bool hasShadowMap;
@@ -135,9 +131,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float skyOvercast;
     vec3 skyOvercastColor;
     vec2 texelSize;
+    float frameExposure;
+    bool enableBloom;
+    float bloomThreshold;
+    float bloomIntensity;
     float edgeThreshold;
     float edgeThresholdMin;
     float subpixelQuality;
+    int colorSampleCount;
     mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
@@ -262,18 +263,26 @@ void main() {
 
     vec3 P = worldFromDepth(TexCoords);
     // Only the flat wet surface reflects; everything else is left as it was.
-    if (abs(P.y - ssrRoadHeight) > 0.06) { FragColor = vec4(scene, 1.0); return; }
+    // A multisampled frame's depth is a sample's, not the pixel centre's
+    // (the nearest sample on Vulkan, whichever the driver blits on OpenGL),
+    // so on a road seen at a slant the height rebuilt from it is off by up
+    // to what one pixel spans there: the angle a pixel subtends times the
+    // distance. That, past a few centimetres, is still the road.
+    vec2 texel = 1.0 / vec2(textureSize(depthTexture, 0));
+    vec4 here = invViewProjection * vec4(TexCoords * 2.0 - 1.0, 0.0, 1.0);
+    vec4 next = invViewProjection * vec4((TexCoords + texel) * 2.0 - 1.0, 0.0, 1.0);
+    float pixelAngle = length(normalize(next.xyz / next.w - viewPos) - normalize(here.xyz / here.w - viewPos));
+    float tolerance = 0.06 + distance(viewPos, P) * pixelAngle;
+    if (abs(P.y - ssrRoadHeight) > tolerance) { FragColor = vec4(scene, 1.0); return; }
 
     vec3 V = normalize(P - viewPos);
     vec3 R = reflect(V, vec3(0.0, 1.0, 0.0));
-    // Water is a dielectric: little straight down, most of the light at a
-    // grazing look. The mirror the road was is what a camera looking down
-    // at it never sees. The base is well above water's 0.02 because the
-    // frame is display values: a lamp a thousand times brighter than the
-    // tarmac is white in it, and two percent of white is nothing, where two
-    // percent of the lamp is the streak every wet street has.
+    // Water is a dielectric: two percent straight down, most of the light at
+    // a grazing look. The frame is radiance, so a lamp in it is the thousand
+    // times brighter than the tarmac it is, and two percent of it is the
+    // streak every wet street has.
     float cosLook = clamp(-V.y, 0.0, 1.0);
-    float fresnel = 0.25 + 0.75 * pow(1.0 - cosLook, 5.0);
+    float fresnel = 0.02 + 0.98 * pow(1.0 - cosLook, 5.0);
     float pool = puddle(P.xz);
     float wet = mix(0.6, 1.0, pool);
     float rough = mix(0.35, 0.02, pool);
@@ -326,11 +335,10 @@ void main() {
         stepLen *= 1.05;
     }
 
-    // Add only the reflection's *excess* brightness -- the lamps and lit
-    // windows mirrored on the wet tarmac -- and never subtract. Reflecting the
-    // dark night sky then costs nothing, so a wet road gains its bright streaks
-    // without the surface going dark, which is both the look and a change the
-    // numbers can only read as more light where a light is mirrored.
-    vec3 glint = max(hit - scene, vec3(0.0));
-    FragColor = vec4(scene + ssrStrength * fresnel * wet * edgeFade * glint, 1.0);
+    // The mirrored light, added where a ray found something: the frame is
+    // light, so a lamp mirrored at two percent is the streak a wet street has
+    // and a dim facade a faint image of itself, and nothing is subtracted --
+    // a ray that finds nothing (the open sky) adds nothing, so the road never
+    // goes dark for being wet.
+    FragColor = vec4(scene + ssrStrength * fresnel * wet * edgeFade * hit, 1.0);
 }

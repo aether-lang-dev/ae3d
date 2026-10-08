@@ -61,7 +61,8 @@ The feature list in full, with the reasoning behind each. The [README](../README
   both backends), the key light's shadow in four cascades that a moving camera does not
   move ([Shadows](#shadows), both
   backends), volumetric clouds and their shadows, a sky drawn from the sun by
-  the hour or a painted one, fog applied after tone mapping and the key
+  the hour or a painted one, fog mixed in as light before the frame's one
+  tone curve and the key
   lamp's light scattered in the fogged air (the haze stands around a lamp
   and thins away from it, marched along the view ray; both backends,
   `rendering.set_frame_haze`), MSAA, FXAA and bloom. Screen-space
@@ -72,9 +73,11 @@ The feature list in full, with the reasoning behind each. The [README](../README
   the road's own metres: still water in the puddles mirrors sharply, the
   damp tarmac between them dimmer and blurred by a cone over the distance
   the ray travelled (eight taps on a disc turned per pixel). The base
-  reflectance sits above water's 0.02 because the frame is display values:
-  a lamp is white in it, and two percent of white is nothing where two
-  percent of the lamp is the streak every wet street has. The critique
+  reflectance is water's 0.02: the frame is light, so a lamp is the thousand
+  times its tarmac it is, and two percent of it is the streak every wet
+  street has. Which pixels are the road is read from the depth with a
+  tolerance of what one pixel spans there, since a multisampled frame's
+  depth is a sample's and not the pixel centre's. The critique
   counts the reflection as the share of the road band the mirrored scene
   lifts by a visible step (13.6% in the street, wanted 5%), not as cells
   that go white -- the mirror did that; a wet road does not. One pass on
@@ -90,8 +93,9 @@ The feature list in full, with the reasoning behind each. The [README](../README
   as one physically based surface: Schlick fresnel between the body of the
   water and the reflected sky (the scene's own skybox image, where it has
   one), GGX glitter from the sun, light through the crests, whitecaps on the
-  steep faces, ripples finer than the mesh from scrolling noise slopes, tone
-  mapped and fogged the same way as the shore beside it. The shore itself
+  steep faces, ripples finer than the mesh from scrolling noise slopes,
+  fogged the same way as the shore beside it and tone mapped with the rest
+  of the frame. The shore itself
   comes from the scene's depth, captured after the opaque pass on both
   backends: shallows go clear over the sand and a foam line runs along the
   waterline. From underneath, the
@@ -234,14 +238,36 @@ The frame the cone draws differs from the tree before's by what the tree
 before differs from itself run to run (mean 0.11 and 0.09 of 255, both
 along the lit windows' edges).
 
+### Light and the frame
+
+The scene is drawn as light, into half floats (RGBA16F on both backends),
+and becomes a picture once, in the composite: the frame's exposure, the
+bloom, the ACES curve (Narkowicz's fit), the exact sRGB encoding and half
+a step of dither so a dark gradient is grain and not bands. Everything
+before it works in light: the multisample resolve weighs each sample by
+how bright it shows (Karis), so a lamp at an edge does not alias as hard
+as one sample would; the reflection adds two percent of a lamp, not of
+white; the temporal pass clamps in the same weighting. FXAA, when it is
+on, runs after the composite over what shows. Colour textures are stored
+sRGB and sampled as light, data textures (normal maps, masks, the pose
+bank, the clouds' noise) as their bytes. Colours given as they should
+look -- the clear colour, the fog, the sky, the overcast -- are taken
+back through the curve to the light that shows as them
+(`core.display_radiance`), so a fog of mid grey still shows mid grey at an
+exposure of one. A capture channel passes through the composite
+untouched: the surfaces' own numbers. `tests/test_hdr` holds both
+backends to these, the curve's numbers against the frame's pixels.
+
 ### Motion vectors
 
 Beside its colour, every scene draw writes where its pixel's surface was
 last frame: a second colour attachment of the scene pass (R16G16, texture
 space, this frame's unnudged position less last frame's; multisampled and
-resolved like the colour on Vulkan, a second draw buffer of the post
-framebuffers on OpenGL), cleared to zero, so a pixel nothing drew has not
-moved. The vertex stage carries the vertex's clip position now and then:
+resolved by the scene pass on Vulkan, a second draw buffer of the post
+framebuffers on OpenGL resolved by a blit), cleared to zero, so a pixel
+nothing drew has not moved. Every surface writes it before any branch of
+its shader returns, and it is never blended: a vector is a surface's, not
+a mix. The vertex stage carries the vertex's clip position now and then:
 a model from its own matrix of last frame (`model_frame_done` keeps it at
 every frame's end) and the last frame's view-projection, unjittered; a
 merged batch or an instance stream, which carries no history, from the
@@ -472,7 +498,8 @@ DLSS reconstructs from, and with no multisampling, since a resolved sample
 has none of that detail left -- and DLSS makes the frame from the scene's
 colour, its resolved depth and its motion vectors, in the temporal pass's
 place, with the same nudged projection (more phases: eight times the
-square of the scale). The composite samples what it wrote.
+square of the scale). The colour it is handed is the scene's light, so it
+is told the buffers are HDR; the composite tones what it wrote.
 
 How it is wired (`native/dlss/streamline.cpp`, C++ against the SDK's headers,
 behind the C surface of `native/dlss/streamline.h`): the Streamline runtime is
@@ -510,8 +537,11 @@ and a temporal pass folds each frame into a history: each pixel's motion
 vector says where its surface was on the screen last frame -- the
 camera's motion, the model's, the figure's walk -- and the history read
 there is held to the range of colours the pixel's neighbourhood has this
-frame, so what the vector does not know of trails no ghost. An edge that
-was a staircase is a ramp, and the shading's own aliasing goes with it.
+frame, so what the vector does not know of trails no ghost. The history
+is clamped and blended with each colour over one plus how bright it shows
+(Karis), so a lamp hundreds of times its neighbours does not decide every
+pixel it reaches. An edge that was a staircase is a ramp, and the
+shading's own aliasing goes with it.
 On both backends; the pass runs between the reflection and the composite,
 and the two history textures are written in turn.
 
@@ -524,18 +554,23 @@ next scene all over again (#378). With `engine_set_eye_adaptation(e, true)`
 (`AE3D_EYE=1` for any program) the renderer measures what it drew and the
 frame's exposure is steered from it, the way an eye adapts:
 
-- the measure: the finished frame blitted into a texture and mip-chained
-  down to 320 texels across (OpenGL: a blit and `glGenerateMipmap`; Vulkan:
-  a blit chain after the last pass), read back two frames late through a
-  ring of buffers, so nothing waits on the frame just drawn -- its mean
-  linear luminance and the share of it near white;
+- the measure: the light the composite read -- before the frame's exposure
+  and tone curve -- blitted into a half-float texture and mip-chained down
+  to 320 texels across (OpenGL: a blit and `glGenerateMipmap`; Vulkan: a
+  blit chain after the composite), read back two frames late through a
+  ring of buffers, so nothing waits on the frame just drawn; each texel
+  then taken through the exposure its frame was drawn at and the tone
+  curve, for the frame's mean linear luminance as it showed and the share
+  of it near white (light averages where shown values do not, so the
+  halving is of the light);
 - the steering (`ae3d.exposure`, arithmetic a test drives by numbers): part
   of the way toward a mid-grey key (a night street stays night), down half a
   stop for every doubling of the near-white share past 0.2% of the frame,
   never up while lamps or a lit face are in view, faster down (0.4 s) than
   up (1.2 s), between two stops under and one and a half over;
-- the result, `frameExposure`, multiplies every material's exposure before
-  the tone curve, in the default shader and the sea's.
+- the result, `frameExposure`, scales the scene's light in the composite,
+  before the tone curve; the resolve and the temporal pass weigh brightness
+  by it too.
 
 The street's chase frame, 240 frames in, 1280x720:
 

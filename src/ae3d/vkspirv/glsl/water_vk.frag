@@ -53,7 +53,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float reflectivity;
     float wetness;
-    float frameExposure;
     bool hasNormalMap;
     float normalStrength;
     float occlusionStrength;
@@ -76,13 +75,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableGlobalIllumination;
     float giIntensity;
     int giBounces;
-    bool enableBloom;
-    float bloomThreshold;
-    float bloomIntensity;
     bool enableFog;
     float fogStart;
     float fogEnd;
-    vec3 fogColor;
+    vec3 fogRadiance;
     float fogIntensity;
     bool enableShadows;
     bool hasShadowMap;
@@ -135,9 +131,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float skyOvercast;
     vec3 skyOvercastColor;
     vec2 texelSize;
+    float frameExposure;
+    bool enableBloom;
+    float bloomThreshold;
+    float bloomIntensity;
     float edgeThreshold;
     float edgeThresholdMin;
     float subpixelQuality;
+    int colorSampleCount;
     mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
@@ -238,7 +239,7 @@ layout(location = 2) in vec3 fragPosition;
 
 
 
-// Configurable fog parameters
+// The scene's haze, the same as the default shader's (fogRadiance is light).
 
 
 
@@ -539,16 +540,24 @@ void waveField(vec2 p, float t, float dist, out vec3 normal, out vec3 swell,
     steep = clamp(length(vec2(dhx, dhz)) / max(slopeMax * 0.5, 0.0001), 0.0, 1.0);
 }
 
-// The frame's exposure, as the default shader has it.
-
-
-vec3 ACESFilm(vec3 x) {
-    float a = 2.51;
-    float b = 0.03;
-    float c = 2.43;
-    float d = 0.59;
-    float e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+// Colours the scene is given as they show -- a sky, a horizon, a fog -- and
+// the radiance that shows as them: the frame's tone curve (ACES, then the
+// sRGB encoding) taken back, so a colour drawn as radiance appears as it
+// was given at an exposure of one. The curve and its inverse are the post
+// pass's and core.display_radiance's; the three must stay the same curve.
+float srgb_decode(float c) {
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+float aces_inverse(float y) {
+    // ACES fitted (Narkowicz): y = x(ax + b) / (x(cx + d) + e), solved for x.
+    y = clamp(y, 0.0, 0.9999);
+    float a = 2.51 - 2.43 * y;
+    float b = 0.03 - 0.59 * y;
+    return (-b + sqrt(b * b + 4.0 * a * 0.14 * y)) / (2.0 * a);
+}
+vec3 display_radiance(vec3 shown) {
+    vec3 c = clamp(shown, 0.0, 1.0);
+    return vec3(aces_inverse(srgb_decode(c.r)), aces_inverse(srgb_decode(c.g)), aces_inverse(srgb_decode(c.b)));
 }
 
 // A stored scene depth as clip-space z: OpenGL keeps depth in 0..1 for a
@@ -574,7 +583,8 @@ float water_below(vec3 fragmentPos, vec3 eye) {
 // it, read as the equirect the skybox shader reads, or the two sky colours
 // graded from horizon to zenith when the scene has no image.
 // The overcast over a sky colour, the pull the sky shader makes: toward a
-// flat cast at the sky's own brightness. In display space, as the sky is.
+// flat cast at the sky's own brightness. In display space, as the sky is
+// given; display_radiance makes it light.
 vec3 overcastSky(vec3 shown) {
     if (skyOvercast <= 0.0) return shown;
     float luma = dot(shown, vec3(0.299, 0.587, 0.114));
@@ -589,10 +599,10 @@ vec3 reflectedSky(vec3 ray) {
         vec3 shown = textureLod(textureSampler,
                                 vec2((theta + 3.14159265) / 6.28318531,
                                      (phi + 1.57079633) / 3.14159265), 0.0).rgb;
-        return pow(overcastSky(shown), vec3(2.2));
+        return display_radiance(overcastSky(shown));
     }
-    vec3 zenith = pow(overcastSky(skyColor), vec3(2.2));
-    vec3 rim = pow(overcastSky(horizonColor), vec3(2.2));
+    vec3 zenith = display_radiance(overcastSky(skyColor));
+    vec3 rim = display_radiance(overcastSky(horizonColor));
     return mix(rim, zenith, smoothstep(0.0, 0.35, ray.y));
 }
 
@@ -657,10 +667,11 @@ void main() {
     float mirror = enableWaterReflection ? clamp(waterReflectionIntensity, 0.0, 1.0) : 0.0;
 
     // Everything below is radiance in the scene shader's units: the sun's
-    // colour times its intensity, tone mapped and gamma-corrected at the
-    // end the way the terrain beside the water is, so the two agree.
+    // colour times its intensity, and the sky's light as the sky is drawn,
+    // tone mapped by the post pass with the terrain beside the water, so
+    // the two agree.
     vec3 sun = lightColor * lightIntensity;
-    vec3 skyLight = pow(overcastSky(skyColor), vec3(2.2));
+    vec3 skyLight = display_radiance(overcastSky(skyColor));
 
     // The sun's glitter: GGX, the surface a little rougher far off so the
     // highlight there is a path of light and not a scatter of aliased points.
@@ -720,13 +731,11 @@ void main() {
     float gpuGemsCaustics = generateCaustics(fragPosition, time);
     finalColor += gpuGemsCaustics * sun * 0.1;
 
-    finalColor = pow(ACESFilm(finalColor * frameExposure), vec3(1.0 / 2.2));
-
-    // The air between the eye and the surface, after the tone curve, the
-    // same as the scene shader does it, so the sea and the shore fade alike.
+    // The air between the eye and the surface, as the scene shader has it,
+    // so the sea and the shore fade alike.
     if (enableFog) {
         float haze = smoothstep(fogStart, fogEnd, distanceFromCamera) * fogIntensity;
-        finalColor = mix(finalColor, fogColor, clamp(haze, 0.0, 1.0));
+        finalColor = mix(finalColor, fogRadiance, clamp(haze, 0.0, 1.0));
     }
 
     // The shore. Where the ground is close under the surface the water goes
@@ -739,7 +748,7 @@ void main() {
         float wash = 1.0 - smoothstep(0.0, max(waterShoreFoam, 0.01), below);
         float lace = 0.5 + 0.5 * noise(fragPosition.xz * rippleFreq * 0.8 + rippleTime * 0.3);
         float shoreFoam = wash * wash * lace * 0.9;
-        vec3 shoreLit = pow(vec3(0.9) * (sun * 0.5 * max(lightDir.y, 0.0) + skyLight * 0.6), vec3(1.0 / 2.2));
+        vec3 shoreLit = vec3(0.9) * (sun * 0.5 * max(lightDir.y, 0.0) + skyLight * 0.6);
         finalColor = mix(finalColor, shoreLit, clamp(shoreFoam, 0.0, 1.0));
         foam = max(foam, shoreFoam);
     }
@@ -762,15 +771,18 @@ void main() {
         // reflects the water's own colour back, and the swell's normals
         // sweep that boundary about, which is what says "waves" from
         // underneath. The tint deepens with the diver's depth.
-        vec3 through = mix(skyColor, waterBaseColor, 0.35);
+        // The sky through it as light, and the water's own colour as it is:
+        // a reflectance lit by that sky.
+        vec3 skyThrough = display_radiance(overcastSky(skyColor));
+        vec3 through = mix(skyThrough, waterBaseColor * skyThrough, 0.35);
         // Softened: the field's every ripple would flip the window between
         // sky and water, and the underside became a hard two-tone print.
         vec3 under = normalize(mix(vec3(0.0, 1.0, 0.0), norm, 0.35));
         float overhead = clamp(dot(under, -viewDir), 0.0, 1.0);
         float window = smoothstep(0.15, 0.75, overhead);
-        vec3 underside = mix(waterBaseColor * 0.55, through, window);
+        vec3 underside = mix(waterBaseColor * skyThrough * 0.55, through, window);
         float deep = clamp(underwaterDepth * 0.0025, 0.0, 0.5);
-        finalColor = mix(underside, waterBaseColor * 0.5, deep);
+        finalColor = mix(underside, waterBaseColor * skyThrough * 0.5, deep);
         // The sun through the surface: a glitter where the swell's normals
         // point it at the eye, and the caustic web on the underside.
         vec3 refracted = normalize(reflect(-viewDir, under));
@@ -783,10 +795,10 @@ void main() {
         // on it fade into -- a fade to 0.4x the water colour was a dark band
         // along the horizon under a sea that was otherwise one colour.
         float underwaterFog = clamp(distanceFromCamera * 0.0002, 0.0, 0.85);
-        vec3 murk = waterBaseColor * 0.4;
+        vec3 murk = waterBaseColor * skyThrough * 0.4;
         if (enableFog) {
             underwaterFog = smoothstep(fogStart, fogEnd, distanceFromCamera) * fogIntensity;
-            murk = fogColor;
+            murk = fogRadiance;
         }
         finalColor = mix(finalColor, murk, underwaterFog);
     }
