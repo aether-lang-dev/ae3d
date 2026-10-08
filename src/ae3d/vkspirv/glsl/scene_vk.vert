@@ -28,6 +28,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     mat4 prevViewProjection;
     bool isSkinned;
     mat4 bones[96];
+    vec4 prevBoneRows[288];
     int clipJoints0;
     int clipJoints1;
     int clipJoints2;
@@ -221,9 +222,7 @@ layout(location = 12) in vec2 inMaskUV;  // the second UV set (#544), (-1, -1) f
 
 
 // Last frame's, for the motion vectors: the model's matrix as it was and
-// the view-projection without its jitter. A skinned draw's previous pose
-// is not carried (a second palette is the uniform budget over); its
-// motion is its model's and the camera's.
+// the view-projection without its jitter.
 
 
 
@@ -234,6 +233,18 @@ layout(location = 12) in vec2 inMaskUV;  // the second UV set (#544), (-1, -1) f
 // rasteriser actually gives.
 
 
+// The palette as last frame drew it (#639), for the motion vectors: each
+// bone's matrix's top three rows (its bottom one is 0 0 0 1), three to a
+// bone (skin.BONE_ROWS), which keeps both palettes inside the budget two
+// whole ones were over. Without it, a limb that swung 20 cm in a frame
+// read as still, and the temporal pass smeared it into a ghost of where it
+// had been.
+
+
+mat4 prevBone(float joint) {
+    int j = int(joint + 0.5) * 3;
+    return transpose(mat4(prevBoneRows[j], prevBoneRows[j + 1], prevBoneRows[j + 2], vec4(0.0, 0.0, 0.0, 1.0)));
+}
 
 layout(location = 0) out vec2 fragTexCoord;
 layout(location = 1) out vec3 Normal;
@@ -305,12 +316,18 @@ void main() {
     }
 
     vec4 posed = vec4(inPosition, 1.0);
+    vec4 posedPrev = posed;
     vec3 posedNormal = inNormal;
     if (isSkinned) {
         mat4 skin = inWeights.x * bones[int(inJoints.x)]
                   + inWeights.y * bones[int(inJoints.y)]
                   + inWeights.z * bones[int(inJoints.z)]
                   + inWeights.w * bones[int(inJoints.w)];
+        mat4 skinPrev = inWeights.x * prevBone(inJoints.x)
+                      + inWeights.y * prevBone(inJoints.y)
+                      + inWeights.z * prevBone(inJoints.z)
+                      + inWeights.w * prevBone(inJoints.w);
+        posedPrev = skinPrev * posed;
         posed = skin * posed;
         posedNormal = mat3(skin) * inNormal;
     }
@@ -339,7 +356,7 @@ void main() {
     // Final vertex position
     FragPosLightSpace = lightSpaceMatrix * vec4(FragPos, 1.0);
     ClipNow = viewProjection * modelMatrix * posed;
-    ClipPrev = prevViewProjection * prevModelMatrix * posed;
+    ClipPrev = prevViewProjection * prevModelMatrix * posedPrev;
     gl_Position = ClipNow;
 }
 

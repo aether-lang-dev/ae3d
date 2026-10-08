@@ -37,6 +37,32 @@ of stopping dead. The same change takes the fox's largest step in any frame
 to 6.7 units and 12.5 degrees, inside the clips' own. 0.4 s after a 0.3 s
 change, the pose is Run's own to within 1e-7.
 
+The offsets ride on the clip's own pose, which the figure keeps each frame
+before they go on (#650). A node the clip does not key starts the next
+frame from that pose, if nothing else has moved it since the figure drew
+it. Before, the next frame's offset went on top of last frame's sum: a
+clip keying only turns, blended in, pulled the limbs metres off within a
+second and kept them there. The figure also counts as drawn in its rest
+pose until a clip plays, so a first blend carries on from that pose
+rather than from zero. A node another writer moved, such as the rig's root
+carried by a ragdoll getting up, is left where that writer put it.
+
+## Clips made at run time
+
+`figure.add_clip(f, animation, clip, node)` gives a figure a clip made at
+run time: captured, retargeted onto its rig, or generated (#645). It goes
+in one `anim` clip a node, each named `"<animation>:<node>"` as the file's
+are. Added, it is counted and named with the file's clips, and played,
+blended, layered and matched by its name. The figure frees it with
+itself. A clip not so named, or a node the figure does not have, is
+refused.
+
+`tests/test_runtime_clip.ae` builds "Turns" on the Fox, turns only, from
+each bone's rest to a quarter radian on. Blended in over 0.3 s from Walk
+and from the rest pose, it comes to the cut's pose within 1 mm, and no
+bone's distance from its parent changes by more than 1 mm. Before #650,
+the blend from the rest pose ended 474 m off the cut's.
+
 ## Layers
 
 On top of the clip and its transition:
@@ -285,6 +311,22 @@ with its momentum, steps and capped turn.
 where the body is, how it moves and what is asked of it. It searches and
 plays and paces the clip, but moves nothing and leaves the figure for the
 engine to advance.
+
+A game whose own animator poses the figure asks instead (#636):
+
+```aether
+if matching.answer(m, at, velocity, wanted, heading, clock, delta) {
+    // play matching.playing_clip(m) from matching.playing_time(m)
+}
+// at matching.pace(m)
+```
+
+`answer` is told the same as `follow`, plus `clock`, how far the animator
+is into the clip it answered last. It searches when due and plays and
+moves nothing. It returns true when the answer is a change. Clips made at
+run time enter the database once they are the figure's (`figure.add_clip`).
+`tests/test_matching.ae` answers a walk to a body walking, at a pace of
+0.52 to 1, and the figure stays on the frame it was given.
 
 `tests/test_locomotion.ae` runs its whole script both ways, to the same
 checks:

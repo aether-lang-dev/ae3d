@@ -43,7 +43,7 @@ The first version drove joint springs instead. A spring's stiffness is relative 
 
 **Balance.** The pelvis alone is held upright from outside, by an anchor capped at 1,200 N·m. This is the balance a standing figure keeps, and what a blow past it overcomes. It holds the figure upright but lets it turn about the vertical. The value was measured: at 600 N·m the figure couldn't hold itself up on its capsule feet, and at 2,500 N·m not even a 400 N·s blow felled it. The balance controller that steps to catch a fall replaces this in a later slice.
 
-**Strength and hits.** `set_strength(body, s)` scales every budget (0 is limp, 1 full strength). `hit(body, bone, point, impulse)` applies the blow and takes 95% of the struck bone's budget and half of its neighbours'. It comes back over `set_recovery` seconds (0.8 by default), so a shoulder shot drops the arm and the arm comes back up.
+**Strength and hits.** `set_strength(body, s)` scales every budget (0 is limp, 1 full strength). `hit(body, bone, point, impulse)` applies the blow and takes a share of the struck bone's budget, and half that share of its neighbours'. By default the share is the speed the blow gives the struck bone over 1.6 m/s, capped at 95%: a bullet in an arm (8 N·s on a 4.9 kg arm) takes all of it. A game that knows what struck passes the share itself, `hit(body, bone, point, impulse, true, cost)`. A punch to the head moves it hard and should cost a little: 0.1 takes 9.5% of the neck's muscle, where the default takes 95%. It comes back over `set_recovery` seconds (0.8 by default), so a shoulder shot drops the arm and the arm comes back up.
 
 ## The protective fall
 
@@ -300,8 +300,39 @@ reference pose against the anchors' 5 Hz: a healthy arm held up ahead
 trailed its clip by 0.14 rad, and an arm taken back stopped 0.25 short.
 Springs off instead, an arm sagged from its keys through a get-up, and
 when the figure went `POWERED` at the end it snapped up 8 degrees a step.
-A `POWERED` part on an `ANIMATED` figure, and a limp part drawn during a
-get-up, are not there yet.
+
+**A `POWERED` part on an `ANIMATED` figure** (#658) is on its own muscles
+while the rest walks its clip:
+- the part's bodies, and every body hanging from them, lose their anchors;
+- each joint's motor drives it toward the clip's turn there, within the
+  bone's muscle, as a `POWERED` figure's joints are; the clip's turn is
+  handed to physics in the pose phase, before the bone is drawn over it;
+- `hit` pushes the part and the muscle brings it back, while the pelvis
+  and the legs stay on the clip;
+- it is drawn as its joints bend, from its parent as drawn. Drawn in the
+  world from its bodies instead, the chest carried the anchored pelvis's
+  sag up to the head, 2 cm aside;
+- given back to `ANIMATED`, it is drawn back to its clip over 0.3 s, as
+  from limp.
+
+The bones hanging from the part go on their muscles with it: held to the
+clip by world anchors, the arms would hold a swaying chest where the clip
+had it. A heavier blow can still take the whole figure `POWERED`.
+
+`tests/test_part_powered.ae` stands the pipeline's rig on its clip, spine
+and head `POWERED`, and jabs it in the face, 20 N·s at a cost of 0.1:
+
+| | Measured |
+|---|---|
+| standing on its muscles | the head drawn 0.001 cm from the clip's |
+| jabbed | the head drawn back 3.3 cm, the pelvis on its clip, the figure `ANIMATED` (no part powered: 0 cm) |
+| 0.9 s on | the head 0.013 cm from where it stood |
+| given back | no step over 0.001 cm; the clip's to 1 mm |
+
+How far the head goes hardly depends on what the blow costs (3.6 cm at a
+cost of 0.6). A muscle here is a velocity servo, rigid within its torque,
+and real muscle gives more (#661). A limp part drawn during a get-up is not
+there yet.
 
 ## On a figure
 
