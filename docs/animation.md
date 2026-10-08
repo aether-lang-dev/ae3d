@@ -192,6 +192,10 @@ feet.ground_height(f, height_fn, state)    // or a function of x and z
 - **Locking.** A foot the clip has set down (low and slow) is locked where
   it was set, whatever the body does over it, until the clip lifts it. It
   is then let go over 0.15 s. No hand-made contact labels are needed.
+  Held, and while it is let go, it stands on the ground under where it is,
+  not under the clip's ankle: a walker going along the plaza's kerb with a
+  foot held on it had that foot posed at the road's height, 15 cm down
+  inside the kerb, once the clip's ankle had passed the kerb's edge.
 
 `set_weight` eases it out while the figure is in the air or ragdolled.
 
@@ -203,7 +207,11 @@ feet.ground_height(f, height_fn, state)    // or a function of x and z
 - stood on a 20 cm kerb with one foot off, that foot reaches the road and
   the pelvis comes down 20 cm, 1 cm a frame at most;
 - a planted foot moves 2 mm while the body walks 6 cm over it, and is let
-  go when the clip lifts it.
+  go when the clip lifts it;
+- a foot set down on a 15 cm kerb 3 cm in from its edge stays on the kerb's
+  top (to 1 cm; 2.5e-16 m now) while the body moves 6 cm on off it, the
+  clip's ankle 3 cm past the edge. Before, it was posed 15 cm down, inside
+  the kerb.
 
 ## A figure under a player's hand
 

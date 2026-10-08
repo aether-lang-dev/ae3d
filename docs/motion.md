@@ -137,10 +137,16 @@ Which foot moves:
 - **Pushed forward:** the foot further behind swings through.
 - **Pushed sideways:** the foot on that side steps out. Swinging the other
   across it only tangled the legs.
-- **Pushed back:** it doesn't step. The reference ragdoll's hips hardly
-  extend (their cone sits forward of the leg), so a step back was too short
-  to catch anything and took a foot from under a figure its balance would
-  have held.
+- **Pushed back:** it shifts its weight onto the stance foot first (0.12
+  s, #578), then steps back. Pushed onto its heels, a figure stands on both
+  feet, and a step back taken at once lifted neither. While the stagger
+  goes mostly back (its backward speed over half its speed), the trunk
+  bends forward over the hips, as a person's does stepping back: 0.2 rad
+  at the chest and half that at the lower spine for each m/s it goes back,
+  at most 0.2 (#642). Upright over its steps, the body's mass stayed over
+  its heels and each step back landed short of a capture point still
+  running away. The bend is let go once the stagger no longer goes back,
+  and the moment the figure falls.
 - **A push past two strides:** that's a fall, and the protective fall has
   it. At a stride and a half, the first step waited for the capture point
   to come back within reach (0.28 s after a 330 N·s shove), and the figure
@@ -170,7 +176,14 @@ How far each way holds:
   first. Catch steps that cross or close the feet are #481: tried, quicker
   steps and a closing step did not catch more, against a hip that turns 30
   degrees.
-- **Backward:** 150 N·s either way.
+- **Backward:** the box man shoved from in front at 1.0 to 1.6 m/s, at
+  seven angles from -30 to 30 degrees, stands out of 17 of the 28 shoves,
+  against 12 upright over its steps; bent for any backward part of a
+  stagger, and further (0.6 rad per m/s), side and forward staggers that
+  turned a little bent too, and it stood out of fewer shoves every way.
+  `tests/test_balance.ae` holds it to all seven at 1.0 m/s and 15 or more
+  of the 21 from 1.0 to 1.4 (17 now), with the chest 3 cm or more ahead of
+  the pelvis on average as it steps back from 1.0 (1.1 cm upright).
 
 ## Staggering
 
