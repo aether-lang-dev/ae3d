@@ -55,6 +55,7 @@ exports (
     figure_new, figure_free, advance, set_speed, set_looping, clip_index, keep_pose, put_pose, pose_free,
     play_blended, play_blended_at, blending, layer_play, layer_play_under, layer_set_weight, layer_stop, layer_count,
     path, clip, speed, looping, time, clip_count, clip_name, duration, skeleton, primitive_count, primitive, add_clip,
+    put_back, turn_put_back,
     figure_kind, attach_figure, figure_component
 )
 
@@ -77,10 +78,24 @@ struct Figure {
     drawn: ptr
     drawn_before: ptr
     // Each node's pose as the clip left it this frame, before a transition's
-    // offsets and the layers went on (#650): where a node the clip does not
-    // key starts the next frame from, if nothing else has moved it.
+    // offsets and the layers went on (#650): where a node starts the next
+    // frame from, if nothing else has moved it. The figure's own: a turn or
+    // a place the clip does not key keeps the figure's, never another
+    // writer's move on it (#673).
     base: ptr
+    // Each node as it stood when the clip had gone on this frame, another
+    // writer's move on it kept: the figure's offsets and layers went on over
+    // it, and come off it again the next frame (#673).
+    posed: ptr
     based: bool
+    // Which of each node's channels the figure put back this frame, TURN
+    // and PLACE (#673): its clip keys them, or the node, still as the
+    // figure drew it, went back to the clip's pose. What was written on a
+    // channel before is gone; on one not put back, another writer's move
+    // is still there, and the figure's own offsets were taken off from
+    // under it.
+    put: ptr                         // int a node
+    keyed: ptr                       // int a node: the channels the clip keys
     nodes: int
     pending: float                   // the frame's seconds, for the decay
     frame_seconds: float             // the last frame's, for the speeds
@@ -93,6 +108,8 @@ struct Figure {
 }
 
 const POSE_FLOATS = 7                // position, rotation
+const TURN = 1                       // a node's rotation, in Figure.put and Figure.keyed
+const PLACE = 2                      // its position
 // A node's transition: the rotation's axis (3), then four quintics -- the
 // rotation's angle and the position's x, y, z -- of QUINTIC floats each.
 const QUINTIC = 7                    // a, b, c, d (t^5..t^2), v0, x0, and when it rests
@@ -182,6 +199,9 @@ figure_new(path: string, group: *Model) -> *Figure {
     f.drawn = calloc(f.nodes * POSE_FLOATS + 1, 8)
     f.drawn_before = calloc(f.nodes * POSE_FLOATS + 1, 8)
     f.base = calloc(f.nodes * POSE_FLOATS + 1, 8)
+    f.posed = calloc(f.nodes * POSE_FLOATS + 1, 8)
+    f.put = calloc(f.nodes + 1, 4)
+    f.keyed = calloc(f.nodes + 1, 4)
     f.inertia = calloc(f.nodes * INERTIA_FLOATS + 1, 8)
     f.layers = list.new()
     f.frame_seconds = 1.0 / 60.0
@@ -195,6 +215,16 @@ figure_new(path: string, group: *Model) -> *Figure {
     // blend carried each bone from the origin, and stretched it 49 m.
     remember(f)
     remember(f)
+    // And posed so, under no offsets: the first clip goes on over the rest
+    // pose as every later one does over the last, and a node moved before
+    // it was moved by another writer, whose move stays its own (#673).
+    i = 0
+    while i < f.nodes {
+        read_node(gltf.model(file, i), f.base as float[], i * POSE_FLOATS)
+        read_node(gltf.model(file, i), f.posed as float[], i * POSE_FLOATS)
+        i = i + 1
+    }
+    f.based = true
     return f
 }
 
@@ -206,6 +236,9 @@ figure_free(f: *Figure) {
     if f.drawn != null { free(f.drawn) }
     if f.drawn_before != null { free(f.drawn_before) }
     if f.base != null { free(f.base) }
+    if f.posed != null { free(f.posed) }
+    if f.put != null { free(f.put) }
+    if f.keyed != null { free(f.keyed) }
     if f.inertia != null { free(f.inertia) }
     if f.layers != null {
         i = 0
@@ -248,6 +281,7 @@ play(f: *Figure, name: string, rate: float, loops: bool) -> bool {
     stop(f)
     made = gltf.play(f.file as *GltfScene, name, f.players as *Registry, loops)
     if made == 0 { return false }
+    mark_keyed(f)
     string.free(f.clip)
     f.clip = string.copy(name)
     f.speed = rate
@@ -297,6 +331,7 @@ stop(f: *Figure) {
     f.clip = string.copy("")
     f.time = 0.0
     f.duration = 0.0
+    mark_keyed(f)
 }
 
 // The clip at `seconds` in (wrapped when it loops, held at its end when not),
@@ -356,6 +391,75 @@ add_clip(f: *Figure, animation: string, clip: *Clip, node: string) -> bool {
     if m == null { return false }
     return gltf.add_clip(f.file as *GltfScene, animation, clip, m)
 }
+
+// Whether the clips in `r` key `node`'s turn, and its place.
+keys_of(r: *Registry, node: *Model) -> (bool, bool) {
+    turn = false
+    place = false
+    k = 0
+    while k < anim.registry_count(r) {
+        b = anim.registry_binding(r, k)
+        if anim.binding_model(b) == node {
+            c = anim.player_clip(anim.binding_player(b))
+            i = 0
+            while i < anim.clip_channel_count(c) {
+                t = anim.channel_target(anim.clip_channel(c, i))
+                if t == anim.ROTATION { turn = true }
+                if t == anim.TRANSLATION { place = true }
+                i = i + 1
+            }
+        }
+        k = k + 1
+    }
+    return turn, place
+}
+
+// Whether the figure put `node`'s place back this frame (#673): its clip
+// keys it, or the node, as the figure drew it, went back to the clip's
+// pose. A module that moves the node each frame finds none of its last
+// move on it then; where not, its last move is still there, for it to
+// take off itself.
+put_back(f: *Figure, node: *Model) -> bool {
+    if f == null || node == null { return false }
+    file = f.file as *GltfScene
+    put = f.put as int[]
+    i = 0
+    while i < f.nodes {
+        if gltf.model(file, i) == node { return has_place(put[i]) }
+        i = i + 1
+    }
+    return false
+}
+
+// The same for `node`'s turn.
+turn_put_back(f: *Figure, node: *Model) -> bool {
+    if f == null || node == null { return false }
+    file = f.file as *GltfScene
+    put = f.put as int[]
+    i = 0
+    while i < f.nodes {
+        if gltf.model(file, i) == node { return has_turn(put[i]) }
+        i = i + 1
+    }
+    return false
+}
+
+// Which channels of each node the playing clip keys, into Figure.keyed.
+mark_keyed(f: *Figure) {
+    file = f.file as *GltfScene
+    keyed = f.keyed as int[]
+    i = 0
+    while i < f.nodes {
+        turn, place = keys_of(f.players as *Registry, gltf.model(file, i))
+        keyed[i] = 0
+        if turn { keyed[i] = keyed[i] + TURN }
+        if place { keyed[i] = keyed[i] + PLACE }
+        i = i + 1
+    }
+}
+
+has_turn(channels: int) -> bool { return channels % 2 == 1 }
+has_place(channels: int) -> bool { return channels >= PLACE }
 
 clip_count(f: *Figure) -> int { return gltf.animation_count(f.file as *GltfScene) }
 clip_name(f: *Figure, index: int) -> string { return gltf.animation_name(f.file as *GltfScene, index) }
@@ -585,31 +689,72 @@ remember(f: *Figure) {
 // by it every frame; one it does not key kept the sum, and the next frame's
 // offset went on top of it -- a clip keying only turns, blended in, pulled
 // the limbs metres off within a second and kept them there. A node something
-// else moved (the rig's root, carried by a ragdoll getting up) is left
-// where that put it.
+// else moved (the rig's root, carried by a ragdoll getting up; the hips,
+// lifted by ae3d.locomotion and lowered by ae3d.feet) keeps that move: only
+// what the figure added over the clip last frame comes off it (#673), as
+// every writer takes its own last move off. Left on, a transition's offset
+// went onto such a node again each frame of the transition, and a standing
+// walker's hips rose 28 cm with its legs folded under it.
 clip_onto_base(f: *Figure, r: *Registry) {
     file = f.file as *GltfScene
     drawn = f.drawn as float[]
     base = f.base as float[]
-    if f.based {
-        i = 0
-        while i < f.nodes {
+    posed = f.posed as float[]
+    put = f.put as int[]
+    keyed = f.keyed as int[]
+    i = 0
+    while i < f.nodes {
+        put[i] = keyed[i]
+        if f.based {
             m = gltf.model(file, i)
             at = i * POSE_FLOATS
             if as_drawn(m, drawn, at) {
                 core.model_set_position(m, base[at], base[at + 1], base[at + 2])
                 core.model_set_rotation(m, node_quat(base, at))
+                put[i] = TURN + PLACE
+            } else {
+                take_own_off(m, drawn, posed, at)
             }
-            i = i + 1
         }
+        i = i + 1
     }
     anim.registry_apply(r)
     i = 0
     while i < f.nodes {
-        read_node(gltf.model(file, i), base, i * POSE_FLOATS)
+        at = i * POSE_FLOATS
+        read_node(gltf.model(file, i), posed, at)
+        if has_place(put[i]) {
+            base[at] = posed[at]
+            base[at + 1] = posed[at + 1]
+            base[at + 2] = posed[at + 2]
+        }
+        if has_turn(put[i]) {
+            k = 3
+            while k < POSE_FLOATS {
+                base[at + k] = posed[at + k]
+                k = k + 1
+            }
+        }
         i = i + 1
     }
     f.based = true
+}
+
+
+// What the figure added over the clip's pose last frame, a transition's
+// offsets and the layers -- the node as drawn against the node as the clip
+// left it -- taken off `m`.
+take_own_off(m: *Model, drawn: float[], posed: float[], at: int) {
+    if drawn[at] != posed[at] || drawn[at + 1] != posed[at + 1] || drawn[at + 2] != posed[at + 2] {
+        core.model_set_position(m, m.position.x - (drawn[at] - posed[at]), m.position.y - (drawn[at + 1] - posed[at + 1]),
+                                m.position.z - (drawn[at + 2] - posed[at + 2]))
+    }
+    was = node_quat(drawn, at)
+    under = node_quat(posed, at)
+    if was.x != under.x || was.y != under.y || was.z != under.z || was.w != under.w {
+        own = core.quat_mul(was, core.quat_conjugate(under))
+        core.model_set_rotation(m, core.quat_normalize(core.quat_mul(core.quat_conjugate(own), m.rotation)))
+    }
 }
 
 // Whether `m` is exactly as `drawn` holds it, at `at`.
@@ -689,9 +834,11 @@ play_blended_at(f: *Figure, name: string, at: float, rate: float, loops: bool, s
     if gltf.animation_duration(f.file as *GltfScene, name) <= 0.0 && !has_clip(f, name) { return false }
     old_now = copy_pose(f, f.drawn)
     old_before = copy_pose(f, f.drawn_before)
+    old_posed = copy_pose(f, f.posed)
     if !play(f, name, rate, loops) {
         free(old_now)
         free(old_before)
+        free(old_posed)
         return false
     }
     f.time = wrapped(f, at)
@@ -707,14 +854,25 @@ play_blended_at(f: *Figure, name: string, at: float, rate: float, loops: bool, s
     if dt <= 0.0 { dt = 1.0 / 60.0 }
     was = old_now as float[]
     was_before = old_before as float[]
+    under = old_posed as float[]
+    keyed = f.keyed as int[]
     inertia = f.inertia as float[]
     i = 0
     while i < f.nodes {
         m = gltf.model(file, i)
         at = i * POSE_FLOATS
         off = i * INERTIA_FLOATS
+        // The offset is to the pose the figure itself gives the node: the
+        // new clip's turn or place where it keys them, and where it does
+        // not, the node as the figure posed it last frame, under its
+        // offsets still falling (#673). Not the node as another writer has
+        // moved it since: that move is the writer's to carry, and taken
+        // into the offset, a walker lifted after it was drawn dropped by the
+        // lift the frame its clip changed.
         new_q = m.rotation
         new_p = m.position
+        if !has_turn(keyed[i]) { new_q = node_quat(under, at) }
+        if !has_place(keyed[i]) { new_p = node_pos(under, at) }
         // The rotation's offset as an angle about an axis, and how fast it
         // was turning about that axis.
         q = core.quat_normalize(core.quat_mul(node_quat(was, at), core.quat_conjugate(new_q)))
@@ -740,6 +898,7 @@ play_blended_at(f: *Figure, name: string, at: float, rate: float, loops: bool, s
     }
     free(old_now)
     free(old_before)
+    free(old_posed)
     f.blend_t = 0.0
     f.blend_time = seconds
     decay(f, 0.0)

@@ -38,14 +38,50 @@ to 6.7 units and 12.5 degrees, inside the clips' own. 0.4 s after a 0.3 s
 change, the pose is Run's own to within 1e-7.
 
 The offsets ride on the clip's own pose, which the figure keeps each frame
-before they go on (#650). A node the clip does not key starts the next
-frame from that pose, if nothing else has moved it since the figure drew
-it. Before, the next frame's offset went on top of last frame's sum: a
-clip keying only turns, blended in, pulled the limbs metres off within a
-second and kept them there. The figure also counts as drawn in its rest
-pose until a clip plays, so a first blend carries on from that pose
-rather than from zero. A node another writer moved, such as the rig's root
-carried by a ragdoll getting up, is left where that writer put it.
+before they go on (#650). A node still as the figure drew it starts the
+next frame from that pose. Before, the next frame's offset went on top of
+last frame's sum: a clip keying only turns, blended in, pulled the limbs
+metres off within a second and kept them there. The figure also counts as
+drawn in its rest pose until a clip plays, so a first blend carries on
+from that pose rather than from zero.
+
+`gltf.bake_bank` puts every node back as it stood after it bakes (#673):
+it left them on the clip's last sample, where a clip played next that does
+not key a node left it. `locomotion.attach` still measures its walk on
+the rig and leaves it there, the box man's hips 3 cm low until it first
+walks (#676).
+
+Other writers move some of the same nodes every frame. On the box man in
+its Idle, which keys only its Spine2's turn, those are
+`ae3d.locomotion`'s lift, lean and foot hold on the hips, and
+`ae3d.feet`'s pelvis drop on them and its solved turns on the legs. Each writer, the figure among them, takes its
+own last move off a node before it makes the next (#673):
+- On a node another writer has moved since it drew it, the figure takes
+  off only what it added over the clip last frame, the transition's
+  offsets and the layers, and keeps the other's move.
+- Its base is its own pose, never the writer's move.
+- A change's offset is from the node as the figure drew it, without what
+  a writer has moved it by since.
+- `figure.put_back(f, node)` says whether the figure put the node's place
+  back this frame: its clip keys it, or the node, still as the figure drew
+  it, went back to the clip's pose. A writer's last move is then gone, and
+  it takes nothing off. `figure.turn_put_back` says the same of its turn.
+  A writer takes its own turn off on the node's side, the figure's being
+  on the other, so what the figure did since stays whole.
+
+Before, the figure left such a node alone, and the next frame's offsets
+went on top of the last. Its base also took in the writer's move, so a
+later frame put the move back on while the writer added its next. In the
+plaza, a walker standing in its Idle had its hips 28 cm up and its legs
+folded under it.
+
+`tests/test_blend_writers.ae` steps the box man from Walk to Run and, four
+frames later, to Idle:
+- with no other writer, the hips step no further in a frame than the
+  clips' own largest step, 1.6 cm, and stay where the changes left them;
+- under a lift that differs a little each frame, the hips under it do
+  exactly what they do with no one lifting them, to 1e-4 m. Before, they
+  stepped 5.6 cm in a frame and came to rest 21.5 cm off.
 
 ## Clips made at run time
 
@@ -135,6 +171,20 @@ feet.ground_height(f, height_fn, state)    // or a function of x and z
 - **The pelvis.** It comes down so the lower foot can reach its ground,
   and never goes up. It eases at no more than `PELVIS_SPEED`
   (0.6 m/s), so a kerb appearing under a foot never snaps the body down.
+  Each frame it takes last frame's drop off first. `feet.set_figure(f,
+  figure)` names the figure posing the legs, so the drop comes off by
+  how far it moved the hips, even where another writer moved them since,
+  unless the figure put the hips' place back itself (`figure.put_back`,
+  #673).
+  `ae3d.locomotion` does the same with its lift and lean. Each used to
+  take its move off only where the hips still held exactly what it had
+  written. The other's write in between defeated that, and in the plaza a
+  standing walker's feet ended 13 cm in the ground.
+  `tests/test_hips_writers.ae` walks the box man on a 10-degree slope
+  across its way, stepping on and stopping every second, for 12 s:
+  standing at the end of each second, its hips, less the pelvis drop, are
+  where they were the second before to 1 cm (to the micron, here), and no
+  foot goes under the slope.
 - **The legs.** Each is solved onto its target with `ae3d.ik`'s two-bone
   solver, its knee turned toward the way the figure faces.
 - **The foot.** A foot on the ground is turned to lie on it, by up to 30
