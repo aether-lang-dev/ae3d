@@ -2,6 +2,19 @@
 
 ## [current]
 
+### The global illumination, cheaper at the same look
+
+- Probes with nothing in reach, or inside geometry, sleep as RTXGI's do:
+  read by no shading, they trace one ray in four, enough to wake or to find
+  their way out. 43% fewer rays a frame in the city, 58% in the street, the
+  lighting the same (`tests/test_gi`). `AE3D_PERF=1` reports the census.
+- The probes' update weighs a ray by the cosine to the fiftieth by squaring,
+  not `pow`, and skips the rays facing away, which weigh nothing.
+- The reflection's wide cones take their taps from a quarter-size copy of
+  the frame, which stays in the cache: the city's post 5.56 to 4.93 ms on
+  Vulkan (M1 Pro, 2560x1440).
+- The temporal pass reads the pixel itself once, not twice.
+
 ### Global illumination: the frame as light, the sky's light, and the probes'
 
 - The frame is light (#656): the scene draws into RGBA16F on both backends

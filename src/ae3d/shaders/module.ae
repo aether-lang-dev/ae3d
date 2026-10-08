@@ -1812,10 +1812,12 @@ ivec3 ddgi_slot(int c, ivec3 g) {
 }
 
 // Whether probe `index`, at grid coordinate g of cascade c, is on: traced
-// since it came to its cell, and not inside anything.
+// since it came to its cell (its stamp's w 1, not 0, nor 2 for woken with
+// its texels not yet replaced), and neither inside anything (its state's w
+// 0) nor asleep, with nothing near it to light (w 2).
 bool ddgi_on(int c, ivec3 g, int index) {
     vec4 stamp = DDGI_STATE(index * 2 + 1);
-    return DDGI_STATE(index * 2).w > 0.5 && stamp.w > 0.5 && all(equal(stamp.xyz, DDGI_BASE(c) + vec3(g)));
+    return abs(DDGI_STATE(index * 2).w - 1.0) < 0.5 && abs(stamp.w - 1.0) < 0.5 && all(equal(stamp.xyz, DDGI_BASE(c) + vec3(g)));
 }
 
 // Where the probe at grid coordinate g of cascade c belongs: its cell's
@@ -4326,11 +4328,13 @@ void main() {
     vec3 history = fold(texture(historyTexture, prevUV).rgb);
     vec3 now = fold(current);
 
-    // The neighbourhood's range this frame, and the history held to it.
+    // The neighbourhood's range this frame, and the history held to it:
+    // the pixel itself and its eight neighbours.
     vec3 low = now;
     vec3 high = now;
     for (int y = -1; y <= 1; y++) {
         for (int x = -1; x <= 1; x++) {
+            if (x == 0 && y == 0) continue;
             vec3 c = fold(texture(screenTexture, uv + vec2(float(x), float(y)) * px).rgb);
             low = min(low, c);
             high = max(high, c);
@@ -4556,6 +4560,7 @@ const COMPUTE_DDGI_TRACE = <<GLSL_END
 #extension GL_EXT_buffer_reference_uvec2 : require
 layout(local_size_x = 64) in;
 #define DDGI_PARAMS 32
+#define DDGI_WAKE 4
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
 layout(set = 0, binding = 1, std140) uniform DdgiParams { vec4 params[DDGI_PARAMS]; };
@@ -4657,10 +4662,12 @@ ivec3 ddgi_slot(int c, ivec3 g) {
 }
 
 // Whether probe `index`, at grid coordinate g of cascade c, is on: traced
-// since it came to its cell, and not inside anything.
+// since it came to its cell (its stamp's w 1, not 0, nor 2 for woken with
+// its texels not yet replaced), and neither inside anything (its state's w
+// 0) nor asleep, with nothing near it to light (w 2).
 bool ddgi_on(int c, ivec3 g, int index) {
     vec4 stamp = DDGI_STATE(index * 2 + 1);
-    return DDGI_STATE(index * 2).w > 0.5 && stamp.w > 0.5 && all(equal(stamp.xyz, DDGI_BASE(c) + vec3(g)));
+    return abs(DDGI_STATE(index * 2).w - 1.0) < 0.5 && abs(stamp.w - 1.0) < 0.5 && all(equal(stamp.xyz, DDGI_BASE(c) + vec3(g)));
 }
 
 // Where the probe at grid coordinate g of cascade c belongs: its cell's
@@ -4843,6 +4850,11 @@ void main() {
     // keeps was for the cell it left.
     vec4 stamp = probeState[index * 2 + 1];
     bool fresh = stamp.w < 0.5 || any(notEqual(stamp.xyz, DDGI_BASE(c) + vec3(g)));
+    // A probe asleep or inside something -- its light read by nothing --
+    // traces one ray in DDGI_WAKE, spread over the sphere: enough to see
+    // geometry come near it, or to find its way out, and wake.
+    float mode = probeState[index * 2].w;
+    if (!fresh && abs(mode - 1.0) > 0.5 && ray % uint(DDGI_WAKE) != 0u) return;
     vec3 origin = fresh ? ddgi_home(c, g) : ddgi_probe_position(c, g, index);
     mat3 turn = mat3(params[5].xyz, params[6].xyz, params[7].xyz);
     vec3 dir = normalize(turn * fibonacci_direction(ray, rays));
@@ -4922,6 +4934,8 @@ const COMPUTE_DDGI_IRRADIANCE = <<GLSL_END
 #define DDGI_PARAMS 32
 #define DDGI_RAYS_MAX 256
 #define DDGI_CLEARANCE 0.15
+#define DDGI_WAKE 4
+#define DDGI_REACH 1.5
 layout(local_size_x = DDGI_SIDE + 2, local_size_y = DDGI_SIDE + 2) in;
 
 layout(set = 0, binding = 1, std140) uniform DdgiParams { vec4 params[DDGI_PARAMS]; };
@@ -5009,8 +5023,15 @@ void main() {
     vec3 cell = DDGI_BASE(c) + vec3(g);
     vec4 stamp = probeState[index * 2 + 1];
     bool fresh = stamp.w < 0.5 || any(notEqual(stamp.xyz, cell));
+    // Woken (stamp 2): its texels are from before it slept, replaced whole;
+    // where it stands, it keeps.
+    bool woken = !fresh && stamp.w > 1.5;
     float spacing = DDGI_SPACING(c);
     mat3 turn = mat3(params[5].xyz, params[6].xyz, params[7].xyz);
+    // Asleep or inside something, it traced one ray in DDGI_WAKE: those
+    // decide whether it wakes, and its texels keep what they had.
+    bool asleep = !fresh && abs(probeState[index * 2].w - 1.0) > 0.5;
+    uint stride = asleep ? uint(DDGI_WAKE) : 1u;
 
     uint threads = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
     for (uint r = gl_LocalInvocationIndex; r < rays; r += threads) {
@@ -5024,14 +5045,21 @@ void main() {
     vec3 n = oct_texel_direction(uv, side + 2.0);
     vec4 sum = vec4(0.0);
     float maxDistance = spacing * 1.5;
-    for (uint r = 0u; r < rays; r++) {
+    for (uint r = 0u; r < rays && !asleep; r++) {
+        float cosine = dot(n, rayDirection[r]);
+        // A ray facing away from this texel's direction weighs nothing.
+        if (cosine <= 0.0) continue;
         vec4 value = rayValue[r];
-        float cosine = max(dot(n, rayDirection[r]), 0.0);
 #if DDGI_MODE == 0
         if (value.a < 0.0) continue;
         sum += vec4(value.rgb * cosine, cosine);
 #else
-        float weight = pow(cosine, 50.0);
+        // The cosine to the fiftieth by squaring, not by pow's exp and log.
+        float c2 = cosine * cosine;
+        float c4 = c2 * c2;
+        float c8 = c4 * c4;
+        float c16 = c8 * c8;
+        float weight = c16 * c16 * c16 * c2;
         float dist = min(abs(value.a), maxDistance);
         sum += vec4(dist * weight, dist * dist * weight, 0.0, weight);
 #endif
@@ -5039,23 +5067,34 @@ void main() {
     vec2 corner = vec2(float(slot.x + slot.y * d.x), float(slot.z + c * d.z)) * (side + 2.0);
     ivec2 at = ivec2(corner) + texel;
     vec4 result = sum.w > 1e-5 ? vec4(sum.xyz / sum.w, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);
-    vec4 old = imageLoad(atlas, at);
-    float keep = fresh ? 0.0 : params[9][DDGI_MODE];
-    imageStore(atlas, at, mix(result, old, keep));
+    if (!asleep) {
+        vec4 old = imageLoad(atlas, at);
+        float keep = fresh || woken ? 0.0 : params[9][DDGI_MODE];
+        imageStore(atlas, at, mix(result, old, keep));
+    }
 
 #if DDGI_MODE == 0
     if (gl_LocalInvocationIndex == 0u) {
         // How many rays met backs and the nearest of them, the way out of
         // what the probe is in; and the nearest and the farthest front.
         int backs = 0;
+        int traced = 0;
+        bool near = false;
+        float reach = DDGI_REACH * spacing;
         float nearestBack = 1e9;
         int backRay = -1;
         float nearestFront = 1e9;
         int nearFrontRay = -1;
         float farthestFront = -1.0;
         int farFrontRay = -1;
-        for (uint r = 0u; r < rays; r++) {
+        for (uint r = 0u; r < rays; r += stride) {
             float distance = rayValue[r].a;
+            traced++;
+            // Anything the ray met within the probe's reach -- the box of
+            // the cells round it, where the surfaces it lights are -- keeps
+            // it awake.
+            vec3 met = rayDirection[r] * abs(distance);
+            if (all(lessThan(abs(met), vec3(reach)))) near = true;
             if (distance < 0.0) {
                 backs++;
                 if (-distance * 5.0 < nearestBack) {
@@ -5074,7 +5113,7 @@ void main() {
             }
         }
         vec4 state = fresh ? vec4(0.0, 0.0, 0.0, 1.0) : probeState[index * 2];
-        float share = float(backs) / float(rays);
+        float share = float(backs) / float(max(traced, 1));
         float clearance = DDGI_CLEARANCE * spacing;
         vec3 moved = state.xyz;
         if (share > 0.25 && backRay >= 0) {
@@ -5089,9 +5128,12 @@ void main() {
         }
         // Within the cell, or it stands for another.
         if (all(lessThan(abs(moved), vec3(0.45 * spacing)))) state.xyz = moved;
-        state.w = share > 0.25 ? 0.0 : 1.0;
+        // Inside something (0), on (1), or asleep with nothing in reach (2).
+        // A probe woken has texels from before: they are replaced whole the
+        // next time its turn comes (its stamp 2 till then).
+        state.w = share > 0.25 ? 0.0 : (near ? 1.0 : 2.0);
         probeState[index * 2] = state;
-        probeState[index * 2 + 1] = vec4(cell, 1.0);
+        probeState[index * 2 + 1] = vec4(cell, asleep && state.w == 1.0 ? 2.0 : 1.0);
     }
 #endif
 }
@@ -5114,6 +5156,8 @@ const COMPUTE_DDGI_DISTANCE = <<GLSL_END
 #define DDGI_PARAMS 32
 #define DDGI_RAYS_MAX 256
 #define DDGI_CLEARANCE 0.15
+#define DDGI_WAKE 4
+#define DDGI_REACH 1.5
 layout(local_size_x = DDGI_SIDE + 2, local_size_y = DDGI_SIDE + 2) in;
 
 layout(set = 0, binding = 1, std140) uniform DdgiParams { vec4 params[DDGI_PARAMS]; };
@@ -5201,8 +5245,15 @@ void main() {
     vec3 cell = DDGI_BASE(c) + vec3(g);
     vec4 stamp = probeState[index * 2 + 1];
     bool fresh = stamp.w < 0.5 || any(notEqual(stamp.xyz, cell));
+    // Woken (stamp 2): its texels are from before it slept, replaced whole;
+    // where it stands, it keeps.
+    bool woken = !fresh && stamp.w > 1.5;
     float spacing = DDGI_SPACING(c);
     mat3 turn = mat3(params[5].xyz, params[6].xyz, params[7].xyz);
+    // Asleep or inside something, it traced one ray in DDGI_WAKE: those
+    // decide whether it wakes, and its texels keep what they had.
+    bool asleep = !fresh && abs(probeState[index * 2].w - 1.0) > 0.5;
+    uint stride = asleep ? uint(DDGI_WAKE) : 1u;
 
     uint threads = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
     for (uint r = gl_LocalInvocationIndex; r < rays; r += threads) {
@@ -5216,14 +5267,21 @@ void main() {
     vec3 n = oct_texel_direction(uv, side + 2.0);
     vec4 sum = vec4(0.0);
     float maxDistance = spacing * 1.5;
-    for (uint r = 0u; r < rays; r++) {
+    for (uint r = 0u; r < rays && !asleep; r++) {
+        float cosine = dot(n, rayDirection[r]);
+        // A ray facing away from this texel's direction weighs nothing.
+        if (cosine <= 0.0) continue;
         vec4 value = rayValue[r];
-        float cosine = max(dot(n, rayDirection[r]), 0.0);
 #if DDGI_MODE == 0
         if (value.a < 0.0) continue;
         sum += vec4(value.rgb * cosine, cosine);
 #else
-        float weight = pow(cosine, 50.0);
+        // The cosine to the fiftieth by squaring, not by pow's exp and log.
+        float c2 = cosine * cosine;
+        float c4 = c2 * c2;
+        float c8 = c4 * c4;
+        float c16 = c8 * c8;
+        float weight = c16 * c16 * c16 * c2;
         float dist = min(abs(value.a), maxDistance);
         sum += vec4(dist * weight, dist * dist * weight, 0.0, weight);
 #endif
@@ -5231,23 +5289,34 @@ void main() {
     vec2 corner = vec2(float(slot.x + slot.y * d.x), float(slot.z + c * d.z)) * (side + 2.0);
     ivec2 at = ivec2(corner) + texel;
     vec4 result = sum.w > 1e-5 ? vec4(sum.xyz / sum.w, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);
-    vec4 old = imageLoad(atlas, at);
-    float keep = fresh ? 0.0 : params[9][DDGI_MODE];
-    imageStore(atlas, at, mix(result, old, keep));
+    if (!asleep) {
+        vec4 old = imageLoad(atlas, at);
+        float keep = fresh || woken ? 0.0 : params[9][DDGI_MODE];
+        imageStore(atlas, at, mix(result, old, keep));
+    }
 
 #if DDGI_MODE == 0
     if (gl_LocalInvocationIndex == 0u) {
         // How many rays met backs and the nearest of them, the way out of
         // what the probe is in; and the nearest and the farthest front.
         int backs = 0;
+        int traced = 0;
+        bool near = false;
+        float reach = DDGI_REACH * spacing;
         float nearestBack = 1e9;
         int backRay = -1;
         float nearestFront = 1e9;
         int nearFrontRay = -1;
         float farthestFront = -1.0;
         int farFrontRay = -1;
-        for (uint r = 0u; r < rays; r++) {
+        for (uint r = 0u; r < rays; r += stride) {
             float distance = rayValue[r].a;
+            traced++;
+            // Anything the ray met within the probe's reach -- the box of
+            // the cells round it, where the surfaces it lights are -- keeps
+            // it awake.
+            vec3 met = rayDirection[r] * abs(distance);
+            if (all(lessThan(abs(met), vec3(reach)))) near = true;
             if (distance < 0.0) {
                 backs++;
                 if (-distance * 5.0 < nearestBack) {
@@ -5266,7 +5335,7 @@ void main() {
             }
         }
         vec4 state = fresh ? vec4(0.0, 0.0, 0.0, 1.0) : probeState[index * 2];
-        float share = float(backs) / float(rays);
+        float share = float(backs) / float(max(traced, 1));
         float clearance = DDGI_CLEARANCE * spacing;
         vec3 moved = state.xyz;
         if (share > 0.25 && backRay >= 0) {
@@ -5281,9 +5350,12 @@ void main() {
         }
         // Within the cell, or it stands for another.
         if (all(lessThan(abs(moved), vec3(0.45 * spacing)))) state.xyz = moved;
-        state.w = share > 0.25 ? 0.0 : 1.0;
+        // Inside something (0), on (1), or asleep with nothing in reach (2).
+        // A probe woken has texels from before: they are replaced whole the
+        // next time its turn comes (its stamp 2 till then).
+        state.w = share > 0.25 ? 0.0 : (near ? 1.0 : 2.0);
         probeState[index * 2] = state;
-        probeState[index * 2 + 1] = vec4(cell, 1.0);
+        probeState[index * 2 + 1] = vec4(cell, asleep && state.w == 1.0 ? 2.0 : 1.0);
     }
 #endif
 }
@@ -5386,10 +5458,12 @@ ivec3 ddgi_slot(int c, ivec3 g) {
 }
 
 // Whether probe `index`, at grid coordinate g of cascade c, is on: traced
-// since it came to its cell, and not inside anything.
+// since it came to its cell (its stamp's w 1, not 0, nor 2 for woken with
+// its texels not yet replaced), and neither inside anything (its state's w
+// 0) nor asleep, with nothing near it to light (w 2).
 bool ddgi_on(int c, ivec3 g, int index) {
     vec4 stamp = DDGI_STATE(index * 2 + 1);
-    return DDGI_STATE(index * 2).w > 0.5 && stamp.w > 0.5 && all(equal(stamp.xyz, DDGI_BASE(c) + vec3(g)));
+    return abs(DDGI_STATE(index * 2).w - 1.0) < 0.5 && abs(stamp.w - 1.0) < 0.5 && all(equal(stamp.xyz, DDGI_BASE(c) + vec3(g)));
 }
 
 // Where the probe at grid coordinate g of cascade c belongs: its cell's
@@ -5702,6 +5776,7 @@ out vec4 FragColor;
 
 uniform sampler2D screenTexture;   // the rendered scene colour
 uniform sampler2D depthTexture;    // camera-space depth of the scene
+uniform sampler2D ssrBlurTexture;  // the scene colour at a quarter of its size
 uniform mat4 viewProjection;       // world -> clip, to project each march step
 uniform mat4 invViewProjection;    // clip -> world, to rebuild a position from depth
 uniform vec3 viewPos;              // the camera, in world space
@@ -5752,14 +5827,21 @@ vec3 reflectionAt(vec2 uv, float radius, vec2 seed) {
     // not line up from one pixel to the next.
     float turn = hash2(seed) * 6.2831853;
     float c = cos(turn), s = sin(turn);
-    vec2 aspect = vec2(1.0, float(textureSize(screenTexture, 0).x) / float(textureSize(screenTexture, 0).y));
+    vec2 size = vec2(textureSize(screenTexture, 0));
+    vec2 aspect = vec2(1.0, size.x / size.y);
+    // A cone wider than eight pixels reads the quarter-size copy: the same
+    // taps, each the light of the texels it stands for already averaged,
+    // out of an image small enough to stay in the cache -- scattered across
+    // the full frame, the taps missed it at every one.
+    bool wide = radius * size.x > 8.0;
     vec3 sum = vec3(0.0);
     for (int i = 0; i < 8; i++) {
         float a = float(i) * 0.7853982;
         float r = radius * (0.35 + 0.65 * float(i + 1) / 8.0);
         vec2 d = vec2(cos(a), sin(a)) * r;
         d = vec2(d.x * c - d.y * s, d.x * s + d.y * c) * aspect;
-        sum += texture(screenTexture, clamp(uv + d, vec2(0.001), vec2(0.999))).rgb;
+        vec2 at = clamp(uv + d, vec2(0.001), vec2(0.999));
+        sum += wide ? texture(ssrBlurTexture, at).rgb : texture(screenTexture, at).rgb;
     }
     return sum * 0.125;
 }

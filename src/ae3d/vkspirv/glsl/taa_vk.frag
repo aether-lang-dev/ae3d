@@ -247,11 +247,13 @@ void main() {
     vec3 history = fold(texture(historyTexture, prevUV).rgb);
     vec3 now = fold(current);
 
-    // The neighbourhood's range this frame, and the history held to it.
+    // The neighbourhood's range this frame, and the history held to it:
+    // the pixel itself and its eight neighbours.
     vec3 low = now;
     vec3 high = now;
     for (int y = -1; y <= 1; y++) {
         for (int x = -1; x <= 1; x++) {
+            if (x == 0 && y == 0) continue;
             vec3 c = fold(texture(screenTexture, uv + vec2(float(x), float(y)) * px).rgb);
             low = min(low, c);
             high = max(high, c);

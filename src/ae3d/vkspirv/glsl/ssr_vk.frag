@@ -199,9 +199,11 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
 };
 layout(set = 0, binding = 1) uniform sampler2D screenTexture;
 layout(set = 0, binding = 2) uniform sampler2D depthTexture;
+layout(set = 0, binding = 3) uniform sampler2D ssrBlurTexture;
 
 layout(location = 0) in vec2 TexCoords;
 layout(location = 0) out vec4 FragColor;
+
 
 
 
@@ -255,14 +257,21 @@ vec3 reflectionAt(vec2 uv, float radius, vec2 seed) {
     // not line up from one pixel to the next.
     float turn = hash2(seed) * 6.2831853;
     float c = cos(turn), s = sin(turn);
-    vec2 aspect = vec2(1.0, float(textureSize(screenTexture, 0).x) / float(textureSize(screenTexture, 0).y));
+    vec2 size = vec2(textureSize(screenTexture, 0));
+    vec2 aspect = vec2(1.0, size.x / size.y);
+    // A cone wider than eight pixels reads the quarter-size copy: the same
+    // taps, each the light of the texels it stands for already averaged,
+    // out of an image small enough to stay in the cache -- scattered across
+    // the full frame, the taps missed it at every one.
+    bool wide = radius * size.x > 8.0;
     vec3 sum = vec3(0.0);
     for (int i = 0; i < 8; i++) {
         float a = float(i) * 0.7853982;
         float r = radius * (0.35 + 0.65 * float(i + 1) / 8.0);
         vec2 d = vec2(cos(a), sin(a)) * r;
         d = vec2(d.x * c - d.y * s, d.x * s + d.y * c) * aspect;
-        sum += texture(screenTexture, clamp(uv + d, vec2(0.001), vec2(0.999))).rgb;
+        vec2 at = clamp(uv + d, vec2(0.001), vec2(0.999));
+        sum += wide ? texture(ssrBlurTexture, at).rgb : texture(screenTexture, at).rgb;
     }
     return sum * 0.125;
 }
