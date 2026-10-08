@@ -8,7 +8,6 @@ struct Light {
     vec3 position;
     vec3 color;
     float intensity;
-    float ambientStrength;
     float temperature;
     int isDirectional;
     vec3 direction;
@@ -126,6 +125,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 damageColours[4];
     vec4 damageRect;
     float damageClamp;
+    int occlusionHistory;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -134,6 +134,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int skyProcedural;
     float skyOvercast;
     vec3 skyOvercastColor;
+    vec3 skyFlat;
+    float skyTurbidity;
+    float skyLevelSize;
+    float skyRoughness;
     vec2 texelSize;
     float frameExposure;
     bool enableBloom;
@@ -293,7 +297,6 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
     L.temperature = d.w;
     L.spotCosOuter = e.x;
     L.spotCosInner = e.y;
-    L.ambientStrength = 0.0;
     // The lamp's own shadow's slot (ae3d.lampshadows), or -1: -1.0 read
     // back rounds toward zero, so it is rounded from below.
     shadowSlot = int(floor(e.z + 0.5));
@@ -964,23 +967,6 @@ vec3 calculateGlobalIllumination(vec3 position, vec3 normal, vec3 albedo, float 
     return gi * giIntensity / float(samples);
 }
 
-// Environment reflections (skybox-based) - simplified to avoid artifacts
-vec3 calculateEnvironmentReflection(vec3 N, vec3 V, float roughness, float metallic) {
-    // Calculate reflection direction
-    vec3 R = reflect(-V, N);
-    
-    // Simple uniform environment color to avoid the "two halves" effect
-    vec3 envColor = vec3(0.6, 0.7, 0.9); // Uniform sky-like color
-    
-    // Roughness affects reflection clarity
-    float reflectionStrength = (1.0 - roughness * 0.9) * 0.5; // Reduced strength
-    
-    // Metallic materials reflect more environment
-    float envContribution = mix(0.05, 0.3, metallic) * reflectionStrength; // Much reduced
-    
-    return envColor * envContribution;
-}
-
 // Simple inter-object reflections approximation
 vec3 calculateInterObjectReflections(vec3 worldPos, vec3 N, vec3 V, float roughness, float metallic) {
     // Only apply to metallic surfaces with low roughness
@@ -1496,6 +1482,100 @@ layout(set = 0, binding = 9) uniform sampler2D damageMask;
 
 #endif
 
+// The light from the sky (#655), what arrives from every direction: its
+// reflections from the octahedral map prefiltered into roughness levels,
+// the split-sum table that scales them by F0 (ae3d.skylight), and its
+// irradiance onto every normal, an octahedral map of its own.
+#ifdef VULKAN
+layout(set = 0, binding = 10) uniform sampler2D skyLight;
+layout(set = 0, binding = 11) uniform sampler2D brdfLut;
+layout(set = 0, binding = 12) uniform sampler2D skyIrradiance;
+layout(set = 0, binding = 13) uniform sampler2D occlusionMap;
+#else
+
+
+
+
+#endif
+// Whether the occlusion map holds the last frame's (FRAGMENT_SSAO): one
+// when the screen's occlusion is on and a frame has been drawn to find it.
+
+
+// The screen's occlusion at this surface: found in the last frame's image
+// where the surface was then (ClipPrev), if the depth found there is this
+// surface's -- what the last frame did not show of it (a corner just come
+// round, a figure just stepped aside), and a surface in front of the one
+// that was there, is not occluded by what the map says.
+float screen_occlusion() {
+    if (occlusionHistory == 0 || ClipPrev.w <= 0.0) return 1.0;
+    vec2 uv = ClipPrev.xy / ClipPrev.w * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
+    vec2 found = texture(occlusionMap, uv).rg;
+    if (abs(found.g - ClipPrev.w) > 0.05 * ClipPrev.w) return 1.0;
+    return found.r;
+}
+// The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
+// the upper hemisphere in the square's inner diamond, the lower folded into
+// its corners, one texel of gutter around each level holding the sky just
+// across the fold, so a filtered read at an edge is still the sky.
+#define SKY_SIZE 256.0
+#define SKY_LEVELS 6.0
+#define SKY_IRRADIANCE_SIZE 16.0
+vec3 oct_decode(vec2 p) {
+    vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0) {
+        vec2 folded = (1.0 - abs(d.zx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = folded.x;
+        d.z = folded.y;
+    }
+    return normalize(d);
+}
+vec2 oct_encode(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p;
+}
+// Where direction d is read in a level `size` texels a side.
+vec2 oct_uv(vec3 d, float size) {
+    return ((oct_encode(d) * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
+// The direction a texel of a level `size` a side stands for, at texture
+// coordinate uv: a gutter texel's folded back across the edge it lies past.
+vec3 oct_texel_direction(vec2 uv, float size) {
+    vec2 p = ((uv * size - 1.0) / (size - 2.0)) * 2.0 - 1.0;
+    if (p.x > 1.0) { p.x = 2.0 - p.x; p.y = -p.y; }
+    if (p.x < -1.0) { p.x = -2.0 - p.x; p.y = -p.y; }
+    if (p.y > 1.0) { p.y = 2.0 - p.y; p.x = -p.x; }
+    if (p.y < -1.0) { p.y = -2.0 - p.y; p.x = -p.x; }
+    return oct_decode(p);
+}
+
+vec3 sky_irradiance(vec3 n) {
+    return texture(skyIrradiance, oct_uv(n, SKY_IRRADIANCE_SIZE)).rgb;
+}
+
+// The sky mirrored along r off a surface of `rough`: one read between the
+// two levels it lies between. Every level is laid out as level 0 is (as a
+// mip of it would be), so one coordinate is right at all of them.
+vec3 sky_reflection(vec3 r, float rough) {
+    float level = clamp(rough, 0.0, 1.0) * (SKY_LEVELS - 1.0);
+    return textureLod(skyLight, oct_uv(r, SKY_SIZE), level).rgb;
+}
+
+// What the sky gives a surface: its diffuse, Lambert over the irradiance,
+// and its reflection, prefiltered by the roughness and scaled by the split
+// sum. A material that turns image-based lighting off keeps the diffuse.
+vec3 sky_light(vec3 N, vec3 V, vec3 albedo, vec3 F0, float rough, float metal, float NdotV) {
+    vec3 F = F0 + (max(vec3(1.0 - rough), F0) - F0) * pow(1.0 - NdotV, 5.0);
+    vec3 kD = (vec3(1.0) - F) * (1.0 - metal);
+    vec3 diffuse = kD * albedo * sky_irradiance(N) / 3.14159265;
+    if (!enableImageBasedLighting) return diffuse;
+    vec2 ab = texture(brdfLut, vec2(NdotV, rough)).rg;
+    vec3 specular = sky_reflection(reflect(-V, N), rough) * (F0 * ab.x + ab.y);
+    return diffuse + specular * iblIntensity;
+}
+
 void main() {
     // A cut model's far side, not drawn (#545): nor its depth, which the
     // occlusion, the reflections and the water read from this pass.
@@ -1703,25 +1783,16 @@ void main() {
         }
     }
 
-    // Ambient belongs to the scene rather than to each light, so it comes from
-    // the key light alone; summing it per light would wash the image out as
-    // lights were added.
-    vec3 keyColor = lights[0].color * kelvinToRGB(lights[0].temperature);
-    // Ambient is light arriving from every direction, so what a point can see
-    // of the sky is exactly what scales it. This is the term occlusion belongs
-    // to and the only one: darkening the direct light as well would put a
-    // shadow where a lamp is plainly shining.
-    float shut = mix(1.0, Occlusion, occlusionStrength);
-    vec3 ambient = lights[0].ambientStrength * keyColor * albedo * 0.8 * shut;
-    vec3 fillLightContrib = vec3(0.0);
-
-    // The direct light, under the clouds' shadow where a cloud drifts over.
-    vec3 color = ambient + fillLightContrib + Lo;
+    // The sky's light arrives from every direction, so what a point can see
+    // of the sky is exactly what scales it: the occlusion, baked, on the
+    // screen and by ray,
+    // belongs to this term and no other -- darkening the direct light as
+    // well would put a shadow where a lamp is plainly shining.
+    float shut = mix(1.0, Occlusion, occlusionStrength) * screen_occlusion();
 #ifdef AE3D_RAY_QUERY
-    // The occlusion by ray darkens what the screen-space pass would have,
-    // the whole of the lit surface, so the two pictures agree.
-    if (traced && rayOcclusion > 0.0) color *= ray_occlusion_factor();
+    if (traced && rayOcclusion > 0.0) shut *= ray_occlusion_factor();
 #endif
+    vec3 color = sky_light(norm, viewDir, albedo, F0, adjustedRoughness, metallic, NdotV) * shut + Lo;
 
 	// Calculate distance for performance scaling (CRITICAL for voxel terrain performance)
 	float distanceToCamera = length(FragPos - viewPos);
@@ -1735,13 +1806,6 @@ void main() {
 	// Global Illumination (with distance LOD built-in)
 	vec3 gi = calculateGlobalIllumination(FragPos, norm, albedo, distanceToCamera);
 	color += gi;
-    
-	// Environment reflections (skybox-based), which is what image based lighting
-	// means here: light arriving from the surroundings rather than from a lamp.
-    if (enableImageBasedLighting) {
-        vec3 envReflection = calculateEnvironmentReflection(norm, viewDir, roughness, metallic);
-        color += envReflection * 0.3 * iblIntensity;
-    }
     
     color += caustic_light(FragPos, norm) * albedo;
 

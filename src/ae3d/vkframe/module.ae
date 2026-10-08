@@ -45,11 +45,11 @@ exports (
     offscreen_width, offscreen_height, draw, draw_range, draw_indirect, draw_sky, set_screen_quad, set_blend, set_normal_map, set_pose_bank, set_damage_mask,
     set_face_culling, set_shadows, shadows, shadow_begin, shadow_draw, shadow_end, shadow_viewport, shadow_done,
     lamp_shadow_begin, lamp_shadow_tile, lamp_static_begin, lamp_copy, lamp_shadow_generation,
-    clusters_reserve, clusters_lights, clusters_words, set_post, post_active, set_frame_exposure, frame_exposure, composited,
+    clusters_reserve, clusters_lights, clusters_words, set_post, post_active, set_frame_exposure, frame_exposure, composited, screen_pass,
     set_bloom_intensity, bloom_intensity, draw_calls, pass_ms, pipeline_binds, set_binds, sample_count,
     set_samples, set_scene_depth, scene_depth_ready, resolve_scene_depth, velocity_texture, set_render_scale,
     render_scale, set_taa, taa, taa_history, set_ssr, ssr, set_ssr_params, ssr_road_height, ssr_strength, set_ssao, ssao, ssao_radius,
-    ssao_intensity, draw_ssao, mark_sky_done, mark_opaque_done, set_capture_bypass, default_texture,
+    ssao_intensity, occlusion_pass, mark_sky_done, mark_opaque_done, set_capture_bypass, default_texture,
     max_texture_size, texture_destroy, dlss_available, set_dlss, dlss, dlss_failed, dlss_camera, clip_correct
 )
 
@@ -139,6 +139,10 @@ var g_empty_skin_memory: ptr = null
 var g_in_shadow_pass = false
 var g_depth_split = false
 var g_depth_resolved = false
+// Whether the camera depth holds the last frame's, at its present size: the
+// occlusion is found from it before the scene.
+var g_occlusion_history = false
+var g_occlusion_serial = 0 - 1
 var g_scene_clear: ptr = null      // f32[4]
 var g_post_active = false
 var g_capture_bypass = false
@@ -921,6 +925,8 @@ frame_begin(r: float, g: float, b: float, a: float) -> bool {
     // renderer says what wants it before the frame (set_scene_depth, the
     // occlusion, the reflection), and the target is made at the size of the
     // scene, here, so the first frame that needs it has it.
+    g_occlusion_history = g_depth_resolved && g_occlusion_serial == vktargets.camdepth_serial()
+    g_occlusion_serial = vktargets.camdepth_serial()
     g_depth_split = false
     g_depth_resolved = false
     wanted = g_ssr_enabled || g_scene_depth_wanted || g_ssao_enabled || g_taa_enabled || g_dlss_mode != 0
@@ -1138,6 +1144,31 @@ draw_sky(handle: int, texture: int, weather: int, shape: int) {
     g_normal_map = normal_was
     g_pose_bank = bank_was
     stamp_through(5)
+}
+
+// One draw of `pipeline` over the screen quad, in a pass of its own:
+// `pass` over `framebuffer`, `w` by `h`, `texture` at binding 1 and, when
+// past zero, `extra3` and `extra4` at 3 and 4 (the sky's clouds read their
+// weather and shape there). Outside the scene pass, which it must not be
+// recorded in; the scene program's block is what the draw reads.
+screen_pass(pass: ptr, framebuffer: ptr, w: int, h: int, pipeline: ptr, texture: int, extra3: int, extra4: int) {
+    if !vkhost.recording() || vkhost.pass_open() || pipeline == null || framebuffer == null { return }
+    normal_was = g_normal_map
+    bank_was = g_pose_bank
+    if extra3 > 0 { g_normal_map = extra3 }
+    if extra4 > 0 { g_pose_bank = extra4 }
+    vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+    begin_pass(pass, framebuffer, w, h, 0)
+    vkhost.set_pass_open(true)
+    viewport(w, h)
+    // A pass of the frame's own, not one of the scene's draws: not counted.
+    counted = g_draw_calls
+    draw_pipeline(pipeline, g_screen_quad, texture, 0, 1)
+    g_draw_calls = counted
+    vk.vkCmdEndRenderPass(commands_now())
+    vkhost.set_pass_open(false)
+    g_normal_map = normal_was
+    g_pose_bank = bank_was
 }
 
 // The sky is done, drawn or not: the renderer says so before the opaque
@@ -1587,18 +1618,25 @@ taa() -> bool { return g_taa_enabled }
 // frame as it is: what the blend uniform is set from.
 taa_history() -> bool { return g_taa_enabled && vktargets.taa_history_valid() }
 
-// The occlusion, over the opaque scene: a multiply drawn inside the scene
-// pass with depth off, reading the camera depth the resolve wrote. Nothing
-// when the occlusion is off, the depth was not resolved, or the pipeline
-// did not build; the scene is then simply not darkened.
-draw_ssao() {
-    if !vkhost.recording() || !g_ssao_enabled || vkpipes.ssao() == null || g_capture_bypass { return }
-    if vktargets.camdepth_view() == null || vktargets.camdepth_framebuffer() == null || g_default_texture <= 0 { return }
-    open_scene_pass()
+// The screen's occlusion found before the scene pass (#655): from the last
+// frame's camera depth into the occlusion map, which the scene shader reads
+// where each surface was then. Only where there is a last frame's depth of
+// the camera depth's present size; true when the map holds this frame's.
+occlusion_pass() -> bool {
+    if !vkhost.recording() || vkhost.pass_open() || !g_ssao_enabled || vkpipes.ssao() == null || g_capture_bypass { return false }
+    if !g_occlusion_history || vktargets.occlusion_framebuffer() == null || vktargets.camdepth_view() == null { return false }
     block_float(vkscene.OFF_SSAORADIUS, g_ssao_radius)
     block_float(vkscene.OFF_SSAOINTENSITY, g_ssao_intensity)
+    vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+    w = vktargets.render_width()
+    h = vktargets.render_height()
+    begin_pass(vktargets.hdr_pass(), vktargets.occlusion_framebuffer(), w, h, 0)
+    vkhost.set_pass_open(true)
+    viewport(w, h)
     draw_screen(vkpipes.ssao(), g_ssao_sets, g_frame, g_default_texture)
-    stamp_through(7)
+    vk.vkCmdEndRenderPass(commands_now())
+    vkhost.set_pass_open(false)
+    return true
 }
 
 // A float into the scene program's block, which the sky, the shadow pass

@@ -191,87 +191,94 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float crowdPhaseStep;
     vec4 shadowReach;
 };
-layout (location = 0) in vec3 inPosition;
-layout (location = 3) in mat4 instanceModel;
-layout (location = 8) in vec4 inJoints;
-layout (location = 9) in vec4 inWeights;
+layout(set = 0, binding = 1) uniform sampler2D skyCapture;
+layout(location = 0) out vec4 FragColor;
 
 
 
 
 
-
-
-
-
-
-
-layout(location = 0) out vec3 BindPos;
-layout(location = 1) out float ClipLimb;
-
-// The joints a cut is kept to (#556), as three words of 32 bits: joint j is
-// bit j % 32 of word j / 32. None named, the cut is the whole model's.
-
-
-
-
-float clipJointOn(float joint) {
-    int j = int(joint + 0.5);
-    int word = j < 32 ? clipJoints0 : (j < 64 ? clipJoints1 : clipJoints2);
-    return float((word >> (j & 31)) & 1);
+// The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
+// the upper hemisphere in the square's inner diamond, the lower folded into
+// its corners, one texel of gutter around each level holding the sky just
+// across the fold, so a filtered read at an edge is still the sky.
+#define SKY_SIZE 256.0
+#define SKY_LEVELS 6.0
+#define SKY_IRRADIANCE_SIZE 16.0
+vec3 oct_decode(vec2 p) {
+    vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0) {
+        vec2 folded = (1.0 - abs(d.zx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = folded.x;
+        d.z = folded.y;
+    }
+    return normalize(d);
+}
+vec2 oct_encode(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p;
+}
+// Where direction d is read in a level `size` texels a side.
+vec2 oct_uv(vec3 d, float size) {
+    return ((oct_encode(d) * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
+// The direction a texel of a level `size` a side stands for, at texture
+// coordinate uv: a gutter texel's folded back across the edge it lies past.
+vec3 oct_texel_direction(vec2 uv, float size) {
+    vec2 p = ((uv * size - 1.0) / (size - 2.0)) * 2.0 - 1.0;
+    if (p.x > 1.0) { p.x = 2.0 - p.x; p.y = -p.y; }
+    if (p.x < -1.0) { p.x = -2.0 - p.x; p.y = -p.y; }
+    if (p.y > 1.0) { p.y = 2.0 - p.y; p.x = -p.x; }
+    if (p.y < -1.0) { p.y = -2.0 - p.y; p.x = -p.x; }
+    return oct_decode(p);
 }
 
-// The share of the vertex's weight on the cut's joints: 1 where none are
-// named or the model is not skinned. The fragment cuts where it is past
-// one half, so the cut's edge across the body is the limb's own weighting.
-float clipLimbOf(vec4 joints, vec4 weights) {
-    if (!isSkinned || (clipJoints0 | clipJoints1 | clipJoints2) == 0) return 1.0;
-    return weights.x * clipJointOn(joints.x) + weights.y * clipJointOn(joints.y)
-         + weights.z * clipJointOn(joints.z) + weights.w * clipJointOn(joints.w);
+#define FILTER_SAMPLES 48
+
+float radical_inverse(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
 }
 
 void main() {
-    BindPos = inPosition;
-    ClipLimb = clipLimbOf(inJoints, inWeights);
-    // The same transform the lit pass builds. Reading instanceModel alone left
-    // an instanced model casting its shadow from wherever its own transform was
-    // not applied.
-    mat4 modelMatrix = isInstanced ? (model * instanceModel) : model;
-    if (isInstanced && instancePoints) {
-        vec4 point = instanceModel[0];
-        modelMatrix = mat4(model[0] * point.w, model[1] * point.w, model[2] * point.w,
-                           vec4(point.xyz, 1.0));
-        // A billboard: the mesh turned to the eye, its +Z toward the camera
-        // -- upright, spun about the world's up alone, for a streak of rain
-        // that stays a streak; or full, tipped to face the eye as well, for
-        // a flake. The model's own scale stays, its rotation does not.
-        if (instanceBillboard > 0) {
-            vec3 toEye = viewPos - point.xyz;
-            vec3 up = vec3(0.0, 1.0, 0.0);
-            vec3 forward;
-            if (instanceBillboard == 1) {
-                forward = normalize(vec3(toEye.x, 0.0, toEye.z));
-            } else {
-                forward = normalize(toEye);
-            }
-            vec3 right = normalize(cross(up, forward));
-            up = cross(forward, right);
-            float sx = length(vec3(model[0])) * point.w;
-            float sy = length(vec3(model[1])) * point.w;
-            float sz = length(vec3(model[2])) * point.w;
-            modelMatrix = mat4(vec4(right * sx, 0.0), vec4(up * sy, 0.0), vec4(forward * sz, 0.0),
-                               vec4(point.xyz, 1.0));
-        }
+    // Laid out as level 0 is, whatever this level's size, so the scene
+    // reads every level at one coordinate (sky_reflection).
+    vec3 N = oct_texel_direction(gl_FragCoord.xy / skyLevelSize, SKY_SIZE);
+    if (skyRoughness <= 0.0) {
+        FragColor = vec4(textureLod(skyCapture, oct_uv(N, SKY_SIZE), 0.0).rgb, 1.0);
+        return;
     }
-    // And the same pose. A shadow pass that skipped this drew the bind pose,
-    // so a figure threw the shadow of a mannequin standing where it started.
-    vec4 posed = vec4(inPosition, 1.0);
-    if (isSkinned) {
-        mat4 skin = inWeights.x * bones[int(inJoints.x)]
-                  + inWeights.y * bones[int(inJoints.y)]
-                  + inWeights.z * bones[int(inJoints.z)]
-                  + inWeights.w * bones[int(inJoints.w)];
-        posed = skin * posed;
+    float a = skyRoughness * skyRoughness;
+    vec3 up = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, N));
+    vec3 B = cross(N, T);
+    // A texel of the capture's level 0, as solid angle: the whole sphere
+    // over its inner texels.
+    float texel = 4.0 * 3.14159265 / ((SKY_SIZE - 2.0) * (SKY_SIZE - 2.0));
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (int i = 0; i < FILTER_SAMPLES; i++) {
+        vec2 xi = vec2((float(i) + 0.5) / float(FILTER_SAMPLES), radical_inverse(uint(i)));
+        float phi = 6.28318531 * xi.y;
+        float cosTheta = sqrt((1.0 - xi.x) / (1.0 + (a * a - 1.0) * xi.x));
+        float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+        vec3 H = T * (sinTheta * cos(phi)) + B * (sinTheta * sin(phi)) + N * cosTheta;
+        vec3 L = 2.0 * dot(N, H) * H - N;
+        float NdotL = dot(N, L);
+        if (NdotL <= 0.0) continue;
+        // With the view along the normal, the pdf of L is D(H) / 4.
+        float d = (cosTheta * cosTheta * (a * a - 1.0) + 1.0);
+        float pdf = (a * a) / (3.14159265 * d * d) / 4.0;
+        float sampleAngle = 1.0 / (float(FILTER_SAMPLES) * pdf + 1e-6);
+        float lod = max(0.5 * log2(sampleAngle / texel) + 1.0, 0.0);
+        sum += textureLod(skyCapture, oct_uv(L, SKY_SIZE), lod).rgb * NdotL;
+        weight += NdotL;
     }
-    gl_Position = lightSpaceMatrix * modelMatrix * posed;
+    FragColor = vec4(sum / max(weight, 1e-6), 1.0);
 }

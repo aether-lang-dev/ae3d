@@ -52,12 +52,12 @@ interleaved with the first.
 | `scene.skeleton` | `object` | Every bone of a skinned model: name, parent, where it is in the world and how it is turned. A skinned mesh stays in its bind pose and its bones carry it, so this is the only thing that says where a figure's hand or foot actually is. Answered at the frame boundary, so it describes a pose that is finished rather than one part way through being built. |
 | `scene.isolate` | `[object], [matching], [none]` | Show only this model, or only the models whose names hold one of the strings in matching, or none of them (the sky alone); every model again when given nothing. |
 | `model.get` | `index` | One model in full: transform, bounds, material and mesh counts. |
-| `light.list` |  | Every light: kind, position, direction, colour, intensity and ambient. |
+| `light.list` |  | Every light: kind, position, direction, colour and intensity. |
 | `model.set` | `index, [position], [rotation], [scale], [diffuse], [metallic], [roughness], [reflectivity], [alpha], [visible], [casts_shadow], [name]` | Change a model. Only the fields present are written; answers with the model as it now is. |
 | `camera.set` | `[position], [look_at], [fov], [near], [far]` | Move or reframe the camera. |
 | `input.set` | `[key], [mouse], [button], [axis], [value], [down], [cursor], [scroll], [clear]` | Press or release a key, mouse button or pad button, hold a pad axis at a value, put the cursor at [x, y] in window coordinates (held until clear), turn the wheel by scroll notches (read for one frame), or clear every injection: what the engine's input reads next frame beside the real devices. |
 | `input.get` |  | Every bound action with its state this frame: down, pressed, released, value. |
-| `light.set` | `[index], [position], [direction], [color], [intensity], [ambient]` | Change a light. |
+| `light.set` | `[index], [position], [direction], [color], [intensity]` | Change a light. |
 | `object.list` | `[filter]` | The scene's game objects: index, name, tag, whether active, and the kinds of their components in order. The scene itself comes first as index -1, named Scene: its components are what is the scene's rather than any object's (Environment, Rendering, a script keeping the game's rules). With filter, only the objects whose name has the text. |
 | `object.get` | `object` | One object and every component on it: its kind, whether enabled, its version (how many times it has changed) and its fields by name. object is an index from object.list, a name, or Scene. |
 | `component.kinds` |  | Every kind of component there is -- the engine's and the game's -- with the heading it is listed under, whether an object may carry only one, whether it is the scene's, and each field's name, type (bool, int, float, vec3, color, rotation, enum, text, asset), range, choices and tooltip. |
@@ -76,7 +76,7 @@ interleaved with the first.
 | `frame.diff` | `[tolerance]` | Changed pixel count, fraction and largest channel delta against the held reference. |
 | `world` |  | Every entity and the relations between them: blend object, asset, model, mesh, clip, light, camera. One query instead of joining four. |
 | `trace.model` | `id \| object \| index` | Follow one model from its Blender object to the pixels: source, asset, mesh, node, animation, visibility. Names the stage it stopped being right at. |
-| `explain.model` | `id \| object \| index` | Why a model looks the way it does on screen: its material, its texture's mean colour, the light each light and the ambient bring to its top and to the side facing the camera, whether its centre can see the key light or which model is in the way, the exposure, and the pixels it produced beside what it would show fully lit. The verdict names the first stage that accounts for a dark or wrong-coloured look, or says it is as lit. |
+| `explain.model` | `id \| object \| index` | Why a model looks the way it does on screen: its material, its texture's mean colour, the light each light and the sky bring to its top and to the side facing the camera, whether its centre can see the key light or which model is in the way, the exposure, and the pixels it produced beside what it would show fully lit. The verdict names the first stage that accounts for a dark or wrong-coloured look, or says it is as lit. |
 | `anim.list` |  | Every animation bound to a model: clip, playhead, duration, speed and the pose it produced. |
 | `anim.get` | `name \| index` | One animation in full, including the transform its playhead currently produces. |
 | `anim.set` | `[name \| index], [time], [speed], [playing], [looping]` | Drive an animation, or every animation at once when no name or index is given. Setting time seeks and reposes together, so a snapshot after it shows that pose. |
@@ -177,15 +177,15 @@ finding accounts for what the pixels show. This is the cube under the roof in
            {"index": 0, "name": "sun", "mode": "directional", "radiance": 1.386, "onto_top": 0.346, "onto_side": 0.26},
            {"index": 1, "name": "lamp", "mode": "point", "distance": 23.324, "reach": 16, "onto_top": 0, "onto_side": 0,
             "note": "out of reach: 23.324 m away, its light stops at 16 m"}],
-         "direct_top": [0.375, 0.342, 0.3], "direct_side": [0.281, 0.257, 0.225], "ambient": [0.08, 0.073, 0.064],
-         "direct_top_luminance": 0.346, "direct_side_luminance": 0.26, "ambient_luminance": 0.074}},
+         "direct_top": [0.375, 0.342, 0.3], "direct_side": [0.281, 0.257, 0.225], "sky": [0.085, 0.103, 0.124],
+         "direct_top_luminance": 0.346, "direct_side_luminance": 0.26, "sky_luminance": 0.101}},
       {"stage": "shadow", "flagged": true, "finding": "in the shadow of roof", "detail": {"shadows": true,
          "key_light": "sun", "centre_blocked_by": "roof", "top_blocked_by": "roof"}},
       {"stage": "exposure", "flagged": false, "detail": {"material": 1, "frame": 1, "eye_adaptation": false, "total": 1}},
-      {"stage": "pixels", "flagged": false, "detail": {"region": {"x": 134, "y": 94, "width": 50, "height": 50},
-         "coverage": 1, "centre": {"x": 151, "y": 111, "width": 17, "height": 17},
-         "mean": [0.314, 0.294, 0.271], "luminance": 0.297,
-         "predicted": [0.642, 0.618, 0.581], "predicted_luminance": 0.621}}]}
+      {"stage": "pixels", "flagged": false, "detail": {"region": {"x": 269, "y": 189, "width": 100, "height": 100},
+         "coverage": 1, "centre": {"x": 302, "y": 222, "width": 35, "height": 35},
+         "mean": [0.314, 0.349, 0.384], "luminance": 0.344,
+         "predicted": [0.652, 0.648, 0.639], "predicted_luminance": 0.648}}]}
 
 The stages:
 
@@ -202,8 +202,9 @@ The stages:
   surface the camera sees there (`side_normal`, the face a ray from the eye
   through the centre meets first), as it multiplies the albedo: a light's
   colour by its temperature, a point light's fall-off, the reach past which
-  the shader skips it, a spot light's cone, and the ambient the key light
-  brings. A light that gives nothing says why: out of reach, outside its
+  the shader skips it, a spot light's cone, and the sky's light as the
+  renderer captured it this frame: its irradiance onto that surface over pi
+  (`sky`). A light that gives nothing says why: out of reach, outside its
   cone, behind the model, below the horizon. Flagged when no direct light
   reaches the side the camera sees.
 - `shadow`: whether the model's centre and top can see the key light, by a

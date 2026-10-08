@@ -191,87 +191,69 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float crowdPhaseStep;
     vec4 shadowReach;
 };
-layout (location = 0) in vec3 inPosition;
-layout (location = 3) in mat4 instanceModel;
-layout (location = 8) in vec4 inJoints;
-layout (location = 9) in vec4 inWeights;
+layout(set = 0, binding = 1) uniform sampler2D skyCapture;
+layout(location = 0) out vec4 FragColor;
 
 
 
-
-
-
-
-
-
-
-
-layout(location = 0) out vec3 BindPos;
-layout(location = 1) out float ClipLimb;
-
-// The joints a cut is kept to (#556), as three words of 32 bits: joint j is
-// bit j % 32 of word j / 32. None named, the cut is the whole model's.
-
-
-
-
-float clipJointOn(float joint) {
-    int j = int(joint + 0.5);
-    int word = j < 32 ? clipJoints0 : (j < 64 ? clipJoints1 : clipJoints2);
-    return float((word >> (j & 31)) & 1);
+// The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
+// the upper hemisphere in the square's inner diamond, the lower folded into
+// its corners, one texel of gutter around each level holding the sky just
+// across the fold, so a filtered read at an edge is still the sky.
+#define SKY_SIZE 256.0
+#define SKY_LEVELS 6.0
+#define SKY_IRRADIANCE_SIZE 16.0
+vec3 oct_decode(vec2 p) {
+    vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0) {
+        vec2 folded = (1.0 - abs(d.zx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = folded.x;
+        d.z = folded.y;
+    }
+    return normalize(d);
 }
-
-// The share of the vertex's weight on the cut's joints: 1 where none are
-// named or the model is not skinned. The fragment cuts where it is past
-// one half, so the cut's edge across the body is the limb's own weighting.
-float clipLimbOf(vec4 joints, vec4 weights) {
-    if (!isSkinned || (clipJoints0 | clipJoints1 | clipJoints2) == 0) return 1.0;
-    return weights.x * clipJointOn(joints.x) + weights.y * clipJointOn(joints.y)
-         + weights.z * clipJointOn(joints.z) + weights.w * clipJointOn(joints.w);
+vec2 oct_encode(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p;
+}
+// Where direction d is read in a level `size` texels a side.
+vec2 oct_uv(vec3 d, float size) {
+    return ((oct_encode(d) * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
+vec3 oct_texel_direction(vec2 uv, float size) {
+    vec2 p = ((uv * size - 1.0) / (size - 2.0)) * 2.0 - 1.0;
+    if (p.x > 1.0) { p.x = 2.0 - p.x; p.y = -p.y; }
+    if (p.x < -1.0) { p.x = -2.0 - p.x; p.y = -p.y; }
+    if (p.y > 1.0) { p.y = 2.0 - p.y; p.x = -p.x; }
+    if (p.y < -1.0) { p.y = -2.0 - p.y; p.x = -p.x; }
+    return oct_decode(p);
 }
 
 void main() {
-    BindPos = inPosition;
-    ClipLimb = clipLimbOf(inJoints, inWeights);
-    // The same transform the lit pass builds. Reading instanceModel alone left
-    // an instanced model casting its shadow from wherever its own transform was
-    // not applied.
-    mat4 modelMatrix = isInstanced ? (model * instanceModel) : model;
-    if (isInstanced && instancePoints) {
-        vec4 point = instanceModel[0];
-        modelMatrix = mat4(model[0] * point.w, model[1] * point.w, model[2] * point.w,
-                           vec4(point.xyz, 1.0));
-        // A billboard: the mesh turned to the eye, its +Z toward the camera
-        // -- upright, spun about the world's up alone, for a streak of rain
-        // that stays a streak; or full, tipped to face the eye as well, for
-        // a flake. The model's own scale stays, its rotation does not.
-        if (instanceBillboard > 0) {
-            vec3 toEye = viewPos - point.xyz;
-            vec3 up = vec3(0.0, 1.0, 0.0);
-            vec3 forward;
-            if (instanceBillboard == 1) {
-                forward = normalize(vec3(toEye.x, 0.0, toEye.z));
-            } else {
-                forward = normalize(toEye);
+    vec3 N = oct_texel_direction(gl_FragCoord.xy / SKY_IRRADIANCE_SIZE, SKY_IRRADIANCE_SIZE);
+    int level = int(log2(SKY_SIZE / SKY_IRRADIANCE_SIZE) + 0.5);
+    int n = int(SKY_IRRADIANCE_SIZE);
+    vec3 sum = vec3(0.0);
+    float total = 0.0;
+    for (int y = 0; y < n; y++) {
+        for (int x = 0; x < n; x++) {
+            vec2 uv = (vec2(float(x), float(y)) + 0.5) / SKY_IRRADIANCE_SIZE;
+            vec2 p = clamp(((uv * SKY_SIZE - 1.0) / (SKY_SIZE - 2.0)) * 2.0 - 1.0, -1.0, 1.0);
+            vec3 q = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+            if (q.y < 0.0) {
+                vec2 folded = (1.0 - abs(q.zx)) * vec2(q.x >= 0.0 ? 1.0 : -1.0, q.z >= 0.0 ? 1.0 : -1.0);
+                q.x = folded.x;
+                q.z = folded.y;
             }
-            vec3 right = normalize(cross(up, forward));
-            up = cross(forward, right);
-            float sx = length(vec3(model[0])) * point.w;
-            float sy = length(vec3(model[1])) * point.w;
-            float sz = length(vec3(model[2])) * point.w;
-            modelMatrix = mat4(vec4(right * sx, 0.0), vec4(up * sy, 0.0), vec4(forward * sz, 0.0),
-                               vec4(point.xyz, 1.0));
+            float len = length(q);
+            float angle = 1.0 / (len * len * len);
+            vec3 L = q / len;
+            sum += texelFetch(skyCapture, ivec2(x, y), level).rgb * max(dot(N, L), 0.0) * angle;
+            total += angle;
         }
     }
-    // And the same pose. A shadow pass that skipped this drew the bind pose,
-    // so a figure threw the shadow of a mannequin standing where it started.
-    vec4 posed = vec4(inPosition, 1.0);
-    if (isSkinned) {
-        mat4 skin = inWeights.x * bones[int(inJoints.x)]
-                  + inWeights.y * bones[int(inJoints.y)]
-                  + inWeights.z * bones[int(inJoints.z)]
-                  + inWeights.w * bones[int(inJoints.w)];
-        posed = skin * posed;
-    }
-    gl_Position = lightSpaceMatrix * modelMatrix * posed;
+    // The weights cover the sphere once: what they sum to stands for 4 pi.
+    FragColor = vec4(sum * (4.0 * 3.14159265 / total), 1.0);
 }

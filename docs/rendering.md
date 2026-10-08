@@ -258,6 +258,59 @@ exposure of one. A capture channel passes through the composite
 untouched: the surfaces' own numbers. `tests/test_hdr` holds both
 backends to these, the curve's numbers against the frame's pixels.
 
+### The sky's light
+
+The sky lights the scene (#655), as bright as it is drawn and from the
+directions it is in. Each frame, before the scene, the sky is drawn into an
+octahedral map (256 texels a side, half floats, a texel of gutter round each
+level so a filtered read at a fold is still the sky) without the sun's and
+the moon's discs -- the key light is them -- and halved down its mips; from
+it, on the device, two things the lit shader reads:
+
+- the irradiance onto every normal, a 16-texel octahedral map, every texel
+  of the capture's 16-texel mip weighed by the cosine and by the solid angle
+  it covers (`dA / |q|^3` on the octahedron), so a surface takes the light of
+  the whole sky over it and none of what is under it;
+- the reflections, the capture prefiltered by GGX into six roughness levels,
+  48 samples a texel read from the mip whose texels cover each sample's share
+  of the lobe (filtered importance sampling), scaled by the split-sum table
+  `ae3d.skylight` makes at start (Karis).
+
+A surface's indirect light is its albedo over pi times the irradiance, by
+`(1 - F)` and its metalness, and its F0 times the reflection; the occlusion,
+baked and by ray, scales this term alone. A scene with no sky of its own is
+surrounded by its clear colour: a white matte surface under a flat sky shows
+the sky's colour, and a black glossy one four percent of it
+(`tests/test_sky_light`, both backends). A material that turns image-based
+lighting off keeps the diffuse and loses the reflections.
+
+The screen's occlusion (`engine_set_ssao`) is found before the scene, from
+the last frame's depth, into an occlusion map: the positions rebuilt with
+this frame's matrices, which is the last frame's geometry moved rigidly by
+the camera's step, so each sample still lands on the image it was drawn in;
+beside each pixel's occlusion, the depth it was found at. A surface reads
+the map where it was last frame (its motion vector's other end) and takes
+it only if the depth there is its own -- a corner just come round, a figure
+just stepped aside, a pane of glass in front of what was there are not
+occluded by what the map says -- and the occlusion darkens its sky's light
+and nothing else: a lamp shining into a corner shines into it. It shows
+from the second frame on, as the temporal pass's history does.
+
+The sky drawn from the sun is light, not a colour: by day it is Preetham,
+Shirley and Smits' analytic sky, its luminance and colour in each direction
+from the sun's height and the air's turbidity (`renderer_set_sky_turbidity`,
+2.5 a clear day), at `core.SKY_PHOTOMETRIC` of the engine's radiance a
+candela a square metre -- the scale at which an 18% grey card under the
+noon sun shows mid-grey at an exposure of one. The sun is the same day's:
+the clear-sky beam of the ESRA model through the air mass at its height
+(`core.sun_light`, which `light_sun` and the hour's sun take their strength
+from). At the day's noon, the sun 66 degrees up, the sky gives 0.547 onto
+the ground and the sun 1.77, three and a quarter to one, the sky's light
+two and a half times bluer than red, the same on both renderers to the
+third place. Low down the daylight hands over to the dusk gradient the sky
+had, where the analytic model is weakest; the night keeps a moon's light a
+game needs.
+
 ### Motion vectors
 
 Beside its colour, every scene draw writes where its pixel's surface was
@@ -416,7 +469,8 @@ Occlusion by ray: `engine_set_ray_occlusion(e, on)`, or `AE3D_RAY_AO=1`,
 with the rays and the occlusion (`engine_set_ssao`) both on. The scene
 shader traces four cosine-weighted rays into the hemisphere over every
 lit pixel, each stopped at the occlusion's reach, on the same turned
-spiral as the sun's taps, and darkens by the share that hit -- the share
+spiral as the sun's taps, and darkens the sky's light by the share that
+hit -- the share
 of the sky the point does not see, from the scene itself, with no screen
 edge or hidden surface for a depth-based estimate to miss -- and the
 screen-space pass is not drawn. The rays start a hand's breadth out,

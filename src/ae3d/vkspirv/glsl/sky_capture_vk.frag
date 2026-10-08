@@ -1,4 +1,5 @@
 #version 450
+#define AE3D_SKY_CAPTURE 1
 
 struct Light {
     vec3 position;
@@ -203,9 +204,9 @@ layout(location = 0) out vec4 FragColor;
 #ifndef AE3D_SKY_CAPTURE
 layout(location = 1) out vec2 outVelocity;
 
-layout(location = 0) in vec3 TexCoords;
-layout(location = 1) in vec4 ClipNow;
-layout(location = 2) in vec4 ClipPrev;
+in vec3 TexCoords;
+in vec4 ClipNow;
+in vec4 ClipPrev;
 #endif
 
 

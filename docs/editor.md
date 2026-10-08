@@ -362,7 +362,7 @@ engine runs in the editor unchanged.
 
 The light section is the light itself: three buttons for its kind -- Sun
 (directional, over the whole scene), Point (a lamp in a room) and Spot (a
-headlight down a street) -- then its intensity, ambient and colour, its
+headlight down a street) -- then its intensity and colour, its
 reach in metres, and, for a spot, the cone: the angle its light is whole
 within and the angle it is gone at. The rows act on the selected light,
 or on the scene's key light when none is selected, and the cone rows are

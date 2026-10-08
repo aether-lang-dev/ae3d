@@ -13,7 +13,7 @@ exports (
     VERTEX_WATER, FRAGMENT_WATER,
     VERTEX_DEPTH, FRAGMENT_DEPTH,
     VERTEX_SKYBOX, FRAGMENT_SKYBOX,
-    VERTEX_SCREEN, FRAGMENT_FXAA, FRAGMENT_COMPOSITE, FRAGMENT_COLOR_RESOLVE, FRAGMENT_SSR,
+    FRAGMENT_SKY_FILTER, FRAGMENT_SKY_IRRADIANCE, VERTEX_SCREEN, FRAGMENT_FXAA, FRAGMENT_COMPOSITE, FRAGMENT_COLOR_RESOLVE, FRAGMENT_SSR,
     FRAGMENT_TAA, FRAGMENT_SSAO, VERTEX_OVERLAY, FRAGMENT_OVERLAY, default_shader, water_shader
 )
 
@@ -430,7 +430,6 @@ struct Light {
     vec3 position;
     vec3 color;
     float intensity;
-    float ambientStrength;  // Configurable ambient strength
     float temperature;      // Color temperature in Kelvin (2000-10000)
     int isDirectional;      // 0 = point light, 1 = directional light, 2 = spot light
     vec3 direction;         // Direction for directional lights; the axis of a spot light's cone
@@ -518,7 +517,6 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
     L.temperature = d.w;
     L.spotCosOuter = e.x;
     L.spotCosInner = e.y;
-    L.ambientStrength = 0.0;
     // The lamp's own shadow's slot (ae3d.lampshadows), or -1: -1.0 read
     // back rounds toward zero, so it is rounded from below.
     shadowSlot = int(floor(e.z + 0.5));
@@ -1189,23 +1187,6 @@ vec3 calculateGlobalIllumination(vec3 position, vec3 normal, vec3 albedo, float 
     return gi * giIntensity / float(samples);
 }
 
-// Environment reflections (skybox-based) - simplified to avoid artifacts
-vec3 calculateEnvironmentReflection(vec3 N, vec3 V, float roughness, float metallic) {
-    // Calculate reflection direction
-    vec3 R = reflect(-V, N);
-    
-    // Simple uniform environment color to avoid the "two halves" effect
-    vec3 envColor = vec3(0.6, 0.7, 0.9); // Uniform sky-like color
-    
-    // Roughness affects reflection clarity
-    float reflectionStrength = (1.0 - roughness * 0.9) * 0.5; // Reduced strength
-    
-    // Metallic materials reflect more environment
-    float envContribution = mix(0.05, 0.3, metallic) * reflectionStrength; // Much reduced
-    
-    return envColor * envContribution;
-}
-
 // Simple inter-object reflections approximation
 vec3 calculateInterObjectReflections(vec3 worldPos, vec3 N, vec3 V, float roughness, float metallic) {
     // Only apply to metallic surfaces with low roughness
@@ -1721,6 +1702,100 @@ layout(set = 0, binding = 9) uniform sampler2D damageMask;
 uniform sampler2D damageMask;
 #endif
 
+// The light from the sky (#655), what arrives from every direction: its
+// reflections from the octahedral map prefiltered into roughness levels,
+// the split-sum table that scales them by F0 (ae3d.skylight), and its
+// irradiance onto every normal, an octahedral map of its own.
+#ifdef VULKAN
+layout(set = 0, binding = 10) uniform sampler2D skyLight;
+layout(set = 0, binding = 11) uniform sampler2D brdfLut;
+layout(set = 0, binding = 12) uniform sampler2D skyIrradiance;
+layout(set = 0, binding = 13) uniform sampler2D occlusionMap;
+#else
+uniform sampler2D skyLight;
+uniform sampler2D brdfLut;
+uniform sampler2D skyIrradiance;
+uniform sampler2D occlusionMap;
+#endif
+// Whether the occlusion map holds the last frame's (FRAGMENT_SSAO): one
+// when the screen's occlusion is on and a frame has been drawn to find it.
+uniform int occlusionHistory;
+
+// The screen's occlusion at this surface: found in the last frame's image
+// where the surface was then (ClipPrev), if the depth found there is this
+// surface's -- what the last frame did not show of it (a corner just come
+// round, a figure just stepped aside), and a surface in front of the one
+// that was there, is not occluded by what the map says.
+float screen_occlusion() {
+    if (occlusionHistory == 0 || ClipPrev.w <= 0.0) return 1.0;
+    vec2 uv = ClipPrev.xy / ClipPrev.w * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
+    vec2 found = texture(occlusionMap, uv).rg;
+    if (abs(found.g - ClipPrev.w) > 0.05 * ClipPrev.w) return 1.0;
+    return found.r;
+}
+// The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
+// the upper hemisphere in the square's inner diamond, the lower folded into
+// its corners, one texel of gutter around each level holding the sky just
+// across the fold, so a filtered read at an edge is still the sky.
+#define SKY_SIZE 256.0
+#define SKY_LEVELS 6.0
+#define SKY_IRRADIANCE_SIZE 16.0
+vec3 oct_decode(vec2 p) {
+    vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0) {
+        vec2 folded = (1.0 - abs(d.zx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = folded.x;
+        d.z = folded.y;
+    }
+    return normalize(d);
+}
+vec2 oct_encode(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p;
+}
+// Where direction d is read in a level `size` texels a side.
+vec2 oct_uv(vec3 d, float size) {
+    return ((oct_encode(d) * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
+// The direction a texel of a level `size` a side stands for, at texture
+// coordinate uv: a gutter texel's folded back across the edge it lies past.
+vec3 oct_texel_direction(vec2 uv, float size) {
+    vec2 p = ((uv * size - 1.0) / (size - 2.0)) * 2.0 - 1.0;
+    if (p.x > 1.0) { p.x = 2.0 - p.x; p.y = -p.y; }
+    if (p.x < -1.0) { p.x = -2.0 - p.x; p.y = -p.y; }
+    if (p.y > 1.0) { p.y = 2.0 - p.y; p.x = -p.x; }
+    if (p.y < -1.0) { p.y = -2.0 - p.y; p.x = -p.x; }
+    return oct_decode(p);
+}
+
+vec3 sky_irradiance(vec3 n) {
+    return texture(skyIrradiance, oct_uv(n, SKY_IRRADIANCE_SIZE)).rgb;
+}
+
+// The sky mirrored along r off a surface of `rough`: one read between the
+// two levels it lies between. Every level is laid out as level 0 is (as a
+// mip of it would be), so one coordinate is right at all of them.
+vec3 sky_reflection(vec3 r, float rough) {
+    float level = clamp(rough, 0.0, 1.0) * (SKY_LEVELS - 1.0);
+    return textureLod(skyLight, oct_uv(r, SKY_SIZE), level).rgb;
+}
+
+// What the sky gives a surface: its diffuse, Lambert over the irradiance,
+// and its reflection, prefiltered by the roughness and scaled by the split
+// sum. A material that turns image-based lighting off keeps the diffuse.
+vec3 sky_light(vec3 N, vec3 V, vec3 albedo, vec3 F0, float rough, float metal, float NdotV) {
+    vec3 F = F0 + (max(vec3(1.0 - rough), F0) - F0) * pow(1.0 - NdotV, 5.0);
+    vec3 kD = (vec3(1.0) - F) * (1.0 - metal);
+    vec3 diffuse = kD * albedo * sky_irradiance(N) / 3.14159265;
+    if (!enableImageBasedLighting) return diffuse;
+    vec2 ab = texture(brdfLut, vec2(NdotV, rough)).rg;
+    vec3 specular = sky_reflection(reflect(-V, N), rough) * (F0 * ab.x + ab.y);
+    return diffuse + specular * iblIntensity;
+}
+
 void main() {
     // A cut model's far side, not drawn (#545): nor its depth, which the
     // occlusion, the reflections and the water read from this pass.
@@ -1928,25 +2003,16 @@ void main() {
         }
     }
 
-    // Ambient belongs to the scene rather than to each light, so it comes from
-    // the key light alone; summing it per light would wash the image out as
-    // lights were added.
-    vec3 keyColor = lights[0].color * kelvinToRGB(lights[0].temperature);
-    // Ambient is light arriving from every direction, so what a point can see
-    // of the sky is exactly what scales it. This is the term occlusion belongs
-    // to and the only one: darkening the direct light as well would put a
-    // shadow where a lamp is plainly shining.
-    float shut = mix(1.0, Occlusion, occlusionStrength);
-    vec3 ambient = lights[0].ambientStrength * keyColor * albedo * 0.8 * shut;
-    vec3 fillLightContrib = vec3(0.0);
-
-    // The direct light, under the clouds' shadow where a cloud drifts over.
-    vec3 color = ambient + fillLightContrib + Lo;
+    // The sky's light arrives from every direction, so what a point can see
+    // of the sky is exactly what scales it: the occlusion, baked, on the
+    // screen and by ray,
+    // belongs to this term and no other -- darkening the direct light as
+    // well would put a shadow where a lamp is plainly shining.
+    float shut = mix(1.0, Occlusion, occlusionStrength) * screen_occlusion();
 #ifdef AE3D_RAY_QUERY
-    // The occlusion by ray darkens what the screen-space pass would have,
-    // the whole of the lit surface, so the two pictures agree.
-    if (traced && rayOcclusion > 0.0) color *= ray_occlusion_factor();
+    if (traced && rayOcclusion > 0.0) shut *= ray_occlusion_factor();
 #endif
+    vec3 color = sky_light(norm, viewDir, albedo, F0, adjustedRoughness, metallic, NdotV) * shut + Lo;
 
 	// Calculate distance for performance scaling (CRITICAL for voxel terrain performance)
 	float distanceToCamera = length(FragPos - viewPos);
@@ -1960,13 +2026,6 @@ void main() {
 	// Global Illumination (with distance LOD built-in)
 	vec3 gi = calculateGlobalIllumination(FragPos, norm, albedo, distanceToCamera);
 	color += gi;
-    
-	// Environment reflections (skybox-based), which is what image based lighting
-	// means here: light arriving from the surroundings rather than from a lamp.
-    if (enableImageBasedLighting) {
-        vec3 envReflection = calculateEnvironmentReflection(norm, viewDir, roughness, metallic);
-        color += envReflection * 0.3 * iblIntensity;
-    }
     
     color += caustic_light(FragPos, norm) * albedo;
 
@@ -3002,11 +3061,17 @@ GLSL_END
 const FRAGMENT_SKYBOX = <<GLSL_END
 #version 330 core
 out vec4 FragColor;
+// AE3D_SKY_CAPTURE: the sky drawn into the octahedral map the scene is lit
+// from (#655), each texel the sky in its direction, without the sun's and
+// the moon's discs -- the key light is them, and counted twice it would
+// light everything again.
+#ifndef AE3D_SKY_CAPTURE
 layout(location = 1) out vec2 outVelocity;
 
 in vec3 TexCoords;
 in vec4 ClipNow;
 in vec4 ClipPrev;
+#endif
 
 uniform sampler2D skybox;
 // The clouds over the painted sky: how much of it they cover (zero is a
@@ -3042,6 +3107,12 @@ uniform int skyProcedural;
 // takes too, since they are lit by the sky behind them.
 uniform float skyOvercast;
 uniform vec3 skyOvercastColor;
+// A flat sky, the clear colour (skyProcedural 2): what surrounds a scene
+// with no sky of its own, as it shows.
+uniform vec3 skyFlat;
+// How hazy the air is (Preetham's turbidity: 2 a clear blue day, 6 a hazy
+// one): what the daylight sky is drawn from with the sun.
+uniform float skyTurbidity;
 
 // Clouds, shared by the sky that draws them and the ground they shadow.
 // A layer between CLOUD_BASE and CLOUD_TOP metres up. Where cloud is, over
@@ -3293,13 +3364,82 @@ vec4 cloudsAlong(vec3 dir, vec3 sky, float cover, float t, float dither) {
     return vec4(colour * horizon, alpha * horizon);
 }
 
-// A clear sky from the sun's position alone. Blue overhead and pale at the
-// horizon by day; the horizon goes gold and then red as the sun nears it,
-// most on the sun's side; a glow around the sun from the air's forward
-// scattering, and the disc itself; a deep blue-grey once the sun is under,
-// with the moon's worth of light the scenes keep. Not a measurement of an
-// atmosphere -- the shapes a clear sky makes, at the cost of a gradient.
+// The daylight sky as light (#655): Preetham, Shirley and Smits' analytic
+// model, the sky's luminance and colour in every direction from the sun's
+// height and the air's turbidity (Perez's distribution over the zenith's
+// value), in cd/m2 and then in the engine's units -- SKY_PHOTOMETRIC
+// radiance a candela a square metre, the scale at which an 18% grey card
+// under the noon sun shows mid-grey at an exposure of one (core.sun_light
+// is the sun's light at the same scale). Below the horizon, the horizon's
+// light through the haze the ground would be seen through.
+#define SKY_PHOTOMETRIC 2.0e-5
+float perez(float cosTheta, float gamma, float A, float B, float C, float D, float E) {
+    return (1.0 + A * exp(B / max(cosTheta, 0.01))) * (1.0 + C * exp(D * gamma) + E * cos(gamma) * cos(gamma));
+}
+vec3 daylight(vec3 dir, vec3 sun, float T) {
+    float thetaS = acos(clamp(sun.y, 0.0, 1.0));
+    float below = 1.0;
+    if (dir.y < 0.0) {
+        below = mix(1.0, 0.6, clamp(-dir.y * 4.0, 0.0, 1.0));
+        dir = normalize(vec3(dir.x, 0.0, dir.z));
+    }
+    float cosTheta = dir.y;
+    float gamma = acos(clamp(dot(dir, sun), -1.0, 1.0));
+    float chi = (4.0 / 9.0 - T / 120.0) * (3.14159265 - 2.0 * thetaS);
+    float Yz = ((4.0453 * T - 4.9710) * tan(chi) - 0.2155 * T + 2.4192) * 1000.0;
+    float t1 = thetaS, t2 = thetaS * thetaS, t3 = t2 * thetaS;
+    float xz = T * T * (0.00166 * t3 - 0.00375 * t2 + 0.00209 * t1) +
+               T * (-0.02903 * t3 + 0.06377 * t2 - 0.03202 * t1 + 0.00394) +
+               (0.11693 * t3 - 0.21196 * t2 + 0.06052 * t1 + 0.25886);
+    float yz = T * T * (0.00275 * t3 - 0.00610 * t2 + 0.00317 * t1) +
+               T * (-0.04214 * t3 + 0.08970 * t2 - 0.04153 * t1 + 0.00516) +
+               (0.15346 * t3 - 0.26756 * t2 + 0.06670 * t1 + 0.26688);
+    float Y = Yz * perez(cosTheta, gamma, 0.1787 * T - 1.4630, -0.3554 * T + 0.4275, -0.0227 * T + 5.3251, 0.1206 * T - 2.5771, -0.0670 * T + 0.3703) /
+                   perez(1.0, thetaS, 0.1787 * T - 1.4630, -0.3554 * T + 0.4275, -0.0227 * T + 5.3251, 0.1206 * T - 2.5771, -0.0670 * T + 0.3703);
+    float x = xz * perez(cosTheta, gamma, -0.0193 * T - 0.2592, -0.0665 * T + 0.0008, -0.0004 * T + 0.2125, -0.0641 * T - 0.8989, -0.0033 * T + 0.0452) /
+                   perez(1.0, thetaS, -0.0193 * T - 0.2592, -0.0665 * T + 0.0008, -0.0004 * T + 0.2125, -0.0641 * T - 0.8989, -0.0033 * T + 0.0452);
+    float y = yz * perez(cosTheta, gamma, -0.0167 * T - 0.2608, -0.0950 * T + 0.0092, -0.0079 * T + 0.2102, -0.0441 * T - 1.6537, -0.0109 * T + 0.0529) /
+                   perez(1.0, thetaS, -0.0167 * T - 0.2608, -0.0950 * T + 0.0092, -0.0079 * T + 0.2102, -0.0441 * T - 1.6537, -0.0109 * T + 0.0529);
+    vec3 XYZ = vec3(x / y * Y, Y, (1.0 - x - y) / y * Y);
+    vec3 rgb = vec3(3.2406 * XYZ.x - 1.5372 * XYZ.y - 0.4986 * XYZ.z,
+                    -0.9689 * XYZ.x + 1.8758 * XYZ.y + 0.0415 * XYZ.z,
+                    0.0557 * XYZ.x - 0.2040 * XYZ.y + 1.0570 * XYZ.z);
+    return max(rgb, vec3(0.0)) * (SKY_PHOTOMETRIC * below);
+}
+
+// Light as it shows at an exposure of one: the frame's tone curve, which
+// display_radiance takes back. The clouds, the overcast and the stars are
+// laid over the sky in what shows, as they always were.
+float shown_channel(float x) {
+    float t = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+    return t <= 0.0031308 ? t * 12.92 : 1.055 * pow(t, 1.0 / 2.4) - 0.055;
+}
+vec3 shown_of(vec3 c) { return vec3(shown_channel(c.r), shown_channel(c.g), shown_channel(c.b)); }
+
+// A clear sky from the sun's position: by day the daylight model above, as
+// it shows; through the dusk and the night the shapes a clear sky makes --
+// the horizon gold and then red as the sun nears it, most on the sun's
+// side, a glow around the sun, a deep blue-grey once it is under with the
+// moon's worth of light the scenes keep -- which the daylight hands over to
+// as the sun goes low, where the analytic model is weakest. The disc
+// itself over both.
+vec3 duskSky(vec3 dir, vec3 sun, vec3 sunColor);
 vec3 proceduralSky(vec3 dir, vec3 sun, vec3 sunColor) {
+    vec3 dusk = duskSky(dir, sun, sunColor);
+    float dayShare = smoothstep(0.0, 0.25, sun.y);
+    vec3 sky = dusk;
+    if (dayShare > 0.0) sky = mix(dusk, shown_of(daylight(dir, sun, skyTurbidity)), dayShare);
+    float cosAngle = dot(dir, sun);
+    float day = smoothstep(-0.14, 0.06, sun.y);
+#ifndef AE3D_SKY_CAPTURE
+    float disc = smoothstep(0.9993, 0.9997, cosAngle);
+    sky += sunColor * disc * (0.6 + 1.4 * day);
+#endif
+    return sky;
+}
+
+// The dusk and night sky, as it shows: a gradient from the sun's position.
+vec3 duskSky(vec3 dir, vec3 sun, vec3 sunColor) {
     float elevation = sun.y;
     // Day lasts until the sun is well under: the sky at sunset is still
     // bright, and goes dark through the twilight after.
@@ -3325,8 +3465,6 @@ vec3 proceduralSky(vec3 dir, vec3 sun, vec3 sunColor) {
     float cosAngle = dot(dir, sun);
     float glow = pow(max(cosAngle, 0.0), 4.0) * 0.16 + pow(max(cosAngle, 0.0), 40.0) * 0.5;
     sky += sunColor * glow * (0.3 + 0.7 * day) * (1.0 + low * 1.6);
-    float disc = smoothstep(0.9993, 0.9997, cosAngle);
-    sky += sunColor * disc * (0.6 + 1.4 * day);
     return sky;
 }
 
@@ -3348,7 +3486,9 @@ vec3 nightSky(vec3 dir, vec3 moon, float night) {
     }
     if (moon.y > 0.0) {
         float c = dot(dir, moon);
+#ifndef AE3D_SKY_CAPTURE
         add += vec3(0.82, 0.86, 0.95) * smoothstep(0.99955, 0.99975, c) * 1.4;
+#endif
         add += vec3(0.30, 0.34, 0.45) * pow(max(c, 0.0), 60.0) * 0.18;
     }
     return add * night;
@@ -3387,8 +3527,51 @@ vec2 velocity(vec4 now, vec4 prev, vec2 nudge) {
     return uvNow - uvPrev;
 }
 
+#ifdef AE3D_SKY_CAPTURE
+// The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
+// the upper hemisphere in the square's inner diamond, the lower folded into
+// its corners, one texel of gutter around each level holding the sky just
+// across the fold, so a filtered read at an edge is still the sky.
+#define SKY_SIZE 256.0
+#define SKY_LEVELS 6.0
+#define SKY_IRRADIANCE_SIZE 16.0
+vec3 oct_decode(vec2 p) {
+    vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0) {
+        vec2 folded = (1.0 - abs(d.zx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = folded.x;
+        d.z = folded.y;
+    }
+    return normalize(d);
+}
+vec2 oct_encode(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p;
+}
+// Where direction d is read in a level `size` texels a side.
+vec2 oct_uv(vec3 d, float size) {
+    return ((oct_encode(d) * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
+// The direction a texel of a level `size` a side stands for, at texture
+// coordinate uv: a gutter texel's folded back across the edge it lies past.
+vec3 oct_texel_direction(vec2 uv, float size) {
+    vec2 p = ((uv * size - 1.0) / (size - 2.0)) * 2.0 - 1.0;
+    if (p.x > 1.0) { p.x = 2.0 - p.x; p.y = -p.y; }
+    if (p.x < -1.0) { p.x = -2.0 - p.x; p.y = -p.y; }
+    if (p.y > 1.0) { p.y = 2.0 - p.y; p.x = -p.x; }
+    if (p.y < -1.0) { p.y = -2.0 - p.y; p.x = -p.x; }
+    return oct_decode(p);
+}
+#endif
+
 void main() {
+#ifdef AE3D_SKY_CAPTURE
+    vec3 dir = oct_texel_direction(gl_FragCoord.xy / SKY_SIZE, SKY_SIZE);
+#else
     vec3 dir = normalize(TexCoords);
+#endif
 
     float theta = atan(dir.z, dir.x);
     float phi = asin(dir.y);
@@ -3408,6 +3591,7 @@ void main() {
         float night = 1.0 - smoothstep(-0.14, -0.02, hourSun.y);
         sky += nightSky(dir, normalize(cloudSun), night);
     }
+    if (skyProcedural == 2) sky = skyFlat;
     if (skyOvercast > 0.0) {
         // The cast's brightness follows the sky's broad brightness, not the
         // pixel's: read from a coarse level of the painting, so a star -- a
@@ -3423,7 +3607,185 @@ void main() {
     vec4 clouds = cloudsAlong(dir, sky, cloudCover, cloudTime, cloudDither(grain));
     sky = sky * (1.0 - clouds.a) + clouds.rgb;
     FragColor = vec4(display_radiance(sky), 1.0);
+#ifndef AE3D_SKY_CAPTURE
     outVelocity = velocity(ClipNow, ClipPrev, vec2(0.0));
+#endif
+}
+GLSL_END
+
+// The sky's irradiance onto every normal (#655): the capture's mip of
+// SKY_IRRADIANCE_SIZE texels a side -- the sky's radiance, box-averaged --
+// weighed by the cosine onto this texel's normal and the solid angle each
+// source texel covers, every source texel summed. A texel of the square at
+// p covers dA / |q|^3 of the sphere, q the point of the octahedron p maps
+// to; the mip keeps level 0's layout, so its texels are found there.
+const FRAGMENT_SKY_IRRADIANCE = <<GLSL_END
+#version 330 core
+out vec4 FragColor;
+
+uniform sampler2D skyCapture;      // the capture, its mips box-filtered
+
+// The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
+// the upper hemisphere in the square's inner diamond, the lower folded into
+// its corners, one texel of gutter around each level holding the sky just
+// across the fold, so a filtered read at an edge is still the sky.
+#define SKY_SIZE 256.0
+#define SKY_LEVELS 6.0
+#define SKY_IRRADIANCE_SIZE 16.0
+vec3 oct_decode(vec2 p) {
+    vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0) {
+        vec2 folded = (1.0 - abs(d.zx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = folded.x;
+        d.z = folded.y;
+    }
+    return normalize(d);
+}
+vec2 oct_encode(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p;
+}
+// Where direction d is read in a level `size` texels a side.
+vec2 oct_uv(vec3 d, float size) {
+    return ((oct_encode(d) * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
+vec3 oct_texel_direction(vec2 uv, float size) {
+    vec2 p = ((uv * size - 1.0) / (size - 2.0)) * 2.0 - 1.0;
+    if (p.x > 1.0) { p.x = 2.0 - p.x; p.y = -p.y; }
+    if (p.x < -1.0) { p.x = -2.0 - p.x; p.y = -p.y; }
+    if (p.y > 1.0) { p.y = 2.0 - p.y; p.x = -p.x; }
+    if (p.y < -1.0) { p.y = -2.0 - p.y; p.x = -p.x; }
+    return oct_decode(p);
+}
+
+void main() {
+    vec3 N = oct_texel_direction(gl_FragCoord.xy / SKY_IRRADIANCE_SIZE, SKY_IRRADIANCE_SIZE);
+    int level = int(log2(SKY_SIZE / SKY_IRRADIANCE_SIZE) + 0.5);
+    int n = int(SKY_IRRADIANCE_SIZE);
+    vec3 sum = vec3(0.0);
+    float total = 0.0;
+    for (int y = 0; y < n; y++) {
+        for (int x = 0; x < n; x++) {
+            vec2 uv = (vec2(float(x), float(y)) + 0.5) / SKY_IRRADIANCE_SIZE;
+            vec2 p = clamp(((uv * SKY_SIZE - 1.0) / (SKY_SIZE - 2.0)) * 2.0 - 1.0, -1.0, 1.0);
+            vec3 q = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+            if (q.y < 0.0) {
+                vec2 folded = (1.0 - abs(q.zx)) * vec2(q.x >= 0.0 ? 1.0 : -1.0, q.z >= 0.0 ? 1.0 : -1.0);
+                q.x = folded.x;
+                q.z = folded.y;
+            }
+            float len = length(q);
+            float angle = 1.0 / (len * len * len);
+            vec3 L = q / len;
+            sum += texelFetch(skyCapture, ivec2(x, y), level).rgb * max(dot(N, L), 0.0) * angle;
+            total += angle;
+        }
+    }
+    // The weights cover the sphere once: what they sum to stands for 4 pi.
+    FragColor = vec4(sum * (4.0 * 3.14159265 / total), 1.0);
+}
+GLSL_END
+
+// The captured sky prefiltered for the reflections a surface of some
+// roughness throws (#655): each texel of a level the sky around its
+// direction weighted by GGX at the level's roughness, importance-sampled,
+// each sample read from the capture's mip whose texels cover its share of
+// the lobe (filtered importance sampling, Krivanek and Colbert), so a few
+// dozen samples are a smooth lobe and not a scatter of the sky's points.
+// The view is taken along the normal (the split sum's assumption).
+const FRAGMENT_SKY_FILTER = <<GLSL_END
+#version 330 core
+out vec4 FragColor;
+
+uniform sampler2D skyCapture;      // the capture, its mips box-filtered
+uniform float skyLevelSize;        // the level written, texels a side
+uniform float skyRoughness;        // and its roughness
+
+// The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
+// the upper hemisphere in the square's inner diamond, the lower folded into
+// its corners, one texel of gutter around each level holding the sky just
+// across the fold, so a filtered read at an edge is still the sky.
+#define SKY_SIZE 256.0
+#define SKY_LEVELS 6.0
+#define SKY_IRRADIANCE_SIZE 16.0
+vec3 oct_decode(vec2 p) {
+    vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0) {
+        vec2 folded = (1.0 - abs(d.zx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = folded.x;
+        d.z = folded.y;
+    }
+    return normalize(d);
+}
+vec2 oct_encode(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p;
+}
+// Where direction d is read in a level `size` texels a side.
+vec2 oct_uv(vec3 d, float size) {
+    return ((oct_encode(d) * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
+// The direction a texel of a level `size` a side stands for, at texture
+// coordinate uv: a gutter texel's folded back across the edge it lies past.
+vec3 oct_texel_direction(vec2 uv, float size) {
+    vec2 p = ((uv * size - 1.0) / (size - 2.0)) * 2.0 - 1.0;
+    if (p.x > 1.0) { p.x = 2.0 - p.x; p.y = -p.y; }
+    if (p.x < -1.0) { p.x = -2.0 - p.x; p.y = -p.y; }
+    if (p.y > 1.0) { p.y = 2.0 - p.y; p.x = -p.x; }
+    if (p.y < -1.0) { p.y = -2.0 - p.y; p.x = -p.x; }
+    return oct_decode(p);
+}
+
+#define FILTER_SAMPLES 48
+
+float radical_inverse(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+
+void main() {
+    // Laid out as level 0 is, whatever this level's size, so the scene
+    // reads every level at one coordinate (sky_reflection).
+    vec3 N = oct_texel_direction(gl_FragCoord.xy / skyLevelSize, SKY_SIZE);
+    if (skyRoughness <= 0.0) {
+        FragColor = vec4(textureLod(skyCapture, oct_uv(N, SKY_SIZE), 0.0).rgb, 1.0);
+        return;
+    }
+    float a = skyRoughness * skyRoughness;
+    vec3 up = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, N));
+    vec3 B = cross(N, T);
+    // A texel of the capture's level 0, as solid angle: the whole sphere
+    // over its inner texels.
+    float texel = 4.0 * 3.14159265 / ((SKY_SIZE - 2.0) * (SKY_SIZE - 2.0));
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (int i = 0; i < FILTER_SAMPLES; i++) {
+        vec2 xi = vec2((float(i) + 0.5) / float(FILTER_SAMPLES), radical_inverse(uint(i)));
+        float phi = 6.28318531 * xi.y;
+        float cosTheta = sqrt((1.0 - xi.x) / (1.0 + (a * a - 1.0) * xi.x));
+        float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+        vec3 H = T * (sinTheta * cos(phi)) + B * (sinTheta * sin(phi)) + N * cosTheta;
+        vec3 L = 2.0 * dot(N, H) * H - N;
+        float NdotL = dot(N, L);
+        if (NdotL <= 0.0) continue;
+        // With the view along the normal, the pdf of L is D(H) / 4.
+        float d = (cosTheta * cosTheta * (a * a - 1.0) + 1.0);
+        float pdf = (a * a) / (3.14159265 * d * d) / 4.0;
+        float sampleAngle = 1.0 / (float(FILTER_SAMPLES) * pdf + 1e-6);
+        float lod = max(0.5 * log2(sampleAngle / texel) + 1.0, 0.0);
+        sum += textureLod(skyCapture, oct_uv(L, SKY_SIZE), lod).rgb * NdotL;
+        weight += NdotL;
+    }
+    FragColor = vec4(sum / max(weight, 1e-6), 1.0);
 }
 GLSL_END
 
@@ -3988,14 +4350,16 @@ const FRAGMENT_SSAO = <<GLSL_END
 in vec2 TexCoords;
 out vec4 FragColor;
 
-// Ambient occlusion from the scene's own depth, drawn over the opaque pass
-// as a multiply before anything transparent: the corners, the feet of
-// things and the ground under a canopy go darker by how much of the
-// hemisphere over them the depth says is filled. It replaces a term in
-// the scene shader that took no depth at all -- it sampled a hemisphere
-// against its own surface, which came out the same number everywhere,
-// and darkened everything drawn with it by two and a half times while
-// leaving what was drawn without it alone.
+// Ambient occlusion from the scene's own depth: the corners, the feet of
+// things and the ground under a canopy, by how much of the hemisphere over
+// them the depth says is filled. Drawn before the scene from the last
+// frame's depth (#655), into the occlusion map the scene shader reads: the
+// occlusion in red, and in green the depth it was found at (clip w, the
+// last frame's view depth) for a surface to tell it is the one that was
+// there. The positions are rebuilt with this frame's matrices: the last
+// frame's geometry moved rigidly by the camera's step, so every sample
+// still lands on the image it was drawn in. It darkens the light from the
+// sky and nothing else; a lamp shining into a corner shines into it.
 uniform sampler2D screenTexture;   // the stage's colour input; unread here
 uniform sampler2D depthTexture;    // the scene's depth, from the camera
 uniform mat4 viewProjection;       // world -> clip, to find where a sample lands on screen
@@ -4036,7 +4400,7 @@ void main() {
     vec2 uv = gl_FragCoord.xy / screenSize;
     float depth;
     vec3 P = worldAt(uv, depth);
-    if (depth >= 0.99999 || ssaoIntensity <= 0.0) { FragColor = vec4(1.0); return; }
+    if (depth >= 0.99999 || ssaoIntensity <= 0.0) { FragColor = vec4(1.0, 0.0, 0.0, 1.0); return; }
 
     // The surface's normal from the slope of its own depth: the neighbour
     // a pixel over on each axis, whichever of the two sides is nearer in
@@ -4109,7 +4473,7 @@ void main() {
     // Gone in the distance, where the radius is a few pixels and the depth
     // has no room left to tell a corner from a plane.
     ao = mix(ao, 1.0, smoothstep(ssaoRadius * 40.0, ssaoRadius * 120.0, eyeDist));
-    FragColor = vec4(ao, ao, ao, 1.0);
+    FragColor = vec4(ao, (viewProjection * vec4(P, 1.0)).w, 0.0, 1.0);
 }
 GLSL_END
 

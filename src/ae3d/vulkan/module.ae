@@ -15,6 +15,7 @@ import ae3d.png
 import ae3d.platform
 import ae3d.rendering
 import ae3d.vkscene
+import ae3d.vksky
 import ae3d.skin
 import ae3d.shaders
 import ae3d.vkmeter
@@ -43,9 +44,9 @@ exports (
     renderer_shadow_ms, renderer_scene_ms, renderer_post_ms, renderer_stage_ms, STAGE_COUNT, stage_name, renderer_cpu_work_ms, renderer_post_active, renderer_program_binds, renderer_material_binds,
     renderer_set_normal_strength, renderer_set_occlusion_strength, renderer_set_capture_channel, renderer_set_wetness, renderer_set_frame_exposure, renderer_set_meter, renderer_meter, renderer_material_texture_size,
     renderer_load_texture, renderer_release_texture, renderer_sample_count, renderer_set_post,
-    renderer_set_bloom_intensity, renderer_bloom_intensity,
+    renderer_set_bloom_intensity, renderer_bloom_intensity, renderer_sky_irradiance,
     renderer_set_shadows, renderer_shadows, renderer_set_ssr, renderer_ssr, renderer_set_ssr_params, renderer_ssr_road_height, renderer_ssr_strength, renderer_set_taa, renderer_taa, request_dlss, dlss_available, renderer_set_dlss, renderer_dlss, set_samples, renderer_ray_query, renderer_set_ray_shadows, renderer_ray_shadows, renderer_set_sun_size, renderer_sun_size, renderer_set_ray_occlusion, renderer_ray_occlusion, renderer_set_lamp_size, renderer_set_ray_budget, renderer_ray_budget, renderer_ray_figures, renderer_ray_reach, renderer_set_ray_skinned, renderer_ray_skinned, renderer_map_drawn, renderer_add_light, renderer_remove_light,
-    renderer_set_fog, renderer_fog, renderer_set_clouds, renderer_set_sky_overcast, renderer_set_sky_sun, renderer_set_shadow_distance, renderer_shadow_distance,
+    renderer_set_fog, renderer_fog, renderer_set_clouds, renderer_set_sky_overcast, renderer_set_sky_turbidity, renderer_set_sky_sun, renderer_set_shadow_distance, renderer_shadow_distance,
     renderer_set_ssao, renderer_ssao,
     skybox_create, skybox_free,
     offscreen_pixels, offscreen_width, offscreen_height,
@@ -194,6 +195,7 @@ struct VKRenderer {
     sky_sun: Vec3
     sky_sun_set: bool
     sky_overcast: float
+    sky_turbidity: float           // the daylight sky's haze (#655)
     sky_overcast_color: Vec3
     defaults: ptr
     loaded_names: ptr
@@ -290,6 +292,7 @@ renderer_new() -> *VKRenderer {
     r.capture_channel = 0
     r.wetness = 0.0
     r.frame_exposure = 1.0
+    r.sky_turbidity = core.SKY_TURBIDITY
     r.sun_angle = 0.0
     r.ray_occlusion = false
     r.lamp_radius = 0.12
@@ -402,10 +405,13 @@ renderer_init(r: *VKRenderer, window: ptr, width: int, height: int) -> int {
         return 0
     }
     vkrays.start()
-    if !vkcrowd.start() {
+    if !vkcrowd.start() || !vksky.start() {
         println("ae3d: Vulkan init failed (${vkdevice.last_error()})")
         return 0
     }
+    // What the sky is captured with when the scene has no clouds yet: a
+    // texture is made outside any frame.
+    ensure_cloud_textures(r, false)
     println("ae3d: Vulkan on ${vkdevice.name()}, ${vkframe.sample_count()}x MSAA")
     r.initialized = true
 
@@ -473,6 +479,12 @@ renderer_set_clouds(r: *VKRenderer, cover: float, wind: float) {
     r.cloud_cover = cover
     if cover > 0.0 { ensure_cloud_textures(r, true) }
     r.cloud_wind = wind
+}
+
+// How hazy the daylight sky's air is (Preetham's turbidity: 2 a clear
+// blue day, 6 a hazy one).
+renderer_set_sky_turbidity(r: *VKRenderer, turbidity: float) {
+    if r != null { r.sky_turbidity = turbidity }
 }
 
 renderer_set_sky_overcast(r: *VKRenderer, amount: float, color: Vec3) {
@@ -1679,6 +1691,28 @@ skybox_free(r: *VKRenderer, sky: *Skybox) {
     heap.free(sky)
 }
 
+// The sky's irradiance onto a surface facing `n`, read back from the device
+// (the agent's).
+renderer_sky_irradiance(r: *VKRenderer, n: Vec3) -> Vec3 { return vksky.irradiance_at(n) }
+
+// The sky this frame is lit by, captured before the scene pass (#655): the
+// scene's sky, painted or from the sun, or with none the clear colour all
+// round -- what surrounds the scene, as it shows.
+capture_sky(r: *VKRenderer) {
+    vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+    sky = r.skybox as *Skybox
+    texture = vkframe.default_texture()
+    kind = 2
+    if sky != null && sky.texture != 0 {
+        texture = sky.texture
+        kind = 0
+        if sky.procedural { kind = 1 }
+    }
+    vkdesc.set_int(vkscene.OFF_SKYPROCEDURAL, kind)
+    vkdesc.set_vec3(vkscene.OFF_SKYFLAT, r.clear_r, r.clear_g, r.clear_b)
+    vksky.capture(texture, r.cloud_weather_texture, r.cloud_shape_texture)
+}
+
 // The sky sits behind everything, so the camera's translation is stripped from
 // the view matrix and the shader pushes it to the far plane.
 draw_skybox(r: *VKRenderer, cam: *Camera) {
@@ -2065,6 +2099,7 @@ write_frame_uniforms(r: *VKRenderer, light: *Light, cam: *Camera) {
     // The clouds, for the sky that draws them and the ground they shadow.
     vkdesc.set_float(vkscene.OFF_CLOUDCOVER, r.cloud_cover)
     vkdesc.set_float(vkscene.OFF_SKYOVERCAST, r.sky_overcast)
+    vkdesc.set_float(vkscene.OFF_SKYTURBIDITY, r.sky_turbidity)
     vkdesc.set_vec3(vkscene.OFF_SKYOVERCASTCOLOR, r.sky_overcast_color.x, r.sky_overcast_color.y, r.sky_overcast_color.z)
     vkdesc.set_float(vkscene.OFF_CLOUDTIME, r.scene_time * r.cloud_wind)
     // The frame for the march's dither only when a temporal pass (TAA or
@@ -2486,7 +2521,6 @@ upload_light(index: int, l: *Light) {
     vkdesc.set_vec3(base + vkscene.LIGHT_POSITION, l.position.x, l.position.y, l.position.z)
     vkdesc.set_vec3(base + vkscene.LIGHT_COLOR, l.color.x, l.color.y, l.color.z)
     vkdesc.set_float(base + vkscene.LIGHT_INTENSITY, l.intensity)
-    vkdesc.set_float(base + vkscene.LIGHT_AMBIENTSTRENGTH, l.ambient_strength)
     vkdesc.set_float(base + vkscene.LIGHT_TEMPERATURE, l.temperature)
 
     kind = 0
@@ -2688,6 +2722,17 @@ renderer_render(r: *VKRenderer, cam: *Camera, light: *Light) {
         vkdesc.set_float(vkscene.OFF_SCREENSIZE + 4, vkframe.render_height() as float)
         i = i + 1
     }
+    capture_sky(r)
+    // The screen's occlusion from the last frame's depth, which every lit
+    // program's block says it has or not.
+    history = 0
+    if ssao_on && vkframe.occlusion_pass() { history = 1 }
+    k = 0
+    while k < programs {
+        vkdesc.set_program(k)
+        vkdesc.set_int(vkscene.OFF_OCCLUSIONHISTORY, history)
+        k = k + 1
+    }
     // The sky, first into the pass, after the blocks carry the frame's
     // matrices: its motion vector is the camera's turn since last frame.
     // Its own matrices go into the scene program's block, which it draws
@@ -2704,7 +2749,6 @@ renderer_render(r: *VKRenderer, cam: *Camera, light: *Light) {
     vkframe.resolve_scene_depth()
     // The occlusion over what the opaque pass drew, before the transparent
     // one, so the water is not darkened by the ground it hides.
-    if ssao_on && depth_ready { vkframe.draw_ssao() }
 
     count = list.size(r.models)
     pass = 1
@@ -3082,6 +3126,7 @@ renderer_cleanup(r: *VKRenderer) {
         i = i + 1
     }
     list.clear(r.models)
+    vksky.stop()
     vkcrowd.stop()
     vkrays.stop()
     // The frame's meshes, textures and targets go with it (vkframe.shutdown),
