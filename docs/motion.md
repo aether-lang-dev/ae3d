@@ -128,8 +128,16 @@ put itself under that point when two things hold:
   pelvis keeps brings back without a step;
 - the figure is moving over the ground at 0.25 m/s or more.
 
-The thigh reaches toward the spot, within the hip's cone, with the knee
-bent 0.5 rad for the first 0.12 s so the foot clears the ground. Then the
+The thigh reaches toward the spot, within the hip's cone as the joint has
+it (`physics.ragdoll_within_cone`: about the cone's own centre, an ellipse
+for the hips, aephysics#129), with the knee bent for the first 0.12 s so
+the foot clears the ground: 1.2 rad for a step aside or back, about a
+person's swing knee at its most, and 0.6 for a step ahead (within 45
+degrees of the way it faces), which swings under the body. On a person's
+hips the stepping foot dragged at 0.5 and the box man stood out of 51 of
+84 shoves (1.0 to 1.6 m/s, seven angles from the side, in front and
+behind), against 82 now. Ahead, a knee lifted 1.2 left the foot up behind
+as a fall forward cut its step short, and the figure dived onto its hands. Then the
 leg straightens onto it. The whole step takes 0.3 s, and lands 5 cm past
 the capture point, at most half a metre from under the hip.
 
