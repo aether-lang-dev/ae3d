@@ -27,6 +27,7 @@ import ae3d.vkdevice
 import ae3d.vkrays
 import ae3d.vkddgi
 import ae3d.vkcrowd
+import ae3d.vkclusterlod
 import ae3d.vkframe
 import ae3d.vkdesc
 import ae3d.vktargets
@@ -46,7 +47,7 @@ exports (
     renderer_set_normal_strength, renderer_set_occlusion_strength, renderer_set_capture_channel, renderer_set_wetness, renderer_set_frame_exposure, renderer_set_meter, renderer_meter, renderer_material_texture_size,
     renderer_load_texture, renderer_release_texture, renderer_sample_count, renderer_set_post,
     renderer_set_bloom_intensity, renderer_bloom_intensity, renderer_sky_irradiance,
-    renderer_set_shadows, renderer_shadows, renderer_set_ssr, renderer_ssr, renderer_set_ssr_params, renderer_ssr_road_height, renderer_ssr_strength, renderer_set_taa, renderer_taa, request_dlss, dlss_available, renderer_set_dlss, renderer_dlss, set_samples, renderer_ray_query, renderer_set_ray_shadows, renderer_ray_shadows, renderer_set_gi, renderer_gi, renderer_set_gi_probes, renderer_indirect_irradiance, renderer_gi_census, renderer_set_sun_size, renderer_sun_size, renderer_set_ray_occlusion, renderer_ray_occlusion, renderer_set_lamp_size, renderer_set_ray_budget, renderer_ray_budget, renderer_ray_figures, renderer_ray_reach, renderer_set_ray_skinned, renderer_ray_skinned, renderer_map_drawn, renderer_add_light, renderer_remove_light,
+    renderer_set_shadows, renderer_shadows, renderer_set_ssr, renderer_ssr, renderer_set_ssr_params, renderer_ssr_road_height, renderer_ssr_strength, renderer_set_taa, renderer_taa, request_dlss, dlss_available, renderer_set_dlss, renderer_dlss, set_samples, renderer_ray_query, renderer_set_ray_shadows, renderer_ray_shadows, renderer_set_gi, renderer_gi, renderer_set_clusters, renderer_clusters, renderer_cut_census, renderer_set_gi_probes, renderer_indirect_irradiance, renderer_gi_census, renderer_set_sun_size, renderer_sun_size, renderer_set_ray_occlusion, renderer_ray_occlusion, renderer_set_lamp_size, renderer_set_ray_budget, renderer_ray_budget, renderer_ray_figures, renderer_ray_reach, renderer_set_ray_skinned, renderer_ray_skinned, renderer_map_drawn, renderer_add_light, renderer_remove_light,
     renderer_set_fog, renderer_fog, renderer_set_clouds, renderer_set_sky_overcast, renderer_set_sky_turbidity, renderer_set_sky_sun, renderer_set_shadow_distance, renderer_shadow_distance,
     renderer_set_ssao, renderer_ssao,
     skybox_create, skybox_free,
@@ -58,6 +59,8 @@ exports (
 // The clustered lamps' storage buffers for this frame slot (#468): grown to
 // hold what the frame needs, then written through their mapped memory.
 extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
 extern tan(x: float) -> float
 extern atan(x: float) -> float
 extern sqrt(x: float) -> float
@@ -126,6 +129,12 @@ struct VKRenderer {
     lamp_radius: float
     // The global illumination asked for (core.GI_*).
     gi: int
+    // The cluster cut asked for (core.CLUSTERS_*), and whether it is on:
+    // asked for, and the device draws one (ae3d.vkclusterlod).
+    clusters: int
+    cutting: bool
+    // The sixteen floats a clustered draw's matrix is queued as.
+    cut_matrix: ptr
     textures: ptr
     frustum: ptr
     skybox: ptr
@@ -300,6 +309,8 @@ renderer_new() -> *VKRenderer {
     r.ray_occlusion = false
     r.lamp_radius = 0.12
     r.gi = core.gi_from_env(core.GI_AUTO)
+    r.clusters = core.clusters_from_env(core.CLUSTERS_AUTO)
+    r.cut_matrix = calloc(16, 4)
     r.batches = list.new()
     r.shadow_batches = list.new()
     r.shadow_batch_count = 0
@@ -419,6 +430,7 @@ renderer_init(r: *VKRenderer, window: ptr, width: int, height: int) -> int {
     println("ae3d: Vulkan on ${vkdevice.name()}, ${vkframe.sample_count()}x MSAA")
     r.initialized = true
     apply_gi(r)
+    apply_clusters(r)
 
     r.screen_mesh = core.mesh_create()
     core.mesh_push_screen_quad(r.screen_mesh)
@@ -670,6 +682,185 @@ apply_gi(r: *VKRenderer) {
         vkddgi.stop()
     }
     vkrays.set_probes(vkddgi.ready())
+}
+
+// --- the cluster cut (#536) ------------------------------------------------------------------------------------
+
+// The smallest mesh drawn by a cut: under a few groups' worth of clusters,
+// the cut draws about what the mesh is.
+const CUT_TRIANGLES = 8192
+// The error a cut may make on the screen, in pixels.
+const CUT_PIXELS = 1.0
+
+// The cut asked for (core.CLUSTERS_*): started, every model it draws given
+// its graph, or stopped, every model drawn whole again.
+renderer_set_clusters(r: *VKRenderer, mode: int) {
+    r.clusters = mode
+    if !r.initialized { return }
+    was = r.cutting
+    apply_clusters(r)
+    if r.cutting == was { return }
+    count = list.size(r.models)
+    i = 0
+    while i < count {
+        m = list.get_raw(r.models, i) as *Model
+        if r.cutting && m.vbo != 0 && clusterable(m) { acquire_cut(m) }
+        if !r.cutting { release_cut(m) }
+        i = i + 1
+    }
+}
+
+// Whether models are drawn by a cut.
+renderer_clusters(r: *VKRenderer) -> bool { return r != null && r.cutting }
+
+// What the cut of the frame read back last kept: into `counts` (three
+// ints) the models with a graph, the clusters kept and the indices asked
+// for. False when the cut is off.
+renderer_cut_census(r: *VKRenderer, counts: ptr) -> bool {
+    if !renderer_clusters(r) { return false }
+    graphs = 0
+    n = list.size(r.models)
+    i = 0
+    while i < n {
+        if (list.get_raw(r.models, i) as *Model).cluster_graph > 0 { graphs = graphs + 1 }
+        i = i + 1
+    }
+    c = counts as int[]
+    c[0] = graphs
+    c[1] = vkclusterlod.kept_last()
+    c[2] = vkclusterlod.indices_last()
+    return true
+}
+
+// The cut started or stopped for what was asked: CLUSTERS_ON or
+// CLUSTERS_AUTO where the device draws one. On, asked for, where it does
+// not, is said.
+apply_clusters(r: *VKRenderer) {
+    want = r.clusters != core.CLUSTERS_OFF
+    if want && !vkdevice.cluster_draws() {
+        if r.clusters == core.CLUSTERS_ON { println("ae3d: AE3D_CLUSTERS=on, but ${vkdevice.name()} draws no cluster cut") }
+        want = false
+    }
+    if !want {
+        vkclusterlod.stop()
+        r.cutting = false
+        return
+    }
+    if !vkclusterlod.start() {
+        println("ae3d: the cluster cut did not start (${vkdevice.last_error()})")
+        vkclusterlod.stop()
+        r.cutting = false
+        return
+    }
+    r.cutting = true
+}
+
+// Whether a model is drawn by a cut of its mesh: a mesh big enough to be
+// worth one, drawn by the scene's own pipelines -- not a skinned mesh, whose
+// clusters' spheres are the bind pose's wherever its bones have taken it (a
+// figure's body hangs off a skeleton its parent holds), not a crowd's, not a
+// stream of points, not a program of its own (water).
+clusterable(m: *Model) -> bool {
+    if m.skeleton != null || m.device_crowd != null || m.pose_bank != null || vkmesh.skinned(m.vbo) { return false }
+    if core.shader_valid(&m.shader) { return false }
+    if m.is_instanced && m.instances != null && geometry.inst_is_points(m.instances) == 1 { return false }
+    return core.mesh_index_count(m.mesh) / 3 >= CUT_TRIANGLES
+}
+
+// The model's mesh's graph, split by its material groups: built here the
+// first time a mesh is drawn by a cut, shared by every model after.
+acquire_cut(m: *Model) {
+    groups = core.model_group_count(m)
+    ranges = null
+    if groups > 0 {
+        ranges = calloc(groups * 2, 4)
+        i = 0
+        while i < groups {
+            group = core.model_group(m, i)
+            (ranges as int[])[i * 2] = group.index_start
+            (ranges as int[])[i * 2 + 1] = group.index_count
+            i = i + 1
+        }
+    }
+    m.cluster_graph = vkclusterlod.acquire(m.vbo, m.mesh, ranges, groups)
+    if ranges != null { free(ranges) }
+}
+
+release_cut(m: *Model) {
+    if m.cluster_graph > 0 { vkclusterlod.release(m.cluster_graph) }
+    m.cluster_graph = 0
+    m.cluster_draw = 0 - 1
+}
+
+// The frame's cuts: every clustered model in view queued at its matrix
+// over its instances, and the cut recorded, before the scene pass opens.
+// A cut that cannot be recorded is said, and the cut turned off: the
+// models are drawn whole from then on.
+cut_clusters(r: *VKRenderer, cam: *Camera) {
+    count = list.size(r.models)
+    i = 0
+    while i < count {
+        (list.get_raw(r.models, i) as *Model).cluster_draw = 0 - 1
+        i = i + 1
+    }
+    if !r.cutting { return }
+    vkclusterlod.frame_start()
+    core.camera_fill_frustum(cam, r.frustum)
+    queued = 0
+    i = 0
+    while i < count {
+        m = list.get_raw(r.models, i) as *Model
+        if m.cluster_graph > 0 && m.visible && m.vbo != 0 {
+            core.model_sync_transform(m)
+            instances = 1
+            stream = null
+            if m.is_instanced {
+                instances = core.model_instance_count(m)
+                if instances > 0 && m.instance_vbo != 0 { stream = vkmesh.vertex_buffer(m.instance_vbo) }
+            }
+            in_view = core.frustum_sphere_visible(r.frustum, m.bounding_center, m.bounding_radius)
+            if instances > 0 && (!m.is_instanced || stream != null) && (m.is_instanced || in_view) {
+                matrix_floats(&m.model_matrix, r.cut_matrix)
+                m.cluster_draw = vkclusterlod.queue(m.cluster_graph, r.cut_matrix, stream, instances)
+                if m.cluster_draw >= 0 { queued = queued + 1 }
+            }
+        }
+        i = i + 1
+    }
+    if queued == 0 { return }
+    // The pixels a unit spans a unit from the eye: the projection's vertical
+    // scale over half the frame's height.
+    pixels = cam.projection.m5 * (vkframe.render_height() as float) * 0.5
+    if vkclusterlod.cull(r.frustum, cam.position.x, cam.position.y, cam.position.z, pixels, CUT_PIXELS, cam.near) { return }
+    println("ae3d: the cluster cut could not be recorded (${vkdevice.last_error()}); drawing whole meshes")
+    i = 0
+    while i < count {
+        release_cut(list.get_raw(r.models, i) as *Model)
+        i = i + 1
+    }
+    vkclusterlod.stop()
+    r.cutting = false
+}
+
+// A matrix's sixteen numbers as floats, column by column.
+matrix_floats(mat: *Mat4, out: ptr) {
+    f = out as f32[]
+    f[0] = mat.m0 as f32
+    f[1] = mat.m1 as f32
+    f[2] = mat.m2 as f32
+    f[3] = mat.m3 as f32
+    f[4] = mat.m4 as f32
+    f[5] = mat.m5 as f32
+    f[6] = mat.m6 as f32
+    f[7] = mat.m7 as f32
+    f[8] = mat.m8 as f32
+    f[9] = mat.m9 as f32
+    f[10] = mat.m10 as f32
+    f[11] = mat.m11 as f32
+    f[12] = mat.m12 as f32
+    f[13] = mat.m13 as f32
+    f[14] = mat.m14 as f32
+    f[15] = mat.m15 as f32
 }
 
 // How many of a crowd's figures the rays take a frame: the nearest that
@@ -2058,6 +2249,7 @@ renderer_add_model(r: *VKRenderer, m: *Model) {
     // asked of the cache at draw time, since this is only true of the second
     // model built from a mesh and every one after.
     m.shares_geometry = vkmesh.mesh_shared(handle)
+    if r.cutting && clusterable(m) { acquire_cut(m) }
     // Building a mesh marks it dirty, and what was just uploaded is not an edit
     // waiting to be sent.
     geometry.mesh_clear_dirty(m.mesh)
@@ -2256,6 +2448,7 @@ renderer_remove_model(r: *VKRenderer, m: *Model) {
             d.texture = 0
         }
     }
+    release_cut(m)
     if m.vbo != 0 { vkmesh.mesh_free(m.vbo) ; m.vbo = 0 }
     if m.instance_vbo != 0 { vkmesh.mesh_free(m.instance_vbo) ; m.instance_vbo = 0 }
 
@@ -2400,6 +2593,9 @@ apply_shading(r: *VKRenderer, m: *Model, program: int) {
 refresh_geometry(m: *Model) {
     if m.vbo == 0 || geometry.mesh_dirty(m.mesh) != 1 { return }
 
+    // A mesh that is edited is drawn whole from then on: its graph would be
+    // built again at every edit.
+    release_cut(m)
     vkmesh.mesh_free(m.vbo)
     m.vbo = vkmesh.mesh_upload(m.mesh)
     geometry.mesh_clear_dirty(m.mesh)
@@ -2905,6 +3101,10 @@ renderer_render(r: *VKRenderer, cam: *Camera, light: *Light) {
     choose_skinned(r, cam)
     reserve_ray_scene(r)
     sort_device_crowds(r, cam)
+    // The cut as early as the frame knows its camera, so it has run long
+    // before the scene pass reads it: recorded just before that pass, the
+    // pass waited a millisecond for it on an M1, with nothing to overlap.
+    cut_clusters(r, cam)
     vkframe.mark_sorted()
     build_ray_scene(r)
     vkframe.mark_rays_built()
@@ -3071,6 +3271,8 @@ batchable(m: *Model) -> bool {
     // moment the origin left the view, and stood in view while it did.
     if m.skeleton != null { return false }
     if m.device_crowd != null { return false }
+    // A cluster cut is the model's own, chosen for its instances.
+    if m.cluster_graph > 0 { return false }
     // A cut, a wound or a damage mask is the model's own: it draws on its own.
     if m.clip_on || m.wound_count > 0 || m.damage != null { return false }
     if core.model_group_count(m) > 0 { return false }
@@ -3290,7 +3492,7 @@ draw_model(r: *VKRenderer, m: *Model, transparent_pass: bool) {
                 // Its own run of the triangles, as OpenGL draws it: the whole
                 // mesh went once per group, each time in that group's
                 // material, and a model of two materials came out in one.
-                draw_group(m, texture, instances, group)
+                draw_group(m, texture, instances, group, i)
             }
             i = i + 1
         }
@@ -3304,9 +3506,13 @@ draw_model(r: *VKRenderer, m: *Model, transparent_pass: bool) {
     draw_instances(m, texture, instances)
 }
 
-// The draw itself: a device crowd's tier by the count the sort wrote, or
-// the model's own instances.
+// The draw itself: a device crowd's tier by the count the sort wrote, the
+// frame's cut of its clusters, or the model's own instances.
 draw_instances(m: *Model, texture: int, instances: int) {
+    if m.cluster_draw >= 0 {
+        draw_cut(m, texture, instances, 0)
+        return
+    }
     if m.device_crowd != null {
         dc = m.device_crowd as *DeviceCrowd
         vkcrowd.draw(m.vbo, texture, dc.handle, m.device_tier, m.device_part)
@@ -3317,12 +3523,30 @@ draw_instances(m: *Model, texture: int, instances: int) {
 
 // One material group's draw: its run of the mesh's indices. A device crowd
 // draws its tier whole, as it always has.
-draw_group(m: *Model, texture: int, instances: int, group: *MaterialGroup) {
+draw_group(m: *Model, texture: int, instances: int, group: *MaterialGroup, index: int) {
+    if m.cluster_draw >= 0 {
+        draw_cut(m, texture, instances, index)
+        return
+    }
     if m.device_crowd != null {
         draw_instances(m, texture, instances)
         return
     }
     vkframe.draw_range(m.vbo, texture, m.instance_vbo, instances, group.index_start, group.index_count)
+}
+
+// The cut of material `material` of every instance of the model (or of the
+// model alone): its commands, one an instance, `materials` apart.
+draw_cut(m: *Model, texture: int, instances: int, material: int) {
+    materials = vkclusterlod.materials(m.cluster_graph)
+    count = 1
+    stream = 0
+    if m.is_instanced {
+        count = instances
+        stream = m.instance_vbo
+    }
+    vkframe.draw_cut(m.vbo, texture, stream, vkclusterlod.index_buffer(), vkclusterlod.command_buffer(),
+                     m.cluster_draw + material, count, materials * vkclusterlod.COMMAND_BYTES)
 }
 
 // Whether a group of this material draws in this pass: the translucent ones
@@ -3391,6 +3615,8 @@ renderer_cleanup(r: *VKRenderer) {
     while i < count {
         m = list.get_raw(r.models, i) as *Model
         if m != null {
+            m.cluster_graph = 0
+            m.cluster_draw = 0 - 1
             if m.vbo != 0 { vkmesh.mesh_free(m.vbo) ; m.vbo = 0 }
             if m.instance_vbo != 0 { vkmesh.mesh_free(m.instance_vbo) ; m.instance_vbo = 0 }
         }
@@ -3400,6 +3626,7 @@ renderer_cleanup(r: *VKRenderer) {
     vkddgi.stop()
     vksky.stop()
     vkcrowd.stop()
+    vkclusterlod.stop()
     vkrays.stop()
     // The frame's meshes, textures and targets go with it (vkframe.shutdown),
     // and the device after them.

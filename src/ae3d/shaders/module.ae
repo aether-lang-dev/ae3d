@@ -5635,6 +5635,224 @@ void main() {
 }
 GLSL_END
 
+// The cluster cut (#536), three passes over the cluster graphs of the
+// frame's clustered models (ae3d.clusterlod builds them, ae3d.vkclusterlod
+// keeps them on the device). The cull: a thread an instance's cluster,
+// drawn where its own error is at most a pixel on the screen and its
+// parent's more -- every sibling deciding by the same sphere and error, so
+// a group is drawn whole or its parents are -- and where its sphere is in
+// the view. A drawn cluster takes a slot in the visible list and its
+// indices' room in its instance's command for its material, by atomics.
+// The scan then lays the commands end to end in the frame's index buffer
+// and the emit writes each visible cluster's triangles there, as the mesh's
+// own vertex indices, so the draws are the scene's own pipelines over the
+// mesh's vertex buffer, an indirect command an instance and material.
+// Vulkan only: OpenGL 4.1 has no compute, and draws a cut chosen on the CPU.
+//
+// The three share a layout: a cluster's record is twenty words
+// (clusterlod.RECORD_WORDS) -- its vertex references' and triangles' first
+// (in the device's buffers of all of them) and counts, its own sphere, the
+// sphere and error it is chosen by and its parent's -- an instance twenty
+// floats as the draws read it, a command five words as an indexed indirect
+// draw reads it, and the counters: the visible clusters, the indices asked
+// for, and the emit's dispatch at the fifth word.
+const COMPUTE_CLUSTER_CULL = <<GLSL_END
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Records { uint record[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Instances { float instance[]; };
+layout(std430, set = 0, binding = 2) buffer Commands { uint command[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer Visible { uvec4 visible[]; };
+layout(std430, set = 0, binding = 4) buffer Counters { uint counter[]; };
+// The view: its six planes (inside where dot(normal, p) + w >= -radius),
+// the eye and the pixels a unit spans a unit away, then the error a cut
+// may make on the screen, in pixels, and the nearest distance measured.
+layout(std430, set = 0, binding = 5) readonly buffer View { vec4 view[]; };
+
+layout(push_constant) uniform Params {
+    mat4 model;
+    uint firstCluster;
+    uint clusterCount;
+    uint firstInstance;
+    uint instanced;
+    uint firstCommand;
+    uint materials;
+    uint commandCount;
+    uint budget;
+    uint visibleCapacity;
+} params;
+
+const uint WORDS = 20u;
+
+vec4 sphereAt(uint at) {
+    return vec4(uintBitsToFloat(record[at]), uintBitsToFloat(record[at + 1u]),
+                uintBitsToFloat(record[at + 2u]), uintBitsToFloat(record[at + 3u]));
+}
+
+// An error in the model's units, at a sphere, as pixels on the screen: by
+// the sphere's nearest point to the eye, so a cluster is never judged
+// further than any of it is.
+float onScreen(mat4 m, float scale, vec4 sphere, float error) {
+    vec3 centre = (m * vec4(sphere.xyz, 1.0)).xyz;
+    float d = max(distance(centre, view[6].xyz) - sphere.w * scale, view[7].y);
+    return error * scale / d * view[6].w;
+}
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    uint i = params.firstInstance + gl_GlobalInvocationID.y;
+    mat4 m = params.model;
+    if (params.instanced != 0u) {
+        uint at = i * 20u;
+        m = m * mat4(instance[at], instance[at + 1u], instance[at + 2u], instance[at + 3u],
+                     instance[at + 4u], instance[at + 5u], instance[at + 6u], instance[at + 7u],
+                     instance[at + 8u], instance[at + 9u], instance[at + 10u], instance[at + 11u],
+                     instance[at + 12u], instance[at + 13u], instance[at + 14u], instance[at + 15u]);
+    }
+    // The instance's commands, one a material: the draw it is reads its
+    // own instance, and starts empty (the frame filled them with zero).
+    if (k == 0u) {
+        for (uint g = 0u; g < params.materials; g++) {
+            uint c = (params.firstCommand + gl_GlobalInvocationID.y * params.materials + g) * 5u;
+            command[c + 1u] = 1u;
+            command[c + 3u] = 0u;
+            command[c + 4u] = i;
+        }
+    }
+    if (k >= params.clusterCount) return;
+    uint cluster = params.firstCluster + k;
+    uint at = cluster * WORDS;
+    float scale = sqrt(max(dot(m[0].xyz, m[0].xyz), max(dot(m[1].xyz, m[1].xyz), dot(m[2].xyz, m[2].xyz))));
+    float tau = view[7].x;
+    if (onScreen(m, scale, sphereAt(at + 8u), uintBitsToFloat(record[at + 12u])) > tau) return;
+    if (onScreen(m, scale, sphereAt(at + 13u), uintBitsToFloat(record[at + 17u])) <= tau) return;
+    vec4 own = sphereAt(at + 4u);
+    vec3 centre = (m * vec4(own.xyz, 1.0)).xyz;
+    float radius = own.w * scale;
+    for (uint p = 0u; p < 6u; p++) {
+        if (dot(view[p].xyz, centre) + view[p].w < -radius) return;
+    }
+    uint slot = atomicAdd(counter[0], 1u);
+    if (slot >= params.visibleCapacity) return;
+    uint draw = params.firstCommand + gl_GlobalInvocationID.y * params.materials + record[at + 19u];
+    uint offset = atomicAdd(command[draw * 5u], record[at + 3u] * 3u);
+    visible[slot] = uvec4(cluster, draw, offset, 0u);
+}
+GLSL_END
+
+// The commands laid end to end: one group, each thread a run of them,
+// summed, the sums scanned in shared memory, and each command's first index
+// written; a command past the frame's index budget is cut short at it (and
+// the indices asked for counted, for the budget to grow by next frame).
+// Then the emit's dispatch, a group a visible cluster.
+const COMPUTE_CLUSTER_SCAN = <<GLSL_END
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, set = 0, binding = 2) buffer Commands { uint command[]; };
+layout(std430, set = 0, binding = 4) buffer Counters { uint counter[]; };
+
+layout(push_constant) uniform Params {
+    mat4 model;
+    uint firstCluster;
+    uint clusterCount;
+    uint firstInstance;
+    uint instanced;
+    uint firstCommand;
+    uint materials;
+    uint commandCount;
+    uint budget;
+    uint visibleCapacity;
+} params;
+
+shared uint sums[128];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint per = (params.commandCount + 127u) / 128u;
+    uint begin = min(t * per, params.commandCount);
+    uint end = min(begin + per, params.commandCount);
+    uint sum = 0u;
+    for (uint c = begin; c < end; c++) sum += command[c * 5u];
+    sums[t] = sum;
+    barrier();
+    for (uint o = 1u; o < 128u; o <<= 1u) {
+        uint v = t >= o ? sums[t - o] : 0u;
+        barrier();
+        sums[t] += v;
+        barrier();
+    }
+    uint at = t == 0u ? 0u : sums[t - 1u];
+    for (uint c = begin; c < end; c++) {
+        uint n = command[c * 5u];
+        uint fits = at < params.budget ? min(n, params.budget - at) : 0u;
+        command[c * 5u] = fits - fits % 3u;
+        command[c * 5u + 2u] = at;
+        at += n;
+    }
+    if (t == 127u) {
+        counter[1] = sums[127];
+        uint seen = min(counter[0], params.visibleCapacity);
+        counter[4] = min(seen, 65535u);
+        counter[5] = (seen + 65534u) / 65535u;
+        counter[6] = 1u;
+    }
+}
+GLSL_END
+
+// Each visible cluster's triangles into its command's run of the index
+// buffer: a group a cluster, a thread a triangle, its three corners the
+// mesh's own vertices through the cluster's references. A triangle past
+// its command's count -- the budget's cut -- is left out.
+const COMPUTE_CLUSTER_EMIT = <<GLSL_END
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Records { uint record[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Commands { uint command[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Visible { uvec4 visible[]; };
+layout(std430, set = 0, binding = 4) readonly buffer Counters { uint counter[]; };
+layout(std430, set = 0, binding = 6) readonly buffer Refs { uint ref[]; };
+layout(std430, set = 0, binding = 7) readonly buffer Triangles { uint triangle[]; };
+layout(std430, set = 0, binding = 8) writeonly buffer Indices { uint index[]; };
+
+layout(push_constant) uniform Params {
+    mat4 model;
+    uint firstCluster;
+    uint clusterCount;
+    uint firstInstance;
+    uint instanced;
+    uint firstCommand;
+    uint materials;
+    uint commandCount;
+    uint budget;
+    uint visibleCapacity;
+} params;
+
+const uint WORDS = 20u;
+
+void main() {
+    uint slot = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    if (slot >= min(counter[0], params.visibleCapacity)) return;
+    uvec4 entry = visible[slot];
+    uint at = entry.x * WORDS;
+    uint t = gl_LocalInvocationID.x;
+    if (t >= record[at + 3u]) return;
+    uint into = entry.z + t * 3u;
+    if (into + 3u > command[entry.y * 5u]) return;
+    into += command[entry.y * 5u + 2u];
+    uint packed = triangle[record[at + 2u] + t];
+    uint refs = record[at];
+    index[into] = ref[refs + (packed & 255u)];
+    index[into + 1u] = ref[refs + ((packed >> 8u) & 255u)];
+    index[into + 2u] = ref[refs + ((packed >> 16u) & 255u)];
+}
+GLSL_END
+
 const FRAGMENT_SSAO = <<GLSL_END
 #version 410 core
 

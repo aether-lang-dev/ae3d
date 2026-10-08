@@ -1,0 +1,2539 @@
+// ae3d.clusterlod -- a mesh as a hierarchy of clusters, for geometry drawn at
+// the detail the screen can show (#536).
+//
+// A mesh is cut into clusters of at most MAX_TRIANGLES triangles over at
+// most MAX_VERTICES vertices. Then, a level at a time, the clusters are
+// gathered into groups of about GROUP_SIZE that share the most edges, each
+// group's triangles simplified to half -- the vertices it shares with other
+// groups held where they are, so neighbouring groups still meet -- and cut
+// into clusters again: the parents. The result is a directed acyclic graph
+// from the mesh as it was down to a handful of clusters (Karis, "Nanite: A
+// Deep Dive", 2021; the build follows meshoptimizer's clusterlod).
+//
+// Simplification only ever collapses an edge onto one of its own vertices,
+// so every level indexes the mesh's own vertex buffer: no vertex is made,
+// and a skinned mesh's skin holds at every level.
+//
+// Each cluster carries the error of the group that made it and the error of
+// the group it was simplified into (its parent's), with the spheres they
+// were measured over; both grow up the graph, never shrink. A view draws a
+// cluster when its own error, projected, is under the threshold and its
+// parent's is over: a cut of the graph with no cracks, since a group's
+// children and the clusters made from them compare the same two numbers.
+
+exports (
+    MAX_TRIANGLES, MAX_VERTICES, GROUP_SIZE, RECORD_WORDS, ROOT_ERROR,
+    ClusterMesh, build, free_mesh, cluster_count, record, vertex_refs, vertex_ref_count, triangles, levels, triangle_total,
+    REC_REFS, REC_VERTICES, REC_TRIS, REC_TRIANGLES, REC_CULL, REC_LOD, REC_LOD_ERROR, REC_PARENT, REC_PARENT_ERROR,
+    REC_LEVEL, REC_MATERIAL
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern realloc(p: ptr, size: long) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+extern memset(dst: ptr, value: int, n: long) -> ptr
+extern sqrt(x: float) -> float
+
+const MAX_TRIANGLES = 128
+const MAX_VERTICES = 128
+const GROUP_SIZE = 16
+// A group left small by the growth is merged into a neighbour: up to half
+// again the size, or twice it where nothing smaller is next to it.
+const GROUP_MOST = 32
+// A group simplified to no less than this share of its triangles cannot be
+// simplified usefully: its clusters are roots.
+const STUCK_SHARE = 0.85
+// What a root's parent error is: no view is coarse enough to want it gone.
+const ROOT_ERROR = 1.0e30
+// How much a normal's or a texture coordinate's change counts against a
+// collapse, beside the distance it moves the surface (the mesh scaled to a
+// unit extent): enough to keep creases and seams where they are.
+const NORMAL_WEIGHT = 0.0025
+const UV_WEIGHT = 0.0025
+// A border edge's quadric is weighed this much over the faces': open edges
+// hold their outline.
+const BORDER_WEIGHT = 10.0
+const VERTEX_FLOATS = 9
+const PASSES = 24
+
+// A cluster's record, RECORD_WORDS 32-bit words: where its vertex
+// references and its triangles start and how many; the sphere that holds it
+// (for culling); the sphere and error of the group that made it (its LOD);
+// the sphere and error of the group it was simplified into (its parent's);
+// its level; the material group it draws with.
+const RECORD_WORDS = 20
+const REC_REFS = 0
+const REC_VERTICES = 1
+const REC_TRIS = 2
+const REC_TRIANGLES = 3
+const REC_CULL = 4
+const REC_LOD = 8
+const REC_LOD_ERROR = 12
+const REC_PARENT = 13
+const REC_PARENT_ERROR = 17
+const REC_LEVEL = 18
+const REC_MATERIAL = 19
+
+// The graph: the records, each cluster's vertex references (indices into
+// the mesh's vertex buffer, a cluster's contiguous) and its triangles (three
+// bytes of local index packed into a word, a cluster's contiguous).
+struct ClusterMesh {
+    count: int
+    capacity: int
+    records: ptr                   // int32 / f32 words, RECORD_WORDS a cluster
+    refs: ptr                      // uint32
+    ref_count: int
+    ref_capacity: int
+    tris: ptr                      // uint32: a | b << 8 | c << 16
+    tri_count: int
+    tri_capacity: int
+    levels: int
+}
+
+cluster_count(cm: *ClusterMesh) -> int { return cm.count }
+record(cm: *ClusterMesh, k: int) -> ptr { return cm.records + k * RECORD_WORDS * 4 }
+vertex_refs(cm: *ClusterMesh) -> ptr { return cm.refs }
+vertex_ref_count(cm: *ClusterMesh) -> int { return cm.ref_count }
+triangles(cm: *ClusterMesh) -> ptr { return cm.tris }
+levels(cm: *ClusterMesh) -> int { return cm.levels }
+triangle_total(cm: *ClusterMesh) -> int { return cm.tri_count }
+
+free_mesh(cm: *ClusterMesh) {
+    if cm == null { return }
+    if cm.records != null { free(cm.records) }
+    if cm.refs != null { free(cm.refs) }
+    if cm.tris != null { free(cm.tris) }
+    free(cm as ptr)
+}
+
+// --- the build's state --------------------------------------------------------------------------------------------
+
+// What the build keeps about the mesh: its vertices, their positions welded
+// (one id for every vertex at the same place, whatever its normal or
+// texture coordinate), the vertices held fixed, and scratch the size of
+// the mesh, reused by every group.
+struct Build {
+    vertices: f32[]
+    vertex_count: int
+    position_of: int[]             // vertex -> position id
+    position_count: int
+    held: uint8[]                  // position -> held by the caller (a material's border)
+    scale: float                   // 1 over the mesh's extent: errors are measured on a unit mesh
+    // Scratch, a word a vertex or a position, left zeroed (or as noted)
+    // between uses.
+    stamp: int[]                   // vertex -> the mark of the pass that last met it
+    local: int[]                   // vertex -> its index in the pass's list
+    pstamp: int[]                  // position -> mark
+    plocal: int[]                  // position -> index
+    mark: int
+}
+
+next_mark(b: *Build) -> int {
+    b.mark = b.mark + 1
+    return b.mark
+}
+
+px(b: *Build, v: int) -> float { return b.vertices[v * VERTEX_FLOATS] as float }
+py(b: *Build, v: int) -> float { return b.vertices[v * VERTEX_FLOATS + 1] as float }
+pz(b: *Build, v: int) -> float { return b.vertices[v * VERTEX_FLOATS + 2] as float }
+
+// --- sorting ------------------------------------------------------------------------------------------------------
+
+// `n` 64-bit keys sorted ascending, in place: least significant byte first,
+// eight passes, `scratch` as long as the keys.
+sort_keys(keys: ptr, n: int, scratch: ptr) {
+    if n < 2 { return }
+    count = calloc(256, 4) as int[]
+    from = keys as long[]
+    into = scratch as long[]
+    shift = 0
+    while shift < 64 {
+        memset(count as ptr, 0, (256 * 4) as long)
+        i = 0
+        while i < n {
+            d = ((from[i] >> shift) & (255 as long)) as int
+            count[d] = count[d] + 1
+            i = i + 1
+        }
+        total = 0
+        d = 0
+        while d < 256 {
+            c = count[d]
+            count[d] = total
+            total = total + c
+            d = d + 1
+        }
+        i = 0
+        while i < n {
+            d = ((from[i] >> shift) & (255 as long)) as int
+            into[count[d]] = from[i]
+            count[d] = count[d] + 1
+            i = i + 1
+        }
+        swap = from
+        from = into
+        into = swap
+        shift = shift + 8
+    }
+    // Eight passes: the keys are back where they started.
+    free(count as ptr)
+}
+
+// A float's bits as a key that sorts as the float does (for costs, never
+// negative).
+float_key(f: float) -> long {
+    if f <= 0.0 { return 0 as long }
+    if f > 1.0e30 { return 4294967295 as long }
+    // A fixed-point key: costs are compared to a part in a billion of a
+    // unit mesh, far finer than any collapse they rank.
+    k = f * 1000000000.0
+    if k > 4294967295.0 { return 4294967295 as long }
+    return k as long
+}
+
+// A key along the Morton curve through `x, y, z` in 0..1: ten bits each.
+morton(x: float, y: float, z: float) -> long {
+    return spread(unit_bits(x)) | (spread(unit_bits(y)) << 1) | (spread(unit_bits(z)) << 2)
+}
+
+unit_bits(v: float) -> long {
+    t = v
+    if t < 0.0 { t = 0.0 }
+    if t > 1.0 { t = 1.0 }
+    return (t * 1023.0) as long
+}
+
+spread(v: long) -> long {
+    x = v & (1023 as long)
+    x = (x | (x << 16)) & (50331903 as long)       // 0x030000FF
+    x = (x | (x << 8)) & (50393103 as long)        // 0x0300F00F
+    x = (x | (x << 4)) & (51130563 as long)        // 0x030C30C3
+    x = (x | (x << 2)) & (153391689 as long)       // 0x09249249
+    return x
+}
+
+// --- spheres ------------------------------------------------------------------------------------------------------
+
+// The sphere round a set of vertices: their bounding box's centre and the
+// farthest of them from it. Into `out` (f32[4]).
+sphere_of(b: *Build, list: int[], n: int, out: f32[]) {
+    lx = 1.0e30
+    ly = 1.0e30
+    lz = 1.0e30
+    hx = 0.0 - 1.0e30
+    hy = 0.0 - 1.0e30
+    hz = 0.0 - 1.0e30
+    i = 0
+    while i < n {
+        v = list[i]
+        x = px(b, v)
+        y = py(b, v)
+        z = pz(b, v)
+        if x < lx { lx = x }
+        if y < ly { ly = y }
+        if z < lz { lz = z }
+        if x > hx { hx = x }
+        if y > hy { hy = y }
+        if z > hz { hz = z }
+        i = i + 1
+    }
+    cx = (lx + hx) * 0.5
+    cy = (ly + hy) * 0.5
+    cz = (lz + hz) * 0.5
+    r = 0.0
+    i = 0
+    while i < n {
+        v = list[i]
+        dx = px(b, v) - cx
+        dy = py(b, v) - cy
+        dz = pz(b, v) - cz
+        d = sqrt(dx * dx + dy * dy + dz * dz)
+        if d > r { r = d }
+        i = i + 1
+    }
+    out[0] = cx as f32
+    out[1] = cy as f32
+    out[2] = cz as f32
+    out[3] = r as f32
+}
+
+// The sphere holding the spheres at `spheres` (f32[4] each, `n` of them,
+// `stride` floats apart): the box round them, then the farthest reach from
+// its centre.
+merge_spheres(spheres: f32[], n: int, stride: int, out: f32[]) {
+    lx = 1.0e30
+    ly = 1.0e30
+    lz = 1.0e30
+    hx = 0.0 - 1.0e30
+    hy = 0.0 - 1.0e30
+    hz = 0.0 - 1.0e30
+    i = 0
+    while i < n {
+        at = i * stride
+        r = spheres[at + 3] as float
+        x = spheres[at] as float
+        y = spheres[at + 1] as float
+        z = spheres[at + 2] as float
+        if x - r < lx { lx = x - r }
+        if y - r < ly { ly = y - r }
+        if z - r < lz { lz = z - r }
+        if x + r > hx { hx = x + r }
+        if y + r > hy { hy = y + r }
+        if z + r > hz { hz = z + r }
+        i = i + 1
+    }
+    cx = (lx + hx) * 0.5
+    cy = (ly + hy) * 0.5
+    cz = (lz + hz) * 0.5
+    reach = 0.0
+    i = 0
+    while i < n {
+        at = i * stride
+        dx = (spheres[at] as float) - cx
+        dy = (spheres[at + 1] as float) - cy
+        dz = (spheres[at + 2] as float) - cz
+        d = sqrt(dx * dx + dy * dy + dz * dz) + (spheres[at + 3] as float)
+        if d > reach { reach = d }
+        i = i + 1
+    }
+    out[0] = cx as f32
+    out[1] = cy as f32
+    out[2] = cz as f32
+    out[3] = reach as f32
+}
+
+// --- the graph's storage ------------------------------------------------------------------------------------------
+
+new_cluster(cm: *ClusterMesh) -> int {
+    if cm.count == cm.capacity {
+        cm.capacity = cm.capacity * 2
+        if cm.capacity < 64 { cm.capacity = 64 }
+        cm.records = realloc(cm.records, (cm.capacity * RECORD_WORDS * 4) as long)
+    }
+    k = cm.count
+    memset(record(cm, k), 0, (RECORD_WORDS * 4) as long)
+    w = record(cm, k) as f32[]
+    w[REC_PARENT_ERROR] = ROOT_ERROR as f32
+    cm.count = cm.count + 1
+    return k
+}
+
+push_ref(cm: *ClusterMesh, v: int) {
+    if cm.ref_count == cm.ref_capacity {
+        cm.ref_capacity = cm.ref_capacity * 2
+        if cm.ref_capacity < 1024 { cm.ref_capacity = 1024 }
+        cm.refs = realloc(cm.refs, (cm.ref_capacity * 4) as long)
+    }
+    (cm.refs as uint32[])[cm.ref_count] = v as uint32
+    cm.ref_count = cm.ref_count + 1
+}
+
+push_tri(cm: *ClusterMesh, a: int, b: int, c: int) {
+    if cm.tri_count == cm.tri_capacity {
+        cm.tri_capacity = cm.tri_capacity * 2
+        if cm.tri_capacity < 1024 { cm.tri_capacity = 1024 }
+        cm.tris = realloc(cm.tris, (cm.tri_capacity * 4) as long)
+    }
+    (cm.tris as uint32[])[cm.tri_count] = (a | (b << 8) | (c << 16)) as uint32
+    cm.tri_count = cm.tri_count + 1
+}
+
+// A cluster's triangles back as the mesh's vertex indices, three a
+// triangle, appended to `out` (room enough) at `at`; the new end.
+unpack(cm: *ClusterMesh, k: int, out: int[], at: int) -> int {
+    w = record(cm, k) as int[]
+    refs = cm.refs as uint32[]
+    tris = cm.tris as uint32[]
+    first_ref = w[REC_REFS]
+    t = 0
+    while t < w[REC_TRIANGLES] {
+        packed = tris[w[REC_TRIS] + t] as int
+        out[at] = refs[first_ref + (packed & 255)] as int
+        out[at + 1] = refs[first_ref + ((packed >> 8) & 255)] as int
+        out[at + 2] = refs[first_ref + ((packed >> 16) & 255)] as int
+        at = at + 3
+        t = t + 1
+    }
+    return at
+}
+
+// --- clusters from triangles --------------------------------------------------------------------------------------
+
+// The triangles `tris` (vertex indices, three a triangle, `n` of them) cut
+// into clusters, appended to the graph at `level` with `material`: grown
+// one triangle at a time from a seed, the next the adjacent triangle that
+// adds the fewest vertices -- or would be left an island -- and lies
+// nearest the cluster, until it holds MAX_TRIANGLES or no neighbour fits
+// under MAX_VERTICES (meshoptimizer's buildMeshlets); the islands left
+// merged into neighbours after. Returns the first new cluster; they run to
+// the graph's end.
+clusterize(b: *Build, cm: *ClusterMesh, tris: int[], n: int, level: int, material: int) -> int {
+    first = cm.count
+    if n <= 0 { return first }
+    // The triangles' vertices, by position: two triangles that meet across
+    // a seam are neighbours though their vertices differ.
+    mark = next_mark(b)
+    positions = calloc(n * 3, 4) as int[]
+    pcount = 0
+    i = 0
+    while i < n * 3 {
+        p = b.position_of[tris[i]]
+        if b.pstamp[p] != mark {
+            b.pstamp[p] = mark
+            b.plocal[p] = pcount
+            positions[pcount] = p
+            pcount = pcount + 1
+        }
+        i = i + 1
+    }
+    // Triangles round each position (CSR).
+    start = calloc(pcount + 1, 4) as int[]
+    i = 0
+    while i < n * 3 {
+        lp = b.plocal[b.position_of[tris[i]]]
+        start[lp + 1] = start[lp + 1] + 1
+        i = i + 1
+    }
+    i = 0
+    while i < pcount {
+        start[i + 1] = start[i + 1] + start[i]
+        i = i + 1
+    }
+    fill = calloc(pcount, 4) as int[]
+    around = calloc(n * 3, 4) as int[]
+    i = 0
+    while i < n * 3 {
+        lp = b.plocal[b.position_of[tris[i]]]
+        around[start[lp] + fill[lp]] = i / 3
+        fill[lp] = fill[lp] + 1
+        i = i + 1
+    }
+    free(fill as ptr)
+
+    // Centroids, and the triangles in Morton order over the box that holds
+    // them.
+    cent = calloc(n * 3, 8) as float[]
+    lx = 1.0e30
+    ly = 1.0e30
+    lz = 1.0e30
+    hx = 0.0 - 1.0e30
+    hy = 0.0 - 1.0e30
+    hz = 0.0 - 1.0e30
+    t = 0
+    while t < n {
+        a = tris[t * 3]
+        bb = tris[t * 3 + 1]
+        c = tris[t * 3 + 2]
+        x = (px(b, a) + px(b, bb) + px(b, c)) / 3.0
+        y = (py(b, a) + py(b, bb) + py(b, c)) / 3.0
+        z = (pz(b, a) + pz(b, bb) + pz(b, c)) / 3.0
+        cent[t * 3] = x
+        cent[t * 3 + 1] = y
+        cent[t * 3 + 2] = z
+        if x < lx { lx = x }
+        if y < ly { ly = y }
+        if z < lz { lz = z }
+        if x > hx { hx = x }
+        if y > hy { hy = y }
+        if z > hz { hz = z }
+        t = t + 1
+    }
+    span = hx - lx
+    if hy - ly > span { span = hy - ly }
+    if hz - lz > span { span = hz - lz }
+    if span <= 0.0 { span = 1.0 }
+    order = calloc(n, 8)
+    scratch = calloc(n, 8)
+    ok = order as long[]
+    t = 0
+    while t < n {
+        ok[t] = (morton((cent[t * 3] - lx) / span, (cent[t * 3 + 1] - ly) / span, (cent[t * 3 + 2] - lz) / span) << 32) | (t as long)
+        t = t + 1
+    }
+    sort_keys(order, n, scratch)
+    free(scratch)
+    // Each triangle's place in that order, for the nearest unused one when
+    // a cluster has no neighbour left: a mesh of separate pieces -- a
+    // facade's trims, a pile of props -- fills its clusters with the
+    // pieces beside each other instead of making one of each.
+    rank = calloc(n, 4) as int[]
+    t = 0
+    while t < n {
+        rank[(ok[t] & (4294967295 as long)) as int] = t
+        t = t + 1
+    }
+
+    used = calloc(n, 1) as uint8[]
+    candidate = calloc(n, 1) as uint8[]
+    cands = calloc(n, 4) as int[]
+    members = calloc(MAX_TRIANGLES, 4) as int[]
+    verts = calloc(MAX_VERTICES, 4) as int[]
+    // Each triangle's cluster, and each cluster's triangles and vertices.
+    owner = calloc(n, 4) as int[]
+    sizes = calloc(n, 4) as int[]
+    made = 0
+    // How many unused triangles each position still has round it: a
+    // triangle with a corner no other unused triangle shares would be left
+    // an island, and goes first.
+    live = calloc(pcount, 4) as int[]
+    i = 0
+    while i < pcount {
+        live[i] = start[i + 1] - start[i]
+        i = i + 1
+    }
+    vmark = next_mark(b)
+    cursor = 0
+    // The next cluster's seed: the most cornered triangle on the last one's
+    // edge, so the clusters sweep across the surface rather than leaving
+    // islands between seeds taken far apart; the next in Morton order where
+    // the last had nothing left round it.
+    follow = 0 - 1
+    while cursor < n || follow >= 0 {
+        seed = follow
+        follow = 0 - 1
+        if seed < 0 {
+            seed = (ok[cursor] & (4294967295 as long)) as int
+            cursor = cursor + 1
+        }
+        if used[seed] != 0 { continue }
+        // One cluster, grown from the seed.
+        vmark = next_mark(b)
+        mcount = 0
+        vcount = 0
+        ccount = 0
+        sx = 0.0
+        sy = 0.0
+        sz = 0.0
+        pick = seed
+        while pick >= 0 {
+            used[pick] = 1
+            members[mcount] = pick
+            mcount = mcount + 1
+            k = 0
+            while k < 3 {
+                v = tris[pick * 3 + k]
+                live[b.plocal[b.position_of[v]]] = live[b.plocal[b.position_of[v]]] - 1
+                if b.stamp[v] != vmark {
+                    b.stamp[v] = vmark
+                    b.local[v] = vcount
+                    verts[vcount] = v
+                    vcount = vcount + 1
+                }
+                // Its unused neighbours become candidates.
+                lp = b.plocal[b.position_of[v]]
+                j = start[lp]
+                while j < start[lp + 1] {
+                    o = around[j]
+                    if used[o] == 0 && candidate[o] == 0 {
+                        candidate[o] = 1
+                        cands[ccount] = o
+                        ccount = ccount + 1
+                    }
+                    j = j + 1
+                }
+                k = k + 1
+            }
+            sx = sx + cent[pick * 3]
+            sy = sy + cent[pick * 3 + 1]
+            sz = sz + cent[pick * 3 + 2]
+            if mcount >= MAX_TRIANGLES { break }
+            // The candidate adding the fewest vertices, then the nearest.
+            mx = sx / (mcount as float)
+            my = sy / (mcount as float)
+            mz = sz / (mcount as float)
+            pick = 0 - 1
+            best = 1.0e30
+            j = 0
+            while j < ccount {
+                o = cands[j]
+                if used[o] != 0 {
+                    // Taken since: dropped from the list.
+                    ccount = ccount - 1
+                    cands[j] = cands[ccount]
+                    candidate[o] = 0
+                    continue
+                }
+                fresh = 0
+                dangling = false
+                k = 0
+                while k < 3 {
+                    v = tris[o * 3 + k]
+                    if b.stamp[v] != vmark { fresh = fresh + 1 }
+                    if live[b.plocal[b.position_of[v]]] == 1 { dangling = true }
+                    k = k + 1
+                }
+                if vcount + fresh <= MAX_VERTICES {
+                    priority = fresh
+                    if dangling { priority = 0 }
+                    dx = cent[o * 3] - mx
+                    dy = cent[o * 3 + 1] - my
+                    dz = cent[o * 3 + 2] - mz
+                    score = (priority as float) * span * span * 4.0 + dx * dx + dy * dy + dz * dz
+                    if score < best {
+                        best = score
+                        pick = o
+                    }
+                }
+                j = j + 1
+            }
+            // Only where nothing adjacent is left at all: a neighbour that
+            // does not fit ends the cluster where it is.
+            if pick < 0 && ccount == 0 { pick = nearest_unused(b, tris, ok, rank, used, cent, members[mcount - 1], n, vcount, vmark, mx, my, mz) }
+        }
+        // The candidates left go back for the next cluster, the most
+        // cornered of them its seed.
+        fewest = 1 << 30
+        j = 0
+        while j < ccount {
+            o = cands[j]
+            candidate[o] = 0
+            if used[o] == 0 {
+                round = 0
+                k = 0
+                while k < 3 {
+                    round = round + live[b.plocal[b.position_of[tris[o * 3 + k]]]]
+                    k = k + 1
+                }
+                if round < fewest {
+                    fewest = round
+                    follow = o
+                }
+            }
+            j = j + 1
+        }
+        j = 0
+        while j < mcount {
+            owner[members[j]] = made
+            j = j + 1
+        }
+        sizes[made] = mcount
+        made = made + 1
+        cursor = cursor + 1
+    }
+    merge_small(b, tris, n, owner, sizes, made, start, around)
+    // The clusters into the graph, each its triangles in the order they
+    // were taken.
+    tstart = calloc(made + 1, 4) as int[]
+    t = 0
+    while t < n {
+        tstart[owner[t] + 1] = tstart[owner[t] + 1] + 1
+        t = t + 1
+    }
+    k = 0
+    while k < made {
+        tstart[k + 1] = tstart[k + 1] + tstart[k]
+        k = k + 1
+    }
+    tfill = calloc(made, 4) as int[]
+    byc = calloc(n, 4) as int[]
+    t = 0
+    while t < n {
+        o = owner[t]
+        byc[tstart[o] + tfill[o]] = t
+        tfill[o] = tfill[o] + 1
+        t = t + 1
+    }
+    k = 0
+    while k < made {
+        if tstart[k + 1] > tstart[k] {
+            vmark = next_mark(b)
+            vcount = 0
+            mcount = 0
+            j = tstart[k]
+            while j < tstart[k + 1] {
+                tri = byc[j]
+                members[mcount] = tri
+                mcount = mcount + 1
+                q = 0
+                while q < 3 {
+                    v = tris[tri * 3 + q]
+                    if b.stamp[v] != vmark {
+                        b.stamp[v] = vmark
+                        b.local[v] = vcount
+                        verts[vcount] = v
+                        vcount = vcount + 1
+                    }
+                    q = q + 1
+                }
+                j = j + 1
+            }
+            emit_cluster(b, cm, tris, members, mcount, verts, vcount, level, material)
+        }
+        k = k + 1
+    }
+    free(live as ptr)
+    free(rank as ptr)
+    free(tstart as ptr)
+    free(tfill as ptr)
+    free(byc as ptr)
+    free(owner as ptr)
+    free(sizes as ptr)
+    free(used as ptr)
+    free(candidate as ptr)
+    free(cands as ptr)
+    free(members as ptr)
+    free(verts as ptr)
+    free(order)
+    free(cent as ptr)
+    free(start as ptr)
+    free(around as ptr)
+    free(positions as ptr)
+    return first
+}
+
+// Nothing adjacent left: the unused triangle nearest the cluster's middle
+// (mx, my, mz) whose vertices still fit, among those near `last` in the
+// Morton order; -1 for none.
+nearest_unused(b: *Build, tris: int[], ok: long[], rank: int[], used: uint8[], cent: float[], last: int, n: int,
+               vcount: int, vmark: int, mx: float, my: float, mz: float) -> int {
+    window = 64
+    at = rank[last]
+    lo = at - window
+    if lo < 0 { lo = 0 }
+    hi = at + window
+    if hi > n - 1 { hi = n - 1 }
+    pick = 0 - 1
+    best = 1.0e30
+    j = lo
+    while j <= hi {
+        o = (ok[j] & (4294967295 as long)) as int
+        if used[o] == 0 {
+            fresh = 0
+            k = 0
+            while k < 3 {
+                if b.stamp[tris[o * 3 + k]] != vmark { fresh = fresh + 1 }
+                k = k + 1
+            }
+            if vcount + fresh <= MAX_VERTICES {
+                dx = cent[o * 3] - mx
+                dy = cent[o * 3 + 1] - my
+                dz = cent[o * 3 + 2] - mz
+                d = dx * dx + dy * dy + dz * dz
+                if d < best {
+                    best = d
+                    pick = o
+                }
+            }
+        }
+        j = j + 1
+    }
+    return pick
+}
+
+// The clusters too small to be worth their own record -- islands the
+// growth left between clusters it had finished -- merged into a
+// neighbour: the smallest first, into the one it shares the most triangle
+// sides with whose union still fits the limits. `owner` is each
+// triangle's cluster, `sizes` each cluster's triangles (a merged one's
+// left at zero); `start` and `around` the triangles round each position.
+merge_small(b: *Build, tris: int[], n: int, owner: int[], sizes: int[], made: int,
+            start: int[], around: int[]) {
+    small = MAX_TRIANGLES / 4
+    // Each cluster's triangles, to walk a small one's.
+    tstart = calloc(made + 1, 4) as int[]
+    t = 0
+    while t < n {
+        tstart[owner[t] + 1] = tstart[owner[t] + 1] + 1
+        t = t + 1
+    }
+    k = 0
+    while k < made {
+        tstart[k + 1] = tstart[k + 1] + tstart[k]
+        k = k + 1
+    }
+    tfill = calloc(made, 4) as int[]
+    byc = calloc(n, 4) as int[]
+    t = 0
+    while t < n {
+        o = owner[t]
+        byc[tstart[o] + tfill[o]] = t
+        tfill[o] = tfill[o] + 1
+        t = t + 1
+    }
+    free(tfill as ptr)
+    // A merged cluster's triangles stay listed under where they came from;
+    // `into` follows a cluster to the one it went into, and each cluster
+    // still standing chains the ones that went into it (`next`, to `tail`).
+    into = calloc(made, 4) as int[]
+    next = calloc(made, 4) as int[]
+    tail = calloc(made, 4) as int[]
+    k = 0
+    while k < made {
+        into[k] = k
+        next[k] = 0 - 1
+        tail[k] = k
+        k = k + 1
+    }
+    // The small ones, smallest first.
+    order = calloc(made + 1, 8) as long[]
+    count = 0
+    k = 0
+    while k < made {
+        if sizes[k] < small {
+            order[count] = ((sizes[k] as long) << 32) | (k as long)
+            count = count + 1
+        }
+        k = k + 1
+    }
+    scratch = calloc(count + 1, 8)
+    sort_keys(order as ptr, count, scratch)
+    free(scratch)
+    shared = calloc(made, 4) as int[]
+    near = calloc(n, 4) as int[]
+    i = 0
+    while i < count {
+        c = (order[i] & (4294967295 as long)) as int
+        i = i + 1
+        if into[c] != c || sizes[c] >= small { continue }
+        // Its neighbours, by the triangles round its triangles' corners.
+        ncount = 0
+        j = tstart[c]
+        while j < tstart[c + 1] {
+            tri = byc[j]
+            q = 0
+            while q < 3 {
+                lp = b.plocal[b.position_of[tris[tri * 3 + q]]]
+                r = start[lp]
+                while r < start[lp + 1] {
+                    o = root(into, owner[around[r]])
+                    if o != c {
+                        if shared[o] == 0 {
+                            near[ncount] = o
+                            ncount = ncount + 1
+                        }
+                        shared[o] = shared[o] + 1
+                    }
+                    r = r + 1
+                }
+                q = q + 1
+            }
+            j = j + 1
+        }
+        best = 0 - 1
+        most = 0
+        j = 0
+        while j < ncount {
+            o = near[j]
+            if sizes[o] + sizes[c] <= MAX_TRIANGLES && shared[o] > most &&
+               union_vertices(b, tris, byc, tstart, next, c, o) <= MAX_VERTICES {
+                most = shared[o]
+                best = o
+            }
+            j = j + 1
+        }
+        j = 0
+        while j < ncount {
+            shared[near[j]] = 0
+            j = j + 1
+        }
+        if best < 0 { continue }
+        sizes[best] = sizes[best] + sizes[c]
+        sizes[c] = 0
+        into[c] = best
+        next[tail[best]] = c
+        tail[best] = tail[c]
+    }
+    // Every triangle to the cluster its own went into.
+    t = 0
+    while t < n {
+        owner[t] = root(into, owner[t])
+        t = t + 1
+    }
+    free(shared as ptr)
+    free(near as ptr)
+    free(order as ptr)
+    free(into as ptr)
+    free(next as ptr)
+    free(tail as ptr)
+    free(tstart as ptr)
+    free(byc as ptr)
+}
+
+// The group standing nearest group `c` by their middles (sums over
+// `size` clusters) that it fits beside within GROUP_MOST; -1 for none.
+nearest_group(middle: float[], size: int[], into: int[], groups: int, c: int) -> int {
+    cx = middle[c * 3] / (size[c] as float)
+    cy = middle[c * 3 + 1] / (size[c] as float)
+    cz = middle[c * 3 + 2] / (size[c] as float)
+    best = 0 - 1
+    nearest = 1.0e30
+    g = 0
+    while g < groups {
+        if g != c && into[g] == g && size[g] > 0 && size[g] + size[c] <= GROUP_MOST {
+            dx = middle[g * 3] / (size[g] as float) - cx
+            dy = middle[g * 3 + 1] / (size[g] as float) - cy
+            dz = middle[g * 3 + 2] / (size[g] as float) - cz
+            d = dx * dx + dy * dy + dz * dz
+            if d < nearest {
+                nearest = d
+                best = g
+            }
+        }
+        g = g + 1
+    }
+    return best
+}
+
+// Where cluster `c` went, following merges to the end.
+root(into: int[], c: int) -> int {
+    r = c
+    while into[r] != r { r = into[r] }
+    return r
+}
+
+// The vertices clusters `a` and `o` (two still standing) would have
+// together: the triangles of every cluster on either's chain.
+union_vertices(b: *Build, tris: int[], byc: int[], tstart: int[], next: int[], a: int, o: int) -> int {
+    mark = next_mark(b)
+    count = 0
+    side = 0
+    while side < 2 {
+        k = a
+        if side == 1 { k = o }
+        while k >= 0 {
+            j = tstart[k]
+            while j < tstart[k + 1] {
+                tri = byc[j]
+                q = 0
+                while q < 3 {
+                    v = tris[tri * 3 + q]
+                    if b.stamp[v] != mark {
+                        b.stamp[v] = mark
+                        count = count + 1
+                    }
+                    q = q + 1
+                }
+                j = j + 1
+            }
+            k = next[k]
+        }
+        side = side + 1
+    }
+    return count
+}
+
+// A cluster into the graph: its vertices (`verts`, in the order the
+// triangles met them, their local indices in b.local) and its triangles,
+// its culling sphere, its LOD the level's own (error 0, its own sphere)
+// until the group that made it says otherwise.
+emit_cluster(b: *Build, cm: *ClusterMesh, tris: int[], members: int[], mcount: int, verts: int[], vcount: int, level: int, material: int) {
+    k = new_cluster(cm)
+    w = record(cm, k) as int[]
+    f = record(cm, k) as f32[]
+    w[REC_REFS] = cm.ref_count
+    w[REC_VERTICES] = vcount
+    w[REC_TRIS] = cm.tri_count
+    w[REC_TRIANGLES] = mcount
+    w[REC_LEVEL] = level
+    w[REC_MATERIAL] = material
+    i = 0
+    while i < vcount {
+        push_ref(cm, verts[i])
+        i = i + 1
+    }
+    i = 0
+    while i < mcount {
+        t = members[i]
+        push_tri(cm, b.local[tris[t * 3]], b.local[tris[t * 3 + 1]], b.local[tris[t * 3 + 2]])
+        i = i + 1
+    }
+    sphere = calloc(4, 4) as f32[]
+    sphere_of(b, verts, vcount, sphere)
+    i = 0
+    while i < 4 {
+        f[REC_CULL + i] = sphere[i]
+        f[REC_LOD + i] = sphere[i]
+        i = i + 1
+    }
+    f[REC_LOD_ERROR] = 0.0 as f32
+    free(sphere as ptr)
+}
+
+// --- groups of clusters -------------------------------------------------------------------------------------------
+
+// The clusters `ids` (`n` of them) gathered into groups of up to GROUP_SIZE:
+// a seed taken in Morton order, then the neighbour sharing the most edges
+// with the group so far, the nearest on a tie. Into `members` (the ids
+// reordered, group after group) and `starts` (n + 1 words; a group runs
+// from starts[g] to starts[g + 1]). Returns the number of groups.
+partition(b: *Build, cm: *ClusterMesh, ids: int[], n: int, members: int[], starts: int[]) -> int {
+    if n == 0 {
+        starts[0] = 0
+        return 0
+    }
+    // Each edge's first cluster, in a table keyed by its two positions; a
+    // second cluster meeting it is a neighbour of the first.
+    edges = 0
+    i = 0
+    while i < n {
+        edges = edges + (record(cm, ids[i]) as int[])[REC_TRIANGLES] * 3
+        i = i + 1
+    }
+    cap = 64
+    while cap < edges * 2 { cap = cap * 2 }
+    keys = calloc(cap, 8) as long[]
+    owner = calloc(cap, 4) as int[]
+    taken = calloc(cap, 1) as uint8[]
+    pairs = calloc(edges * 2 + 2, 8) as long[]
+    pcount = 0
+    corners = calloc(MAX_TRIANGLES * 3, 4) as int[]
+    i = 0
+    while i < n {
+        tri_end = unpack(cm, ids[i], corners, 0)
+        t = 0
+        while t < tri_end {
+            k = 0
+            while k < 3 {
+                pa = b.position_of[corners[t + k]] as long
+                pb = b.position_of[corners[t + (k + 1) % 3]] as long
+                lo = pa
+                hi = pb
+                if pb < pa {
+                    lo = pb
+                    hi = pa
+                }
+                key = (lo << 32) | hi
+                h = (((key * (2654435761 as long)) >> 7) & ((cap - 1) as long)) as int
+                while taken[h] != 0 && keys[h] != key { h = (h + 1) & (cap - 1) }
+                if taken[h] == 0 {
+                    taken[h] = 1
+                    keys[h] = key
+                    owner[h] = i
+                } else if owner[h] != i {
+                    a = owner[h] as long
+                    c = i as long
+                    pairs[pcount] = (a << 32) | c
+                    pairs[pcount + 1] = (c << 32) | a
+                    pcount = pcount + 2
+                }
+                k = k + 1
+            }
+            t = t + 3
+        }
+        i = i + 1
+    }
+    free(corners as ptr)
+    free(keys as ptr)
+    free(owner as ptr)
+    free(taken as ptr)
+    scratch = calloc(pcount + 1, 8)
+    sort_keys(pairs as ptr, pcount, scratch)
+    free(scratch)
+    // The adjacency, a cluster's neighbours with the edges they share.
+    adj_start = calloc(n + 1, 4) as int[]
+    adj = calloc(pcount + 1, 4) as int[]
+    adj_weight = calloc(pcount + 1, 4) as int[]
+    acount = 0
+    j = 0
+    while j < pcount {
+        run = 1
+        while j + run < pcount && pairs[j + run] == pairs[j] { run = run + 1 }
+        a = (pairs[j] >> 32) as int
+        adj[acount] = (pairs[j] & (4294967295 as long)) as int
+        adj_weight[acount] = run
+        adj_start[a + 1] = adj_start[a + 1] + 1
+        acount = acount + 1
+        j = j + run
+    }
+    i = 0
+    while i < n {
+        adj_start[i + 1] = adj_start[i + 1] + adj_start[i]
+        i = i + 1
+    }
+    free(pairs as ptr)
+
+    // Seeds in Morton order of the clusters' centres.
+    lx = 1.0e30
+    ly = 1.0e30
+    lz = 1.0e30
+    hx = 0.0 - 1.0e30
+    hy = 0.0 - 1.0e30
+    hz = 0.0 - 1.0e30
+    i = 0
+    while i < n {
+        f = record(cm, ids[i]) as f32[]
+        x = f[REC_LOD] as float
+        y = f[REC_LOD + 1] as float
+        z = f[REC_LOD + 2] as float
+        if x < lx { lx = x }
+        if y < ly { ly = y }
+        if z < lz { lz = z }
+        if x > hx { hx = x }
+        if y > hy { hy = y }
+        if z > hz { hz = z }
+        i = i + 1
+    }
+    span = hx - lx
+    if hy - ly > span { span = hy - ly }
+    if hz - lz > span { span = hz - lz }
+    if span <= 0.0 { span = 1.0 }
+    order = calloc(n, 8)
+    ok = order as long[]
+    i = 0
+    while i < n {
+        f = record(cm, ids[i]) as f32[]
+        ok[i] = (morton(((f[REC_LOD] as float) - lx) / span, ((f[REC_LOD + 1] as float) - ly) / span,
+                        ((f[REC_LOD + 2] as float) - lz) / span) << 32) | (i as long)
+        i = i + 1
+    }
+    scratch = calloc(n, 8)
+    sort_keys(order, n, scratch)
+    free(scratch)
+
+    assigned = calloc(n, 1) as uint8[]
+    weight = calloc(n, 4) as int[]
+    frontier = calloc(n, 4) as int[]
+    group_of = calloc(n, 4) as int[]
+    groups = 0
+    out = 0
+    s = 0
+    while s < n {
+        seed = (ok[s] & (4294967295 as long)) as int
+        s = s + 1
+        if assigned[seed] != 0 { continue }
+        starts[groups] = out
+        groups = groups + 1
+        size = 0
+        fcount = 0
+        add = seed
+        sf = record(cm, ids[seed]) as f32[]
+        while add >= 0 {
+            assigned[add] = 1
+            group_of[add] = groups - 1
+            members[out] = ids[add]
+            out = out + 1
+            size = size + 1
+            j = adj_start[add]
+            while j < adj_start[add + 1] {
+                o = adj[j]
+                if assigned[o] == 0 {
+                    if weight[o] == 0 {
+                        frontier[fcount] = o
+                        fcount = fcount + 1
+                    }
+                    weight[o] = weight[o] + adj_weight[j]
+                }
+                j = j + 1
+            }
+            if size >= GROUP_SIZE { break }
+            add = 0 - 1
+            best = 0 - 1
+            nearest = 1.0e30
+            j = 0
+            while j < fcount {
+                o = frontier[j]
+                if assigned[o] == 0 {
+                    of = record(cm, ids[o]) as f32[]
+                    dx = (of[REC_LOD] as float) - (sf[REC_LOD] as float)
+                    dy = (of[REC_LOD + 1] as float) - (sf[REC_LOD + 1] as float)
+                    dz = (of[REC_LOD + 2] as float) - (sf[REC_LOD + 2] as float)
+                    d = dx * dx + dy * dy + dz * dz
+                    if weight[o] > best || (weight[o] == best && d < nearest) {
+                        best = weight[o]
+                        nearest = d
+                        add = o
+                    }
+                }
+                j = j + 1
+            }
+        }
+        // The frontier's weights back to nothing for the next group.
+        j = 0
+        while j < fcount {
+            weight[frontier[j]] = 0
+            j = j + 1
+        }
+    }
+    starts[groups] = out
+    groups = merge_groups(cm, ids, n, members, starts, groups, group_of, adj_start, adj, adj_weight)
+    free(group_of as ptr)
+    free(assigned as ptr)
+    free(weight as ptr)
+    free(frontier as ptr)
+    free(order)
+    free(adj_start as ptr)
+    free(adj as ptr)
+    free(adj_weight as ptr)
+    return groups
+}
+
+// The groups under half of GROUP_SIZE merged into a neighbour, smallest
+// first: the one they share the most edges with that stays within half
+// again GROUP_SIZE, or the smallest within GROUP_MOST; one that shares no
+// edge with any -- a separate piece -- into the nearest within GROUP_MOST.
+// `group_of` is each cluster's (by its place in `ids`) group, the
+// adjacency the clusters'. The groups rewritten into `members` and
+// `starts`; their count returned.
+merge_groups(cm: *ClusterMesh, ids: int[], n: int, members: int[], starts: int[], groups: int, group_of: int[],
+             adj_start: int[], adj: int[], adj_weight: int[]) -> int {
+    size = calloc(groups, 4) as int[]
+    into = calloc(groups, 4) as int[]
+    // Each group's middle, its clusters' spheres' centres summed.
+    middle = calloc(groups * 3, 8) as float[]
+    i = 0
+    while i < n {
+        gg = group_of[i]
+        size[gg] = size[gg] + 1
+        f = record(cm, ids[i]) as f32[]
+        middle[gg * 3] = middle[gg * 3] + (f[REC_LOD] as float)
+        middle[gg * 3 + 1] = middle[gg * 3 + 1] + (f[REC_LOD + 1] as float)
+        middle[gg * 3 + 2] = middle[gg * 3 + 2] + (f[REC_LOD + 2] as float)
+        i = i + 1
+    }
+    g = 0
+    while g < groups {
+        into[g] = g
+        g = g + 1
+    }
+    // Each group's clusters, to walk a small one's.
+    gstart = calloc(groups + 1, 4) as int[]
+    i = 0
+    while i < n {
+        gstart[group_of[i] + 1] = gstart[group_of[i] + 1] + 1
+        i = i + 1
+    }
+    g = 0
+    while g < groups {
+        gstart[g + 1] = gstart[g + 1] + gstart[g]
+        g = g + 1
+    }
+    gfill = calloc(groups, 4) as int[]
+    byg = calloc(n, 4) as int[]
+    i = 0
+    while i < n {
+        gg = group_of[i]
+        byg[gstart[gg] + gfill[gg]] = i
+        gfill[gg] = gfill[gg] + 1
+        i = i + 1
+    }
+    free(gfill as ptr)
+    next = calloc(groups, 4) as int[]
+    tail = calloc(groups, 4) as int[]
+    g = 0
+    while g < groups {
+        next[g] = 0 - 1
+        tail[g] = g
+        g = g + 1
+    }
+    order = calloc(groups + 1, 8) as long[]
+    count = 0
+    g = 0
+    while g < groups {
+        if size[g] < GROUP_SIZE / 2 {
+            order[count] = ((size[g] as long) << 32) | (g as long)
+            count = count + 1
+        }
+        g = g + 1
+    }
+    scratch = calloc(count + 1, 8)
+    sort_keys(order as ptr, count, scratch)
+    free(scratch)
+    shared = calloc(groups, 4) as int[]
+    near = calloc(n + 1, 4) as int[]
+    k = 0
+    while k < count {
+        c = (order[k] & (4294967295 as long)) as int
+        k = k + 1
+        if into[c] != c || size[c] >= GROUP_SIZE / 2 { continue }
+        ncount = 0
+        part = c
+        while part >= 0 {
+            j = gstart[part]
+            while j < gstart[part + 1] {
+                cl = byg[j]
+                a = adj_start[cl]
+                while a < adj_start[cl + 1] {
+                    o = root(into, group_of[adj[a]])
+                    if o != c {
+                        if shared[o] == 0 {
+                            near[ncount] = o
+                            ncount = ncount + 1
+                        }
+                        shared[o] = shared[o] + adj_weight[a]
+                    }
+                    a = a + 1
+                }
+                j = j + 1
+            }
+            part = next[part]
+        }
+        best = 0 - 1
+        most = 0
+        smallest = 0 - 1
+        j = 0
+        while j < ncount {
+            o = near[j]
+            if size[o] + size[c] <= GROUP_SIZE + GROUP_SIZE / 2 && shared[o] > most {
+                most = shared[o]
+                best = o
+            }
+            if size[o] + size[c] <= GROUP_MOST && (smallest < 0 || size[o] < size[smallest]) { smallest = o }
+            j = j + 1
+        }
+        j = 0
+        while j < ncount {
+            shared[near[j]] = 0
+            j = j + 1
+        }
+        if best < 0 { best = smallest }
+        if best < 0 && ncount == 0 { best = nearest_group(middle, size, into, groups, c) }
+        if best < 0 { continue }
+        middle[best * 3] = middle[best * 3] + middle[c * 3]
+        middle[best * 3 + 1] = middle[best * 3 + 1] + middle[c * 3 + 1]
+        middle[best * 3 + 2] = middle[best * 3 + 2] + middle[c * 3 + 2]
+        size[best] = size[best] + size[c]
+        size[c] = 0
+        into[c] = best
+        next[tail[best]] = c
+        tail[best] = tail[c]
+    }
+    // The groups standing, in order, each its clusters and the clusters of
+    // the groups that went into it.
+    out = 0
+    kept = 0
+    g = 0
+    while g < groups {
+        if into[g] == g {
+            starts[kept] = out
+            kept = kept + 1
+            part = g
+            while part >= 0 {
+                j = gstart[part]
+                while j < gstart[part + 1] {
+                    members[out] = ids[byg[j]]
+                    out = out + 1
+                    j = j + 1
+                }
+                part = next[part]
+            }
+        }
+        g = g + 1
+    }
+    starts[kept] = out
+    free(size as ptr)
+    free(into as ptr)
+    free(middle as ptr)
+    free(gstart as ptr)
+    free(byg as ptr)
+    free(next as ptr)
+    free(tail as ptr)
+    free(order as ptr)
+    free(shared as ptr)
+    free(near as ptr)
+    return kept
+}
+
+// --- simplification -----------------------------------------------------------------------------------------------
+
+// A quadric: the squared distance to a set of weighed planes, as the ten
+// numbers of a symmetric four by four and the weights' sum, which
+// quadric_at divides by so its answer is a squared distance.
+const QUADRIC = 11
+
+add_plane(q: float[], at: int, nx: float, ny: float, nz: float, d: float, w: float) {
+    q[at] = q[at] + w * nx * nx
+    q[at + 1] = q[at + 1] + w * nx * ny
+    q[at + 2] = q[at + 2] + w * nx * nz
+    q[at + 3] = q[at + 3] + w * nx * d
+    q[at + 4] = q[at + 4] + w * ny * ny
+    q[at + 5] = q[at + 5] + w * ny * nz
+    q[at + 6] = q[at + 6] + w * ny * d
+    q[at + 7] = q[at + 7] + w * nz * nz
+    q[at + 8] = q[at + 8] + w * nz * d
+    q[at + 9] = q[at + 9] + w * d * d
+    q[at + 10] = q[at + 10] + w
+}
+
+quadric_at(q: float[], at: int, x: float, y: float, z: float) -> float {
+    ex = q[at] * x * x + 2.0 * q[at + 1] * x * y + 2.0 * q[at + 2] * x * z + 2.0 * q[at + 3] * x
+    ey = q[at + 4] * y * y + 2.0 * q[at + 5] * y * z + 2.0 * q[at + 6] * y
+    e = ex + ey + q[at + 7] * z * z + 2.0 * q[at + 8] * z + q[at + 9]
+    if e <= 0.0 || q[at + 10] <= 0.0 { return 0.0 }
+    return e / q[at + 10]
+}
+
+const KIND_MANIFOLD = 0
+const KIND_BORDER = 1
+const KIND_LOCKED = 2
+
+// What one group's simplification leaves: its triangles (vertex indices)
+// and the farthest it moved the surface, in the mesh's own units.
+struct Simplified {
+    tris: ptr                      // int[count * 3]
+    count: int
+    error: float
+}
+
+// The triangles `tris` (`n`, vertex indices) simplified toward `target` by
+// collapsing edges onto one of their ends, cheapest first by the quadric
+// error at the end kept, a normal's or a texture coordinate's change added:
+// in passes, each collapse in a pass touching vertices no other has, until
+// the count is reached or nothing more will go. A position marked in `lock`
+// never moves; one on an open edge moves only along it. A collapse is
+// refused that would turn a triangle over, or that would join a vertex to
+// two different vertices across a seam.
+simplify(b: *Build, tris: int[], n: int, lock: uint8[], target: int) -> Simplified {
+    out = Simplified { tris: null, count: 0, error: 0.0 }
+    // The group's vertices and positions, locally numbered.
+    vmark = next_mark(b)
+    verts = calloc(n * 3, 4) as int[]
+    vcount = 0
+    pos = calloc(n * 3, 4) as int[]
+    pcount = 0
+    i = 0
+    while i < n * 3 {
+        v = tris[i]
+        if b.stamp[v] != vmark {
+            b.stamp[v] = vmark
+            b.local[v] = vcount
+            verts[vcount] = v
+            vcount = vcount + 1
+        }
+        p = b.position_of[v]
+        if b.pstamp[p] != vmark {
+            b.pstamp[p] = vmark
+            b.plocal[p] = pcount
+            pos[pcount] = p
+            pcount = pcount + 1
+        }
+        i = i + 1
+    }
+    vpos = calloc(vcount, 4) as int[]
+    i = 0
+    while i < vcount {
+        vpos[i] = b.plocal[b.position_of[verts[i]]]
+        i = i + 1
+    }
+    // The positions on a unit mesh.
+    s = b.scale
+    ux = calloc(pcount * 3, 8) as float[]
+    i = 0
+    while i < vcount {
+        lp = vpos[i]
+        ux[lp * 3] = px(b, verts[i]) * s
+        ux[lp * 3 + 1] = py(b, verts[i]) * s
+        ux[lp * 3 + 2] = pz(b, verts[i]) * s
+        i = i + 1
+    }
+    t3 = calloc(n * 3, 4) as int[]
+    i = 0
+    while i < n * 3 {
+        t3[i] = b.local[tris[i]]
+        i = i + 1
+    }
+    tcount = n
+    // The group as it came, to measure what it became against.
+    first_t3 = calloc(n * 3, 4) as int[]
+    memcpy(first_t3 as ptr, t3 as ptr, (n * 12) as long)
+    remap = calloc(vcount, 4) as int[]
+    i = 0
+    while i < vcount {
+        remap[i] = i
+        i = i + 1
+    }
+    alive = calloc(pcount, 1) as uint8[]
+    // Where each position collapsed to, -1 while it stands.
+    went = calloc(pcount, 4) as int[]
+    memset(went as ptr, 255, (pcount * 4) as long)
+    memset(alive as ptr, 1, pcount as long)
+    quadric = calloc(pcount * QUADRIC, 8) as float[]
+    kind = calloc(pcount, 1) as uint8[]
+    touched = calloc(pcount, 4) as int[]
+    partner = calloc(vcount, 4) as int[]
+    link = calloc(pcount, 4) as int[]
+    tick = 0
+    worst = 0.0
+
+    pass = 0
+    while pass < PASSES && tcount > target {
+        pass = pass + 1
+        // This pass's edges between positions, with how many triangles
+        // each borders.
+        ekeys = calloc(tcount * 3 + 1, 8) as long[]
+        ecount = 0
+        t = 0
+        while t < tcount {
+            k = 0
+            while k < 3 {
+                pa = vpos[t3[t * 3 + k]] as long
+                pb = vpos[t3[t * 3 + (k + 1) % 3]] as long
+                lo = pa
+                hi = pb
+                if pb < pa {
+                    lo = pb
+                    hi = pa
+                }
+                ekeys[ecount] = (lo << 32) | hi
+                ecount = ecount + 1
+                k = k + 1
+            }
+            t = t + 1
+        }
+        scratch = calloc(ecount + 1, 8)
+        sort_keys(ekeys as ptr, ecount, scratch)
+        free(scratch)
+        memset(kind as ptr, KIND_MANIFOLD, pcount as long)
+        i = 0
+        while i < pcount {
+            if lock[pos[i]] != 0 { kind[i] = KIND_LOCKED }
+            i = i + 1
+        }
+        edge_lo = calloc(ecount + 1, 4) as int[]
+        edge_hi = calloc(ecount + 1, 4) as int[]
+        edge_n = calloc(ecount + 1, 4) as int[]
+        unique = 0
+        j = 0
+        while j < ecount {
+            run = 1
+            while j + run < ecount && ekeys[j + run] == ekeys[j] { run = run + 1 }
+            lo = (ekeys[j] >> 32) as int
+            hi = (ekeys[j] & (4294967295 as long)) as int
+            edge_lo[unique] = lo
+            edge_hi[unique] = hi
+            edge_n[unique] = run
+            unique = unique + 1
+            if run == 1 {
+                if kind[lo] != KIND_LOCKED { kind[lo] = KIND_BORDER }
+                if kind[hi] != KIND_LOCKED { kind[hi] = KIND_BORDER }
+            } else if run > 2 {
+                kind[lo] = KIND_LOCKED
+                kind[hi] = KIND_LOCKED
+            }
+            j = j + run
+        }
+        free(ekeys as ptr)
+        // Once, from the group as it came: faces' planes, by area, into
+        // their corners' quadrics; an open edge's plane across it, by its
+        // length squared. Collapses add them up after.
+        t = 0
+        if pass > 1 { t = tcount }
+        while t < tcount {
+            a = vpos[t3[t * 3]]
+            bb = vpos[t3[t * 3 + 1]]
+            c = vpos[t3[t * 3 + 2]]
+            e1x = ux[bb * 3] - ux[a * 3]
+            e1y = ux[bb * 3 + 1] - ux[a * 3 + 1]
+            e1z = ux[bb * 3 + 2] - ux[a * 3 + 2]
+            e2x = ux[c * 3] - ux[a * 3]
+            e2y = ux[c * 3 + 1] - ux[a * 3 + 1]
+            e2z = ux[c * 3 + 2] - ux[a * 3 + 2]
+            nx = e1y * e2z - e1z * e2y
+            ny = e1z * e2x - e1x * e2z
+            nz = e1x * e2y - e1y * e2x
+            len = sqrt(nx * nx + ny * ny + nz * nz)
+            if len > 0.0 {
+                area = len * 0.5
+                nx = nx / len
+                ny = ny / len
+                nz = nz / len
+                d = 0.0 - (nx * ux[a * 3] + ny * ux[a * 3 + 1] + nz * ux[a * 3 + 2])
+                add_plane(quadric, a * QUADRIC, nx, ny, nz, d, area)
+                add_plane(quadric, bb * QUADRIC, nx, ny, nz, d, area)
+                add_plane(quadric, c * QUADRIC, nx, ny, nz, d, area)
+                k = 0
+                while k < 3 {
+                    p0 = vpos[t3[t * 3 + k]]
+                    p1 = vpos[t3[t * 3 + (k + 1) % 3]]
+                    if is_border(edge_lo, edge_hi, edge_n, unique, p0, p1) {
+                        ex = ux[p1 * 3] - ux[p0 * 3]
+                        ey = ux[p1 * 3 + 1] - ux[p0 * 3 + 1]
+                        ez = ux[p1 * 3 + 2] - ux[p0 * 3 + 2]
+                        mx = ey * nz - ez * ny
+                        my = ez * nx - ex * nz
+                        mz = ex * ny - ey * nx
+                        ml = sqrt(mx * mx + my * my + mz * mz)
+                        if ml > 0.0 {
+                            mx = mx / ml
+                            my = my / ml
+                            mz = mz / ml
+                            md = 0.0 - (mx * ux[p0 * 3] + my * ux[p0 * 3 + 1] + mz * ux[p0 * 3 + 2])
+                            w = BORDER_WEIGHT * (ex * ex + ey * ey + ez * ez)
+                            add_plane(quadric, p0 * QUADRIC, mx, my, mz, md, w)
+                            add_plane(quadric, p1 * QUADRIC, mx, my, mz, md, w)
+                        }
+                    }
+                    k = k + 1
+                }
+            }
+            t = t + 1
+        }
+        // The triangles round each position.
+        rstart = calloc(pcount + 1, 4) as int[]
+        t = 0
+        while t < tcount * 3 {
+            rstart[vpos[t3[t]] + 1] = rstart[vpos[t3[t]] + 1] + 1
+            t = t + 1
+        }
+        i = 0
+        while i < pcount {
+            rstart[i + 1] = rstart[i + 1] + rstart[i]
+            i = i + 1
+        }
+        rfill = calloc(pcount, 4) as int[]
+        rtri = calloc(tcount * 3 + 1, 4) as int[]
+        t = 0
+        while t < tcount * 3 {
+            lp = vpos[t3[t]]
+            rtri[rstart[lp] + rfill[lp]] = t / 3
+            rfill[lp] = rfill[lp] + 1
+            t = t + 1
+        }
+        free(rfill as ptr)
+        // The collapses this pass could make, cheapest first; and the
+        // separate pieces that could go whole, a piece too small for the
+        // error to see -- a trim's box, a bolt -- being the one way a group
+        // of them simplifies at all (meshoptimizer's pruning). A piece
+        // holding a position the group keeps stays.
+        ccost = calloc(unique * 2 + pcount + 1, 8) as float[]
+        csrc = calloc(unique * 2 + pcount + 1, 4) as int[]
+        cdst = calloc(unique * 2 + pcount + 1, 4) as int[]
+        piece = pieces(vpos, t3, tcount, pcount)
+        pieced = calloc(pcount, 4) as int[]
+        cn = 0
+        j = 0
+        while j < unique {
+            dir = 0
+            while dir < 2 {
+                from = edge_lo[j]
+                to = edge_hi[j]
+                if dir == 1 {
+                    from = edge_hi[j]
+                    to = edge_lo[j]
+                }
+                if may_collapse(kind, from, to, edge_n[j]) {
+                    ccost[cn] = quadric_at(quadric, from * QUADRIC, ux[to * 3], ux[to * 3 + 1], ux[to * 3 + 2])
+                    csrc[cn] = from
+                    cdst[cn] = to
+                    cn = cn + 1
+                }
+                dir = dir + 1
+            }
+            j = j + 1
+        }
+        cn = prunable(ux, kind, vpos, t3, tcount, piece, pcount, ccost, csrc, cdst, cn)
+        // Each priced in full where it is allowed at all: the surface it
+        // moves, and what its wedges' normals and texture coordinates change.
+        corder = calloc(cn + 1, 8) as long[]
+        crank = calloc(cn + 1, 8) as float[]
+        valid = 0
+        j = 0
+        while j < cn {
+            tick = tick + 1
+            if csrc[j] < 0 {
+                crank[j] = ccost[j]
+                corder[valid] = (float_key(ccost[j]) << 32) | (j as long)
+                valid = valid + 1
+            } else if collapse_cost(vpos, t3, remap, partner, rtri, rstart, ux, link, tick, csrc[j], cdst[j]) >= 0 {
+                rank = ccost[j] + attribute_change(b, verts, vpos, t3, partner, rtri, rstart, csrc[j])
+                crank[j] = rank
+                corder[valid] = (float_key(rank) << 32) | (j as long)
+                valid = valid + 1
+            }
+            j = j + 1
+        }
+        cn = valid
+        scratch = calloc(cn + 1, 8)
+        sort_keys(corder as ptr, cn, scratch)
+        free(scratch)
+        // Collapse, in order, each where nothing near it has moved yet; none
+        // much dearer than the one that would reach the target were every
+        // collapse to go (each takes two triangles), so a pass short of
+        // cheap ones leaves the rest to the next rather than spend.
+        goal = (tcount - target) / 2
+        limit = 1.0e30
+        if goal < cn { limit = crank[(corder[goal] & (4294967295 as long)) as int] * 1.5 }
+        removed = 0
+        made = 0
+        dead = calloc(tcount + 1, 1) as uint8[]
+        j = 0
+        while j < cn && tcount - removed > target {
+            c = (corder[j] & (4294967295 as long)) as int
+            if crank[c] > limit { break }
+            j = j + 1
+            from = csrc[c]
+            to = cdst[c]
+            if from < 0 {
+                // A piece whole: where nothing in it has moved this pass.
+                if pieced[to] == pass { continue }
+                pieced[to] = pass
+                t = 0
+                while t < tcount {
+                    if piece[vpos[t3[t * 3]]] == to {
+                        dead[t] = 1
+                        removed = removed + 1
+                    }
+                    t = t + 1
+                }
+                i = 0
+                while i < pcount {
+                    if piece[i] == to {
+                        alive[i] = 0
+                        touched[i] = pass
+                    }
+                    i = i + 1
+                }
+                if ccost[c] > worst { worst = ccost[c] }
+                made = made + 1
+                continue
+            }
+            if alive[from] == 0 || alive[to] == 0 || touched[from] == pass || touched[to] == pass { continue }
+            tick = tick + 1
+            gone = collapse_cost(vpos, t3, remap, partner, rtri, rstart, ux, link, tick, from, to)
+            if gone < 0 { continue }
+            // Applied: every wedge of `from` onto its partner at `to`.
+            k = rstart[from]
+            while k < rstart[from + 1] {
+                tt = rtri[k]
+                q = 0
+                while q < 3 {
+                    lv = t3[tt * 3 + q]
+                    if vpos[lv] == from && remap[lv] == lv { remap[lv] = partner[lv] }
+                    q = q + 1
+                }
+                k = k + 1
+            }
+            i = 0
+            while i < QUADRIC {
+                quadric[to * QUADRIC + i] = quadric[to * QUADRIC + i] + quadric[from * QUADRIC + i]
+                i = i + 1
+            }
+            if ccost[c] > worst { worst = ccost[c] }
+            alive[from] = 0
+            went[from] = to
+            touched[from] = pass
+            touched[to] = pass
+            pieced[piece[from]] = pass
+            removed = removed + gone
+            made = made + 1
+        }
+        // The pass's collapses into the triangles; the ones they folded
+        // flat go.
+        kept = 0
+        t = 0
+        while t < tcount {
+            a = remap[t3[t * 3]]
+            bb = remap[t3[t * 3 + 1]]
+            c = remap[t3[t * 3 + 2]]
+            if dead[t] == 0 && vpos[a] != vpos[bb] && vpos[bb] != vpos[c] && vpos[a] != vpos[c] {
+                t3[kept * 3] = a
+                t3[kept * 3 + 1] = bb
+                t3[kept * 3 + 2] = c
+                kept = kept + 1
+            }
+            t = t + 1
+        }
+        tcount = kept
+        i = 0
+        while i < vcount {
+            remap[i] = i
+            i = i + 1
+        }
+        free(edge_lo as ptr)
+        free(edge_hi as ptr)
+        free(edge_n as ptr)
+        free(rstart as ptr)
+        free(rtri as ptr)
+        free(ccost as ptr)
+        free(csrc as ptr)
+        free(cdst as ptr)
+        free(corder as ptr)
+        free(crank as ptr)
+        free(piece as ptr)
+        free(pieced as ptr)
+        free(dead as ptr)
+        if made == 0 { break }
+    }
+    result = calloc(tcount * 3 + 1, 4) as int[]
+    i = 0
+    while i < tcount * 3 {
+        result[i] = verts[t3[i]]
+        i = i + 1
+    }
+    out.tris = result as ptr
+    out.count = tcount
+    // The error: the quadric's, or how far the group as it came lies from
+    // what it became where that is further -- a quadric's error is a mean
+    // over its planes, and a sphere's coarse levels lie up to two thirds
+    // further inside than it says.
+    error = sqrt(worst)
+    gone = deviation(ux, vpos, t3, tcount, first_t3, n, alive, went, pcount)
+    if gone > error { error = gone }
+    out.error = error / s
+    free(went as ptr)
+    free(first_t3 as ptr)
+    free(verts as ptr)
+    free(pos as ptr)
+    free(vpos as ptr)
+    free(ux as ptr)
+    free(t3 as ptr)
+    free(remap as ptr)
+    free(alive as ptr)
+    free(quadric as ptr)
+    free(kind as ptr)
+    free(touched as ptr)
+    free(partner as ptr)
+    free(link as ptr)
+    return out
+}
+
+// Each position's piece: the root of the positions the triangles join to
+// it, by union-find.
+pieces(vpos: int[], t3: int[], tcount: int, pcount: int) -> int[] {
+    up = calloc(pcount, 4) as int[]
+    i = 0
+    while i < pcount {
+        up[i] = i
+        i = i + 1
+    }
+    t = 0
+    while t < tcount {
+        a = top(up, vpos[t3[t * 3]])
+        k = 1
+        while k < 3 {
+            o = top(up, vpos[t3[t * 3 + k]])
+            if o != a { up[o] = a }
+            k = k + 1
+        }
+        t = t + 1
+    }
+    i = 0
+    while i < pcount {
+        up[i] = top(up, i)
+        i = i + 1
+    }
+    return up
+}
+
+top(up: int[], p: int) -> int {
+    r = p
+    while up[r] != r { r = up[r] }
+    // Every step on the way pointed straight at the root.
+    q = p
+    while up[q] != r {
+        n = up[q]
+        up[q] = r
+        q = n
+    }
+    return r
+}
+
+// The pieces of the pass's triangles (`tcount` of them) no kept position
+// is in, as candidates after the `cn` already in `cost`, `src`, `dst`: each
+// priced at the square of half its box's diagonal -- the furthest its
+// going moves any of it -- its source -1 less its root, its destination
+// its root. The candidates' count.
+prunable(ux: float[], kind: uint8[], vpos: int[], t3: int[], tcount: int, piece: int[], pcount: int,
+         cost: float[], src: int[], dst: int[], cn: int) -> int {
+    lo = calloc(pcount * 3, 8) as float[]
+    hi = calloc(pcount * 3, 8) as float[]
+    held = calloc(pcount, 1) as uint8[]
+    seen = calloc(pcount, 1) as uint8[]
+    // Only the positions a triangle still has: one the passes before took
+    // away is a piece of nothing.
+    t = 0
+    while t < tcount * 3 {
+        i = vpos[t3[t]]
+        r = piece[i]
+        k = 0
+        while k < 3 {
+            v = ux[i * 3 + k]
+            if seen[r] == 0 || v < lo[r * 3 + k] { lo[r * 3 + k] = v }
+            if seen[r] == 0 || v > hi[r * 3 + k] { hi[r * 3 + k] = v }
+            k = k + 1
+        }
+        seen[r] = 1
+        if kind[i] == KIND_LOCKED { held[r] = 1 }
+        t = t + 1
+    }
+    n = cn
+    r = 0
+    while r < pcount {
+        if piece[r] == r && seen[r] != 0 && held[r] == 0 {
+            dx = hi[r * 3] - lo[r * 3]
+            dy = hi[r * 3 + 1] - lo[r * 3 + 1]
+            dz = hi[r * 3 + 2] - lo[r * 3 + 2]
+            cost[n] = (dx * dx + dy * dy + dz * dz) * 0.25
+            src[n] = 0 - 1 - r
+            dst[n] = r
+            n = n + 1
+        }
+        r = r + 1
+    }
+    free(lo as ptr)
+    free(hi as ptr)
+    free(held as ptr)
+    free(seen as ptr)
+    return n
+}
+
+// The furthest any position the simplification took away lies from the
+// simplified triangles where its own went: those round where each corner
+// of its triangles as they came ended (`first`, `n` of them) -- the
+// original surface's distance from the simplified one, on the unit mesh.
+deviation(ux: float[], vpos: int[], t3: int[], tcount: int, first: int[], n: int, alive: uint8[], went: int[],
+          pcount: int) -> float {
+    rstart = calloc(pcount + 1, 4) as int[]
+    t = 0
+    while t < tcount * 3 {
+        rstart[vpos[t3[t]] + 1] = rstart[vpos[t3[t]] + 1] + 1
+        t = t + 1
+    }
+    i = 0
+    while i < pcount {
+        rstart[i + 1] = rstart[i + 1] + rstart[i]
+        i = i + 1
+    }
+    rfill = calloc(pcount, 4) as int[]
+    rtri = calloc(tcount * 3 + 1, 4) as int[]
+    t = 0
+    while t < tcount * 3 {
+        lp = vpos[t3[t]]
+        rtri[rstart[lp] + rfill[lp]] = t / 3
+        rfill[lp] = rfill[lp] + 1
+        t = t + 1
+    }
+    free(rfill as ptr)
+    // The triangles as they came round each position.
+    ostart = calloc(pcount + 1, 4) as int[]
+    t = 0
+    while t < n * 3 {
+        ostart[vpos[first[t]] + 1] = ostart[vpos[first[t]] + 1] + 1
+        t = t + 1
+    }
+    i = 0
+    while i < pcount {
+        ostart[i + 1] = ostart[i + 1] + ostart[i]
+        i = i + 1
+    }
+    ofill = calloc(pcount, 4) as int[]
+    otri = calloc(n * 3 + 1, 4) as int[]
+    t = 0
+    while t < n * 3 {
+        lp = vpos[first[t]]
+        otri[ostart[lp] + ofill[lp]] = t / 3
+        ofill[lp] = ofill[lp] + 1
+        t = t + 1
+    }
+    free(ofill as ptr)
+    furthest = 0.0
+    p = 0
+    while p < pcount {
+        if alive[p] == 0 {
+            nearest = 1.0e30
+            j = ostart[p]
+            while j < ostart[p + 1] {
+                ot = otri[j]
+                q = 0
+                while q < 3 {
+                    r = vpos[first[ot * 3 + q]]
+                    while alive[r] == 0 && went[r] >= 0 { r = went[r] }
+                    k = rstart[r]
+                    while k < rstart[r + 1] {
+                        tt = rtri[k]
+                        d = point_triangle(ux, p, vpos[t3[tt * 3]], vpos[t3[tt * 3 + 1]], vpos[t3[tt * 3 + 2]])
+                        if d < nearest { nearest = d }
+                        k = k + 1
+                    }
+                    q = q + 1
+                }
+                j = j + 1
+            }
+            if nearest < 1.0e30 && nearest > furthest { furthest = nearest }
+        }
+        p = p + 1
+    }
+    free(rstart as ptr)
+    free(rtri as ptr)
+    free(ostart as ptr)
+    free(otri as ptr)
+    return sqrt(furthest)
+}
+
+// The squared distance from position `p` to the triangle of positions `a`,
+// `b`, `c` (Ericson, Real-Time Collision Detection, 5.1.5).
+point_triangle(ux: float[], p: int, a: int, b: int, c: int) -> float {
+    ax = ux[a * 3]
+    ay = ux[a * 3 + 1]
+    az = ux[a * 3 + 2]
+    abx = ux[b * 3] - ax
+    aby = ux[b * 3 + 1] - ay
+    abz = ux[b * 3 + 2] - az
+    acx = ux[c * 3] - ax
+    acy = ux[c * 3 + 1] - ay
+    acz = ux[c * 3 + 2] - az
+    apx = ux[p * 3] - ax
+    apy = ux[p * 3 + 1] - ay
+    apz = ux[p * 3 + 2] - az
+    d1 = abx * apx + aby * apy + abz * apz
+    d2 = acx * apx + acy * apy + acz * apz
+    if d1 <= 0.0 && d2 <= 0.0 { return apx * apx + apy * apy + apz * apz }
+    bpx = ux[p * 3] - ux[b * 3]
+    bpy = ux[p * 3 + 1] - ux[b * 3 + 1]
+    bpz = ux[p * 3 + 2] - ux[b * 3 + 2]
+    d3 = abx * bpx + aby * bpy + abz * bpz
+    d4 = acx * bpx + acy * bpy + acz * bpz
+    if d3 >= 0.0 && d4 <= d3 { return bpx * bpx + bpy * bpy + bpz * bpz }
+    u = 0.0
+    v = 0.0
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        u = d1 / (d1 - d3)
+        return distance_to(apx, apy, apz, abx * u, aby * u, abz * u)
+    }
+    cpx = ux[p * 3] - ux[c * 3]
+    cpy = ux[p * 3 + 1] - ux[c * 3 + 1]
+    cpz = ux[p * 3 + 2] - ux[c * 3 + 2]
+    d5 = abx * cpx + aby * cpy + abz * cpz
+    d6 = acx * cpx + acy * cpy + acz * cpz
+    if d6 >= 0.0 && d5 <= d6 { return cpx * cpx + cpy * cpy + cpz * cpz }
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        v = d2 / (d2 - d6)
+        return distance_to(apx, apy, apz, acx * v, acy * v, acz * v)
+    }
+    va = d3 * d6 - d5 * d4
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+        return distance_to(bpx, bpy, bpz, (acx - abx) * w, (acy - aby) * w, (acz - abz) * w)
+    }
+    denom = va + vb + vc
+    if denom == 0.0 { return apx * apx + apy * apy + apz * apz }
+    v = vb / denom
+    w = vc / denom
+    return distance_to(apx, apy, apz, abx * v + acx * w, aby * v + acy * w, abz * v + acz * w)
+}
+
+// The squared distance between two points given from the same origin.
+distance_to(x: float, y: float, z: float, qx: float, qy: float, qz: float) -> float {
+    dx = x - qx
+    dy = y - qy
+    dz = z - qz
+    return dx * dx + dy * dy + dz * dz
+}
+
+// Whether the edge between positions `p0` and `p1` borders one triangle:
+// by a binary search of the pass's sorted edges.
+is_border(lo_of: int[], hi_of: int[], count_of: int[], n: int, p0: int, p1: int) -> bool {
+    lo = p0
+    hi = p1
+    if p1 < p0 {
+        lo = p1
+        hi = p0
+    }
+    a = 0
+    z = n - 1
+    while a <= z {
+        m = (a + z) / 2
+        if lo_of[m] < lo || (lo_of[m] == lo && hi_of[m] < hi) {
+            a = m + 1
+        } else if lo_of[m] == lo && hi_of[m] == hi {
+            return count_of[m] == 1
+        } else {
+            z = m - 1
+        }
+    }
+    return false
+}
+
+// Whether `from` may collapse onto `to` along an edge `n` triangles border:
+// never a held position, an open edge's ends only along the open edge, and
+// never across an edge three or more triangles share.
+may_collapse(kind: uint8[], from: int, to: int, n: int) -> bool {
+    if kind[from] == KIND_LOCKED { return false }
+    if n > 2 { return false }
+    if kind[from] == KIND_BORDER { return n == 1 }
+    return n == 2
+}
+
+// The triangles collapsing `from` onto `to` folds flat, or -1 where the
+// collapse is refused: a wedge of `from` with no partner at `to`, or with
+// two (a seam it would tear), a triangle it would turn over, or a
+// neighbour the two share past the edge's own triangles (two sheets it
+// would fold together). The partners, into `partner`; `link`, scratch
+// stamped with `tick`, a value no earlier call used.
+collapse_cost(vpos: int[], t3: int[], remap: int[], partner: int[], rtri: int[], rstart: int[],
+              ux: float[], link: int[], tick: int, from: int, to: int) -> int {
+    // A partner at `to` for each wedge of `from`: the vertex at `to` in a
+    // triangle the wedge is in.
+    k = rstart[from]
+    while k < rstart[from + 1] {
+        t = rtri[k]
+        q = 0
+        while q < 3 {
+            lv = remap[t3[t * 3 + q]]
+            if vpos[lv] == from { partner[lv] = 0 - 1 }
+            q = q + 1
+        }
+        k = k + 1
+    }
+    // Corners are read through this pass's collapses so far.
+    flat = 0
+    k = rstart[from]
+    while k < rstart[from + 1] {
+        t = rtri[k]
+        at_from = 0 - 1
+        at_to = 0 - 1
+        q = 0
+        while q < 3 {
+            lv = remap[t3[t * 3 + q]]
+            if vpos[lv] == from { at_from = lv }
+            if vpos[lv] == to { at_to = lv }
+            q = q + 1
+        }
+        if at_from >= 0 && at_to >= 0 {
+            flat = flat + 1
+            if partner[at_from] < 0 {
+                partner[at_from] = at_to
+            } else if partner[at_from] != at_to {
+                return 0 - 1
+            }
+        }
+        k = k + 1
+    }
+    if flat == 0 { return 0 - 1 }
+    if shared_neighbours(vpos, t3, remap, rtri, rstart, link, tick, from, to) > flat { return 0 - 1 }
+    // Every wedge of `from` met a partner; and no triangle left turns over.
+    k = rstart[from]
+    while k < rstart[from + 1] {
+        t = rtri[k]
+        q = 0
+        has_to = false
+        while q < 3 {
+            lv = remap[t3[t * 3 + q]]
+            if vpos[lv] == from && partner[lv] < 0 { return 0 - 1 }
+            if vpos[lv] == to { has_to = true }
+            q = q + 1
+        }
+        if !has_to && turns_over(vpos, t3, remap, ux, t, from, to) { return 0 - 1 }
+        k = k + 1
+    }
+    return flat
+}
+
+// How many positions both `from` and `to` neighbour, through the pass's
+// collapses so far.
+shared_neighbours(vpos: int[], t3: int[], remap: int[], rtri: int[], rstart: int[], link: int[], tick: int, from: int, to: int) -> int {
+    k = rstart[to]
+    while k < rstart[to + 1] {
+        t = rtri[k]
+        a = vpos[remap[t3[t * 3]]]
+        bb = vpos[remap[t3[t * 3 + 1]]]
+        c = vpos[remap[t3[t * 3 + 2]]]
+        if a != bb && bb != c && a != c {
+            link[a] = tick
+            link[bb] = tick
+            link[c] = tick
+        }
+        k = k + 1
+    }
+    shared = 0
+    k = rstart[from]
+    while k < rstart[from + 1] {
+        t = rtri[k]
+        q = 0
+        while q < 3 {
+            p = vpos[remap[t3[t * 3 + q]]]
+            if p != from && p != to && link[p] == tick {
+                link[p] = 0 - tick
+                shared = shared + 1
+            }
+            q = q + 1
+        }
+        k = k + 1
+    }
+    return shared
+}
+
+// What collapsing `from`'s wedges onto their partners changes of the
+// normals and texture coordinates, weighed, averaged over its corners.
+attribute_change(b: *Build, verts: int[], vpos: int[], t3: int[], partner: int[], rtri: int[], rstart: int[], from: int) -> float {
+    sum = 0.0
+    corners = 0
+    k = rstart[from]
+    while k < rstart[from + 1] {
+        t = rtri[k]
+        q = 0
+        while q < 3 {
+            lv = t3[t * 3 + q]
+            if vpos[lv] == from && partner[lv] >= 0 {
+                a = verts[lv] * VERTEX_FLOATS
+                c = verts[partner[lv]] * VERTEX_FLOATS
+                du = (b.vertices[a + 3] as float) - (b.vertices[c + 3] as float)
+                dv = (b.vertices[a + 4] as float) - (b.vertices[c + 4] as float)
+                dx = (b.vertices[a + 5] as float) - (b.vertices[c + 5] as float)
+                dy = (b.vertices[a + 6] as float) - (b.vertices[c + 6] as float)
+                dz = (b.vertices[a + 7] as float) - (b.vertices[c + 7] as float)
+                sum = sum + NORMAL_WEIGHT * (dx * dx + dy * dy + dz * dz) + UV_WEIGHT * (du * du + dv * dv)
+                corners = corners + 1
+            }
+            q = q + 1
+        }
+        k = k + 1
+    }
+    if corners == 0 { return 0.0 }
+    return sum / (corners as float)
+}
+
+// Whether moving position `from` to `to` turns triangle `t` over (or flat).
+turns_over(vpos: int[], t3: int[], remap: int[], ux: float[], t: int, from: int, to: int) -> bool {
+    a = vpos[remap[t3[t * 3]]]
+    bb = vpos[remap[t3[t * 3 + 1]]]
+    c = vpos[remap[t3[t * 3 + 2]]]
+    normal_of(ux, a, bb, c)
+    n0x = g_nx
+    n0y = g_ny
+    n0z = g_nz
+    if a == from { a = to }
+    if bb == from { bb = to }
+    if c == from { c = to }
+    normal_of(ux, a, bb, c)
+    return n0x * g_nx + n0y * g_ny + n0z * g_nz <= 0.0
+}
+
+var g_nx = 0.0
+var g_ny = 0.0
+var g_nz = 0.0
+
+normal_of(ux: float[], a: int, bb: int, c: int) {
+    e1x = ux[bb * 3] - ux[a * 3]
+    e1y = ux[bb * 3 + 1] - ux[a * 3 + 1]
+    e1z = ux[bb * 3 + 2] - ux[a * 3 + 2]
+    e2x = ux[c * 3] - ux[a * 3]
+    e2y = ux[c * 3 + 1] - ux[a * 3 + 1]
+    e2z = ux[c * 3 + 2] - ux[a * 3 + 2]
+    g_nx = e1y * e2z - e1z * e2y
+    g_ny = e1z * e2x - e1x * e2z
+    g_nz = e1x * e2y - e1y * e2x
+}
+
+// --- the graph ----------------------------------------------------------------------------------------------------
+
+// The cluster graph of a mesh: `vertices` (VERTEX_FLOATS f32 a vertex,
+// `vertex_count`) and `indices` (u32 triangles), drawn in `ranges` (an
+// index start and count a material, `range_count` of them; null for one
+// range over everything); a triangle with two corners at one place is left
+// out, since it covers nothing. Each material's triangles form their own graph,
+// their clusters marked with its index; where two materials meet, the
+// vertices they share are held, so neither's simplification opens a crack
+// along the other.
+build(vertices: ptr, vertex_count: int, indices: ptr, index_count: int, ranges: ptr, range_count: int) -> *ClusterMesh {
+    cm = calloc(1, sizeof(ClusterMesh)) as *ClusterMesh
+    if vertices == null || indices == null || vertex_count <= 0 || index_count < 3 { return cm }
+    b = calloc(1, sizeof(Build)) as *Build
+    b.vertices = vertices as f32[]
+    b.vertex_count = vertex_count
+    weld(b)
+    b.stamp = calloc(vertex_count, 4) as int[]
+    b.local = calloc(vertex_count, 4) as int[]
+    b.pstamp = calloc(b.position_count, 4) as int[]
+    b.plocal = calloc(b.position_count, 4) as int[]
+    b.held = calloc(b.position_count, 1) as uint8[]
+    idx = indices as uint32[]
+    ranges_of = ranges as int[]
+    nranges = range_count
+    if ranges == null || range_count <= 0 { nranges = 1 }
+
+    // Positions two materials share are held.
+    if nranges > 1 {
+        seen = calloc(b.position_count, 4) as int[]
+        g = 0
+        while g < nranges {
+            first = ranges_of[g * 2]
+            count = ranges_of[g * 2 + 1]
+            i = first
+            while i < first + count {
+                p = b.position_of[idx[i] as int]
+                if seen[p] == 0 {
+                    seen[p] = g + 1
+                } else if seen[p] != g + 1 {
+                    b.held[p] = 1
+                }
+                i = i + 1
+            }
+            g = g + 1
+        }
+        free(seen as ptr)
+    }
+
+    g = 0
+    while g < nranges {
+        first = 0
+        count = index_count
+        if ranges != null && range_count > 0 {
+            first = ranges_of[g * 2]
+            count = ranges_of[g * 2 + 1]
+        }
+        // A triangle with two corners at one place covers nothing, and
+        // its edge between them would hold its neighbours where they are
+        // (an edge three triangles border): a sphere's poles, where every
+        // quad of the first ring is one, never simplified at all.
+        tris = calloc(count + 3, 4) as int[]
+        n = 0
+        i = 0
+        while i + 2 < count {
+            a = idx[first + i] as int
+            bb = idx[first + i + 1] as int
+            c = idx[first + i + 2] as int
+            pa = b.position_of[a]
+            pb = b.position_of[bb]
+            pc = b.position_of[c]
+            if pa != pb && pb != pc && pa != pc {
+                tris[n * 3] = a
+                tris[n * 3 + 1] = bb
+                tris[n * 3 + 2] = c
+                n = n + 1
+            }
+            i = i + 3
+        }
+        if n > 0 { build_material(b, cm, tris, n, g) }
+        free(tris as ptr)
+        g = g + 1
+    }
+    free(b.position_of as ptr)
+    free(b.stamp as ptr)
+    free(b.local as ptr)
+    free(b.pstamp as ptr)
+    free(b.plocal as ptr)
+    free(b.held as ptr)
+    free(b as ptr)
+    return cm
+}
+
+// One material's graph: its triangles cut into the first level's clusters,
+// then level after level, the level's clusters grouped, each group
+// simplified to half with what it shares with other groups held, and cut
+// into the next level's clusters; until one cluster is left or no group
+// simplifies.
+build_material(b: *Build, cm: *ClusterMesh, tris: int[], n: int, material: int) {
+    first = clusterize(b, cm, tris, n, 0, material)
+    pending = calloc(cm.count - first + 1, 4) as int[]
+    pcount = 0
+    k = first
+    while k < cm.count {
+        pending[pcount] = k
+        pcount = pcount + 1
+        k = k + 1
+    }
+    level = 0
+    shared = calloc(b.position_count, 1) as uint8[]
+    lock = calloc(b.position_count, 1) as uint8[]
+    owner = calloc(b.position_count, 4) as int[]
+    corners = calloc(GROUP_MOST * MAX_TRIANGLES * 3, 4) as int[]
+    while pcount > 1 {
+        members = calloc(pcount, 4) as int[]
+        starts = calloc(pcount + 1, 4) as int[]
+        groups = partition(b, cm, pending, pcount, members, starts)
+        // What a group shares with another is held this level.
+        mark = next_mark(b)
+        touched_positions = calloc(pcount * MAX_VERTICES + 1, 4) as int[]
+        tp = 0
+        g = 0
+        while g < groups {
+            m = starts[g]
+            while m < starts[g + 1] {
+                w = record(cm, members[m]) as int[]
+                r = 0
+                while r < w[REC_VERTICES] {
+                    p = b.position_of[(cm.refs as uint32[])[w[REC_REFS] + r] as int]
+                    if b.pstamp[p] != mark {
+                        b.pstamp[p] = mark
+                        owner[p] = g
+                        touched_positions[tp] = p
+                        tp = tp + 1
+                    } else if owner[p] != g {
+                        shared[p] = 1
+                    }
+                    r = r + 1
+                }
+                m = m + 1
+            }
+            g = g + 1
+        }
+        i = 0
+        while i < tp {
+            p = touched_positions[i]
+            lock[p] = shared[p] | b.held[p]
+            i = i + 1
+        }
+
+        // The level's new clusters land at the graph's end, one run.
+        level_first = cm.count
+        retry = calloc(pcount, 4) as int[]
+        rcount = 0
+        progressed = false
+        g = 0
+        while g < groups {
+            gcount = starts[g + 1] - starts[g]
+            end = 0
+            m = starts[g]
+            while m < starts[g + 1] {
+                end = unpack(cm, members[m], corners, end)
+                m = m + 1
+            }
+            total = end / 3
+            done = simplify(b, corners, total, lock, total / 2)
+            if (done.count as float) > (total as float) * STUCK_SHARE || done.count == 0 {
+                // It will not go with these neighbours: its clusters wait for
+                // the next level's grouping, still what the others meet.
+                m = starts[g]
+                while m < starts[g + 1] {
+                    retry[rcount] = members[m]
+                    rcount = rcount + 1
+                    m = m + 1
+                }
+                free(done.tris)
+                g = g + 1
+                continue
+            }
+            progressed = true
+            // The group's sphere holds its clusters' spheres; its error is
+            // the most any of them had or this simplification made.
+            spheres = calloc(gcount * 4, 4) as f32[]
+            err = done.error
+            m = 0
+            while m < gcount {
+                f = record(cm, members[starts[g] + m]) as f32[]
+                c = 0
+                while c < 4 {
+                    spheres[m * 4 + c] = f[REC_LOD + c]
+                    c = c + 1
+                }
+                if (f[REC_LOD_ERROR] as float) > err { err = f[REC_LOD_ERROR] as float }
+                m = m + 1
+            }
+            bounds = calloc(4, 4) as f32[]
+            merge_spheres(spheres, gcount, 4, bounds)
+            m = 0
+            while m < gcount {
+                f = record(cm, members[starts[g] + m]) as f32[]
+                c = 0
+                while c < 4 {
+                    f[REC_PARENT + c] = bounds[c]
+                    c = c + 1
+                }
+                f[REC_PARENT_ERROR] = err as f32
+                m = m + 1
+            }
+            made = clusterize(b, cm, done.tris as int[], done.count, level + 1, material)
+            k = made
+            while k < cm.count {
+                f = record(cm, k) as f32[]
+                c = 0
+                while c < 4 {
+                    f[REC_LOD + c] = bounds[c]
+                    c = c + 1
+                }
+                f[REC_LOD_ERROR] = err as f32
+                k = k + 1
+            }
+            free(spheres as ptr)
+            free(bounds as ptr)
+            free(done.tris)
+            g = g + 1
+        }
+        i = 0
+        while i < tp {
+            p = touched_positions[i]
+            shared[p] = 0
+            lock[p] = 0
+            i = i + 1
+        }
+        free(touched_positions as ptr)
+        free(members as ptr)
+        free(starts as ptr)
+        free(pending as ptr)
+        pending = calloc(rcount + cm.count - level_first + 1, 4) as int[]
+        k = 0
+        while k < rcount {
+            pending[k] = retry[k]
+            k = k + 1
+        }
+        free(retry as ptr)
+        pcount = rcount
+        k = level_first
+        while k < cm.count {
+            pending[pcount] = k
+            pcount = pcount + 1
+            k = k + 1
+        }
+        level = level + 1
+        if level + 1 > cm.levels { cm.levels = level + 1 }
+        if !progressed { break }
+    }
+    if cm.levels < 1 { cm.levels = 1 }
+    free(pending as ptr)
+    free(shared as ptr)
+    free(lock as ptr)
+    free(owner as ptr)
+    free(corners as ptr)
+}
+
+// The vertices welded by position: an id for every distinct place, shared
+// by the vertices there whatever their normals or texture coordinates (a
+// hash of the position's bits), and the mesh's extent, which errors are
+// measured against while simplifying.
+weld(b: *Build) {
+    n = b.vertex_count
+    b.position_of = calloc(n, 4) as int[]
+    cap = 64
+    while cap < n * 2 { cap = cap * 2 }
+    first = calloc(cap, 4) as int[]
+    taken = calloc(cap, 1) as uint8[]
+    bits = b.vertices as ptr as uint32[]
+    count = 0
+    lx = 1.0e30
+    ly = 1.0e30
+    lz = 1.0e30
+    hx = 0.0 - 1.0e30
+    hy = 0.0 - 1.0e30
+    hz = 0.0 - 1.0e30
+    v = 0
+    while v < n {
+        x = coordinate(bits, v * VERTEX_FLOATS)
+        y = coordinate(bits, v * VERTEX_FLOATS + 1)
+        z = coordinate(bits, v * VERTEX_FLOATS + 2)
+        h = ((((x * (73856093 as long)) ^ (y * (19349663 as long)) ^ (z * (83492791 as long))) & (2147483647 as long)) as int) & (cap - 1)
+        while taken[h] != 0 && !same_position(bits, first[h], v) { h = (h + 1) & (cap - 1) }
+        if taken[h] == 0 {
+            taken[h] = 1
+            first[h] = v
+            b.position_of[v] = count
+            count = count + 1
+        } else {
+            b.position_of[v] = b.position_of[first[h]]
+        }
+        fx = px(b, v)
+        fy = py(b, v)
+        fz = pz(b, v)
+        if fx < lx { lx = fx }
+        if fy < ly { ly = fy }
+        if fz < lz { lz = fz }
+        if fx > hx { hx = fx }
+        if fy > hy { hy = fy }
+        if fz > hz { hz = fz }
+        v = v + 1
+    }
+    b.position_count = count
+    extent = hx - lx
+    if hy - ly > extent { extent = hy - ly }
+    if hz - lz > extent { extent = hz - lz }
+    if extent <= 0.0 { extent = 1.0 }
+    b.scale = 1.0 / extent
+    free(first as ptr)
+    free(taken as ptr)
+}
+
+same_position(bits: uint32[], a: int, v: int) -> bool {
+    return coordinate(bits, a * VERTEX_FLOATS) == coordinate(bits, v * VERTEX_FLOATS) &&
+           coordinate(bits, a * VERTEX_FLOATS + 1) == coordinate(bits, v * VERTEX_FLOATS + 1) &&
+           coordinate(bits, a * VERTEX_FLOATS + 2) == coordinate(bits, v * VERTEX_FLOATS + 2)
+}
+
+// A coordinate's bits, minus zero's as zero's: the two are one place, and a
+// sphere's pole, at x = 0 times the cosine of each column, is both.
+coordinate(bits: uint32[], at: int) -> long {
+    c = bits[at] as long
+    if c == (2147483648 as long) { return 0 as long }
+    return c
+}

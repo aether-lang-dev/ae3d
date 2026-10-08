@@ -78,7 +78,8 @@ Every program honours the same environment: `AE3D_FRAMES=n` to stop after
 `n` frames, `AE3D_HIDDEN=1` for no window, `AE3D_SNAPSHOT=frame.png` for
 the last frame, `AE3D_PERF=1` for the frame's cost by stage, `AE3D_RAYS=1`
 for ray-traced shadows, `AE3D_GI=auto|rt|sky|off` for the global
-illumination, `AE3D_DLSS=n`, `AE3D_AGENT=port` for the channel.
+illumination, `AE3D_CLUSTERS=auto|on|off` for big meshes at the detail
+their distance needs, `AE3D_DLSS=n`, `AE3D_AGENT=port` for the channel.
 The full list, the build's options and the CI gate are in
 [docs/building.md](docs/building.md). `./ci.sh` is the whole gate: every
 module type-checked, every suite and benchmark run, every example driven
