@@ -2,6 +2,33 @@
 
 ## [current]
 
+### Global illumination: the frame as light, the sky's light, and the probes'
+
+- The frame is light (#656): the scene draws into RGBA16F on both backends
+  and is tone mapped once, in the composite (exposure, bloom, ACES, sRGB,
+  dither); colour textures are sRGB, and clear, fog and sky colours are taken
+  back through the curve to the light that shows as them.
+- The sky lights the scene (#655), as bright as it is drawn: captured each
+  frame into an octahedral map, its irradiance onto every normal and its
+  GGX-prefiltered reflections made on the device. The procedural daylight is
+  Preetham's sky with the ESRA clear-sky sun at one photometric scale. The
+  flat ambient is gone. SSAO comes from the last frame's depth and darkens
+  only the sky's light.
+- Probes light it with every bounce (#537), where the GPU traces: two
+  cascades of 32x8x32 probes round the camera (DDGI, Majercik et al. 2019),
+  a quarter of them tracing 128 rays a frame through the scene's structure,
+  each hit lit by the sun, the lamps and the probes' own light the frame
+  before. `engine_set_gi(e, mode)` or `AE3D_GI=auto|rt|sky|off`: `auto`, the
+  default, takes the probes on a GPU that offers them and the sky's light
+  elsewhere (OpenGL, MoltenVK, software rasterizers). Scene files and the
+  editor carry the setting.
+- The per-model "global illumination" shading knob, a constant tint, is
+  gone (`Config.global_illumination`, `gi_intensity`, `gi_bounces`).
+- The agent's explain names what lights a surface besides the lights: the
+  probes' reading at that point, the sky's, or none (`gi`, `indirect`).
+- `test_hdr`, `test_sky_light` and `test_gi` hold each to its numbers; the ray
+  suites run again with the probes on.
+
 ### Multiplayer: the horde simulated on every peer
 
 - The horde isn't replicated a zombie at a time (#413). `ae3d.nethorde`

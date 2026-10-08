@@ -1,0 +1,189 @@
+// A probe's rays folded into its octahedron (#537): every texel of it, the
+// gutter's too -- a gutter texel is the direction across the fold it
+// stands for -- the rays' DDGI_MODE weighted by their cosine to the texel's
+// direction: for the irradiance, the radiance by the cosine; for the
+// distance, the distance and its square by the cosine to the fiftieth, a
+// sharp lobe, which is what the visibility test asks of them. Blended into
+// what the texel held by the hysteresis, all at once when the probe has
+// just come to a new cell. The irradiance pass also keeps the probe's
+// state: whether it is on -- not where a quarter of its rays met backs, a
+// probe inside a wall -- and how far it has moved out of the nearest one.
+#version 450
+#define DDGI_SIDE 6
+#define DDGI_MODE 0
+#define DDGI_PARAMS 32
+#define DDGI_RAYS_MAX 256
+#define DDGI_CLEARANCE 0.15
+layout(local_size_x = DDGI_SIDE + 2, local_size_y = DDGI_SIDE + 2) in;
+
+layout(set = 0, binding = 1, std140) uniform DdgiParams { vec4 params[DDGI_PARAMS]; };
+layout(set = 0, binding = 4, std430) buffer State { vec4 probeState[]; };
+layout(set = 0, binding = 5, rgba16f) uniform readonly image2D rayImage;
+// The irradiance's atlas, or the distance's: its mean and its mean square.
+#if DDGI_MODE == 0
+layout(set = 0, binding = 9, rgba16f) uniform image2D atlas;
+#else
+layout(set = 0, binding = 9, rg16f) uniform image2D atlas;
+#endif
+layout(push_constant) uniform Batch { uint first; uint count; } batch;
+
+#define DDGI_DIMS params[0]
+#define DDGI_BASE(c) params[1 + (c)].xyz
+#define DDGI_SPACING(c) params[3][(c)]
+// The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
+// the upper hemisphere in the square's inner diamond, the lower folded into
+// its corners, one texel of gutter around each level holding the sky just
+// across the fold, so a filtered read at an edge is still the sky.
+#define SKY_SIZE 256.0
+#define SKY_LEVELS 6.0
+#define SKY_IRRADIANCE_SIZE 16.0
+vec3 oct_decode(vec2 p) {
+    vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (d.y < 0.0) {
+        vec2 folded = (1.0 - abs(d.zx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+        d.x = folded.x;
+        d.z = folded.y;
+    }
+    return normalize(d);
+}
+vec2 oct_encode(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return p;
+}
+// Where direction d is read in a level `size` texels a side.
+vec2 oct_uv(vec3 d, float size) {
+    return ((oct_encode(d) * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
+// The direction a texel of a level `size` a side stands for, at texture
+// coordinate uv: a gutter texel's folded back across the edge it lies past.
+vec3 oct_texel_direction(vec2 uv, float size) {
+    vec2 p = ((uv * size - 1.0) / (size - 2.0)) * 2.0 - 1.0;
+    if (p.x > 1.0) { p.x = 2.0 - p.x; p.y = -p.y; }
+    if (p.x < -1.0) { p.x = -2.0 - p.x; p.y = -p.y; }
+    if (p.y > 1.0) { p.y = 2.0 - p.y; p.x = -p.x; }
+    if (p.y < -1.0) { p.y = -2.0 - p.y; p.x = -p.x; }
+    return oct_decode(p);
+}
+
+// v wrapped into 0 to d-1 on each axis (GLSL's % is undefined for a
+// negative operand, and a grid west of the origin has negative cells).
+ivec3 ddgi_wrap(ivec3 v, ivec3 d) {
+    return v - d * ivec3(floor(vec3(v) / vec3(d)));
+}
+// The i-th of n directions spread evenly over the sphere (spherical
+// Fibonacci).
+vec3 fibonacci_direction(uint i, uint n) {
+    float golden = 2.39996323;
+    float y = 1.0 - (float(i) + 0.5) * (2.0 / float(n));
+    float r = sqrt(max(1.0 - y * y, 0.0));
+    float phi = float(i) * golden;
+    return vec3(cos(phi) * r, y, sin(phi) * r);
+}
+
+// The probe's rays, read once into the group: each thread reads its share
+// of the ray image and the directions, every texel then folds them all.
+shared vec4 rayValue[DDGI_RAYS_MAX];
+shared vec3 rayDirection[DDGI_RAYS_MAX];
+
+void main() {
+    if (gl_WorkGroupID.x >= batch.count) return;
+    uint probe = batch.first + gl_WorkGroupID.x;
+    int index = int(probe);
+    uint rays = min(uint(params[8].y), uint(DDGI_RAYS_MAX));
+    float side = float(DDGI_SIDE);
+    int c = index / int(DDGI_DIMS.w);
+    int local = index - c * int(DDGI_DIMS.w);
+    ivec3 d = ivec3(DDGI_DIMS.xyz);
+    ivec3 slot = ivec3(local % d.x, (local / d.x) % d.y, local / (d.x * d.y));
+    ivec3 g = ddgi_wrap(slot - ivec3(DDGI_BASE(c)), d);
+    vec3 cell = DDGI_BASE(c) + vec3(g);
+    vec4 stamp = probeState[index * 2 + 1];
+    bool fresh = stamp.w < 0.5 || any(notEqual(stamp.xyz, cell));
+    float spacing = DDGI_SPACING(c);
+    mat3 turn = mat3(params[5].xyz, params[6].xyz, params[7].xyz);
+
+    uint threads = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+    for (uint r = gl_LocalInvocationIndex; r < rays; r += threads) {
+        rayValue[r] = imageLoad(rayImage, ivec2(r, probe));
+        rayDirection[r] = normalize(turn * fibonacci_direction(r, rays));
+    }
+    barrier();
+
+    ivec2 texel = ivec2(gl_LocalInvocationID.xy);
+    vec2 uv = (vec2(texel) + 0.5) / (side + 2.0);
+    vec3 n = oct_texel_direction(uv, side + 2.0);
+    vec4 sum = vec4(0.0);
+    float maxDistance = spacing * 1.5;
+    for (uint r = 0u; r < rays; r++) {
+        vec4 value = rayValue[r];
+        float cosine = max(dot(n, rayDirection[r]), 0.0);
+#if DDGI_MODE == 0
+        if (value.a < 0.0) continue;
+        sum += vec4(value.rgb * cosine, cosine);
+#else
+        float weight = pow(cosine, 50.0);
+        float dist = min(abs(value.a), maxDistance);
+        sum += vec4(dist * weight, dist * dist * weight, 0.0, weight);
+#endif
+    }
+    vec2 corner = vec2(float(slot.x + slot.y * d.x), float(slot.z + c * d.z)) * (side + 2.0);
+    ivec2 at = ivec2(corner) + texel;
+    vec4 result = sum.w > 1e-5 ? vec4(sum.xyz / sum.w, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);
+    vec4 old = imageLoad(atlas, at);
+    float keep = fresh ? 0.0 : params[9][DDGI_MODE];
+    imageStore(atlas, at, mix(result, old, keep));
+
+#if DDGI_MODE == 0
+    if (gl_LocalInvocationIndex == 0u) {
+        // How many rays met backs and the nearest of them, the way out of
+        // what the probe is in; and the nearest and the farthest front.
+        int backs = 0;
+        float nearestBack = 1e9;
+        int backRay = -1;
+        float nearestFront = 1e9;
+        int nearFrontRay = -1;
+        float farthestFront = -1.0;
+        int farFrontRay = -1;
+        for (uint r = 0u; r < rays; r++) {
+            float distance = rayValue[r].a;
+            if (distance < 0.0) {
+                backs++;
+                if (-distance * 5.0 < nearestBack) {
+                    nearestBack = -distance * 5.0;
+                    backRay = int(r);
+                }
+                continue;
+            }
+            if (distance < nearestFront) {
+                nearestFront = distance;
+                nearFrontRay = int(r);
+            }
+            if (distance > farthestFront) {
+                farthestFront = distance;
+                farFrontRay = int(r);
+            }
+        }
+        vec4 state = fresh ? vec4(0.0, 0.0, 0.0, 1.0) : probeState[index * 2];
+        float share = float(backs) / float(rays);
+        float clearance = DDGI_CLEARANCE * spacing;
+        vec3 moved = state.xyz;
+        if (share > 0.25 && backRay >= 0) {
+            // Inside something: through its nearest back, and a little past.
+            moved += rayDirection[backRay] * (nearestBack + clearance * 0.5);
+        } else if (nearestFront < clearance && nearFrontRay >= 0 && farFrontRay >= 0 &&
+                   dot(rayDirection[nearFrontRay], rayDirection[farFrontRay]) <= 0.0) {
+            // Too near a face for its light to be the room's: toward the
+            // open side, as far as the farthest face lets it (Majercik et
+            // al.'s relocation, as RTXGI moves a probe).
+            moved += rayDirection[farFrontRay] * min(farthestFront, clearance);
+        }
+        // Within the cell, or it stands for another.
+        if (all(lessThan(abs(moved), vec3(0.45 * spacing)))) state.xyz = moved;
+        state.w = share > 0.25 ? 0.0 : 1.0;
+        probeState[index * 2] = state;
+        probeState[index * 2 + 1] = vec4(cell, 1.0);
+    }
+#endif
+}

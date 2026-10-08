@@ -34,12 +34,12 @@ import ae3d.vkspirv
 import ae3d.geometry
 
 exports (
-    Blas, start, stop, input_usage, blas_build, blas_free,
+    Blas, start, stop, input_usage, address_of, blas_build, blas_free,
     begin, reserve, add, add_one, build, empty, structure,
-    query, set_shadows, shadows, shadows_now, set_reach, reach_now, set_budget, budget, figures,
+    RAY_SHADOW, RAY_PROBES, query, set_shadows, shadows, shadows_now, set_probes, probes, traced, set_reach, reach_now, set_budget, budget, figures,
     instances, counter, limit, statics, reserved, claim,
-    pose_create, pose_destroy, pose_frames, pose_addresses, pose_ready, pose_bytes,
-    skin_pose, skin_end, skin_posed, skin_forget, set_skin_budget, skin_budget, skinned
+    pose_create, pose_destroy, pose_frames, pose_addresses, pose_vertices, pose_indices, pose_ready, pose_bytes,
+    skin_pose, skin_end, skin_posed, skin_structure, skin_vertices, skin_indices, skin_forget, set_skin_budget, skin_budget, skinned
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -89,12 +89,18 @@ struct RayFrame {
 }
 
 // A crowd's pose structures: one a frame of its pose bank, the posed
-// vertices each is built from, and the buffer of their addresses.
+// vertices each is built from and the indices they share (kept, and their
+// device addresses, for the probes' rays to read a hit's triangle from),
+// and the buffer of the structures' addresses.
 struct PoseSet {
     in_use: bool
     frames: int
     vertices: ptr                  // VkBuffer[frames]
     vertex_memory: ptr             // VkDeviceMemory[frames]
+    vertex_addresses: ptr          // long[frames]
+    indices: ptr
+    index_memory: ptr
+    index_address: long
     blas: ptr                      // Blas[frames]
     addresses: ptr
     address_memory: ptr
@@ -120,9 +126,11 @@ var g_reserved = false
 var g_locked = false
 var g_ready = false
 
-// Shadows by ray, how far from the camera a crowd's figures may be in the
-// rays (0 for all) and the reach that keeps them near the budget.
+// Shadows by ray, the probes' light (ae3d.vkddgi), how far from the camera
+// a crowd's figures may be in the rays (0 for all) and the reach that keeps
+// them near the budget.
 var g_shadows = false
+var g_probes = false
 var g_reach = 0.0
 var g_reach_now = 0.0
 var g_seen = 0
@@ -149,6 +157,7 @@ start() {
     g_locked = false
     g_ready = false
     g_shadows = false
+    g_probes = false
     g_reach = 0.0
     g_reach_now = 0.0
     g_seen = 0
@@ -565,10 +574,19 @@ reserve(count: int, static_count: int) -> bool {
     return true
 }
 
+// An instance's mask bits: what casts a shadow, which the scene's shadow
+// and occlusion rays meet, and what the probes' rays see (ae3d.vkddgi): a
+// surface that casts none still bounces light. A crowd's figures carry
+// every bit.
+const RAY_SHADOW = 1
+const RAY_PROBES = 2
+
 // One instance record at `at`: the transform from the column-major matrix
 // of floats at `m`, the mask all on, facing culling off, pointing at the
-// structure at `address`.
-write_instance(at: ptr, m: ptr, address: long) {
+// structure at `address`, its mask `mask` (RAY_SHADOW, RAY_PROBES), its
+// custom index `record`: the probes' record of its surface (ae3d.vkddgi), 0
+// where there is none.
+write_instance(at: ptr, m: ptr, address: long, mask: int, record: int) {
     t = at as f32[]
     src = m as f32[]
     r = 0
@@ -580,16 +598,19 @@ write_instance(at: ptr, m: ptr, address: long) {
         r = r + 1
     }
     words = (at + 48) as uint32[]
-    words[0] = 255 << 24
+    custom = 0
+    if record > 0 { custom = record & 16777215 }
+    words[0] = (mask << 24) | custom
     words[1] = vk.GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR << 24
     ((at + 56) as long[])[0] = address
 }
 
 // `count` instances of the mesh whose structure is at `address`, at the
 // column-major matrices of floats at `matrices`, into this frame's
-// structure. A mesh without a structure (address 0: a skinned one, or one
-// the build refused) adds nothing.
-add(address: long, matrices: ptr, count: int) {
+// structure, each with `mask` and the probes' `record`. A mesh without a
+// structure (address 0: a skinned one, or one the build refused) adds
+// nothing.
+add(address: long, matrices: ptr, count: int, mask: int, record: int) {
     frame = vkhost.frame_slot()
     if !g_query || !vkhost.recording() || count <= 0 || matrices == null || address == 0 { return }
     if g_static > 0 {
@@ -608,7 +629,7 @@ add(address: long, matrices: ptr, count: int) {
     while i < count {
         at = f.instances_mapped + (g_count + i) * INSTANCE_BYTES
         memset(at, 0, INSTANCE_BYTES as long)
-        write_instance(at, matrices + i * 64, address)
+        write_instance(at, matrices + i * 64, address, mask, record)
         i = i + 1
     }
     g_count = g_count + count
@@ -616,7 +637,7 @@ add(address: long, matrices: ptr, count: int) {
 
 // One instance at a column-major matrix of doubles: a model drawn on its
 // own, whose matrix the scene keeps in doubles.
-add_one(address: long, matrix: ptr) {
+add_one(address: long, matrix: ptr, mask: int, record: int) {
     if matrix == null { return }
     m = calloc(16, 4)
     floats = m as f32[]
@@ -626,7 +647,7 @@ add_one(address: long, matrix: ptr) {
         floats[i] = doubles[i] as f32
         i = i + 1
     }
-    add(address, m, 1)
+    add(address, m, 1, mask, record)
     free(m)
 }
 
@@ -788,6 +809,12 @@ build_frame(allow_empty: bool) -> bool {
 // structure was built, and the map is left to the skinned.
 set_shadows(on: bool) { g_shadows = on }
 shadows() -> bool { return g_query && g_shadows }
+// The probes' rays on or off: the frame's structure is built for them, the
+// shadows by ray or not.
+set_probes(on: bool) { g_probes = on }
+probes() -> bool { return g_query && g_probes }
+// The frame's structure is built: for the shadows, the probes, or both.
+traced() -> bool { return g_query && (g_shadows || g_probes) }
 // This frame traces: the flag the scene block carries, set by the renderer
 // after the build.
 shadows_now() -> bool { return g_query && g_shadows && g_ready }
@@ -863,6 +890,7 @@ pose_create(mesh: ptr, bank: ptr, frames: int, bones: int) -> int {
     p.frames = frames
     p.vertices = calloc(frames, 8)
     p.vertex_memory = calloc(frames, 8)
+    p.vertex_addresses = calloc(frames, 8)
     p.blas = calloc(frames, sizeof(Blas))
     posed = calloc(vertex_count * 3, 4)
     addresses = calloc(frames, 8)
@@ -870,7 +898,13 @@ pose_create(mesh: ptr, bank: ptr, frames: int, bones: int) -> int {
     // One index buffer for every frame: the topology does not move.
     usage = vk.BUFFER_USAGE_INDEX_BUFFER_BIT | input_usage()
     index_buffer = vkhost.upload(indices, index_count * 4, usage)
+    p.indices = index_buffer.buffer
+    p.index_memory = index_buffer.memory
     ok = index_buffer.buffer != null
+    if ok {
+        p.index_address = address_of(index_buffer.buffer)
+        p.bytes = (index_count * 4) as long
+    }
     bind = vertices as f32[]
     joints = skin as f32[]
     out = posed as f32[]
@@ -906,13 +940,13 @@ pose_create(mesh: ptr, bank: ptr, frames: int, bones: int) -> int {
         if made.buffer == null {
             ok = false
         } else {
-            // Built and waited for, the posed vertices are no longer read:
-            // a structure keeps nothing of its inputs.
             b = blas_build_with(made.buffer, index_buffer.buffer, vertex_count, index_count, 12, null,
                                 vk.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
                                 vk.BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR)
-            vkhost.device_buffer_free(made)
-            p.bytes = p.bytes + g_last_blas_size
+            (p.vertices as ptr[])[f] = made.buffer
+            (p.vertex_memory as ptr[])[f] = made.memory
+            (p.vertex_addresses as long[])[f] = address_of(made.buffer)
+            p.bytes = p.bytes + g_last_blas_size + (vertex_count * 12) as long
             slot_blas = (p.blas + f * sizeof(Blas)) as *Blas
             slot_blas.handle = b.handle
             slot_blas.buffer = b.buffer
@@ -928,7 +962,7 @@ pose_create(mesh: ptr, bank: ptr, frames: int, bones: int) -> int {
     if ok {
         compacted = compact(p.blas, frames)
         if compacted > 0 {
-            p.bytes = compacted
+            p.bytes = compacted + ((frames * vertex_count * 12) + index_count * 4) as long
             f = 0
             while f < frames {
                 (addresses as long[])[f] = ((p.blas + f * sizeof(Blas)) as *Blas).address
@@ -942,10 +976,6 @@ pose_create(mesh: ptr, bank: ptr, frames: int, bones: int) -> int {
         p.address_memory = table.memory
         ok = table.buffer != null
     }
-    // The index buffer is the first frame's to keep; every structure was
-    // built from it already, and a structure keeps no reference to its
-    // inputs.
-    vkhost.device_buffer_free(index_buffer)
     free(posed)
     free(addresses)
     if !ok {
@@ -1079,9 +1109,11 @@ pose_destroy(handle: int) {
         }
         if p.addresses != null { vk.vkDestroyBuffer(d, p.addresses, null) }
         if p.address_memory != null { vk.vkFreeMemory(d, p.address_memory, null) }
+        vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: p.indices, memory: p.index_memory })
     }
     if p.vertices != null { free(p.vertices) }
     if p.vertex_memory != null { free(p.vertex_memory) }
+    if p.vertex_addresses != null { free(p.vertex_addresses) }
     if p.blas != null { free(p.blas) }
     memset(p as ptr, 0, sizeof(PoseSet) as long)
 }
@@ -1094,6 +1126,10 @@ pose_ready(handle: int) -> bool {
 }
 pose_frames(handle: int) -> int { return pose_at(handle - 1).frames }
 pose_addresses(handle: int) -> ptr { return pose_at(handle - 1).addresses }
+// The device address of frame `frame`'s posed positions (three floats a
+// vertex) and of the indices every frame shares.
+pose_vertices(handle: int, frame: int) -> long { return (pose_at(handle - 1).vertex_addresses as long[])[frame] }
+pose_indices(handle: int) -> long { return pose_at(handle - 1).index_address }
 // What a set's structures and their posed vertices take on the device, in
 // bytes: the cost of a crowd's mesh in the rays, for its diagnostics.
 pose_bytes(handle: int) -> long {
@@ -1549,19 +1585,19 @@ memory_barrier(commands: ptr, src_access: int, dst_access: int, src_stage: int, 
     free(b as ptr)
 }
 
-// A skinned figure posed into this frame's structure: mesh `mesh` (its
+// A skinned figure posed for this frame's structure: mesh `mesh` (its
 // bind-pose `vertices`, its `skin` stream and its `indices`, vkmesh's) by
 // the `bones` matrices of `palette` (column-major f32s, the palette its
-// draw is posed by), at the column-major matrix of doubles `matrix`. The
-// skinning is recorded now and the structure's refit with every other
-// figure's at skin_end; its instance goes into the frame's structure
-// here, after the frame's room was reserved (reserve) and before its
-// build. False where the device does not trace, past this frame's budget,
-// or when its structure could not be made: the figure keeps the map.
+// draw is posed by). The skinning is recorded now and the structure's
+// refit with every other figure's at skin_end; the caller adds its
+// instance (add_one, at skin_structure), after the frame's room was
+// reserved (reserve) and before its build. False where the device does
+// not trace, past this frame's budget, or when its structure could not be
+// made: the figure keeps the map.
 skin_pose(mesh: int, vertices: ptr, skin: ptr, indices: ptr, vertex_count: int, index_count: int,
-          palette: ptr, bones: int, matrix: ptr) -> bool {
+          palette: ptr, bones: int) -> bool {
     if !g_query || !vkhost.recording() || vkhost.pass_open() { return false }
-    if g_skinned_now >= g_skin_budget || palette == null || bones <= 0 || matrix == null { return false }
+    if g_skinned_now >= g_skin_budget || palette == null || bones <= 0 { return false }
     if vertices == null || skin == null || indices == null || vertex_count <= 0 || index_count < 3 { return false }
     if !skin_pipeline() { return false }
     index = skin_find(mesh)
@@ -1584,7 +1620,6 @@ skin_pose(mesh: int, vertices: ptr, skin: ptr, indices: ptr, vertex_count: int, 
     palette_bytes = (bones * 64) as long
     if k.built && memcmp(k.last_palette, palette, palette_bytes) == 0 {
         k.posed_frame = g_serial
-        add_one(k.blas_address, matrix)
         g_skinned_now = g_skinned_now + 1
         return true
     }
@@ -1619,9 +1654,30 @@ skin_pose(mesh: int, vertices: ptr, skin: ptr, indices: ptr, vertex_count: int, 
     vk.vkCmdDispatch(commands, (vertex_count + SKIN_GROUP - 1) / SKIN_GROUP, 1, 1)
     k.pending = true
     k.posed_frame = g_serial
-    add_one(k.blas_address, matrix)
     g_skinned_now = g_skinned_now + 1
     return true
+}
+
+// The structure a posed figure of `mesh` is traced by, and the device
+// addresses of its posed positions (three floats a vertex) and of its
+// indices, which a probe's ray reads its hit's triangle from: 0 for a mesh
+// never posed.
+skin_structure(mesh: int) -> long {
+    index = skin_find(mesh)
+    if index < 0 { return 0 as long }
+    return skin_at(index).blas_address
+}
+
+skin_vertices(mesh: int) -> long {
+    index = skin_find(mesh)
+    if index < 0 { return 0 as long }
+    return skin_at(index).posed_address
+}
+
+skin_indices(mesh: int) -> long {
+    index = skin_find(mesh)
+    if index < 0 { return 0 as long }
+    return address_of(skin_at(index).indices)
 }
 
 // The structures of every figure posed this frame refitted from what the

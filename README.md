@@ -25,7 +25,7 @@ kernels; what remains in C is there for one stated reason each
 | | |
 |---|---|
 | **Two renderers, one interface** | Vulkan by default, OpenGL 4.1 at parity: one test draws the same scene through both and holds them to 0.7% of channels. DirectX 12 and Metal are the next implementations of the same vtable. |
-| **Physically based shading** | Metallic/roughness materials, sixteen directional, point or spot lights a frame from any number, normal mapping, texel-snapped shadow maps, SSAO, screen-space reflections, ray-traced shadows with penumbrae and ambient occlusion by ray (Vulkan ray query), MSAA, TAA, DLSS, FXAA, bloom, ACES with an exposure that follows the frame, fog, wet surfaces. |
+| **Physically based shading** | Metallic/roughness materials, sixteen directional, point or spot lights a frame from any number, normal mapping, global illumination (probes traced with every bounce where the GPU traces, the sky's own light elsewhere), texel-snapped shadow maps, SSAO, screen-space reflections, ray-traced shadows with penumbrae and ambient occlusion by ray (Vulkan ray query), MSAA, TAA, DLSS, FXAA, bloom, ACES with an exposure that follows the frame, fog, wet surfaces. |
 | **A sky by the hour** | `engine_set_time_of_day(hours)` places the sun and derives the light, the fog and a procedural sky. Volumetric clouds from baked Perlin-Worley textures, lit through a sun march and shadowing the ground, in about 1.5 ms. |
 | **Weather and water** | Rain, snow, dust and storm over any scene: a hundred thousand particles stepped over the job pool, the sky gone overcast, lightning. A Gerstner sea with dispersion, fresnel, whitecaps and caustics from underneath. |
 | **Physics** | [aephysics](https://github.com/aether-lang-dev/aephysics), a rigid body engine written in Aether on Box3D's design -- hulls, meshes, joints of every kind, ragdolls that wear a skinned figure, vehicles, continuous collision, a parallel step that is the same to the bit at any thread count -- in the scene as a `Rigidbody` component and colliders on game objects. A character controller walks, runs and jumps up kerbs and stairs and off slopes: ten thousand random moves through the street end no deeper than the solver's 5 mm slop. |
@@ -77,7 +77,8 @@ AE3D_API=opengl ./build/zombie_city                               # the other re
 Every program honours the same environment: `AE3D_FRAMES=n` to stop after
 `n` frames, `AE3D_HIDDEN=1` for no window, `AE3D_SNAPSHOT=frame.png` for
 the last frame, `AE3D_PERF=1` for the frame's cost by stage, `AE3D_RAYS=1`
-for ray-traced shadows, `AE3D_DLSS=n`, `AE3D_AGENT=port` for the channel.
+for ray-traced shadows, `AE3D_GI=auto|rt|sky|off` for the global
+illumination, `AE3D_DLSS=n`, `AE3D_AGENT=port` for the channel.
 The full list, the build's options and the CI gate are in
 [docs/building.md](docs/building.md). `./ci.sh` is the whole gate: every
 module type-checked, every suite and benchmark run, every example driven

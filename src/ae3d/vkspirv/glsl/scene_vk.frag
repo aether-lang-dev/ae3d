@@ -68,13 +68,11 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableEnergyConservation;
     bool enableImageBasedLighting;
     float iblIntensity;
+    int giOff;
     bool enableVolumetricLighting;
     float volumetricIntensity;
     int volumetricSteps;
     float volumetricScattering;
-    bool enableGlobalIllumination;
-    float giIntensity;
-    int giBounces;
     bool enableFog;
     float fogStart;
     float fogEnd;
@@ -123,6 +121,11 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 damageRect;
     float damageClamp;
     int occlusionHistory;
+    int ddgiOn;
+    vec4 ddgiDims;
+    vec4 ddgiBase[2];
+    vec4 ddgiSpacing;
+    vec4 ddgiAtlas;
     mat4 projection;
     mat4 view;
     vec3 cloudSunColor;
@@ -364,14 +367,12 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 
 
 
+// No light but the direct (the global illumination off, core.GI_OFF): no
+// sky's light and no bounce, what a surface the lights miss shows as.
+
 
 // Volumetric Lighting
 
-
-
-
-
-// Global Illumination
 
 
 
@@ -655,12 +656,14 @@ float lamp_shadow(int slot, vec3 surface) {
 // One ray toward the sun from just off the surface: lit, or the shadow's
 // share of the light. The origin steps out along the normal by a little
 // more than the surface's own tessellation error, so a face does not
-// shadow itself, and the ray is opaque-only and stops at its first hit.
+// shadow itself, and the ray is opaque-only and stops at its first hit. It
+// meets what casts a shadow (mask bit 1: ae3d.vkrays' RAY_SHADOW), not what
+// only the probes see.
 bool ray_blocked_to(vec3 origin, vec3 direction, float far) {
     rayQueryEXT query;
     rayQueryInitializeEXT(query, sceneAS,
                           gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-                          0xFF, origin, 0.01, direction, far);
+                          0x01, origin, 0.01, direction, far);
     rayQueryProceedEXT(query);
     return rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
@@ -727,7 +730,7 @@ float ray_occlusion_factor() {
         rayQueryEXT query;
         rayQueryInitializeEXT(query, sceneAS,
                               gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-                              0xFF, origin, 0.12, direction, rayOcclusion);
+                              0x01, origin, 0.12, direction, rayOcclusion);
         rayQueryProceedEXT(query);
         if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT) blocked += 1.0;
     }
@@ -927,41 +930,6 @@ vec3 calculateVolumetricLighting(vec3 worldPos, vec3 lightPos, vec3 viewPos) {
         scatter += stepSize / (1.0 + d * d * volumetricScattering);
     }
     return tint * scatter * volumetricIntensity;
-}
-
-// Global Illumination approximation with distance-based optimization
-vec3 calculateGlobalIllumination(vec3 position, vec3 normal, vec3 albedo, float distanceToCamera) {
-    if (!enableGlobalIllumination) return vec3(0.0);
-    
-    // Adaptive sample count based on distance (CRITICAL for voxel performance)
-    int baseSamples = giBounces * 4;
-    int samples = baseSamples;
-    
-    if (distanceToCamera < viewDistance * 0.5) {
-        // Very close: minimal GI (too expensive for dense voxels)
-        samples = max(2, baseSamples / 8);
-    } else if (distanceToCamera < viewDistance * 2.0) {
-        samples = max(4, baseSamples / 4);
-    } else if (distanceToCamera < viewDistance * 5.0) {
-        samples = max(6, baseSamples / 2);
-    }
-    
-    samples = min(samples, 16);
-    
-    // Very simple GI approximation using hemisphere sampling
-    vec3 gi = vec3(0.0);
-    
-    for (int i = 0; i < samples; i++) {
-        float angle = float(i) * 3.14159 * 2.0 / float(samples);
-        vec3 sampleDir = vec3(cos(angle), sin(angle), 1.0);
-        sampleDir = normalize(normal + sampleDir * 0.5);
-        
-        // Simple indirect lighting approximation
-        float indirectLight = max(0.0, dot(normal, sampleDir)) * 0.1;
-        gi += albedo * indirectLight;
-    }
-    
-    return gi * giIntensity / float(samples);
 }
 
 // Simple inter-object reflections approximation
@@ -1551,6 +1519,181 @@ vec3 oct_texel_direction(vec2 uv, float size) {
 vec3 sky_irradiance(vec3 n) {
     return texture(skyIrradiance, oct_uv(n, SKY_IRRADIANCE_SIZE)).rgb;
 }
+#ifdef AE3D_RAY_QUERY
+// The probes' irradiance, where the device traces and the probes are on
+// (#537): what the sky's light and every bounce of it bring to this point,
+// in place of the sky's irradiance alone.
+layout(set = 0, binding = 14) uniform sampler2D ddgiIrradiance;
+layout(set = 0, binding = 15) uniform sampler2D ddgiDistance;
+layout(set = 0, binding = 16, std430) readonly buffer DdgiState { vec4 ddgiProbeState[]; };
+
+
+
+
+
+#define DDGI_DIMS ddgiDims
+#define DDGI_BASE(c) ddgiBase[(c)].xyz
+#define DDGI_SPACING(c) ddgiSpacing[(c)]
+#define DDGI_ATLAS ddgiAtlas
+#define DDGI_IRRADIANCE ddgiIrradiance
+#define DDGI_DISTANCE ddgiDistance
+#define DDGI_STATE(i) ddgiProbeState[(i)]
+// v wrapped into 0 to d-1 on each axis (GLSL's % is undefined for a
+// negative operand, and a grid west of the origin has negative cells).
+ivec3 ddgi_wrap(ivec3 v, ivec3 d) {
+    return v - d * ivec3(floor(vec3(v) / vec3(d)));
+}
+
+// The probe volume (#537, ae3d.vkddgi, whose layout this must match):
+// DDGI_CASCADES grids of probes around the camera, each DDGI_DIMS probes
+// DDGI_SPACING(c) apart, addressed toroidally -- a probe's slot is its
+// world cell modulo the grid -- so the grid scrolls with the camera by whole
+// cells and what a probe knows stays where it was learned. Each probe keeps
+// its irradiance and its distance moments in octahedral texels in two
+// atlases, a one-texel gutter round each, and its state -- the offset that
+// moves it out of a wall, whether it is on -- in the state buffer.
+//
+// What a shader including this defines first: DDGI_DIMS (vec4: probes a
+// side, x y z, and probes a cascade), DDGI_BASE(c) (vec3: the world cell of
+// cascade c's first probe), DDGI_SPACING(c), DDGI_ATLAS (vec4: the
+// irradiance atlas's size, then the distance atlas's), DDGI_IRRADIANCE and
+// DDGI_DISTANCE (the atlases' samplers) and DDGI_STATE(i) (vec4 i of the
+// state buffer).
+#define DDGI_CASCADES 2
+#define DDGI_IRR 6
+#define DDGI_DIST 14
+
+// A probe's index from its cascade and its slot in the grid.
+int ddgi_index(int c, ivec3 slot) {
+    ivec3 d = ivec3(DDGI_DIMS.xyz);
+    return c * int(DDGI_DIMS.w) + (slot.z * d.y + slot.y) * d.x + slot.x;
+}
+
+// The slot of the probe at grid coordinate g of cascade c (0 to DDGI_DIMS-1
+// from the cascade's first cell).
+ivec3 ddgi_slot(int c, ivec3 g) {
+    return ddgi_wrap(ivec3(DDGI_BASE(c)) + g, ivec3(DDGI_DIMS.xyz));
+}
+
+// Whether probe `index`, at grid coordinate g of cascade c, is on: traced
+// since it came to its cell, and not inside anything.
+bool ddgi_on(int c, ivec3 g, int index) {
+    vec4 stamp = DDGI_STATE(index * 2 + 1);
+    return DDGI_STATE(index * 2).w > 0.5 && stamp.w > 0.5 && all(equal(stamp.xyz, DDGI_BASE(c) + vec3(g)));
+}
+
+// Where the probe at grid coordinate g of cascade c belongs: its cell's
+// centre, not its corner, so a floor or a wall at a whole number of cells
+// does not run through a row of probes.
+vec3 ddgi_home(int c, ivec3 g) {
+    return (DDGI_BASE(c) + vec3(g) + 0.5) * DDGI_SPACING(c);
+}
+
+// Where probe `index` stands: its home and the offset its state keeps.
+vec3 ddgi_probe_position(int c, ivec3 g, int index) {
+    return ddgi_home(c, g) + DDGI_STATE(index * 2).xyz;
+}
+
+// Point P in cascade c's grid coordinates, a probe at each whole number.
+vec3 ddgi_grid(int c, vec3 P) {
+    return P / DDGI_SPACING(c) - DDGI_BASE(c) - 0.5;
+}
+
+// The atlas texel a probe's octahedron starts at (its gutter's corner).
+vec2 ddgi_corner(int index, float side) {
+    int c = index / int(DDGI_DIMS.w);
+    int local = index - c * int(DDGI_DIMS.w);
+    ivec3 d = ivec3(DDGI_DIMS.xyz);
+    int x = local % d.x;
+    int y = (local / d.x) % d.y;
+    int z = local / (d.x * d.y);
+    return vec2(float(x + y * d.x), float(z + c * d.z)) * (side + 2.0);
+}
+
+// Where direction n is read in probe `index`'s octahedron of `side` texels.
+vec2 ddgi_uv(int index, vec3 n, float side, vec2 atlas) {
+    vec2 o = oct_encode(n) * 0.5 + 0.5;
+    return (ddgi_corner(index, side) + 1.0 + o * side) / atlas;
+}
+
+// The irradiance onto a surface at P facing N, seen from V's side, from
+// the eight probes of cascade c's cell around it: trilinear, each weighed
+// by whether it faces the surface and by whether, by its distance moments,
+// it can see it (Chebyshev). The irradiance the probes keep is the cosine
+// average of the radiance, so pi times it is the irradiance; a weight sum of
+// nothing returns -1, for the caller to take what lies beyond.
+vec3 ddgi_cascade(int c, vec3 P, vec3 N, vec3 V, out float total) {
+    float spacing = DDGI_SPACING(c);
+    vec3 biased = P + (N * 0.2 + V * 0.8) * (0.3 * spacing);
+    vec3 gridPos = ddgi_grid(c, biased);
+    ivec3 g0 = ivec3(floor(gridPos));
+    vec3 alpha = clamp(gridPos - vec3(g0), 0.0, 1.0);
+    vec3 sum = vec3(0.0);
+    total = 0.0;
+    for (int i = 0; i < 8; i++) {
+        ivec3 offset = ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        ivec3 g = clamp(g0 + offset, ivec3(0), ivec3(DDGI_DIMS.xyz) - 1);
+        int index = ddgi_index(c, ddgi_slot(c, g));
+        if (!ddgi_on(c, g, index)) continue;
+        vec3 probe = ddgi_probe_position(c, g, index);
+        vec3 tri = mix(1.0 - alpha, alpha, vec3(offset));
+        float weight = tri.x * tri.y * tri.z;
+        vec3 toProbe = probe - P;
+        vec3 dirToProbe = normalize(toProbe);
+        float facing = (dot(dirToProbe, N) + 1.0) * 0.5;
+        weight *= facing * facing + 0.2;
+        vec3 fromProbe = biased - probe;
+        float dist = length(fromProbe);
+        vec2 moments = textureLod(DDGI_DISTANCE, ddgi_uv(index, fromProbe / max(dist, 1e-4), float(DDGI_DIST), DDGI_ATLAS.zw), 0.0).rg;
+        float variance = abs(moments.x * moments.x - moments.y);
+        float visible = 1.0;
+        if (dist > moments.x) {
+            float d = dist - moments.x;
+            visible = variance / (variance + d * d);
+            visible = max(visible * visible * visible, 0.0);
+        }
+        weight *= max(visible, 0.05);
+        // Small weights crushed, so a probe that barely sees the point does
+        // not tint it (Majercik et al.'s threshold).
+        if (weight < 0.2) weight *= weight * weight / 0.04;
+        vec3 irradiance = textureLod(DDGI_IRRADIANCE, ddgi_uv(index, N, float(DDGI_IRR), DDGI_ATLAS.xy), 0.0).rgb;
+        sum += irradiance * weight;
+        total += weight;
+    }
+    if (total <= 0.0) return vec3(0.0);
+    return sum / total * 3.14159265;
+}
+
+// How far inside cascade c point P is, in cells from its nearest face: past
+// one the cascade is whole; under it, the next one out takes over.
+float ddgi_inside(int c, vec3 P) {
+    vec3 gridPos = ddgi_grid(c, P);
+    vec3 edge = min(gridPos, (DDGI_DIMS.xyz - 1.0) - gridPos);
+    return min(edge.x, min(edge.y, edge.z));
+}
+
+// The probes' irradiance at P onto N, the nearest cascade that holds it
+// blending into the next over its last cell, and beyond the last the
+// `beyond` irradiance (the sky's) over the far cascade's last cell. From
+// the near cascade out, so a point the near one holds whole reads its
+// eight probes and no more.
+vec3 ddgi_irradiance(vec3 P, vec3 N, vec3 V, vec3 beyond) {
+    vec3 result = vec3(0.0);
+    float left = 1.0;
+    for (int c = 0; c < DDGI_CASCADES; c++) {
+        float inside = ddgi_inside(c, P);
+        if (inside <= 0.0) continue;
+        float total;
+        vec3 e = ddgi_cascade(c, P, N, V, total);
+        if (total <= 0.0) continue;
+        float share = clamp(inside, 0.0, 1.0) * left;
+        result += e * share;
+        left -= share;
+        if (left <= 0.0) return result;
+    }
+    return result + beyond * left;
+}
+#endif
 
 // The sky mirrored along r off a surface of `rough`: one read between the
 // two levels it lies between. Every level is laid out as level 0 is (as a
@@ -1564,9 +1707,14 @@ vec3 sky_reflection(vec3 r, float rough) {
 // and its reflection, prefiltered by the roughness and scaled by the split
 // sum. A material that turns image-based lighting off keeps the diffuse.
 vec3 sky_light(vec3 N, vec3 V, vec3 albedo, vec3 F0, float rough, float metal, float NdotV) {
+    if (giOff != 0) return vec3(0.0);
     vec3 F = F0 + (max(vec3(1.0 - rough), F0) - F0) * pow(1.0 - NdotV, 5.0);
     vec3 kD = (vec3(1.0) - F) * (1.0 - metal);
-    vec3 diffuse = kD * albedo * sky_irradiance(N) / 3.14159265;
+    vec3 irradiance = sky_irradiance(N);
+#ifdef AE3D_RAY_QUERY
+    if (ddgiOn != 0) irradiance = ddgi_irradiance(FragPos, N, V, irradiance);
+#endif
+    vec3 diffuse = kD * albedo * irradiance / 3.14159265;
     if (!enableImageBasedLighting) return diffuse;
     vec2 ab = texture(brdfLut, vec2(NdotV, rough)).rg;
     vec3 specular = sky_reflection(reflect(-V, N), rough) * (F0 * ab.x + ab.y);
@@ -1799,10 +1947,6 @@ void main() {
 	// Volumetric lighting (with distance LOD built-in)
 	vec3 volumetric = calculateVolumetricLighting(FragPos, lights[0].position, viewPos);
 	color += volumetric;
-    
-	// Global Illumination (with distance LOD built-in)
-	vec3 gi = calculateGlobalIllumination(FragPos, norm, albedo, distanceToCamera);
-	color += gi;
     
     color += caustic_light(FragPos, norm) * albedo;
 

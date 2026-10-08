@@ -129,8 +129,9 @@ finding accounts for what the pixels show. This is the cube under the roof in
            {"index": 0, "name": "sun", "mode": "directional", "radiance": 1.386, "onto_top": 0.346, "onto_side": 0.26},
            {"index": 1, "name": "lamp", "mode": "point", "distance": 23.324, "reach": 16, "onto_top": 0, "onto_side": 0,
             "note": "out of reach: 23.324 m away, its light stops at 16 m"}],
-         "direct_top": [0.375, 0.342, 0.3], "direct_side": [0.281, 0.257, 0.225], "sky": [0.085, 0.103, 0.124],
-         "direct_top_luminance": 0.346, "direct_side_luminance": 0.26, "sky_luminance": 0.101}},
+         "direct_top": [0.375, 0.342, 0.3], "direct_side": [0.281, 0.257, 0.225], "gi": "sky",
+         "indirect": [0.085, 0.103, 0.124],
+         "direct_top_luminance": 0.346, "direct_side_luminance": 0.26, "indirect_luminance": 0.101}},
       {"stage": "shadow", "flagged": true, "finding": "in the shadow of roof", "detail": {"shadows": true,
          "key_light": "sun", "centre_blocked_by": "roof", "top_blocked_by": "roof"}},
       {"stage": "exposure", "flagged": false, "detail": {"material": 1, "frame": 1, "eye_adaptation": false, "total": 1}},
@@ -154,9 +155,11 @@ The stages:
   surface the camera sees there (`side_normal`, the face a ray from the eye
   through the centre meets first), as it multiplies the albedo: a light's
   colour by its temperature, a point light's fall-off, the reach past which
-  the shader skips it, a spot light's cone, and the sky's light as the
-  renderer captured it this frame: its irradiance onto that surface over pi
-  (`sky`). A light that gives nothing says why: out of reach, outside its
+  the shader skips it, a spot light's cone; and the light that is not the
+  lights', by the global illumination in effect (`gi`: `rt` the probes'
+  light at that point, the sky's beyond them; `sky` the sky's as the
+  renderer captured it this frame; `off` none): its irradiance onto that
+  surface over pi (`indirect`). A light that gives nothing says why: out of reach, outside its
   cone, behind the model, below the horizon. Flagged when no direct light
   reaches the side the camera sees.
 - `shadow`: whether the model's centre and top can see the key light, by a

@@ -25,6 +25,7 @@ import ae3d.vktexture
 import ae3d.vkmesh
 import ae3d.vkdevice
 import ae3d.vkrays
+import ae3d.vkddgi
 import ae3d.vkcrowd
 import ae3d.vkframe
 import ae3d.vkdesc
@@ -45,7 +46,7 @@ exports (
     renderer_set_normal_strength, renderer_set_occlusion_strength, renderer_set_capture_channel, renderer_set_wetness, renderer_set_frame_exposure, renderer_set_meter, renderer_meter, renderer_material_texture_size,
     renderer_load_texture, renderer_release_texture, renderer_sample_count, renderer_set_post,
     renderer_set_bloom_intensity, renderer_bloom_intensity, renderer_sky_irradiance,
-    renderer_set_shadows, renderer_shadows, renderer_set_ssr, renderer_ssr, renderer_set_ssr_params, renderer_ssr_road_height, renderer_ssr_strength, renderer_set_taa, renderer_taa, request_dlss, dlss_available, renderer_set_dlss, renderer_dlss, set_samples, renderer_ray_query, renderer_set_ray_shadows, renderer_ray_shadows, renderer_set_sun_size, renderer_sun_size, renderer_set_ray_occlusion, renderer_ray_occlusion, renderer_set_lamp_size, renderer_set_ray_budget, renderer_ray_budget, renderer_ray_figures, renderer_ray_reach, renderer_set_ray_skinned, renderer_ray_skinned, renderer_map_drawn, renderer_add_light, renderer_remove_light,
+    renderer_set_shadows, renderer_shadows, renderer_set_ssr, renderer_ssr, renderer_set_ssr_params, renderer_ssr_road_height, renderer_ssr_strength, renderer_set_taa, renderer_taa, request_dlss, dlss_available, renderer_set_dlss, renderer_dlss, set_samples, renderer_ray_query, renderer_set_ray_shadows, renderer_ray_shadows, renderer_set_gi, renderer_gi, renderer_set_gi_probes, renderer_indirect_irradiance, renderer_set_sun_size, renderer_sun_size, renderer_set_ray_occlusion, renderer_ray_occlusion, renderer_set_lamp_size, renderer_set_ray_budget, renderer_ray_budget, renderer_ray_figures, renderer_ray_reach, renderer_set_ray_skinned, renderer_ray_skinned, renderer_map_drawn, renderer_add_light, renderer_remove_light,
     renderer_set_fog, renderer_fog, renderer_set_clouds, renderer_set_sky_overcast, renderer_set_sky_turbidity, renderer_set_sky_sun, renderer_set_shadow_distance, renderer_shadow_distance,
     renderer_set_ssao, renderer_ssao,
     skybox_create, skybox_free,
@@ -123,6 +124,8 @@ struct VKRenderer {
     ray_occlusion: bool
     // The radius of a lamp's face in metres, for the rays' lamp shadows.
     lamp_radius: float
+    // The global illumination asked for (core.GI_*).
+    gi: int
     textures: ptr
     frustum: ptr
     skybox: ptr
@@ -296,6 +299,7 @@ renderer_new() -> *VKRenderer {
     r.sun_angle = 0.0
     r.ray_occlusion = false
     r.lamp_radius = 0.12
+    r.gi = core.gi_from_env(core.GI_AUTO)
     r.batches = list.new()
     r.shadow_batches = list.new()
     r.shadow_batch_count = 0
@@ -414,6 +418,7 @@ renderer_init(r: *VKRenderer, window: ptr, width: int, height: int) -> int {
     ensure_cloud_textures(r, false)
     println("ae3d: Vulkan on ${vkdevice.name()}, ${vkframe.sample_count()}x MSAA")
     r.initialized = true
+    apply_gi(r)
 
     r.screen_mesh = core.mesh_create()
     core.mesh_push_screen_quad(r.screen_mesh)
@@ -591,6 +596,74 @@ renderer_set_ray_shadows(r: *VKRenderer, on: bool) {
 
 renderer_ray_shadows(r: *VKRenderer) -> bool { return vkrays.shadows() }
 
+// The global illumination asked for (core.GI_*): GI_RT, the probes
+// (ae3d.vkddgi) -- the sky's light and every bounce of it -- where the
+// device traces; GI_AUTO the probes on a GPU that traces and the sky's
+// light elsewhere, a software rasterizer included, which would trace a
+// frame's probes in seconds; GI_SKY the sky's light alone; GI_OFF the
+// direct light only. Applied at once when the backend is up.
+renderer_set_gi(r: *VKRenderer, mode: int) {
+    if r == null { return }
+    r.gi = mode
+    if r.initialized { apply_gi(r) }
+}
+
+// The probes' volume: `x` by `y` by `z` probes a cascade round the camera,
+// the near cascade's `near` metres apart and the far one's `far`, and one
+// probe in `share` traced a frame (32 by 8 by 32, 2 m and 8 m, one in four
+// unless set). Made again at once where the probes are on.
+renderer_set_gi_probes(r: *VKRenderer, x: int, y: int, z: int, near: float, far: float, share: int) {
+    if r == null || x < 2 || y < 2 || z < 2 || near <= 0.0 || far < near { return }
+    on = vkddgi.ready()
+    if on { vkddgi.stop() }
+    vkddgi.set_grid(x, y, z, near, far)
+    vkddgi.set_share(share)
+    if on {
+        if !vkddgi.start() {
+            println("ae3d: the probes' light did not start (${vkdevice.last_error()})")
+            vkddgi.stop()
+        }
+        vkrays.set_probes(vkddgi.ready())
+    }
+}
+
+// The light that is not the lights' onto a surface at `p` facing `n`, seen
+// along `v` (toward the eye): the probes' where they are on, the sky's
+// beyond them; the sky's alone under GI_SKY; none under GI_OFF. What a
+// question about a surface (ae3d.agent) is answered with.
+renderer_indirect_irradiance(r: *VKRenderer, p: Vec3, n: Vec3, v: Vec3) -> Vec3 {
+    if renderer_gi(r) == core.GI_OFF { return core.vec3(0.0, 0.0, 0.0) }
+    sky = renderer_sky_irradiance(r, n)
+    if !vkddgi.ready() { return sky }
+    probes = vkddgi.irradiance_at(p, n, v)
+    return core.vec3(probes.x + sky.x * probes.w, probes.y + sky.y * probes.w, probes.z + sky.z * probes.w)
+}
+
+// What is in effect: GI_RT, GI_SKY or GI_OFF.
+renderer_gi(r: *VKRenderer) -> int {
+    if r == null || r.gi == core.GI_OFF { return core.GI_OFF }
+    if vkddgi.ready() { return core.GI_RT }
+    return core.GI_SKY
+}
+
+// The probes made or let go for what was asked, the device idle: GI_RT on
+// a device that offers them (vkddgi.offered), GI_AUTO on one that is not a
+// CPU. Probes that
+// would not make are said, and the frame has the sky's light.
+apply_gi(r: *VKRenderer) {
+    want = vkddgi.offered() && (r.gi == core.GI_RT || (r.gi == core.GI_AUTO && !vkdevice.software()))
+    if want == vkddgi.ready() { return }
+    if want {
+        if !vkddgi.start() {
+            println("ae3d: the probes' light did not start (${vkdevice.last_error()})")
+            vkddgi.stop()
+        }
+    } else {
+        vkddgi.stop()
+    }
+    vkrays.set_probes(vkddgi.ready())
+}
+
 // How many of a crowd's figures the rays take a frame: the nearest that
 // many, the reach following the crowd's density so they stay about that
 // many (0: no limit but the shadow distance). 2048 unless set. What the
@@ -653,14 +726,34 @@ renderer_set_lamp_size(r: *VKRenderer, metres: float) {
 // frame instead (skin_traced), a crowd by its pose structures
 // (crowd_traced), and a point stream keeps the map.
 traced(m: *Model) -> bool {
-    if m == null || !m.visible || !m.casts_shadow || m.vbo == 0 { return false }
-    if m.skeleton != null || m.pose_bank != null || m.device_crowd != null { return false }
-    if m.is_instanced && core.model_instance_points(m) { return false }
-    if m.depth_proxy != null { return false }
+    if !in_structure(m) || !m.casts_shadow { return false }
     // A cut model's shadow is the map's, whose depth pass drops its far
     // side: a ray would meet the whole mesh.
     if m.clip_on || m.wound_count > 0 { return false }
     return true
+}
+
+// A static mesh the frame's structure can hold, drawn on its own or
+// through a matrix stream.
+in_structure(m: *Model) -> bool {
+    if m == null || !m.visible || m.vbo == 0 { return false }
+    if m.skeleton != null || m.pose_bank != null || m.device_crowd != null { return false }
+    if m.is_instanced && core.model_instance_points(m) { return false }
+    if m.depth_proxy != null { return false }
+    return true
+}
+
+// What the frame's structure holds a model as (vkrays.RAY_SHADOW,
+// RAY_PROBES), 0 for nothing: what casts a shadow, which the scene's shadow
+// rays meet where they are on and the probes' hits' always do; and with the
+// probes on every static mesh shown -- a floor that casts no shadow still
+// bounces the light that falls on it, and a cut model bounces as the whole
+// it stands for.
+ray_mask(m: *Model) -> int {
+    mask = 0
+    if traced(m) { mask = vkrays.RAY_SHADOW }
+    if vkrays.probes() && in_structure(m) { mask = mask | vkrays.RAY_PROBES }
+    return mask
 }
 
 // A crowd model whose figures the rays hold: its crowd has pose
@@ -708,7 +801,7 @@ skin_traced(m: *Model) -> bool {
 // map. Before the frame's room is reserved, which counts them.
 choose_skinned(r: *VKRenderer, cam: *Camera) {
     list.clear(r.skinned_rays)
-    if !vkrays.shadows() || vkrays.skin_budget() <= 0 { return }
+    if !vkrays.traced() || vkrays.skin_budget() <= 0 { return }
     reach = r.shadow_distance
     count = list.size(r.models)
     i = 0
@@ -760,9 +853,13 @@ pose_skinned(r: *VKRenderer) {
         sk = m.skeleton as *Skeleton
         skin.skeleton_update(sk)
         bones = skin.skeleton_count(sk)
-        vkrays.skin_pose(m.vbo, vkmesh.vertex_buffer(m.vbo), vkmesh.skin_buffer(m.vbo), vkmesh.index_buffer(m.vbo),
-                         vkmesh.vertex_count(m.vbo), vkmesh.index_count(m.vbo),
-                         core.palette_data(skin.skeleton_palette(sk)), bones, (&m.model_matrix) as ptr)
+        if vkrays.skin_pose(m.vbo, vkmesh.vertex_buffer(m.vbo), vkmesh.skin_buffer(m.vbo), vkmesh.index_buffer(m.vbo),
+                            vkmesh.vertex_count(m.vbo), vkmesh.index_count(m.vbo),
+                            core.palette_data(skin.skeleton_palette(sk)), bones) {
+            record = 0
+            if vkrays.probes() { record = probe_record(m, vkrays.skin_vertices(m.vbo), vkrays.skin_indices(m.vbo), 3) }
+            vkrays.add_one(vkrays.skin_structure(m.vbo), (&m.model_matrix) as ptr, figure_mask(), record)
+        }
         i = i + 1
     }
     vkrays.skin_end()
@@ -773,7 +870,7 @@ pose_skinned(r: *VKRenderer) {
 // instances -- before any sort records into it, since the buffer cannot
 // be remade once one has.
 reserve_ray_scene(r: *VKRenderer) {
-    if !vkrays.shadows() { return }
+    if !vkrays.traced() { return }
     // The crowd's figures in the rays reach as far as the map did.
     vkrays.set_reach(r.shadow_distance)
     // The skinned figures chosen for the rays take a slot each.
@@ -783,7 +880,7 @@ reserve_ray_scene(r: *VKRenderer) {
     i = 0
     while i < count {
         m = list.get_raw(r.models, i) as *Model
-        if traced(m) {
+        if ray_mask(m) != 0 {
             if m.is_instanced { statics = statics + core.model_instance_count(m) } else { statics = statics + 1 }
         } else if crowd_traced(m) {
             dc = m.device_crowd as *DeviceCrowd
@@ -804,7 +901,7 @@ reserve_ray_scene(r: *VKRenderer) {
 build_ray_scene(r: *VKRenderer) {
     // Not traced this frame: the slot still has a structure, empty if it
     // never had another, for the pipelines' binding.
-    if !vkrays.shadows() {
+    if !vkrays.traced() {
         vkrays.empty()
         return
     }
@@ -812,12 +909,17 @@ build_ray_scene(r: *VKRenderer) {
     i = 0
     while i < count {
         m = list.get_raw(r.models, i) as *Model
-        if traced(m) {
+        mask = ray_mask(m)
+        if mask != 0 {
             core.model_sync_transform(m)
+            record = 0
+            if vkrays.probes() {
+                record = probe_record(m, vkmesh.vertex_address(m.vbo), vkmesh.index_address(m.vbo), vkmesh.STRIDE / 4)
+            }
             if m.is_instanced && core.model_instance_count(m) > 0 {
-                vkrays.add(vkmesh.blas_address(m.vbo), geometry.inst_matrix_data(m.instances), core.model_instance_count(m))
+                vkrays.add(vkmesh.blas_address(m.vbo), geometry.inst_matrix_data(m.instances), core.model_instance_count(m), mask, record)
             } else if !m.is_instanced {
-                vkrays.add_one(vkmesh.blas_address(m.vbo), (&m.model_matrix) as ptr)
+                vkrays.add_one(vkmesh.blas_address(m.vbo), (&m.model_matrix) as ptr, mask, record)
             }
         }
         i = i + 1
@@ -825,6 +927,72 @@ build_ray_scene(r: *VKRenderer) {
     pose_skinned(r)
     // Nothing traced in view this frame: an empty structure all the same.
     if !vkrays.build() { vkrays.empty() }
+}
+
+// What a skinned figure posed into the rays is held as: a caster, and seen
+// by the probes where they are on.
+figure_mask() -> int {
+    if vkrays.probes() { return vkrays.RAY_SHADOW | vkrays.RAY_PROBES }
+    return vkrays.RAY_SHADOW
+}
+
+// The probes' record of a model's surface (ae3d.vkddgi) for this frame,
+// its triangles read from `vertices` and `indices` (device addresses),
+// `stride` floats a vertex: its materials, each group by its share of the
+// mesh's indices, as probe_surface takes them.
+probe_record(m: *Model, vertices: long, indices: long, stride: int) -> int {
+    sums = calloc(7, 8) as float[]
+    groups = 0
+    if m != null { groups = core.model_group_count(m) }
+    if m == null {
+        probe_surface(sums, null, 1.0)
+    } else if groups > 0 {
+        i = 0
+        while i < groups {
+            group = core.model_group(m, i)
+            if group != null { probe_surface(sums, group.material, group.index_count as float) }
+            i = i + 1
+        }
+    } else {
+        probe_surface(sums, m.material, 1.0)
+    }
+    weight = sums[6]
+    if weight <= 0.0 { weight = 1.0 }
+    record = vkddgi.record(vertices, indices, stride,
+                           core.vec3(sums[0] / weight, sums[1] / weight, sums[2] / weight),
+                           core.vec3(sums[3] / weight, sums[4] / weight, sums[5] / weight))
+    free(sums as ptr)
+    return record
+}
+
+// A material's surface as a probe's ray sees it, by `weight` into `sums`
+// (albedo rgb, glow rgb, the weights): its diffuse colour by its texture's
+// mean light, less what a metal reflects as a mirror; or, emissive (an
+// exposure past 10, as the scene shader takes it), that colour as its glow
+// and no albedo. No material is the scene's default white.
+probe_surface(sums: float[], material: *Material, weight: float) {
+    sums[6] = sums[6] + weight
+    if material == null {
+        sums[0] = sums[0] + weight
+        sums[1] = sums[1] + weight
+        sums[2] = sums[2] + weight
+        return
+    }
+    tint = vktexture.mean_of(material.texture_id)
+    cr = material.diffuse.x * tint.x
+    cg = material.diffuse.y * tint.y
+    cb = material.diffuse.z * tint.z
+    if material.exposure > 10.0 {
+        glow = material.exposure * 0.1 * weight
+        sums[3] = sums[3] + cr * glow
+        sums[4] = sums[4] + cg * glow
+        sums[5] = sums[5] + cb * glow
+        return
+    }
+    diffuse = (1.0 - material.metallic) * weight
+    sums[0] = sums[0] + cr * diffuse
+    sums[1] = sums[1] + cg * diffuse
+    sums[2] = sums[2] + cb * diffuse
 }
 
 // The multisampling the frame takes, asked for before the backend starts:
@@ -1504,12 +1672,56 @@ sort_device_crowds(r: *VKRenderer, cam: *Camera) {
                 dc.sorted_serial = r.sort_serial
                 if dc.count > 0 && vkcrowd.fill(dc.handle, dc.pos, dc.yaw, dc.phase, dc.col, dc.start, dc.count) > 0 {
                     vkcrowd.sort(dc.handle, dc.cx, dc.cz, dc.near_dist, dc.mid_dist, dc.cull_dist, crowd_casts(r, dc),
-                                 cam.position.x, cam.position.y, cam.position.z, cam.front.x, cam.front.y, cam.front.z, cone)
+                                 cam.position.x, cam.position.y, cam.position.z, cam.front.x, cam.front.y, cam.front.z, cone,
+                                 crowd_records(r, dc))
                 }
             }
         }
         i = i + 1
     }
+}
+
+// The probes' records of a crowd's poses for this frame, where the probes
+// are on and the crowd is in the rays: one a frame of its far mesh's, posed,
+// then one a frame of its near band's where the near band is traced as its
+// own mesh (as vkcrowd.sort decides it), each of its tier's first part's
+// surface. The first's index, or 0.
+crowd_records(r: *VKRenderer, dc: *DeviceCrowd) -> int {
+    if !vkrays.probes() || !vkrays.pose_ready(dc.poses) { return 0 }
+    frames = vkrays.pose_frames(dc.poses)
+    first = crowd_poses_recorded(crowd_tier_model(r, dc, true), dc.poses, frames)
+    near = vkrays.pose_ready(dc.near_poses) && vkrays.pose_frames(dc.near_poses) == frames
+    if near { crowd_poses_recorded(crowd_tier_model(r, dc, false), dc.near_poses, frames) }
+    if first < 0 { return 0 }
+    return first
+}
+
+crowd_poses_recorded(m: *Model, poses: int, frames: int) -> int {
+    first = 0 - 1
+    f = 0
+    while f < frames {
+        record = probe_record(m, vkrays.pose_vertices(poses, f), vkrays.pose_indices(poses), 3)
+        if f == 0 { first = record }
+        f = f + 1
+    }
+    return first
+}
+
+// The model drawing a crowd's far tier's first part (`far`), or its near
+// tier's: whose materials its figures are made of.
+crowd_tier_model(r: *VKRenderer, dc: *DeviceCrowd, far: bool) -> *Model {
+    found = null as *Model
+    count = list.size(r.models)
+    i = 0
+    while i < count {
+        m = list.get_raw(r.models, i) as *Model
+        if m != null && m.device_crowd == dc as ptr && m.device_part == 0 {
+            if far && (found == null || m.device_tier > found.device_tier) { found = m }
+            if !far && m.device_tier == 0 { return m }
+        }
+        i = i + 1
+    }
+    return found
 }
 
 // How far from a figure's feet all of it can reach: its near mesh's bounds
@@ -2491,6 +2703,39 @@ prepare_clusters(r: *VKRenderer, key: *Light, cam: *Camera) {
     memcpy(vkframe.clusters_words(), lightgrid.word_data(g), word_bytes as long)
 }
 
+// The frame's clustered lamps, which the probes' hits are lit by too.
+lamp_count(r: *VKRenderer) -> int {
+    if r.light_grid == null { return 0 }
+    return lightgrid.light_count(r.light_grid as *LightGrid)
+}
+
+// Where the probes are and how to read them, into the current program's
+// block; off where they are not on.
+probe_uniforms() {
+    if !vkddgi.ready() {
+        vkdesc.set_int(vkscene.OFF_DDGION, 0)
+        return
+    }
+    vkdesc.set_int(vkscene.OFF_DDGION, 1)
+    dims = vkddgi.dims()
+    vkdesc.set_float(vkscene.OFF_DDGIDIMS, dims.x)
+    vkdesc.set_float(vkscene.OFF_DDGIDIMS + 4, dims.y)
+    vkdesc.set_float(vkscene.OFF_DDGIDIMS + 8, dims.z)
+    vkdesc.set_float(vkscene.OFF_DDGIDIMS + 12, dims.w)
+    c = 0
+    while c < vkddgi.CASCADES {
+        base = vkddgi.base_cell(c)
+        vkdesc.set_vec3(vkscene.OFF_DDGIBASE + c * 16, base.x, base.y, base.z)
+        vkdesc.set_float(vkscene.OFF_DDGISPACING + c * 4, vkddgi.spacing(c))
+        c = c + 1
+    }
+    atlas = vkddgi.atlas_size()
+    vkdesc.set_float(vkscene.OFF_DDGIATLAS, atlas.x)
+    vkdesc.set_float(vkscene.OFF_DDGIATLAS + 4, atlas.y)
+    vkdesc.set_float(vkscene.OFF_DDGIATLAS + 8, atlas.z)
+    vkdesc.set_float(vkscene.OFF_DDGIATLAS + 12, atlas.w)
+}
+
 // The grid's shape and the matrices a pixel finds its cell by.
 cluster_uniforms(r: *VKRenderer) {
     cells = 0
@@ -2614,8 +2859,10 @@ renderer_render(r: *VKRenderer, cam: *Camera, light: *Light) {
         return
     }
     upload_damage(r)
-    // The frame's structure starts empty and every crowd unsorted.
+    // The frame's structure starts empty, with no probes' records, and
+    // every crowd unsorted.
     vkrays.begin()
+    vkddgi.begin()
     vkcrowd.frame_start()
     // Which lamps have a shadow of their own this frame, before the clusters
     // are cut: each clustered lamp carries its slot.
@@ -2727,10 +2974,20 @@ renderer_render(r: *VKRenderer, cam: *Camera, light: *Light) {
     // program's block says it has or not.
     history = 0
     if ssao_on && vkframe.occlusion_pass() { history = 1 }
+    // The probes' share of the frame, traced through the structure and lit
+    // by the sky just captured, before the pass that reads them.
+    if vkddgi.ready() {
+        vkddgi.dispatch(cam.position, r.lights, active_light, vkdesc.clusters_buffer(vkframe.frame_slot()), lamp_count(r),
+                        vksky.reflections_view(), vksky.reflections_sampler())
+    }
+    gi_off = 0
+    if r.gi == core.GI_OFF { gi_off = 1 }
     k = 0
     while k < programs {
         vkdesc.set_program(k)
         vkdesc.set_int(vkscene.OFF_OCCLUSIONHISTORY, history)
+        vkdesc.set_int(vkscene.OFF_GIOFF, gi_off)
+        probe_uniforms()
         k = k + 1
     }
     // The sky, first into the pass, after the blocks carry the frame's
@@ -3126,6 +3383,7 @@ renderer_cleanup(r: *VKRenderer) {
         i = i + 1
     }
     list.clear(r.models)
+    vkddgi.stop()
     vksky.stop()
     vkcrowd.stop()
     vkrays.stop()

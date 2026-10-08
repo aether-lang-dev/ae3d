@@ -107,7 +107,7 @@ GPU_SUITES="test_agent test_agent_attached test_agent_components test_agent_expl
     test_crowd_ecs test_crowd_render test_crowd_render_scale
     test_culling test_damage test_depth_clear test_depth_proxy test_device_crowd
     test_dlss test_ecs_render test_engine_shadows test_engine_skybox
-    test_figure test_fog test_gameobjects test_gltf_crowd test_hdr test_hierarchy
+    test_figure test_fog test_gameobjects test_gi test_gltf_crowd test_hdr test_hierarchy
     test_hud_layout test_impostor test_instance_colours test_instance_positions test_interpolation
     test_instance_streams test_instances test_lamp_clusters
     test_lamp_shadows test_lights test_mesh_edit test_model_mesh
@@ -570,7 +570,7 @@ step "Vulkan under the validation layer, synchronization included"
 # the layer reports fails the suite. The loader names every layer it inserts
 # when asked (VK_LOADER_DEBUG=layer): a run it did not insert the layer into
 # would pass having checked nothing, so that is a skip, never a pass.
-for name in test_fog test_overlay test_hud_layout test_damage test_backend_parity; do
+for name in test_fog test_overlay test_hud_layout test_damage test_backend_parity test_gi; do
     if ! built_ok "$name"; then
         skip "$name under the layer" "did not build"
         continue
@@ -598,6 +598,39 @@ for name in test_fog test_overlay test_hud_layout test_damage test_backend_parit
         pass "$name under the layer"
     else
         skip "$name under the layer" "$(printf '%s' "$output" | grep -m1 "SKIP" | sed 's/.*SKIP *//')"
+    fi
+done
+
+fi
+
+if in_tier suites; then
+step "the probes' light over the ray suites"
+# The suites that put crowds, skinned figures and instance streams into the
+# rays, again with the probes on (AE3D_GI=rt, #537): every instance's record
+# is read by a probe's ray -- a crowd's pose frames, a posed figure's
+# vertices -- where a wrong address loses the device. GI_AUTO keeps a
+# software rasterizer on the sky's light, so nothing else here runs them.
+for name in test_ray_shadows test_ray_occlusion; do
+    if ! built_ok "$name"; then
+        skip "$name with the probes" "did not build"
+        continue
+    fi
+    if ! have_display; then
+        skip "$name with the probes" "no display"
+        continue
+    fi
+    output="$(AE3D_GI=rt AE3D_FRAMES="$FRAMES" bounded "$RUN_LIMIT" ./build/"$name" 2>&1)"
+    probes_status=$?
+    if [ "$probes_status" -ne 0 ]; then
+        fail "$name with the probes$(died_on "$probes_status")"
+        printf '%s\n' "$output" | sed 's/^/        /' | tail -10
+    elif printf '%s' "$output" | grep -q "all checks passed"; then
+        pass "$name with the probes"
+    elif printf '%s' "$output" | grep -q "SKIP" && ! printf '%s' "$output" | grep -q "FAIL"; then
+        skip "$name with the probes" "$(printf '%s' "$output" | grep -m1 "SKIP" | sed 's/.*SKIP *//')"
+    else
+        fail "$name with the probes"
+        printf '%s\n' "$output" | sed 's/^/        /' | head -20
     fi
 done
 

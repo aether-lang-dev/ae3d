@@ -311,6 +311,72 @@ third place. Low down the daylight hands over to the dusk gradient the sky
 had, where the analytic model is weakest; the night keeps a moon's light a
 game needs.
 
+### The probes' light
+
+`engine_set_gi(e, mode)`, or `AE3D_GI=auto|rt|sky|off` on any program, picks
+the light that is not straight from a light (#537): `core.GI_RT`, the
+probes', the sky's light and every bounce of it, traced; `GI_SKY`, the sky's
+light alone, above; `GI_OFF`, none, the direct light only. `GI_AUTO`, the
+default, is the probes on a GPU that offers them and the sky's light
+elsewhere: on OpenGL, on a device without `VK_KHR_ray_query` or without the
+extended storage formats, and on a software rasterizer, which would trace a
+frame's probes in seconds. `engine_gi(e)` says what is in effect.
+
+The probes (Majercik et al., "Dynamic Diffuse Global Illumination with
+Ray-Traced Irradiance Fields", 2019) stand in two cascades round the
+camera, 32 by 8 by 32 each, 2 m and 8 m apart
+(`renderer_set_gi_probes`), each at its cell's centre, so a floor or a wall
+at a whole number of metres does not run through a row of them. A probe's
+slot is its world cell modulo the grid: the grid scrolls with the camera by
+whole cells and what a probe has learned stays where it learned it; a probe
+come to a new cell starts over and counts as off until it has traced.
+
+Each frame a quarter of the probes trace 128 rays each, spherical Fibonacci
+directions turned by a rotation of the frame's, through the frame's
+acceleration structure (`ae3d.vkddgi`, a compute pass after the sky's
+capture and before the scene). The structure holds every static mesh shown
+when the probes are on, not only what casts a shadow -- a floor that casts
+none still bounces the light that falls on it -- each instance's mask
+saying which it is, and the crowd's figures by their pose frames and the
+skinned figures as they are posed. A ray that meets nothing brings the
+sky's light back from its sharpest level. One that meets a surface reads
+its triangle by the instance's record -- the device addresses of its
+vertices and indices, its materials' colour by their textures' mean light,
+less what a metal mirrors, and its glow -- and lights it as the scene
+shader lights a diffuse surface: its glow, the directional lights and the
+frame's lamps through rays of their own toward each, and the probes' own
+light of the frame before at that point, so the light bounces on, a bounce
+a frame. A ray that meets a back is a probe inside something.
+
+The rays are folded into each probe's two octahedra, a texel of gutter
+round each: its irradiance, 6 texels a side, half floats (`RGBA16F`), every
+ray by its cosine to the texel's direction; and its distances, 14 a side,
+the mean and the mean square (`RG16F`), by the cosine to the fiftieth. A
+texel keeps 97% of what it had, all of it new when the probe has just come
+to its cell. A probe a quarter of whose rays met backs is off, and moves
+out through the nearest back; one nearer a face than 15% of its spacing
+moves toward the open side, never past its cell's 45%.
+
+The lit shader reads the eight probes round a point, at the point moved off
+the surface toward its normal and the eye: trilinear, each weighed by
+whether it faces the surface and whether, by its distances, it can see it
+(Chebyshev), small weights crushed. The near cascade blends into the far
+one over its last cell, the far one into the sky's light over its own. The
+result is the irradiance the sky's light was, so the rest of the shading --
+the occlusion on it, the reflections -- is as it was.
+
+What it costs: 128 rays for each of 4,096 probes a frame, and a shadow ray
+from each hit toward each directional light and each lamp in reach; the
+two atlases and the rays take 8 MiB, 16 MiB and 16 MiB, the state 512 KiB.
+`tests/test_gi` (lavapipe) holds the tiers to what they are for: a white
+wall over a red floor, lit only by the sun off the floor, takes it red
+(158 against 0 on the sky's tier); a sealed room under a grey sky stays
+dark inside (3 against the sky tier's 134) and a glowing panel inside it
+lights its far wall green; asked about the wall, the engine answers with
+the probes' reading (ae3d.agent's explain), not the sky's. The ray suites
+run again with the probes on, their crowds and posed figures read by the
+probes' rays (`ci.sh`).
+
 ### Motion vectors
 
 Beside its colour, every scene draw writes where its pixel's surface was
