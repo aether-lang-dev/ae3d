@@ -111,6 +111,10 @@ The feature list in full, with the reasoning behind each. The [README](../README
   parent's, so bones are ordinary models: a clip exported from Blender drives a
   bone exactly as it drives a part, and `ae3d.ik` solves a limb of bones
   without being told they belong to a skin.
+- **The sea mirrors the sky drawn (#742).** `water.simulation_set_sky_capture`
+  reflects the frame's own captured sky and lights the water by its
+  irradiance; the underside is drawn only when the eye is under the surface
+  over it (`tests/test_water_sky.ae`).
 - **Bodies that float (#637).** `water.simulation_height_at` and
   `simulation_normal_at` are the sea's surface on the CPU, the vertex
   shader's four trains summed the same way (a drawn vertex is within 3

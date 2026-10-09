@@ -201,13 +201,13 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float waterOpacity;
     bool enableFoam;
     float foamIntensity;
-    float waterPlaneHeight;
     float waterLevel;
     vec3 skyColor;
     vec3 horizonColor;
     bool enableWaterReflection;
     float waterReflectionIntensity;
     int hasSkyTexture;
+    int waterSkyCapture;
     float waterDepthFade;
     float waterShoreFoam;
     bool enableWaterDistortion;

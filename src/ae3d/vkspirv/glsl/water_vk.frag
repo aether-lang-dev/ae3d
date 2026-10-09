@@ -197,13 +197,13 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float waterOpacity;
     bool enableFoam;
     float foamIntensity;
-    float waterPlaneHeight;
     float waterLevel;
     vec3 skyColor;
     vec3 horizonColor;
     bool enableWaterReflection;
     float waterReflectionIntensity;
     int hasSkyTexture;
+    int waterSkyCapture;
     float waterDepthFade;
     float waterShoreFoam;
     bool enableWaterDistortion;
@@ -263,7 +263,7 @@ layout(location = 2) in vec3 fragPosition;
 // up for a rough sea.
 
 
-
+layout(location = 5) in float EyeBelow;
 // The still level the waves rise and fall around, so a crest can be measured
 // against the water rather than against however high the world's zero happens
 // to be.
@@ -303,6 +303,26 @@ layout(location = 2) in vec3 fragPosition;
 // reflection stays the computed sky colour.
 
 
+// The sky the frame is lit by (#742): the engine's capture of it -- painted,
+// drawn from the sun, or the clear colour -- prefiltered into levels, read
+// where the reflected ray meets it, in place of the sky colours or the
+// image. 0 keeps those.
+
+// And the light it gives a surface facing up, its irradiance, which lights
+// the water's body and its foam in place of the sky colour.
+#ifdef VULKAN
+layout(set = 0, binding = 10) uniform sampler2D skyLight;
+layout(set = 0, binding = 12) uniform sampler2D skyIrradiance;
+#else
+
+
+#endif
+vec2 water_oct_uv(vec3 d, float size) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return ((p * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
 // What is under the water: the scene's depth as drawn before the water,
 // so a fragment knows how much water lies between its surface and the
 // ground beneath. Shallow water goes clear and pale and lays a line of foam
@@ -628,6 +648,9 @@ vec3 overcastSky(vec3 shown) {
 
 vec3 reflectedSky(vec3 ray) {
     ray.y = abs(ray.y);
+    // The captured sky at its sharpest level but one: water a mirror whose
+    // ripples finer than the mesh still soften it a little.
+    if (waterSkyCapture == 1) return textureLod(skyLight, water_oct_uv(normalize(ray), 256.0), 0.5).rgb;
     if (hasSkyTexture == 1) {
         float theta = atan(ray.z, ray.x);
         float phi = asin(clamp(ray.y, -1.0, 1.0));
@@ -707,6 +730,9 @@ void main() {
     // the two agree.
     vec3 sun = lightColor * lightIntensity;
     vec3 skyLight = display_radiance(overcastSky(skyColor));
+    // The captured sky's light from above, as radiance (its irradiance
+    // over pi), where the water mirrors the captured sky.
+    if (waterSkyCapture == 1) skyLight = texture(skyIrradiance, water_oct_uv(vec3(0.0, 1.0, 0.0), 16.0)).rgb / 3.14159265;
 
     // The sun's glitter: GGX, the surface a little rougher far off so the
     // highlight there is a path of light and not a scatter of aliased points.
@@ -798,8 +824,8 @@ void main() {
     alpha = mix(alpha, 1.0, foam);
 
     // Underwater camera effect (when camera is below water surface)
-    float underwaterDepth = max(0.0, waterPlaneHeight - viewPos.y);
-    if (underwaterDepth > 0.5) {
+    float underwaterDepth = max(0.0, EyeBelow);
+    if (underwaterDepth > 0.0) {
         // The surface from below is the sky coming through the swell, not a
         // ceiling lit by the fill. Straight overhead the sky comes through
         // brightest (Snell's window); toward the horizon the underside

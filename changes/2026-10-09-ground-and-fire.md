@@ -102,3 +102,14 @@
   whose start-up builds a world on the CPU ran 1.5 to 5 times slower so
   (smooth_terrain 4.7 s to 23.8) and say `// ci: optimised`, as do the
   scene tools that measure or render whole scenes.
+- **The sea mirrors the sky the engine drew, and knows the eye is above it
+  (#742).** `water.simulation_set_sky_capture` reflects the frame's own sky
+  capture (painted, drawn from the sun, or the clear colour) and lights the
+  water's body by its irradiance, in place of the colours a scene copied
+  in. And the underside is drawn only when the eye is under the surface
+  over it, from the same trains in the vertex shader: a fixed level five
+  metres over the sea's took an eye three metres up for under it, and the
+  sea from a boat drew as its own underside, flat and blue. Under a flat
+  green sky, the sea's own sky colour red, from 3 m up the sea is (40,
+  129, 56) and from 10 m under its underside (246, 12, 0), on both
+  renderers (`tests/test_water_sky.ae`). The floating example uses it.
