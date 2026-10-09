@@ -177,7 +177,17 @@ ae3d_runtime_library() {
 }
 
 # The runtime's DLL built from the toolchain's static library, when the
-# library is newer than the DLL or the DLL is missing: Windows only.
+# DLL is missing or was built from another archive: Windows only.
+#
+# Which archive is said by a stamp beside the DLL, the archive's path, size
+# and time: a newer-than test kept a newer toolchain's runtime when an
+# older one was switched to, and linked 0.791's programs against 0.793's.
+# Several builds at once (ci.sh's pool, the motion gate's 8) all found the
+# DLL stale after the toolchain changed and rebuilt it over each other,
+# through one scratch file: `comm: build/aether_runtime.defined: No such
+# file`, `ld returned 1` or 5, in 9 of 32 (#692). One builds it now, under a
+# lock, into names of its own moved into place; the rest wait and find it
+# built.
 #
 #   ae3d_runtime_build <cc> "<the toolchain's --libs>"
 ae3d_runtime_build() {
@@ -194,7 +204,53 @@ ae3d_runtime_build() {
         return 1
     fi
     ae3d_rt_lib="$(ae3d_runtime_library)"
-    if [ -f "$ae3d_rt_lib" ] && [ ! "$ae3d_rt_dir/libaether.a" -nt "$ae3d_rt_lib" ]; then return 0; fi
+    ae3d_rt_from="$(ae3d_runtime_stamp "$ae3d_rt_dir/libaether.a")"
+    ae3d_runtime_current "$ae3d_rt_lib" "$ae3d_rt_from" && return 0
+    mkdir -p build
+    ae3d_rt_lock="build/aether_runtime.lock"
+    ae3d_rt_waited=0
+    until mkdir "$ae3d_rt_lock" 2>/dev/null; do
+        # A build killed while holding it leaves the lock; a rebuild takes
+        # well under a minute.
+        if [ "$ae3d_rt_waited" -ge 120 ]; then
+            rmdir "$ae3d_rt_lock" 2>/dev/null
+            ae3d_rt_waited=0
+            continue
+        fi
+        sleep 1
+        ae3d_rt_waited=$((ae3d_rt_waited + 1))
+    done
+    if ae3d_runtime_current "$ae3d_rt_lib" "$ae3d_rt_from"; then
+        rmdir "$ae3d_rt_lock"
+        return 0
+    fi
+    ae3d_runtime_link "$1" "$2" "$ae3d_rt_dir" "$ae3d_rt_lib"
+    ae3d_rt_status=$?
+    [ "$ae3d_rt_status" -eq 0 ] && printf '%s\n' "$ae3d_rt_from" > "$ae3d_rt_lib.stamp"
+    rmdir "$ae3d_rt_lock"
+    return "$ae3d_rt_status"
+}
+
+# What says which archive a runtime DLL was built from: its path, size and
+# modification time.
+ae3d_runtime_stamp() {
+    printf '%s %s' "$1" "$(stat -c '%s %Y' "$1" 2>/dev/null)"
+}
+
+# Whether the DLL is there and was built from the archive `stamp` says.
+#
+#   ae3d_runtime_current <dll> <stamp>
+ae3d_runtime_current() {
+    [ -f "$1" ] && [ -f "$1.stamp" ] && [ "$(cat "$1.stamp")" = "$2" ]
+}
+
+# The DLL linked from the archive whole, into names of this build's own and
+# then moved over the DLL and its import library.
+#
+#   ae3d_runtime_link <cc> "<the toolchain's --libs>" <archive's directory> <dll>
+ae3d_runtime_link() {
+    ae3d_rt_dir="$3"
+    ae3d_rt_lib="$4"
     # What the runtime itself links: the toolchain's --libs without the
     # runtime's own name, and the optional libraries its archive calls into.
     # A program is given those only when it uses the module that needs them
@@ -209,19 +265,23 @@ ae3d_runtime_build() {
     done
     # Undefined in the archive as a whole: named by a member and defined by
     # none (PCRE2 is built into it, so its calls resolve inside).
-    nm --defined-only "$ae3d_rt_dir/libaether.a" 2>/dev/null | awk 'NF >= 3 {print $3}' | sort -u > build/aether_runtime.defined
+    ae3d_rt_new="build/aether_runtime.$$"
+    nm --defined-only "$ae3d_rt_dir/libaether.a" 2>/dev/null | awk 'NF >= 3 {print $3}' | sort -u > "$ae3d_rt_new.defined"
     ae3d_rt_undefined=" $(nm -u "$ae3d_rt_dir/libaether.a" 2>/dev/null | awk 'NF && $NF !~ /:$/ {print $NF}' | sort -u |
-        comm -23 - build/aether_runtime.defined | tr '\n' ' ')"
-    rm -f build/aether_runtime.defined
+        comm -23 - "$ae3d_rt_new.defined" | tr '\n' ' ')"
+    rm -f "$ae3d_rt_new.defined"
     case "$ae3d_rt_undefined" in *ZSTD_*) ae3d_rt_deps="$ae3d_rt_deps -lzstd" ;; esac
     case "$ae3d_rt_undefined" in *nghttp2_*) ae3d_rt_deps="$ae3d_rt_deps -lnghttp2" ;; esac
     case "$ae3d_rt_undefined" in *pcre2_*) ae3d_rt_deps="$ae3d_rt_deps -lpcre2-8" ;; esac
     case "$ae3d_rt_undefined" in *Brotli*) ae3d_rt_deps="$ae3d_rt_deps -lbrotlienc -lbrotlicommon" ;; esac
     case "$ae3d_rt_undefined" in *" fy_"*) ae3d_rt_deps="$ae3d_rt_deps -lfyaml" ;; esac
-    mkdir -p build
     # shellcheck disable=SC2086
-    "$1" -shared -Wl,--whole-archive "$ae3d_rt_dir/libaether.a" -Wl,--no-whole-archive \
-        -Wl,--out-implib,"$ae3d_rt_lib.a" $ae3d_rt_deps -o "$ae3d_rt_lib"
+    if ! "$1" -shared -Wl,--whole-archive "$ae3d_rt_dir/libaether.a" -Wl,--no-whole-archive \
+        -Wl,--out-implib,"$ae3d_rt_new.dll.a" $ae3d_rt_deps -o "$ae3d_rt_new.dll"; then
+        rm -f "$ae3d_rt_new.dll" "$ae3d_rt_new.dll.a"
+        return 1
+    fi
+    mv -f "$ae3d_rt_new.dll" "$ae3d_rt_lib" && mv -f "$ae3d_rt_new.dll.a" "$ae3d_rt_lib.a"
 }
 
 # The toolchain's --libs as a program or a script links them: the runtime
