@@ -131,8 +131,15 @@ back in the pose it had -- a clip's frame, or the pose the file saved --
 the bodies put on it and the root riding the pelvis as the two stand
 there, so dressing moves no bone and a figure dressed mid-clip starts in
 the clip's stance (#542). The rig's bind pose is then the
-ragdoll's rest pose: each joint's spring and limits sit where the
-reference's did about its rest, and the rotation a body carries to its
+ragdoll's rest pose: each joint's spring sits where the reference's did
+about its rest, and its limits are a person's ranges measured on the
+figure itself (aephysics.human's `human_anatomical_limits`: up from its
+pelvis to its neck, forward the way its toes point). Kept as the
+reference had them about its rest, the hips' cones turned with the
+pelvis body, fitted along the rig's pelvis bone: an MPFB one runs 20 to
+32.5 degrees up and back, each cone leaned that far forward of the
+figure, and a thigh hanging straight down was past it (#706). The
+rotation a body carries to its
 bone is a twist with no bend, so a spine that curves -- an MPFB human's
 leans 7 degrees forward, then 9 back, its neck's base 14 cm forward -- is
 held curved instead of driven straight. The figure is set down with its
