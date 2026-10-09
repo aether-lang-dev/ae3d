@@ -52,6 +52,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float cloudTime;
     vec3 cloudSun;
     float materialAlpha;
+    float materialCutout;
     float reflectivity;
     float wetness;
     bool hasNormalMap;
@@ -331,6 +332,10 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 
 
 
+
+// The texture's alpha under which the surface is a hole (0: never), before
+// anything else is decided -- an emissive particle is cut to its disc too
+// (#711).
 
 // How mirror-like the surface is. Zero is an ordinary matte surface whose
 // highlight fades as the view grazes it. Above zero the surface reflects the
@@ -1742,6 +1747,7 @@ void main() {
     outVelocity = velocity(ClipNow, ClipPrev, jitter);
 
     vec4 texColor = texture(textureSampler, fragTexCoord);
+    if (texColor.a < materialCutout) discard;
     
     // An emissive surface is its own light source, so it skips shading. It does
     // not skip having a colour: this returned a hardcoded white, which made an

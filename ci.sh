@@ -139,7 +139,7 @@ GPU_SUITES="test_agent test_agent_attached test_agent_components test_agent_expl
     test_hud_layout test_impostor test_instance_colours test_instance_positions test_interpolation
     test_instance_streams test_instances test_lamp_clusters
     test_lamp_shadows test_lights test_mesh_edit test_model_mesh
-    test_motion test_offscreen test_overlay test_physics
+    test_motion test_offscreen test_overlay test_particles_drawn test_physics
     test_ray_occlusion test_ray_shadows test_readback_buffers
     test_render test_render_scale test_scene_hold test_shading_isolation
     test_shading_knobs test_shadow_batches test_shadow_cascades test_sky_light
