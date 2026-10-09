@@ -158,6 +158,8 @@ aetherc_seconds=$((SECONDS - build_started))
 # loader, which ae3d.vkmeter's contrib.vulkan.vk calls through), as build.sh
 # links them: the engine's own are left to its library.
 AETHER_SOURCES="$(ae3d_program_sources "$GEN" "$ROOT")"
+# The directories its headers are in, as build.sh reads them.
+PROGRAM_INCLUDES="$(ae3d_program_includes "$GEN")"
 
 # Each file compiled to an object of its own, then linked, as build.sh does:
 # a compile is what a launcher can cache, and one command that compiled and
@@ -170,7 +172,7 @@ compile_started=$SECONDS
 for src in "$GEN" $UI_SOURCES $AETHER_SOURCES; do
     base="$(basename "$src")"
     obj="$PROGRAM_OBJ_DIR/${base%.*}.o"
-    $LAUNCHER "$CC" -c $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $UI_FLAGS $AETHER_COMPILE_FLAGS "$src" -o "$obj"
+    $LAUNCHER "$CC" -c $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $UI_FLAGS $AETHER_COMPILE_FLAGS $PROGRAM_INCLUDES "$src" -o "$obj"
     PROGRAM_OBJECTS="$PROGRAM_OBJECTS $obj"
 done
 cc_seconds=$((SECONDS - compile_started))
