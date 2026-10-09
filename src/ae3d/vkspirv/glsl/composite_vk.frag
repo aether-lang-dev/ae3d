@@ -159,6 +159,9 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float frameExposure;
     bool enableBloom;
     float bloomIntensity;
+    int hazeCount;
+    vec4 hazeColumn[4];
+    vec4 hazeShape[4];
     vec2 texelSize;
     int bloomFirst;
     float bloomThreshold;
@@ -232,6 +235,58 @@ layout(location = 0) out vec4 FragColor;
 
 
 
+// Heat haze (#738): up to four columns of hot air over fires, each a base
+// and a radius (hazeColumn) and a height, a strength and the phase its
+// shimmer has risen to (hazeShape), projected by the frame's own camera;
+// what is seen through one ripples, most just over the fire, rising.
+
+
+
+
+
+vec2 haze_screen(vec3 p, out float w) {
+    vec4 c = viewProjection * vec4(p, 1.0);
+    w = c.w;
+    return c.xy / max(c.w, 0.0001) * 0.5 + 0.5;
+}
+
+float haze_hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+float haze_noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(haze_hash(i), haze_hash(i + vec2(1.0, 0.0)), f.x),
+               mix(haze_hash(i + vec2(0.0, 1.0)), haze_hash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+
+// How far the image is pulled at `uv` by the hot air over it.
+vec2 haze_offset(vec2 uv) {
+    vec2 offset = vec2(0.0);
+    for (int k = 0; k < 4; k++) {
+        if (k >= hazeCount) break;
+        float wb;
+        float wt;
+        vec2 b = haze_screen(hazeColumn[k].xyz, wb);
+        vec2 t = haze_screen(hazeColumn[k].xyz + vec3(0.0, hazeShape[k].x, 0.0), wt);
+        if (wb <= 0.0 || wt <= 0.0) continue;
+        vec2 axis = t - b;
+        float len2 = dot(axis, axis);
+        if (len2 < 1e-10) continue;
+        float along = dot(uv - b, axis) / len2;
+        // Wider as it rises, as a plume spreads.
+        float width = hazeColumn[k].w * abs(viewProjection[0][0]) / wb * 0.5 * (1.0 + 0.6 * along);
+        float across = abs(uv.x - (b.x + axis.x * along)) / max(width, 1e-6);
+        if (along < 0.0 || along > 1.0 || across > 1.0) continue;
+        float amount = hazeShape[k].y * smoothstep(0.0, 0.08, along) * (1.0 - along) * (1.0 - across * across);
+        vec2 q = vec2(across * 3.0 + float(k) * 7.1, along * 7.0 - hazeShape[k].z);
+        vec2 n = vec2(haze_noise(q * 2.3), haze_noise(q * 2.3 + vec2(17.3, 5.9))) - 0.5;
+        offset += n * amount * width * 0.18;
+    }
+    return offset;
+}
 
 vec3 aces(vec3 x) {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
@@ -242,9 +297,11 @@ float srgb_encode(float c) {
 }
 
 void main() {
-    vec3 radiance = texture(screenTexture, TexCoords).rgb;
+    vec2 at = TexCoords;
+    if (hazeCount > 0 && captureChannel == 0) at += haze_offset(TexCoords);
+    vec3 radiance = texture(screenTexture, at).rgb;
     if (captureChannel != 0) { FragColor = vec4(radiance, 1.0); return; }
-    if (enableBloom) radiance += texture(bloomTexture, TexCoords).rgb * bloomIntensity;
+    if (enableBloom) radiance += texture(bloomTexture, at).rgb * bloomIntensity;
     vec3 shown = aces(radiance * frameExposure);
     shown = vec3(srgb_encode(shown.r), srgb_encode(shown.g), srgb_encode(shown.b));
     // Half a step of an 8-bit target, in a pattern that does not repeat

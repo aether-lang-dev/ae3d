@@ -70,3 +70,12 @@
   296 bright just over it soft, 687 hard, and 687 either way higher up, on
   both renderers. `set_fire` and `set_smoke` make theirs soft; the
   campfire's flames melt into the logs instead of cutting a line.
+- **Heat haze (#738).** `particles.set_haze` keeps a column of hot air
+  over an emitter, one of the engine's four (`engine_haze_slot`,
+  `engine_set_haze`); the composite projects each by the frame's camera and
+  ripples what is seen through it, most just over the fire, rising. Before
+  a wall of stripes, a 2 m column changes 4,445 pixels inside its screen
+  box and none beyond it, their middle at row 48 of its 1 to 92 on both
+  renderers; at no strength nothing changes (`tests/test_heat_haze.ae`). It
+  ripples whatever is in the column's box, things nearer than the fire too.
+  The campfire shimmers.

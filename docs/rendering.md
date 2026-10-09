@@ -1037,7 +1037,9 @@ lift)` gives the fire a point light of the black body's colour flickering
 about its power on the emitter's own clock. A blended emitter keeps its
 texture's soft rim: `set_blend` cuts only opaque particles. `set_soft(em,
 metres)` fades blended particles out near what the scene drew behind them,
-from the scene's depth (fire's and smoke's are soft by default).
+from the scene's depth (fire's and smoke's are soft by default). `set_haze(em, radius, height, strength)` keeps a column of hot air over
+the emitter that the composite ripples the frame through (four a scene);
+it ripples whatever the column covers on the screen, nearer things too.
 `examples/campfire.ae` is all of it. `tests/test_flames.ae`: the same seed
 bakes the same flames to the byte, the heat's middle climbs from 12 cells
 to 31 by the eighth frame and the last frame gives off 0.005% of the
