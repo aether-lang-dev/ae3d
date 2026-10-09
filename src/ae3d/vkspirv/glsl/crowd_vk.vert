@@ -20,6 +20,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool useInstanceColor;
     bool instancePoints;
     int instanceBillboard;
+    int pointFlipbookColumns;
+    int pointFlipbookRows;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -52,6 +54,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec3 cloudSun;
     float materialAlpha;
     float materialCutout;
+    int surfaceBlend;
     float reflectivity;
     float wetness;
     bool hasNormalMap;
@@ -278,6 +281,7 @@ layout(location = 8) out vec3 BindPos;
 // A crowd's cut is the whole figure's: no joints of its own (#556).
 layout(location = 9) out float ClipLimb;
 layout(location = 10) out vec2 MaskUV;
+layout(location = 11) out float ParticleAlpha;
 
 // The bone's matrix at a frame, read as its four columns from the bank.
 mat4 boneAt(int bone, int frame) {
@@ -340,6 +344,7 @@ void main() {
     ClipLimb = 1.0;
     MaskUV = inTexCoord;
     Occlusion = inOcclusion;
+    ParticleAlpha = 1.0;
     mat4 modelMatrix = model * instanceModel;
     // The way the figure faces, which is the way it walks.
     vec3 walking = normalize(vec3(modelMatrix[0].x, 0.0, modelMatrix[0].z));

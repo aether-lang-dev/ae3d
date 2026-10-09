@@ -20,6 +20,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool useInstanceColor;
     bool instancePoints;
     int instanceBillboard;
+    int pointFlipbookColumns;
+    int pointFlipbookRows;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -52,6 +54,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec3 cloudSun;
     float materialAlpha;
     float materialCutout;
+    int surfaceBlend;
     float reflectivity;
     float wetness;
     bool hasNormalMap;
@@ -209,17 +212,24 @@ layout(location = 8) in vec4 inJoints;   // The four bones this vertex hangs off
 layout(location = 9) in vec4 inWeights;  // How much of each, summing to one
 layout(location = 10) in float inOcclusion; // How much of the sky it can see
 layout(location = 12) in vec2 inMaskUV;  // the second UV set (#544), (-1, -1) for none
+// A point's alpha, how much of its life is gone (0..1) and its turn about
+// the way it faces, radians (#728); unused for an instance of a matrix.
+layout(location = 13) in vec4 instanceExtras;
 
 
 
 // Instances as points: the stream carries a position and a scale in the
 // first column of instanceModel and nothing in the other three, and the
 // model matrix carries the model's own rotation and scale, without its
-// translation. Eight floats an instance instead of twenty, for a million
+// translation. Twelve floats an instance instead of twenty, for a million
 // grains that all move every frame.
 
 // Points drawn as billboards: 0 as the mesh is, 1 upright (spun about the
 // world's up to face the eye), 2 full (tipped to face it too).
+
+// A point's texture as a flipbook (#728): columns and rows of frames, row 0
+// at the top, played over the point's life; (0, 0) for one picture.
+
 
 
 
@@ -261,6 +271,7 @@ layout(location = 7) out vec4 ClipPrev;
 layout(location = 8) out vec3 BindPos;
 layout(location = 10) out vec2 MaskUV;
 layout(location = 9) out float ClipLimb;
+layout(location = 11) out float ParticleAlpha;
 
 // The joints a cut is kept to (#556), as three words of 32 bits: joint j is
 // bit j % 32 of word j / 32. None named, the cut is the whole model's.
@@ -292,8 +303,20 @@ void main() {
     // For instanced rendering, we multiply the global model matrix by the instance matrix
     // This allows moving/scaling/rotating the entire group of instances using the model transform
     mat4 modelMatrix = isInstanced ? (model * instanceModel) : model;
+    ParticleAlpha = 1.0;
+    fragTexCoord = inTexCoord;
     if (isInstanced && instancePoints) {
         vec4 point = instanceModel[0];
+        ParticleAlpha = instanceExtras.x;
+        // The frame of its flipbook its life is at.
+        if (pointFlipbookColumns > 0 && pointFlipbookRows > 0) {
+            int frames = pointFlipbookColumns * pointFlipbookRows;
+            int frame = min(int(instanceExtras.y * float(frames)), frames - 1);
+            float column = float(frame - (frame / pointFlipbookColumns) * pointFlipbookColumns);
+            float row = float(frame / pointFlipbookColumns);
+            fragTexCoord = vec2((column + inTexCoord.x) / float(pointFlipbookColumns),
+                                1.0 - (row + 1.0 - inTexCoord.y) / float(pointFlipbookRows));
+        }
         modelMatrix = mat4(model[0] * point.w, model[1] * point.w, model[2] * point.w,
                            vec4(point.xyz, 1.0));
         // A billboard: the mesh turned to the eye, its +Z toward the camera
@@ -311,6 +334,12 @@ void main() {
             }
             vec3 right = normalize(cross(up, forward));
             up = cross(forward, right);
+            // Its own turn about the way it faces: a flame licks, smoke rolls.
+            float c = cos(instanceExtras.z);
+            float s = sin(instanceExtras.z);
+            vec3 turned = c * right + s * up;
+            up = c * up - s * right;
+            right = turned;
             float sx = length(vec3(model[0])) * point.w;
             float sy = length(vec3(model[1])) * point.w;
             float sz = length(vec3(model[2])) * point.w;
@@ -351,8 +380,6 @@ void main() {
     // For non-uniform scaling, this should be inverse(transpose(mat3(modelMatrix)))
     mat3 normalMatrix = mat3(modelMatrix);
     Normal = normalize(normalMatrix * posedNormal);
-    
-    fragTexCoord = inTexCoord;
     
     // Pass instance color to fragment shader (default white if not instanced)
     InstanceColor = (isInstanced && useInstanceColor) ? instanceColor : vec3(1.0, 1.0, 1.0);
