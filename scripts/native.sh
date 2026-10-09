@@ -265,23 +265,31 @@ ae3d_runtime_link() {
     done
     # Undefined in the archive as a whole: named by a member and defined by
     # none (PCRE2 is built into it, so its calls resolve inside).
+    # Its own directory, the DLL under its own name in it: the import
+    # library records the name it was linked as, and a program linked
+    # against aether_runtime.<pid>.dll's could not load.
     ae3d_rt_new="build/aether_runtime.$$"
-    nm --defined-only "$ae3d_rt_dir/libaether.a" 2>/dev/null | awk 'NF >= 3 {print $3}' | sort -u > "$ae3d_rt_new.defined"
+    rm -rf "$ae3d_rt_new"
+    mkdir -p "$ae3d_rt_new"
+    nm --defined-only "$ae3d_rt_dir/libaether.a" 2>/dev/null | awk 'NF >= 3 {print $3}' | sort -u > "$ae3d_rt_new/defined"
     ae3d_rt_undefined=" $(nm -u "$ae3d_rt_dir/libaether.a" 2>/dev/null | awk 'NF && $NF !~ /:$/ {print $NF}' | sort -u |
-        comm -23 - "$ae3d_rt_new.defined" | tr '\n' ' ')"
-    rm -f "$ae3d_rt_new.defined"
+        comm -23 - "$ae3d_rt_new/defined" | tr '\n' ' ')"
     case "$ae3d_rt_undefined" in *ZSTD_*) ae3d_rt_deps="$ae3d_rt_deps -lzstd" ;; esac
     case "$ae3d_rt_undefined" in *nghttp2_*) ae3d_rt_deps="$ae3d_rt_deps -lnghttp2" ;; esac
     case "$ae3d_rt_undefined" in *pcre2_*) ae3d_rt_deps="$ae3d_rt_deps -lpcre2-8" ;; esac
     case "$ae3d_rt_undefined" in *Brotli*) ae3d_rt_deps="$ae3d_rt_deps -lbrotlienc -lbrotlicommon" ;; esac
     case "$ae3d_rt_undefined" in *" fy_"*) ae3d_rt_deps="$ae3d_rt_deps -lfyaml" ;; esac
     # shellcheck disable=SC2086
+    ae3d_rt_name="$(basename "$ae3d_rt_lib")"
     if ! "$1" -shared -Wl,--whole-archive "$ae3d_rt_dir/libaether.a" -Wl,--no-whole-archive \
-        -Wl,--out-implib,"$ae3d_rt_new.dll.a" $ae3d_rt_deps -o "$ae3d_rt_new.dll"; then
-        rm -f "$ae3d_rt_new.dll" "$ae3d_rt_new.dll.a"
+        -Wl,--out-implib,"$ae3d_rt_new/$ae3d_rt_name.a" $ae3d_rt_deps -o "$ae3d_rt_new/$ae3d_rt_name"; then
+        rm -rf "$ae3d_rt_new"
         return 1
     fi
-    mv -f "$ae3d_rt_new.dll" "$ae3d_rt_lib" && mv -f "$ae3d_rt_new.dll.a" "$ae3d_rt_lib.a"
+    mv -f "$ae3d_rt_new/$ae3d_rt_name" "$ae3d_rt_lib" && mv -f "$ae3d_rt_new/$ae3d_rt_name.a" "$ae3d_rt_lib.a"
+    ae3d_rt_moved=$?
+    rm -rf "$ae3d_rt_new"
+    return "$ae3d_rt_moved"
 }
 
 # The toolchain's --libs as a program or a script links them: the runtime
