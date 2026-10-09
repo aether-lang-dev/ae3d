@@ -40,6 +40,10 @@ The feature list in full, with the reasoning behind each. The [README](../README
   a repeating noise wall's frame matches itself a tile over at 0.94 and at
   0.01 broken up; varied, a white wall's spread is 0.076 against 0.002;
   the detail layer takes a magnified wall's grain from 16.8 to 46.1.
+  `material_set_triplanar` maps a material from the world on three planes
+  (slopes and cliffs without stretch, whiteout-blended normals), and every
+  normal map's averaged-away bumps widen its roughness (Toksvig), so a
+  highlight over bumps finer than a pixel spreads instead of sparkling.
 - **Instances as matrices or as points.** An instanced model carries a
   matrix, a colour and a phase per instance, or -- `model_enable_point_instancing`
   -- a position, a scale, a colour and a phase, and a particle's alpha, life

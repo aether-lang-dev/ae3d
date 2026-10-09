@@ -39,3 +39,17 @@
   Under a 19-degree sun the near sand's luminance spread is 0.18 where it
   was 0.44, and none of it is over 1.5 times the mean (21% was). The
   colour texture and the skies it writes are unchanged.
+- **Triplanar mapping on a material (#737).** `material_set_triplanar`
+  takes its colour and normal map from the world position on three planes,
+  blended by the way the surface faces, normals by the whiteout blend
+  (Golus 2017): slopes without one projection's stretch, no UVs needed. A
+  wall with every UV at (0, 0) is one colour (grain 1.5) and mapped so has
+  its texture's (33.8). The sand example's heap and dunes use it.
+- **A normal map's averaged-away bumps go into the roughness (Toksvig,
+  #737).** A mip that averages a normal map's bumps is shorter than one;
+  the shortness is put back as roughness, so a highlight over bumps too
+  fine for the pixel spreads instead of sparkling or turning to a mirror.
+  A glossy wall whose 30-degree bumps the mips flattened peaks at 59 where
+  the same wall flat peaks at 241. On every normal-mapped surface.
+- **The sand example's grains reflect as sand does,** a specular of 0.03 as
+  its plain's, where the default reflected the sky whole.
