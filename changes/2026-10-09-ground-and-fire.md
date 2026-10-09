@@ -63,3 +63,10 @@
   (`tests/test_ground_bounce.ae`). The campfire uses it. A painted sky
   keeps its own ground: the sand example's heap, its shaded side under a
   blue sky, is unchanged by it.
+- **Soft particles (#738).** `particles.set_soft` / `core.model_set_soft`:
+  a blended particle fades out within its softness of what the scene drew
+  behind it, from the scene's depth read at binding 4 (unit 4 on OpenGL),
+  where the water reads it. A glowing particle standing in the ground is
+  296 bright just over it soft, 687 hard, and 687 either way higher up, on
+  both renderers. `set_fire` and `set_smoke` make theirs soft; the
+  campfire's flames melt into the logs instead of cutting a line.

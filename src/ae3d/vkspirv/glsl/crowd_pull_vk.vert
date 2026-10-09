@@ -64,6 +64,9 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialDetailFade;
     float materialFire;
     float materialTriplanar;
+    float materialSoft;
+    int hasSceneDepth;
+    mat4 invViewProjection;
     int surfaceBlend;
     float reflectivity;
     float wetness;
@@ -165,7 +168,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float edgeThresholdMin;
     float subpixelQuality;
     int colorSampleCount;
-    mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
     float ssaoRadius;
@@ -197,7 +199,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableWaterReflection;
     float waterReflectionIntensity;
     int hasSkyTexture;
-    int hasSceneDepth;
     float waterDepthFade;
     float waterShoreFoam;
     bool enableWaterDistortion;

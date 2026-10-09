@@ -1035,7 +1035,9 @@ draws them along their flight as it shows on screen (sparks), `set_glow(em,
 brightness)` makes them glow, and `set_light(em, kelvin, power, range,
 lift)` gives the fire a point light of the black body's colour flickering
 about its power on the emitter's own clock. A blended emitter keeps its
-texture's soft rim: `set_blend` cuts only opaque particles.
+texture's soft rim: `set_blend` cuts only opaque particles. `set_soft(em,
+metres)` fades blended particles out near what the scene drew behind them,
+from the scene's depth (fire's and smoke's are soft by default).
 `examples/campfire.ae` is all of it. `tests/test_flames.ae`: the same seed
 bakes the same flames to the byte, the heat's middle climbs from 12 cells
 to 31 by the eighth frame and the last frame gives off 0.005% of the

@@ -64,6 +64,9 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialDetailFade;
     float materialFire;
     float materialTriplanar;
+    float materialSoft;
+    int hasSceneDepth;
+    mat4 invViewProjection;
     int surfaceBlend;
     float reflectivity;
     float wetness;
@@ -165,7 +168,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float edgeThresholdMin;
     float subpixelQuality;
     int colorSampleCount;
-    mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
     float ssaoRadius;
@@ -197,7 +199,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableWaterReflection;
     float waterReflectionIntensity;
     int hasSkyTexture;
-    int hasSceneDepth;
     float waterDepthFade;
     float waterShoreFoam;
     bool enableWaterDistortion;
@@ -219,6 +220,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
 layout(set = 0, binding = 1) uniform sampler2D textureSampler;
 layout(set = 0, binding = 2) uniform sampler2D shadowMap;
 layout(set = 0, binding = 3) uniform sampler2D normalMap;
+layout(set = 0, binding = 4) uniform sampler2D sceneDepth;
 layout(location = 0) in vec2 fragTexCoord;
 layout(location = 1) in vec3 Normal;
 layout(location = 2) in vec3 FragPos;
@@ -381,6 +383,33 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 // faces (#737): slopes and cliffs without the stretch of one projection.
 // 0 for its UVs.
 
+// A soft particle (#738): faded out where what the scene drew behind it is
+// nearer than materialSoft metres, so a flame or a puff that meets the
+// ground melts into it instead of cutting a line across it (0: hard).
+
+
+
+
+
+// A stored scene depth as clip-space z: OpenGL keeps depth in 0..1 for a
+// clip range of -1..1, Vulkan's clip range is the 0..1 it stores.
+float scene_depth_clip(float depth) {
+    return depth;
+}
+
+// How much of a soft particle's alpha this fragment keeps: the gap to what
+// the scene drew behind it over its softness, 1 where it is clear of it.
+float soft_fade() {
+    if (materialSoft <= 0.0 || hasSceneDepth != 1) return 1.0;
+    vec2 suv = gl_FragCoord.xy / screenSize;
+    float d = texture(sceneDepth, suv).r;
+    if (d >= 0.99999) return 1.0;
+    vec4 clip = vec4(suv * 2.0 - 1.0, scene_depth_clip(d), 1.0);
+    vec4 world = invViewProjection * clip;
+    vec3 behind = world.xyz / world.w;
+    float gap = distance(viewPos, behind) - distance(viewPos, FragPos);
+    return clamp(gap / materialSoft, 0.0, 1.0);
+}
 // How the surface goes over what is behind it (#728): 0 opaque, 1 blended by
 // its alpha, 2 added to it. Only a blended one carries its texture's and its
 // point's alpha out.
@@ -1977,11 +2006,11 @@ void main() {
     if (materialFire > 0.0) {
         float heat = clamp(texColor.r * InstanceColor.r, 0.0, 1.0);
         vec3 glowing = black_body(heat * materialFire) * (heat * heat * heat * heat) * max(exposure * 0.1, 1.0);
-        FragColor = vec4(glowing * diffuseColor, texColor.a * materialAlpha * ParticleAlpha);
+        FragColor = vec4(glowing * diffuseColor, texColor.a * materialAlpha * ParticleAlpha * soft_fade());
         return;
     }
     if (exposure > 10.0) {
-        float glowAlpha = surfaceBlend != 0 ? texColor.a * materialAlpha * ParticleAlpha : 1.0;
+        float glowAlpha = surfaceBlend != 0 ? texColor.a * materialAlpha * ParticleAlpha * soft_fade() : 1.0;
         FragColor = vec4(diffuseColor * texColor.rgb * InstanceColor * (exposure * 0.1), glowAlpha);
         return;
     }
@@ -2222,7 +2251,7 @@ void main() {
     if (materialAlpha >= 0.99) {
         finalAlpha = 1.0; // Force fully opaque for materials that should be opaque
     }
-    if (surfaceBlend != 0) finalAlpha = texColor.a * materialAlpha * ParticleAlpha;
+    if (surfaceBlend != 0) finalAlpha = texColor.a * materialAlpha * ParticleAlpha * soft_fade();
     
     FragColor = vec4(color, finalAlpha);
 }
