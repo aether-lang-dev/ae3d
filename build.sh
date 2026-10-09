@@ -197,6 +197,8 @@ aetherc_seconds=$((SECONDS - build_started))
 # top of what it generates, as `ae build` reads them. The engine's own are
 # left to its library (ae3d_program_sources).
 AETHER_SOURCES="$(ae3d_program_sources "$GEN" "$ROOT")"
+# The directories its headers are in, as `ae build` reads them.
+PROGRAM_INCLUDES="$(ae3d_program_includes "$GEN")"
 # zlib is the engine's, and the engine is a library of its own that names it
 # on its own link line. Naming it again here is not harmless: where the Aether
 # toolchain is built against zlib its --libs already carries -lz, Apple's ld
@@ -211,11 +213,11 @@ PROGRAM_OBJ_DIR="$OBJ_DIR/$NAME"
 mkdir -p "$PROGRAM_OBJ_DIR"
 PROGRAM_OBJECTS="$PROGRAM_OBJ_DIR/$NAME.o"
 compile_started=$SECONDS
-$LAUNCHER "$CC" -c $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $AETHER_COMPILE_FLAGS "$GEN" -o "$PROGRAM_OBJ_DIR/$NAME.o"
+$LAUNCHER "$CC" -c $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $AETHER_COMPILE_FLAGS $PROGRAM_INCLUDES "$GEN" -o "$PROGRAM_OBJ_DIR/$NAME.o"
 for src in $AETHER_SOURCES; do
     base="$(basename "$src")"
     obj="$PROGRAM_OBJ_DIR/${base%.*}.o"
-    $LAUNCHER "$CC" -c $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $AETHER_COMPILE_FLAGS "$src" -o "$obj"
+    $LAUNCHER "$CC" -c $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $AETHER_COMPILE_FLAGS $PROGRAM_INCLUDES "$src" -o "$obj"
     PROGRAM_OBJECTS="$PROGRAM_OBJECTS $obj"
 done
 cc_seconds=$((SECONDS - compile_started))

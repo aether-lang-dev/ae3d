@@ -270,6 +270,40 @@ check_platform MINGW64_NT-10.0   "-lgdi32"
 check_platform MSYS_NT-10.0      "-lopengl32"
 check_platform Windows_NT        "-lopengl32"
 
+step "a program's generated C, read as ae build reads it"
+# The include directories the generated C names, as -I flags (aether#1986):
+# not read, a header named from its module's directory was found only where
+# a -I happened to point there. Windows paths and line ends included.
+directives="$(mktemp -t ae3d_directives.XXXXXX)"
+printf '// aether-include: C:\\aether\\contrib\\vulkan\\vk\r\n// aether-include: /opt/aether/std/intarr\n#include "x.h"\n' > "$directives"
+includes="$(ae3d_program_includes "$directives")"
+if [ "$includes" = " -IC:/aether/contrib/vulkan/vk -I/opt/aether/std/intarr" ]; then
+    pass "each // aether-include: is a -I"
+else
+    fail "each // aether-include: is a -I (got: '$includes')"
+fi
+rm -f "$directives"
+# The runtime DLL is current only when built from the archive its stamp
+# names: a newer-than test kept a newer toolchain's runtime for an older one,
+# and an archive dated ahead of the clock had every build rebuild it at once
+# (#692).
+runtime="$(mktemp -t ae3d_runtime.XXXXXX)"
+printf '%s\n' "/a/libaether.a 10 20" > "$runtime.stamp"
+if ae3d_runtime_current "$runtime" "/a/libaether.a 10 20" &&
+   ! ae3d_runtime_current "$runtime" "/b/libaether.a 10 20" &&
+   ! ae3d_runtime_current "$runtime" "/a/libaether.a 11 20"; then
+    pass "the runtime DLL is current only for the archive it was built from"
+else
+    fail "the runtime DLL is current only for the archive it was built from"
+fi
+rm -f "$runtime.stamp"
+if ae3d_runtime_current "$runtime" "/a/libaether.a 10 20"; then
+    fail "a runtime DLL with no stamp is rebuilt"
+else
+    pass "a runtime DLL with no stamp is rebuilt"
+fi
+rm -f "$runtime"
+
 step "the agent channel stays behind its gate"
 # The one property the channel's whole design rests on, and the one thing a
 # timing test cannot check: an ungated hook is a change to the source, not a
