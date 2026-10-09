@@ -218,8 +218,9 @@ in_pool() {
 
 build_one() {   # build_one <source>: its log and its status, under BUILD_DIR
     target="$(basename "$1" .ae)"
-    # A suite that times its own code against a budget says so, and is
-    # built as the engine ships; the rest take SUITE_CFLAGS (see the suites).
+    # A suite that times its own code against a budget, or an example whose
+    # start-up builds its world on the CPU, says so and is built as the
+    # engine ships; the rest take SUITE_CFLAGS (see the suites).
     flags="${SUITE_CFLAGS:-}"
     grep -q '^// ci: optimised' "$1" && flags=""
     AE3D_PROGRAM_CFLAGS="$flags" ./build.sh "$1" "$target" >"$BUILD_DIR/$target.log" 2>&1
@@ -749,7 +750,13 @@ scene_tools=""
 if [ -n "$SCENES" ]; then
     scene_tools="tools/ae3d_bench.ae tools/measure_scene.ae tools/ae3d_agent.ae tools/ae3d_view.ae tools/critique_scene.ae tools/zombie_street.ae tools/bake_impostor.ae tools/fold_changes.ae tools/scene_parity.ae"
 fi
+# Unoptimised too, as the suites: thirteen of the twenty-one examples run
+# their ten frames in the same time either way and compile in half of it;
+# the eight that build a world at start-up (2 to 5 times slower so) are
+# marked `// ci: optimised`.
+export SUITE_CFLAGS=-O0
 build_together examples/*.ae $scene_tools
+unset SUITE_CFLAGS
 for example in examples/*.ae; do
     name="$(basename "$example" .ae)"
     if ! built_ok "$name"; then

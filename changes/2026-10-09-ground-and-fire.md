@@ -96,3 +96,9 @@
   `rigidbody_point_velocity`, `rigidbody_mass` added for it): half water's
   density settles 0.51 under, a quarter's 0.25, and a box on a 2 m swell
   rides 2.08 m of it (`tests/test_buoyancy.ae`).
+- **CI builds the examples' own C unoptimised too (#511).** Thirteen of the
+  twenty-one run their ten frames in the same time at -O0 and compile in
+  half of it (376 s summed at -O2, 182 at -O0, on an M1 Pro); the eight
+  whose start-up builds a world on the CPU ran 1.5 to 5 times slower so
+  (smooth_terrain 4.7 s to 23.8) and say `// ci: optimised`, as do the
+  scene tools that measure or render whole scenes.
