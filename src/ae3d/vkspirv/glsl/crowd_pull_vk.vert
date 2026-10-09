@@ -1,4 +1,5 @@
 #version 450
+#define AE3D_PULL 1
 
 struct Light {
     vec3 position;
