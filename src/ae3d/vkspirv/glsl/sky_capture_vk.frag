@@ -54,6 +54,13 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float materialCutout;
     float materialNormalStrength;
+    float materialTileBreakup;
+    float materialTileRotation;
+    float materialVariation;
+    float materialVariationScale;
+    float materialDetailScale;
+    float materialDetailStrength;
+    float materialDetailFade;
     int surfaceBlend;
     float reflectivity;
     float wetness;

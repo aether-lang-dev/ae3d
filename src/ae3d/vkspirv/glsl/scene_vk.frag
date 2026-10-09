@@ -54,6 +54,13 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float materialCutout;
     float materialNormalStrength;
+    float materialTileBreakup;
+    float materialTileRotation;
+    float materialVariation;
+    float materialVariationScale;
+    float materialDetailScale;
+    float materialDetailStrength;
+    float materialDetailFade;
     int surfaceBlend;
     float reflectivity;
     float wetness;
@@ -341,6 +348,21 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 // The texture's alpha under which the surface is a hole (0: never), before
 // anything else is decided -- an emissive particle is cut to its disc too
 // (#711).
+
+
+// The texture's tiling broken up (#737): 1 samples it as hexagons, each an
+// offset copy turned by up to materialTileRotation of a half turn, blended
+// where they meet; 0 as it repeats.
+
+
+// The albedo varied over the world in patches of materialVariationScale
+// metres, by up to materialVariation either way (0: none).
+
+
+// The material's own textures again at materialDetailScale times their
+// frequency, by materialDetailStrength, gone by materialDetailFade metres:
+// the grain a texture magnified at the feet does not have (0: none).
+
 
 
 // How the surface goes over what is behind it (#728): 0 opaque, 1 blended by
@@ -1242,8 +1264,93 @@ mat3 cotangent_frame(vec3 normal, vec3 position, vec2 uv) {
     return mat3(tangent * scale, bitangent * scale, normal);
 }
 
+// --- the tiling broken up: hex-tile sampling (Mikkelsen, "Practical
+// Real-Time Hex-Tiling", JCGT 2022). The plane is cut into hexagons; each
+// samples the texture offset at random and turned, and the three over a
+// point blend by how near it is to each one's middle, sharpened toward the
+// brighter so the blend keeps the texture's contrast instead of greying it.
+// The derivatives are turned with the coordinates, so the mips stay right
+// across the seams. Worked out once in main, read by the colour and the
+// normal map alike.
+bool hexOn = false;
+vec3 hexWeights = vec3(1.0, 0.0, 0.0);
+vec2 hexUV[3];
+mat2 hexTurn[3];
+vec2 hexDx = vec2(0.0);
+vec2 hexDy = vec2(0.0);
+
+vec2 hex_offset(ivec2 cell) {
+    vec2 q = vec2(cell);
+    return fract(sin(vec2(dot(q, vec2(127.1, 311.7)), dot(q, vec2(269.5, 183.3)))) * 43758.5453);
+}
+
+mat2 hex_rotation(ivec2 cell, float strength) {
+    float angle = abs(float(cell.x * cell.y)) + abs(float(cell.x + cell.y)) + 3.14159265;
+    angle = mod(angle, 6.28318531);
+    if (angle > 3.14159265) angle -= 6.28318531;
+    angle *= strength;
+    float c = cos(angle);
+    float s = sin(angle);
+    return mat2(c, -s, s, c);
+}
+
+void hex_setup(vec2 uv, float rotation) {
+    hexDx = dFdx(uv);
+    hexDy = dFdy(uv);
+    vec2 skewed = mat2(1.0, -0.57735027, 0.0, 1.15470054) * (uv * 3.46410162);
+    ivec2 base = ivec2(floor(skewed));
+    vec3 t = vec3(fract(skewed), 0.0);
+    t.z = 1.0 - t.x - t.y;
+    float s = step(0.0, -t.z);
+    float s2 = 2.0 * s - 1.0;
+    hexWeights = vec3(-t.z * s2, s - t.y * s2, s - t.x * s2);
+    int si = int(s);
+    ivec2 cells[3];
+    cells[0] = base + ivec2(si, si);
+    cells[1] = base + ivec2(si, 1 - si);
+    cells[2] = base + ivec2(1 - si, si);
+    for (int k = 0; k < 3; k++) {
+        hexTurn[k] = hex_rotation(cells[k], rotation);
+        vec2 middle = mat2(1.0, 0.0, 0.5, 0.86602540) * vec2(cells[k]) / 3.46410162;
+        hexUV[k] = hexTurn[k] * (uv - middle) + middle + hex_offset(cells[k]);
+    }
+    hexOn = true;
+}
+
+vec4 hex_texture(sampler2D tex) {
+    vec4 c0 = textureGrad(tex, hexUV[0], hexTurn[0] * hexDx, hexTurn[0] * hexDy);
+    vec4 c1 = textureGrad(tex, hexUV[1], hexTurn[1] * hexDx, hexTurn[1] * hexDy);
+    vec4 c2 = textureGrad(tex, hexUV[2], hexTurn[2] * hexDx, hexTurn[2] * hexDy);
+    vec3 luma = vec3(0.299, 0.587, 0.114);
+    vec3 bright = mix(vec3(1.0), vec3(dot(c0.rgb, luma), dot(c1.rgb, luma), dot(c2.rgb, luma)), 0.6);
+    vec3 w = bright * pow(hexWeights, vec3(7.0));
+    w /= max(w.x + w.y + w.z, 1e-6);
+    hexWeights = w;
+    return w.x * c0 + w.y * c1 + w.z * c2;
+}
+
+// The normal map through the same hexagons and weights, each sample's
+// tilt turned back into the surface's own frame.
+vec3 hex_normal() {
+    vec3 n = vec3(0.0);
+    for (int k = 0; k < 3; k++) {
+        vec3 s = textureGrad(normalMap, hexUV[k], hexTurn[k] * hexDx, hexTurn[k] * hexDy).xyz * 2.0 - 1.0;
+        s.xy = transpose(hexTurn[k]) * s.xy;
+        n += hexWeights[k] * s;
+    }
+    return n;
+}
+
+// How much of the detail layer this fragment takes, worked out in main.
+float detailWeight = 0.0;
+
 vec3 mapped_normal(vec3 normal, vec3 position, vec2 uv) {
-    vec3 sampled = texture(normalMap, uv).xyz * 2.0 - 1.0;
+    vec3 sampled = hexOn ? hex_normal() : texture(normalMap, uv).xyz * 2.0 - 1.0;
+    if (detailWeight > 0.0) {
+        // Whiteout blend: the fine tilt added to the coarse, the coarse kept.
+        vec3 fine = texture(normalMap, uv * materialDetailScale).xyz * 2.0 - 1.0;
+        sampled = vec3(sampled.xy + fine.xy * detailWeight, sampled.z);
+    }
     sampled.xy *= normalStrength * materialNormalStrength;
     return normalize(cotangent_frame(normal, position, uv) * sampled);
 }
@@ -1756,8 +1863,18 @@ void main() {
     // temporal pass dragged its history by whatever the driver left there.
     outVelocity = velocity(ClipNow, ClipPrev, jitter);
 
-    vec4 texColor = texture(textureSampler, fragTexCoord);
+    vec4 texColor;
+    if (materialTileBreakup > 0.0) {
+        hex_setup(fragTexCoord, materialTileRotation);
+        texColor = hex_texture(textureSampler);
+    } else {
+        texColor = texture(textureSampler, fragTexCoord);
+    }
     if (texColor.a < materialCutout) discard;
+    if (materialDetailScale > 0.0) {
+        float away = length(FragPos - viewPos);
+        detailWeight = materialDetailStrength * (1.0 - smoothstep(materialDetailFade * 0.5, materialDetailFade, away));
+    }
     
     // An emissive surface is its own light source, so it skips shading. It does
     // not skip having a colour: this returned a hardcoded white, which made an
@@ -1829,6 +1946,24 @@ void main() {
             if (woundAt < woundLayers[k].w) layer = woundLayers[k].rgb;
         }
         albedo = mix(albedo, layer, smoothstep(1.0, 0.94, woundAt));
+    }
+
+    // The detail layer's colour, as a ratio to the texture's own mean (its
+    // last mip), so it adds grain without shifting the colour.
+    if (detailWeight > 0.0) {
+        vec3 fine = texture(textureSampler, fragTexCoord * materialDetailScale).rgb;
+        vec3 mean = max(textureLod(textureSampler, fragTexCoord, 16.0).rgb, vec3(0.02));
+        albedo *= mix(vec3(1.0), clamp(fine / mean, vec3(0.0), vec3(2.0)), detailWeight);
+    }
+
+    // Patches over the world, two octaves of value noise, so a texture
+    // repeated across a field is not the same from one stretch to the next.
+    if (materialVariation > 0.0) {
+        vec3 cell = FragPos / max(materialVariationScale, 0.01);
+        float v = clipValueNoise(cell) * 0.65 + clipValueNoise(cell * 2.7 + vec3(13.1, 7.3, 2.9)) * 0.35;
+        // Value noise keeps near its middle; stretched, the amount is reached.
+        v = smoothstep(0.25, 0.75, v);
+        albedo *= 1.0 + (v * 2.0 - 1.0) * materialVariation;
     }
 
     // GPU Gems Chapter 5: Apply Perlin noise for surface detail if enabled

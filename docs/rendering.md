@@ -27,9 +27,23 @@ The feature list in full, with the reasoning behind each. The [README](../README
   (#526). A light's back fill, the light it lends the side turned from it,
   is never shadowed: under the sun's map, cast up through the ground, it
   had been a night's whole light, and a shadow took a third of it.
+- **Ground that holds up to the horizon (#737).** Scene textures filter
+  across up to 16 texels at a slant (`engine_set_anisotropy`, both
+  backends), so ground ahead of a walker stays sharp where one mip blurred
+  it: a 1 m checker's detail at a grazing view reads 71.7 at 16 against
+  44.6 at 1 (`tests/test_anisotropy.ae`). A material can break up its
+  repeat (`material_set_tile_breakup`: hex-tile sampling, three offset and
+  optionally turned copies blended, Mikkelsen 2022), vary its albedo over
+  world patches (`material_set_variation`), and add its own textures again
+  at a finer scale near the eye (`material_set_detail`), for the grain a
+  texture magnified at the feet does not have. `tests/test_tile_breakup.ae`:
+  a repeating noise wall's frame matches itself a tile over at 0.94 and at
+  0.01 broken up; varied, a white wall's spread is 0.076 against 0.002;
+  the detail layer takes a magnified wall's grain from 16.8 to 46.1.
 - **Instances as matrices or as points.** An instanced model carries a
   matrix, a colour and a phase per instance, or -- `model_enable_point_instancing`
-  -- a position, a scale, a colour and a phase in eight floats, with the
+  -- a position, a scale, a colour and a phase, and a particle's alpha, life
+  and turn, in twelve floats, with the
   model's own rotation and scale applied to all of them in the shader. A
   million grains of sand that all move in a frame are a 32 MB stream
   instead of an 80 MB one built matrix by matrix, on both backends. An
