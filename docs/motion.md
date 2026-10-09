@@ -12,7 +12,9 @@ import ae3d.motion
 r = physics.ragdoll(e, "Zombie", position, 8.0, 8.0, 1.0)
 physics.ragdoll_dress(r, rig)                       // the skinned figure it wears
 body = motion.active_ragdoll(r)                     // ANIMATED to begin with
-motion.attach(e, body)                              // its recovery stepped every fixed step
+motion.attach(e, body)                              // stepped every fixed step, posed after the clips
+                                                    // (a program stepping motion_step itself calls
+                                                    // motion.pose(body, e) from its pose phase, #699)
 motion.set_mode(body, motion.POWERED)               // the muscles play the animation
 motion.hit(body, human.BONE_SPINE_03, point, impulse)
 ```
