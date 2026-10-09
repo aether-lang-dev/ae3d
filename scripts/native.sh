@@ -304,6 +304,23 @@ ae3d_program_sources() {
     printf '%s' "$ae3d_out"
 }
 
+# The directories the generated program's headers are in (`// aether-include:`,
+# from the modules' @c_include), as -I flags. The generated C includes a
+# header by the name its @c_include gives, and `ae build` puts the module's
+# own directory on the include path for it (aether#1986). Not read, a header
+# named from its module's directory was found only where a -I happened to
+# point there: contrib.vulkan.vk's "../aether_vulkan_compat.h" (Aether
+# 0.796) failed every program that draws.
+#
+#   ae3d_program_includes <generated C>
+ae3d_program_includes() {
+    ae3d_out=""
+    for ae3d_dir in $(sed -n 's|^// aether-include: ||p' "$1" | tr '\\' '/' | tr -d '\r'); do
+        ae3d_out="$ae3d_out -I$ae3d_dir"
+    done
+    printf '%s' "$ae3d_out"
+}
+
 # The compiler and the flags a native source takes: C++ for the shim, with
 # the SDK's headers and without the runtime the engine's library does not
 # link (no exceptions, no RTTI, nothing from the standard library).
