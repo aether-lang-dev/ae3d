@@ -23,6 +23,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int instanceBillboard;
     int pointFlipbookColumns;
     int pointFlipbookRows;
+    float pointLift;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -61,6 +62,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialDetailScale;
     float materialDetailStrength;
     float materialDetailFade;
+    float materialFire;
     int surfaceBlend;
     float reflectivity;
     float wetness;

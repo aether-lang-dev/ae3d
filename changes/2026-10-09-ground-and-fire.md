@@ -19,3 +19,14 @@
   a texture magnified four times over has 46.1 of grain against 16.8.
 - All four saved with the scene; `examples/sand.ae`'s plain and horizon use
   them.
+- **Fire is the engine's (#738).** `particles.set_fire` makes each
+  particle a flame simulated by the new `ae3d.flames` (stable fluids with
+  vorticity confinement, baked at load into a 4 by 4 flipbook) glowing as a
+  black body (`core.model_set_fire`): a hot flame draws (250, 232) red and
+  green, one cooled to 0.6 (193, 63). Flipbook frames blend instead of
+  stepping. `set_smoke`, `set_area` (born over a disc), `set_stretch` (sparks
+  drawn along their flight), `set_glow`, and `set_light` (a point light of
+  the black body's colour, flickering about its power, never past it) on an
+  emitter; `core.model_set_billboard_lift` stands a billboard on its point.
+  A blended emitter is no longer cut at a half, which clipped every soft
+  rim. `examples/campfire.ae`; `tests/test_flames.ae`.

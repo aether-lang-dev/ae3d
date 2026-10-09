@@ -23,6 +23,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int instanceBillboard;
     int pointFlipbookColumns;
     int pointFlipbookRows;
+    float pointLift;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -61,6 +62,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialDetailScale;
     float materialDetailStrength;
     float materialDetailFade;
+    float materialFire;
     int surfaceBlend;
     float reflectivity;
     float wetness;
@@ -225,6 +227,7 @@ layout(location = 8) in vec3 BindPos;
 layout(location = 9) in float ClipLimb;
 layout(location = 10) in vec2 MaskUV;
 layout(location = 11) in float ParticleAlpha;
+layout(location = 12) in vec3 FlipNext;
 layout(location = 1) out vec2 outVelocity;
 
 
@@ -364,6 +367,11 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 // the grain a texture magnified at the feet does not have (0: none).
 
 
+
+// Fire (#738): the texture's red is the flame's heat (0 to 1), cooled over
+// a particle's life by its colour's red, and the surface glows as a black
+// body at that share of materialFire kelvin, bright as its fourth power.
+// 0 for a surface that is not fire.
 
 // How the surface goes over what is behind it (#728): 0 opaque, 1 blended by
 // its alpha, 2 added to it. Only a blended one carries its texture's and its
@@ -822,6 +830,16 @@ vec3 kelvinToRGB(float kelvin) {
     } else {
         return mix(vec3(1.0, 1.0, 1.0), vec3(0.7, 0.8, 1.0), (kelvin - 6500.0) / 5500.0);
     }
+}
+
+// The colour a black body glows at `kelvin`, linear, its brightest channel
+// one: Helland's fit to the Planckian locus, red alone under about 1900 K
+// (an ember), yellow-white toward 3000 K (a flame's core).
+vec3 black_body(float kelvin) {
+    float t = max(kelvin, 500.0) / 100.0;
+    float g = t <= 6.6 ? 0.0 : clamp((99.4708025861 * log(t) - 161.1195681661) / 255.0, 0.0, 1.0);
+    float b = t <= 19.0 ? 0.0 : clamp((138.5177312231 * log(t - 10.0) - 305.0447927307) / 255.0, 0.0, 1.0);
+    return pow(vec3(1.0, g, b), vec3(2.2));
 }
 
 // Optimized Schlick's approximation for Fresnel reflectance
@@ -1869,6 +1887,7 @@ void main() {
         texColor = hex_texture(textureSampler);
     } else {
         texColor = texture(textureSampler, fragTexCoord);
+        if (FlipNext.z >= 0.0) texColor = mix(texColor, texture(textureSampler, FlipNext.xy), FlipNext.z);
     }
     if (texColor.a < materialCutout) discard;
     if (materialDetailScale > 0.0) {
@@ -1890,6 +1909,12 @@ void main() {
     //
     // exposure is the emissive strength, scaled so the 10.0 that opens this
     // branch means 1x. Below that the surface is lit normally.
+    if (materialFire > 0.0) {
+        float heat = clamp(texColor.r * InstanceColor.r, 0.0, 1.0);
+        vec3 glowing = black_body(heat * materialFire) * (heat * heat * heat * heat) * max(exposure * 0.1, 1.0);
+        FragColor = vec4(glowing * diffuseColor, texColor.a * materialAlpha * ParticleAlpha);
+        return;
+    }
     if (exposure > 10.0) {
         float glowAlpha = surfaceBlend != 0 ? texColor.a * materialAlpha * ParticleAlpha : 1.0;
         FragColor = vec4(diffuseColor * texColor.rgb * InstanceColor * (exposure * 0.1), glowAlpha);

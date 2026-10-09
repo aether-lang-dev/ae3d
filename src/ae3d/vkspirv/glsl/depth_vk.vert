@@ -22,6 +22,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int instanceBillboard;
     int pointFlipbookColumns;
     int pointFlipbookRows;
+    float pointLift;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -60,6 +61,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialDetailScale;
     float materialDetailStrength;
     float materialDetailFade;
+    float materialFire;
     int surfaceBlend;
     float reflectivity;
     float wetness;
@@ -225,6 +227,7 @@ layout (location = 9) in vec4 inWeights;
 
 
 
+
 layout(location = 0) out vec3 BindPos;
 layout(location = 1) out float ClipLimb;
 
@@ -279,7 +282,7 @@ void main() {
             float sy = length(vec3(model[1])) * point.w;
             float sz = length(vec3(model[2])) * point.w;
             modelMatrix = mat4(vec4(right * sx, 0.0), vec4(up * sy, 0.0), vec4(forward * sz, 0.0),
-                               vec4(point.xyz, 1.0));
+                               vec4(point.xyz + up * (sy * pointLift), 1.0));
         }
     }
     // And the same pose. A shadow pass that skipped this drew the bind pose,

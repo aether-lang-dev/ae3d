@@ -22,6 +22,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int instanceBillboard;
     int pointFlipbookColumns;
     int pointFlipbookRows;
+    float pointLift;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -60,6 +61,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialDetailScale;
     float materialDetailStrength;
     float materialDetailFade;
+    float materialFire;
     int surfaceBlend;
     float reflectivity;
     float wetness;
@@ -290,6 +292,7 @@ layout(location = 8) out vec3 BindPos;
 layout(location = 9) out float ClipLimb;
 layout(location = 10) out vec2 MaskUV;
 layout(location = 11) out float ParticleAlpha;
+layout(location = 12) out vec3 FlipNext;
 
 // The bone's matrix at a frame, read as its four columns from the bank.
 mat4 boneAt(int bone, int frame) {
@@ -353,6 +356,7 @@ void main() {
     MaskUV = inTexCoord;
     Occlusion = inOcclusion;
     ParticleAlpha = 1.0;
+    FlipNext = vec3(0.0, 0.0, -1.0);
     mat4 modelMatrix = model * instanceModel;
     // The way the figure faces, which is the way it walks.
     vec3 walking = normalize(vec3(modelMatrix[0].x, 0.0, modelMatrix[0].z));

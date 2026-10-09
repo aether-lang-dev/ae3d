@@ -1010,10 +1010,33 @@ the way it faces at a rate it is born with. A point carries its alpha, its
 life gone and its turn in its record of the stream, twelve floats now
 (`core.model_set_instance_extras`), and a model of any mesh can take a
 blend (`core.model_set_blend`) or a flipbook (`core.model_set_flipbook`).
-`tests/test_particles_drawn.ae` draws, on both renderers alike, a flipbook's
-first frame a quarter through its life and its second three quarters
-through, two added particles at one place 531 bright against one's 384,
-and a blended one at alpha 0.5 at 243 against 384.
+`tests/test_particles_drawn.ae` draws, on both renderers alike, a flipbook
+mostly its first frame a quarter through its life and mostly its second
+three quarters through, two added particles at one place 531 bright
+against one's 384, and a blended one at alpha 0.5 at 243 against 384.
+
+The engine's fire (#738). `set_fire(em, kelvin)` makes each particle a
+flame simulated by `ae3d.flames`: a small 2D fluid (Stam's stable fluids,
+with vorticity confinement, Fedkiw et al.) run once at load, a puff of hot
+gas fed at the grid's foot and let go, baked into a 4 by 4 flipbook of
+64 by 128 frames in about 25 ms. A frame's red is the flame's heat; the
+shader glows it as a black body at that share of `kelvin`, as bright as
+the fourth power of it (`core.model_set_fire`), so a flame's core is
+yellow-white and its rags red, and colour keys' red cools it over a life.
+Its frames blend into each other rather than stepping, its quads are twice
+as tall as wide and stand on their point (`core.model_set_billboard_lift`).
+`set_smoke(em)` plays the same run's smoke. `set_area(em, radius)` births
+particles over a disc (a fire across its logs), `set_stretch(em, seconds)`
+draws them along their flight as it shows on screen (sparks), `set_glow(em,
+brightness)` makes them glow, and `set_light(em, kelvin, power, range,
+lift)` gives the fire a point light of the black body's colour flickering
+about its power on the emitter's own clock. A blended emitter keeps its
+texture's soft rim: `set_blend` cuts only opaque particles.
+`examples/campfire.ae` is all of it. `tests/test_flames.ae`: the same seed
+bakes the same flames to the byte, the heat's middle climbs from 12 cells
+to 31 by the eighth frame and the last frame gives off 0.005% of the
+brightest's light. `tests/test_particles_drawn.ae`: a flame at full heat
+draws (250, 232) red and green, cooled to 0.6 (193, 63), on both renderers.
 
 ### Rain on the surfaces
 
