@@ -1,0 +1,1077 @@
+// ae3d.vkclusterlod -- the cluster cut on the Vulkan device (#536), on
+// contrib.vulkan.vk.
+//
+// A model whose mesh has a cluster graph (ae3d.clusterlod) is drawn at the
+// detail its distance needs, chosen on the device each frame and for each of
+// its instances on its own. The graphs of every such mesh are kept here, end
+// to end in three buffers -- the clusters' records, their vertex references
+// and their triangles, a byte a corner -- and the renderer queues the
+// frame's clustered draws (queue) before the scene pass. The frame's cut
+// (cull) is then three compute passes: the cull, a thread an instance's
+// cluster, keeps a cluster where its error is about a pixel on the screen
+// and its sphere is in the view, and counts its triangles into its
+// instance's command for its material; the scan lays the commands end to
+// end in the frame's index buffer; the emit writes each kept cluster's
+// triangles there, as the mesh's own vertex indices. The draws
+// (vkframe.draw_cut) are the scene's pipelines over the mesh's vertices,
+// one indirect command an instance and material, read in one call.
+//
+// The commands, the list of kept clusters, the counters and the index buffer
+// are one of each, written and read in order on the queue; the view the cull
+// reads and the copy of the counters the host reads back are one a frame in
+// flight. The budgets -- how many clusters a frame may keep, how many
+// indices it may write -- start small and grow to what the frame before
+// asked for, so a scene settles in a frame or two; a frame past them draws
+// what fitted.
+
+import contrib.vulkan.vk
+import ae3d.vkhost
+import ae3d.vkdevice
+import ae3d.vkframe
+import ae3d.vkspirv
+import ae3d.vkpipes
+import ae3d.clusterlod
+import ae3d.geometry
+import ae3d.core
+
+exports (
+    start, stop, started, acquire, release, materials, clusters_of, frame_start, queue, queue_pulled, pull_set, cull,
+    index_buffer, command_buffer, COMMAND_BYTES, kept_last, indices_last
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern malloc(size: long) -> ptr
+extern realloc(p: ptr, size: long) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+extern memmove(dst: ptr, src: ptr, n: long) -> ptr
+extern memset(p: ptr, value: int, n: long) -> ptr
+
+const COMMAND_BYTES = 20
+// The passes' push constants: the model's matrix, then its first cluster,
+// its clusters, its first instance in this dispatch, whether it is
+// instanced, its first command, its materials, the frame's commands, index
+// budget and kept clusters' room, and for a pulled draw where its count of
+// instances is, that it is pulled and its vertices' bits.
+const PARAMS_BYTES = 112
+const BINDINGS = 10
+const VIEW_BYTES = 128
+const COUNTERS_BYTES = 32
+// A dispatch's most groups along one side the spec promises.
+const MOST_GROUPS = 65535
+// The cull's group: a thread a cluster.
+const CULL_GROUP = 64
+// The sets a pool holds; a frame that queues more takes another pool.
+const POOL_SETS = 64
+// The budgets' first sizes, before a frame has asked for more.
+const FIRST_INDICES = 4194304
+const FIRST_KEPT = 65536
+const FIRST_COMMANDS = 4096
+// The most of a mesh a graph's coarsest cut may still draw for the graph to
+// be drawn at all.
+const MOST_KEPT_SHARE = 0.5
+// And the most they grow to: half a gigabyte of indices, sixty-four
+// megabytes of kept clusters, eighty of commands. A frame past them draws
+// what fitted.
+const MOST_INDICES = 134217728
+const MOST_KEPT = 4194304
+const MOST_COMMANDS = 4194304
+
+// A mesh's graph in the device's buffers: its first cluster there and how
+// many, how many materials its clusters are of, the mesh it is of and how
+// many models draw it.
+struct Graph {
+    in_use: bool
+    mesh: int
+    refs: int
+    first: int
+    count: int
+    materials: int
+    first_ref: int
+    ref_count: int
+    first_tri: int
+    tri_count: int
+}
+
+// A clustered draw queued for the frame: its graph, its model's matrix, its
+// instances (a buffer of the draws' twenty floats each, or null for the
+// model alone) and how many, and its first command. A pulled one (a crowd's
+// tier) has room for `count` instances, as many of them as the word at
+// `count_at` in `counted` says this frame, its mesh's buffers and its
+// vertices' bits, and its set of them for the draw.
+struct Queued {
+    graph: int
+    model: ptr                     // f32[16], column-major
+    instances: ptr
+    count: int
+    first_command: int
+    pulled: bool
+    counted: ptr
+    count_at: int
+    bits: int
+    pull_set: ptr
+}
+
+var g_started = false
+var g_set_layout: ptr = null
+var g_layout: ptr = null
+var g_cull: ptr = null
+var g_scan: ptr = null
+var g_emit: ptr = null
+
+var g_graphs: ptr = null           // Graph[g_graph_capacity], by handle - 1
+var g_graph_capacity = 0
+// Every graph's records (RECORD_WORDS words a cluster, its references'
+// and triangles' first as offsets into the buffers of all of them), vertex
+// references and packed triangles, as the device's buffers hold them.
+var g_records: ptr = null
+var g_record_count = 0
+var g_record_capacity = 0
+var g_refs: ptr = null
+var g_ref_count = 0
+var g_ref_capacity = 0
+var g_tris: ptr = null
+var g_tri_count = 0
+var g_tri_capacity = 0
+var g_dirty = false
+var g_record_buffer: ptr = null
+var g_record_memory: ptr = null
+var g_ref_buffer: ptr = null
+var g_ref_memory: ptr = null
+var g_tri_buffer: ptr = null
+var g_tri_memory: ptr = null
+
+// The frame's buffers and their room.
+var g_commands: ptr = null
+var g_commands_memory: ptr = null
+var g_command_capacity = 0
+var g_kept: ptr = null
+var g_kept_memory: ptr = null
+var g_kept_capacity = 0
+var g_counters: ptr = null
+var g_counters_memory: ptr = null
+var g_indices: ptr = null
+var g_indices_memory: ptr = null
+var g_index_capacity = 0
+// One a frame in flight: the view, and the counters read back.
+var g_views: ptr = null            // *HostBuffer[FRAMES]
+var g_readback: ptr = null         // *HostBuffer[FRAMES]
+var g_kept_last = 0
+var g_indices_last = 0
+
+// The frame's queue.
+var g_queued: ptr = null           // Queued[g_queue_capacity]
+var g_queue_count = 0
+var g_queue_capacity = 0
+var g_command_count = 0
+
+// The sets' pools, a list a frame in flight, reset as the frame begins.
+var g_pools: ptr = null            // ptr[FRAMES * g_pool_slots]
+var g_pool_slots = 0
+var g_pool_used: ptr = null        // int[FRAMES]: pools of the frame's list in use
+var g_pool_sets: ptr = null        // int[FRAMES]: sets taken from its last
+var g_params: ptr = null
+
+started() -> bool { return g_started }
+index_buffer() -> ptr { return g_indices }
+command_buffer() -> ptr { return g_commands }
+// What the last frame read back kept and asked for: clusters, indices.
+kept_last() -> int { return g_kept_last }
+indices_last() -> int { return g_indices_last }
+
+cell() -> ptr { return calloc(1, 8) }
+taken(c: ptr) -> ptr {
+    h = (c as ptr[])[0]
+    free(c)
+    return h
+}
+
+graph_at(handle: int) -> *Graph {
+    return (g_graphs + (handle - 1) * sizeof(Graph)) as *Graph
+}
+
+valid(handle: int) -> bool {
+    return g_graphs != null && handle > 0 && handle <= g_graph_capacity && graph_at(handle).in_use
+}
+
+// --- the pipelines -----------------------------------------------------------------------------------------------
+
+// The passes' set layout, pipeline layout and pipelines, and the frame's
+// buffers at their first sizes. False, with the reason in the backend's
+// last error, when one would not make.
+start() -> bool {
+    if g_started { return true }
+    d = vkdevice.device()
+    if d == null || !vkdevice.cluster_draws() {
+        vkdevice.fail("the device draws no cluster cut (multiDrawIndirect, drawIndirectFirstInstance)")
+        return false
+    }
+    bindings = calloc(BINDINGS, sizeof(VkDescriptorSetLayoutBinding))
+    i = 0
+    while i < BINDINGS {
+        b = (bindings + i * sizeof(VkDescriptorSetLayoutBinding)) as *VkDescriptorSetLayoutBinding
+        b.binding = i
+        b.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+        b.descriptorCount = 1
+        b.stageFlags = vk.SHADER_STAGE_COMPUTE_BIT
+        i = i + 1
+    }
+    info = calloc(1, sizeof(VkDescriptorSetLayoutCreateInfo)) as *VkDescriptorSetLayoutCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    info.bindingCount = BINDINGS
+    info.pBindings = bindings
+    out = cell()
+    r = vk.vkCreateDescriptorSetLayout(d, info as ptr, null, out)
+    g_set_layout = taken(out)
+    free(info as ptr)
+    free(bindings)
+    if r != vk.SUCCESS {
+        g_set_layout = null
+        vkdevice.fail("cluster vkCreateDescriptorSetLayout failed")
+        return false
+    }
+
+    range = calloc(1, sizeof(VkPushConstantRange)) as *VkPushConstantRange
+    range.stageFlags = vk.SHADER_STAGE_COMPUTE_BIT
+    range.size = PARAMS_BYTES
+    layouts = cell()
+    (layouts as ptr[])[0] = g_set_layout
+    pl = calloc(1, sizeof(VkPipelineLayoutCreateInfo)) as *VkPipelineLayoutCreateInfo
+    pl.sType = vk.STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+    pl.setLayoutCount = 1
+    pl.pSetLayouts = layouts
+    pl.pushConstantRangeCount = 1
+    pl.pPushConstantRanges = range as ptr
+    out = cell()
+    r = vk.vkCreatePipelineLayout(d, pl as ptr, null, out)
+    g_layout = taken(out)
+    free(pl as ptr)
+    free(layouts)
+    free(range as ptr)
+    if r != vk.SUCCESS {
+        g_layout = null
+        vkdevice.fail("cluster vkCreatePipelineLayout failed")
+        stop()
+        return false
+    }
+    g_cull = pipeline(vkspirv.CLUSTER_CULL_COMP)
+    g_scan = pipeline(vkspirv.CLUSTER_SCAN_COMP)
+    g_emit = pipeline(vkspirv.CLUSTER_EMIT_COMP)
+    if g_cull == null || g_scan == null || g_emit == null {
+        stop()
+        return false
+    }
+
+    frames = vkframe.FRAMES
+    g_views = calloc(frames, 8)
+    g_readback = calloc(frames, 8)
+    i = 0
+    while i < frames {
+        view = vkhost.mapped_buffer(VIEW_BYTES, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        back = vkhost.host_buffer(COUNTERS_BYTES)
+        (g_views as ptr[])[i] = view as ptr
+        (g_readback as ptr[])[i] = back as ptr
+        if view == null || back == null {
+            vkdevice.fail("the cluster cut's view could not be made")
+            stop()
+            return false
+        }
+        // Read before any cut has written it: nothing kept, nothing asked.
+        memset(back.mapped, 0, COUNTERS_BYTES as long)
+        i = i + 1
+    }
+    counters = vkhost.device_buffer(COUNTERS_BYTES, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                                    vk.BUFFER_USAGE_TRANSFER_DST_BIT | vk.BUFFER_USAGE_TRANSFER_SRC_BIT)
+    g_counters = counters.buffer
+    g_counters_memory = counters.memory
+    g_pool_used = calloc(frames, 4)
+    g_pool_sets = calloc(frames, 4)
+    g_params = calloc(1, PARAMS_BYTES)
+    g_started = g_counters != null && grow_commands(FIRST_COMMANDS) && grow_kept(FIRST_KEPT) && grow_indices(FIRST_INDICES)
+    if !g_started {
+        vkdevice.fail("the cluster cut's buffers could not be made")
+        stop()
+        return false
+    }
+    return true
+}
+
+// A compute pipeline of `shader` on the passes' layout, or null.
+pipeline(shader: int) -> ptr {
+    d = vkdevice.device()
+    code = vkspirv.code(shader)
+    mi = calloc(1, sizeof(VkShaderModuleCreateInfo)) as *VkShaderModuleCreateInfo
+    mi.sType = vk.STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+    mi.codeSize = vkspirv.bytes(shader)
+    mi.pCode = code
+    out = cell()
+    r = vk.vkCreateShaderModule(d, mi as ptr, null, out)
+    shader_module = taken(out)
+    free(mi as ptr)
+    free(code)
+    if r != vk.SUCCESS {
+        vkdevice.fail("cluster vkCreateShaderModule failed")
+        return null
+    }
+    ci = calloc(1, sizeof(VkComputePipelineCreateInfo)) as *VkComputePipelineCreateInfo
+    ci.sType = vk.STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+    ci.stage.sType = vk.STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+    ci.stage.stage = vk.SHADER_STAGE_COMPUTE_BIT
+    ci.stage.module = shader_module
+    ci.stage.pName = "main"
+    ci.layout = g_layout
+    out = cell()
+    r = vk.vkCreateComputePipelines(d, null, 1, ci as ptr, null, out)
+    made = taken(out)
+    free(ci as ptr)
+    vk.vkDestroyShaderModule(d, shader_module, null)
+    if r != vk.SUCCESS {
+        vkdevice.fail("cluster vkCreateComputePipelines failed")
+        return null
+    }
+    return made
+}
+
+// Everything made here destroyed, the device idle; the graphs forgotten.
+stop() {
+    d = vkdevice.device()
+    if d != null { vk.vkDeviceWaitIdle(d) }
+    if d != null {
+        if g_cull != null { vk.vkDestroyPipeline(d, g_cull, null) }
+        if g_scan != null { vk.vkDestroyPipeline(d, g_scan, null) }
+        if g_emit != null { vk.vkDestroyPipeline(d, g_emit, null) }
+        if g_layout != null { vk.vkDestroyPipelineLayout(d, g_layout, null) }
+        if g_set_layout != null { vk.vkDestroyDescriptorSetLayout(d, g_set_layout, null) }
+        i = 0
+        while i < vkframe.FRAMES * g_pool_slots {
+            pool = (g_pools as ptr[])[i]
+            if pool != null { vk.vkDestroyDescriptorPool(d, pool, null) }
+            i = i + 1
+        }
+    }
+    g_cull = null
+    g_scan = null
+    g_emit = null
+    g_layout = null
+    g_set_layout = null
+    if g_pools != null { free(g_pools) }
+    g_pools = null
+    g_pool_slots = 0
+    if g_pool_used != null { free(g_pool_used) }
+    if g_pool_sets != null { free(g_pool_sets) }
+    g_pool_used = null
+    g_pool_sets = null
+    if g_views != null {
+        i = 0
+        while i < vkframe.FRAMES {
+            vkhost.host_buffer_free((g_views as ptr[])[i] as *HostBuffer)
+            vkhost.host_buffer_free((g_readback as ptr[])[i] as *HostBuffer)
+            i = i + 1
+        }
+        free(g_views)
+        free(g_readback)
+    }
+    g_views = null
+    g_readback = null
+    free_pair(g_counters, g_counters_memory)
+    free_pair(g_commands, g_commands_memory)
+    free_pair(g_kept, g_kept_memory)
+    free_pair(g_indices, g_indices_memory)
+    free_pair(g_record_buffer, g_record_memory)
+    free_pair(g_ref_buffer, g_ref_memory)
+    free_pair(g_tri_buffer, g_tri_memory)
+    g_counters = null
+    g_counters_memory = null
+    g_commands = null
+    g_commands_memory = null
+    g_kept = null
+    g_kept_memory = null
+    g_indices = null
+    g_indices_memory = null
+    forget_graph_buffers()
+    g_command_capacity = 0
+    g_kept_capacity = 0
+    g_index_capacity = 0
+    if g_records != null { free(g_records) }
+    if g_refs != null { free(g_refs) }
+    if g_tris != null { free(g_tris) }
+    if g_graphs != null { free(g_graphs) }
+    if g_queued != null {
+        i = 0
+        while i < g_queue_capacity {
+            q = queued_at(i)
+            if q.model != null { free(q.model) }
+            i = i + 1
+        }
+        free(g_queued)
+    }
+    if g_params != null { free(g_params) }
+    g_params = null
+    g_records = null
+    g_refs = null
+    g_tris = null
+    g_graphs = null
+    g_queued = null
+    g_record_count = 0
+    g_record_capacity = 0
+    g_ref_count = 0
+    g_ref_capacity = 0
+    g_tri_count = 0
+    g_tri_capacity = 0
+    g_graph_capacity = 0
+    g_queue_capacity = 0
+    g_queue_count = 0
+    g_started = false
+}
+
+free_pair(buffer: ptr, memory: ptr) {
+    vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: buffer, memory: memory })
+}
+
+// --- the frame's buffers -----------------------------------------------------------------------------------------
+
+// Room for `count` commands; the device idle first when there were some.
+grow_commands(count: int) -> bool {
+    if count <= g_command_capacity { return true }
+    room = next_room(g_command_capacity, count, FIRST_COMMANDS, MOST_COMMANDS)
+    if room <= g_command_capacity { return count <= g_command_capacity }
+    made = replace(g_commands, g_commands_memory, room * COMMAND_BYTES,
+                   vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_INDIRECT_BUFFER_BIT | vk.BUFFER_USAGE_TRANSFER_DST_BIT)
+    g_commands = made.buffer
+    g_commands_memory = made.memory
+    if made.buffer == null {
+        g_command_capacity = 0
+        return false
+    }
+    g_command_capacity = room
+    return true
+}
+
+grow_kept(count: int) -> bool {
+    if count <= g_kept_capacity { return true }
+    room = next_room(g_kept_capacity, count, FIRST_KEPT, MOST_KEPT)
+    if room <= g_kept_capacity { return true }
+    made = replace(g_kept, g_kept_memory, room * 16, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT)
+    g_kept = made.buffer
+    g_kept_memory = made.memory
+    if made.buffer == null {
+        g_kept_capacity = 0
+        return false
+    }
+    g_kept_capacity = room
+    return true
+}
+
+grow_indices(count: int) -> bool {
+    if count <= g_index_capacity { return true }
+    room = next_room(g_index_capacity, count, FIRST_INDICES, MOST_INDICES)
+    if room <= g_index_capacity { return true }
+    made = replace(g_indices, g_indices_memory, room * 4, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_INDEX_BUFFER_BIT)
+    g_indices = made.buffer
+    g_indices_memory = made.memory
+    if made.buffer == null {
+        g_index_capacity = 0
+        return false
+    }
+    g_index_capacity = room
+    return true
+}
+
+// The room to grow to: doubling from what there is (or `first`) until a
+// quarter past `count` fits, so a scene that grows a little each frame does
+// not wait for the device each frame; never past `most`.
+next_room(had: int, count: int, first: int, most: int) -> int {
+    room = had
+    if room < first { room = first }
+    wanted = count
+    if wanted < most { wanted = wanted + wanted / 4 }
+    while room < wanted && room < most { room = room * 2 }
+    if room > most { room = most }
+    return room
+}
+
+// A fresh device-local buffer for `usage` in place of `buffer`, which the
+// device may still be reading: it is let go of once the device is idle.
+replace(buffer: ptr, memory: ptr, bytes: int, usage: int) -> DeviceBuffer {
+    if buffer != null {
+        vk.vkDeviceWaitIdle(vkdevice.device())
+        free_pair(buffer, memory)
+    }
+    return vkhost.device_buffer(bytes, usage)
+}
+
+// --- the graphs ------------------------------------------------------------------------------------------------
+
+// The graph of the mesh uploaded under `mesh` (a vkmesh handle) from its
+// vertices and indices (`source`, a geometry mesh), split by material into
+// `ranges` (first index, count, `range_count` pairs; null for one): built
+// the first time a model asks, shared by every model after. Its handle, or
+// 0 when it could not be made.
+acquire(mesh: int, source: ptr, ranges: ptr, range_count: int) -> int {
+    if !g_started || mesh <= 0 { return 0 }
+    h = 1
+    while h <= g_graph_capacity {
+        g = graph_at(h)
+        if g.in_use && g.mesh == mesh {
+            g.refs = g.refs + 1
+            return h
+        }
+        h = h + 1
+    }
+    cm = clusterlod.build(geometry.mesh_vertex_data(source), geometry.mesh_vertex_count(source),
+                          geometry.mesh_index_data(source), geometry.mesh_index_count(source), ranges, range_count)
+    // A graph whose coarsest cut is still most of the mesh would cost the
+    // cut every frame and draw what the mesh draws whole.
+    if cm == null || clusterlod.cluster_count(cm) == 0 || clusterlod.coarsest_share(cm) > MOST_KEPT_SHARE {
+        if cm != null { clusterlod.free_mesh(cm) }
+        return 0
+    }
+    handle = free_graph()
+    g = graph_at(handle)
+    g.in_use = true
+    g.mesh = mesh
+    g.refs = 1
+    g.first = g_record_count
+    g.count = clusterlod.cluster_count(cm)
+    g.materials = range_count
+    if ranges == null || range_count <= 0 { g.materials = 1 }
+    g.first_ref = g_ref_count
+    g.ref_count = clusterlod.vertex_ref_count(cm)
+    g.first_tri = g_tri_count
+    g.tri_count = clusterlod.triangle_total(cm)
+    append(cm, g)
+    clusterlod.free_mesh(cm)
+    g_dirty = true
+    return handle
+}
+
+free_graph() -> int {
+    h = 1
+    while h <= g_graph_capacity {
+        if !graph_at(h).in_use { return h }
+        h = h + 1
+    }
+    grown = g_graph_capacity * 2
+    if grown < 16 { grown = 16 }
+    fresh = calloc(grown, sizeof(Graph))
+    if g_graphs != null {
+        memcpy(fresh, g_graphs, (g_graph_capacity * sizeof(Graph)) as long)
+        free(g_graphs)
+    }
+    g_graphs = fresh
+    h = g_graph_capacity + 1
+    g_graph_capacity = grown
+    return h
+}
+
+// The graph's clusters, references and triangles onto the ends of the
+// buffers of all of them, its records' offsets moved onto those ends.
+append(cm: *ClusterMesh, g: *Graph) {
+    words = clusterlod.RECORD_WORDS
+    if g_record_count + g.count > g_record_capacity {
+        g_record_capacity = room(g_record_capacity, g_record_count + g.count)
+        g_records = realloc(g_records, (g_record_capacity * words * 4) as long)
+    }
+    if g_ref_count + g.ref_count > g_ref_capacity {
+        g_ref_capacity = room(g_ref_capacity, g_ref_count + g.ref_count)
+        g_refs = realloc(g_refs, (g_ref_capacity * 4) as long)
+    }
+    if g_tri_count + g.tri_count > g_tri_capacity {
+        g_tri_capacity = room(g_tri_capacity, g_tri_count + g.tri_count)
+        g_tris = realloc(g_tris, (g_tri_capacity * 4) as long)
+    }
+    memcpy(g_records + g_record_count * words * 4, clusterlod.record(cm, 0), (g.count * words * 4) as long)
+    memcpy(g_refs + g_ref_count * 4, clusterlod.vertex_refs(cm), (g.ref_count * 4) as long)
+    memcpy(g_tris + g_tri_count * 4, clusterlod.triangles(cm), (g.tri_count * 4) as long)
+    shift(g.first, g.count, g_ref_count, g_tri_count)
+    g_record_count = g_record_count + g.count
+    g_ref_count = g_ref_count + g.ref_count
+    g_tri_count = g_tri_count + g.tri_count
+}
+
+// `count` records from `first` with `refs` added to their references'
+// first and `tris` to their triangles'.
+shift(first: int, count: int, refs: int, tris: int) {
+    words = clusterlod.RECORD_WORDS
+    w = g_records as int[]
+    k = first
+    while k < first + count {
+        w[k * words + clusterlod.REC_REFS] = w[k * words + clusterlod.REC_REFS] + refs
+        w[k * words + clusterlod.REC_TRIS] = w[k * words + clusterlod.REC_TRIS] + tris
+        k = k + 1
+    }
+}
+
+// The room an array that holds `had` grows to for `count`.
+room(had: int, count: int) -> int {
+    grown = had * 2
+    if grown < 1024 { grown = 1024 }
+    while grown < count { grown = grown * 2 }
+    return grown
+}
+
+// A model lets go of the graph; the last one's leaves the buffers, the
+// graphs after it moving down into its place.
+release(handle: int) {
+    if !valid(handle) { return }
+    g = graph_at(handle)
+    g.refs = g.refs - 1
+    if g.refs > 0 { return }
+    words = clusterlod.RECORD_WORDS
+    after = g_record_count - g.first - g.count
+    memmove(g_records + g.first * words * 4, g_records + (g.first + g.count) * words * 4, (after * words * 4) as long)
+    memmove(g_refs + g.first_ref * 4, g_refs + (g.first_ref + g.ref_count) * 4,
+            ((g_ref_count - g.first_ref - g.ref_count) * 4) as long)
+    memmove(g_tris + g.first_tri * 4, g_tris + (g.first_tri + g.tri_count) * 4,
+            ((g_tri_count - g.first_tri - g.tri_count) * 4) as long)
+    shift(g.first, after, 0 - g.ref_count, 0 - g.tri_count)
+    h = 1
+    while h <= g_graph_capacity {
+        o = graph_at(h)
+        if o.in_use && o.first > g.first {
+            o.first = o.first - g.count
+            o.first_ref = o.first_ref - g.ref_count
+            o.first_tri = o.first_tri - g.tri_count
+        }
+        h = h + 1
+    }
+    g_record_count = g_record_count - g.count
+    g_ref_count = g_ref_count - g.ref_count
+    g_tri_count = g_tri_count - g.tri_count
+    g.in_use = false
+    g_dirty = true
+}
+
+// How many materials the graph's commands are an instance of, and its
+// clusters.
+materials(handle: int) -> int {
+    if !valid(handle) { return 0 }
+    return graph_at(handle).materials
+}
+
+clusters_of(handle: int) -> int {
+    if !valid(handle) { return 0 }
+    return graph_at(handle).count
+}
+
+forget_graph_buffers() {
+    g_record_buffer = null
+    g_record_memory = null
+    g_ref_buffer = null
+    g_ref_memory = null
+    g_tri_buffer = null
+    g_tri_memory = null
+}
+
+// The graphs onto the device, where they changed: the device idle first,
+// since the frames before may still read the buffers being replaced.
+sync_graphs() -> bool {
+    if !g_dirty { return true }
+    d = vkdevice.device()
+    vk.vkDeviceWaitIdle(d)
+    free_pair(g_record_buffer, g_record_memory)
+    free_pair(g_ref_buffer, g_ref_memory)
+    free_pair(g_tri_buffer, g_tri_memory)
+    forget_graph_buffers()
+    g_dirty = false
+    if g_record_count == 0 { return true }
+    records = vkhost.upload(g_records, g_record_count * clusterlod.RECORD_WORDS * 4, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT)
+    refs = vkhost.upload(g_refs, g_ref_count * 4, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT)
+    tris = vkhost.upload(g_tris, g_tri_count * 4, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT)
+    g_record_buffer = records.buffer
+    g_record_memory = records.memory
+    g_ref_buffer = refs.buffer
+    g_ref_memory = refs.memory
+    g_tri_buffer = tris.buffer
+    g_tri_memory = tris.memory
+    if g_record_buffer == null || g_ref_buffer == null || g_tri_buffer == null {
+        vkdevice.fail("the cluster graphs could not be uploaded")
+        return false
+    }
+    return true
+}
+
+// --- the frame ---------------------------------------------------------------------------------------------------
+
+// The frame begun: its queue emptied, its sets' pools reset, and what the
+// frame that last used this slot read back -- the clusters it kept, the
+// indices it asked for -- the budgets grown to.
+frame_start() {
+    if !g_started { return }
+    g_queue_count = 0
+    g_command_count = 0
+    slot = vkframe.frame_slot()
+    d = vkdevice.device()
+    p = 0
+    while p < g_pool_slots {
+        pool = (g_pools as ptr[])[slot * g_pool_slots + p]
+        if pool != null { vk.vkResetDescriptorPool(d, pool, 0) }
+        p = p + 1
+    }
+    (g_pool_used as int[])[slot] = 0
+    (g_pool_sets as int[])[slot] = 0
+    back = ((g_readback as ptr[])[slot] as *HostBuffer).mapped as uint32[]
+    g_kept_last = back[0] as int
+    g_indices_last = back[1] as int
+    grow_kept(g_kept_last)
+    grow_indices(g_indices_last)
+}
+
+queued_at(i: int) -> *Queued {
+    return (g_queued + i * sizeof(Queued)) as *Queued
+}
+
+// A clustered draw for the frame: graph `handle` at `model` (a Mat4's
+// sixteen floats, column-major), over `count` instances in `instances` (the
+// draws' instance buffer) or the model alone (null). Its first command: the
+// draw of material `m` of instance `i` is command first + i * materials + m.
+// -1 when it could not be queued.
+queue(handle: int, model: ptr, instances: ptr, count: int) -> int {
+    if !g_started || !valid(handle) || count <= 0 { return 0 - 1 }
+    if g_queue_count >= g_queue_capacity {
+        grown = g_queue_capacity * 2
+        if grown < 16 { grown = 16 }
+        fresh = calloc(grown, sizeof(Queued))
+        if g_queued != null {
+            memcpy(fresh, g_queued, (g_queue_capacity * sizeof(Queued)) as long)
+            free(g_queued)
+        }
+        g_queued = fresh
+        g_queue_capacity = grown
+    }
+    q = queued_at(g_queue_count)
+    if q.model == null { q.model = calloc(16, 4) }
+    memcpy(q.model, model, 64 as long)
+    q.graph = handle
+    q.instances = instances
+    q.count = count
+    q.first_command = g_command_count
+    q.pulled = false
+    q.counted = null
+    q.count_at = 0
+    q.bits = 0
+    q.pull_set = null
+    g_queue_count = g_queue_count + 1
+    g_command_count = g_command_count + count * graph_at(handle).materials
+    return q.first_command
+}
+
+// A pulled draw for the frame (a crowd's tier): graph `handle` at `model`
+// over the instances in `instances` -- room for `capacity`, as many as the
+// word `count_at` bytes into `counted` says when the cut runs -- its mesh's
+// `vertices` and `skin` read by the draw with each index the instance's
+// slot above `bits` bits of vertex. One command a material. Its first
+// command, or -1.
+queue_pulled(handle: int, model: ptr, instances: ptr, capacity: int, counted: ptr, count_at: int,
+             vertices: ptr, skin: ptr, bits: int) -> int {
+    if !g_started || !valid(handle) || capacity <= 0 || instances == null || counted == null { return 0 - 1 }
+    if vertices == null || skin == null || vkpipes.pull_set_layout() == null { return 0 - 1 }
+    set = take_set(vkpipes.pull_set_layout())
+    if set == null { return 0 - 1 }
+    write_set(set, 0, vertices)
+    write_set(set, 1, skin)
+    write_set(set, 2, instances)
+    first = queue(handle, model, instances, capacity)
+    if first < 0 { return first }
+    q = queued_at(g_queue_count - 1)
+    q.pulled = true
+    q.counted = counted
+    q.count_at = count_at
+    q.bits = bits
+    q.pull_set = set
+    g_command_count = first + graph_at(handle).materials
+    return first
+}
+
+// The vertices' set of the pulled draw whose first command is `first`.
+pull_set(first: int) -> ptr {
+    i = 0
+    while i < g_queue_count {
+        q = queued_at(i)
+        if q.pulled && q.first_command == first { return q.pull_set }
+        i = i + 1
+    }
+    return null
+}
+
+// One storage buffer into `set` at `binding`.
+write_set(set: ptr, binding: int, buffer: ptr) {
+    info = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+    info.buffer = buffer
+    info.range = vk.WHOLE_SIZE
+    w = calloc(1, sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+    w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    w.dstSet = set
+    w.dstBinding = binding
+    w.descriptorCount = 1
+    w.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+    w.pBufferInfo = info as ptr
+    vk.vkUpdateDescriptorSets(vkdevice.device(), 1, w as ptr, 0, null)
+    free(w as ptr)
+    free(info as ptr)
+}
+
+// A set of `layout` from this frame's pools, a fresh pool where they are
+// spent.
+take_set(layout: ptr) -> ptr {
+    d = vkdevice.device()
+    slot = vkframe.frame_slot()
+    used = (g_pool_used as int[])[slot]
+    if used == 0 || (g_pool_sets as int[])[slot] >= POOL_SETS {
+        if used >= g_pool_slots { widen_pools() }
+        index = slot * g_pool_slots + used
+        if (g_pools as ptr[])[index] == null {
+            (g_pools as ptr[])[index] = make_pool()
+            if (g_pools as ptr[])[index] == null { return null }
+        }
+        (g_pool_used as int[])[slot] = used + 1
+        (g_pool_sets as int[])[slot] = 0
+    }
+    pool = (g_pools as ptr[])[slot * g_pool_slots + (g_pool_used as int[])[slot] - 1]
+    layouts = cell()
+    (layouts as ptr[])[0] = layout
+    ai = calloc(1, sizeof(VkDescriptorSetAllocateInfo)) as *VkDescriptorSetAllocateInfo
+    ai.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+    ai.descriptorPool = pool
+    ai.descriptorSetCount = 1
+    ai.pSetLayouts = layouts
+    out = cell()
+    r = vk.vkAllocateDescriptorSets(d, ai as ptr, out)
+    set = taken(out)
+    free(ai as ptr)
+    free(layouts)
+    if r != vk.SUCCESS {
+        vkdevice.fail("cluster vkAllocateDescriptorSets failed")
+        return null
+    }
+    (g_pool_sets as int[])[slot] = (g_pool_sets as int[])[slot] + 1
+    return set
+}
+
+// Another pool's place in every frame's list.
+widen_pools() {
+    frames = vkframe.FRAMES
+    slots = g_pool_slots + 4
+    fresh = calloc(frames * slots, 8)
+    f = 0
+    while f < frames {
+        p = 0
+        while p < g_pool_slots {
+            (fresh as ptr[])[f * slots + p] = (g_pools as ptr[])[f * g_pool_slots + p]
+            p = p + 1
+        }
+        f = f + 1
+    }
+    if g_pools != null { free(g_pools) }
+    g_pools = fresh
+    g_pool_slots = slots
+}
+
+make_pool() -> ptr {
+    size = calloc(1, sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
+    size.type = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+    size.descriptorCount = BINDINGS * POOL_SETS
+    pi = calloc(1, sizeof(VkDescriptorPoolCreateInfo)) as *VkDescriptorPoolCreateInfo
+    pi.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+    pi.maxSets = POOL_SETS
+    pi.poolSizeCount = 1
+    pi.pPoolSizes = size as ptr
+    out = cell()
+    r = vk.vkCreateDescriptorPool(vkdevice.device(), pi as ptr, null, out)
+    pool = taken(out)
+    free(pi as ptr)
+    free(size as ptr)
+    if r != vk.SUCCESS {
+        vkdevice.fail("cluster vkCreateDescriptorPool failed")
+        return null
+    }
+    return pool
+}
+
+// A set of the frame's buffers, `instances` at binding 1 and a pulled
+// draw's `counted` at 9 (the view where there are none: the cull reads
+// them only for a draw that has them).
+set_for(instances: ptr, counted: ptr, view: ptr) -> ptr {
+    set = take_set(g_set_layout)
+    if set == null { return null }
+    buffers = calloc(BINDINGS, sizeof(VkDescriptorBufferInfo))
+    writes = calloc(BINDINGS, sizeof(VkWriteDescriptorSet))
+    b = 0
+    while b < BINDINGS {
+        info = (buffers + b * sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+        if b == 0 { info.buffer = g_record_buffer }
+        if b == 1 {
+            info.buffer = instances
+            if instances == null { info.buffer = view }
+        }
+        if b == 2 { info.buffer = g_commands }
+        if b == 3 { info.buffer = g_kept }
+        if b == 4 { info.buffer = g_counters }
+        if b == 5 { info.buffer = view }
+        if b == 6 { info.buffer = g_ref_buffer }
+        if b == 7 { info.buffer = g_tri_buffer }
+        if b == 8 { info.buffer = g_indices }
+        if b == 9 {
+            info.buffer = counted
+            if counted == null { info.buffer = view }
+        }
+        info.range = vk.WHOLE_SIZE
+        w = (writes + b * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+        w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+        w.dstSet = set
+        w.dstBinding = b
+        w.descriptorCount = 1
+        w.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+        w.pBufferInfo = info as ptr
+        b = b + 1
+    }
+    vk.vkUpdateDescriptorSets(vkdevice.device(), BINDINGS, writes, 0, null)
+    free(writes)
+    free(buffers)
+    return set
+}
+
+// A global barrier from `src` to `dst`.
+barrier(commands: ptr, src_stage: int, dst_stage: int, src_access: int, dst_access: int) {
+    mb = calloc(1, sizeof(VkMemoryBarrier)) as *VkMemoryBarrier
+    mb.sType = vk.STRUCTURE_TYPE_MEMORY_BARRIER
+    mb.srcAccessMask = src_access
+    mb.dstAccessMask = dst_access
+    vk.vkCmdPipelineBarrier(commands, src_stage, dst_stage, 0, 1, mb as ptr, 0, null, 0, null)
+    free(mb as ptr)
+}
+
+bind(commands: ptr, pipeline: ptr, set: ptr) {
+    vk.vkCmdBindPipeline(commands, vk.PIPELINE_BIND_POINT_COMPUTE, pipeline)
+    c = cell()
+    (c as ptr[])[0] = set
+    vk.vkCmdBindDescriptorSets(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_layout, 0, 1, c, 0, null)
+    free(c)
+}
+
+// A view plane's normal and distance at `at`.
+plane(v: f32[], at: int, p: *FrustumPlane) {
+    v[at] = p.normal.x as f32
+    v[at + 1] = p.normal.y as f32
+    v[at + 2] = p.normal.z as f32
+    v[at + 3] = p.distance as f32
+}
+
+push(commands: ptr) {
+    vk.vkCmdPushConstants(commands, g_layout, vk.SHADER_STAGE_COMPUTE_BIT, 0, PARAMS_BYTES, g_params)
+}
+
+// The frame's cut of every queued draw, recorded before the scene pass
+// opens: the view -- `frustum` (a core Frustum: six planes of a normal and
+// a distance), the eye, the pixels a unit spans a unit away (`pixels`), the
+// error the cut may make on the screen (`tau`, pixels) and the nearest
+// distance measured (`near`) -- then the cull, the scan and the emit, and
+// their writes made visible to the draws' indirect and index reads. False
+// when nothing was cut: the queued draws are then not drawn.
+cull(frustum: ptr, ex: float, ey: float, ez: float, pixels: float, tau: float, near: float) -> bool {
+    if !g_started || g_queue_count == 0 { return false }
+    if !vkhost.recording() || vkhost.pass_open() { return false }
+    if !sync_graphs() || g_record_buffer == null { return false }
+    if !grow_commands(g_command_count) { return false }
+    commands = vkhost.frame_commands()
+    slot = vkframe.frame_slot()
+    view = (g_views as ptr[])[slot] as *HostBuffer
+    v = view.mapped as f32[]
+    f = frustum as *Frustum
+    plane(v, 0, &f.left)
+    plane(v, 4, &f.right)
+    plane(v, 8, &f.bottom)
+    plane(v, 12, &f.top)
+    plane(v, 16, &f.near)
+    plane(v, 20, &f.far)
+    v[24] = ex as f32
+    v[25] = ey as f32
+    v[26] = ez as f32
+    v[27] = pixels as f32
+    v[28] = tau as f32
+    v[29] = near as f32
+    v[30] = 0.0
+    v[31] = 0.0
+
+    // The frame before's draws read the commands and the indices this cut
+    // writes over, and its passes wrote them; and a crowd's sort, just
+    // before, wrote the counts of figures a pulled draw reads, by a copy.
+    barrier(commands, vk.PIPELINE_STAGE_DRAW_INDIRECT_BIT | vk.PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                      vk.PIPELINE_STAGE_VERTEX_SHADER_BIT | vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                      vk.PIPELINE_STAGE_TRANSFER_BIT,
+            vk.PIPELINE_STAGE_TRANSFER_BIT | vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.ACCESS_INDIRECT_COMMAND_READ_BIT | vk.ACCESS_INDEX_READ_BIT | vk.ACCESS_SHADER_WRITE_BIT |
+            vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_TRANSFER_READ_BIT | vk.ACCESS_TRANSFER_WRITE_BIT,
+            vk.ACCESS_TRANSFER_WRITE_BIT | vk.ACCESS_SHADER_WRITE_BIT | vk.ACCESS_SHADER_READ_BIT)
+    vk.vkCmdFillBuffer(commands, g_commands, 0, (g_command_count * COMMAND_BYTES) as long, 0)
+    vk.vkCmdFillBuffer(commands, g_counters, 0, COUNTERS_BYTES as long, 0)
+    barrier(commands, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.ACCESS_TRANSFER_WRITE_BIT, vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_SHADER_WRITE_BIT)
+
+    params = g_params as uint32[]
+    params[22] = g_command_count
+    params[23] = g_index_capacity
+    params[24] = g_kept_capacity
+    first_set = null
+    i = 0
+    while i < g_queue_count {
+        q = queued_at(i)
+        g = graph_at(q.graph)
+        set = set_for(q.instances, q.counted, view.buffer)
+        if set == null { return false }
+        if first_set == null { first_set = set }
+        bind(commands, g_cull, set)
+        memcpy(g_params, q.model, 64 as long)
+        params[16] = g.first
+        params[17] = g.count
+        params[19] = 0
+        if q.instances != null { params[19] = 1 }
+        params[21] = g.materials
+        params[25] = q.count_at
+        params[26] = 0
+        if q.pulled { params[26] = 1 }
+        params[27] = q.bits
+        // A dispatch's instances along its second side, as many as a side
+        // may have, and the rest in dispatches after.
+        done = 0
+        while done < q.count {
+            n = q.count - done
+            if n > MOST_GROUPS { n = MOST_GROUPS }
+            params[18] = done
+            params[20] = q.first_command + done * g.materials
+            if q.pulled { params[20] = q.first_command }
+            push(commands)
+            vk.vkCmdDispatch(commands, (g.count + CULL_GROUP - 1) / CULL_GROUP, n, 1)
+            done = done + n
+        }
+        i = i + 1
+    }
+    barrier(commands, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.ACCESS_SHADER_WRITE_BIT, vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_SHADER_WRITE_BIT)
+    bind(commands, g_scan, first_set)
+    push(commands)
+    vk.vkCmdDispatch(commands, 1, 1, 1)
+    barrier(commands, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT | vk.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+            vk.ACCESS_SHADER_WRITE_BIT, vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_INDIRECT_COMMAND_READ_BIT)
+    bind(commands, g_emit, first_set)
+    push(commands)
+    vk.vkCmdDispatchIndirect(commands, g_counters, 16)
+    // The commands and the indices for the draws; and the streams a crowd's
+    // sort wrote, which a pulled draw reads in its vertex shader.
+    barrier(commands, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.PIPELINE_STAGE_DRAW_INDIRECT_BIT | vk.PIPELINE_STAGE_VERTEX_INPUT_BIT | vk.PIPELINE_STAGE_VERTEX_SHADER_BIT |
+            vk.PIPELINE_STAGE_TRANSFER_BIT,
+            vk.ACCESS_SHADER_WRITE_BIT,
+            vk.ACCESS_INDIRECT_COMMAND_READ_BIT | vk.ACCESS_INDEX_READ_BIT | vk.ACCESS_SHADER_READ_BIT |
+            vk.ACCESS_TRANSFER_READ_BIT)
+    // The counters, for the budgets of the frame that next has this slot.
+    region = calloc(1, sizeof(VkBufferCopy)) as *VkBufferCopy
+    region.size = 8
+    back = (g_readback as ptr[])[slot] as *HostBuffer
+    vk.vkCmdCopyBuffer(commands, g_counters, back.buffer, 1, region as ptr)
+    free(region as ptr)
+    barrier(commands, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_HOST_BIT,
+            vk.ACCESS_TRANSFER_WRITE_BIT, vk.ACCESS_HOST_READ_BIT)
+    return true
+}

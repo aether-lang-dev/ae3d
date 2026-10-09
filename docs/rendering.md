@@ -242,6 +242,63 @@ The frame the cone draws differs from the tree before's by what the tree
 before differs from itself run to run (mean 0.11 and 0.09 of 255, both
 along the lit windows' edges).
 
+### The cluster cut
+
+On Vulkan a big mesh is drawn at the detail its distance needs (#536), the
+way Nanite draws one (Karis, "Nanite: A Deep Dive", 2021). When a model of
+8,192 triangles or more is added, `ae3d.clusterlod` cuts its mesh into
+clusters of at most 128 triangles over 128 vertices, groups them by the
+edges they share, simplifies each group to half -- the vertices it shares
+with other groups held, so neighbours still meet -- and cuts the result
+again, level after level, down to a single cluster: a graph of every
+detail the mesh can be drawn at. A cluster carries the error of the group
+that made it and of the group it was simplified into, each the furthest
+the surface moved, measured against the triangles it came from. A view
+draws a cluster where its own error, projected, is under a pixel and its
+parent's is over: siblings compare the same two numbers, so a group is
+drawn whole or its parents are, and the surface has no cracks. Pieces too
+small to simplify -- a facade's stone trim is hundreds of little boxes --
+go whole once the error allows their size. The graph is built once a mesh
+and shared by every model of it; the zombie's body (26,636 triangles)
+takes 0.21 s on an M1 Pro.
+
+Each frame `ae3d.vkclusterlod` cuts the graph on the device, recorded right
+after the crowds' sort so it has run before the scene pass reads it: a
+compute thread an instance's cluster keeps it where its error and its
+sphere say, and counts its triangles into its instance's command for its
+material; a scan lays the commands end to end; a third pass writes the
+kept clusters' triangles into the frame's index buffer as the mesh's own
+vertex indices. The scene's own pipelines then draw the mesh's vertex
+buffer over those indices, one `vkCmdDrawIndexedIndirect` of every
+instance's command for a material, so the lighting, the motion vectors and
+the passes after are what they were. In zombie_city the stone trim of the
+15 nearest blocks draws 36,194 of its 217,860 triangles, and the scene and
+shadow passes fall from 109.18 to 108.64 ms on an M1 Pro at 2560 by 1440
+(the city is bound by its pixels there, not its triangles); the frame is
+the same but for the horde's animation, which differs run to run.
+
+A crowd's near tier is cut too, figure by figure, since its figures are
+where a crowd's triangles are. The cut runs over the figures the crowd's
+sort kept for the tier, as many as it counted on the device, and writes
+each index as the figure's slot in the tier's stream above the mesh's
+vertex; the crowd's vertex shader in its pulling variant
+(`crowd_pull_vk.vert`) reads the vertex, its skin and the figure from
+storage, so the whole tier, however many figures and at whatever detail
+each, is one draw. In zombie_city each of the horde's 400 figures is
+30,364 triangles up close and every one within 600 m is drawn by the near
+tier; cut, the horde and the trim draw 380,703 triangles a frame, and the
+scene and shadow passes fall from 109.17 to 53.56 ms on the M1 Pro at 2560
+by 1440 (8.8 to 17.1 fps).
+
+`AE3D_CLUSTERS=auto|on|off` (`core.CLUSTERS_*`, `renderer_set_clusters`)
+picks it: `auto`, the default, wherever the device has `multiDrawIndirect`
+and `drawIndirectFirstInstance`. A skinned mesh outside a crowd, a crowd's
+far tiers, a stream of points or a model with a program of its own is
+drawn whole, as is a mesh once it is edited, and the shadow pass draws
+every mesh whole (a crowd casts by its far mesh, as before). OpenGL 4.1
+has no compute and draws every mesh whole. `AE3D_PERF=1` says what the
+last frame's cut kept (`perf cut`).
+
 ### Light and the frame
 
 The scene is drawn as light, into half floats (RGBA16F on both backends),
