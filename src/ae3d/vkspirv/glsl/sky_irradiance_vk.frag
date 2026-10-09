@@ -151,6 +151,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float skyTurbidity;
     float skyLevelSize;
     float skyRoughness;
+    vec3 groundAlbedo;
+    vec3 groundSun;
     float frameExposure;
     bool enableBloom;
     float bloomIntensity;
@@ -217,6 +219,13 @@ layout(set = 0, binding = 1) uniform sampler2D skyCapture;
 layout(location = 0) out vec4 FragColor;
 
 
+// The ground the scene stands on (#740): its albedo (0 for none, the
+// capture's own lower half kept) and the sun's light onto level ground. A
+// direction under the horizon then sees the ground lit by the sky and the
+// sun, so a surface turned from the sun is lit from below by the sunlit
+// ground round it, as shaded sand is.
+
+
 
 // The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
 // the upper hemisphere in the square's inner diamond, the lower folded into
@@ -253,26 +262,52 @@ vec3 oct_texel_direction(vec2 uv, float size) {
     return oct_decode(p);
 }
 
+// A texel of the capture's level `n` texels a side: its direction (unit)
+// and the solid angle it stands for, unnormalised.
+vec3 capture_direction(int x, int y, out float angle) {
+    vec2 uv = (vec2(float(x), float(y)) + 0.5) / SKY_IRRADIANCE_SIZE;
+    vec2 p = clamp(((uv * SKY_SIZE - 1.0) / (SKY_SIZE - 2.0)) * 2.0 - 1.0, -1.0, 1.0);
+    vec3 q = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (q.y < 0.0) {
+        vec2 folded = (1.0 - abs(q.zx)) * vec2(q.x >= 0.0 ? 1.0 : -1.0, q.z >= 0.0 ? 1.0 : -1.0);
+        q.x = folded.x;
+        q.z = folded.y;
+    }
+    float len = length(q);
+    angle = 1.0 / (len * len * len);
+    return q / len;
+}
+
 void main() {
     vec3 N = oct_texel_direction(gl_FragCoord.xy / SKY_IRRADIANCE_SIZE, SKY_IRRADIANCE_SIZE);
     int level = int(log2(SKY_SIZE / SKY_IRRADIANCE_SIZE) + 0.5);
     int n = int(SKY_IRRADIANCE_SIZE);
+    bool grounded = groundAlbedo.x + groundAlbedo.y + groundAlbedo.z > 0.0;
+    // The ground's own light: lit by the sky over it and the sun, and
+    // giving back its albedo's share of that, evenly (Lambert: over pi).
+    vec3 ground = vec3(0.0);
+    if (grounded) {
+        vec3 up = vec3(0.0);
+        float whole = 0.0;
+        for (int y = 0; y < n; y++) {
+            for (int x = 0; x < n; x++) {
+                float angle;
+                vec3 L = capture_direction(x, y, angle);
+                if (L.y > 0.0) up += texelFetch(skyCapture, ivec2(x, y), level).rgb * L.y * angle;
+                whole += angle;
+            }
+        }
+        up *= 4.0 * 3.14159265 / whole;
+        ground = groundAlbedo * (up + groundSun) / 3.14159265;
+    }
     vec3 sum = vec3(0.0);
     float total = 0.0;
     for (int y = 0; y < n; y++) {
         for (int x = 0; x < n; x++) {
-            vec2 uv = (vec2(float(x), float(y)) + 0.5) / SKY_IRRADIANCE_SIZE;
-            vec2 p = clamp(((uv * SKY_SIZE - 1.0) / (SKY_SIZE - 2.0)) * 2.0 - 1.0, -1.0, 1.0);
-            vec3 q = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
-            if (q.y < 0.0) {
-                vec2 folded = (1.0 - abs(q.zx)) * vec2(q.x >= 0.0 ? 1.0 : -1.0, q.z >= 0.0 ? 1.0 : -1.0);
-                q.x = folded.x;
-                q.z = folded.y;
-            }
-            float len = length(q);
-            float angle = 1.0 / (len * len * len);
-            vec3 L = q / len;
-            sum += texelFetch(skyCapture, ivec2(x, y), level).rgb * max(dot(N, L), 0.0) * angle;
+            float angle;
+            vec3 L = capture_direction(x, y, angle);
+            vec3 seen = (grounded && L.y < 0.0) ? ground : texelFetch(skyCapture, ivec2(x, y), level).rgb;
+            sum += seen * max(dot(N, L), 0.0) * angle;
             total += angle;
         }
     }

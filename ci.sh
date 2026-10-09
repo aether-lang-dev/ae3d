@@ -129,7 +129,7 @@ PLATFORM_SUITES="test_net test_net_authority test_net_budget test_net_delta
 # to print SKIP and be held to `leaks` on the way out. AE3D_CI_GPU=0, which the
 # workflow sets on those runners, builds none of them. A suite left off this
 # list is built and skips as before: forgetting one costs time, not coverage.
-GPU_SUITES="test_agent test_agent_attached test_agent_components test_agent_explain test_anisotropy test_tile_breakup
+GPU_SUITES="test_agent test_agent_attached test_agent_components test_agent_explain test_anisotropy test_tile_breakup test_ground_bounce
     test_agent_net test_agent_record test_backend_parity test_batching
     test_blackhole test_camera_collision test_caustics test_character test_cluster_cut
     test_crowd_ecs test_crowd_render test_crowd_render_scale

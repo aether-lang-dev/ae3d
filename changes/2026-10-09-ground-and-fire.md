@@ -53,3 +53,13 @@
   the same wall flat peaks at 241. On every normal-mapped surface.
 - **The sand example's grains reflect as sand does,** a specular of 0.03 as
   its plain's, where the default reflected the sky whole.
+- **The ground lights what faces down (#740).** `engine_set_ground_bounce`
+  gives the sky's irradiance a ground under the horizon, its albedo lit by
+  the sky and the sun, where a renderer without probes' light took the
+  sky's lower half as it was drawn: under the sky drawn from the sun, a
+  haze. Over desert sand a downward face is lit (0.78, 0.64, 0.48) where it
+  was (0.22, 0.40, 0.99) under a blue sky, red over blue 1.63 against 0.22,
+  and an upward face within 3% of before, on both renderers
+  (`tests/test_ground_bounce.ae`). The campfire uses it. A painted sky
+  keeps its own ground: the sand example's heap, its shaded side under a
+  blue sky, is unchanged by it.

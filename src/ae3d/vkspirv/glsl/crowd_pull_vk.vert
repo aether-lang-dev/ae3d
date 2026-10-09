@@ -152,6 +152,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float skyTurbidity;
     float skyLevelSize;
     float skyRoughness;
+    vec3 groundAlbedo;
+    vec3 groundSun;
     float frameExposure;
     bool enableBloom;
     float bloomIntensity;
