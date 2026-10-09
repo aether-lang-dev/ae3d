@@ -56,6 +56,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec3 cloudSun;
     float materialAlpha;
     float materialCutout;
+    float materialNormalStrength;
     int surfaceBlend;
     float reflectivity;
     float wetness;
@@ -343,6 +344,7 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 // The texture's alpha under which the surface is a hole (0: never), before
 // anything else is decided -- an emissive particle is cut to its disc too
 // (#711).
+
 
 // How the surface goes over what is behind it (#728): 0 opaque, 1 blended by
 // its alpha, 2 added to it. Only a blended one carries its texture's and its
@@ -1245,7 +1247,7 @@ mat3 cotangent_frame(vec3 normal, vec3 position, vec2 uv) {
 
 vec3 mapped_normal(vec3 normal, vec3 position, vec2 uv) {
     vec3 sampled = texture(normalMap, uv).xyz * 2.0 - 1.0;
-    sampled.xy *= normalStrength;
+    sampled.xy *= normalStrength * materialNormalStrength;
     return normalize(cotangent_frame(normal, position, uv) * sampled);
 }
 
