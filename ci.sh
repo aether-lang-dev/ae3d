@@ -218,7 +218,11 @@ in_pool() {
 
 build_one() {   # build_one <source>: its log and its status, under BUILD_DIR
     target="$(basename "$1" .ae)"
-    ./build.sh "$1" "$target" >"$BUILD_DIR/$target.log" 2>&1
+    # A suite that times its own code against a budget says so, and is
+    # built as the engine ships; the rest take SUITE_CFLAGS (see the suites).
+    flags="${SUITE_CFLAGS:-}"
+    grep -q '^// ci: optimised' "$1" && flags=""
+    AE3D_PROGRAM_CFLAGS="$flags" ./build.sh "$1" "$target" >"$BUILD_DIR/$target.log" 2>&1
     echo $? >"$BUILD_DIR/$target.status"
 }
 
@@ -612,7 +616,13 @@ if [ "${AE3D_CI_GPU:-1}" = 0 ]; then
     drawn=$((drawn - $(printf '%s\n' $SUITES | wc -l)))
     [ "$drawn" -gt 0 ] && skip "$drawn suites that draw" "AE3D_CI_GPU=0: no window, GL context or Vulkan device here"
 fi
+# The suites' own C unoptimised: the one file a change to the engine makes
+# anew for every suite, the bulk of its compile, and none of its running
+# time but for the few marked `// ci: optimised` (#511). test_motion's
+# compiles in 4 s for 16, and runs in the same 5.4 s.
+export SUITE_CFLAGS=-O0
 build_together $SUITES
+unset SUITE_CFLAGS
 for suite in $SUITES; do
     name="$(basename "$suite" .ae)"
     if ! built_ok "$name"; then
