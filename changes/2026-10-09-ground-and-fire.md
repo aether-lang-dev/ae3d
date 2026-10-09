@@ -87,3 +87,12 @@
   the eye single grains sparkle and further off fewer and fainter, never a
   crawl. A glittering wall flashes in 142 of 57,600 pixels on OpenGL and
   141 on Vulkan, none without it. The sand example's plain sparkles.
+- **Bodies float on the sea (#637, its first part).** The Gerstner surface
+  on the CPU (`water.simulation_height_at`, `simulation_normal_at`,
+  `simulation_displaced`), the shader's own sum: a drawn vertex is within 3
+  micrometres of the height the query gives. The new `ae3d.buoyancy` floats
+  a physics body on it, four columns of its box each lifted by the water it
+  displaces (`physics.rigidbody_apply_force_at`, `rigidbody_world_point`,
+  `rigidbody_point_velocity`, `rigidbody_mass` added for it): half water's
+  density settles 0.51 under, a quarter's 0.25, and a box on a 2 m swell
+  rides 2.08 m of it (`tests/test_buoyancy.ae`).

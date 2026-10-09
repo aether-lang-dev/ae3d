@@ -111,6 +111,16 @@ The feature list in full, with the reasoning behind each. The [README](../README
   parent's, so bones are ordinary models: a clip exported from Blender drives a
   bone exactly as it drives a part, and `ae3d.ik` solves a limb of bones
   without being told they belong to a skin.
+- **Bodies that float (#637).** `water.simulation_height_at` and
+  `simulation_normal_at` are the sea's surface on the CPU, the vertex
+  shader's four trains summed the same way (a drawn vertex is within 3
+  micrometres of the height the query gives over it), and
+  `buoyancy.floater(sea, body, half)` floats a body on it: its box as four
+  columns over its bottom corners, each pushed up by the water it displaces
+  and held back at a share of critical damping, so it rights itself and
+  rolls with a swell. A box half water's density settles 0.51 under, a
+  quarter's 0.25, and on a 2 m swell one rises and falls 2.08 m
+  (`tests/test_buoyancy.ae`).
 - **Water that is water.** A Gerstner sea with deep-water dispersion, shaded
   as one physically based surface: Schlick fresnel between the body of the
   water and the reflected sky (the scene's own skybox image, where it has
