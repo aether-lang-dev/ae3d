@@ -983,6 +983,24 @@ plane and on a box, the lifetime, the rate, the cone, the seed and the
 colour. `tests/test_instance_streams` checks that a point recoloured on its
 own is drawn in its new colour.
 
+What a fire needs of them (#728): `set_blend(em, mode)` draws an emitter's
+particles cut to their texture's shape (`core.BLEND_OPAQUE`, the default;
+the cut is the material's `cutout`, #711), mixed with what is behind them by
+their alpha (`BLEND_ALPHA`: smoke) or added to it (`BLEND_ADD`: flames and
+embers, which only brighten where they cross; `SRC_ALPHA, ONE` on both
+renderers). `set_texture(em, path, columns, rows)` gives them a texture, as
+a flipbook of frames played over each particle's life. `add_color_key(em,
+t, r, g, b, a)` gives a colour and an alpha at share `t` of a life, up to
+eight, blended between; `set_spin(em, low, high)` turns each particle about
+the way it faces at a rate it is born with. A point carries its alpha, its
+life gone and its turn in its record of the stream, twelve floats now
+(`core.model_set_instance_extras`), and a model of any mesh can take a
+blend (`core.model_set_blend`) or a flipbook (`core.model_set_flipbook`).
+`tests/test_particles_drawn.ae` draws, on both renderers alike, a flipbook's
+first frame a quarter through its life and its second three quarters
+through, two added particles at one place 531 bright against one's 384,
+and a blended one at alpha 0.5 at 243 against 384.
+
 ### Rain on the surfaces
 
 `engine_set_wetness(e, amount)` is rain on the scene: every surface that

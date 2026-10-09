@@ -24,6 +24,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool useInstanceColor;
     bool instancePoints;
     int instanceBillboard;
+    int pointFlipbookColumns;
+    int pointFlipbookRows;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -31,8 +33,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     mat4 prevModel;
     mat4 prevViewProjection;
     bool isSkinned;
-    mat4 bones[96];
-    vec4 prevBoneRows[288];
     int clipJoints0;
     int clipJoints1;
     int clipJoints2;
@@ -55,6 +55,9 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float cloudTime;
     vec3 cloudSun;
     float materialAlpha;
+    float materialCutout;
+    float materialNormalStrength;
+    int surfaceBlend;
     float reflectivity;
     float wetness;
     bool hasNormalMap;
@@ -201,6 +204,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float crowdTravel;
     float crowdPhaseStep;
     vec4 shadowReach;
+    mat4 bones[96];
+    vec4 prevBoneRows[288];
 };
 layout(set = 0, binding = 1) uniform sampler2D textureSampler;
 layout(set = 0, binding = 2) uniform sampler2D shadowMap;
@@ -215,6 +220,7 @@ layout(location = 7) in vec4 ClipPrev;
 layout(location = 8) in vec3 BindPos;
 layout(location = 9) in float ClipLimb;
 layout(location = 10) in vec2 MaskUV;
+layout(location = 11) in float ParticleAlpha;
 layout(location = 1) out vec2 outVelocity;
 
 
@@ -334,6 +340,15 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 
 
 
+
+// The texture's alpha under which the surface is a hole (0: never), before
+// anything else is decided -- an emissive particle is cut to its disc too
+// (#711).
+
+
+// How the surface goes over what is behind it (#728): 0 opaque, 1 blended by
+// its alpha, 2 added to it. Only a blended one carries its texture's and its
+// point's alpha out.
 
 // How mirror-like the surface is. Zero is an ordinary matte surface whose
 // highlight fades as the view grazes it. Above zero the surface reflects the
@@ -1232,7 +1247,7 @@ mat3 cotangent_frame(vec3 normal, vec3 position, vec2 uv) {
 
 vec3 mapped_normal(vec3 normal, vec3 position, vec2 uv) {
     vec3 sampled = texture(normalMap, uv).xyz * 2.0 - 1.0;
-    sampled.xy *= normalStrength;
+    sampled.xy *= normalStrength * materialNormalStrength;
     return normalize(cotangent_frame(normal, position, uv) * sampled);
 }
 
@@ -1745,6 +1760,7 @@ void main() {
     outVelocity = velocity(ClipNow, ClipPrev, jitter);
 
     vec4 texColor = texture(textureSampler, fragTexCoord);
+    if (texColor.a < materialCutout) discard;
     
     // An emissive surface is its own light source, so it skips shading. It does
     // not skip having a colour: this returned a hardcoded white, which made an
@@ -1761,7 +1777,8 @@ void main() {
     // exposure is the emissive strength, scaled so the 10.0 that opens this
     // branch means 1x. Below that the surface is lit normally.
     if (exposure > 10.0) {
-        FragColor = vec4(diffuseColor * texColor.rgb * InstanceColor * (exposure * 0.1), 1.0);
+        float glowAlpha = surfaceBlend != 0 ? texColor.a * materialAlpha * ParticleAlpha : 1.0;
+        FragColor = vec4(diffuseColor * texColor.rgb * InstanceColor * (exposure * 0.1), glowAlpha);
         return;
     }
 
@@ -1982,6 +1999,7 @@ void main() {
     if (materialAlpha >= 0.99) {
         finalAlpha = 1.0; // Force fully opaque for materials that should be opaque
     }
+    if (surfaceBlend != 0) finalAlpha = texColor.a * materialAlpha * ParticleAlpha;
     
     FragColor = vec4(color, finalAlpha);
 }

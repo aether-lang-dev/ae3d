@@ -56,6 +56,10 @@ AETHERC="${AETHERC:-aetherc}"
 # imports a change did not touch generates the same C byte for byte.
 LAUNCHER="${AE3D_CC_LAUNCHER:-}"
 CFLAGS="${CFLAGS:--O2}"
+# The program's own C, the one file a change to any module it imports makes
+# anew: CI's suites build it unoptimised, where it is most of the compile and
+# none of the tests' time (#511); the native layer and the runtime keep CFLAGS.
+PROGRAM_CFLAGS="${AE3D_PROGRAM_CFLAGS:-$CFLAGS}"
 WARN="-Wall -Wextra"
 
 if ! command -v "$AETHERC" >/dev/null 2>&1; then
@@ -213,7 +217,7 @@ PROGRAM_OBJ_DIR="$OBJ_DIR/$NAME"
 mkdir -p "$PROGRAM_OBJ_DIR"
 PROGRAM_OBJECTS="$PROGRAM_OBJ_DIR/$NAME.o"
 compile_started=$SECONDS
-$LAUNCHER "$CC" -c $CFLAGS $FP_FLAGS $VULKAN_CFLAGS $AETHER_COMPILE_FLAGS $PROGRAM_INCLUDES "$GEN" -o "$PROGRAM_OBJ_DIR/$NAME.o"
+$LAUNCHER "$CC" -c $PROGRAM_CFLAGS $FP_FLAGS $VULKAN_CFLAGS $AETHER_COMPILE_FLAGS $PROGRAM_INCLUDES "$GEN" -o "$PROGRAM_OBJ_DIR/$NAME.o"
 for src in $AETHER_SOURCES; do
     base="$(basename "$src")"
     obj="$PROGRAM_OBJ_DIR/${base%.*}.o"

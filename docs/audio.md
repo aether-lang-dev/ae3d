@@ -90,7 +90,9 @@ The sounds are made in Aether, not read from files, so a program needs no
 assets for them and every run hears the same samples:
 - **Rain:** two seconds of lightly smoothed noise, looped.
 - **Wind:** four seconds of heavily smoothed noise swelling twice, looped.
-- **Thunder:** three seconds of low noise that cracks in and rolls off.
+- **Thunder:** three seconds of low noise that cracks in and rolls off;
+  from a strike past 2 km (`NEAR_THUNDER`), lower noise that swells in over
+  a third of a second and rolls on, with no crack.
 - **Engine:** one exact cycle of a 50 Hz tone and five harmonics, looped.
 - **Hit:** an eighth of a second of noise dying away.
 
@@ -103,19 +105,32 @@ hits play on EFFECTS, placed where they are.
 - **Thunder.** Each lightning flash now records how far off it struck, half
   a kilometre to six (`weather_strike_distance`). Its thunder is heard that
   distance over 343 m/s later, at a volume of 1000 / d, kept between 0.15
-  and 1.
+  and 1. `thunder_last_distance` and `thunder_last_far` say which strike
+  the last one heard came from, the frame `thunder_started` counts it.
 - **Engines.** The pitch is 0.8 + 0.05 times the speed, at most 2.4.
 - **Hits.** A frame keeps its strongest physics contacts, at most four
   (`MAX_HITS`), and starts them at their points. Volume is the approach
   speed over 8 m/s, and a harder strike is pitched lower.
+
+A game with weather sounds of its own plays them on the same clock (#631):
+
+```aether
+worldsound.set_weather_sounds(ws, "rain.wav", "wind.wav", "thunder_near.wav", "thunder_far.wav", 2000.0)
+```
+
+Each path replaces the made sound (`""` keeps it). Thunder from a strike
+nearer than the distance plays the near clip, further off the far one.
 
 `tests/test_worldsound.ae` checks each of these headless:
 - rain at 0.5 is gain 0.5, and 0 cleared; wind at 10 m/s is 0.4;
 - the rain is in the rendered mix;
 - a strike 5,981 m off is heard after 17.45 s (17.44 s by the speed of
   sound, within a frame);
-- the engine pitch is 1.31533 at 10.31 m/s, exactly 0.8 + 0.05 v;
-- twelve dropped crates are heard 29 times, never more than 4 in a frame.
+- the engine pitch is 1.30456 at 10.09 m/s, exactly 0.8 + 0.05 v;
+- twelve dropped crates are heard 25 times, never more than 4 in a frame;
+- a game's rain clip, every sample 0.2, peaks at 0.1414 in the mix at full
+  rain (0.2 centred); its near thunder at 0.6 and far at 0.3 play as 0.424
+  and 0.212 over their volumes.
 
 ## In the editor
 

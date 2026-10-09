@@ -21,6 +21,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool useInstanceColor;
     bool instancePoints;
     int instanceBillboard;
+    int pointFlipbookColumns;
+    int pointFlipbookRows;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -28,8 +30,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     mat4 prevModel;
     mat4 prevViewProjection;
     bool isSkinned;
-    mat4 bones[96];
-    vec4 prevBoneRows[288];
     int clipJoints0;
     int clipJoints1;
     int clipJoints2;
@@ -52,6 +52,9 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float cloudTime;
     vec3 cloudSun;
     float materialAlpha;
+    float materialCutout;
+    float materialNormalStrength;
+    int surfaceBlend;
     float reflectivity;
     float wetness;
     bool hasNormalMap;
@@ -198,6 +201,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float crowdTravel;
     float crowdPhaseStep;
     vec4 shadowReach;
+    mat4 bones[96];
+    vec4 prevBoneRows[288];
 };
 layout(set = 0, binding = 1) uniform sampler2D skybox;
 layout(set = 0, binding = 2) uniform sampler2D shadowMap;
