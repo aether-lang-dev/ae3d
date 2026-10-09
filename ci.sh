@@ -216,6 +216,17 @@ died_on() {   # died_on <status>
     fi
 }
 
+# What a failing suite printed: its own FAIL lines and its last lines, the
+# engine's notice of the API it fell back to left out. Its first 20 lines
+# were printed before, and on macOS the "no Vulkan driver" notice of every
+# engine a suite makes filled them, so the log never named the check that
+# failed (test_motion_cost on #727).
+suite_failure() {   # suite_failure <output>
+    quiet="$(printf '%s\n' "$1" | grep -v 'no Vulkan driver')"
+    printf '%s\n' "$quiet" | grep -E 'FAIL' | sed 's/^/        /' | head -10
+    printf '%s\n' "$quiet" | sed 's/^/        /' | tail -12
+}
+
 # A crash on a headless runner leaves only "died on signal 11". When the status
 # is a signal and gdb is present, run the program again under it and print the
 # native stack, so the log names the frame that fell over instead of a core
@@ -578,7 +589,7 @@ for suite in $SUITES; do
         printf '%s\n' "$output" | sed 's/^/        /' | tail -10
     elif [ "$suite_status" -ne 0 ]; then
         fail "$name$(died_on "$suite_status")"
-        printf '%s\n' "$output" | sed 's/^/        /' | head -20
+        suite_failure "$output"
         trace_crash "$suite_status" ./build/"$name"
     elif printf '%s' "$output" | grep -q "all checks passed"; then
         pass "$name"
@@ -588,7 +599,7 @@ for suite in $SUITES; do
         skip "$name" "$(printf '%s' "$output" | grep -m1 "SKIP" | sed 's/.*SKIP *//')"
     else
         fail "$name"
-        printf '%s\n' "$output" | sed 's/^/        /' | head -20
+        suite_failure "$output"
     fi
 done
 
