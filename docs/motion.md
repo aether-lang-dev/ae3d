@@ -12,7 +12,9 @@ import ae3d.motion
 r = physics.ragdoll(e, "Zombie", position, 8.0, 8.0, 1.0)
 physics.ragdoll_dress(r, rig)                       // the skinned figure it wears
 body = motion.active_ragdoll(r)                     // ANIMATED to begin with
-motion.attach(e, body)                              // its recovery stepped every fixed step
+motion.attach(e, body)                              // stepped every fixed step, posed after the clips
+                                                    // (a program stepping motion_step itself calls
+                                                    // motion.pose(body, e) from its pose phase, #699)
 motion.set_mode(body, motion.POWERED)               // the muscles play the animation
 motion.hit(body, human.BONE_SPINE_03, point, impulse)
 ```
@@ -23,6 +25,8 @@ motion.hit(body, human.BONE_SPINE_03, point, impulse)
 | `POWERED` | Muscles. Every joint's motor drives it toward the pose the animation gives it, within a torque budget. Nothing holds the figure up but its own feet and a balance the pelvis keeps within a budget of its own. The figure is drawn as its bodies are. |
 | `LIMP` | A ragdoll. The animation follows the bodies. |
 | `GETTING_UP` | Not set but got to: `get_up(body)` from the ground. A way up keyed on the rig, the bodies following it as an `ANIMATED` figure's do. |
+
+**Going with its object.** `engine.destroy(e, o)` on a figure's object takes the figure with it (#714): its meshes out of the renderer, the figure out of the engine's list, and its file's models freed at the end of the frame. An active ragdoll from `motion.on_figure` or `on_skeleton` goes too: its twelve bones' objects are destroyed, its bodies taken out of the world, and the motion released and freed, so a program drops its `*Motion` with the object. A ragdoll built by hand is taken out with `physics.ragdoll_destroy(r)`. When the whole scene goes at once, at the engine's end, figures and motions are freed after the engine (`figures_free`, `motions_free`), as before.
 
 **Two poses.** A powered figure has two poses: the animation's, which its muscles track, and its bodies', which is what gets drawn. The rig is where an animation writes a pose and where the skin is drawn from, so the physics module keeps the animation's pose beside it. Before each step it takes whatever the animation has written to the rig since the bodies last did, bone by bone, and drives the joints toward that. After the step it writes the bodies' pose into the rig for drawing. A clip that moves one bone leaves the rest of the pose where the animation last put them, not where the bodies fell. Until this, a powered figure was drawn in its animation's pose whatever its bodies did: knocked down, it was drawn standing.
 
