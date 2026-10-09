@@ -30,3 +30,12 @@
   emitter; `core.model_set_billboard_lift` stands a billboard on its point.
   A blended emitter is no longer cut at a half, which clipped every soft
   rim. `examples/campfire.ae`; `tests/test_flames.ae`.
+- **The sand's normal map is the slope of real ripples (#737, #702).** It
+  was the slope of the colour's relief, whose grain sampled a texel apart
+  stood the normals at a median 50 degrees; under a low sun every texel
+  turned from it in a speckle of dark. `tools/make_sky.ae` now writes it
+  from wind ripples' height (a gentle windward climb, a steeper lee, a
+  degree of grain): a median of 2.9 degrees, 12.2 at the 99th percentile.
+  Under a 19-degree sun the near sand's luminance spread is 0.18 where it
+  was 0.44, and none of it is over 1.5 times the mean (21% was). The
+  colour texture and the skies it writes are unchanged.
