@@ -68,6 +68,9 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialFire;
     float materialTriplanar;
     float materialSoft;
+    float materialGlitter;
+    float materialGlitterGrains;
+    float materialGlitterStrength;
     int hasSceneDepth;
     mat4 invViewProjection;
     int surfaceBlend;
@@ -392,6 +395,13 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 // A soft particle (#738): faded out where what the scene drew behind it is
 // nearer than materialSoft metres, so a flame or a puff that meets the
 // ground melts into it instead of cutting a line across it (0: hard).
+
+// Glitter (#741): a share materialGlitter of the material's grains,
+// materialGlitterGrains of them a metre, each a facet tilted its own way
+// that flashes when it mirrors the sun into the eye, by
+// materialGlitterStrength (0: none). Sand, snow, frost, mica.
+
+
 
 
 
@@ -884,6 +894,36 @@ vec3 black_body(float kelvin) {
     float b = t <= 19.0 ? 0.0 : clamp((138.5177312231 * log(t - 10.0) - 305.0447927307) / 255.0, 0.0, 1.0);
     return pow(vec3(1.0, g, b), vec3(2.2));
 }
+
+// The key light glinting off the grains under this fragment (#741): the
+// grains a cell of the world each, a facet of each tilted its own way, a
+// mirror-sharp lobe. Where a pixel covers many grains it looks at one
+// coarser cell standing for them -- likelier to hold a facet that flashes,
+// as any of its grains might, and dimmer by the share of the pixel one
+// grain is -- so near the eye single grains sparkle, further off fewer and
+// fainter, never a crawl of noise.
+vec3 glitter(vec3 n, vec3 v, Light L) {
+    vec3 grid = FragPos * materialGlitterGrains;
+    float footprint = max(length(fwidth(grid)), 1e-4);
+    float level = max(ceil(log2(footprint)), 0.0);
+    if (level > 7.0) return vec3(0.0);
+    float scale = exp2(level);
+    vec3 cell = floor(grid / scale);
+    vec3 h = fract(sin(vec3(dot(cell, vec3(127.1, 311.7, 74.7)), dot(cell, vec3(269.5, 183.3, 246.1)),
+                            dot(cell, vec3(113.5, 271.9, 124.6)))) * 43758.5453);
+    float chance = min(materialGlitter * scale * scale, 1.0);
+    if (h.x > chance) return vec3(0.0);
+    vec3 l = normalize(L.direction);
+    float lit = max(dot(n, l), 0.0);
+    if (lit <= 0.0) return vec3(0.0);
+    // A grain's faces turn every way: its facet anywhere over the upper
+    // hemisphere, leaning toward the surface's normal.
+    vec3 k = fract(h * 13.731 + h.yzx * 7.17);
+    vec3 facet = normalize(n * 0.6 + (k * 2.0 - 1.0));
+    float flash = pow(max(dot(facet, normalize(l + v)), 0.0), 900.0);
+    return L.color * kelvinToRGB(L.temperature) * L.intensity * flash * lit * materialGlitterStrength / (scale * scale);
+}
+
 
 // Optimized Schlick's approximation for Fresnel reflectance
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
@@ -2178,6 +2218,9 @@ void main() {
         vec3 backFill;
         vec3 lit = direct_light(lights[i], norm, viewDir, albedo, F0, NdotV, adjustedRoughness, backFill);
         Lo += (i == 0 ? lit * sunlit * shaded : lit) + backFill;
+    }
+    if (materialGlitter > 0.0 && lightCount > 0 && lights[0].isDirectional == 1) {
+        Lo += glitter(norm, viewDir, lights[0]) * sunlit * shaded;
     }
     if (clusterDims.w > 0.5) {
         int cell = cluster_of(FragPos);

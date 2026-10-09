@@ -79,3 +79,11 @@
   renderers; at no strength nothing changes (`tests/test_heat_haze.ae`). It
   ripples whatever is in the column's box, things nearer than the fire too.
   The campfire shimmers.
+- **Glitter (#741).** `core.model_set_glitter(m, share, grains, strength)`:
+  a share of a material's grains, so many a metre, each a facet of its own
+  that flashes the key light when it mirrors it into the eye. Where a
+  pixel covers many grains it reads one coarser cell standing for them,
+  likelier to hold a flash and dimmer by the share one grain is, so near
+  the eye single grains sparkle and further off fewer and fainter, never a
+  crawl. A glittering wall flashes in 142 of 57,600 pixels on OpenGL and
+  141 on Vulkan, none without it. The sand example's plain sparkles.

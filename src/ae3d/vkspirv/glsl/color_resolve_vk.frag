@@ -64,6 +64,9 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialFire;
     float materialTriplanar;
     float materialSoft;
+    float materialGlitter;
+    float materialGlitterGrains;
+    float materialGlitterStrength;
     int hasSceneDepth;
     mat4 invViewProjection;
     int surfaceBlend;
