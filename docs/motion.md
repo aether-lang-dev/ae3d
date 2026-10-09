@@ -254,12 +254,16 @@ counts from then. A `LIMP` figure is past it.
 - **Caught on its hands and knees**, as a figure not hurt is, it does not
   stay there. It lets go, down to 15% of its muscle and no balance, and
   goes down to writhe where it comes to lie.
-- **Where it lands**, it writhes. Face down its legs draw up under it, the
-  hips lifting off the ground as the knees come in, and its arms stay
-  tucked. It used to turn over onto its back first: the arm on the higher
-  side pushed the ground, the leg on that side crossed, the trunk twisted.
-  With the figure at rest (#579), that only braced it against the ground,
-  still for the whole of its writhing.
+- **Where it lands**, it writhes. Face down its legs bend at the knee,
+  heels coming up behind, while the hips hardly move, and its arms stay
+  tucked at 40% of their muscle (#691). Drawn up at the hip as on its back,
+  a knee went down under the belly, lifted that side, and rolled the figure
+  onto its back in 1.3 s, 0.3 m and more across the ground. Folded with all
+  their muscle, the arms pressed the chest up and the kicking legs pushed
+  the body along on them. It used to turn over onto its back first: the arm
+  on the higher side pushed the ground, the leg on that side crossed, the
+  trunk twisted. With the figure at rest (#579), that only braced it
+  against the ground, still for the whole of its writhing.
 - **A limb a blow left weak**, or the struck arm, doesn't take part: shot in
   the arm, it clutches with the other.
 
@@ -289,10 +293,13 @@ The hip draws up 0.3 rad on its back and no further: the reference
 ragdoll's hip turns 30 degrees about a cone that is not centred ahead of
 the leg. More of a person's curl waits on that limit (#578).
 
-The same test shoves sixteen writhers from eight directions, at 450 and
-500 N·s (#480). All of them land, eight face up and eight face down. In
-every one the hip swings at least 0.30 rad, the pelvis drifts no more than
-7 cm, and the writhing stops when its time is up.
+The same test shoves 64 writhers from 32 directions, at 450 and 500 N·s
+(#480, #691). All of them land, 21 face up and 43 face down or on their
+sides. In every one the leg swings at least 0.30 rad (at the hip, or face
+down at the knee), the pelvis drifts no more than 10 cm, and the writhing
+stops when its time is up. Sixteen from eight directions, 45 degrees
+apart, missed the shoves from straight behind, where face-down writhers
+had rolled over and drifted 0.3 m.
 
 ## Body parts
 
