@@ -75,6 +75,34 @@ case "$TIER" in
 esac
 SCENES="${AE3D_CI_SCENES:-}"
 [ "$TIER" = all ] && SCENES=1
+# A tier split over several runners at once (AE3D_CI_SHARD=k/n, the
+# workflow's matrix, #710): almost all of a runner's minutes are compiling,
+# so n runners each building a share finish in about a share of the time.
+# The suites go every n-th to each; the steps that run once -- the checks of
+# what is generated, the type-check, the validation layer's and the probes'
+# reruns, the benchmarks -- go to the first, with the suites they rerun; the
+# apps' examples to the first and the editor to the second.
+SHARD="${AE3D_CI_SHARD:-0/1}"
+SHARD_INDEX="${SHARD%/*}"
+SHARD_COUNT="${SHARD#*/}"
+case "$SHARD_INDEX/$SHARD_COUNT" in
+    [0-9]/[1-9]|[0-9][0-9]/[1-9]|[0-9]/[1-9][0-9]) ;;
+    *) echo "ci: AE3D_CI_SHARD '$SHARD' is not k/n" >&2; exit 2 ;;
+esac
+if [ "$SHARD_INDEX" -ge "$SHARD_COUNT" ]; then
+    echo "ci: AE3D_CI_SHARD '$SHARD' names no shard of $SHARD_COUNT" >&2
+    exit 2
+fi
+first_shard() { [ "$SHARD_INDEX" = 0 ]; }
+# The apps' part on this runner: `examples` or `editor`, both where unsplit.
+apps_part() {
+    [ "$SHARD_COUNT" = 1 ] && return 0
+    case "$1" in examples) [ "$SHARD_INDEX" = 0 ] ;; editor) [ "$SHARD_INDEX" = 1 ] ;; esac
+}
+# The suites the first shard's steps run again: the validation layer's, the
+# probes', and the determinism trail's.
+ONCE_SUITES="test_fog test_overlay test_hud_layout test_damage test_backend_parity test_gi
+    test_ray_shadows test_ray_occlusion test_determinism"
 in_tier() {   # in_tier <tier>...: whether this run covers any of them
     [ "$TIER" = all ] && return 0
     for wanted in "$@"; do
@@ -107,7 +135,7 @@ GPU_SUITES="test_agent test_agent_attached test_agent_components test_agent_expl
     test_crowd_ecs test_crowd_render test_crowd_render_scale
     test_culling test_damage test_depth_clear test_depth_proxy test_device_crowd
     test_dlss test_ecs_render test_engine_shadows test_engine_skybox
-    test_figure test_fog test_gameobjects test_gi test_gltf_crowd test_hdr test_hierarchy
+    test_figure test_fly_look test_fog test_gameobjects test_gi test_gltf_crowd test_hdr test_hierarchy
     test_hud_layout test_impostor test_instance_colours test_instance_positions test_interpolation
     test_instance_streams test_instances test_lamp_clusters
     test_lamp_shadows test_lights test_mesh_edit test_model_mesh
@@ -117,7 +145,8 @@ GPU_SUITES="test_agent test_agent_attached test_agent_components test_agent_expl
     test_shading_knobs test_shadow_batches test_shadow_cascades test_sky_light
     test_shadows test_skinned_render test_ssr test_taa test_texture_swap
     test_trace test_velocity test_vk_mesh test_weather"
-suite_sources() {   # the suites this tier builds and runs
+suite_sources() {   # the suites this tier, and this shard of it, builds and runs
+    turn=0
     for suite in tests/test_*.ae; do
         name="$(basename "$suite" .ae)"
         if [ "$TIER" = platform ]; then
@@ -125,6 +154,26 @@ suite_sources() {   # the suites this tier builds and runs
         fi
         if [ "${AE3D_CI_GPU:-1}" = 0 ]; then
             case " $(echo $GPU_SUITES) " in *" $name "*) continue ;; esac
+        fi
+        if [ "$SHARD_COUNT" -gt 1 ]; then
+            case " $(echo $ONCE_SUITES) " in
+                *" $name "*) first_shard || continue ;;
+                *)
+                    # The first shard has the steps that run once as well, about
+                    # ten suites' worth: it takes one turn in a cycle of 2n - 1
+                    # and every other shard two.
+                    slot=$((turn % (2 * SHARD_COUNT - 1)))
+                    turn=$((turn + 1))
+                    if [ "$slot" -lt $((SHARD_COUNT - 1)) ]; then
+                        mine=$((slot + 1))
+                    elif [ "$slot" = $((SHARD_COUNT - 1)) ]; then
+                        mine=0
+                    else
+                        mine=$((slot - SHARD_COUNT + 1))
+                    fi
+                    [ "$mine" = "$SHARD_INDEX" ] || continue
+                    ;;
+            esac
         fi
         echo "$suite"
     done
@@ -362,7 +411,7 @@ else
     skip "exported fixtures" "no Blender"
 fi
 
-if in_tier suites; then
+if in_tier suites && first_shard; then
 step "no two surfaces share a plane"
 # Z-fighting is two faces in one plane close enough in depth that rounding
 # decides which is in front. Looked for on screen it depends on where the
@@ -466,7 +515,7 @@ fi
 
 # One runner of Linux's two is enough to say a module stopped compiling; the
 # apps half would only say it again.
-if in_tier suites leaks platform; then
+if in_tier suites leaks platform && first_shard; then
 step "modules type-check"
 for module in src/ae3d/*/; do
     name="$(basename "$module")"
@@ -605,7 +654,7 @@ done
 
 fi
 
-if in_tier suites; then
+if in_tier suites && first_shard; then
 step "Vulkan under the validation layer, synchronization included"
 # The suites that read frames back, run again with the Khronos layer and its
 # synchronization validation on: a frame copied out while the pass that wrote
@@ -648,7 +697,7 @@ done
 
 fi
 
-if in_tier suites; then
+if in_tier suites && first_shard; then
 step "the probes' light over the ray suites"
 # The suites that put crowds, skinned figures and instance streams into the
 # rays, again with the probes on (AE3D_GI=rt, #537): every instance's record
@@ -681,7 +730,7 @@ done
 
 fi
 
-if in_tier apps; then
+if in_tier apps && apps_part examples; then
 step "examples build and run"
 # The scenes' tools are built in the same pass when the scenes run:
 # build_together starts from a clean status directory, so a later call would
@@ -722,9 +771,9 @@ done
 
 fi
 
-if [ -n "$SCENES" ] && in_tier apps; then
+if [ -n "$SCENES" ] && in_tier apps && apps_part examples; then
     . "$ROOT/scripts/ci_scenes.sh"
-elif in_tier apps; then
+elif in_tier apps && apps_part examples; then
     step "showcase scenes"
     skip "the street, the demo scene, the impostor atlas, renderer parity" "the local gate's; AE3D_CI_SCENES=1 runs them here"
 fi
@@ -975,7 +1024,7 @@ check_editor_run() {
     rm -f "$report" "$snapshot" "$log"
 }
 
-if in_tier apps; then
+if in_tier apps && apps_part editor; then
 step "editor"
 # A print left in from working something out ships silently: it goes to the
 # editor's own console, where it looks like a message the editor meant to
@@ -1124,7 +1173,7 @@ fi
 
 # On the suites' runner: the two Linux runners take about as long with it
 # there, and the apps' one is the run's longest without it.
-if in_tier suites; then
+if in_tier suites && first_shard; then
 step "benchmarks"
 # A shared runner is not a machine anyone should take a timing from, and a
 # software rasteriser needs orders of magnitude longer per frame than the
