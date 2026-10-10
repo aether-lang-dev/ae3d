@@ -161,14 +161,18 @@ suite_sources() {   # the suites this tier, and this shard of it, builds and run
                 *)
                     # The suites' first shard has the steps that run once as
                     # well -- the validation layer's and the probes' reruns,
-                    # the benchmarks -- and with one suite in seven besides it
-                    # was still the tier's longest runner, 10 to 11 minutes
-                    # against 5 to 8: there it takes none, and the rest go
-                    # round the others. A tier without those steps (the
-                    # leaks', whose first shard ran 5 minutes to the second's
-                    # 10 on a third of the suites) goes round them all.
+                    # the benchmarks. With one suite in seven besides it was
+                    # the tier's longest runner (10 to 11 minutes against 5
+                    # to 8), and with none its shortest (6 against 7 to 10,
+                    # 9 suites built in 21 s against 56 in 200): it takes one
+                    # turn in a cycle where every other shard takes four. A
+                    # tier without those steps (the leaks', whose first shard
+                    # ran 5 minutes to the second's 10 on a third of the
+                    # suites) goes round them all.
                     if in_tier suites && [ "$TIER" != all ]; then
-                        mine=$((turn % (SHARD_COUNT - 1) + 1))
+                        slot=$((turn % (4 * (SHARD_COUNT - 1) + 1)))
+                        mine=0
+                        [ "$slot" -gt 0 ] && mine=$(((slot - 1) % (SHARD_COUNT - 1) + 1))
                     else
                         mine=$((turn % SHARD_COUNT))
                     fi
