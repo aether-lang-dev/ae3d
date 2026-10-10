@@ -1073,6 +1073,17 @@ metres)` fades blended particles out near what the scene drew behind them,
 from the scene's depth (fire's and smoke's are soft by default). `set_haze(em, radius, height, strength)` keeps a column of hot air over
 the emitter that the composite ripples the frame through (four a scene);
 it ripples whatever the column covers on the screen, nearer things too.
+`set_heat(em, kelvin)` glows sparks the same way without the flame's
+flipbook: each a black body at its colour's red share of `kelvin`, so a
+spark rises yellow-white and dies a dull red as it fades. And a mesh can
+burn: `core.model_set_embers(m, kelvin, cover, glow)` keeps it lit as it
+is and adds the light of its char -- blocks some 5 cm across, from the
+world position, with thin cracks between them; `cover` of them alight,
+gathered in hot spots by a broader noise, their cracks bright and their
+skin glowing dimly, each breathing on its own clock; elsewhere a crack is
+barely warm. Charred logs, a bed of coals. A charred wall up close glows
+red-hot over none of itself with none alight, 0.30 with half and 0.57 with
+all, red over blue 12 (`tests/test_tile_breakup.ae`, both renderers).
 `examples/campfire.ae` is all of it. `tests/test_flames.ae`: the same seed
 bakes the same flames to the byte, the heat's middle climbs from 12 cells
 to 31 by the eighth frame and the last frame gives off 0.005% of the

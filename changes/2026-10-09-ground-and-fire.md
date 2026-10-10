@@ -168,3 +168,12 @@
   at 0.6), corrected 0.00025 mm at most, where met at the host's present
   they were corrected 60 and 49 mm. A client's commands cost 1.10 KB a
   second, were 0.85.
+- **Embers and cooling sparks (#738).** `core.model_set_embers(m, kelvin,
+  cover, glow)`: a surface lit as it is and glowing in its char's cracks,
+  blocks of 5 cm from the world position, `cover` of them alight in hot
+  spots, each breathing. `particles.set_heat(em, kelvin)`: sparks as black
+  bodies cooled by their colour's red, so they rise yellow-white and die
+  dull red. The campfire's logs are charred capsules laid in to a bed of
+  coals, where they were three black boxes. A charred wall up close glows
+  over 0, 0.30 and 0.57 of the frame with none, half and all of its char
+  alight, red over blue 12, on both renderers.
