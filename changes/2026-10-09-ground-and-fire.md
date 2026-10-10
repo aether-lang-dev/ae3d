@@ -146,7 +146,16 @@
   after, the depth test rejects them. On the M1 Pro's tile-based GPU the
   frame does not change (its hidden-surface removal already culled them);
   the gain is for GPUs that shade in draw order, to measure there.
-- **The editor's widget drive renders small on CI.** The driver presses
-  widgets and reads the tree, never the viewport's pixels, and each press
-  waits on a frame: on a runner it drives at AE3D_RENDER_SCALE=25 and
-  AE3D_SHADOW_SIZE=512. That step was 337 s of the 654 s linux-editor job.
+- **Clouds in a pass of their own, folded over frames (#317).** Marched
+  before the scene at half the frame's size into one of two targets, with
+  half the steps and the dither turned every frame, each texel mixed at an
+  eighth into last frame's read where its direction was then; the sky draw
+  reads the result instead of marching. The sky capture refreshes every
+  half second of cloud drift and every 16 m of the eye (it was redrawn
+  every frame, 3 ms) and keeps its dither still. Over smooth_terrain at
+  2560x1440 on an M1 Pro the clouds went from 12.8 to 4.0 ms on OpenGL and
+  from 24.6 to 9.1 ms on Vulkan, and the march's grain is gone. A view
+  reached by turning a degree a frame is 1.1 (OpenGL) and 2.5 (Vulkan)
+  levels from the view held still, where the turn moved it 35; read
+  without reprojection it was 30 (`tests/test_clouds.ae`). On Vulkan a
+  draw can bind a texture of its own at binding 2, keyed in the set cache.

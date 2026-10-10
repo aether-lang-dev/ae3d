@@ -154,10 +154,18 @@ The feature list in full, with the reasoning behind each. The [README](../README
   0.3 of the sun), with the powder darkening, and by the sky, and rolled
   off by a shoulder that nears white without clipping. The noise is baked
   once at start into a 2D and two 3D textures (`ae3d.cloudnoise`), so the
-  march is a fetch a sample. The sky is drawn after the opaque geometry,
-  so the depth test spares the march every pixel the ground covers. Over
-  smooth_terrain's view at 2560x1440 on an M1 Pro the clouds are 12.8 ms
-  of the frame on OpenGL and 24.6 ms on Vulkan. The ground computes
+  march is a fetch a sample. The march runs in a cloud pass of its own
+  before the scene, at half the frame's size, half the steps a frame with
+  the dither turned every frame, each texel folded at an eighth into its
+  history read back from where its direction was last frame (#317): the
+  march's grain averages away, a view reached by turning matches one held
+  still, and the sky draw only reads the result. The sky's light (the
+  capture) follows the clouds every half second of drift and the eye
+  every 16 m. Over smooth_terrain's view at 2560x1440 on an M1 Pro the
+  clouds are 4.0 ms of the frame on OpenGL and 9.1 ms on Vulkan, where
+  marched in the sky draw at every pixel they were 12.8 and 24.6. The
+  sky is drawn after the opaque geometry, so a GPU that shades in draw
+  order spares it the pixels the ground covers. The ground computes
   the same weather field where the sun's ray meets the layer, so their
   shadows cross the terrain as they drift. One call,
   `engine_set_clouds(cover, wind)`, on either backend.

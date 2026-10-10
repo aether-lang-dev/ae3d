@@ -155,6 +155,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec3 skyOvercastColor;
     vec3 skyFlat;
     float skyTurbidity;
+    vec2 cloudPassSize;
+    int cloudHistoryOn;
     float skyLevelSize;
     float skyRoughness;
     vec3 groundAlbedo;
@@ -225,14 +227,19 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
 };
 layout(set = 0, binding = 1) uniform sampler2D skybox;
 layout(set = 0, binding = 2) uniform sampler2D shadowMap;
-layout(set = 0, binding = 3) uniform sampler2D cloudWeather;
-layout(set = 0, binding = 4) uniform sampler3D cloudShape;
+layout(set = 0, binding = 3) uniform sampler2D cloudBuffer;
 layout(location = 0) out vec4 FragColor;
 // AE3D_SKY_CAPTURE: the sky drawn into the octahedral map the scene is lit
 // from (#655), each texel the sky in its direction, without the sun's and
 // the moon's discs -- the key light is them, and counted twice it would
 // light everything again.
-#ifndef AE3D_SKY_CAPTURE
+// AE3D_CLOUD_PASS: the clouds alone over the screen at half the frame's
+// size, folded into the frames before (#317); the sky draw reads them
+// back. Both are screen passes, with no velocity and no discs.
+#if defined(AE3D_SKY_CAPTURE) || defined(AE3D_CLOUD_PASS)
+#define AE3D_SKY_SCREEN 1
+#endif
+#ifndef AE3D_SKY_SCREEN
 layout(location = 1) out vec2 outVelocity;
 
 layout(location = 0) in vec3 TexCoords;
@@ -252,13 +259,12 @@ layout(location = 2) in vec4 ClipPrev;
 // drawn from. The key light may be the moon, at night; the sky is the
 // hour's whatever lights the scene (#526).
 
-// The frame, when a temporal pass folds frames (TAA, DLSS), else zero. The
-// march is dithered per pixel; turned by the frame, the dither is a
-// different set of steps every frame and the temporal pass averages them,
-// so the grain at the horizon -- where a step is a hundred metres -- goes,
-// and the march takes several frames' samples for one frame's cost. Zero
-// keeps the dither still: without a pass to fold it, a turning dither is
-// grain that crawls.
+// The frame, for the cloud pass (#317). The march is dithered per pixel;
+// turned by the frame, the dither is a different set of steps every frame
+// and the pass's history averages them, so the grain at the horizon --
+// where a step is a hundred metres -- goes, and the march takes several
+// frames' samples for one frame's cost. The capture, with no history to
+// fold it, keeps its dither still.
 
 // Where the eye is: the layer stands in the world, over the ground it
 // shadows, so the march starts from the camera and not from the origin.
@@ -281,6 +287,9 @@ layout(location = 2) in vec4 ClipPrev;
 // one): what the daylight sky is drawn from with the sun.
 
 
+// The clouds' march, in the two passes that march them: the capture and
+// the cloud pass. The sky draw reads the cloud pass's result.
+#if defined(AE3D_SKY_SCREEN)
 // Clouds, shared by the sky that draws them and the ground they shadow.
 // A layer between CLOUD_BASE and CLOUD_TOP metres up. Where cloud is, over
 // the world, is the weather field: a fractal of tileable 2D value noise
@@ -485,7 +494,13 @@ vec4 cloudsAlong(vec3 dir, vec3 sky, float cover, float t, float dither) {
     // a cloud.
     float t1 = min(CLOUD_TOP / dir.y, t0 + 12000.0);
     float slant = 1.0 - clamp(dir.y, 0.0, 1.0);
+    // Half the steps in the cloud pass, whose history folds a dozen frames'
+    // dithered marches into each texel (#317).
+#ifdef AE3D_CLOUD_PASS
+    float fine = (t1 - t0) / (16.0 + 32.0 * slant * slant);
+#else
     float fine = (t1 - t0) / (32.0 + 64.0 * slant * slant);
+#endif
     float coarse = fine * 3.0;
     vec3 sun = normalize(cloudSun);
     // A cloud's albedo is near one and the sun outshines the sky many
@@ -575,6 +590,34 @@ vec4 cloudsAlong(vec3 dir, vec3 sky, float cover, float t, float dither) {
     return vec4(colour * horizon, alpha * horizon);
 }
 
+#endif
+
+// The cloud pass's own (#317): its size and whether there is a history
+// yet. A texel looks along the direction the sky's view and projection
+// give it, and last frame's view-projection, the eye's move left out,
+// finds where that direction was then, so the history is read from where
+// the clouds were drawn. Each frame marches every texel with the dither
+// turned by the frame, and folds an eighth of it into what the frames
+// before left: the march's grain averages away and a texel's samples are
+// a dozen frames'.
+
+
+#ifdef AE3D_CLOUD_PASS
+
+#endif
+// The sky draw's: what the cloud pass left, read at the pixel's place on
+// the screen.
+#ifdef AE3D_CLOUD_PASS
+
+
+
+#else
+#ifndef AE3D_SKY_SCREEN
+
+
+#endif
+#endif
+
 // The daylight sky as light (#655): Preetham, Shirley and Smits' analytic
 // model, the sky's luminance and colour in every direction from the sun's
 // height and the air's turbidity (Perez's distribution over the zenith's
@@ -642,7 +685,7 @@ vec3 proceduralSky(vec3 dir, vec3 sun, vec3 sunColor) {
     if (dayShare > 0.0) sky = mix(dusk, shown_of(daylight(dir, sun, skyTurbidity)), dayShare);
     float cosAngle = dot(dir, sun);
     float day = smoothstep(-0.14, 0.06, sun.y);
-#ifndef AE3D_SKY_CAPTURE
+#ifndef AE3D_SKY_SCREEN
     float disc = smoothstep(0.9993, 0.9997, cosAngle);
     sky += sunColor * disc * (0.6 + 1.4 * day);
 #endif
@@ -697,7 +740,7 @@ vec3 nightSky(vec3 dir, vec3 moon, float night) {
     }
     if (moon.y > 0.0) {
         float c = dot(dir, moon);
-#ifndef AE3D_SKY_CAPTURE
+#ifndef AE3D_SKY_SCREEN
         add += vec3(0.82, 0.86, 0.95) * smoothstep(0.99955, 0.99975, c) * 1.4;
 #endif
         add += vec3(0.30, 0.34, 0.45) * pow(max(c, 0.0), 60.0) * 0.18;
@@ -778,8 +821,15 @@ vec3 oct_texel_direction(vec2 uv, float size) {
 #endif
 
 void main() {
-#ifdef AE3D_SKY_CAPTURE
+#if defined(AE3D_SKY_CAPTURE)
     vec3 dir = oct_texel_direction(gl_FragCoord.xy / SKY_SIZE, SKY_SIZE);
+#elif defined(AE3D_CLOUD_PASS)
+    // The texel's direction through the projection (its offset terms are
+    // a jitter or an off-centre frustum) and the view's turn, which has no
+    // translation in it.
+    vec2 ndc = gl_FragCoord.xy / cloudPassSize * 2.0 - 1.0;
+    vec3 eye = vec3((ndc.x + projection[2][0]) / projection[0][0], (ndc.y + projection[2][1]) / projection[1][1], -1.0);
+    vec3 dir = normalize(transpose(mat3(view)) * eye);
 #else
     vec3 dir = normalize(TexCoords);
 #endif
@@ -813,12 +863,31 @@ void main() {
         float luma = dot(broad, vec3(0.299, 0.587, 0.114));
         sky = mix(sky, skyOvercastColor * (0.35 + 0.65 * luma), clamp(skyOvercast, 0.0, 1.0));
     }
+#ifdef AE3D_SKY_SCREEN
     vec2 grain = gl_FragCoord.xy;
-    if (cloudFrame > 0) grain += 5.588238 * float(cloudFrame % 64);
+#ifdef AE3D_CLOUD_PASS
+    grain += 5.588238 * float(cloudFrame % 64);
+#endif
     vec4 clouds = cloudsAlong(dir, sky, cloudCover, cloudTime, cloudDither(grain));
+#else
+    vec4 clouds = vec4(0.0);
+    if (cloudCover > 0.0) clouds = texture(cloudBuffer, gl_FragCoord.xy / screenSize);
+#endif
+#ifdef AE3D_CLOUD_PASS
+    // Where this direction was last frame, and what was drawn there.
+    if (cloudHistoryOn == 1) {
+        vec4 then = prevViewProjection * vec4(dir, 0.0);
+        vec2 at = then.xy / max(then.w, 1e-5) * 0.5 + 0.5;
+        if (then.w > 0.0 && at.x >= 0.0 && at.x <= 1.0 && at.y >= 0.0 && at.y <= 1.0) {
+            clouds = mix(texture(cloudHistory, at), clouds, 0.125);
+        }
+    }
+    FragColor = clouds;
+#else
     sky = sky * (1.0 - clouds.a) + clouds.rgb;
     FragColor = vec4(display_radiance(sky), 1.0);
-#ifndef AE3D_SKY_CAPTURE
+#endif
+#ifndef AE3D_SKY_SCREEN
     outVelocity = velocity(ClipNow, ClipPrev, vec2(0.0));
 #endif
 }

@@ -1,5 +1,5 @@
 #version 450
-#define AE3D_SKY_CAPTURE 1
+#define AE3D_CLOUD_PASS 1
 
 struct Light {
     vec3 position;
@@ -227,7 +227,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 prevBoneRows[288];
 };
 layout(set = 0, binding = 1) uniform sampler2D skybox;
-layout(set = 0, binding = 2) uniform sampler2D shadowMap;
+layout(set = 0, binding = 2) uniform sampler2D cloudHistory;
 layout(set = 0, binding = 3) uniform sampler2D cloudWeather;
 layout(set = 0, binding = 4) uniform sampler3D cloudShape;
 layout(location = 0) out vec4 FragColor;

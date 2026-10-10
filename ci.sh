@@ -1147,19 +1147,13 @@ else
             # hold both backends there.
             driver_backends="opengl vulkan"
             [ "$TIER" = all ] || driver_backends="vulkan"
-            # The driver presses widgets and reads the tree, never the
-            # viewport's pixels, and every press waits on a frame: on a
-            # runner the viewport at a quarter of its size and 512-texel
-            # cascades, where the drive was 337 s at half size and 1024.
-            driver_env=""
-            [ "$TIER" = all ] || driver_env="AE3D_RENDER_SCALE=25 AE3D_SHADOW_SIZE=512"
             for driver_backend in $driver_backends; do
                 driver_log="$(mktemp)"
                 # A backstop, as the editor's own runs have: an editor that
                 # stops answering fails this step with its log, rather than
                 # holding the runner until the job's limit cancels it and
                 # takes every result after it along.
-                if env $driver_env timeout 900 ./build/drive_editor --backend "$driver_backend" \
+                if timeout 900 ./build/drive_editor --backend "$driver_backend" \
                         --port 8797 >"$driver_log" 2>&1; then
                     pass "ae3d_editor (driver, $driver_backend)"
                 else
