@@ -159,18 +159,20 @@ suite_sources() {   # the suites this tier, and this shard of it, builds and run
             case " $(echo $ONCE_SUITES) " in
                 *" $name "*) first_shard || continue ;;
                 *)
-                    # The first shard has the steps that run once as well, about
-                    # ten suites' worth: it takes one turn in a cycle of 2n - 1
-                    # and every other shard two.
-                    slot=$((turn % (2 * SHARD_COUNT - 1)))
-                    turn=$((turn + 1))
-                    if [ "$slot" -lt $((SHARD_COUNT - 1)) ]; then
-                        mine=$((slot + 1))
-                    elif [ "$slot" = $((SHARD_COUNT - 1)) ]; then
-                        mine=0
+                    # The suites' first shard has the steps that run once as
+                    # well -- the validation layer's and the probes' reruns,
+                    # the benchmarks -- and with one suite in seven besides it
+                    # was still the tier's longest runner, 10 to 11 minutes
+                    # against 5 to 8: there it takes none, and the rest go
+                    # round the others. A tier without those steps (the
+                    # leaks', whose first shard ran 5 minutes to the second's
+                    # 10 on a third of the suites) goes round them all.
+                    if in_tier suites && [ "$TIER" != all ]; then
+                        mine=$((turn % (SHARD_COUNT - 1) + 1))
                     else
-                        mine=$((slot - SHARD_COUNT + 1))
+                        mine=$((turn % SHARD_COUNT))
                     fi
+                    turn=$((turn + 1))
                     [ "$mine" = "$SHARD_INDEX" ] || continue
                     ;;
             esac
