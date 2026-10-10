@@ -1071,6 +1071,11 @@ fi
 # whole.
 editor_scale_was="${AE3D_RENDER_SCALE:-}"
 if [ "$TIER" != all ]; then export AE3D_RENDER_SCALE="${AE3D_RENDER_SCALE:-50}"; fi
+# And its sun's shadow cascades at half their texels, a quarter of the
+# pixels: the shadow pass was 297 of a 930 ms frame under the software
+# rasteriser, the driver's pressing the editor at one frame a second.
+editor_shadow_was="${AE3D_SHADOW_SIZE:-}"
+if [ "$TIER" != all ]; then export AE3D_SHADOW_SIZE="${AE3D_SHADOW_SIZE:-1024}"; fi
 if [ ! -f "$UI_ROOT/ui/module.ae" ]; then
     skip "ae3d_editor" "aether-ui not found at $UI_ROOT"
 elif ! have_display; then
@@ -1186,6 +1191,7 @@ else
 fi
 
 if [ -n "$editor_scale_was" ]; then export AE3D_RENDER_SCALE="$editor_scale_was"; else unset AE3D_RENDER_SCALE; fi
+if [ -n "$editor_shadow_was" ]; then export AE3D_SHADOW_SIZE="$editor_shadow_was"; else unset AE3D_SHADOW_SIZE; fi
 fi
 
 # On the suites' runner: the two Linux runners take about as long with it

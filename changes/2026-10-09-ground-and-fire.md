@@ -126,3 +126,10 @@
   speed, not Kelvin's. A floater slides across the water at an eighth of
   the hold it heaves against, where held as hard both ways a boat crawled.
   The floating example drives a boat round the crates.
+- **The sun's shadow resolution is a setting (#511).**
+  `engine_set_shadow_resolution` (a cascade's texels a side, 2048 as
+  shipped, 256 to 4096) or `AE3D_SHADOW_SIZE`; the cascades' fit and both
+  renderers' atlases follow it (`cascades.size`, `atlas`). CI's editor runs
+  take 1024: the shadow pass was 297 ms of the editor's 930 ms frame under
+  the runner's software rasteriser, and the widget driver presses the
+  editor at one frame a second for six minutes.
