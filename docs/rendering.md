@@ -143,13 +143,21 @@ The feature list in full, with the reasoning behind each. The [README](../README
 - **Volumetric clouds.** A layer of cloud marched in the sky shader over
   whatever sky is set, built the way a production sky builds it: a weather
   map says where cloud is and what kind, from a low stratus to a tall
-  cumulus; a tileable Perlin-Worley cube gives the body and a Worley
-  fractal erodes its edges, wisps at the base and billows above; each
-  sample is lit by the sun through the cloud over it, in three octaves of
-  Beer's law with the powder darkening and a two-lobe phase, and by the
-  sky. The noise is baked once at start into a 2D and a 3D texture
-  (`ae3d.cloudnoise`), so the march is a fetch a sample and the
-  clouds are a millisecond and a half of the frame. The ground computes
+  cumulus, with flat bases at the condensation level; a tileable
+  Perlin-Worley cube gives the body and a Worley fractal erodes its edges;
+  close up a detail cube of curl noise turns the sample position and its
+  own Worley fractal breaks the edges into wisps at the base and
+  cauliflower above (#317). Each sample is lit by the sun through the
+  cloud over it, in three octaves of Beer's law each with its own
+  two-lobe phase, flatter each octave (Wrenninge's multiple scattering: a
+  cloud lit from behind the eye is white, where one scattering left it at
+  0.3 of the sun), with the powder darkening, and by the sky, and rolled
+  off by a shoulder that nears white without clipping. The noise is baked
+  once at start into a 2D and two 3D textures (`ae3d.cloudnoise`), so the
+  march is a fetch a sample. The sky is drawn after the opaque geometry,
+  so the depth test spares the march every pixel the ground covers. Over
+  smooth_terrain's view at 2560x1440 on an M1 Pro the clouds are 12.8 ms
+  of the frame on OpenGL and 24.6 ms on Vulkan. The ground computes
   the same weather field where the sun's ray meets the layer, so their
   shadows cross the terrain as they drift. One call,
   `engine_set_clouds(cover, wind)`, on either backend.

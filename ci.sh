@@ -129,7 +129,7 @@ PLATFORM_SUITES="test_net test_net_authority test_net_budget test_net_delta
 # to print SKIP and be held to `leaks` on the way out. AE3D_CI_GPU=0, which the
 # workflow sets on those runners, builds none of them. A suite left off this
 # list is built and skips as before: forgetting one costs time, not coverage.
-GPU_SUITES="test_agent test_agent_attached test_agent_components test_agent_explain test_anisotropy test_tile_breakup test_ground_bounce test_heat_haze test_water_sky
+GPU_SUITES="test_agent test_agent_attached test_agent_components test_agent_explain test_anisotropy test_tile_breakup test_ground_bounce test_heat_haze test_water_sky test_clouds
     test_agent_net test_agent_record test_backend_parity test_batching
     test_blackhole test_camera_collision test_caustics test_character test_cluster_cut
     test_crowd_ecs test_crowd_render test_crowd_render_scale
@@ -1147,13 +1147,19 @@ else
             # hold both backends there.
             driver_backends="opengl vulkan"
             [ "$TIER" = all ] || driver_backends="vulkan"
+            # The driver presses widgets and reads the tree, never the
+            # viewport's pixels, and every press waits on a frame: on a
+            # runner the viewport at a quarter of its size and 512-texel
+            # cascades, where the drive was 337 s at half size and 1024.
+            driver_env=""
+            [ "$TIER" = all ] || driver_env="AE3D_RENDER_SCALE=25 AE3D_SHADOW_SIZE=512"
             for driver_backend in $driver_backends; do
                 driver_log="$(mktemp)"
                 # A backstop, as the editor's own runs have: an editor that
                 # stops answering fails this step with its log, rather than
                 # holding the runner until the job's limit cancels it and
                 # takes every result after it along.
-                if timeout 900 ./build/drive_editor --backend "$driver_backend" \
+                if env $driver_env timeout 900 ./build/drive_editor --backend "$driver_backend" \
                         --port 8797 >"$driver_log" 2>&1; then
                     pass "ae3d_editor (driver, $driver_backend)"
                 else

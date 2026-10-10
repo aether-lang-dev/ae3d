@@ -133,3 +133,20 @@
   take 1024: the shadow pass was 297 ms of the editor's 930 ms frame under
   the runner's software rasteriser, and the widget driver presses the
   editor at one frame a second for six minutes.
+- **Clouds with detail and multiple scattering (#317).** A 32-cube detail
+  texture (curl noise, a Worley fractal) baked with the shape, at binding
+  9 on Vulkan and unit 3 on OpenGL; flat bases, kinds pushed apart so a
+  sky has towers; extinction 0.06 to 0.12 a metre so a cloud has a
+  surface; the phase flattened per octave and the sun doubled, so a
+  front-lit cloud's brightest tenth reads 220 where it read 160
+  (`tests/test_clouds.ae`, both backends); a shoulder roll-off in place of
+  c / (1 + 0.45 c), which was white past 1.8. The bake is 34 ms at -O2.
+- **The sky after the opaque draws.** Both backends drew the sky first,
+  so every pixel the ground then covered had marched the clouds; drawn
+  after, the depth test rejects them. On the M1 Pro's tile-based GPU the
+  frame does not change (its hidden-surface removal already culled them);
+  the gain is for GPUs that shade in draw order, to measure there.
+- **The editor's widget drive renders small on CI.** The driver presses
+  widgets and reads the tree, never the viewport's pixels, and each press
+  waits on a frame: on a runner it drives at AE3D_RENDER_SCALE=25 and
+  AE3D_SHADOW_SIZE=512. That step was 337 s of the 654 s linux-editor job.
