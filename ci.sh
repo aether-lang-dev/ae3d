@@ -1156,6 +1156,7 @@ else
                 if timeout 900 ./build/drive_editor --backend "$driver_backend" \
                         --port 8797 >"$driver_log" 2>&1; then
                     pass "ae3d_editor (driver, $driver_backend)"
+                    grep '^slowest' "$driver_log" | sed 's/^/        /'
                 else
                     fail "ae3d_editor (driver, $driver_backend)"
                     # The failing lines, not the first twenty. The driver runs
