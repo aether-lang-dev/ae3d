@@ -185,3 +185,10 @@
   against sqrt(g h) 3.13, a wave runs up a beach and settles level. A frame
   costs 0.24 ms at 128 x 128, 1.28 ms at 256 x 256 with 3.5 m of water,
   over the 1 ms the issue budgeted there. New `examples/flood.ae`.
+- **Clouds lit in radiance (#317).** Their sun is the key light's
+  irradiance, a thick cloud giving it back as a white surface of albedo
+  0.9 does, their ambient the sky's radiance, and they go over the sky's
+  radiance before the tone curve, where they were lit as they show and
+  rolled off. The scattering octaves take Wrenninge's weights, 1, 1/2,
+  1/4: weighed to one, a front-lit cloud was 82% of a white wall's
+  brightness as it shows; now 91% (204 against 224, both renderers).

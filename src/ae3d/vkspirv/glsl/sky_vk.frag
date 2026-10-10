@@ -293,6 +293,7 @@ layout(location = 2) in vec4 ClipPrev;
 // The clouds' march, in the two passes that march them: the capture and
 // the cloud pass. The sky draw reads the cloud pass's result.
 #if defined(AE3D_SKY_SCREEN)
+vec3 display_radiance(vec3 shown);
 // Clouds, shared by the sky that draws them and the ground they shadow.
 // A layer between CLOUD_BASE and CLOUD_TOP metres up. Where cloud is, over
 // the world, is the weather field: a fractal of tileable 2D value noise
@@ -506,10 +507,22 @@ vec4 cloudsAlong(vec3 dir, vec3 sky, float cover, float t, float dither) {
 #endif
     float coarse = fine * 3.0;
     vec3 sun = normalize(cloudSun);
-    // A cloud's albedo is near one and the sun outshines the sky many
-    // times over: its light is twice the key light's colour, the roll-off
-    // below keeping a lit crown under paper white.
-    vec3 sunLight = cloudSunColor * 2.0;
+    // Lit in radiance (#317), as the scene's surfaces are, and composited
+    // over the sky's radiance before the frame's one tone curve: a crown
+    // in the sun is as bright as it is, a silver lining past white, and the
+    // exposure follows them as it follows the ground. A thick cloud gives
+    // back the sun about as a white surface of albedo 0.9 does: the key
+    // light's irradiance, cloudSunColor, times 0.9 over pi.
+    vec3 sunLight = cloudSunColor * (0.9 / 3.14159265);
+    // The sky behind the ray, as light: what lights the cloud from round it
+    // and what the haze fades it to. Lifted toward a neutral of its own
+    // brightness by day, when the ground and the air scatter light up into
+    // the layer, and not at night, when a cloud lit only by a dark sky is a
+    // darker patch of it.
+    vec3 skyRadiance = display_radiance(sky);
+    float skyShown = dot(sky, vec3(0.299, 0.587, 0.114));
+    float skyBright = dot(skyRadiance, vec3(0.299, 0.587, 0.114));
+    vec3 skyLight = mix(skyRadiance, vec3(skyBright * 1.6), 0.35 * clamp(skyShown * 2.5, 0.0, 1.0));
     // Forward scattering for the silver lining, a little back scattering
     // for the bright face of a cloud lit from behind the eye; scaled so
     // light scattered evenly is one. One lobe pair an octave of Beer's law
@@ -545,21 +558,20 @@ vec4 cloudsAlong(vec3 dir, vec3 sky, float cover, float t, float dither) {
             // The sun through the cloud above: three octaves of Beer's law,
             // the way light that has scattered a few times still gets
             // through, so a base is grey and not black, each with its
-            // octave's phase.
+            // octave's phase and half the one before's weight (Wrenninge):
+            // the light scattered many times is light the eye gets besides
+            // the once-scattered, which is why a thick cloud gives the sun
+            // back almost as a white wall does. Weighed to one between them,
+            // a cloud lit from behind the eye was 82% of a white wall's
+            // brightness as it shows.
             float tau = shade * CLOUD_SIGMA;
-            float scattered = 0.50 * exp(-tau) * phase0 + 0.32 * exp(-tau * 0.25) * phase1 +
-                              0.18 * exp(-tau * 0.0625) * phase2;
+            float scattered = exp(-tau) * phase0 + 0.5 * exp(-tau * 0.25) * phase1 +
+                              0.25 * exp(-tau * 0.0625) * phase2;
             // Darker where the cloud is thin against the light: the powder
             // effect, the crevices of a cumulus reading darker than its
             // domes.
             float powder = 1.0 - 0.5 * exp(-d * 12.0);
-            // The sky's light, from the blue above and the ground below,
-            // dimmed down the layer and inside the cloud.
-            // Lifted toward white by day, when the ground and the air
-            // scatter light up into the layer, and not at night, when a
-            // cloud lit only by a dark sky is a darker patch of it.
-            float skyLuma = dot(sky, vec3(0.299, 0.587, 0.114));
-            vec3 skyLight = mix(sky, vec3(1.0), 0.35 * clamp(skyLuma * 2.5, 0.0, 1.0));
+            // The sky's light, dimmed down the layer and inside the cloud.
             // Most of what lights a cloud's shaded side is the cloud: light
             // scattered many times through it and the field of cloud round
             // it, with the sky's. A side turned from the sun is a lighter
@@ -567,13 +579,8 @@ vec4 cloudsAlong(vec3 dir, vec3 sky, float cover, float t, float dither) {
             // ambient left it.
             vec3 ambient = skyLight * mix(0.62, 1.0, hf) * (0.7 + 0.3 * exp(-tau * 0.25));
             vec3 c = sunLight * scattered * powder + ambient;
-            // Rolled off, since the sky is drawn without the scene's tone
-            // curve: a shoulder that nears white and never reaches it, so a
-            // lit crown keeps its shape (c / (1 + 0.45 c) was white past
-            // 1.8, and the crowns clipped flat).
-            c = 1.0 - exp(-c * 1.25);
             float haze = 1.0 - exp(-ray * 0.00005);
-            c = mix(c, sky, haze);
+            c = mix(c, skyRadiance, haze);
             float a = (1.0 - exp(-d * dt * CLOUD_SIGMA)) * (1.0 - 0.8 * haze);
             colour += c * a * (1.0 - alpha);
             alpha += a * (1.0 - alpha);
@@ -887,8 +894,8 @@ void main() {
     }
     FragColor = clouds;
 #else
-    sky = sky * (1.0 - clouds.a) + clouds.rgb;
-    FragColor = vec4(display_radiance(sky), 1.0);
+    // The clouds are radiance, premultiplied: over the sky's.
+    FragColor = vec4(display_radiance(sky) * (1.0 - clouds.a) + clouds.rgb, 1.0);
 #endif
 #ifndef AE3D_SKY_SCREEN
     outVelocity = velocity(ClipNow, ClipPrev, vec2(0.0));

@@ -168,10 +168,15 @@ The feature list in full, with the reasoning behind each. The [README](../README
   own Worley fractal breaks the edges into wisps at the base and
   cauliflower above (#317). Each sample is lit by the sun through the
   cloud over it, in three octaves of Beer's law each with its own
-  two-lobe phase, flatter each octave (Wrenninge's multiple scattering: a
-  cloud lit from behind the eye is white, where one scattering left it at
-  0.3 of the sun), with the powder darkening, and by the sky, and rolled
-  off by a shoulder that nears white without clipping. The noise is baked
+  two-lobe phase, flatter each octave and half the one before's weight
+  (Wrenninge's multiple scattering), with the powder darkening, and by the
+  sky. It is lit in radiance as the ground is -- the key light's
+  irradiance, a thick cloud giving it back as a white surface of albedo 0.9
+  does -- and laid over the sky's radiance before the frame's one tone
+  curve, so a crown in the sun is as bright as it is and the exposure
+  follows it: a cloud lit from behind the eye shows at 204 where a white
+  wall square to the same sun shows at 225 (one scattering left it at 0.3
+  of the sun). The noise is baked
   once at start into a 2D and two 3D textures (`ae3d.cloudnoise`), so the
   march is a fetch a sample. The march runs in a cloud pass of its own
   before the scene, at half the frame's size, half the steps a frame with
