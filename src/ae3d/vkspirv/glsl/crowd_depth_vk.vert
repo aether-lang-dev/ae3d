@@ -204,6 +204,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float waterReflectionIntensity;
     int hasSkyTexture;
     int waterSkyCapture;
+    vec3 rippleArea;
     float waterDepthFade;
     float waterShoreFoam;
     bool enableWaterDistortion;

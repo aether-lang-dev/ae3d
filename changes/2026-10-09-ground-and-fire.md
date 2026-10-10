@@ -113,3 +113,16 @@
   green sky, the sea's own sky colour red, from 3 m up the sea is (40,
   129, 56) and from 10 m under its underside (246, 12, 0), on both
   renderers (`tests/test_water_sky.ae`). The floating example uses it.
+- **Wakes and rings: ripples on the sea (#637, its second part).** The new
+  `ae3d.ripples` is a damped wave equation over a square of the sea, drawn
+  over the swell (`water.simulation_set_ripples`, its slopes sent as the
+  surface's mask, `core.model_enable_mask`); a floating body moving through
+  the surface disturbs it, so a boat leaves a wake and a bobbing crate
+  rings the water round it. A 5 cm dip spreads as a ring 2.5 m out in 2 s
+  (1.6 m/s set; the grid carries a dip three cells wide a little slower),
+  dies to 0.3% of its energy in 10 s, and never grows; a box pushed
+  across a calm sea leaves its ripples behind it, none ahead
+  (`tests/test_buoyancy.ae`). Non-dispersive: a wake is the Mach V of its
+  speed, not Kelvin's. A floater slides across the water at an eighth of
+  the hold it heaves against, where held as hard both ways a boat crawled.
+  The floating example drives a boat round the crates.

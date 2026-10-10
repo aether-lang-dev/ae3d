@@ -124,7 +124,10 @@ The feature list in full, with the reasoning behind each. The [README](../README
   and held back at a share of critical damping, so it rights itself and
   rolls with a swell. A box half water's density settles 0.51 under, a
   quarter's 0.25, and on a 2 m swell one rises and falls 2.08 m
-  (`tests/test_buoyancy.ae`).
+  (`tests/test_buoyancy.ae`). `ae3d.ripples` draws the small waves bodies
+  make over the swell (`water.simulation_set_ripples`): a damped wave
+  equation a floater disturbs as it moves through the surface, so a boat
+  leaves a wake and a bobbing crate rings the water.
 - **Water that is water.** A Gerstner sea with deep-water dispersion, shaded
   as one physically based surface: Schlick fresnel between the body of the
   water and the reflected sky (the scene's own skybox image, where it has
