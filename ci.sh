@@ -129,7 +129,7 @@ PLATFORM_SUITES="test_net test_net_authority test_net_budget test_net_delta
 # to print SKIP and be held to `leaks` on the way out. AE3D_CI_GPU=0, which the
 # workflow sets on those runners, builds none of them. A suite left off this
 # list is built and skips as before: forgetting one costs time, not coverage.
-GPU_SUITES="test_agent test_agent_attached test_agent_components test_agent_explain
+GPU_SUITES="test_agent test_agent_attached test_agent_components test_agent_explain test_anisotropy test_tile_breakup test_ground_bounce test_heat_haze test_water_sky test_clouds
     test_agent_net test_agent_record test_backend_parity test_batching
     test_blackhole test_camera_collision test_caustics test_character test_cluster_cut
     test_crowd_ecs test_crowd_render test_crowd_render_scale
@@ -159,18 +159,24 @@ suite_sources() {   # the suites this tier, and this shard of it, builds and run
             case " $(echo $ONCE_SUITES) " in
                 *" $name "*) first_shard || continue ;;
                 *)
-                    # The first shard has the steps that run once as well, about
-                    # ten suites' worth: it takes one turn in a cycle of 2n - 1
-                    # and every other shard two.
-                    slot=$((turn % (2 * SHARD_COUNT - 1)))
-                    turn=$((turn + 1))
-                    if [ "$slot" -lt $((SHARD_COUNT - 1)) ]; then
-                        mine=$((slot + 1))
-                    elif [ "$slot" = $((SHARD_COUNT - 1)) ]; then
+                    # The suites' first shard has the steps that run once as
+                    # well -- the validation layer's and the probes' reruns,
+                    # the benchmarks. With one suite in seven besides it was
+                    # the tier's longest runner (10 to 11 minutes against 5
+                    # to 8), and with none its shortest (6 against 7 to 10,
+                    # 9 suites built in 21 s against 56 in 200): it takes one
+                    # turn in a cycle where every other shard takes four. A
+                    # tier without those steps (the leaks', whose first shard
+                    # ran 5 minutes to the second's 10 on a third of the
+                    # suites) goes round them all.
+                    if in_tier suites && [ "$TIER" != all ]; then
+                        slot=$((turn % (4 * (SHARD_COUNT - 1) + 1)))
                         mine=0
+                        [ "$slot" -gt 0 ] && mine=$(((slot - 1) % (SHARD_COUNT - 1) + 1))
                     else
-                        mine=$((slot - SHARD_COUNT + 1))
+                        mine=$((turn % SHARD_COUNT))
                     fi
+                    turn=$((turn + 1))
                     [ "$mine" = "$SHARD_INDEX" ] || continue
                     ;;
             esac
@@ -218,8 +224,9 @@ in_pool() {
 
 build_one() {   # build_one <source>: its log and its status, under BUILD_DIR
     target="$(basename "$1" .ae)"
-    # A suite that times its own code against a budget says so, and is
-    # built as the engine ships; the rest take SUITE_CFLAGS (see the suites).
+    # A suite that times its own code against a budget, or an example whose
+    # start-up builds its world on the CPU, says so and is built as the
+    # engine ships; the rest take SUITE_CFLAGS (see the suites).
     flags="${SUITE_CFLAGS:-}"
     grep -q '^// ci: optimised' "$1" && flags=""
     AE3D_PROGRAM_CFLAGS="$flags" ./build.sh "$1" "$target" >"$BUILD_DIR/$target.log" 2>&1
@@ -749,7 +756,13 @@ scene_tools=""
 if [ -n "$SCENES" ]; then
     scene_tools="tools/ae3d_bench.ae tools/measure_scene.ae tools/ae3d_agent.ae tools/ae3d_view.ae tools/critique_scene.ae tools/zombie_street.ae tools/bake_impostor.ae tools/fold_changes.ae tools/scene_parity.ae"
 fi
+# Unoptimised too, as the suites: thirteen of the twenty-one examples run
+# their ten frames in the same time either way and compile in half of it;
+# the eight that build a world at start-up (2 to 5 times slower so) are
+# marked `// ci: optimised`.
+export SUITE_CFLAGS=-O0
 build_together examples/*.ae $scene_tools
+unset SUITE_CFLAGS
 for example in examples/*.ae; do
     name="$(basename "$example" .ae)"
     if ! built_ok "$name"; then
@@ -1064,6 +1077,11 @@ fi
 # whole.
 editor_scale_was="${AE3D_RENDER_SCALE:-}"
 if [ "$TIER" != all ]; then export AE3D_RENDER_SCALE="${AE3D_RENDER_SCALE:-50}"; fi
+# And its sun's shadow cascades at half their texels, a quarter of the
+# pixels: the shadow pass was 297 of a 930 ms frame under the software
+# rasteriser, the driver's pressing the editor at one frame a second.
+editor_shadow_was="${AE3D_SHADOW_SIZE:-}"
+if [ "$TIER" != all ]; then export AE3D_SHADOW_SIZE="${AE3D_SHADOW_SIZE:-1024}"; fi
 if [ ! -f "$UI_ROOT/ui/module.ae" ]; then
     skip "ae3d_editor" "aether-ui not found at $UI_ROOT"
 elif ! have_display; then
@@ -1144,6 +1162,7 @@ else
                 if timeout 900 ./build/drive_editor --backend "$driver_backend" \
                         --port 8797 >"$driver_log" 2>&1; then
                     pass "ae3d_editor (driver, $driver_backend)"
+                    grep '^slowest' "$driver_log" | sed 's/^/        /'
                 else
                     fail "ae3d_editor (driver, $driver_backend)"
                     # The failing lines, not the first twenty. The driver runs
@@ -1179,6 +1198,7 @@ else
 fi
 
 if [ -n "$editor_scale_was" ]; then export AE3D_RENDER_SCALE="$editor_scale_was"; else unset AE3D_RENDER_SCALE; fi
+if [ -n "$editor_shadow_was" ]; then export AE3D_SHADOW_SIZE="$editor_shadow_was"; else unset AE3D_SHADOW_SIZE; fi
 fi
 
 # On the suites' runner: the two Linux runners take about as long with it

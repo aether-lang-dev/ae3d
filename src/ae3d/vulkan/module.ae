@@ -45,7 +45,7 @@ exports (
     available, device_name, last_error,
     renderer_model_count, renderer_model, renderer_light_count, renderer_light, renderer_draw_calls, renderer_set_clear_color,
     renderer_shadow_ms, renderer_scene_ms, renderer_post_ms, renderer_stage_ms, STAGE_COUNT, stage_name, renderer_cpu_work_ms, renderer_post_active, renderer_program_binds, renderer_material_binds,
-    renderer_set_normal_strength, renderer_set_occlusion_strength, renderer_set_capture_channel, renderer_set_wetness, renderer_set_frame_exposure, renderer_set_meter, renderer_meter, renderer_material_texture_size,
+    renderer_set_normal_strength, renderer_set_anisotropy, renderer_set_ground_bounce, renderer_set_haze, renderer_set_occlusion_strength, renderer_set_capture_channel, renderer_set_wetness, renderer_set_frame_exposure, renderer_set_meter, renderer_meter, renderer_material_texture_size,
     renderer_load_texture, renderer_release_texture, renderer_sample_count, renderer_set_post,
     renderer_set_bloom_intensity, renderer_bloom_intensity, renderer_sky_irradiance,
     renderer_set_shadows, renderer_shadows, renderer_set_ssr, renderer_ssr, renderer_set_ssr_params, renderer_ssr_road_height, renderer_ssr_strength, renderer_set_taa, renderer_taa, request_dlss, dlss_available, renderer_set_dlss, renderer_dlss, set_samples, renderer_ray_query, renderer_set_ray_shadows, renderer_ray_shadows, renderer_set_gi, renderer_gi, renderer_set_clusters, renderer_clusters, renderer_cut_census, renderer_set_gi_probes, renderer_indirect_irradiance, renderer_gi_census, renderer_set_sun_size, renderer_sun_size, renderer_set_ray_occlusion, renderer_ray_occlusion, renderer_set_lamp_size, renderer_set_ray_budget, renderer_ray_budget, renderer_ray_figures, renderer_ray_reach, renderer_set_ray_skinned, renderer_ray_skinned, renderer_map_drawn, renderer_add_light, renderer_remove_light,
@@ -173,8 +173,17 @@ struct VKRenderer {
     last_cpu_work_ms: float
     // The clouds' noise as textures, made with the first sky and kept.
     cloud_shape_texture: int
+    cloud_detail_texture: int
     cloud_weather_texture: int
     cloud_textures_real: bool      // the noise, not the placeholders
+    // The cloud pass (#317): which of its two targets it draws next, the
+    // one the sky reads this frame (0 for none), and the targets' serial
+    // and the cover its history was drawn under, either changed meaning
+    // the history is gone.
+    cloud_next: int
+    clouds_drawn: int
+    cloud_serial: int
+    cloud_cover_drawn: float
     last_pipeline_binds: int
     last_set_binds: int
     clear_r: float
@@ -209,6 +218,9 @@ struct VKRenderer {
     sky_sun_set: bool
     sky_overcast: float
     sky_turbidity: float           // the daylight sky's haze (#655)
+    ground_albedo: Vec3            // the ground a surface turned down sees, lit (#740); 0 for the capture's
+    haze: ptr                      // f32[32]: four columns of hot air, then their shapes (#738)
+    haze_count: int
     sky_overcast_color: Vec3
     defaults: ptr
     loaded_names: ptr
@@ -521,23 +533,25 @@ renderer_set_sky_sun(r: *VKRenderer, toward: Vec3) {
 }
 
 // The clouds' textures. The noise behind them is 161 ms of CPU for the
-// shape and 5 for the weather (core.cloud_shape_bytes, measured), and
+// shape, 5 for the weather and 34 for the detail (core.cloud_shape_bytes,
+// measured), and
 // every sky made them whether the scene had clouds or not -- the whole
 // of the 168 ms a scene's sky cost to open in the editor, and the same in
 // every program with a sky and no clouds. With no cover the sky shader
 // never samples them (cloudsAlong returns before the march), but the
 // draw still binds a texture of each kind, so a sky without clouds gets
-// two placeholders of the right types -- a 2x2x2 volume and a 1x1 image
-// -- and the noise is made the first time the cover is above zero.
+// placeholders of the right types -- 2x2x2 volumes and a 1x1 image --
+// and the noise is made the first time the cover is above zero.
 // On Vulkan a texture is made outside any frame, so the upgrade happens
 // when the cover is set rather than where the sky is drawn.
 ensure_cloud_textures(r: *VKRenderer, real: bool) {
     if r.cloud_textures_real { return }
     if !real {
-        if r.cloud_shape_texture == 0 || r.cloud_weather_texture == 0 {
+        if r.cloud_shape_texture == 0 || r.cloud_weather_texture == 0 || r.cloud_detail_texture == 0 {
             blank = calloc(2 * 2 * 2 * 4, 1)
             // depth 2, not 1: the native side makes a volume only past one layer.
             if r.cloud_shape_texture == 0 { r.cloud_shape_texture = vktexture.texture_create_rgba(2, 2, 2, blank) }
+            if r.cloud_detail_texture == 0 { r.cloud_detail_texture = vktexture.texture_create_rgba(2, 2, 2, blank) }
             if r.cloud_weather_texture == 0 { r.cloud_weather_texture = vktexture.texture_create_rgba(1, 1, 1, blank) }
             free(blank)
         }
@@ -545,11 +559,14 @@ ensure_cloud_textures(r: *VKRenderer, real: bool) {
     }
     shape = core.cloud_shape_bytes()
     weather = core.cloud_weather_bytes()
-    if shape == null || weather == null { return }
+    detail = core.cloud_detail_bytes()
+    if shape == null || weather == null || detail == null { return }
     if r.cloud_shape_texture != 0 { vkframe.texture_destroy(r.cloud_shape_texture) }
     if r.cloud_weather_texture != 0 { vkframe.texture_destroy(r.cloud_weather_texture) }
+    if r.cloud_detail_texture != 0 { vkframe.texture_destroy(r.cloud_detail_texture) }
     r.cloud_shape_texture = vktexture.texture_create_rgba(core.CLOUD_SHAPE_SIZE, core.CLOUD_SHAPE_SIZE, core.CLOUD_SHAPE_SIZE, shape)
     r.cloud_weather_texture = vktexture.texture_create_rgba(core.CLOUD_WEATHER_SIZE, core.CLOUD_WEATHER_SIZE, 1, weather)
+    r.cloud_detail_texture = vktexture.texture_create_rgba(core.CLOUD_DETAIL_SIZE, core.CLOUD_DETAIL_SIZE, core.CLOUD_DETAIL_SIZE, detail)
     r.cloud_textures_real = true
 }
 
@@ -1353,6 +1370,11 @@ renderer_ssr_strength(r: *VKRenderer) -> float { return vkframe.ssr_strength() }
 // back after, since the scene pass samples the shadow map through it.
 // Whether any model draws through the water program: the one shader that
 // reads the scene's depth, for its shore.
+// A soft particle, blended, drawn: it reads the scene's depth (#738).
+soft_drawn(m: *Model) -> bool {
+    return m.material != null && m.material.soft > 0.0 && m.blend != core.BLEND_OPAQUE
+}
+
 wants_scene_depth(r: *VKRenderer) -> bool {
     count = list.size(r.models)
     i = 0
@@ -1361,6 +1383,7 @@ wants_scene_depth(r: *VKRenderer) -> bool {
         if m != null && m.visible && core.shader_valid(&m.shader) && m.shader.kind == core.SHADER_WATER {
             return true
         }
+        if m != null && m.visible && soft_drawn(m) { return true }
         i = i + 1
     }
     return false
@@ -1444,7 +1467,7 @@ render_shadow_pass(r: *VKRenderer, light: *Light, cam: *Camera) {
                     // Cascade k's tile of the atlas, two by two, and its
                     // matrix: every draw copies the block as it stands, so
                     // the draws that follow cast into this cascade.
-                    vkframe.shadow_viewport((k % 2) * cascades.SIZE, (k / 2) * cascades.SIZE, cascades.SIZE)
+                    vkframe.shadow_viewport((k % 2) * cascades.size(), (k / 2) * cascades.size(), cascades.size())
                     space = cascades.matrix(c, k)
                     vkdesc.set_clip_mat4(vkscene.OFF_LIGHTSPACEMATRIX, &space)
                     draw_casters(r, false, kind, 0, k, 0, LAYER_ALL)
@@ -2162,7 +2185,46 @@ capture_sky(r: *VKRenderer) {
     }
     vkdesc.set_int(vkscene.OFF_SKYPROCEDURAL, kind)
     vkdesc.set_vec3(vkscene.OFF_SKYFLAT, r.clear_r, r.clear_g, r.clear_b)
-    vksky.capture(texture, r.cloud_weather_texture, r.cloud_shape_texture)
+    vksky.capture(texture, r.cloud_weather_texture, r.cloud_shape_texture, r.cloud_detail_texture)
+}
+
+// The clouds marched at half the frame's size into one of the two targets,
+// folded into last frame's in the other (#317), before the scene pass: what
+// the sky draw reads, so it marches nothing itself. A fresh pair of targets
+// or a new cover starts without a history. The dither turns every frame,
+// which is what the history averages.
+render_clouds(r: *VKRenderer, cam: *Camera) {
+    r.clouds_drawn = 0
+    sky = r.skybox as *Skybox
+    if sky == null || sky.texture == 0 || r.cloud_cover <= 0.0 || !r.cloud_textures_real { return }
+    if !vktargets.cloud_ensure() { return }
+    history_on = 1
+    if vktargets.cloud_serial() != r.cloud_serial || r.cloud_cover != r.cloud_cover_drawn { history_on = 0 }
+    r.cloud_serial = vktargets.cloud_serial()
+    r.cloud_cover_drawn = r.cloud_cover
+    write = r.cloud_next
+    history = vktargets.cloud_texture(1 - write)
+    if history_on == 0 { history = vkframe.default_texture() }
+
+    vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+    view = core.camera_view(cam)
+    view.m12 = 0.0
+    view.m13 = 0.0
+    view.m14 = 0.0
+    projection = core.camera_projection(cam)
+    vkdesc.set_mat4(vkscene.OFF_VIEW, &view)
+    vkdesc.set_clip_mat4(vkscene.OFF_PROJECTION, &projection)
+    procedural = 0
+    if sky.procedural { procedural = 1 }
+    vkdesc.set_int(vkscene.OFF_SKYPROCEDURAL, procedural)
+    vkdesc.set_float(vkscene.OFF_CLOUDPASSSIZE, vktargets.cloud_width() as float)
+    vkdesc.set_float(vkscene.OFF_CLOUDPASSSIZE + 4, vktargets.cloud_height() as float)
+    vkdesc.set_int(vkscene.OFF_CLOUDHISTORYON, history_on)
+    vkdesc.set_int(vkscene.OFF_CLOUDFRAME, r.sort_serial % 64 + 1)
+    vkframe.cloud_pass(vktargets.cloud_framebuffer(write), vktargets.cloud_width(), vktargets.cloud_height(),
+                       sky.texture, history, r.cloud_weather_texture, r.cloud_shape_texture, r.cloud_detail_texture)
+    r.clouds_drawn = vktargets.cloud_texture(write)
+    r.cloud_next = 1 - write
 }
 
 // The sky sits behind everything, so the camera's translation is stripped from
@@ -2182,7 +2244,15 @@ draw_skybox(r: *VKRenderer, cam: *Camera) {
     procedural = 0
     if sky.procedural { procedural = 1 }
     vkdesc.set_int(vkscene.OFF_SKYPROCEDURAL, procedural)
-    vkframe.draw_sky(sky.vbo, sky.texture, r.cloud_weather_texture, r.cloud_shape_texture)
+    // No clouds drawn this frame, none read: the cover the ground's cloud
+    // shadow keeps is zero for the sky's draw alone.
+    if r.clouds_drawn == 0 {
+        vkdesc.set_float(vkscene.OFF_CLOUDCOVER, 0.0)
+        vkframe.draw_sky(sky.vbo, sky.texture, vkframe.default_texture())
+        vkdesc.set_float(vkscene.OFF_CLOUDCOVER, r.cloud_cover)
+    } else {
+        vkframe.draw_sky(sky.vbo, sky.texture, r.clouds_drawn)
+    }
 }
 
 // A colour from a file -- a surface's albedo, what a texture id names --
@@ -2350,6 +2420,45 @@ texture_for(r: *VKRenderer, material: *Material) -> int {
 // without one binds nothing and the shader is told not to look.
 renderer_set_normal_strength(r: *VKRenderer, strength: float) {
     if r != null { r.normal_strength = strength }
+}
+
+// How many texels a scene texture filters across a surface seen at a
+// slant, 1 to 16 (capped at the device's): the sets naming the samplers it
+// replaces go with them.
+// A column of hot air (#738) in `slot` (0 to 3): over `base`, `radius`
+// across, `height` tall, rippling what is seen through it by `strength`
+// (0 clears it), its shimmer risen to `phase`. The composite draws it.
+renderer_set_haze(r: *VKRenderer, slot: int, base: Vec3, radius: float, height: float, strength: float, phase: float) {
+    if r == null || slot < 0 || slot >= 4 { return }
+    if r.haze == null { r.haze = calloc(32, 4) }
+    h = r.haze as f32[]
+    h[slot * 4] = base.x as f32
+    h[slot * 4 + 1] = base.y as f32
+    h[slot * 4 + 2] = base.z as f32
+    h[slot * 4 + 3] = radius as f32
+    h[16 + slot * 4] = height as f32
+    h[16 + slot * 4 + 1] = strength as f32
+    h[16 + slot * 4 + 2] = phase as f32
+    h[16 + slot * 4 + 3] = 0.0 as f32
+    // Drawn up to the last column with any strength; one cleared before it
+    // is drawn at none.
+    r.haze_count = 0
+    k = 0
+    while k < 4 {
+        if (h[16 + k * 4 + 1] as float) > 0.0 { r.haze_count = k + 1 }
+        k = k + 1
+    }
+}
+
+// The ground the scene stands on (#740): its albedo, so a surface turned
+// down is lit by it lit by the sky and the sun; 0 for the sky's capture
+// alone, as before. The capture is drawn again.
+renderer_set_ground_bounce(r: *VKRenderer, albedo: Vec3) {
+    if r != null { r.ground_albedo = albedo }
+}
+
+renderer_set_anisotropy(r: *VKRenderer, texels: float) {
+    if r != null && vktexture.set_anisotropy(texels) { vkdesc.forget_all() }
 }
 
 // What the frame is drawn as: 0 the lit picture, 1 every surface's albedo,
@@ -2556,11 +2665,6 @@ write_frame_uniforms(r: *VKRenderer, light: *Light, cam: *Camera) {
     vkdesc.set_float(vkscene.OFF_SKYTURBIDITY, r.sky_turbidity)
     vkdesc.set_vec3(vkscene.OFF_SKYOVERCASTCOLOR, r.sky_overcast_color.x, r.sky_overcast_color.y, r.sky_overcast_color.z)
     vkdesc.set_float(vkscene.OFF_CLOUDTIME, r.scene_time * r.cloud_wind)
-    // The frame for the march's dither only when a temporal pass (TAA or
-    // DLSS) will fold it; still otherwise.
-    cloud_frame = 0
-    if vkframe.taa() || vkframe.dlss() > 0 { cloud_frame = r.sort_serial % 64 + 1 }
-    vkdesc.set_int(vkscene.OFF_CLOUDFRAME, cloud_frame)
     sun = key_light(r, light)
     if sun != null {
         vkdesc.set_vec3(vkscene.OFF_CLOUDSUN, sun.direction.x, sun.direction.y, sun.direction.z)
@@ -2578,6 +2682,14 @@ write_frame_uniforms(r: *VKRenderer, light: *Light, cam: *Camera) {
         vkdesc.set_vec3(vkscene.OFF_SKYSUN, sun.direction.x, sun.direction.y, sun.direction.z)
     } else {
         vkdesc.set_vec3(vkscene.OFF_SKYSUN, 0.0, 1.0, 0.0)
+    }
+    lit = core.ground_sun(sun)
+    vkdesc.set_vec3(vkscene.OFF_GROUNDALBEDO, r.ground_albedo.x, r.ground_albedo.y, r.ground_albedo.z)
+    vkdesc.set_vec3(vkscene.OFF_GROUNDSUN, lit.x, lit.y, lit.z)
+    vkdesc.set_int(vkscene.OFF_HAZECOUNT, r.haze_count)
+    if r.haze_count > 0 {
+        vkdesc.set_vec4v(vkscene.OFF_HAZECOLUMN, 4, r.haze)
+        vkdesc.set_vec4v(vkscene.OFF_HAZESHAPE, 4, r.haze + 64)
     }
 
     fog_on = 0
@@ -2703,6 +2815,7 @@ set_scene_uniforms(r: *VKRenderer, m: *Model) {
     vkdesc.set_int(vkscene.OFF_INSTANCEBILLBOARD, points * m.billboard)
     vkdesc.set_int(vkscene.OFF_POINTFLIPBOOKCOLUMNS, points * m.flipbook_columns)
     vkdesc.set_int(vkscene.OFF_POINTFLIPBOOKROWS, points * m.flipbook_rows)
+    vkdesc.set_float(vkscene.OFF_POINTLIFT, (points as float) * m.billboard_lift)
     // This backend draws a model's own instances and nothing else, so a model
     // that has instances always has a colour for each of them.
     vkdesc.set_int(vkscene.OFF_USEINSTANCECOLOR, instanced)
@@ -2858,6 +2971,7 @@ pose(m: *Model) {
     if core.shader_valid(&m.shader) && m.shader.kind == core.SHADER_WATER && vkframe.scene_depth_ready() {
         aux = 0 - 1
     }
+    if soft_drawn(m) && vkframe.scene_depth_ready() { aux = 0 - 1 }
     vkframe.set_pose_bank(aux)
     if m.skeleton == null {
         vkdesc.set_int(vkscene.OFF_ISSKINNED, 0)
@@ -3072,6 +3186,13 @@ set_material_uniforms(material: *Material) {
         vkdesc.set_float(vkscene.OFF_MATERIALALPHA, 1.0)
         vkdesc.set_float(vkscene.OFF_MATERIALCUTOUT, 0.0)
         vkdesc.set_float(vkscene.OFF_MATERIALNORMALSTRENGTH, 1.0)
+        vkdesc.set_float(vkscene.OFF_MATERIALTILEBREAKUP, 0.0)
+        vkdesc.set_float(vkscene.OFF_MATERIALVARIATION, 0.0)
+        vkdesc.set_float(vkscene.OFF_MATERIALDETAILSCALE, 0.0)
+        vkdesc.set_float(vkscene.OFF_MATERIALFIRE, 0.0)
+        vkdesc.set_float(vkscene.OFF_MATERIALTRIPLANAR, 0.0)
+        vkdesc.set_float(vkscene.OFF_MATERIALSOFT, 0.0)
+        vkdesc.set_float(vkscene.OFF_MATERIALGLITTER, 0.0)
         return
     }
     vkdesc.set_vec3(vkscene.OFF_DIFFUSECOLOR, material.diffuse.x, material.diffuse.y, material.diffuse.z)
@@ -3083,6 +3204,24 @@ set_material_uniforms(material: *Material) {
     vkdesc.set_float(vkscene.OFF_MATERIALALPHA, material.alpha)
     vkdesc.set_float(vkscene.OFF_MATERIALCUTOUT, material.cutout)
     vkdesc.set_float(vkscene.OFF_MATERIALNORMALSTRENGTH, material.normal_strength)
+    breakup = 0.0
+    if material.tile_breakup { breakup = 1.0 }
+    vkdesc.set_float(vkscene.OFF_MATERIALTILEBREAKUP, breakup)
+    vkdesc.set_float(vkscene.OFF_MATERIALTILEROTATION, material.tile_rotation)
+    vkdesc.set_float(vkscene.OFF_MATERIALVARIATION, material.variation)
+    vkdesc.set_float(vkscene.OFF_MATERIALVARIATIONSCALE, material.variation_scale)
+    vkdesc.set_float(vkscene.OFF_MATERIALDETAILSCALE, material.detail_scale)
+    vkdesc.set_float(vkscene.OFF_MATERIALDETAILSTRENGTH, material.detail_strength)
+    vkdesc.set_float(vkscene.OFF_MATERIALDETAILFADE, material.detail_fade)
+    vkdesc.set_float(vkscene.OFF_MATERIALFIRE, material.fire)
+    vkdesc.set_float(vkscene.OFF_MATERIALTRIPLANAR, material.triplanar)
+    vkdesc.set_float(vkscene.OFF_MATERIALSOFT, material.soft)
+    vkdesc.set_float(vkscene.OFF_MATERIALGLITTER, material.glitter)
+    vkdesc.set_float(vkscene.OFF_MATERIALGLITTERGRAINS, material.glitter_grains)
+    vkdesc.set_float(vkscene.OFF_MATERIALGLITTERSTRENGTH, material.glitter_strength)
+    vkdesc.set_float(vkscene.OFF_MATERIALEMBERS, material.embers)
+    vkdesc.set_float(vkscene.OFF_MATERIALEMBERCOVER, material.ember_cover)
+    vkdesc.set_float(vkscene.OFF_MATERIALEMBERGLOW, material.ember_glow)
 }
 
 // A frame the device would not take is said once, not once a frame: a lost
@@ -3227,6 +3366,7 @@ renderer_render(r: *VKRenderer, cam: *Camera, light: *Light) {
         i = i + 1
     }
     capture_sky(r)
+    render_clouds(r, cam)
     // The screen's occlusion from the last frame's depth, which every lit
     // program's block says it has or not.
     history = 0
@@ -3247,16 +3387,17 @@ renderer_render(r: *VKRenderer, cam: *Camera, light: *Light) {
         probe_uniforms()
         k = k + 1
     }
-    // The sky, first into the pass, after the blocks carry the frame's
-    // matrices: its motion vector is the camera's turn since last frame.
-    // Its own matrices go into the scene program's block, which it draws
-    // from, so that program is current before they are set.
+    draw_opaque(r)
+    vkframe.mark_opaque_done()
+    // The sky after the opaque draws, at the far plane under the depth
+    // test: a pixel the ground covers is rejected before its shader runs,
+    // where drawn first every pixel marched the clouds (#317). Its motion
+    // vector is the camera's turn since last frame. Its own matrices go
+    // into the scene program's block, which it draws from, so that program
+    // is current before they are set.
     vkdesc.set_program(core.SHADER_CUSTOM)
     draw_skybox(r, cam)
     vkframe.mark_sky_done()
-
-    draw_opaque(r)
-    vkframe.mark_opaque_done()
     // The depth the opaque draws left, resolved for the occlusion, the
     // reflection and the water: the frame's own depth, so a figure's
     // silhouette is the one drawn and a picture of a figure is in it too.
@@ -3672,6 +3813,7 @@ renderer_cleanup(r: *VKRenderer) {
     if r.skybox != null { skybox_free(r, r.skybox as *Skybox) ; r.skybox = null }
     if r.cloud_shape_texture != 0 { vkframe.texture_destroy(r.cloud_shape_texture) ; r.cloud_shape_texture = 0 }
     if r.cloud_weather_texture != 0 { vkframe.texture_destroy(r.cloud_weather_texture) ; r.cloud_weather_texture = 0 }
+    if r.cloud_detail_texture != 0 { vkframe.texture_destroy(r.cloud_detail_texture) ; r.cloud_detail_texture = 0 }
     if r.screen_handle != 0 { vkmesh.mesh_free(r.screen_handle) ; r.screen_handle = 0 }
     if r.screen_mesh != null { core.mesh_destroy(r.screen_mesh) ; r.screen_mesh = null }
     count = list.size(r.models)

@@ -22,6 +22,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int instanceBillboard;
     int pointFlipbookColumns;
     int pointFlipbookRows;
+    float pointLift;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -53,6 +54,24 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float materialCutout;
     float materialNormalStrength;
+    float materialTileBreakup;
+    float materialTileRotation;
+    float materialVariation;
+    float materialVariationScale;
+    float materialDetailScale;
+    float materialDetailStrength;
+    float materialDetailFade;
+    float materialFire;
+    float materialTriplanar;
+    float materialSoft;
+    float materialGlitter;
+    float materialGlitterGrains;
+    float materialGlitterStrength;
+    float materialEmbers;
+    float materialEmberCover;
+    float materialEmberGlow;
+    int hasSceneDepth;
+    mat4 invViewProjection;
     int surfaceBlend;
     float reflectivity;
     float wetness;
@@ -139,11 +158,18 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec3 skyOvercastColor;
     vec3 skyFlat;
     float skyTurbidity;
+    vec2 cloudPassSize;
+    int cloudHistoryOn;
     float skyLevelSize;
     float skyRoughness;
+    vec3 groundAlbedo;
+    vec3 groundSun;
     float frameExposure;
     bool enableBloom;
     float bloomIntensity;
+    int hazeCount;
+    vec4 hazeColumn[4];
+    vec4 hazeShape[4];
     vec2 texelSize;
     int bloomFirst;
     float bloomThreshold;
@@ -152,7 +178,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float edgeThresholdMin;
     float subpixelQuality;
     int colorSampleCount;
-    mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
     float ssaoRadius;
@@ -177,14 +202,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float waterOpacity;
     bool enableFoam;
     float foamIntensity;
-    float waterPlaneHeight;
     float waterLevel;
     vec3 skyColor;
     vec3 horizonColor;
     bool enableWaterReflection;
     float waterReflectionIntensity;
     int hasSkyTexture;
-    int hasSceneDepth;
+    int waterSkyCapture;
+    vec3 rippleArea;
     float waterDepthFade;
     float waterShoreFoam;
     bool enableWaterDistortion;
@@ -236,6 +261,7 @@ layout(location = 13) in vec4 instanceExtras;
 
 
 
+
 // Last frame's, for the motion vectors: the model's matrix as it was and
 // the view-projection without its jitter.
 
@@ -273,6 +299,7 @@ layout(location = 8) out vec3 BindPos;
 layout(location = 10) out vec2 MaskUV;
 layout(location = 9) out float ClipLimb;
 layout(location = 11) out float ParticleAlpha;
+layout(location = 12) out vec3 FlipNext;
 
 // The joints a cut is kept to (#556), as three words of 32 bits: joint j is
 // bit j % 32 of word j / 32. None named, the cut is the whole model's.
@@ -305,18 +332,27 @@ void main() {
     // This allows moving/scaling/rotating the entire group of instances using the model transform
     mat4 modelMatrix = isInstanced ? (model * instanceModel) : model;
     ParticleAlpha = 1.0;
+    FlipNext = vec3(0.0, 0.0, -1.0);
     fragTexCoord = inTexCoord;
     if (isInstanced && instancePoints) {
         vec4 point = instanceModel[0];
         ParticleAlpha = instanceExtras.x;
-        // The frame of its flipbook its life is at.
+        // The frame of its flipbook its life is at, and the next one it is
+        // on its way to: the two blended, so a flame flows from frame to
+        // frame instead of stepping (#738).
         if (pointFlipbookColumns > 0 && pointFlipbookRows > 0) {
             int frames = pointFlipbookColumns * pointFlipbookRows;
-            int frame = min(int(instanceExtras.y * float(frames)), frames - 1);
+            float at = clamp(instanceExtras.y, 0.0, 1.0) * float(frames - 1);
+            int frame = min(int(at), frames - 1);
+            int next = min(frame + 1, frames - 1);
             float column = float(frame - (frame / pointFlipbookColumns) * pointFlipbookColumns);
             float row = float(frame / pointFlipbookColumns);
             fragTexCoord = vec2((column + inTexCoord.x) / float(pointFlipbookColumns),
                                 1.0 - (row + 1.0 - inTexCoord.y) / float(pointFlipbookRows));
+            float nextColumn = float(next - (next / pointFlipbookColumns) * pointFlipbookColumns);
+            float nextRow = float(next / pointFlipbookColumns);
+            FlipNext = vec3((nextColumn + inTexCoord.x) / float(pointFlipbookColumns),
+                            1.0 - (nextRow + 1.0 - inTexCoord.y) / float(pointFlipbookRows), at - float(frame));
         }
         modelMatrix = mat4(model[0] * point.w, model[1] * point.w, model[2] * point.w,
                            vec4(point.xyz, 1.0));
@@ -340,12 +376,13 @@ void main() {
             float s = sin(instanceExtras.z);
             vec3 turned = c * right + s * up;
             up = c * up - s * right;
-            right = turned;
+            // Drawn long down its turn, a spark along its flight (#738).
+            right = turned * max(instanceExtras.w, 1.0);
             float sx = length(vec3(model[0])) * point.w;
             float sy = length(vec3(model[1])) * point.w;
             float sz = length(vec3(model[2])) * point.w;
             modelMatrix = mat4(vec4(right * sx, 0.0), vec4(up * sy, 0.0), vec4(forward * sz, 0.0),
-                               vec4(point.xyz, 1.0));
+                               vec4(point.xyz + up * (sy * pointLift), 1.0));
         }
     }
 

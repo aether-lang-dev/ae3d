@@ -22,6 +22,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int instanceBillboard;
     int pointFlipbookColumns;
     int pointFlipbookRows;
+    float pointLift;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -53,6 +54,24 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float materialCutout;
     float materialNormalStrength;
+    float materialTileBreakup;
+    float materialTileRotation;
+    float materialVariation;
+    float materialVariationScale;
+    float materialDetailScale;
+    float materialDetailStrength;
+    float materialDetailFade;
+    float materialFire;
+    float materialTriplanar;
+    float materialSoft;
+    float materialGlitter;
+    float materialGlitterGrains;
+    float materialGlitterStrength;
+    float materialEmbers;
+    float materialEmberCover;
+    float materialEmberGlow;
+    int hasSceneDepth;
+    mat4 invViewProjection;
     int surfaceBlend;
     float reflectivity;
     float wetness;
@@ -139,11 +158,18 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec3 skyOvercastColor;
     vec3 skyFlat;
     float skyTurbidity;
+    vec2 cloudPassSize;
+    int cloudHistoryOn;
     float skyLevelSize;
     float skyRoughness;
+    vec3 groundAlbedo;
+    vec3 groundSun;
     float frameExposure;
     bool enableBloom;
     float bloomIntensity;
+    int hazeCount;
+    vec4 hazeColumn[4];
+    vec4 hazeShape[4];
     vec2 texelSize;
     int bloomFirst;
     float bloomThreshold;
@@ -152,7 +178,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float edgeThresholdMin;
     float subpixelQuality;
     int colorSampleCount;
-    mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
     float ssaoRadius;
@@ -177,14 +202,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float waterOpacity;
     bool enableFoam;
     float foamIntensity;
-    float waterPlaneHeight;
     float waterLevel;
     vec3 skyColor;
     vec3 horizonColor;
     bool enableWaterReflection;
     float waterReflectionIntensity;
     int hasSkyTexture;
-    int hasSceneDepth;
+    int waterSkyCapture;
+    vec3 rippleArea;
     float waterDepthFade;
     float waterShoreFoam;
     bool enableWaterDistortion;
@@ -244,7 +269,7 @@ layout(location = 2) in vec3 fragPosition;
 // up for a rough sea.
 
 
-
+layout(location = 5) in float EyeBelow;
 // The still level the waves rise and fall around, so a crest can be measured
 // against the water rather than against however high the world's zero happens
 // to be.
@@ -284,6 +309,37 @@ layout(location = 2) in vec3 fragPosition;
 // reflection stays the computed sky colour.
 
 
+// The sky the frame is lit by (#742): the engine's capture of it -- painted,
+// drawn from the sun, or the clear colour -- prefiltered into levels, read
+// where the reflected ray meets it, in place of the sky colours or the
+// image. 0 keeps those.
+
+// The ripples bodies make (#637, ae3d.ripples): their slopes over a square
+// of the sea, its corner and one over its side in rippleArea, read from the
+// model's mask (damageMask) where damageOn says it has one.
+
+
+#ifdef VULKAN
+layout(set = 0, binding = 9) uniform sampler2D damageMask;
+#else
+
+#endif
+#define RIPPLE_SLOPE_RANGE 0.6
+// And the light it gives a surface facing up, its irradiance, which lights
+// the water's body and its foam in place of the sky colour.
+#ifdef VULKAN
+layout(set = 0, binding = 10) uniform sampler2D skyLight;
+layout(set = 0, binding = 12) uniform sampler2D skyIrradiance;
+#else
+
+
+#endif
+vec2 water_oct_uv(vec3 d, float size) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 p = d.xz;
+    if (d.y < 0.0) p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+    return ((p * 0.5 + 0.5) * (size - 2.0) + 1.0) / size;
+}
 // What is under the water: the scene's depth as drawn before the water,
 // so a fragment knows how much water lies between its surface and the
 // ground beneath. Shallow water goes clear and pale and lays a line of foam
@@ -609,6 +665,9 @@ vec3 overcastSky(vec3 shown) {
 
 vec3 reflectedSky(vec3 ray) {
     ray.y = abs(ray.y);
+    // The captured sky at its sharpest level but one: water a mirror whose
+    // ripples finer than the mesh still soften it a little.
+    if (waterSkyCapture == 1) return textureLod(skyLight, water_oct_uv(normalize(ray), 256.0), 0.5).rgb;
     if (hasSkyTexture == 1) {
         float theta = atan(ray.z, ray.x);
         float phi = asin(clamp(ray.y, -1.0, 1.0));
@@ -660,6 +719,16 @@ void main() {
         norm = normalize(mix(vec3(0.0, 1.0, 0.0), norm, waterNormalIntensity));
         swell = normalize(mix(vec3(0.0, 1.0, 0.0), swell, waterNormalIntensity));
     }
+    // The ripples over the swell: a wake, a ring round a bobbing crate.
+    if (damageOn == 1) {
+        vec2 ruv = (fragPosition.xz - rippleArea.xy) * rippleArea.z;
+        if (ruv.x > 0.0 && ruv.y > 0.0 && ruv.x < 1.0 && ruv.y < 1.0) {
+            vec2 slope = (texture(damageMask, ruv).rg * 2.0 - 1.0) * RIPPLE_SLOPE_RANGE;
+            vec3 tilt = vec3(-slope.x, 0.0, -slope.y);
+            norm = normalize(norm + tilt);
+            swell = normalize(swell + tilt);
+        }
+    }
     float rippleFreq = waveFrequencies[3] * 9.0 / 6.28318531;
     float rippleTime = time * waveSpeeds[3] * max(waveSpeedMultiplier, 0.001) * 0.35;
     // How far the ripples bend the mirror: the distortion setting, its
@@ -688,6 +757,9 @@ void main() {
     // the two agree.
     vec3 sun = lightColor * lightIntensity;
     vec3 skyLight = display_radiance(overcastSky(skyColor));
+    // The captured sky's light from above, as radiance (its irradiance
+    // over pi), where the water mirrors the captured sky.
+    if (waterSkyCapture == 1) skyLight = texture(skyIrradiance, water_oct_uv(vec3(0.0, 1.0, 0.0), 16.0)).rgb / 3.14159265;
 
     // The sun's glitter: GGX, the surface a little rougher far off so the
     // highlight there is a path of light and not a scatter of aliased points.
@@ -779,8 +851,8 @@ void main() {
     alpha = mix(alpha, 1.0, foam);
 
     // Underwater camera effect (when camera is below water surface)
-    float underwaterDepth = max(0.0, waterPlaneHeight - viewPos.y);
-    if (underwaterDepth > 0.5) {
+    float underwaterDepth = max(0.0, EyeBelow);
+    if (underwaterDepth > 0.0) {
         // The surface from below is the sky coming through the swell, not a
         // ceiling lit by the fill. Straight overhead the sky comes through
         // brightest (Snell's window); toward the horizon the underside

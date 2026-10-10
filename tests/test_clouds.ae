@@ -1,0 +1,312 @@
+// The clouds' detail and their light (#317), on OpenGL and Vulkan alike.
+//
+//   - The detail texture's curl swirls and does not gather: its divergence
+//     is a small share of its gradient, so what it turns flows round and
+//     no edge is pulled into a knot or torn into a hole; its billows span
+//     dark gaps and bright cores; and a bake is the same bytes every time.
+//   - A cloud lit from behind the eye is white: lit in radiance, as the
+//     ground is, its brightest is near a white wall's facing the same sun.
+//     Light scattered once is thrown mostly onward, and a single-scattering
+//     phase lit such a cloud with 0.3 of the sun: a grey sheet under a blue
+//     sky. Scattered many times it has forgotten where the sun was, and a
+//     cumulus seen with the sun at the back is the brightest thing in the
+//     sky.
+//   - The clouds are marched at half the frame's size and folded into the
+//     frames before, each texel's history read from where its direction
+//     was last frame. A view reached by turning shows the clouds a view
+//     held still there shows: the history followed the turn, and did not
+//     smear the clouds along it.
+import std.mem
+import ae3d.core
+import ae3d.cloudnoise
+import ae3d.gl
+import ae3d.offscreen
+import ae3d.vulkan
+
+const WIDTH = 200
+const HEIGHT = 120
+const DETAIL = 16
+
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        println("  FAIL ${name}")
+        g_failures = g_failures + 1
+    }
+}
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+// Channel c of the detail texel at (x, y, z), wrapped, as -1..1.
+curl_at(bytes: ptr, x: int, y: int, z: int, c: int) -> float {
+    wx = (x + DETAIL) % DETAIL
+    wy = (y + DETAIL) % DETAIL
+    wz = (z + DETAIL) % DETAIL
+    at = ((wz * DETAIL + wy) * DETAIL + wx) * 4 + c
+    return (mem.get_byte(bytes, at) as float) / 127.5 - 1.0
+}
+
+abs_of(v: float) -> float {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+detail_checks() {
+    bytes = calloc(DETAIL * DETAIL * DETAIL * 4, 1)
+    again = calloc(DETAIL * DETAIL * DETAIL * 4, 1)
+    check("the detail bakes", cloudnoise.detail(DETAIL, bytes) && cloudnoise.detail(DETAIL, again))
+    check("a bake is the same bytes every time", mem.compare(bytes, again, DETAIL * DETAIL * DETAIL * 4) == 0)
+    // Over every texel, by central differences across the wrap: the
+    // divergence against the gradient's own size.
+    divergence = 0.0
+    gradient = 0.0
+    lowest = 255
+    highest = 0
+    z = 0
+    while z < DETAIL {
+        y = 0
+        while y < DETAIL {
+            x = 0
+            while x < DETAIL {
+                dxx = curl_at(bytes, x + 1, y, z, 0) - curl_at(bytes, x - 1, y, z, 0)
+                dyy = curl_at(bytes, x, y + 1, z, 1) - curl_at(bytes, x, y - 1, z, 1)
+                dzz = curl_at(bytes, x, y, z + 1, 2) - curl_at(bytes, x, y, z - 1, 2)
+                divergence = divergence + abs_of(dxx + dyy + dzz)
+                gradient = gradient + abs_of(dxx) + abs_of(dyy) + abs_of(dzz) +
+                           abs_of(curl_at(bytes, x, y + 1, z, 0) - curl_at(bytes, x, y - 1, z, 0)) +
+                           abs_of(curl_at(bytes, x, y, z + 1, 1) - curl_at(bytes, x, y, z - 1, 1)) +
+                           abs_of(curl_at(bytes, x + 1, y, z, 2) - curl_at(bytes, x - 1, y, z, 2))
+                billow = mem.get_byte(bytes, ((z * DETAIL + y) * DETAIL + x) * 4 + 3)
+                if billow < lowest { lowest = billow }
+                if billow > highest { highest = billow }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        z = z + 1
+    }
+    share = divergence / (gradient / 2.0)
+    println("  the curl's divergence is ${share} of its gradient; its billows run ${lowest} to ${highest}")
+    check("the curl swirls: its divergence is under a fifth of its gradient", gradient > 0.0 && share < 0.2)
+    check("the billows span dark gaps and bright cores", lowest < 80 && highest > 170)
+    free(bytes)
+    free(again)
+}
+
+// The frame's cloud: its pixels with little colour, where the sky is blue.
+// How many there are, and the brightness the brightest tenth of them
+// reaches, 0..255.
+struct Cloud {
+    share: float
+    bright: int
+}
+
+cloud_of(pixels: ptr) -> Cloud {
+    counts = calloc(256, 4) as int[]
+    n = 0
+    i = 0
+    while i < WIDTH * HEIGHT {
+        r = mem.get_byte(pixels, i * 4)
+        g = mem.get_byte(pixels, i * 4 + 1)
+        b = mem.get_byte(pixels, i * 4 + 2)
+        hi = r
+        if g > hi { hi = g }
+        if b > hi { hi = b }
+        lo = r
+        if g < lo { lo = g }
+        if b < lo { lo = b }
+        if hi - lo < 24 {
+            luma = (r * 30 + g * 59 + b * 11) / 100
+            counts[luma] = counts[luma] + 1
+            n = n + 1
+        }
+        i = i + 1
+    }
+    bright = 0
+    seen = 0
+    level = 255
+    while level >= 0 && seen * 10 < n {
+        seen = seen + counts[level]
+        bright = level
+        level = level - 1
+    }
+    free(counts as ptr)
+    return Cloud { share: (n as float) / ((WIDTH * HEIGHT) as float), bright: bright }
+}
+
+// `frames` frames drawn, each read back as it is drawn, and the last: the
+// OpenGL renderer reads a frame back behind the one it draws, so a frame
+// read once after several is an older one.
+settled(backend: *Backend, cam: *Camera, light: *Light, frames: int) -> ptr {
+    pixels = null as ptr
+    i = 0
+    while i < frames {
+        core.backend_render(backend, cam, light)
+        pixels = core.backend_frame_pixels(backend)
+        i = i + 1
+    }
+    return pixels
+}
+
+// A white wall `far` metres along the view, square to the sun: what a
+// white surface the sun lights full on shows as.
+sunlit_wall(sun: Vec3, at: Vec3) -> *Model {
+    m = core.model_new()
+    n = core.v3_normalize(sun)
+    side = core.v3_normalize(core.v3_cross(n, core.vec3(1.0, 0.0, 0.0)))
+    up = core.v3_cross(side, n)
+    core.mesh_reserve(m.mesh, 4, 6)
+    corners = [0.0 - 1.0, 0.0 - 1.0, 1.0, 0.0 - 1.0, 1.0, 1.0, 0.0 - 1.0, 1.0]
+    k = 0
+    while k < 4 {
+        p = core.v3_add(at, core.v3_add(core.v3_mul(side, corners[k * 2] * 3.0), core.v3_mul(up, corners[k * 2 + 1] * 3.0)))
+        core.mesh_push_vertex(m.mesh, p, 0.0, 0.0, n)
+        k = k + 1
+    }
+    // Wound to face the sun, the side the camera sees it from.
+    core.mesh_push_triangle(m.mesh, 0, 2, 1)
+    core.mesh_push_triangle(m.mesh, 0, 3, 2)
+    core.model_set_diffuse(m, 1.0, 1.0, 1.0)
+    core.model_set_pbr(m, 0.0, 1.0)
+    core.model_set_specular(m, 0.0, 0.0, 0.0)
+    core.model_update_matrix(m)
+    core.model_recalculate_bounds(m)
+    return m
+}
+
+// Under a heavy cover, the sun high at the back, the view up into the
+// clouds ahead; then a white wall square to the same sun in the middle of
+// the view.
+front_lit(backend: *Backend, name: string) {
+    cam = core.camera_new(WIDTH, HEIGHT)
+    core.camera_set_position(cam, core.vec3(0.0, 0.0, 0.0))
+    core.camera_set_far(cam, 30000.0)
+    core.camera_look_at(cam, core.vec3(0.0, 0.55, 1.0))
+    light = core.light_sun(core.vec3(0.0, 0.7, 0.0 - 0.7))
+    c = cloud_of(settled(backend, cam, light, 4))
+    wall = sunlit_wall(core.vec3(0.0, 0.7, 0.0 - 0.7), core.v3_mul(core.v3_normalize(core.vec3(0.0, 0.55, 1.0)), 8.0))
+    core.backend_add_model(backend, wall)
+    white = luma_at(settled(backend, cam, light, 4), (HEIGHT / 2) * WIDTH + WIDTH / 2)
+    core.backend_remove_model(backend, wall)
+    settled(backend, cam, light, 4)
+    core.model_free(wall)
+    println("  ${name}: cloud over ${c.share} of the frame, its brightest tenth at ${c.bright}; a white wall square to the sun ${white}")
+    check("${name}: the clouds fill a good share of the view", c.share > 0.1)
+    check("${name}: a cloud lit from behind the eye is white, near a white wall in the same sun, not grey", white > 60 && c.bright * 100 > white * 85)
+    core.light_free(light)
+    core.camera_free(cam)
+}
+
+luma_at(pixels: ptr, i: int) -> int {
+    return (mem.get_byte(pixels, i * 4) * 30 + mem.get_byte(pixels, i * 4 + 1) * 59 + mem.get_byte(pixels, i * 4 + 2) * 11) / 100
+}
+
+// The view `yaw` radians round from +z, up into the clouds.
+face(cam: *Camera, yaw: float) {
+    core.camera_look_at(cam, core.vec3(core.sin_of(yaw), 0.55, core.cos_of(yaw)))
+}
+
+// The view reached by turning a degree a frame, against the same view held
+// still until its history settled: the mean difference over the frame, in
+// levels of 255, and how far the turn moved the clouds, the same against
+// where the turn began.
+turned(backend: *Backend, name: string) {
+    cam = core.camera_new(WIDTH, HEIGHT)
+    core.camera_set_position(cam, core.vec3(0.0, 0.0, 0.0))
+    core.camera_set_far(cam, 30000.0)
+    light = core.light_sun(core.vec3(0.0, 0.7, 0.0 - 0.7))
+    end_yaw = 0.5
+    face(cam, end_yaw)
+    // Two frames at a view before it is read: the OpenGL renderer's read is
+    // a frame behind.
+    held = calloc(WIDTH * HEIGHT * 4, 1)
+    mem.copy(held, settled(backend, cam, light, 40), WIDTH * HEIGHT * 4)
+    drawn = null as ptr
+    i = 0
+    while i <= 30 {
+        face(cam, end_yaw * (i as float) / 30.0)
+        frames = 1
+        if i == 0 || i == 30 { frames = 2 }
+        drawn = settled(backend, cam, light, frames)
+        if i == 0 {
+            start = calloc(WIDTH * HEIGHT * 4, 1)
+            mem.copy(start, drawn, WIDTH * HEIGHT * 4)
+        }
+        i = i + 1
+    }
+    now = drawn
+    off = 0
+    moved = 0
+    i = 0
+    while i < WIDTH * HEIGHT {
+        d = luma_at(now, i) - luma_at(held, i)
+        if d < 0 { d = 0 - d }
+        off = off + d
+        m = luma_at(start, i) - luma_at(held, i)
+        if m < 0 { m = 0 - m }
+        moved = moved + m
+        i = i + 1
+    }
+    off_mean = (off as float) / ((WIDTH * HEIGHT) as float)
+    moved_mean = (moved as float) / ((WIDTH * HEIGHT) as float)
+    println("  ${name}: turned there, the view is ${off_mean} levels from held there; the turn moved it ${moved_mean}")
+    check("${name}: the turn moved the clouds", moved_mean > 6.0)
+    check("${name}: a view reached by turning shows the clouds a view held there shows", off_mean < moved_mean * 0.15)
+    free(held)
+    free(start)
+    core.light_free(light)
+    core.camera_free(cam)
+}
+
+main() {
+    println("clouds: the detail and the light (#317)")
+    detail_checks()
+    context = offscreen.context_create(WIDTH, HEIGHT)
+    if context == null {
+        println("  opengl: SKIP no OpenGL context available")
+    } else {
+        renderer = gl.renderer_new()
+        backend = gl.backend(renderer)
+        if core.backend_init(&backend, context, WIDTH, HEIGHT) {
+            target = offscreen.target_create(WIDTH, HEIGHT)
+            gl.renderer_set_target(renderer, target)
+            sky = gl.skybox_create(renderer, core.SKY_PROCEDURAL)
+            core.backend_set_skybox(&backend, sky as ptr)
+            gl.renderer_set_clouds(renderer, 0.9, 0.0)
+            front_lit(&backend, "opengl")
+            turned(&backend, "opengl")
+            core.backend_cleanup(&backend)
+            offscreen.target_destroy(target)
+        } else {
+            println("  opengl: SKIP the backend would not initialise")
+        }
+        gl.renderer_free(renderer)
+        offscreen.context_destroy(context)
+    }
+    if !vulkan.available() {
+        println("  vulkan: SKIP no Vulkan driver (${vulkan.last_error()})")
+    } else {
+        vrenderer = vulkan.renderer_new()
+        vbackend = vulkan.backend(vrenderer)
+        if core.backend_init(&vbackend, null, WIDTH, HEIGHT) {
+            vsky = vulkan.skybox_create(vrenderer, core.SKY_PROCEDURAL)
+            core.backend_set_skybox(&vbackend, vsky as ptr)
+            vulkan.renderer_set_clouds(vrenderer, 0.9, 0.0)
+            front_lit(&vbackend, "vulkan")
+            turned(&vbackend, "vulkan")
+            core.backend_cleanup(&vbackend)
+        } else {
+            println("  vulkan: SKIP Vulkan would not start (${vulkan.last_error()})")
+        }
+        vulkan.renderer_free(vrenderer)
+    }
+    if g_failures == 0 {
+        println("clouds: all checks passed")
+    } else {
+        println("clouds: ${g_failures} failure(s)")
+    }
+}
