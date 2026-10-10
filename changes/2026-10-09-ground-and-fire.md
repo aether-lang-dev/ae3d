@@ -159,3 +159,12 @@
   levels from the view held still, where the turn moved it 35; read
   without reprojection it was 30 (`tests/test_clouds.ae`). On Vulkan a
   draw can bind a texture of its own at binding 2, keyed in the set cache.
+- **Networked players meet each other (#664).** Players are solid; every
+  command carries its view and a lead the client measures (interpolation
+  delay, round trip, two steps of queue), and around each move, on the
+  client and on the host, the other players stand where that view's
+  history had them carried on by the lead. Two clients walked into each
+  other over 100 ms and 2% loss: never closer than 0.65 m (capsules touch
+  at 0.6), corrected 0.00025 mm at most, where met at the host's present
+  they were corrected 60 and 49 mm. A client's commands cost 1.10 KB a
+  second, were 0.85.

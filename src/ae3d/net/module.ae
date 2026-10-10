@@ -270,11 +270,13 @@ const TCP_CHUNK = 65536
 const HUB_ENDPOINTS = 64
 const COMMANDS = 128                 // a client's commands kept until the host has applied them
 const CMD_FIELDS = 8                 // the fields a player's command has at most (#531)
-const COMMAND = 11                   // floats a command: seq, the tick its view had reached, the input messages it went in, then CMD_FIELDS values in steps
+const COMMAND = 12                   // floats a command: seq, the tick its view had reached, the input messages it went in, its lead, then CMD_FIELDS values in steps
 const C_SEQ = 0
 const C_SEEN = 1
 const C_SENT = 2
-const C_VALUE = 3
+const C_LEAD = 3
+const C_VALUE = 4
+const LEAD_UNIT = 0.004              // seconds: a command's lead on the wire, a byte of them
 const INPUTS_MOST = 64               // the commands an input message carries at most, the oldest: a second of them
 const CARRIED = 3                    // the input messages a command goes in at least: it is lost only when all of them are
 const CARRIED_LOST = 0.000001        // at the link's measured loss, the share of commands every message of which may be lost
@@ -876,6 +878,7 @@ struct Net {
     // its clock; and the objects a rewind moved, with where they were.
     tick_times: ptr                  // float[TICK_TIMES], by tick % TICK_TIMES
     rewound: ptr                     // list of *Rewound
+    placed: ptr                      // list of *Rewound: the players a move put where its view had them (#664)
     since_tick: float
     tick: int
     last_step: float
@@ -1002,6 +1005,7 @@ net_new(role: int, kind: int) -> *Net {
     n.tick_rate = 30.0
     n.tick_times = calloc(TICK_TIMES, 8)
     n.rewound = list.new()
+    n.placed = list.new()
     n.interpolation_delay = 0.1
     n.last_step = 0.0 - 1.0
     n.out = buf_new(2048)
@@ -4297,7 +4301,10 @@ make_player(n: *Net, client: int, id: int) -> *NetPlayer {
         if controller == null { return null }
         // The session moves it -- by commands, by prediction, or by
         // snapshots -- so the world does not also stand it where it is.
+        // Solid: players meet each other, where each one's view had the
+        // others (place_players).
         controller.driven = true
+        physics.character_set_solid(controller, true)
         object = controller.object as *GameObject
     }
     if object == null { return null }
@@ -4380,6 +4387,7 @@ apply_inputs(n: *Net, p: *Peer, r: *NetReader, ack_tick: int) {
         f = f + 1
     }
     seen = 0.0
+    lead = 0.0
     i = 0
     while i < count {
         seq = first + i
@@ -4391,11 +4399,9 @@ apply_inputs(n: *Net, p: *Peer, r: *NetReader, ack_tick: int) {
                 coded[f] = value
                 f = f + 1
             }
-            seen = 0.0
-            if command_acts_coded(n, coded) {
-                seen = (ack_tick - ((get_varint(r)) as int)) as float
-                seen = seen + (get_u8(r) as float) / 256.0
-            }
+            seen = (ack_tick - ((get_varint(r)) as int)) as float
+            seen = seen + (get_u8(r) as float) / 256.0
+            lead = (get_u8(r) as float) * LEAD_UNIT
         } else if i == 0 {
             return
         } else {
@@ -4404,6 +4410,7 @@ apply_inputs(n: *Net, p: *Peer, r: *NetReader, ack_tick: int) {
                 coded[CMD_FIELDS + f] = 0 as long
                 f = f + 1
             }
+            seen = step_on(n, seen)
         }
         if !r.ok { return }
         // Not yet applied, and within the ring: kept at its place by
@@ -4412,6 +4419,7 @@ apply_inputs(n: *Net, p: *Peer, r: *NetReader, ack_tick: int) {
             slot = (seq % COMMANDS) * COMMAND
             q[slot + C_SEQ] = seq as float
             q[slot + C_SEEN] = seen
+            q[slot + C_LEAD] = lead
             f = 0
             while f < n.cmd_count {
                 q[slot + C_VALUE + f] = coded[f] as float
@@ -4447,7 +4455,7 @@ apply_queued(n: *Net, p: *Peer) {
     slot = (next % COMMANDS) * COMMAND
     if (q[slot + C_SEQ]) as int != next { return }
     pl = p.player as *NetPlayer
-    player_apply(n, pl, command_units(n, q, slot), q[slot + C_SEEN])
+    player_apply(n, pl, command_units(n, q, slot), q[slot + C_SEEN], q[slot + C_LEAD])
     settle(n, pl)
     p.last_input = next
 }
@@ -4528,7 +4536,7 @@ player_command(n: *Net, values: ptr, now: float) {
             cmds[C_VALUE + f] = (command_steps(n, f, given[f])) as float
             f = f + 1
         }
-        player_apply(n, mine, command_units(n, cmds, 0), n.tick)
+        player_apply(n, mine, command_units(n, cmds, 0), n.tick, 0.0)
         free(cmds as ptr)
         settle(n, mine)
         return
@@ -4548,10 +4556,26 @@ player_command(n: *Net, values: ptr, now: float) {
         cmds[slot + C_VALUE + f] = (command_steps(n, f, given[f])) as float
         f = f + 1
     }
-    cmds[slot + C_SEEN] = 0.0
-    if command_acts(n, cmds, slot) { cmds[slot + C_SEEN] = seen_point(n, now) }
+    // Every command carries the view it was made at: where its player
+    // meets the others (#664), and where an action was aimed. A walk held
+    // takes the view a step on from the command before, which a repeated
+    // command costs nothing to say, while that is within an eighth of a
+    // tick of the view's own; an action takes its own.
+    seen = seen_point(n, now)
+    lead = lead_now(n)
+    if n.command_count > 0 && !command_acts(n, cmds, slot) {
+        was = ((n.command_first + n.command_count - 1) % COMMANDS) * COMMAND
+        on = step_on(n, cmds[was + C_SEEN])
+        if same_values(n, cmds, slot, was) && on > 0.0 && core.abs_of(seen - on) <= 0.125 &&
+           core.abs_of(lead - cmds[was + C_LEAD]) <= 4.0 * LEAD_UNIT {
+            seen = on
+            lead = cmds[was + C_LEAD]
+        }
+    }
+    cmds[slot + C_SEEN] = seen
+    cmds[slot + C_LEAD] = lead
     n.command_count = n.command_count + 1
-    player_apply(n, mine, command_units(n, cmds, slot), cmds[slot + C_SEEN])
+    player_apply(n, mine, command_units(n, cmds, slot), cmds[slot + C_SEEN], cmds[slot + C_LEAD])
     settle(n, mine)
     // Each command goes in as many messages from the one it is made in as
     // the link's loss asks (carried_for), so it is lost only when all of
@@ -4562,8 +4586,8 @@ player_command(n: *Net, values: ptr, now: float) {
     // the one before it, each field as its change from the change before:
     // a walk turning or speeding up changes a little more each step, a
     // byte an axis; a key held is the same command step after step, a bit
-    // each. A command that acts carries how far behind the message's tick
-    // its view was.
+    // each. A command sent carries how far behind the message's tick its
+    // view was; a repeat's view is the one before it a step on.
     carried = carried_for(n)
     start = 0
     while start < n.command_count - 1 && cmds[((n.command_first + start) % COMMANDS) * COMMAND + C_SENT] >= (carried as float) {
@@ -4610,16 +4634,15 @@ player_command(n: *Net, values: ptr, now: float) {
                 coded[f] = value
                 f = f + 1
             }
-            if command_acts(n, cmds, at) {
-                // The view's point: its tick, behind the newest snapshot,
-                // and the 256ths of a tick on from it.
-                seen = cmds[at + C_SEEN]
-                whole = floor(seen)
-                behind = n.newest_tick - (whole as int)
-                if behind < 0 { behind = 0 }
-                put_varint(b, behind as long)
-                put_u8(b, ((seen - whole) * 256.0 + 0.5) as int)
-            }
+            // The view's point: its tick, behind the newest snapshot, and
+            // the 256ths of a tick on from it.
+            seen = cmds[at + C_SEEN]
+            whole = floor(seen)
+            behind = n.newest_tick - (whole as int)
+            if behind < 0 { behind = 0 }
+            put_varint(b, behind as long)
+            put_u8(b, ((seen - whole) * 256.0 + 0.5) as int)
+            put_u8(b, (cmds[at + C_LEAD] / LEAD_UNIT + 0.5) as int)
         } else {
             f = 0
             while f < n.cmd_count {
@@ -4671,15 +4694,58 @@ command_acts(n: *Net, cmds: float[], at: int) -> bool {
 
 // A player moved by one command: the game's mover, or its controller by
 // the controller's command (a walk along x and z, a jump).
-player_apply(n: *Net, pl: *NetPlayer, values: ptr, seen: float) {
+player_apply(n: *Net, pl: *NetPlayer, values: ptr, seen: float, lead: float) {
+    place_players(n, pl, seen, lead)
     apply = n.mover_apply
     if apply != null {
         apply(n.mover_context, pl.object, values, PLAYER_STEP, point_time(n, seen))
-        return
+    } else if pl.controller != null {
+        v = values as float[]
+        physics.character_move(pl.controller, core.vec3(v[0], 0.0, v[1]), v[2], PLAYER_STEP)
     }
-    if pl.controller == null { return }
-    v = values as float[]
-    physics.character_move(pl.controller, core.vec3(v[0], 0.0, v[1]), v[2], PLAYER_STEP)
+    players_back(n)
+}
+
+// The other players put where `pl`'s view had them when it made the
+// command, `seen` (a view's point), for the move to meet them there (#664):
+// between the two states of each around that moment, as the client's view
+// had them, carried on `lead` (lead_now). The client predicts and replays the command against them
+// there, and the host applies it against them there, so the two take the
+// same step: against where the host has them now, a client's player and
+// the host's parted by 12.5 cm where two met. The host's own player moves
+// against the others as they are. Until players_back.
+place_players(n: *Net, pl: *NetPlayer, seen: float, lead: float) {
+    if seen <= 0.0 || list.size(n.players) < 2 { return }
+    if n.role == ROLE_HOST && pl.client == 0 { return }
+    view = point_time(n, seen)
+    if view <= 0.0 { return }
+    i = 0
+    while i < list.size(n.players) {
+        other = list.get_raw(n.players, i) as *NetPlayer
+        no = object_by_id(n, other.net_id)
+        if other != pl && no != null && no.object != null && no.count > 0 {
+            saved = heap.new(Rewound)
+            saved.object = no.object
+            saved.position = position_of(no.object)
+            saved.rotation = rotation_of(no.object)
+            list.add_raw(n.placed, saved as ptr)
+            put_at_view(no, view, lead)
+        }
+        i = i + 1
+    }
+}
+
+// The players place_players moved, back where they were.
+players_back(n: *Net) {
+    i = 0
+    while i < list.size(n.placed) {
+        saved = list.get_raw(n.placed, i) as *Rewound
+        set_transform(saved.object, saved.position, saved.rotation)
+        place_body(saved.object)
+        heap.free(saved)
+        i = i + 1
+    }
+    list.clear(n.placed)
 }
 
 // A player's movable state into `out` (float[OWN]); how many numbers.
@@ -4800,34 +4866,50 @@ rewind(n: *Net, client: int, view: float) -> bool {
     while i < list.size(n.objects) {
         no = list.get_raw(n.objects, i) as *NetObject
         if no != null && no.object != null && no.object != mine && no.count > 0 {
-            h = no.history as float[]
-            after = 0 - 1
-            before = 0 - 1
-            k = 0
-            while k < no.count {
-                slot = (no.newest - k + HISTORY) % HISTORY
-                if h[slot * SAMPLE] > view {
-                    after = slot
-                } else {
-                    before = slot
-                    break
-                }
-                k = k + 1
-            }
-            if before < 0 { before = after }
-            if after < 0 { after = before }
-            t = sample_share(h, before, after, false, view, 0.0)
             saved = heap.new(Rewound)
             saved.object = no.object
             saved.position = position_of(no.object)
             saved.rotation = rotation_of(no.object)
             list.add_raw(n.rewound, saved as ptr)
-            set_transform(no.object, sample_place(h, before, after, t), nlerp(h, before * SAMPLE + 4, after * SAMPLE + 4, t))
-            place_body(no.object)
+            put_at_view(no, view, 0.0)
         }
         i = i + 1
     }
     return true
+}
+
+// An object put where its history had it at `view`, a time on the host's
+// clock: between the two samples around it, or the nearest where the view
+// is past either end, and carried on `lead` seconds at the pace between
+// those two; its body with it.
+put_at_view(no: *NetObject, view: float, lead: float) {
+    h = no.history as float[]
+    after = 0 - 1
+    before = 0 - 1
+    k = 0
+    while k < no.count {
+        slot = (no.newest - k + HISTORY) % HISTORY
+        if h[slot * SAMPLE] > view {
+            after = slot
+        } else {
+            before = slot
+            break
+        }
+        k = k + 1
+    }
+    if before < 0 { before = after }
+    if after < 0 { after = before }
+    t = sample_share(h, before, after, false, view, 0.0)
+    at = sample_place(h, before, after, t)
+    span = h[after * SAMPLE] - h[before * SAMPLE]
+    if lead > 0.0 && span > 0.0 {
+        on = lead / span
+        at = core.vec3(at.x + (h[after * SAMPLE + 1] - h[before * SAMPLE + 1]) * on,
+                       at.y + (h[after * SAMPLE + 2] - h[before * SAMPLE + 2]) * on,
+                       at.z + (h[after * SAMPLE + 3] - h[before * SAMPLE + 3]) * on)
+    }
+    set_transform(no.object, at, nlerp(h, before * SAMPLE + 4, after * SAMPLE + 4, t))
+    place_body(no.object)
 }
 
 // Every object a rewind moved put back where it was, its body with it.
@@ -4904,14 +4986,46 @@ command_differs(n: *Net, k: int, first: bool) -> bool {
     cmds = n.commands as float[]
     at = ((n.command_first + k) % COMMANDS) * COMMAND
     was = ((n.command_first + k - 1) % COMMANDS) * COMMAND
+    // The same command again, at the view a step on, goes as a bit; an
+    // action held, aimed somewhere new, goes whole.
+    return !same_values(n, cmds, at, was) || cmds[at + C_SEEN] != step_on(n, cmds[was + C_SEEN]) ||
+           cmds[at + C_LEAD] != cmds[was + C_LEAD]
+}
+
+// How far on from its view a command made now meets the other players
+// (#664), to the wire's LEAD_UNIT: the view is the interpolation delay
+// behind the host's present, and when the host applies the command it has
+// the others a round trip and its queue of commands further on again. Met
+// where its view had them, each of two players walking at each other found
+// the other a third of a second back along its walk, and they slid through
+// each other's capsules, 0.25 m apart at the closest; carried on that far
+// along their history, they meet where they are. The client measures it and the command carries it, so
+// both sides use the same.
+lead_now(n: *Net) -> float {
+    lead = n.interpolation_delay + 2.0 * PLAYER_STEP
+    host = peer_by_id(n, 0)
+    if host != null && host.rtt_known { lead = lead + (host.srtt_us as float) / 1000000.0 }
+    steps = floor(lead / LEAD_UNIT + 0.5)
+    if steps > 255.0 { steps = 255.0 }
+    return steps * LEAD_UNIT
+}
+
+// Whether the commands at `at` and `was` have the same values.
+same_values(n: *Net, cmds: float[], at: int, was: int) -> bool {
     f = 0
     while f < n.cmd_count {
-        if cmds[at + C_VALUE + f] != cmds[was + C_VALUE + f] { return true }
+        if cmds[at + C_VALUE + f] != cmds[was + C_VALUE + f] { return false }
         f = f + 1
     }
-    // An action held is the same command again but for the tick it was
-    // aimed at, which the host needs for every one of them.
-    return command_acts(n, cmds, at) && cmds[at + C_SEEN] != cmds[was + C_SEEN]
+    return true
+}
+
+// The view a command one step after a command seen at `seen` has when it
+// is not sent: a player's step on in the host's ticks, to the 256th, the
+// same on both sides. None stays none.
+step_on(n: *Net, seen: float) -> float {
+    if seen <= 0.0 { return 0.0 }
+    return floor((seen + PLAYER_STEP * n.tick_rate) * 256.0 + 0.5) / 256.0
 }
 
 // Host: the oldest command of a client's it lacks while it holds a later
@@ -4946,7 +5060,7 @@ reconcile(n: *Net, own: ptr, ack: int) {
     k = 0
     while k < n.command_count {
         slot = ((n.command_first + k) % COMMANDS) * COMMAND
-        player_apply(n, mine, command_units(n, cmds, slot), cmds[slot + C_SEEN])
+        player_apply(n, mine, command_units(n, cmds, slot), cmds[slot + C_SEEN], cmds[slot + C_LEAD])
         settle(n, mine)
         k = k + 1
     }
