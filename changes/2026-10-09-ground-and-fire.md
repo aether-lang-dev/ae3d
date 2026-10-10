@@ -177,3 +177,11 @@
   coals, where they were three black boxes. A charred wall up close glows
   over 0, 0.30 and 0.57 of the frame with none, half and all of its char
   alight, red over blue 12, on both renderers.
+- **Shallow water over the ground (#744).** New `ae3d.shallow`: depth a
+  cell, discharge a face, gravity down the water's slope carried by the
+  water above the higher bed, outflow held to what a cell holds, a little
+  viscosity. A lake over a bumpy bed stays level (0 mm in 10 s), a dam
+  break keeps its volume to a part in 10^11, a small wave runs at 3.25 m/s
+  against sqrt(g h) 3.13, a wave runs up a beach and settles level. A frame
+  costs 0.24 ms at 128 x 128, 1.28 ms at 256 x 256 with 3.5 m of water,
+  over the 1 ms the issue budgeted there. New `examples/flood.ae`.

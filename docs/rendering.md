@@ -128,6 +128,25 @@ The feature list in full, with the reasoning behind each. The [README](../README
   make over the swell (`water.simulation_set_ripples`): a damped wave
   equation a floater disturbs as it moves through the surface, so a boat
   leaves a wake and a bobbing crate rings the water.
+- **Water that runs over the ground (#744).** `ae3d.shallow` is the
+  shallow-water equations over a square near the player, a depth a cell
+  and a discharge a face, over whatever ground the caller gives
+  (`shallow_ground_from`): gravity drives each face down the water's slope,
+  carried by the water above the higher of its two beds, so a dry bank
+  stays dry and water over any ground stands still when its surface is
+  level; a cell gives no more than it holds, so the volume is the volume;
+  a little viscosity takes the grid's own two-cell ripple out of a front.
+  `shallow_fill_box`, `shallow_add` and `shallow_clear` put water in and
+  take it out, `shallow_level` and `shallow_depth` read it, and
+  `shallow_model` draws it as a heightfield, tucked under the ground where
+  dry, moved each frame by `shallow_refresh`. A lake over a bumpy bed stays
+  level to a tenth of a millimetre, a dam breaking keeps its volume to a
+  part in 10^11, a small wave runs at 3.25 m/s against sqrt(g h)'s 3.13, a
+  dam's front over a dry bed at two thirds of sqrt(g h0), and a wave runs
+  up a beach and falls back to rest at its level (`tests/test_shallow.ae`).
+  With 3.5 m of water a frame costs 0.24 ms at 128 x 128 cells and 1.28 ms
+  at 256 x 256 (M1 Pro, -O2). `examples/flood.ae` lets a dam go down a
+  street.
 - **Water that is water.** A Gerstner sea with deep-water dispersion, shaded
   as one physically based surface: Schlick fresnel between the body of the
   water and the reflected sky (the scene's own skybox image, where it has
