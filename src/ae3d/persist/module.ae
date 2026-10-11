@@ -1,0 +1,561 @@
+// ae3d.persist -- save games (#507): the running game written to a slot and
+// read back over the scene it was played from.
+//
+//   base = persist.baseline(scene)              // as authored, once it is loaded
+//   ... the game runs: fields change, objects come and go ...
+//   persist.save(scene, base, "saves/slot1.save", "Chapter 2", play_seconds, null)
+//
+//   // a fresh process: the authored scene loaded again, then
+//   persist.set_spawner(make_object, game)      // what makes a spawned object back
+//   persist.load(scene, "saves/slot1.save")
+//
+// What is saved is declared, not written: every field a component's kind
+// registered (ae3d.component) that is neither hidden nor transient, and only
+// where it differs from the kind's default. An object is named by its id
+// (behaviour.object_id), which an authored scene's objects get in the order
+// they are loaded, the same every time: a save holds, over the authored
+// scene, the objects it still has with their transforms and components,
+// the objects spawned since, whole, and the ids of those destroyed since.
+// A component of a kind the program has no longer is counted, not loaded.
+//
+// Every save records each kind's schema version. A save from an earlier
+// one is read through the kind's renames (component.rename_field) and the
+// migrations registered for the steps since (persist.migration), oldest
+// first: a field added since takes its default, a renamed one its old
+// value, and a removed one is dropped and counted.
+//
+// Two forms of one document. Text (save_json, load_json) for a diff or a
+// bug report; a slot file (save, load) for the game: a header of its own --
+// "AE3S", the format, the slot's details as text for a menu to list
+// without reading the rest -- then the state deflated and its CRC-32, so a
+// file cut short or changed reads as damaged, not as a game. Written
+// atomically: a crash mid-save leaves the slot it had.
+import std.list
+import std.heap
+import std.string
+import std.json
+import std.fs
+import std.os
+import std.mem
+import std.bytes
+import ae3d.core
+import ae3d.behaviour
+import ae3d.component
+import ae3d.deflate
+import ae3d.inflate
+import ae3d.checksum
+
+exports (
+    Baseline, baseline, baseline_free, state_json, save_json, load_json, apply_json, save, load,
+    slot_info, migration, migrations_clear, set_spawner, last_error, last_unknown, FORMAT
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+
+// What this program writes and reads.
+const FORMAT = 1
+const MAGIC = 0x53334541             // "AE3S", little-endian
+const HEADER = 24                    // magic, format, the details' length, the state's length, its deflated CRC-32 and length
+
+var g_error = ""
+var g_unknown = 0
+var g_spawner: fn(ptr, string, string) -> *GameObject = null
+var g_spawn_context: ptr = null
+var g_migrations: ptr = null         // list of *Migration
+
+last_error() -> string { return g_error }
+
+// How many fields and components the last load could not place: names a
+// kind no longer has, kinds the program no longer registers.
+last_unknown() -> int { return g_unknown }
+
+fail(why: string) -> bool {
+    g_error = core.set_owned(g_error, why)
+    return false
+}
+
+// --- the scene as authored -------------------------------------------------------------
+
+// The ids the scene held when it was loaded, what a save is written over.
+struct Baseline {
+    ids: ptr                         // int[count]
+    count: int
+}
+
+baseline(s: *Scene) -> *Baseline {
+    b = heap.new(Baseline)
+    n = behaviour.scene_count(s)
+    b.ids = calloc(n + 1, 4)
+    i = 0
+    while i < n {
+        (b.ids as int[])[i] = behaviour.object_id(behaviour.scene_object(s, i))
+        i = i + 1
+    }
+    b.count = n
+    return b
+}
+
+baseline_free(b: *Baseline) {
+    if b == null { return }
+    free(b.ids)
+    heap.free(b)
+}
+
+authored(b: *Baseline, id: int) -> bool {
+    i = 0
+    while i < b.count {
+        if (b.ids as int[])[i] == id { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// --- migrations -------------------------------------------------------------------------
+
+// A step a save's component of kind `kind` takes to reach `version`: `apply`
+// is given its fields as the save wrote them (renames since already made)
+// and changes them in place -- a value scaled, a field split in two.
+struct Migration {
+    kind: string
+    version: int
+    apply: fn(ptr)
+}
+
+migration(kind: string, version: int, apply: fn(ptr)) {
+    if g_migrations == null { g_migrations = list.new() }
+    m = heap.new(Migration)
+    m.kind = string.copy(kind)
+    m.version = version
+    m.apply = apply
+    list.add_raw(g_migrations, m as ptr)
+}
+
+migrations_clear() {
+    if g_migrations == null { return }
+    i = 0
+    while i < list.size(g_migrations) {
+        // heap.free takes its string with it.
+        heap.free(list.get_raw(g_migrations, i) as *Migration)
+        i = i + 1
+    }
+    list.free(g_migrations)
+    g_migrations = null
+}
+
+// A component's saved fields brought from `version` to the kind's own.
+migrate(k: *ComponentKind, fields: ptr, version: int) {
+    if version >= component.schema_version(k) { return }
+    component.renamed_since(k, fields, version)
+    if g_migrations == null { return }
+    v = version + 1
+    while v <= component.schema_version(k) {
+        i = 0
+        while i < list.size(g_migrations) {
+            m = list.get_raw(g_migrations, i) as *Migration
+            if m.version == v && string.equals(m.kind, component.kind_name(k)) == 1 {
+                apply = m.apply
+                apply(fields)
+            }
+            i = i + 1
+        }
+        v = v + 1
+    }
+}
+
+// What makes an object the save spawned back: given its name and its
+// model's file ("" for none), it makes the object, in the scene, as the game
+// made it, and the load gives it its id, transform and components.
+set_spawner(maker: fn(ptr, string, string) -> *GameObject, context: ptr) {
+    g_spawner = maker
+    g_spawn_context = context
+}
+
+// --- writing ----------------------------------------------------------------------------
+
+vec3_json(v: Vec3) -> ptr {
+    a = json.arr()
+    json.array_add_raw(a, json.num(v.x))
+    json.array_add_raw(a, json.num(v.y))
+    json.array_add_raw(a, json.num(v.z))
+    return a
+}
+
+quat_json(q: Quat) -> ptr {
+    a = json.arr()
+    json.array_add_raw(a, json.num(q.x))
+    json.array_add_raw(a, json.num(q.y))
+    json.array_add_raw(a, json.num(q.z))
+    json.array_add_raw(a, json.num(q.w))
+    return a
+}
+
+// An object's saved record: who it is, where, and its components' fields.
+object_json(o: *GameObject, spawned: bool, kinds: ptr) -> ptr {
+    out = json.obj()
+    json.object_set_raw(out, "id", json.from_int(behaviour.object_id(o)))
+    json.object_set_raw(out, "name", json.str(core.text(o.name)))
+    json.object_set_raw(out, "tag", json.str(core.text(o.tag)))
+    json.object_set_raw(out, "active", json.boolean(o.active))
+    json.object_set_raw(out, "position", vec3_json(behaviour.object_position(o)))
+    json.object_set_raw(out, "rotation", quat_json(behaviour.object_rotation(o)))
+    json.object_set_raw(out, "scale", vec3_json(behaviour.object_scale(o)))
+    if spawned {
+        json.object_set_raw(out, "spawned", json.boolean(true))
+        path = ""
+        m = behaviour.object_model(o)
+        if m != null { path = core.text(m.source_path) }
+        json.object_set_raw(out, "model", json.str(path))
+    }
+    list_json = json.arr()
+    n = behaviour.object_component_count(o)
+    i = 0
+    while i < n {
+        c = behaviour.object_component(o, i)
+        k = component.kind_of(c)
+        if k != null {
+            entry = json.obj()
+            json.object_set_raw(entry, "kind", json.str(component.kind_name(k)))
+            json.object_set_raw(entry, "enabled", json.boolean(behaviour.component_enabled(c)))
+            json.object_set_raw(entry, "fields", component.to_json(c, true))
+            json.array_add_raw(list_json, entry)
+            json.object_set_raw(kinds, component.kind_name(k), json.from_int(component.schema_version(k)))
+        }
+        i = i + 1
+    }
+    json.object_set_raw(out, "components", list_json)
+    return out
+}
+
+// The running game as one document: the caller frees it (json.free).
+state_json(s: *Scene, b: *Baseline) -> ptr {
+    root = json.obj()
+    kinds = json.obj()
+    json.object_set_raw(root, "format", json.from_int(FORMAT))
+    objects = json.arr()
+    // The scene's own components, as id 0.
+    json.array_add_raw(objects, object_json(behaviour.scene_root(s), false, kinds))
+    n = behaviour.scene_count(s)
+    i = 0
+    while i < n {
+        o = behaviour.scene_object(s, i)
+        json.array_add_raw(objects, object_json(o, !authored(b, behaviour.object_id(o)), kinds))
+        i = i + 1
+    }
+    gone = json.arr()
+    i = 0
+    while i < b.count {
+        id = (b.ids as int[])[i]
+        if behaviour.scene_find_id(s, id) == null { json.array_add_raw(gone, json.from_int(id)) }
+        i = i + 1
+    }
+    json.object_set_raw(root, "kinds", kinds)
+    json.object_set_raw(root, "objects", objects)
+    json.object_set_raw(root, "destroyed", gone)
+    json.object_set_raw(root, "next_id", json.from_int(behaviour.scene_next_id(s)))
+    return root
+}
+
+// The running game as text, to `path`.
+save_json(s: *Scene, b: *Baseline, path: string) -> bool {
+    root = state_json(s, b)
+    text = json.stringify_raw(root)
+    json.free(root)
+    err = fs.write(path, text)
+    string.free(text)
+    if err != "" { return fail("cannot write ${path}: ${err}") }
+    return true
+}
+
+// --- reading ----------------------------------------------------------------------------
+
+vec3_of(node: ptr) -> Vec3 {
+    if node == null { return core.vec3(0.0, 0.0, 0.0) }
+    return core.vec3(json.get_number(json.array_get_raw(node, 0)), json.get_number(json.array_get_raw(node, 1)),
+                     json.get_number(json.array_get_raw(node, 2)))
+}
+
+quat_of(node: ptr) -> Quat {
+    if node == null { return core.quat(0.0, 0.0, 0.0, 1.0) }
+    return core.quat(json.get_number(json.array_get_raw(node, 0)), json.get_number(json.array_get_raw(node, 1)),
+                     json.get_number(json.array_get_raw(node, 2)), json.get_number(json.array_get_raw(node, 3)))
+}
+
+text_of(node: ptr, key: string) -> string {
+    v = json.object_get_raw(node, key)
+    if v == null { return "" }
+    return json.get_string_raw(v)
+}
+
+// The saved components put on the object: each found or added by its kind,
+// set back to the kind's defaults and then to what the save holds -- a
+// field the game had returned to its default is in no save, and over an
+// authored value it would otherwise stay authored -- and any the object
+// has that the save does not, which the game took off, taken off.
+apply_components(o: *GameObject, node: ptr, kinds: ptr) {
+    saved = json.object_get_raw(node, "components")
+    count = 0
+    if saved != null { count = json.array_size(saved) }
+    // What the save does not name goes first.
+    i = behaviour.object_component_count(o) - 1
+    while i >= 0 {
+        c = behaviour.object_component(o, i)
+        k = component.kind_of(c)
+        if k != null && !names_kind(saved, count, component.kind_name(k)) { component.remove(o, c) }
+        i = i - 1
+    }
+    i = 0
+    while i < count {
+        entry = json.array_get_raw(saved, i)
+        name = text_of(entry, "kind")
+        k = component.kind_named(name)
+        if k == null {
+            g_unknown = g_unknown + 1
+        } else {
+            c = component.find(o, k)
+            if c == null { c = component.add(o, k) }
+            if c != null {
+                // Renamed and migrated on a copy of its own: what is read
+                // is the caller's, and stays as it was written.
+                saved_fields = json.object_get_raw(entry, "fields")
+                written = 1
+                v = json.object_get_raw(kinds, name)
+                if v != null { written = json.get_int(v) }
+                component.reset(c)
+                if saved_fields != null {
+                    fields = component.json_copy(saved_fields)
+                    migrate(k, fields, written)
+                    g_unknown = g_unknown + component.from_json(c, fields)
+                    json.free(fields)
+                }
+                on = json.object_get_raw(entry, "enabled")
+                if on != null { behaviour.component_set_enabled(c, json.get_bool(on) != 0) }
+            }
+        }
+        i = i + 1
+    }
+}
+
+names_kind(saved: ptr, count: int, name: string) -> bool {
+    i = 0
+    while i < count {
+        if string.equals(text_of(json.array_get_raw(saved, i), "kind"), name) == 1 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// A document read over the scene, which is the scene it was saved from, as
+// authored and just loaded. Objects the save destroyed go at the scene's
+// next update, as any destroyed object does.
+apply_json(s: *Scene, root: ptr) -> bool {
+    g_unknown = 0
+    format = json.object_get_raw(root, "format")
+    if format == null || json.get_int(format) != FORMAT { return fail("not a save of format ${FORMAT}") }
+    kinds = json.object_get_raw(root, "kinds")
+    gone = json.object_get_raw(root, "destroyed")
+    if gone != null {
+        i = 0
+        while i < json.array_size(gone) {
+            o = behaviour.scene_find_id(s, json.get_int(json.array_get_raw(gone, i)))
+            if o != null { behaviour.scene_destroy_later(s, o) }
+            i = i + 1
+        }
+    }
+    objects = json.object_get_raw(root, "objects")
+    missing = 0
+    if objects != null {
+        i = 0
+        while i < json.array_size(objects) {
+            node = json.array_get_raw(objects, i)
+            id = json.get_int(json.object_get_raw(node, "id"))
+            o = null as *GameObject
+            if id == 0 {
+                o = behaviour.scene_root(s)
+            } else {
+                o = behaviour.scene_find_id(s, id)
+                spawned = json.object_get_raw(node, "spawned")
+                if o == null && spawned != null && json.get_bool(spawned) != 0 {
+                    maker = g_spawner
+                    if maker == null { return fail("the save spawned objects and nothing is set to make them (set_spawner)") }
+                    o = maker(g_spawn_context, text_of(node, "name"), text_of(node, "model"))
+                    if o != null { o.id = id }
+                }
+            }
+            if o == null {
+                missing = missing + 1
+            } else {
+                if id != 0 {
+                    behaviour.object_set_name(o, text_of(node, "name"))
+                    behaviour.object_set_tag(o, text_of(node, "tag"))
+                    on = json.object_get_raw(node, "active")
+                    if on != null { behaviour.object_set_active(o, json.get_bool(on) != 0) }
+                    behaviour.object_set_position(o, vec3_of(json.object_get_raw(node, "position")))
+                    behaviour.object_set_rotation(o, quat_of(json.object_get_raw(node, "rotation")))
+                    behaviour.object_set_scale(o, vec3_of(json.object_get_raw(node, "scale")))
+                }
+                apply_components(o, node, kinds)
+            }
+            i = i + 1
+        }
+    }
+    next = json.object_get_raw(root, "next_id")
+    if next != null { behaviour.scene_set_next_id(s, json.get_int(next)) }
+    if missing > 0 { return fail("${missing} object(s) the save names are not in the scene: not the scene it was saved from") }
+    return true
+}
+
+load_json(s: *Scene, path: string) -> bool {
+    text, err = fs.read(path)
+    if err != "" { return fail("cannot read ${path}: ${err}") }
+    root = json.parse_raw(text)
+    if root == null { return fail("${path} is not JSON") }
+    ok = apply_json(s, root)
+    json.free(root)
+    return ok
+}
+
+// --- slot files ---------------------------------------------------------------------------
+
+// The running game to the slot file `path`: its details -- `title`, when
+// it was saved, `play_seconds`, and the game's own fields `extra` (a JSON
+// object, or null; the caller keeps it) -- then the state, deflated and
+// checksummed.
+save(s: *Scene, b: *Baseline, path: string, title: string, play_seconds: float, extra: ptr) -> bool {
+    details = json.obj()
+    json.object_set_raw(details, "title", json.str(title))
+    json.object_set_raw(details, "saved_ms", json.num(os.now_unix_ms() as float))
+    json.object_set_raw(details, "play_seconds", json.num(play_seconds))
+    if extra != null { json.object_set_raw(details, "game", component.json_copy(extra)) }
+    detail_text = json.stringify_raw(details)
+    json.free(details)
+    root = state_json(s, b)
+    state_text = json.stringify_raw(root)
+    json.free(root)
+    state_length = string.length(state_text)
+    plain = bytes.new(state_length + 1)
+    bytes.copy_from_string(plain, 0, state_text, state_length)
+    z = deflate.zlib(bytes.data(plain), state_length, 6)
+    packed = deflate.take(z)
+    packed_length = deflate.size(z)
+    deflate.done(z)
+    bytes.free(plain)
+    detail_length = string.length(detail_text)
+    total = HEADER + detail_length + packed_length
+    out = bytes.new(total)
+    bytes.copy_from_string(out, HEADER, detail_text, detail_length)
+    raw = bytes.data(out)
+    mem.set_uint32(raw, 0, MAGIC as long)
+    mem.set_uint32(raw, 4, FORMAT as long)
+    mem.set_uint32(raw, 8, detail_length as long)
+    mem.set_uint32(raw, 12, state_length as long)
+    mem.set_uint32(raw, 16, checksum.crc32(0 as long, packed, packed_length))
+    mem.set_uint32(raw, 20, packed_length as long)
+    memcpy(raw + HEADER + detail_length, packed, packed_length as long)
+    err = fs.write_atomic(path, (raw as byte[])[0..total])
+    bytes.free(out)
+    free(packed)
+    string.free(detail_text)
+    string.free(state_text)
+    if err != "" { return fail("cannot write ${path}: ${err}") }
+    return true
+}
+
+// A slot file's bytes, checked: null, with last_error, when it is not one.
+struct Slot {
+    data: ptr                        // the file's bytes, a std.bytes buffer
+    length: int
+}
+
+read_slot(path: string) -> *Slot {
+    content, length, err = fs.read_binary(path)
+    if err != "" {
+        fail("cannot read ${path}: ${err}")
+        return null
+    }
+    if length < HEADER {
+        fail("${path} is too short to be a save")
+        return null
+    }
+    b = bytes.new(length + 4)
+    bytes.copy_from_string(b, 0, content, length)
+    raw = bytes.data(b)
+    if mem.get_uint32(raw, 0) != (MAGIC as long) {
+        bytes.free(b)
+        fail("${path} is not a save")
+        return null
+    }
+    if mem.get_uint32(raw, 4) != (FORMAT as long) {
+        bytes.free(b)
+        fail("${path} is a save of another format")
+        return null
+    }
+    detail_length = mem.get_uint32(raw, 8) as int
+    packed_length = mem.get_uint32(raw, 20) as int
+    if HEADER + detail_length + packed_length != length {
+        bytes.free(b)
+        fail("${path} is damaged: it is not as long as it says")
+        return null
+    }
+    sl = heap.new(Slot)
+    sl.data = b
+    sl.length = length
+    return sl
+}
+
+slot_free(sl: *Slot) {
+    bytes.free(sl.data)
+    heap.free(sl)
+}
+
+// A slot's details, without reading its state: what a save menu lists.
+// The caller frees it (json.free); null, with last_error, for a file that is
+// not a save.
+slot_info(path: string) -> ptr {
+    sl = read_slot(path)
+    if sl == null { return null }
+    raw = bytes.data(sl.data)
+    detail_length = mem.get_uint32(raw, 8) as int
+    text = bytes.string_from_ptr(raw + HEADER, detail_length)
+    slot_free(sl)
+    root = json.parse_raw(text)
+    string.free(text)
+    if root == null { fail("${path}'s details are not JSON") }
+    return root
+}
+
+// The slot file `path` read over the scene it was saved from.
+load(s: *Scene, path: string) -> bool {
+    sl = read_slot(path)
+    if sl == null { return false }
+    raw = bytes.data(sl.data)
+    detail_length = mem.get_uint32(raw, 8) as int
+    state_length = mem.get_uint32(raw, 12) as int
+    crc = mem.get_uint32(raw, 16)
+    packed_length = mem.get_uint32(raw, 20) as int
+    packed = raw + HEADER + detail_length
+    if checksum.crc32(0 as long, packed, packed_length) != crc {
+        slot_free(sl)
+        return fail("${path} is damaged: its checksum does not match")
+    }
+    z = inflate.zlib(packed, packed_length, state_length, state_length + 1, 1)
+    if inflate.failed(z) {
+        why = inflate.reason(inflate.error_code(z))
+        inflate.done(z)
+        slot_free(sl)
+        return fail("${path} is damaged: ${why}")
+    }
+    state = inflate.take(z)
+    got = inflate.size(z)
+    inflate.done(z)
+    slot_free(sl)
+    text = bytes.string_from_ptr(state, got)
+    free(state)
+    root = json.parse_raw(text)
+    string.free(text)
+    if root == null { return fail("${path}'s state is not JSON") }
+    ok = apply_json(s, root)
+    json.free(root)
+    return ok
+}

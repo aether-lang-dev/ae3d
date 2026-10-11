@@ -192,3 +192,16 @@
   rolled off. The scattering octaves take Wrenninge's weights, 1, 1/2,
   1/4: weighed to one, a front-lit cloud was 82% of a white wall's
   brightness as it shows; now 91% (204 against 224, both renderers).
+- **Save games, first part (#507).** New `ae3d.persist`: every object has
+  an id from its first `scene_add`, the same each load of an authored
+  scene; a save holds each object's transform and its components' fields
+  that differ from their defaults, the objects spawned since (made back by
+  the game's spawner) and the ids destroyed since. Kinds have schema
+  versions and declared renames, and migrations run per version step on a
+  copy of the saved fields. Text form (`save_json`), and slot files: a
+  header with the slot's details, the state deflated with its CRC-32,
+  written atomically. `tests/test_persist.ae`: a played scene comes back
+  whole from a slot and from text, a damaged slot is refused, a version 1
+  save migrates, 200 saves and loads in a row, no leaks. The leak found on
+  the way is std.json's (aether#2719, fixed in aether#2720; tracked here
+  in #745).

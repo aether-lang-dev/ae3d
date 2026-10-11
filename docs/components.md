@@ -145,6 +145,48 @@ Loading reads the fields by name:
 A game's script, opened in an editor that has not built it, survives the
 round trip.
 
+### Save games
+
+`ae3d.persist` (#507) writes the running game the same way, over the scene
+it was played from:
+
+```aether
+base = persist.baseline(scene)                       // the authored scene, just loaded
+persist.save(scene, base, "saves/1.save", "Chapter 2", play_seconds, null)
+// a fresh process, the authored scene loaded again:
+persist.set_spawner(make_object, game)               // makes a spawned object back
+persist.load(scene, "saves/1.save")
+```
+
+- **Who an object is.** Every object has an id from its first
+  `scene_add` (`behaviour.object_id`), and an authored scene's objects are
+  added in the same order every load, so a save names them by it.
+- **What a save holds.** Every object's transform and its components'
+  fields that differ from their kind's defaults; the objects spawned since
+  the baseline, whole, made back by the game's spawner; the ids destroyed
+  since. A loaded component is set back to its defaults before its saved
+  fields, so a field returned to its default over an authored value comes
+  back as the default. A component the object has and the save does not is
+  taken off.
+- **Versions.** Each kind has a schema version
+  (`component.set_schema_version`), recorded with every save. A save from
+  before reads renamed fields under their new names
+  (`component.rename_field(k, old, new, version)`) and goes through the
+  migrations registered for each step since (`persist.migration(kind,
+  version, apply)`); a field added since keeps its default. Migrations work
+  on a copy of each component's fields: the document read is left as it was
+  written.
+- **Two forms.** `save_json` / `load_json` write and read the document as
+  text. `save` / `load` write a slot file: `AE3S`, the format, the slot's
+  details as text (title, when, play time, the game's own fields:
+  `persist.slot_info` reads them without the rest), then the state deflated
+  and its CRC-32, written atomically. A file changed by a byte is refused
+  as damaged.
+
+Not yet: references between objects as ids, state that is not a
+registered field (a body's velocity, an animator's time), the save taken
+off the frame, and the scene file as the text form of the same document.
+
 ## Scripts
 
 A script is a component kind in a file of its own, built into a shared
@@ -201,6 +243,12 @@ drives each over a socket.
   engine, the scene's root running first and never listed, and a scene
   file carrying components that own their state, with one of an unknown
   kind kept.
+- `tests/test_persist.ae`: a played scene saved to a slot and to text and
+  read over the scene loaded fresh, every field, transform and object
+  back, the next spawned id unused; a slot's details; a damaged slot
+  refused; a version 1 save migrated (36 km/h as `velocity` comes back as
+  `speed` 10 m/s, the added `grip` at its default); two hundred saves and
+  loads in a row the same; no leaks.
 - `tests/test_agent_components.ae`: the channel's ops.
 - The editor's driver (`tools/drive_editor.ae`) presses the panels on both
   renderers ([the editor](editor.md)).
