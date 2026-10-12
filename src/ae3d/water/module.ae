@@ -7,6 +7,9 @@ import std.heap
 import ae3d.core
 import ae3d.shaders
 import ae3d.loader
+import ae3d.ripples
+
+extern pow(x: float, y: float) -> float
 
 exports (
     Simulation, MAX_WAVES, RESOLUTION,
@@ -26,7 +29,9 @@ exports (
     simulation_caustics_scale, simulation_foam_on, simulation_foam_intensity,
     simulation_reflection, simulation_shadow,
     simulation_distortion, simulation_normal,
-    simulation_wave_scale, simulation_sky_path, simulation_shore_fade, simulation_shore_foam
+    simulation_wave_scale, simulation_sky_path, simulation_shore_fade, simulation_shore_foam,
+    simulation_height_at, simulation_normal_at, simulation_displaced, simulation_elapsed,
+    simulation_set_sky_capture, simulation_sky_capture, simulation_set_ripples, simulation_ripples
 )
 
 
@@ -57,6 +62,8 @@ struct Simulation {
     wave_speed_multiplier: float
     wave_height: float
     wave_randomness: float
+    sky_capture: bool                  // mirrors the sky the engine drew (#742)
+    ripples: ptr                       // *Ripples drawn over the swell (#637), or null
 
     caustics_enabled: bool
     caustics_intensity: float
@@ -237,6 +244,39 @@ simulation_set_wave_speed(w: *Simulation, value: float) {
     settled(w)
 }
 
+// The sea mirroring the sky the engine drew and captured (#742), painted,
+// from the sun or the clear colour, where its reflected ray meets it,
+// instead of its sky colours or image: the sea at every hour the sky's.
+simulation_set_sky_capture(w: *Simulation, on: bool) {
+    w.sky_capture = on
+    if w.model != null { simulation_apply(w) }
+}
+
+simulation_sky_capture(w: *Simulation) -> bool { return w.sky_capture }
+
+// The ripples bodies make (#637) drawn over the swell, stepped with it
+// (simulation_update) and sent as the surface's mask; null for none. The
+// sea borrows them, and the caller frees them after it.
+simulation_set_ripples(w: *Simulation, r: *Ripples) {
+    w.ripples = r as ptr
+    attach_ripples(w)
+}
+
+simulation_ripples(w: *Simulation) -> *Ripples { return w.ripples as *Ripples }
+
+attach_ripples(w: *Simulation) {
+    m = w.model as *Model
+    if m == null { return }
+    if w.ripples == null {
+        core.model_disable_damage(m)
+        return
+    }
+    r = w.ripples as *Ripples
+    core.model_enable_mask(m, ripples.ripples_cells(r))
+    core.model_set_uniform_vec3(m, "rippleArea", core.vec3(ripples.ripples_origin_x(r), ripples.ripples_origin_z(r),
+                                                          1.0 / ripples.ripples_extent(r)))
+}
+
 simulation_set_randomness(w: *Simulation, value: float) {
     w.wave_randomness = value
     settled(w)
@@ -370,6 +410,9 @@ simulation_build(w: *Simulation, resolution: int) -> *Model {
     core.model_set_uniform_int(m, "waveCount", MAX_WAVES)
     core.model_set_uniform_float(m, "waveHeightMultiplier", w.wave_height)
     core.model_set_uniform_float(m, "waveRandomness", w.wave_randomness)
+    capture = 0
+    if w.sky_capture { capture = 1 }
+    core.model_set_uniform_int(m, "waterSkyCapture", capture)
     core.model_set_uniform_float(m, "time", 0.0)
 
     core.model_set_uniform_int(m, "enableShadows", 0)
@@ -389,6 +432,7 @@ simulation_build(w: *Simulation, resolution: int) -> *Model {
 
     w.model = m as ptr
     simulation_apply(w)
+    if w.ripples != null { attach_ripples(w) }
     return m
 }
 
@@ -409,6 +453,9 @@ simulation_apply(w: *Simulation) {
     core.model_set_uniform_float(m, "waveSpeedMultiplier", w.wave_speed_multiplier)
     core.model_set_uniform_float(m, "waveHeightMultiplier", w.wave_height)
     core.model_set_uniform_float(m, "waveRandomness", w.wave_randomness)
+    capture = 0
+    if w.sky_capture { capture = 1 }
+    core.model_set_uniform_int(m, "waterSkyCapture", capture)
 
     foam = 0
     if w.foam_enabled { foam = 1 }
@@ -435,7 +482,6 @@ simulation_apply(w: *Simulation) {
     core.model_set_uniform_vec3(m, "skyColor", core.vec3(w.sky_r, w.sky_g, w.sky_b))
     core.model_set_uniform_vec3(m, "horizonColor",
                                 core.vec3(w.sky_r * 0.85, w.sky_g * 0.85, w.sky_b * 0.85))
-    core.model_set_uniform_float(m, "waterPlaneHeight", m.position.y + 5.0)
     core.model_set_uniform_float(m, "waterLevel", m.position.y)
 }
 
@@ -444,4 +490,160 @@ simulation_update(w: *Simulation, delta: float) {
     if m == null { return }
     w.elapsed = w.elapsed + delta
     core.model_set_uniform_float(m, "time", w.elapsed)
+    if w.ripples != null {
+        r = w.ripples as *Ripples
+        ripples.ripples_step(r, delta)
+        ripples.ripples_encode(r, core.model_damage_pixels(m))
+        core.model_mask_changed(m)
+    }
+}
+
+// --- the surface on the CPU (#637) -----------------------------------------
+
+// The sea's surface where the vertex shader puts it, so a body floats on the
+// waves that are drawn: the same four trains, the same sharpened sine and Q,
+// the same speed, height and randomness multipliers, the same half again on
+// the height, at the same time (simulation_update's).
+simulation_elapsed(w: *Simulation) -> float { return w.elapsed }
+
+// The hash and two-octave noise of the shader's waveRandomness.
+hash2(x: float, y: float) -> float {
+    v = core.sin_of(x * 127.1 + y * 311.7) * 43758.5453
+    return v - floor_of(v)
+}
+
+floor_of(x: float) -> float {
+    i = x as long
+    f = i as float
+    if f > x { return f - 1.0 }
+    return f
+}
+
+noise2(x: float, y: float, octaves: int) -> float {
+    value = 0.0
+    amplitude = 0.5
+    px = x
+    py = y
+    o = 0
+    while o < octaves {
+        ix = floor_of(px)
+        iy = floor_of(py)
+        fx = px - ix
+        fy = py - iy
+        fx = fx * fx * (3.0 - 2.0 * fx)
+        fy = fy * fy * (3.0 - 2.0 * fy)
+        a = hash2(ix, iy)
+        b = hash2(ix + 1.0, iy)
+        c = hash2(ix, iy + 1.0)
+        d = hash2(ix + 1.0, iy + 1.0)
+        value = value + amplitude * ((a + (b - a) * fx) + ((c + (d - c) * fx) - (a + (b - a) * fx)) * fy)
+        amplitude = amplitude * 0.5
+        px = px * 2.0
+        py = py * 2.0
+        o = o + 1
+    }
+    return value
+}
+
+// Train `i`'s heading, as upload_wave_table fans them.
+wave_heading(i: int) -> Vec3 {
+    spread = 0.0
+    if i == 1 { spread = 0.0 - 27.0 }
+    if i == 2 { spread = 38.0 }
+    if i == 3 { spread = 0.0 - 61.0 }
+    angle = core.deg_to_rad(17.0 + spread)
+    return core.v3_normalize(core.vec3(core.cos_of(angle), 0.0, core.sin_of(angle)))
+}
+
+// Train `i` at the undisplaced point (x, z): its displacement, and the
+// normal's share it adds, into g_disp_* and g_slope_* (the shader's two
+// functions).
+var g_disp_x = 0.0
+var g_disp_y = 0.0
+var g_disp_z = 0.0
+var g_slope_x = 0.0
+var g_slope_y = 0.0
+var g_slope_z = 0.0
+
+wave_at(w: *Simulation, i: int, x: float, z: float) {
+    d = wave_heading(i)
+    randomFactor = 1.0
+    if w.wave_randomness > 0.001 {
+        n = noise2(x * 0.01 + w.elapsed * 0.1 + (i as float), z * 0.01 + w.elapsed * 0.1 + (i as float), 2)
+        randomFactor = 1.0 + (0.5 + n - 1.0) * w.wave_randomness
+    }
+    amplitude = wave_amplitude(w, i) * w.wave_height * randomFactor
+    frequency = wave_frequency(w, i)
+    speed = wave_speed(w, i) * w.wave_speed_multiplier
+    if w.wave_speed_multiplier <= 0.001 { speed = wave_speed(w, i) }
+    phase = (i as float) * core.PI / 3.0
+    steepness = 0.2 + (i as float) * 0.1
+    wave = (d.x * x + d.z * z) * frequency + w.elapsed * speed + phase
+    c = core.cos_of(wave)
+    s = core.sin_of(wave)
+    sharp = pow((s + 1.0) * 0.5, 1.2) * 2.0 - 1.0
+    q = steepness / (frequency * amplitude * 6.0 + 0.01)
+    g_disp_x = q * amplitude * d.x * c
+    g_disp_y = amplitude * sharp
+    g_disp_z = q * amplitude * d.z * c
+    slope = 1.2 * pow((s + 1.0) * 0.5, 0.2)
+    wa = frequency * amplitude
+    g_slope_x = 0.0 - d.x * wa * c * slope
+    g_slope_y = 1.0 - q * wa * s
+    g_slope_z = 0.0 - d.z * wa * c * slope
+}
+
+// The four trains' displacement of the undisplaced point (x, z).
+offset_at(w: *Simulation, x: float, z: float) -> Vec3 {
+    total = core.vec3(0.0, 0.0, 0.0)
+    i = 0
+    while i < MAX_WAVES {
+        wave_at(w, i, x, z)
+        total = core.v3_add(total, core.vec3(g_disp_x, g_disp_y, g_disp_z))
+        i = i + 1
+    }
+    return total
+}
+
+// The undisplaced point whose wave lands over (x, z): the waves push the
+// surface sideways too, a few times a fixed point away.
+source_of(w: *Simulation, x: float, z: float) -> Vec3 {
+    px = x
+    pz = z
+    k = 0
+    while k < 4 {
+        o = offset_at(w, px, pz)
+        px = x - o.x
+        pz = z - o.z
+        k = k + 1
+    }
+    return core.vec3(px, 0.0, pz)
+}
+
+base_height(w: *Simulation) -> float {
+    if w.model == null { return 0.0 }
+    return (w.model as *Model).position.y
+}
+
+// The surface's height over the world point (x, z), now.
+simulation_height_at(w: *Simulation, x: float, z: float) -> float {
+    p = source_of(w, x, z)
+    return base_height(w) + offset_at(w, p.x, p.z).y * 1.5
+}
+
+// The surface's normal over the world point (x, z), now: the slope of its
+// height there, the surface as drawn (the shader lights it by its own sum
+// of the trains' normals, which leaves out the half again on the height).
+simulation_normal_at(w: *Simulation, x: float, z: float) -> Vec3 {
+    d = 0.05
+    gx = (simulation_height_at(w, x + d, z) - simulation_height_at(w, x - d, z)) / (2.0 * d)
+    gz = (simulation_height_at(w, x, z + d) - simulation_height_at(w, x, z - d)) / (2.0 * d)
+    return core.v3_normalize(core.vec3(0.0 - gx, 1.0, 0.0 - gz))
+}
+
+// Where the vertex shader draws the sea's vertex at rest over (x, z): the
+// trains' displacement of it, the height half again.
+simulation_displaced(w: *Simulation, x: float, z: float) -> Vec3 {
+    o = offset_at(w, x, z)
+    return core.vec3(x + o.x, base_height(w) + o.y * 1.5, z + o.z)
 }
