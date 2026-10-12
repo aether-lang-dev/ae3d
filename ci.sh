@@ -249,6 +249,7 @@ build_together() {   # build_together <source> [<source>...]
 # there were: the sum of each phase over every target, and the slowest three.
 build_costs() {
     cat "$BUILD_DIR"/*.log 2>/dev/null | awk -v wall="$1" -v jobs="$JOBS" '
+        /^aetherc: from the cache$/ { cached++ }
         /^built: .*\(aetherc [0-9]+ s, cc [0-9]+ s, link [0-9]+ s\)$/ {
             n++; a += $(NF-7); c += $(NF-4); l += $(NF-1)
             name = $2; sub(/.*\//, "", name)
@@ -256,7 +257,7 @@ build_costs() {
             print total, name > "/dev/stderr"
         }
         END {
-            if (n) printf "        built %d in %d s, %d at a time: aetherc %d s, cc %d s, link %d s in all\n", n, wall, jobs, a, c, l
+            if (n) printf "        built %d in %d s, %d at a time: aetherc %d s (%d from its cache), cc %d s, link %d s in all\n", n, wall, jobs, a, cached, c, l
         }' 2>"$BUILD_DIR/costs"
     if [ -s "$BUILD_DIR/costs" ]; then
         printf '        slowest:'
@@ -524,9 +525,11 @@ if [ "$(uname -s)" = "Darwin" ]; then
     fi
 fi
 
-# One runner of Linux's two is enough to say a module stopped compiling; the
-# apps half would only say it again.
-if in_tier suites leaks platform && first_shard; then
+# One runner is enough to say a module stopped compiling: the check is the
+# compiler's front end, the same on every platform, and each platform's
+# suites compile the modules they import again. On macOS it was two of the
+# critical path's thirteen minutes.
+if in_tier suites && first_shard; then
 step "modules type-check"
 for module in src/ae3d/*/; do
     name="$(basename "$module")"
