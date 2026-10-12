@@ -5,6 +5,12 @@ For Nic, from Paul (written up with Claude), 2026-10-12. This is step 4 of
 before building anything. It is grounded in how the compiler handles trailing
 blocks today. File and line references are to `aether` at v0.807.0.
 
+The comparison throughout is ChrysaLisp's shader language, which we have
+checked out at `~/scm/not-ours/Cyl` (at `3326d4333`, 2026-10-12; see section
+1b of the other doc). There a shader is already an s-expression, so Lisp
+gets for nothing the tree that `quote` would give us. We use it for ideas
+only: no code from `not-ours/` is copied, ported or paraphrased.
+
 ## 1. What it is
 
 A fourth trailing-block form. The compiler type-checks the block as ordinary
@@ -266,6 +272,11 @@ From mapping the compiler; nothing here is built yet.
 - **`@derive(schema)`** (`codegen_schema.c`) is the nearest thing the
   compiler already does: it turns syntax into a table the program reads at
   runtime. Its shape is the model for the emitted builder.
+- **A hash for each tree.** The builder can also emit a hash of the quote's
+  source and tree, as a constant, so a back end can cache what it made
+  (GLSL, SPIR-V, native code) under it plus a hash of the back end itself.
+  That is how ChrysaLisp keeps its shader output now: it never rebuilds an
+  unchanged shader, and it never serves output from an older back end.
 
 ## 8. Beyond shaders
 
@@ -275,6 +286,11 @@ From mapping the compiler; nothing here is built yet.
   of the `BINARY` node.
 - **Query builders.** `where() quote |p: Person| -> p.age > 30` becomes
   `WHERE age > 30`, as LINQ does.
+- **Numeric functions, not shaders.** A quote with arguments and no pixel,
+  such as a matrix product or a physics step, can go to the CPU evaluator,
+  to C, or later to GPU compute. ChrysaLisp has just done this ("functions
+  for Lisp to call": the shader language with arguments in place of a
+  pixel, as fast as hand-written native code), and plans GPU compute next.
 - **Symbolic maths and autodiff**, by walking and rewriting the tree.
 - **aether-ui's** reactive bindings could see which state a computed value
   reads, instead of being told.
@@ -297,7 +313,13 @@ From mapping the compiler; nothing here is built yet.
    1, and then one shader at a time, retiring the duplicated GL and `_vk`
    GLSL as each moves.
 5. **MSL**, then a SPIR-V writer of our own (after reading Chris's
-   `spirv.inc`), with glslang kept in CI as the checker.
+   `spirv.inc` for ideas, then writing ours from the SPIR-V spec), with
+   glslang and `spirv-val` kept in CI as the checkers.
+6. **Vertex shaders.** ChrysaLisp's split is worth taking as an idea: a
+   vertex shader's inputs and outputs are declared, and one vertex shader
+   serves any pixel shader whose inputs it provides. For us the vertex
+   quote's return type is a struct of varyings, which the pixel quote takes
+   as its parameter.
 
 ## 10. Open questions for Nic
 

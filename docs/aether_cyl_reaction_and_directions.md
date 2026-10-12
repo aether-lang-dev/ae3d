@@ -1,6 +1,11 @@
 # ChrysaLisp's GPU burst, and what Aether / ae3d might do about it
 
-For Nic, from Paul (written up with Claude), 2026-10-06, updated after Chris's afternoon commits (to `9db12a8a1`).
+For Nic, from Paul (written up with Claude), 2026-10-06, updated after Chris's afternoon commits (to `9db12a8a1`), and again on 2026-10-12 (to `3326d4333`, section 1b).
+
+Our checkout of ChrysaLisp is `~/scm/not-ours/Cyl` (Paul's fork,
+`paul-hammant/ChrysaLisp_AI_made_apps_experiment`). It sits under `not-ours/`
+on purpose: we read it for ideas and never copy, port or paraphrase its code
+into ours, whatever its licence.
 
 ## 1. What Chris did
 
@@ -88,12 +93,47 @@ tree, so each back end is just a walk over that tree. GLSL takes 83 lines, and
 SPIR-V, *binary*, takes 339 with no external compiler. One shader source now
 gives GLSL, Metal, SPIR-V, an interpreted CPU fallback and native code.
 
+## 1b. Since then: 6 to 12 October (to `3326d4333`)
+
+Chris (and his Claude) is on a roll: **437 more commits in six days**, all
+his, about 100 a day at the peak (8 to 10 October). ChrysaLisp 7.2 and 7.3
+are written up in `docs/releases/`. Most of it is off the GPU: a
+content-addressed storage service spread over several machines, machines
+that find each other and form a mesh (`mesh`, `sync`, `rack`), a whiteboard
+app, SHA-512 and Ed25519, a source-checking tool, and the VP assembler's
+expressions as forms. The GPU part is what matters to us:
+
+| Then (`9db12a8a1`) | Now (`3326d4333`) |
+|---|---|
+| About 2,000 lines in `lib/gpu/` | 4,075: `vp.inc` 1,759, `shader.inc` 700, `cpu.inc` 517, `spirv.inc` 495, `msl.inc` 231, `glsl.inc` 150, plus `tris`, `gui` and `tile` |
+| Fragment shaders only, one real shader (the raymarch) | **Vertex shaders too**: `defattr` (what a vertex gives), `defvarying` (what is handed to the pixel shader), a `:mat4`. One vertex shader serves any pixel shader whose varyings it has. Six shaders in `lib/gpu/shaders/` |
+| No meshes | **Triangles**, with a depth buffer, clipping at the near plane, and alpha. Drawn as native code (20,000 triangles at 900×900 in 12ms on one core), with the Lisp reference matching it to the bit |
+| GPU drew a full-screen picture | **Meshes on the GPU** through Metal on a Mac and Vulkan on a Pi 4 and Windows. The mesh stays on the GPU; the host has calls for a shader pair, a mesh and a frame. 4× multisampling where the device has it. The Pi draws the Mesh demo in 36ms a frame, where three of its cores take 62 to 98ms. The SPIR-V modules pass `spirv-val` |
+| GLSL fragment only | GLSL has a vertex stage too, checked by compiling as GLSL ES 1.00 and desktop 1.20. No host draws with it yet |
+| Shaders only | **Typed functions that Lisp calls as native code**: a file with no `main` is a set of functions, e.g. a matrix product, and these run as fast as the hand-written VP (52ns for a mat4 product on an M4 Max). "Compute on the CPU first"; GPU compute is still to come |
+| Built each time | **Kept by hash.** Native code, Metal text and SPIR-V are cached under the SHA-256 of the shader file *and* a hash of the back end's own source. Change a back end and its old output is simply not found: there is no version number to remember to bump |
+
+Checking got broader too. The test module has 157 tests and passes on ARM64
+macOS, a Pi 4, x86_64 macOS, RISC-V 64 and LoongArch 64 under QEMU, and the
+VP64 emulator. CPU (doubles) against GPU (32-bit floats) differs by at most
+about 0.01 per pixel on the raymarch, except for a `fract(sin(n) * 43758.5)`
+hash that depends on the float's last bits. Chris explains that difference
+instead of hiding it.
+
+Still not there, by his own list: **textures as inputs**, **GPU compute**,
+register spill in the VP back end (more than 16 float registers is refused),
+SIMD, and guarding GLSL's reserved words. Textures are exactly what our
+FXAA example needs (`aether_quote_design.md`, section 6), and ae3d's
+post-processing is mostly texture reads.
+
 ## 2. Where we stand
 
 **ae3d** is far ahead on rendering. Its shaders do TAA, SSR, SSAO, FXAA, bloom,
 sky, depth resolve, crowds, plus compute shaders for crowd sorting and skinning.
 Around them sit IK, locomotion, horde, water, weather, terrain and the rest.
-Chris has nothing near this.
+Chris has nothing near this. Since section 1b he has vertex shaders, meshes
+and a depth buffer, but still no textures as inputs and no compute, and ae3d
+needs both.
 
 But ae3d's shaders are GLSL text in heredocs (`src/ae3d/shaders/module.ae`,
 about 4,300 lines), with a second set of 24 `_vk` variants under
@@ -206,7 +246,8 @@ stable looks too costly.
 4. **Design `quote` as a trailing-block form** (Option 3): the syntax,
    what a capture becomes, which subset of the language is allowed, and what
    errors look like. Write it up in `aether/docs/` next to
-   `closures-and-builder-dsl.md` before building it.
+   `closures-and-builder-dsl.md` before building it. *Drafted:*
+   `docs/aether_quote_design.md` on this branch.
 5. **Use ae3d's shaders as the test set.** Migrate one shader at a time, and
    keep `tools/generate_shaders.ae` working throughout. The first payoff is
    retiring the duplicated GL and `_vk` GLSL variants, with one source emitted
@@ -216,20 +257,36 @@ stable looks too costly.
 7. **Later, and only if it earns its keep**: native CPU shaders (Aether to C
    to the C compiler, our version of his VP back end) and SIMD over a tile of
    pixels. That's the part Chris hasn't done yet either.
-8. **Read Chris's `spirv.inc` before writing our own SPIR-V emitter.** It
-   writes the binary directly in 339 lines. ae3d currently relies on
+8. **Read Chris's `spirv.inc` before writing our own SPIR-V emitter**, for
+   ideas only: we read it and then write ours from the SPIR-V spec. It
+   writes the binary directly, 339 lines then and 495 now, with vertex
+   stages. ae3d currently relies on
    glslang (`tools/generate_shaders.ae` runs `glslangValidator`). An emitter
    that writes the words itself would drop that dependency, though glslang
    should stay in CI as the checker.
 9. **Borrow his runtime patterns**, which carry straight over to ae3d:
    build pipelines on a worker thread with a CPU or placeholder picture
    meanwhile, and keep slow GPUs from stalling the frame.
+10. **Key generated shader output by content hash** (section 1b): the hash
+    of the source together with a hash of the emitter's own source. For
+    ae3d that means `tools/generate_shaders.ae`'s SPIR-V, and later whatever
+    a quoted tree emits. A cache whose key changes when the emitter changes
+    needs no version bump and never serves stale output.
+11. **One numeric language for shaders and plain functions.** His typed
+    functions for Lisp to call are the same language with arguments in
+    place of a pixel. With `quote`, the same falls out for us: a quoted
+    function that isn't a shader can go to the CPU evaluator or to C, and
+    later to GPU compute (`aether_quote_design.md`, section 8).
 
 ## 5. Sources
 
-- ChrysaLisp commits `7c6fba47f` (shader language) through `9db12a8a1`;
-  `docs/releases/v7.1.md` (draft), `lib/gpu/*.inc`, `cmd/shader.lisp`, `lib/gpu/shaders/raymarch.shader`,
-  `docs/ai_digest/shader_language.md`.
+- ChrysaLisp, checked out at `~/scm/not-ours/Cyl`: commits `7c6fba47f`
+  (shader language) through `9db12a8a1` for sections 1 to 4, and on to
+  `3326d4333` (2026-10-12) for section 1b;
+  `docs/releases/v7.1.md`, `v7.2.md`, `v7.3.md`, `lib/gpu/*.inc`,
+  `lib/gpu/shaders/`, `cmd/shader.lisp`,
+  `docs/ai_digest/shader_language.md` (sections "Functions For Lisp To Call",
+  "A file is known by a hash of it", "Do They Agree", "Limits").
 - `aether/docs/closures-and-builder-dsl.md`;
   `aether-ui/examples/calculator/calculator.ae`.
 - `ae3d/src/ae3d/shaders/module.ae`, `ae3d/src/ae3d/vkspirv/`,
