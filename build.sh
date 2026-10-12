@@ -193,8 +193,43 @@ export AETHER_LIB_DIR="$ROOT/src:$AEPHYSICS"
 # Where a build's time goes, on its last line: what CI's cost is made of
 # (#511), and what a change to the compile is measured against. Whole
 # seconds, since a build is several and bash 3.2 has no finer clock.
+# Whether every path in the file is still not there.
+still_absent() {
+    while IFS= read -r path; do
+        [ -e "$path" ] && return 1
+    done < "$1"
+    return 0
+}
+
 build_started=$SECONDS
-"$AETHERC" "$SOURCE" "$GEN"
+# The program's C from the last build of it, while nothing aetherc read for
+# it has changed (#511): aetherc compiles every module a program imports
+# into it, and a CI build was mostly that, the same C again for every
+# program a change did not reach. AE3D_AETHERC_CACHE names the directory;
+# unset, aetherc always runs. An entry holds while each file the compiler
+# read hashes the same, each path it looked for and did not find is still
+# not there (its --emit-deps manifest), and the compiler, the source and the
+# search path are the same.
+if [ -n "${AE3D_AETHERC_CACHE:-}" ]; then
+    if command -v sha256sum >/dev/null 2>&1; then SUM="sha256sum"; else SUM="shasum -a 256"; fi
+    entry="$AE3D_AETHERC_CACHE/$NAME"
+    stamp="$($SUM "$(command -v "$AETHERC")" | cut -d' ' -f1) $SOURCE $AETHER_LIB_DIR"
+    if [ -f "$entry/stamp" ] && [ "$(cat "$entry/stamp")" = "$stamp" ] &&
+       $SUM -c --status "$entry/read" 2>/dev/null && still_absent "$entry/absent"; then
+        cp "$entry/gen.c" "$GEN"
+        echo "aetherc: from the cache"
+    else
+        mkdir -p "$entry"
+        rm -f "$entry/stamp"
+        "$AETHERC" --emit-deps="$entry/deps" "$SOURCE" "$GEN"
+        awk '$1 == "read" { print substr($0, 6) }' "$entry/deps" | tr '\n' '\0' | xargs -0 $SUM > "$entry/read"
+        awk '$1 == "absent" { print substr($0, 8) }' "$entry/deps" > "$entry/absent"
+        cp "$GEN" "$entry/gen.c"
+        printf '%s' "$stamp" > "$entry/stamp"
+    fi
+else
+    "$AETHERC" "$SOURCE" "$GEN"
+fi
 aetherc_seconds=$((SECONDS - build_started))
 # C files a module compiles into the program with @source (contrib.vulkan's
 # loader, which contrib.vulkan.vk calls through): aetherc names them at the
