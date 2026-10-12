@@ -1,0 +1,506 @@
+// ae3d.shallow -- water that runs over the ground (#744): rivers, floods, a
+// burst main filling a street, a wave running up a beach and stopping. The
+// shallow-water equations over a square of the world, N cells a side, near
+// the player, over a ground the caller gives.
+//
+//   s = shallow.shallow_new(128, 64.0, 0.0, 0.0)        // 64 m round the origin
+//   shallow.shallow_ground_from(s, height_at, world)    // the bed under each cell
+//   shallow.shallow_fill_box(s, x0, z0, x1, z1, 3.0)    // a reservoir to 3 m
+//   shallow.shallow_step(s, delta)
+//   m = shallow.shallow_model(s)                        // drawn as water
+//   shallow.shallow_refresh(s)                          // each frame after the step
+//
+// The scheme is the flux form on a staggered grid: a depth in every cell, a
+// discharge (cubic metres a second a metre of width) on every face between
+// two. Each step gravity drives a face's discharge down the slope of the
+// water's surface, carried by the water standing above the higher of the
+// two beds there -- none where neither side is wet, so a dry bank stays dry
+// and water stands still over any ground when its surface is level; then
+// what flows out of a cell is held to what the cell holds, so no cell ever
+// goes below empty; then each depth takes its faces' net inflow. Every
+// cubic metre that leaves one cell enters the next: the volume is the
+// volume, to the floats' rounding. A little viscosity spreads each face's
+// discharge to its neighbours, which takes the grid's own two-cell ripple
+// out of a front and leaves the waves the street shows. Without the momentum's own advection: a
+// small wave runs at sqrt(g h), as the equations say, and a dam's front
+// over a dry bed at about two thirds of it, where Ritter's runs at twice
+// it -- a flood that reads right, not a hydraulics code. Stepped as many times a frame as the waves' speed and the
+// cell let it stay stable.
+import std.heap
+import ae3d.core
+
+exports (
+    Shallow, shallow_new, shallow_free, shallow_ground_from, shallow_set_ground, shallow_fill_box, shallow_clear,
+    shallow_add, shallow_step, shallow_depth, shallow_level, shallow_ground, shallow_volume,
+    shallow_wet_cells, shallow_cells, shallow_extent, shallow_origin_x, shallow_origin_z,
+    shallow_set_friction, shallow_set_viscosity, shallow_model, shallow_refresh, GRAVITY, DRY
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern sqrt(x: float) -> float
+extern floor(x: float) -> float
+extern exp(x: float) -> float
+
+const GRAVITY = 9.81
+// Water shallower than a millimetre is drawn as none, and is where the
+// drawn surface tucks under the ground.
+const DRY = 0.001
+
+struct Shallow {
+    n: int
+    extent: float                      // metres a side
+    x0: float                          // its corner in the world
+    z0: float
+    cell: float                        // metres a cell
+    ground: ptr                        // float[n * n]: the bed's height
+    depth: ptr                         // float[n * n]: the water's depth over it
+    qx: ptr                            // float[(n + 1) * n]: discharge across the face west of (i, j), toward +x
+    qz: ptr                            // float[n * (n + 1)]: across the face south of (i, j), toward +z
+    scale: ptr                         // float[n * n]: a step's share of each cell's outflow it can afford
+    was_x: ptr                         // float[(n + 1) * n]: qx before a step's viscosity
+    was_z: ptr                         // float[n * (n + 1)]
+    friction: float                    // the share of its flow water loses a second to the bed
+    viscosity: float                   // square metres a second the flow spreads to its neighbours
+    model: ptr                         // *Model, once asked for
+}
+
+shallow_new(n: int, extent: float, centre_x: float, centre_z: float) -> *Shallow {
+    s = heap.new(Shallow)
+    s.n = n
+    s.extent = extent
+    s.x0 = centre_x - extent * 0.5
+    s.z0 = centre_z - extent * 0.5
+    s.cell = extent / (n as float)
+    s.ground = calloc(n * n, 8)
+    s.depth = calloc(n * n, 8)
+    s.qx = calloc((n + 1) * n, 8)
+    s.qz = calloc(n * (n + 1), 8)
+    s.scale = calloc(n * n, 8)
+    s.was_x = calloc((n + 1) * n, 8)
+    s.was_z = calloc(n * (n + 1), 8)
+    s.friction = 0.2
+    // A cell's square a second: a wave two cells long, the grid's own ripple
+    // a front sheds, is gone in a tenth of a second; one ten metres long on
+    // a half-metre grid loses 4% a second.
+    s.viscosity = s.cell * s.cell
+    return s
+}
+
+shallow_free(s: *Shallow) {
+    if s == null { return }
+    free(s.ground)
+    free(s.depth)
+    free(s.qx)
+    free(s.qz)
+    free(s.scale)
+    free(s.was_x)
+    free(s.was_z)
+    heap.free(s)
+}
+
+shallow_cells(s: *Shallow) -> int { return s.n }
+shallow_extent(s: *Shallow) -> float { return s.extent }
+shallow_origin_x(s: *Shallow) -> float { return s.x0 }
+shallow_origin_z(s: *Shallow) -> float { return s.z0 }
+shallow_set_friction(s: *Shallow, share_a_second: float) { s.friction = share_a_second }
+shallow_set_viscosity(s: *Shallow, square_metres_a_second: float) { s.viscosity = square_metres_a_second }
+
+// The middle of cell (i, j) in the world.
+centre_x(s: *Shallow, i: int) -> float { return s.x0 + ((i as float) + 0.5) * s.cell }
+centre_z(s: *Shallow, j: int) -> float { return s.z0 + ((j as float) + 0.5) * s.cell }
+
+// The bed under every cell, from `height(context, x, z)` at its middle.
+shallow_ground_from(s: *Shallow, height: fn(ptr, float, float) -> float, context: ptr) {
+    g = s.ground as float[]
+    j = 0
+    while j < s.n {
+        i = 0
+        while i < s.n {
+            g[j * s.n + i] = height(context, centre_x(s, i), centre_z(s, j))
+            i = i + 1
+        }
+        j = j + 1
+    }
+}
+
+shallow_set_ground(s: *Shallow, i: int, j: int, height: float) {
+    if i < 0 || j < 0 || i >= s.n || j >= s.n { return }
+    (s.ground as float[])[j * s.n + i] = height
+}
+
+// No water anywhere, and none moving.
+shallow_clear(s: *Shallow) {
+    d = s.depth as float[]
+    qx = s.qx as float[]
+    qz = s.qz as float[]
+    k = 0
+    while k < s.n * s.n {
+        d[k] = 0.0
+        k = k + 1
+    }
+    k = 0
+    while k < (s.n + 1) * s.n {
+        qx[k] = 0.0
+        qz[k] = 0.0
+        k = k + 1
+    }
+}
+
+// Water to `level` over every cell of the box (x0, z0)-(x1, z1) whose bed is
+// under it: a reservoir, a pond, a flooded basement. Other cells keep theirs.
+shallow_fill_box(s: *Shallow, x0: float, z0: float, x1: float, z1: float, level: float) {
+    g = s.ground as float[]
+    d = s.depth as float[]
+    j = 0
+    while j < s.n {
+        i = 0
+        while i < s.n {
+            x = centre_x(s, i)
+            z = centre_z(s, j)
+            at = j * s.n + i
+            if x >= x0 && x <= x1 && z >= z0 && z <= z1 && level > g[at] { d[at] = level - g[at] }
+            i = i + 1
+        }
+        j = j + 1
+    }
+}
+
+// `metres` of water added over a disc `radius` across at (x, z), most in the
+// middle: rain on a spot, a burst main, a bucket. Negative takes it away,
+// never below empty.
+shallow_add(s: *Shallow, x: float, z: float, radius: float, metres: float) {
+    d = s.depth as float[]
+    j = 0
+    while j < s.n {
+        i = 0
+        while i < s.n {
+            dx = (centre_x(s, i) - x) / radius
+            dz = (centre_z(s, j) - z) / radius
+            q = dx * dx + dz * dz
+            if q < 1.0 {
+                at = j * s.n + i
+                d[at] = d[at] + metres * (1.0 - q) * (1.0 - q)
+                if d[at] < 0.0 { d[at] = 0.0 }
+            }
+            i = i + 1
+        }
+        j = j + 1
+    }
+}
+
+// The water `seconds` on.
+shallow_step(s: *Shallow, seconds: float) {
+    if seconds <= 0.0 { return }
+    // Stable while a gravity wave, sqrt(g h) at the deepest, crosses under
+    // a quarter of a cell a step: the scheme carries no momentum along with
+    // the flow, so the water's own speed sets no limit, and what leaves a
+    // cell is held to what it holds at any step. Counted against the
+    // fastest flow as well, a thin front's speed over its millimetres of
+    // depth asked for hundreds of steps a frame.
+    fastest = sqrt(GRAVITY * deepest(s))
+    steps = 1
+    if fastest > 0.0 { steps = (seconds * fastest / (0.25 * s.cell)) as int + 1 }
+    dt = seconds / (steps as float)
+    k = 0
+    while k < steps {
+        substep(s, dt)
+        k = k + 1
+    }
+}
+
+deepest(s: *Shallow) -> float {
+    d = s.depth as float[]
+    most = 0.0
+    k = 0
+    while k < s.n * s.n {
+        if d[k] > most { most = d[k] }
+        k = k + 1
+    }
+    return most
+}
+
+// The face between two cells, whose beds are `ga` and `gb` and depths `da`
+// and `db` (a toward -, b toward +), its discharge `q` a step `dt` on: down
+// the surface's slope, carried by the water above the higher bed, slowed by
+// the bed. None where no water stands above the higher bed.
+face(q: float, ga: float, da: float, gb: float, db: float, dt: float, cell: float, keep: float) -> float {
+    ea = ga + da
+    eb = gb + db
+    top = ea
+    if eb > top { top = eb }
+    bed = ga
+    if gb > bed { bed = gb }
+    over = top - bed
+    if over <= 0.0 { return 0.0 }
+    return (q - dt * GRAVITY * over * (eb - ea) / cell) * keep
+}
+
+// Each inner face's discharge moved toward its four neighbours' by the
+// viscosity, from the step's starting values; the faces then take their
+// slope and their dry banks as before.
+spread(s: *Shallow, dt: float) {
+    a = s.viscosity * dt / (s.cell * s.cell)
+    if a <= 0.0 { return }
+    if a > 0.2 { a = 0.2 }
+    n = s.n
+    w = n + 1
+    qx = s.qx as float[]
+    qz = s.qz as float[]
+    wx = s.was_x as float[]
+    wz = s.was_z as float[]
+    k = 0
+    while k < w * n {
+        wx[k] = qx[k]
+        wz[k] = qz[k]
+        k = k + 1
+    }
+    // qx is (n + 1) a row, n rows; its inner faces i 1..n-1.
+    j = 1
+    while j < n - 1 {
+        i = 2
+        while i < n - 1 {
+            f = j * w + i
+            qx[f] = wx[f] + a * (wx[f - 1] + wx[f + 1] + wx[f - w] + wx[f + w] - 4.0 * wx[f])
+            i = i + 1
+        }
+        j = j + 1
+    }
+    // qz is n a row, n + 1 rows; its inner faces j 1..n-1.
+    j = 2
+    while j < n - 1 {
+        i = 1
+        while i < n - 1 {
+            f = j * n + i
+            qz[f] = wz[f] + a * (wz[f - 1] + wz[f + 1] + wz[f - n] + wz[f + n] - 4.0 * wz[f])
+            i = i + 1
+        }
+        j = j + 1
+    }
+}
+
+substep(s: *Shallow, dt: float) {
+    n = s.n
+    g = s.ground as float[]
+    d = s.depth as float[]
+    qx = s.qx as float[]
+    qz = s.qz as float[]
+    scale = s.scale as float[]
+    keep = exp(0.0 - s.friction * dt)
+    spread(s, dt)
+    // The faces between cells; the square's rim is a wall, its faces 0.
+    j = 0
+    while j < n {
+        i = 1
+        while i < n {
+            a = j * n + i - 1
+            b = j * n + i
+            f = j * (n + 1) + i
+            qx[f] = face(qx[f], g[a], d[a], g[b], d[b], dt, s.cell, keep)
+            i = i + 1
+        }
+        j = j + 1
+    }
+    j = 1
+    while j < n {
+        i = 0
+        while i < n {
+            a = (j - 1) * n + i
+            b = j * n + i
+            f = j * n + i
+            qz[f] = face(qz[f], g[a], d[a], g[b], d[b], dt, s.cell, keep)
+            i = i + 1
+        }
+        j = j + 1
+    }
+    // What leaves each cell held to what it holds.
+    j = 0
+    while j < n {
+        i = 0
+        while i < n {
+            out = 0.0
+            west = qx[j * (n + 1) + i]
+            east = qx[j * (n + 1) + i + 1]
+            south = qz[j * n + i]
+            north = qz[(j + 1) * n + i]
+            if west < 0.0 { out = out - west }
+            if east > 0.0 { out = out + east }
+            if south < 0.0 { out = out - south }
+            if north > 0.0 { out = out + north }
+            out = out * dt / s.cell
+            at = j * n + i
+            scale[at] = 1.0
+            if out > d[at] {
+                scale[at] = 0.0
+                if out > 0.0 { scale[at] = d[at] / out }
+            }
+            i = i + 1
+        }
+        j = j + 1
+    }
+    j = 0
+    while j < n {
+        i = 1
+        while i < n {
+            f = j * (n + 1) + i
+            if qx[f] > 0.0 { qx[f] = qx[f] * scale[j * n + i - 1] } else { qx[f] = qx[f] * scale[j * n + i] }
+            i = i + 1
+        }
+        j = j + 1
+    }
+    j = 1
+    while j < n {
+        i = 0
+        while i < n {
+            f = j * n + i
+            if qz[f] > 0.0 { qz[f] = qz[f] * scale[(j - 1) * n + i] } else { qz[f] = qz[f] * scale[j * n + i] }
+            i = i + 1
+        }
+        j = j + 1
+    }
+    // Each depth takes its faces' net inflow.
+    j = 0
+    while j < n {
+        i = 0
+        while i < n {
+            at = j * n + i
+            inflow = qx[j * (n + 1) + i] - qx[j * (n + 1) + i + 1] + qz[j * n + i] - qz[(j + 1) * n + i]
+            d[at] = d[at] + inflow * dt / s.cell
+            if d[at] < 0.0 { d[at] = 0.0 }
+            i = i + 1
+        }
+        j = j + 1
+    }
+}
+
+// The cell under (x, z), clamped to the square.
+cell_index(s: *Shallow, x: float, z: float) -> int {
+    i = floor((x - s.x0) / s.cell) as int
+    j = floor((z - s.z0) / s.cell) as int
+    if i < 0 { i = 0 }
+    if j < 0 { j = 0 }
+    if i >= s.n { i = s.n - 1 }
+    if j >= s.n { j = s.n - 1 }
+    return j * s.n + i
+}
+
+// The water's depth at (x, z), the cell's under it.
+shallow_depth(s: *Shallow, x: float, z: float) -> float { return (s.depth as float[])[cell_index(s, x, z)] }
+
+// The bed's height at (x, z).
+shallow_ground(s: *Shallow, x: float, z: float) -> float { return (s.ground as float[])[cell_index(s, x, z)] }
+
+// The water's surface at (x, z): the bed and the depth over it.
+shallow_level(s: *Shallow, x: float, z: float) -> float {
+    at = cell_index(s, x, z)
+    return (s.ground as float[])[at] + (s.depth as float[])[at]
+}
+
+// All the water there is, cubic metres.
+shallow_volume(s: *Shallow) -> float {
+    d = s.depth as float[]
+    total = 0.0
+    k = 0
+    while k < s.n * s.n {
+        total = total + d[k]
+        k = k + 1
+    }
+    return total * s.cell * s.cell
+}
+
+// How many cells hold more than DRY.
+shallow_wet_cells(s: *Shallow) -> int {
+    d = s.depth as float[]
+    wet = 0
+    k = 0
+    while k < s.n * s.n {
+        if d[k] > DRY { wet = wet + 1 }
+        k = k + 1
+    }
+    return wet
+}
+
+// The surface as a model: a vertex a cell at the water's level where it is
+// wet and tucked a few centimetres under the bed where it is not, so the
+// wet edge is where the water meets the ground. Drawn as water: dark,
+// glossy, the sky in it, and what is under it seen through. Made once;
+// shallow_refresh moves it to the water after each step. The model is the
+// caller's, or the engine's once added to it: shallow_free leaves it.
+shallow_model(s: *Shallow) -> *Model {
+    if s.model != null { return s.model as *Model }
+    n = s.n
+    m = core.model_new()
+    core.mesh_reserve(m.mesh, n * n, (n - 1) * (n - 1) * 6)
+    up = core.vec3(0.0, 1.0, 0.0)
+    j = 0
+    while j < n {
+        i = 0
+        while i < n {
+            core.mesh_push_vertex(m.mesh, core.vec3(centre_x(s, i), drawn_height(s, j * n + i), centre_z(s, j)),
+                                  (i as float) / ((n - 1) as float), (j as float) / ((n - 1) as float), up)
+            i = i + 1
+        }
+        j = j + 1
+    }
+    j = 0
+    while j < n - 1 {
+        i = 0
+        while i < n - 1 {
+            a = j * n + i
+            core.mesh_push_triangle(m.mesh, a, a + n, a + 1)
+            core.mesh_push_triangle(m.mesh, a + 1, a + n, a + n + 1)
+            i = i + 1
+        }
+        j = j + 1
+    }
+    core.mesh_recalculate_normals(m.mesh)
+    core.model_update_matrix(m)
+    core.model_recalculate_bounds(m)
+    core.model_set_diffuse(m, 0.05, 0.11, 0.13)
+    core.model_set_pbr(m, 0.0, 0.06)
+    core.model_set_specular(m, 0.04, 0.04, 0.04)
+    core.model_set_alpha(m, 0.72)
+    m.blend = core.BLEND_ALPHA
+    s.model = m as ptr
+    return m
+}
+
+// Where a cell's vertex is drawn: on the water, or under the bed.
+drawn_height(s: *Shallow, at: int) -> float {
+    d = (s.depth as float[])[at]
+    g = (s.ground as float[])[at]
+    if d > DRY { return g + d }
+    return g - 0.05
+}
+
+// The model moved to the water as it now is: each vertex to its cell's
+// drawn height, its normal from its neighbours' across the grid -- the
+// heightfield's own, where recalculating it from every triangle was most of
+// the refresh.
+shallow_refresh(s: *Shallow) {
+    if s.model == null { return }
+    m = s.model as *Model
+    n = s.n
+    two = 2.0 * s.cell
+    j = 0
+    while j < n {
+        i = 0
+        while i < n {
+            at = j * n + i
+            here = drawn_height(s, at)
+            core.mesh_set_position(m.mesh, at, core.vec3(centre_x(s, i), here, centre_z(s, j)))
+            west = here
+            east = here
+            south = here
+            north = here
+            if i > 0 { west = drawn_height(s, at - 1) }
+            if i < n - 1 { east = drawn_height(s, at + 1) }
+            if j > 0 { south = drawn_height(s, at - n) }
+            if j < n - 1 { north = drawn_height(s, at + n) }
+            core.mesh_set_normal(m.mesh, at, core.v3_normalize(core.vec3((west - east) / two, 1.0, (south - north) / two)))
+            i = i + 1
+        }
+        j = j + 1
+    }
+    core.model_recalculate_bounds(m)
+}

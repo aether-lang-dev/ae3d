@@ -26,6 +26,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int instanceBillboard;
     int pointFlipbookColumns;
     int pointFlipbookRows;
+    float pointLift;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -57,6 +58,24 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float materialCutout;
     float materialNormalStrength;
+    float materialTileBreakup;
+    float materialTileRotation;
+    float materialVariation;
+    float materialVariationScale;
+    float materialDetailScale;
+    float materialDetailStrength;
+    float materialDetailFade;
+    float materialFire;
+    float materialTriplanar;
+    float materialSoft;
+    float materialGlitter;
+    float materialGlitterGrains;
+    float materialGlitterStrength;
+    float materialEmbers;
+    float materialEmberCover;
+    float materialEmberGlow;
+    int hasSceneDepth;
+    mat4 invViewProjection;
     int surfaceBlend;
     float reflectivity;
     float wetness;
@@ -143,11 +162,18 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec3 skyOvercastColor;
     vec3 skyFlat;
     float skyTurbidity;
+    vec2 cloudPassSize;
+    int cloudHistoryOn;
     float skyLevelSize;
     float skyRoughness;
+    vec3 groundAlbedo;
+    vec3 groundSun;
     float frameExposure;
     bool enableBloom;
     float bloomIntensity;
+    int hazeCount;
+    vec4 hazeColumn[4];
+    vec4 hazeShape[4];
     vec2 texelSize;
     int bloomFirst;
     float bloomThreshold;
@@ -156,7 +182,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float edgeThresholdMin;
     float subpixelQuality;
     int colorSampleCount;
-    mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
     float ssaoRadius;
@@ -181,14 +206,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float waterOpacity;
     bool enableFoam;
     float foamIntensity;
-    float waterPlaneHeight;
     float waterLevel;
     vec3 skyColor;
     vec3 horizonColor;
     bool enableWaterReflection;
     float waterReflectionIntensity;
     int hasSkyTexture;
-    int hasSceneDepth;
+    int waterSkyCapture;
+    vec3 rippleArea;
     float waterDepthFade;
     float waterShoreFoam;
     bool enableWaterDistortion;
@@ -210,6 +235,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
 layout(set = 0, binding = 1) uniform sampler2D textureSampler;
 layout(set = 0, binding = 2) uniform sampler2D shadowMap;
 layout(set = 0, binding = 3) uniform sampler2D normalMap;
+layout(set = 0, binding = 4) uniform sampler2D sceneDepth;
 layout(location = 0) in vec2 fragTexCoord;
 layout(location = 1) in vec3 Normal;
 layout(location = 2) in vec3 FragPos;
@@ -221,6 +247,7 @@ layout(location = 8) in vec3 BindPos;
 layout(location = 9) in float ClipLimb;
 layout(location = 10) in vec2 MaskUV;
 layout(location = 11) in float ParticleAlpha;
+layout(location = 12) in vec3 FlipNext;
 layout(location = 1) out vec2 outVelocity;
 
 
@@ -346,6 +373,71 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
 // (#711).
 
 
+// The texture's tiling broken up (#737): 1 samples it as hexagons, each an
+// offset copy turned by up to materialTileRotation of a half turn, blended
+// where they meet; 0 as it repeats.
+
+
+// The albedo varied over the world in patches of materialVariationScale
+// metres, by up to materialVariation either way (0: none).
+
+
+// The material's own textures again at materialDetailScale times their
+// frequency, by materialDetailStrength, gone by materialDetailFade metres:
+// the grain a texture magnified at the feet does not have (0: none).
+
+
+
+// Fire (#738): the texture's red is the flame's heat (0 to 1), cooled over
+// a particle's life by its colour's red, and the surface glows as a black
+// body at that share of materialFire kelvin, bright as its fourth power.
+// 0 for a surface that is not fire.
+
+// The material's textures taken from the world position on three planes,
+// a repeat every materialTriplanar metres, blended by the way the surface
+// faces (#737): slopes and cliffs without the stretch of one projection.
+// 0 for its UVs.
+
+// A soft particle (#738): faded out where what the scene drew behind it is
+// nearer than materialSoft metres, so a flame or a puff that meets the
+// ground melts into it instead of cutting a line across it (0: hard).
+
+// Glitter (#741): a share materialGlitter of the material's grains,
+// materialGlitterGrains of them a metre, each a facet tilted its own way
+// that flashes when it mirrors the sun into the eye, by
+// materialGlitterStrength (0: none). Sand, snow, frost, mica.
+
+
+
+// Embers (#738): the surface's cracks glowing as a black body up to
+// materialEmbers kelvin, materialEmberCover of its blocks alight, by
+// materialEmberGlow (0 kelvin: none). Charred wood, coal.
+
+
+
+
+
+
+
+// A stored scene depth as clip-space z: OpenGL keeps depth in 0..1 for a
+// clip range of -1..1, Vulkan's clip range is the 0..1 it stores.
+float scene_depth_clip(float depth) {
+    return depth;
+}
+
+// How much of a soft particle's alpha this fragment keeps: the gap to what
+// the scene drew behind it over its softness, 1 where it is clear of it.
+float soft_fade() {
+    if (materialSoft <= 0.0 || hasSceneDepth != 1) return 1.0;
+    vec2 suv = gl_FragCoord.xy / screenSize;
+    float d = texture(sceneDepth, suv).r;
+    if (d >= 0.99999) return 1.0;
+    vec4 clip = vec4(suv * 2.0 - 1.0, scene_depth_clip(d), 1.0);
+    vec4 world = invViewProjection * clip;
+    vec3 behind = world.xyz / world.w;
+    float gap = distance(viewPos, behind) - distance(viewPos, FragPos);
+    return clamp(gap / materialSoft, 0.0, 1.0);
+}
 // How the surface goes over what is behind it (#728): 0 opaque, 1 blended by
 // its alpha, 2 added to it. Only a blended one carries its texture's and its
 // point's alpha out.
@@ -805,6 +897,100 @@ vec3 kelvinToRGB(float kelvin) {
     }
 }
 
+// The colour a black body glows at `kelvin`, linear, its brightest channel
+// one: Helland's fit to the Planckian locus, red alone under about 1900 K
+// (an ember), yellow-white toward 3000 K (a flame's core).
+vec3 black_body(float kelvin) {
+    float t = max(kelvin, 500.0) / 100.0;
+    float g = t <= 6.6 ? 0.0 : clamp((99.4708025861 * log(t) - 161.1195681661) / 255.0, 0.0, 1.0);
+    float b = t <= 19.0 ? 0.0 : clamp((138.5177312231 * log(t - 10.0) - 305.0447927307) / 255.0, 0.0, 1.0);
+    return pow(vec3(1.0, g, b), vec3(2.2));
+}
+
+// A burning surface's own light (#738): char cracks into blocks, a cell of
+// the world each some 5 cm across, and the light comes from the thin
+// cracks between them. Which blocks are alight follows a broad noise some
+// 25 cm across, so the glow gathers in hot spots and does not check the
+// whole surface; an alight block's cracks are bright and the block glows
+// dimly through its skin, breathing on its own clock; elsewhere a crack is
+// barely warm. Radiance, as a black body at the heat's share of
+// materialEmbers, as bright as the heat's fourth power.
+float ember_hash(vec3 c) { return fract(sin(dot(c, vec3(41.3, 289.1, 157.7))) * 43758.5453); }
+float ember_noise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = p - i;
+    f = f * f * (3.0 - 2.0 * f);
+    float a = mix(mix(ember_hash(i), ember_hash(i + vec3(1, 0, 0)), f.x),
+                  mix(ember_hash(i + vec3(0, 1, 0)), ember_hash(i + vec3(1, 1, 0)), f.x), f.y);
+    float b = mix(mix(ember_hash(i + vec3(0, 0, 1)), ember_hash(i + vec3(1, 0, 1)), f.x),
+                  mix(ember_hash(i + vec3(0, 1, 1)), ember_hash(i + vec3(1, 1, 1)), f.x), f.y);
+    return mix(a, b, f.z);
+}
+vec3 ember_light() {
+    vec3 p = FragPos * 20.0;
+    vec3 i = floor(p);
+    vec3 f = p - i;
+    float f1 = 8.0;
+    float f2 = 8.0;
+    vec3 nearest = i;
+    for (int z = -1; z <= 1; z++) {
+        for (int y = -1; y <= 1; y++) {
+            for (int x = -1; x <= 1; x++) {
+                vec3 o = vec3(float(x), float(y), float(z));
+                vec3 c = i + o;
+                vec3 h = fract(sin(vec3(dot(c, vec3(127.1, 311.7, 74.7)), dot(c, vec3(269.5, 183.3, 246.1)),
+                                        dot(c, vec3(113.5, 271.9, 124.6)))) * 43758.5453);
+                float d = length(o + h - f);
+                if (d < f1) {
+                    f2 = f1;
+                    f1 = d;
+                    nearest = c;
+                } else if (d < f2) {
+                    f2 = d;
+                }
+            }
+        }
+    }
+    float crack = 1.0 - smoothstep(0.0, 0.07, f2 - f1);
+    float h = ember_hash(nearest);
+    float hot = ember_noise(nearest * 0.2) * 0.75 + h * 0.25;
+    float breath = 0.75 + 0.25 * sin(causticsTime * (0.9 + h * 1.6) + h * 37.0);
+    float heat = crack * 0.3;
+    if (hot < materialEmberCover) heat = mix(0.55, 1.0, crack) * breath * (0.8 + 0.2 * ember_noise(p * 0.7));
+    float h2 = heat * heat;
+    return black_body(heat * materialEmbers) * (h2 * h2) * materialEmberGlow;
+}
+
+// The key light glinting off the grains under this fragment (#741): the
+// grains a cell of the world each, a facet of each tilted its own way, a
+// mirror-sharp lobe. Where a pixel covers many grains it looks at one
+// coarser cell standing for them -- likelier to hold a facet that flashes,
+// as any of its grains might, and dimmer by the share of the pixel one
+// grain is -- so near the eye single grains sparkle, further off fewer and
+// fainter, never a crawl of noise.
+vec3 glitter(vec3 n, vec3 v, Light L) {
+    vec3 grid = FragPos * materialGlitterGrains;
+    float footprint = max(length(fwidth(grid)), 1e-4);
+    float level = max(ceil(log2(footprint)), 0.0);
+    if (level > 7.0) return vec3(0.0);
+    float scale = exp2(level);
+    vec3 cell = floor(grid / scale);
+    vec3 h = fract(sin(vec3(dot(cell, vec3(127.1, 311.7, 74.7)), dot(cell, vec3(269.5, 183.3, 246.1)),
+                            dot(cell, vec3(113.5, 271.9, 124.6)))) * 43758.5453);
+    float chance = min(materialGlitter * scale * scale, 1.0);
+    if (h.x > chance) return vec3(0.0);
+    vec3 l = normalize(L.direction);
+    float lit = max(dot(n, l), 0.0);
+    if (lit <= 0.0) return vec3(0.0);
+    // A grain's faces turn every way: its facet anywhere over the upper
+    // hemisphere, leaning toward the surface's normal.
+    vec3 k = fract(h * 13.731 + h.yzx * 7.17);
+    vec3 facet = normalize(n * 0.6 + (k * 2.0 - 1.0));
+    float flash = pow(max(dot(facet, normalize(l + v)), 0.0), 900.0);
+    return L.color * kelvinToRGB(L.temperature) * L.intensity * flash * lit * materialGlitterStrength / (scale * scale);
+}
+
+
 // Optimized Schlick's approximation for Fresnel reflectance
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     float invCosTheta = clamp(1.0 - cosTheta, 0.0, 1.0);
@@ -1245,9 +1431,148 @@ mat3 cotangent_frame(vec3 normal, vec3 position, vec2 uv) {
     return mat3(tangent * scale, bitangent * scale, normal);
 }
 
+// --- the tiling broken up: hex-tile sampling (Mikkelsen, "Practical
+// Real-Time Hex-Tiling", JCGT 2022). The plane is cut into hexagons; each
+// samples the texture offset at random and turned, and the three over a
+// point blend by how near it is to each one's middle, sharpened toward the
+// brighter so the blend keeps the texture's contrast instead of greying it.
+// The derivatives are turned with the coordinates, so the mips stay right
+// across the seams. Worked out once in main, read by the colour and the
+// normal map alike.
+bool hexOn = false;
+vec3 hexWeights = vec3(1.0, 0.0, 0.0);
+vec2 hexUV[3];
+mat2 hexTurn[3];
+vec2 hexDx = vec2(0.0);
+vec2 hexDy = vec2(0.0);
+
+vec2 hex_offset(ivec2 cell) {
+    vec2 q = vec2(cell);
+    return fract(sin(vec2(dot(q, vec2(127.1, 311.7)), dot(q, vec2(269.5, 183.3)))) * 43758.5453);
+}
+
+mat2 hex_rotation(ivec2 cell, float strength) {
+    float angle = abs(float(cell.x * cell.y)) + abs(float(cell.x + cell.y)) + 3.14159265;
+    angle = mod(angle, 6.28318531);
+    if (angle > 3.14159265) angle -= 6.28318531;
+    angle *= strength;
+    float c = cos(angle);
+    float s = sin(angle);
+    return mat2(c, -s, s, c);
+}
+
+void hex_setup(vec2 uv, float rotation) {
+    hexDx = dFdx(uv);
+    hexDy = dFdy(uv);
+    vec2 skewed = mat2(1.0, -0.57735027, 0.0, 1.15470054) * (uv * 3.46410162);
+    ivec2 base = ivec2(floor(skewed));
+    vec3 t = vec3(fract(skewed), 0.0);
+    t.z = 1.0 - t.x - t.y;
+    float s = step(0.0, -t.z);
+    float s2 = 2.0 * s - 1.0;
+    hexWeights = vec3(-t.z * s2, s - t.y * s2, s - t.x * s2);
+    int si = int(s);
+    ivec2 cells[3];
+    cells[0] = base + ivec2(si, si);
+    cells[1] = base + ivec2(si, 1 - si);
+    cells[2] = base + ivec2(1 - si, si);
+    for (int k = 0; k < 3; k++) {
+        hexTurn[k] = hex_rotation(cells[k], rotation);
+        vec2 middle = mat2(1.0, 0.0, 0.5, 0.86602540) * vec2(cells[k]) / 3.46410162;
+        hexUV[k] = hexTurn[k] * (uv - middle) + middle + hex_offset(cells[k]);
+    }
+    hexOn = true;
+}
+
+vec4 hex_texture(sampler2D tex) {
+    vec4 c0 = textureGrad(tex, hexUV[0], hexTurn[0] * hexDx, hexTurn[0] * hexDy);
+    vec4 c1 = textureGrad(tex, hexUV[1], hexTurn[1] * hexDx, hexTurn[1] * hexDy);
+    vec4 c2 = textureGrad(tex, hexUV[2], hexTurn[2] * hexDx, hexTurn[2] * hexDy);
+    vec3 luma = vec3(0.299, 0.587, 0.114);
+    vec3 bright = mix(vec3(1.0), vec3(dot(c0.rgb, luma), dot(c1.rgb, luma), dot(c2.rgb, luma)), 0.6);
+    vec3 w = bright * pow(hexWeights, vec3(7.0));
+    w /= max(w.x + w.y + w.z, 1e-6);
+    hexWeights = w;
+    return w.x * c0 + w.y * c1 + w.z * c2;
+}
+
+// The normal map through the same hexagons and weights, each sample's
+// tilt turned back into the surface's own frame.
+vec3 hex_normal() {
+    vec3 n = vec3(0.0);
+    for (int k = 0; k < 3; k++) {
+        vec3 s = textureGrad(normalMap, hexUV[k], hexTurn[k] * hexDx, hexTurn[k] * hexDy).xyz * 2.0 - 1.0;
+        s.xy = transpose(hexTurn[k]) * s.xy;
+        n += hexWeights[k] * s;
+    }
+    return n;
+}
+
+// How much of the detail layer this fragment takes, worked out in main.
+float detailWeight = 0.0;
+
+// --- triplanar mapping (#737): the world position projected on the
+// planes across x, y and z, each sampled, blended by the fourth power of
+// how squarely the surface faces it.
+bool triOn = false;
+vec3 triWeights = vec3(0.0, 1.0, 0.0);
+vec2 triX = vec2(0.0);
+vec2 triY = vec2(0.0);
+vec2 triZ = vec2(0.0);
+
+void tri_setup(vec3 n, vec3 position, float metres) {
+    vec3 w = pow(abs(n), vec3(4.0));
+    triWeights = w / max(w.x + w.y + w.z, 1e-6);
+    vec3 q = position / metres;
+    triX = q.zy;
+    triY = q.xz;
+    triZ = q.xy;
+    triOn = true;
+}
+
+vec4 tri_texture(sampler2D tex) {
+    return texture(tex, triX) * triWeights.x + texture(tex, triY) * triWeights.y + texture(tex, triZ) * triWeights.z;
+}
+
+// How much a normal map's own bumps, averaged away by its mips, have to be
+// put back into the roughness (Toksvig 2005): a filtered normal shorter
+// than one is bumps the pixel covers, and a highlight over them spreads
+// instead of sparkling. Read by main's roughness.
+float normalVariance = 0.0;
+
+float toksvig(float len, float strength) {
+    float l = clamp(len, 0.001, 1.0);
+    return min((1.0 - l) / l * strength * strength, 1.0);
+}
+
+// The normal maps of the three planes, each tilt laid on the surface's own
+// normal by the whiteout blend (Golus, "Normal Mapping for a Triplanar
+// Shader", 2017) and the three blended.
+vec3 tri_normal(vec3 n, float strength) {
+    vec3 tx = texture(normalMap, triX).xyz * 2.0 - 1.0;
+    vec3 ty = texture(normalMap, triY).xyz * 2.0 - 1.0;
+    vec3 tz = texture(normalMap, triZ).xyz * 2.0 - 1.0;
+    normalVariance = toksvig(length(tx) * triWeights.x + length(ty) * triWeights.y + length(tz) * triWeights.z, strength);
+    tx.xy *= strength;
+    ty.xy *= strength;
+    tz.xy *= strength;
+    tx = vec3(tx.xy + n.zy, abs(tx.z) * n.x);
+    ty = vec3(ty.xy + n.xz, abs(ty.z) * n.y);
+    tz = vec3(tz.xy + n.xy, abs(tz.z) * n.z);
+    return normalize(tx.zyx * triWeights.x + ty.xzy * triWeights.y + tz.xyz * triWeights.z);
+}
+
 vec3 mapped_normal(vec3 normal, vec3 position, vec2 uv) {
-    vec3 sampled = texture(normalMap, uv).xyz * 2.0 - 1.0;
-    sampled.xy *= normalStrength * materialNormalStrength;
+    float strength = normalStrength * materialNormalStrength;
+    if (triOn) return tri_normal(normal, strength);
+    vec3 sampled = hexOn ? hex_normal() : texture(normalMap, uv).xyz * 2.0 - 1.0;
+    normalVariance = toksvig(length(sampled), strength);
+    if (detailWeight > 0.0) {
+        // Whiteout blend: the fine tilt added to the coarse, the coarse kept.
+        vec3 fine = texture(normalMap, uv * materialDetailScale).xyz * 2.0 - 1.0;
+        sampled = vec3(sampled.xy + fine.xy * detailWeight, sampled.z);
+    }
+    sampled.xy *= strength;
     return normalize(cotangent_frame(normal, position, uv) * sampled);
 }
 
@@ -1759,8 +2084,22 @@ void main() {
     // temporal pass dragged its history by whatever the driver left there.
     outVelocity = velocity(ClipNow, ClipPrev, jitter);
 
-    vec4 texColor = texture(textureSampler, fragTexCoord);
+    vec4 texColor;
+    if (materialTriplanar > 0.0) {
+        tri_setup(normalize(Normal), FragPos, materialTriplanar);
+        texColor = tri_texture(textureSampler);
+    } else if (materialTileBreakup > 0.0) {
+        hex_setup(fragTexCoord, materialTileRotation);
+        texColor = hex_texture(textureSampler);
+    } else {
+        texColor = texture(textureSampler, fragTexCoord);
+        if (FlipNext.z >= 0.0) texColor = mix(texColor, texture(textureSampler, FlipNext.xy), FlipNext.z);
+    }
     if (texColor.a < materialCutout) discard;
+    if (materialDetailScale > 0.0 && !triOn) {
+        float away = length(FragPos - viewPos);
+        detailWeight = materialDetailStrength * (1.0 - smoothstep(materialDetailFade * 0.5, materialDetailFade, away));
+    }
     
     // An emissive surface is its own light source, so it skips shading. It does
     // not skip having a colour: this returned a hardcoded white, which made an
@@ -1776,8 +2115,14 @@ void main() {
     //
     // exposure is the emissive strength, scaled so the 10.0 that opens this
     // branch means 1x. Below that the surface is lit normally.
+    if (materialFire > 0.0) {
+        float heat = clamp(texColor.r * InstanceColor.r, 0.0, 1.0);
+        vec3 glowing = black_body(heat * materialFire) * (heat * heat * heat * heat) * max(exposure * 0.1, 1.0);
+        FragColor = vec4(glowing * diffuseColor, texColor.a * materialAlpha * ParticleAlpha * soft_fade());
+        return;
+    }
     if (exposure > 10.0) {
-        float glowAlpha = surfaceBlend != 0 ? texColor.a * materialAlpha * ParticleAlpha : 1.0;
+        float glowAlpha = surfaceBlend != 0 ? texColor.a * materialAlpha * ParticleAlpha * soft_fade() : 1.0;
         FragColor = vec4(diffuseColor * texColor.rgb * InstanceColor * (exposure * 0.1), glowAlpha);
         return;
     }
@@ -1834,6 +2179,24 @@ void main() {
         albedo = mix(albedo, layer, smoothstep(1.0, 0.94, woundAt));
     }
 
+    // The detail layer's colour, as a ratio to the texture's own mean (its
+    // last mip), so it adds grain without shifting the colour.
+    if (detailWeight > 0.0) {
+        vec3 fine = texture(textureSampler, fragTexCoord * materialDetailScale).rgb;
+        vec3 mean = max(textureLod(textureSampler, fragTexCoord, 16.0).rgb, vec3(0.02));
+        albedo *= mix(vec3(1.0), clamp(fine / mean, vec3(0.0), vec3(2.0)), detailWeight);
+    }
+
+    // Patches over the world, two octaves of value noise, so a texture
+    // repeated across a field is not the same from one stretch to the next.
+    if (materialVariation > 0.0) {
+        vec3 cell = FragPos / max(materialVariationScale, 0.01);
+        float v = clipValueNoise(cell) * 0.65 + clipValueNoise(cell * 2.7 + vec3(13.1, 7.3, 2.9)) * 0.35;
+        // Value noise keeps near its middle; stretched, the amount is reached.
+        v = smoothstep(0.25, 0.75, v);
+        albedo *= 1.0 + (v * 2.0 - 1.0) * materialVariation;
+    }
+
     // GPU Gems Chapter 5: Apply Perlin noise for surface detail if enabled
     if (enablePerlinNoise) {
         vec3 noiseCoord = FragPos * noiseScale;
@@ -1870,7 +2233,8 @@ void main() {
 
     float NdotV = clamp(dot(norm, viewDir), 0.001, 1.0); // Avoid zero division
     // Ensure minimum roughness to prevent point light artifacts
-    float adjustedRoughness = max(roughness, 0.08); // Balanced minimum roughness
+    // The normal map's averaged-away bumps widen the lobe (Toksvig).
+    float adjustedRoughness = max(sqrt(roughness * roughness + normalVariance), 0.08);
     // Rain on the surface: the flatter it lies, the more it holds. Darker,
     // smoother, and a mirror at a grazing angle.
     float wet = wetness * clamp(norm.y, 0.0, 1.0);
@@ -1920,6 +2284,9 @@ void main() {
         vec3 backFill;
         vec3 lit = direct_light(lights[i], norm, viewDir, albedo, F0, NdotV, adjustedRoughness, backFill);
         Lo += (i == 0 ? lit * sunlit * shaded : lit) + backFill;
+    }
+    if (materialGlitter > 0.0 && lightCount > 0 && lights[0].isDirectional == 1) {
+        Lo += glitter(norm, viewDir, lights[0]) * sunlit * shaded;
     }
     if (clusterDims.w > 0.5) {
         int cell = cluster_of(FragPos);
@@ -1982,6 +2349,7 @@ void main() {
     // the bloom and the tone curve are the post pass's, once for the whole
     // frame, so the colour written here is radiance.
     color = color * exposure;
+    if (materialEmbers > 0.0) color += ember_light();
 
     // The air between the eye and the surface: the light the haze scatters
     // toward the eye in place of the surface's. Its radiance is the fog colour
@@ -1999,7 +2367,7 @@ void main() {
     if (materialAlpha >= 0.99) {
         finalAlpha = 1.0; // Force fully opaque for materials that should be opaque
     }
-    if (surfaceBlend != 0) finalAlpha = texColor.a * materialAlpha * ParticleAlpha;
+    if (surfaceBlend != 0) finalAlpha = texColor.a * materialAlpha * ParticleAlpha * soft_fade();
     
     FragColor = vec4(color, finalAlpha);
 }

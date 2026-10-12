@@ -22,6 +22,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int instanceBillboard;
     int pointFlipbookColumns;
     int pointFlipbookRows;
+    float pointLift;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -53,6 +54,24 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float materialCutout;
     float materialNormalStrength;
+    float materialTileBreakup;
+    float materialTileRotation;
+    float materialVariation;
+    float materialVariationScale;
+    float materialDetailScale;
+    float materialDetailStrength;
+    float materialDetailFade;
+    float materialFire;
+    float materialTriplanar;
+    float materialSoft;
+    float materialGlitter;
+    float materialGlitterGrains;
+    float materialGlitterStrength;
+    float materialEmbers;
+    float materialEmberCover;
+    float materialEmberGlow;
+    int hasSceneDepth;
+    mat4 invViewProjection;
     int surfaceBlend;
     float reflectivity;
     float wetness;
@@ -139,11 +158,18 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec3 skyOvercastColor;
     vec3 skyFlat;
     float skyTurbidity;
+    vec2 cloudPassSize;
+    int cloudHistoryOn;
     float skyLevelSize;
     float skyRoughness;
+    vec3 groundAlbedo;
+    vec3 groundSun;
     float frameExposure;
     bool enableBloom;
     float bloomIntensity;
+    int hazeCount;
+    vec4 hazeColumn[4];
+    vec4 hazeShape[4];
     vec2 texelSize;
     int bloomFirst;
     float bloomThreshold;
@@ -152,7 +178,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float edgeThresholdMin;
     float subpixelQuality;
     int colorSampleCount;
-    mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
     float ssaoRadius;
@@ -177,14 +202,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float waterOpacity;
     bool enableFoam;
     float foamIntensity;
-    float waterPlaneHeight;
     float waterLevel;
     vec3 skyColor;
     vec3 horizonColor;
     bool enableWaterReflection;
     float waterReflectionIntensity;
     int hasSkyTexture;
-    int hasSceneDepth;
+    int waterSkyCapture;
+    vec3 rippleArea;
     float waterDepthFade;
     float waterShoreFoam;
     bool enableWaterDistortion;
@@ -213,6 +238,10 @@ layout(location = 1) out vec3 fragNormal;
 layout(location = 2) out vec3 fragPosition;
 layout(location = 3) out vec4 ClipNow;
 layout(location = 4) out vec4 ClipPrev;
+// How far under the sea's surface the eye is, the surface over the eye
+// from the same trains (#742); negative above it.
+layout(location = 5) out float EyeBelow;
+
 
 
 
@@ -369,4 +398,21 @@ void main() {
     ClipNow = viewProjection * vec4(worldPos, 1.0);
     ClipPrev = prevViewProjection * vec4(worldPos, 1.0);
     gl_Position = ClipNow;
+
+    // The surface over the eye: the trains summed where the eye stands, as
+    // they are summed at every vertex. A camera a few metres up is above
+    // the swell, where a fixed level five metres over the sea's took it for
+    // under, and every sea seen from a boat drew as its own underside.
+    vec3 eyeAt = vec3(viewPos.x, 0.0, viewPos.z);
+    float over = 0.0;
+    for (int i = 0; i < 4; i++) {
+        float randomFactor = 1.0;
+        if (waveRandomness > 0.001) {
+            float randomNoise = perlinNoise(eyeAt.xz * 0.01 + time * 0.1 + float(i), 2);
+            randomFactor = mix(1.0, 0.5 + randomNoise, waveRandomness);
+        }
+        over += calculateGerstnerWave(eyeAt, waveDirections[i], waveAmplitudes[i] * waveHeightMultiplier * randomFactor,
+                                      waveFrequencies[i], waveSpeeds[i], wavePhases[i], waveSteepness[i], time).y;
+    }
+    EyeBelow = model[3].y + over * 1.5 - viewPos.y;
 }

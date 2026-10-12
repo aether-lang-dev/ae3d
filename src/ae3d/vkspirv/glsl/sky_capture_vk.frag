@@ -23,6 +23,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int instanceBillboard;
     int pointFlipbookColumns;
     int pointFlipbookRows;
+    float pointLift;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -54,6 +55,24 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float materialCutout;
     float materialNormalStrength;
+    float materialTileBreakup;
+    float materialTileRotation;
+    float materialVariation;
+    float materialVariationScale;
+    float materialDetailScale;
+    float materialDetailStrength;
+    float materialDetailFade;
+    float materialFire;
+    float materialTriplanar;
+    float materialSoft;
+    float materialGlitter;
+    float materialGlitterGrains;
+    float materialGlitterStrength;
+    float materialEmbers;
+    float materialEmberCover;
+    float materialEmberGlow;
+    int hasSceneDepth;
+    mat4 invViewProjection;
     int surfaceBlend;
     float reflectivity;
     float wetness;
@@ -140,11 +159,18 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec3 skyOvercastColor;
     vec3 skyFlat;
     float skyTurbidity;
+    vec2 cloudPassSize;
+    int cloudHistoryOn;
     float skyLevelSize;
     float skyRoughness;
+    vec3 groundAlbedo;
+    vec3 groundSun;
     float frameExposure;
     bool enableBloom;
     float bloomIntensity;
+    int hazeCount;
+    vec4 hazeColumn[4];
+    vec4 hazeShape[4];
     vec2 texelSize;
     int bloomFirst;
     float bloomThreshold;
@@ -153,7 +179,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float edgeThresholdMin;
     float subpixelQuality;
     int colorSampleCount;
-    mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
     float ssaoRadius;
@@ -178,14 +203,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float waterOpacity;
     bool enableFoam;
     float foamIntensity;
-    float waterPlaneHeight;
     float waterLevel;
     vec3 skyColor;
     vec3 horizonColor;
     bool enableWaterReflection;
     float waterReflectionIntensity;
     int hasSkyTexture;
-    int hasSceneDepth;
+    int waterSkyCapture;
+    vec3 rippleArea;
     float waterDepthFade;
     float waterShoreFoam;
     bool enableWaterDistortion;
@@ -213,7 +238,13 @@ layout(location = 0) out vec4 FragColor;
 // from (#655), each texel the sky in its direction, without the sun's and
 // the moon's discs -- the key light is them, and counted twice it would
 // light everything again.
-#ifndef AE3D_SKY_CAPTURE
+// AE3D_CLOUD_PASS: the clouds alone over the screen at half the frame's
+// size, folded into the frames before (#317); the sky draw reads them
+// back. Both are screen passes, with no velocity and no discs.
+#if defined(AE3D_SKY_CAPTURE) || defined(AE3D_CLOUD_PASS)
+#define AE3D_SKY_SCREEN 1
+#endif
+#ifndef AE3D_SKY_SCREEN
 layout(location = 1) out vec2 outVelocity;
 
 in vec3 TexCoords;
@@ -233,13 +264,12 @@ in vec4 ClipPrev;
 // drawn from. The key light may be the moon, at night; the sky is the
 // hour's whatever lights the scene (#526).
 
-// The frame, when a temporal pass folds frames (TAA, DLSS), else zero. The
-// march is dithered per pixel; turned by the frame, the dither is a
-// different set of steps every frame and the temporal pass averages them,
-// so the grain at the horizon -- where a step is a hundred metres -- goes,
-// and the march takes several frames' samples for one frame's cost. Zero
-// keeps the dither still: without a pass to fold it, a turning dither is
-// grain that crawls.
+// The frame, for the cloud pass (#317). The march is dithered per pixel;
+// turned by the frame, the dither is a different set of steps every frame
+// and the pass's history averages them, so the grain at the horizon --
+// where a step is a hundred metres -- goes, and the march takes several
+// frames' samples for one frame's cost. The capture, with no history to
+// fold it, keeps its dither still.
 
 // Where the eye is: the layer stands in the world, over the ground it
 // shadows, so the march starts from the camera and not from the origin.
@@ -262,6 +292,10 @@ in vec4 ClipPrev;
 // one): what the daylight sky is drawn from with the sun.
 
 
+// The clouds' march, in the two passes that march them: the capture and
+// the cloud pass. The sky draw reads the cloud pass's result.
+#if defined(AE3D_SKY_SCREEN)
+vec3 display_radiance(vec3 shown);
 // Clouds, shared by the sky that draws them and the ground they shadow.
 // A layer between CLOUD_BASE and CLOUD_TOP metres up. Where cloud is, over
 // the world, is the weather field: a fractal of tileable 2D value noise
@@ -344,11 +378,21 @@ float cloudCoverage(vec2 xz, float cover, float t) {
 // fractal of forty hashes.
 
 
+// And the detail (#317), read where a cloud is near: curl noise in RGB that
+// turns the sample position, a Worley fractal in A that its edges billow
+// into. At binding 9 on Vulkan, where a model draw keeps its damage mask.
+#ifdef VULKAN
+layout(set = 0, binding = 9) uniform sampler3D cloudDetail;
+#else
+
+#endif
 
 // The cloud's extinction, per metre at full density: the one constant
 // the sun's shade and the eye's alpha both use, so a cloud that hides the
-// sky hides the sun the same.
-const float CLOUD_SIGMA = 0.025;
+// sky hides the sun the same. At 0.025 a cloud of density 0.2 took 600 m
+// to hide the sky: every cloud was a fuzz the eye saw deep into, its
+// shaded middle darker than its rim.
+const float CLOUD_SIGMA = 0.12;
 
 float remap(float v, float lo, float hi, float newLo, float newHi) {
     return newLo + (clamp(v, lo, hi) - lo) / max(hi - lo, 1e-5) * (newHi - newLo);
@@ -358,17 +402,23 @@ float remap(float v, float lo, float hi, float newLo, float newHi) {
 // builds it: the weather says where cloud is and what kind; the height
 // profile gives the kind its shape, a low flat stratus or a tall cumulus;
 // the Perlin-Worley shape carves the body, the Worley fractal erodes its
-// edges into detail -- wispy at the base, billowing above.
-float cloudDensity(vec3 p, float cover, float t, out float heightFraction) {
+// edges into detail -- wispy at the base, billowing above. `detailed`
+// reads the detail texture as well, which the eye's march wants and the
+// far steps toward the sun do not.
+float cloudDensity(vec3 p, float cover, float t, bool detailed, out float heightFraction) {
     vec3 weather = texture(cloudWeather, cloudWeatherUv(p.xz, t)).rgb;
     float cov = cloudCoverageFrom(vec2(weather.r, weather.b), cover);
     heightFraction = clamp((p.y - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE), 0.0, 1.0);
     if (cov <= 0.0) return 0.0;
     // A stratus fills the bottom third of the layer, a cumulus climbs to
-    // its top; more cover, taller clouds.
-    float kind = weather.g;
-    float top = mix(0.30, 1.0, kind) * (0.6 + 0.4 * cov);
-    float profile = smoothstep(0.0, 0.18, heightFraction) * (1.0 - smoothstep(top * 0.55, top, heightFraction));
+    // its top; more cover, taller clouds. The kind is the weather's value
+    // noise pushed apart, so a sky has towers among its flat clouds and not
+    // only the middling kind the noise mostly is.
+    float kind = smoothstep(0.25, 0.75, weather.g);
+    float top = mix(0.30, 1.0, kind) * (0.75 + 0.25 * cov);
+    // A flat base -- the condensation level, where a cumulus starts at
+    // once -- and a crown rounded off toward the top.
+    float profile = smoothstep(0.0, 0.04, heightFraction) * (1.0 - smoothstep(top * 0.4, top, heightFraction));
     if (profile <= 0.0) return 0.0;
     // The shape, at a scale where a texel is twenty metres and the tile
     // a kilometre and a half, blown along by the wind.
@@ -380,13 +430,23 @@ float cloudDensity(vec3 p, float cover, float t, out float heightFraction) {
     // only the cores.
     float d = remap(base, 1.0 - cov, 1.0, 0.0, 1.0) * cov;
     if (d <= 0.0) return 0.0;
-    // Detail: the Worley fractal at four times the scale, eating the edges;
-    // inverted near the base, where a cloud is wisps, upright above, where
-    // it billows.
+    // The shape's Worley fractal at six times the scale, puffs some sixty
+    // metres across, eating the edges.
     vec4 fine = texture(cloudShape, sp * 6.0 + vec3(0.37, 0.21, 0.63) + vec3(t * 0.01, 0.0, 0.0));
-    float detail = fine.g * 0.625 + fine.b * 0.25 + fine.a * 0.125;
+    float puffs = fine.g * 0.625 + fine.b * 0.25 + fine.a * 0.125;
+    // And the detail texture's, a tile of 240 m whose billows are 15 to
+    // 60 m, its position turned by the curl so the base trails off in
+    // wisps and the tops break into cauliflower. Inverted near the base,
+    // where a cloud is wisps, upright above, where it billows.
+    float detail = puffs;
+    if (detailed) {
+        vec3 dp = p * (1.0 / 240.0) + vec3(t * 0.012, 0.0, t * 0.005);
+        vec3 curl = texture(cloudDetail, dp * 0.25).rgb * 2.0 - 1.0;
+        dp += curl * (0.25 * (1.0 - heightFraction));
+        detail = mix(puffs, texture(cloudDetail, dp).a, 0.6);
+    }
     float erosion = mix(detail, 1.0 - detail, clamp(heightFraction * 6.0, 0.0, 1.0));
-    d = remap(d, erosion * 0.4, 1.0, 0.0, 1.0);
+    d = remap(d, erosion * 0.45, 1.0, 0.0, 1.0);
     return clamp(d, 0.0, 1.0);
 }
 
@@ -414,7 +474,7 @@ float cloudSunShade(vec3 p, vec3 sun, float cover, float t) {
     float hf;
     for (int k = 0; k < 6; k++) {
         p += sun * step;
-        shade += cloudDensity(p, cover, t, hf) * step;
+        shade += cloudDensity(p, cover, t, k < 2, hf) * step;
         step *= 1.6;
     }
     return shade;
@@ -440,15 +500,42 @@ vec4 cloudsAlong(vec3 dir, vec3 sky, float cover, float t, float dither) {
     // a cloud.
     float t1 = min(CLOUD_TOP / dir.y, t0 + 12000.0);
     float slant = 1.0 - clamp(dir.y, 0.0, 1.0);
+    // Half the steps in the cloud pass, whose history folds a dozen frames'
+    // dithered marches into each texel (#317).
+#ifdef AE3D_CLOUD_PASS
+    float fine = (t1 - t0) / (16.0 + 32.0 * slant * slant);
+#else
     float fine = (t1 - t0) / (32.0 + 64.0 * slant * slant);
+#endif
     float coarse = fine * 3.0;
     vec3 sun = normalize(cloudSun);
-    vec3 sunLight = cloudSunColor * 1.0;
+    // Lit in radiance (#317), as the scene's surfaces are, and composited
+    // over the sky's radiance before the frame's one tone curve: a crown
+    // in the sun is as bright as it is, a silver lining past white, and the
+    // exposure follows them as it follows the ground. A thick cloud gives
+    // back the sun about as a white surface of albedo 0.9 does: the key
+    // light's irradiance, cloudSunColor, times 0.9 over pi.
+    vec3 sunLight = cloudSunColor * (0.9 / 3.14159265);
+    // The sky behind the ray, as light: what lights the cloud from round it
+    // and what the haze fades it to. Lifted toward a neutral of its own
+    // brightness by day, when the ground and the air scatter light up into
+    // the layer, and not at night, when a cloud lit only by a dark sky is a
+    // darker patch of it.
+    vec3 skyRadiance = display_radiance(sky);
+    float skyShown = dot(sky, vec3(0.299, 0.587, 0.114));
+    float skyBright = dot(skyRadiance, vec3(0.299, 0.587, 0.114));
+    vec3 skyLight = mix(skyRadiance, vec3(skyBright * 1.6), 0.35 * clamp(skyShown * 2.5, 0.0, 1.0));
     // Forward scattering for the silver lining, a little back scattering
-    // for the bright face of a cloud lit from behind the eye; scaled so a
-    // cloud beside the sun is lit as if it scattered evenly.
+    // for the bright face of a cloud lit from behind the eye; scaled so
+    // light scattered evenly is one. One lobe pair an octave of Beer's law
+    // below, flatter each time (Wrenninge's multiple scattering): light
+    // that has scattered many times has forgotten where the sun was, which
+    // is why a cumulus lit from behind the eye is white and not the 0.3 of
+    // the sun a single scattering gave it.
     float cosAngle = dot(dir, sun);
-    float phase = mix(cloudPhase(cosAngle, 0.5), cloudPhase(cosAngle, -0.25), 0.30) * 12.566;
+    float phase0 = mix(cloudPhase(cosAngle, 0.5), cloudPhase(cosAngle, -0.25), 0.30) * 12.566;
+    float phase1 = mix(cloudPhase(cosAngle, 0.25), cloudPhase(cosAngle, -0.125), 0.30) * 12.566;
+    float phase2 = mix(cloudPhase(cosAngle, 0.125), cloudPhase(cosAngle, -0.0625), 0.30) * 12.566;
     vec3 colour = vec3(0.0);
     float alpha = 0.0;
     float ray = t0 + fine * dither;
@@ -458,7 +545,7 @@ vec4 cloudsAlong(vec3 dir, vec3 sky, float cover, float t, float dither) {
         if (ray > t1) break;
         vec3 p = vec3(viewPos.x, 0.0, viewPos.z) + dir * ray;
         float hf;
-        float d = cloudDensity(p, cover, t, hf);
+        float d = cloudDensity(p, cover, t, true, hf);
         if (d > 0.002) {
             if (dt > fine) {
                 // Struck cloud on a coarse stride: back up to where the
@@ -472,27 +559,30 @@ vec4 cloudsAlong(vec3 dir, vec3 sky, float cover, float t, float dither) {
             float shade = cloudSunShade(p, sun, cover, t);
             // The sun through the cloud above: three octaves of Beer's law,
             // the way light that has scattered a few times still gets
-            // through, so a base is grey and not black.
+            // through, so a base is grey and not black, each with its
+            // octave's phase and half the one before's weight (Wrenninge):
+            // the light scattered many times is light the eye gets besides
+            // the once-scattered, which is why a thick cloud gives the sun
+            // back almost as a white wall does. Weighed to one between them,
+            // a cloud lit from behind the eye was 82% of a white wall's
+            // brightness as it shows.
             float tau = shade * CLOUD_SIGMA;
-            float beer = 0.50 * exp(-tau) + 0.32 * exp(-tau * 0.25) + 0.18 * exp(-tau * 0.0625);
+            float scattered = exp(-tau) * phase0 + 0.5 * exp(-tau * 0.25) * phase1 +
+                              0.25 * exp(-tau * 0.0625) * phase2;
             // Darker where the cloud is thin against the light: the powder
             // effect, the crevices of a cumulus reading darker than its
             // domes.
-            float powder = 1.0 - 0.7 * exp(-d * 8.0);
-            // The sky's light, from the blue above and the ground below,
-            // dimmed down the layer and inside the cloud.
-            // Lifted toward white by day, when the ground and the air
-            // scatter light up into the layer, and not at night, when a
-            // cloud lit only by a dark sky is a darker patch of it.
-            float skyLuma = dot(sky, vec3(0.299, 0.587, 0.114));
-            vec3 skyLight = mix(sky, vec3(1.0), 0.35 * clamp(skyLuma * 2.5, 0.0, 1.0));
-            vec3 ambient = skyLight * mix(0.30, 0.50, hf) * (0.6 + 0.4 * exp(-tau * 0.5));
-            vec3 c = sunLight * beer * powder * phase + ambient;
-            // Rolled off, since the sky is drawn without the scene's tone
-            // curve and a lit crown would otherwise clip to paper white.
-            c = c / (1.0 + c * 0.45);
+            float powder = 1.0 - 0.5 * exp(-d * 12.0);
+            // The sky's light, dimmed down the layer and inside the cloud.
+            // Most of what lights a cloud's shaded side is the cloud: light
+            // scattered many times through it and the field of cloud round
+            // it, with the sky's. A side turned from the sun is a lighter
+            // grey than the base, not the dark middle a single-scattering
+            // ambient left it.
+            vec3 ambient = skyLight * mix(0.62, 1.0, hf) * (0.7 + 0.3 * exp(-tau * 0.25));
+            vec3 c = sunLight * scattered * powder + ambient;
             float haze = 1.0 - exp(-ray * 0.00005);
-            c = mix(c, sky, haze);
+            c = mix(c, skyRadiance, haze);
             float a = (1.0 - exp(-d * dt * CLOUD_SIGMA)) * (1.0 - 0.8 * haze);
             colour += c * a * (1.0 - alpha);
             alpha += a * (1.0 - alpha);
@@ -511,6 +601,34 @@ vec4 cloudsAlong(vec3 dir, vec3 sky, float cover, float t, float dither) {
     float horizon = smoothstep(0.04, 0.32, dir.y);
     return vec4(colour * horizon, alpha * horizon);
 }
+
+#endif
+
+// The cloud pass's own (#317): its size and whether there is a history
+// yet. A texel looks along the direction the sky's view and projection
+// give it, and last frame's view-projection, the eye's move left out,
+// finds where that direction was then, so the history is read from where
+// the clouds were drawn. Each frame marches every texel with the dither
+// turned by the frame, and folds an eighth of it into what the frames
+// before left: the march's grain averages away and a texel's samples are
+// a dozen frames'.
+
+
+#ifdef AE3D_CLOUD_PASS
+
+#endif
+// The sky draw's: what the cloud pass left, read at the pixel's place on
+// the screen.
+#ifdef AE3D_CLOUD_PASS
+
+
+
+#else
+#ifndef AE3D_SKY_SCREEN
+
+
+#endif
+#endif
 
 // The daylight sky as light (#655): Preetham, Shirley and Smits' analytic
 // model, the sky's luminance and colour in every direction from the sun's
@@ -579,7 +697,7 @@ vec3 proceduralSky(vec3 dir, vec3 sun, vec3 sunColor) {
     if (dayShare > 0.0) sky = mix(dusk, shown_of(daylight(dir, sun, skyTurbidity)), dayShare);
     float cosAngle = dot(dir, sun);
     float day = smoothstep(-0.14, 0.06, sun.y);
-#ifndef AE3D_SKY_CAPTURE
+#ifndef AE3D_SKY_SCREEN
     float disc = smoothstep(0.9993, 0.9997, cosAngle);
     sky += sunColor * disc * (0.6 + 1.4 * day);
 #endif
@@ -634,7 +752,7 @@ vec3 nightSky(vec3 dir, vec3 moon, float night) {
     }
     if (moon.y > 0.0) {
         float c = dot(dir, moon);
-#ifndef AE3D_SKY_CAPTURE
+#ifndef AE3D_SKY_SCREEN
         add += vec3(0.82, 0.86, 0.95) * smoothstep(0.99955, 0.99975, c) * 1.4;
 #endif
         add += vec3(0.30, 0.34, 0.45) * pow(max(c, 0.0), 60.0) * 0.18;
@@ -715,8 +833,15 @@ vec3 oct_texel_direction(vec2 uv, float size) {
 #endif
 
 void main() {
-#ifdef AE3D_SKY_CAPTURE
+#if defined(AE3D_SKY_CAPTURE)
     vec3 dir = oct_texel_direction(gl_FragCoord.xy / SKY_SIZE, SKY_SIZE);
+#elif defined(AE3D_CLOUD_PASS)
+    // The texel's direction through the projection (its offset terms are
+    // a jitter or an off-centre frustum) and the view's turn, which has no
+    // translation in it.
+    vec2 ndc = gl_FragCoord.xy / cloudPassSize * 2.0 - 1.0;
+    vec3 eye = vec3((ndc.x + projection[2][0]) / projection[0][0], (ndc.y + projection[2][1]) / projection[1][1], -1.0);
+    vec3 dir = normalize(transpose(mat3(view)) * eye);
 #else
     vec3 dir = normalize(TexCoords);
 #endif
@@ -750,12 +875,31 @@ void main() {
         float luma = dot(broad, vec3(0.299, 0.587, 0.114));
         sky = mix(sky, skyOvercastColor * (0.35 + 0.65 * luma), clamp(skyOvercast, 0.0, 1.0));
     }
+#ifdef AE3D_SKY_SCREEN
     vec2 grain = gl_FragCoord.xy;
-    if (cloudFrame > 0) grain += 5.588238 * float(cloudFrame % 64);
+#ifdef AE3D_CLOUD_PASS
+    grain += 5.588238 * float(cloudFrame % 64);
+#endif
     vec4 clouds = cloudsAlong(dir, sky, cloudCover, cloudTime, cloudDither(grain));
-    sky = sky * (1.0 - clouds.a) + clouds.rgb;
-    FragColor = vec4(display_radiance(sky), 1.0);
-#ifndef AE3D_SKY_CAPTURE
+#else
+    vec4 clouds = vec4(0.0);
+    if (cloudCover > 0.0) clouds = texture(cloudBuffer, gl_FragCoord.xy / screenSize);
+#endif
+#ifdef AE3D_CLOUD_PASS
+    // Where this direction was last frame, and what was drawn there.
+    if (cloudHistoryOn == 1) {
+        vec4 then = prevViewProjection * vec4(dir, 0.0);
+        vec2 at = then.xy / max(then.w, 1e-5) * 0.5 + 0.5;
+        if (then.w > 0.0 && at.x >= 0.0 && at.x <= 1.0 && at.y >= 0.0 && at.y <= 1.0) {
+            clouds = mix(texture(cloudHistory, at), clouds, 0.125);
+        }
+    }
+    FragColor = clouds;
+#else
+    // The clouds are radiance, premultiplied: over the sky's.
+    FragColor = vec4(display_radiance(sky) * (1.0 - clouds.a) + clouds.rgb, 1.0);
+#endif
+#ifndef AE3D_SKY_SCREEN
     outVelocity = velocity(ClipNow, ClipPrev, vec2(0.0));
 #endif
 }

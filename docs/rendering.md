@@ -27,9 +27,27 @@ The feature list in full, with the reasoning behind each. The [README](../README
   (#526). A light's back fill, the light it lends the side turned from it,
   is never shadowed: under the sun's map, cast up through the ground, it
   had been a night's whole light, and a shadow took a third of it.
+- **Ground that holds up to the horizon (#737).** Scene textures filter
+  across up to 16 texels at a slant (`engine_set_anisotropy`, both
+  backends), so ground ahead of a walker stays sharp where one mip blurred
+  it: a 1 m checker's detail at a grazing view reads 71.7 at 16 against
+  44.6 at 1 (`tests/test_anisotropy.ae`). A material can break up its
+  repeat (`material_set_tile_breakup`: hex-tile sampling, three offset and
+  optionally turned copies blended, Mikkelsen 2022), vary its albedo over
+  world patches (`material_set_variation`), and add its own textures again
+  at a finer scale near the eye (`material_set_detail`), for the grain a
+  texture magnified at the feet does not have. `tests/test_tile_breakup.ae`:
+  a repeating noise wall's frame matches itself a tile over at 0.94 and at
+  0.01 broken up; varied, a white wall's spread is 0.076 against 0.002;
+  the detail layer takes a magnified wall's grain from 16.8 to 46.1.
+  `material_set_triplanar` maps a material from the world on three planes
+  (slopes and cliffs without stretch, whiteout-blended normals), and every
+  normal map's averaged-away bumps widen its roughness (Toksvig), so a
+  highlight over bumps finer than a pixel spreads instead of sparkling.
 - **Instances as matrices or as points.** An instanced model carries a
   matrix, a colour and a phase per instance, or -- `model_enable_point_instancing`
-  -- a position, a scale, a colour and a phase in eight floats, with the
+  -- a position, a scale, a colour and a phase, and a particle's alpha, life
+  and turn, in twelve floats, with the
   model's own rotation and scale applied to all of them in the shader. A
   million grains of sand that all move in a frame are a 32 MB stream
   instead of an 80 MB one built matrix by matrix, on both backends. An
@@ -93,6 +111,42 @@ The feature list in full, with the reasoning behind each. The [README](../README
   parent's, so bones are ordinary models: a clip exported from Blender drives a
   bone exactly as it drives a part, and `ae3d.ik` solves a limb of bones
   without being told they belong to a skin.
+- **The sea mirrors the sky drawn (#742).** `water.simulation_set_sky_capture`
+  reflects the frame's own captured sky and lights the water by its
+  irradiance; the underside is drawn only when the eye is under the surface
+  over it (`tests/test_water_sky.ae`).
+- **Bodies that float (#637).** `water.simulation_height_at` and
+  `simulation_normal_at` are the sea's surface on the CPU, the vertex
+  shader's four trains summed the same way (a drawn vertex is within 3
+  micrometres of the height the query gives over it), and
+  `buoyancy.floater(sea, body, half)` floats a body on it: its box as four
+  columns over its bottom corners, each pushed up by the water it displaces
+  and held back at a share of critical damping, so it rights itself and
+  rolls with a swell. A box half water's density settles 0.51 under, a
+  quarter's 0.25, and on a 2 m swell one rises and falls 2.08 m
+  (`tests/test_buoyancy.ae`). `ae3d.ripples` draws the small waves bodies
+  make over the swell (`water.simulation_set_ripples`): a damped wave
+  equation a floater disturbs as it moves through the surface, so a boat
+  leaves a wake and a bobbing crate rings the water.
+- **Water that runs over the ground (#744).** `ae3d.shallow` is the
+  shallow-water equations over a square near the player, a depth a cell
+  and a discharge a face, over whatever ground the caller gives
+  (`shallow_ground_from`): gravity drives each face down the water's slope,
+  carried by the water above the higher of its two beds, so a dry bank
+  stays dry and water over any ground stands still when its surface is
+  level; a cell gives no more than it holds, so the volume is the volume;
+  a little viscosity takes the grid's own two-cell ripple out of a front.
+  `shallow_fill_box`, `shallow_add` and `shallow_clear` put water in and
+  take it out, `shallow_level` and `shallow_depth` read it, and
+  `shallow_model` draws it as a heightfield, tucked under the ground where
+  dry, moved each frame by `shallow_refresh`. A lake over a bumpy bed stays
+  level to a tenth of a millimetre, a dam breaking keeps its volume to a
+  part in 10^11, a small wave runs at 3.25 m/s against sqrt(g h)'s 3.13, a
+  dam's front over a dry bed at two thirds of sqrt(g h0), and a wave runs
+  up a beach and falls back to rest at its level (`tests/test_shallow.ae`).
+  With 3.5 m of water a frame costs 0.24 ms at 128 x 128 cells and 1.28 ms
+  at 256 x 256 (M1 Pro, -O2). `examples/flood.ae` lets a dam go down a
+  street.
 - **Water that is water.** A Gerstner sea with deep-water dispersion, shaded
   as one physically based surface: Schlick fresnel between the body of the
   water and the reflected sky (the scene's own skybox image, where it has
@@ -108,13 +162,34 @@ The feature list in full, with the reasoning behind each. The [README](../README
 - **Volumetric clouds.** A layer of cloud marched in the sky shader over
   whatever sky is set, built the way a production sky builds it: a weather
   map says where cloud is and what kind, from a low stratus to a tall
-  cumulus; a tileable Perlin-Worley cube gives the body and a Worley
-  fractal erodes its edges, wisps at the base and billows above; each
-  sample is lit by the sun through the cloud over it, in three octaves of
-  Beer's law with the powder darkening and a two-lobe phase, and by the
-  sky. The noise is baked once at start into a 2D and a 3D texture
-  (`ae3d.cloudnoise`), so the march is a fetch a sample and the
-  clouds are a millisecond and a half of the frame. The ground computes
+  cumulus, with flat bases at the condensation level; a tileable
+  Perlin-Worley cube gives the body and a Worley fractal erodes its edges;
+  close up a detail cube of curl noise turns the sample position and its
+  own Worley fractal breaks the edges into wisps at the base and
+  cauliflower above (#317). Each sample is lit by the sun through the
+  cloud over it, in three octaves of Beer's law each with its own
+  two-lobe phase, flatter each octave and half the one before's weight
+  (Wrenninge's multiple scattering), with the powder darkening, and by the
+  sky. It is lit in radiance as the ground is -- the key light's
+  irradiance, a thick cloud giving it back as a white surface of albedo 0.9
+  does -- and laid over the sky's radiance before the frame's one tone
+  curve, so a crown in the sun is as bright as it is and the exposure
+  follows it: a cloud lit from behind the eye shows at 204 where a white
+  wall square to the same sun shows at 225 (one scattering left it at 0.3
+  of the sun). The noise is baked
+  once at start into a 2D and two 3D textures (`ae3d.cloudnoise`), so the
+  march is a fetch a sample. The march runs in a cloud pass of its own
+  before the scene, at half the frame's size, half the steps a frame with
+  the dither turned every frame, each texel folded at an eighth into its
+  history read back from where its direction was last frame (#317): the
+  march's grain averages away, a view reached by turning matches one held
+  still, and the sky draw only reads the result. The sky's light (the
+  capture) follows the clouds every half second of drift and the eye
+  every 16 m. Over smooth_terrain's view at 2560x1440 on an M1 Pro the
+  clouds are 4.0 ms of the frame on OpenGL and 9.1 ms on Vulkan, where
+  marched in the sky draw at every pixel they were 12.8 and 24.6. The
+  sky is drawn after the opaque geometry, so a GPU that shades in draw
+  order spares it the pixels the ground covers. The ground computes
   the same weather field where the sun's ray meets the layer, so their
   shadows cross the terrain as they drift. One call,
   `engine_set_clouds(cover, wind)`, on either backend.
@@ -996,10 +1071,48 @@ the way it faces at a rate it is born with. A point carries its alpha, its
 life gone and its turn in its record of the stream, twelve floats now
 (`core.model_set_instance_extras`), and a model of any mesh can take a
 blend (`core.model_set_blend`) or a flipbook (`core.model_set_flipbook`).
-`tests/test_particles_drawn.ae` draws, on both renderers alike, a flipbook's
-first frame a quarter through its life and its second three quarters
-through, two added particles at one place 531 bright against one's 384,
-and a blended one at alpha 0.5 at 243 against 384.
+`tests/test_particles_drawn.ae` draws, on both renderers alike, a flipbook
+mostly its first frame a quarter through its life and mostly its second
+three quarters through, two added particles at one place 531 bright
+against one's 384, and a blended one at alpha 0.5 at 243 against 384.
+
+The engine's fire (#738). `set_fire(em, kelvin)` makes each particle a
+flame simulated by `ae3d.flames`: a small 2D fluid (Stam's stable fluids,
+with vorticity confinement, Fedkiw et al.) run once at load, a puff of hot
+gas fed at the grid's foot and let go, baked into a 4 by 4 flipbook of
+64 by 128 frames in about 25 ms. A frame's red is the flame's heat; the
+shader glows it as a black body at that share of `kelvin`, as bright as
+the fourth power of it (`core.model_set_fire`), so a flame's core is
+yellow-white and its rags red, and colour keys' red cools it over a life.
+Its frames blend into each other rather than stepping, its quads are twice
+as tall as wide and stand on their point (`core.model_set_billboard_lift`).
+`set_smoke(em)` plays the same run's smoke. `set_area(em, radius)` births
+particles over a disc (a fire across its logs), `set_stretch(em, seconds)`
+draws them along their flight as it shows on screen (sparks), `set_glow(em,
+brightness)` makes them glow, and `set_light(em, kelvin, power, range,
+lift)` gives the fire a point light of the black body's colour flickering
+about its power on the emitter's own clock. A blended emitter keeps its
+texture's soft rim: `set_blend` cuts only opaque particles. `set_soft(em,
+metres)` fades blended particles out near what the scene drew behind them,
+from the scene's depth (fire's and smoke's are soft by default). `set_haze(em, radius, height, strength)` keeps a column of hot air over
+the emitter that the composite ripples the frame through (four a scene);
+it ripples whatever the column covers on the screen, nearer things too.
+`set_heat(em, kelvin)` glows sparks the same way without the flame's
+flipbook: each a black body at its colour's red share of `kelvin`, so a
+spark rises yellow-white and dies a dull red as it fades. And a mesh can
+burn: `core.model_set_embers(m, kelvin, cover, glow)` keeps it lit as it
+is and adds the light of its char -- blocks some 5 cm across, from the
+world position, with thin cracks between them; `cover` of them alight,
+gathered in hot spots by a broader noise, their cracks bright and their
+skin glowing dimly, each breathing on its own clock; elsewhere a crack is
+barely warm. Charred logs, a bed of coals. A charred wall up close glows
+red-hot over none of itself with none alight, 0.30 with half and 0.57 with
+all, red over blue 12 (`tests/test_tile_breakup.ae`, both renderers).
+`examples/campfire.ae` is all of it. `tests/test_flames.ae`: the same seed
+bakes the same flames to the byte, the heat's middle climbs from 12 cells
+to 31 by the eighth frame and the last frame gives off 0.005% of the
+brightest's light. `tests/test_particles_drawn.ae`: a flame at full heat
+draws (250, 232) red and green, cooled to 0.6 (193, 63), on both renderers.
 
 ### Rain on the surfaces
 

@@ -22,6 +22,7 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int instanceBillboard;
     int pointFlipbookColumns;
     int pointFlipbookRows;
+    float pointLift;
     vec3 viewPos;
     mat4 model;
     mat4 viewProjection;
@@ -53,6 +54,24 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialAlpha;
     float materialCutout;
     float materialNormalStrength;
+    float materialTileBreakup;
+    float materialTileRotation;
+    float materialVariation;
+    float materialVariationScale;
+    float materialDetailScale;
+    float materialDetailStrength;
+    float materialDetailFade;
+    float materialFire;
+    float materialTriplanar;
+    float materialSoft;
+    float materialGlitter;
+    float materialGlitterGrains;
+    float materialGlitterStrength;
+    float materialEmbers;
+    float materialEmberCover;
+    float materialEmberGlow;
+    int hasSceneDepth;
+    mat4 invViewProjection;
     int surfaceBlend;
     float reflectivity;
     float wetness;
@@ -139,11 +158,18 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec3 skyOvercastColor;
     vec3 skyFlat;
     float skyTurbidity;
+    vec2 cloudPassSize;
+    int cloudHistoryOn;
     float skyLevelSize;
     float skyRoughness;
+    vec3 groundAlbedo;
+    vec3 groundSun;
     float frameExposure;
     bool enableBloom;
     float bloomIntensity;
+    int hazeCount;
+    vec4 hazeColumn[4];
+    vec4 hazeShape[4];
     vec2 texelSize;
     int bloomFirst;
     float bloomThreshold;
@@ -152,7 +178,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float edgeThresholdMin;
     float subpixelQuality;
     int colorSampleCount;
-    mat4 invViewProjection;
     float ssrRoadHeight;
     float ssrStrength;
     float ssaoRadius;
@@ -177,14 +202,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float waterOpacity;
     bool enableFoam;
     float foamIntensity;
-    float waterPlaneHeight;
     float waterLevel;
     vec3 skyColor;
     vec3 horizonColor;
     bool enableWaterReflection;
     float waterReflectionIntensity;
     int hasSkyTexture;
-    int hasSceneDepth;
+    int waterSkyCapture;
+    vec3 rippleArea;
     float waterDepthFade;
     float waterShoreFoam;
     bool enableWaterDistortion;
@@ -207,6 +232,7 @@ layout (location = 0) in vec3 inPosition;
 layout (location = 3) in mat4 instanceModel;
 layout (location = 8) in vec4 inJoints;
 layout (location = 9) in vec4 inWeights;
+
 
 
 
@@ -272,7 +298,7 @@ void main() {
             float sy = length(vec3(model[1])) * point.w;
             float sz = length(vec3(model[2])) * point.w;
             modelMatrix = mat4(vec4(right * sx, 0.0), vec4(up * sy, 0.0), vec4(forward * sz, 0.0),
-                               vec4(point.xyz, 1.0));
+                               vec4(point.xyz + up * (sy * pointLift), 1.0));
         }
     }
     // And the same pose. A shadow pass that skipped this drew the bind pose,
