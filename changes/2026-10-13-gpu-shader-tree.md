@@ -1,9 +1,9 @@
 ### A shader as a tree: ae3d.gpu
 
 - New `ae3d.gpu`: a shader built as a tree of nodes (the shapes Aether's
-  planned `quote` will hand a library, `docs/aether_quote_design.md` on the
-  for_nic branch), written out as GLSL or run on the CPU. Step 1 of that
-  plan: the back ends proved before the compiler changes.
+  planned `quote` will hand a library, `docs/aether_quote_design.md`),
+  written out as GLSL or run on the CPU. Step 1 of that plan: the back ends
+  proved before the compiler changes.
 - The GLSL back end writes a Vulkan fragment shader: the captures in a small
   uniform block and a sampler binding each, the parameter at location 0, a
   return as the output colour, parenthesised only where the operators need
