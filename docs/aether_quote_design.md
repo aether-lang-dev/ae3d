@@ -106,6 +106,7 @@ Kinds, version 1:
 | `CALL` | arguments | `name` is the function as written, plus its module (`math.sin`) |
 | `FIELD` | object | `.x`, `name` holds the field |
 | `INDEX` | object, index | `a[i]` |
+| `MAKE` | field values | a struct literal, `Varyings { pos: p, uv: t }`; `type` is the struct, each child's `name` the field it sets |
 
 **Every node carries the type the type-checker gave it.** A back end that
 emits GLSL needs to know `t` is a `float` and `uv.x * 10.0` is a `float`; it
@@ -158,7 +159,7 @@ construct, says why, and points at its line:
 | actor sends, `spawn`, `receive`, `reply` | ditto |
 | `match` | not in v1; it would need the pattern kinds in the tree. Later |
 | string interpolation | v1 keeps `LIT` strings only. Later, as `CALL concat` |
-| a struct literal, `new`, an array literal | v1 has no node for them. Later, when a back end needs them |
+| `new`, an array literal | v1 has no node for them. Later, when a back end needs them |
 | taking a capture's address or writing a capture | the cell is shared with the program; a quote reads it |
 
 Example error:
@@ -234,11 +235,17 @@ What this shows, and what it asks of the language:
   binding, without anyone writing a uniform block. ae3d's shared 300-field
   `SceneBlock` could be replaced shader by shader.
 - **It needs vector types with arithmetic.** `uv + vec2(…) * texel` has to
-  type-check. Aether's `f32x4` lane type already has lane-wise operators and
-  `.x .y .z .w`. The open question is whether `vec2`, `vec3` and `vec4` can be
-  distinct types over a lane type, keeping its operators while staying
-  distinct to the checker so GLSL gets the right type names. If they can't,
-  that is a small language change of its own and comes first.
+  type-check. **Settled (2026-10-13, aether 0.809.0):** `vec2`, `vec3` and
+  `vec4` are distinct types over the `f32x4` lane type. They keep its
+  operators and `.x .y .z .w`, `vec4 * s` with a float variable is a `vec4`,
+  and `vec3 + vec4` is a type error, so GLSL gets the right type names from
+  the checker. Two compiler bugs stood in the way and are fixed
+  (aether#2778, in 0.809.0): a scalar variable did not splat across a lane
+  vector (only a literal did), and two different distinct types mixed in an
+  operator were accepted. No new language feature was needed.
+- **Matrices.** A `mat4` is a struct of four `vec4` columns in the shader
+  library, with `*` as a library function (`mul(m, v)`) until Aether has
+  operators on structs. Vertex shaders need it from the start (section 9).
 - **`if` as an expression** covers GLSL's `?:` (`CHOOSE` in the tree).
 - **An early `return`** inside the `if` is fine: it's a `RETURN` node, and
   GLSL keeps it as written.
@@ -303,7 +310,8 @@ From mapping the compiler; nothing here is built yet.
    `glslangValidator` to the same SPIR-V as `fxaa_vk.frag`, and the CPU
    evaluator matches the GPU within a tolerance on a test image. This needs
    no compiler change and settles the node kinds against a real shader.
-2. **Settle the vector-type question** (section 6), in aether.
+2. ~~**Settle the vector-type question** (section 6), in aether.~~ Done:
+   distinct types over `f32x4`, after aether#2778 (0.809.0).
 3. **`std.quote` and `AST_QUOTE` in aether**, expressions first, then
    statements, then captures. Each step has a regression test that prints the
    tree back as source, and an error test for each rejected construct. Then
@@ -318,14 +326,17 @@ From mapping the compiler; nothing here is built yet.
 6. **Vertex shaders.** ChrysaLisp's split is worth taking as an idea: a
    vertex shader's inputs and outputs are declared, and one vertex shader
    serves any pixel shader whose inputs it provides. For us the vertex
-   quote's return type is a struct of varyings, which the pixel quote takes
-   as its parameter.
+   quote's return type is a struct of varyings, built with a struct literal
+   (`MAKE`, which is why v1 has one), and the pixel quote takes it as its
+   parameter.
 
 ## 10. Open questions for Nic
 
+Nic said "go for it" on 2026-10-10. These are the questions still open; the
+vector-type one is settled (section 6).
+
 - **Is `quote.Tree`'s public shape stable enough to commit to?** It is the
   feature's long-term cost. Versioned and additive-only is the proposal.
-- **Vector types**: distinct types over the lane types, or something new?
 - **Build time instead of start-up?** Running the library at compile time
   (as a Lisp macro does) would mean running Aether inside `aetherc`. Not
   proposed now, but the tree format should not rule it out.
