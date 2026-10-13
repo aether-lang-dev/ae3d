@@ -1,551 +1,511 @@
-// ae3d.gpu: a shader as a tree of nodes, written out as GLSL or run on the
+// ae3d.gpu: a shader written with `quote`, written out as GLSL or run on the
 // CPU.
 //
-// Step 1 of docs/aether_quote_design.md. The nodes
-// are the shapes std.quote will hand a library once Aether has `quote`:
-// kind, type, name, op, literal text and children, every node carrying the
-// type the checker would give it. Until then a shader is built with the
-// calls below, which is what lets the back ends be proved before the
-// compiler is touched. A back end only ever walks a tree; it never parses.
+// A shader is a function whose body is a quote (ae3d.shaders.fxaa):
 //
-//   s = gpu.shader_new("fxaa", "TexCoords", "vec2")
-//   gpu.shader_capture(s, "texelSize", "vec2")      // a uniform
-//   gpu.shader_capture(s, "screenTexture", "sampler2D")
-//   b = gpu.block()
-//   gpu.add(b, gpu.let_("c", "vec3", gpu.field(gpu.call2("texture", "vec4",
-//       gpu.cap("screenTexture", "sampler2D"), gpu.local("TexCoords", "vec2")), "rgb", "vec3")))
-//   gpu.add(b, gpu.ret(gpu.call2("vec4", "vec4", gpu.local("c", "vec3"), gpu.f("1.0"))))
-//   gpu.shader_body(s, b)
-//   glsl = gpu.emit_glsl(s)                         // the fragment shader's text
-//   out = gpu.cpu_run(ctx, uv)                       // one pixel, on the CPU
+//   fxaa(screen: Texture, texel: vec2, edge: float, ...) -> *GpuShader {
+//       return fragment("fxaa") quote | uv: vec2 | { ... return vec4(c, 1.0) }
+//   }
 //
-// The GLSL back end writes a fragment shader: the captures become a small
-// uniform block (and a sampler binding each for the textures), the
-// parameter the varying at location 0, and a `return` the output colour.
-// The CPU back end runs the same tree over vec values in doubles, with
-// texture() reading an image bilinearly, clamped at its edges.
+// The compiler type-checks the body against ae3d.shaderlib and hands
+// fragment() the tree (std.quote), every node carrying its type. A back end
+// only ever walks that tree:
+//
+//   - emit_glsl writes a Vulkan fragment shader (#version 450): the
+//     captures that are not textures in a std140 uniform block, `Params`, at
+//     binding 0, each texture a sampler at the next binding, the parameter
+//     at location 0 and the value returned the output colour. params_*
+//     give the block's layout and params_write fills it from the captures'
+//     cells, which are the variables themselves: what the program last set
+//     is what the next frame reads. emit_screen_vertex writes the vertex
+//     shader a full-screen pass draws it with.
+//   - cpu_run runs the tree for one pixel over vec values in doubles, the
+//     captures read from their cells, texture() reading a Texture's ShaderImage.
+//
+// The tree's kinds this version takes: BLOCK, LET, ASSIGN, RETURN, IF,
+// WHILE, FOR, BREAK, CONTINUE, EXPR, LIT, LOCAL, CAPTURE, UNARY, BINARY,
+// CHOOSE, CALL and FIELD; INDEX is written as GLSL but not run, and MAKE
+// (a struct literal) is refused with the node's line. A shader owns its
+// tree: shader_free gives it back.
 
 import std.heap
 import std.list
+import std.lanes
+import std.quote
 import std.string
 import std.strbuilder
+import ae3d.shaderlib (Texture, ShaderImage, image_w, image_h, image_channel)
 
 exports (
-    GpuNode, GpuShader, GpuVal, GpuImage, GpuRun,
-    BLOCK, LET, ASSIGN, RETURN, IF, EXPR, LIT, LOCAL, CAPTURE, UNARY, BINARY,
-    CHOOSE, CALL, FIELD,
-    f, i, b, local, cap, bin, neg, not_, call1, call2, call3, call4, call, field,
-    choose, let_, assign, ret, iff, expr, block, add,
-    shader_new, shader_capture, shader_body, shader_name, shader_free,
-    emit_glsl, fxaa_shader,
+    GpuShader, GpuVal, GpuRun,
+    fragment, shader_free, shader_name, shader_tree, shader_hash,
+    emit_glsl, emit_screen_vertex,
+    params_count, params_name, params_type, params_offset, params_size, params_write,
+    samplers_count, samplers_name,
     v1, v2, v3, v4, val_n, val_x, val_y, val_z, val_w, val_bool,
-    image_new, image_set, image_get, image_w, image_h, image_free,
-    cpu_new, cpu_set, cpu_texture, cpu_run, cpu_free, last_error
+    cpu_new, cpu_run, cpu_free, last_error
 )
 
-// GpuNode kinds, version 1 of the tree (docs/aether_quote_design.md, section
-// 3). Added to, never renumbered.
-const BLOCK   = 1
-const LET     = 2
-const ASSIGN  = 3
-const RETURN  = 4
-const IF      = 5
-const EXPR    = 9
-const LIT     = 10
-const LOCAL   = 11
-const CAPTURE = 12
-const UNARY   = 13
-const BINARY  = 14
-const CHOOSE  = 15
-const CALL    = 16
-const FIELD   = 17
-
-struct GpuNode {
-    kind: int
-    type: string     // "float", "int", "bool", "vec2", "vec3", "vec4", "sampler2D"
-    name: string     // a local's, a capture's or a field's name; a called function's
-    op: string       // an operator
-    lit: string      // a literal's text, as written
-    num: float       // a literal's value
-    kids: ptr        // list of *GpuNode
-}
-
+// A shader: its name and the tree its quote made, which it owns.
 struct GpuShader {
     name: string
-    param: string        // the varying it is run for (a fragment's position)
-    param_type: string
-    captures: ptr        // list of *GpuNode (CAPTURE: name, type)
-    body: *GpuNode
+    tree: quote.Tree
 }
 
 var g_error = ""
 
+// Why the last emit or run failed.
 last_error() -> string { return g_error }
 
-_node(kind: int, type: string) -> *GpuNode {
-    n = heap.new(GpuNode)
-    n.kind = kind
-    n.type = type
-    n.name = ""
-    n.op = ""
-    n.lit = ""
-    n.num = 0.0
-    n.kids = list.new()
-    return n
-}
-
-_kid(n: *GpuNode, k: *GpuNode) -> *GpuNode {
-    list.add_raw(n.kids, k as ptr)
-    return n
-}
-
-_child(n: *GpuNode, i: int) -> *GpuNode {
-    return list.get_raw(n.kids, i) as *GpuNode
-}
-
-// ── Building a tree ────────────────────────────────────────────────────
-
-// A float literal from its text ("0.299"), which is what the GLSL shows.
-f(text: string) -> *GpuNode {
-    n = _node(LIT, "float")
-    n.lit = text
-    v, _e = string.to_float(text)
-    n.num = v
-    return n
-}
-
-// An int literal, and a bool one.
-i(v: int) -> *GpuNode {
-    n = _node(LIT, "int")
-    n.lit = "${v}"
-    n.num = v * 1.0
-    return n
-}
-b(v: bool) -> *GpuNode {
-    n = _node(LIT, "bool")
-    n.lit = "false"
-    if v {
-        n.lit = "true"
-        n.num = 1.0
-    }
-    return n
-}
-
-// A local or the parameter, by name; a capture (an outer variable: a
-// uniform, or a texture), by name.
-local(name: string, type: string) -> *GpuNode {
-    n = _node(LOCAL, type)
-    n.name = name
-    return n
-}
-cap(name: string, type: string) -> *GpuNode {
-    n = _node(CAPTURE, type)
-    n.name = name
-    return n
-}
-
-// a op c, of type `type`.
-bin(op: string, type: string, a: *GpuNode, c: *GpuNode) -> *GpuNode {
-    n = _node(BINARY, type)
-    n.op = op
-    return _kid(_kid(n, a), c)
-}
-neg(type: string, a: *GpuNode) -> *GpuNode {
-    n = _node(UNARY, type)
-    n.op = "-"
-    return _kid(n, a)
-}
-not_(a: *GpuNode) -> *GpuNode {
-    n = _node(UNARY, "bool")
-    n.op = "!"
-    return _kid(n, a)
-}
-
-// A call of a function (a builtin such as texture, dot or vec4), recorded,
-// not made.
-call(name: string, type: string) -> *GpuNode {
-    n = _node(CALL, type)
-    n.name = name
-    return n
-}
-call1(name: string, type: string, a: *GpuNode) -> *GpuNode {
-    return _kid(call(name, type), a)
-}
-call2(name: string, type: string, a: *GpuNode, c: *GpuNode) -> *GpuNode {
-    return _kid(_kid(call(name, type), a), c)
-}
-call3(name: string, type: string, a: *GpuNode, c: *GpuNode, d: *GpuNode) -> *GpuNode {
-    return _kid(_kid(_kid(call(name, type), a), c), d)
-}
-call4(name: string, type: string, a: *GpuNode, c: *GpuNode, d: *GpuNode, e: *GpuNode) -> *GpuNode {
-    return _kid(_kid(_kid(_kid(call(name, type), a), c), d), e)
-}
-
-// obj.name: a component (.x) or a swizzle (.rgb).
-field(obj: *GpuNode, name: string, type: string) -> *GpuNode {
-    n = _node(FIELD, type)
-    n.name = name
-    return _kid(n, obj)
-}
-
-// `if c { a } else { d }` as a value (GLSL's ?:).
-choose(type: string, c: *GpuNode, a: *GpuNode, d: *GpuNode) -> *GpuNode {
-    n = _node(CHOOSE, type)
-    return _kid(_kid(_kid(n, c), a), d)
-}
-
-// Statements.
-let_(name: string, type: string, value: *GpuNode) -> *GpuNode {
-    n = _node(LET, type)
-    n.name = name
-    return _kid(n, value)
-}
-assign(name: string, value: *GpuNode) -> *GpuNode {
-    n = _node(ASSIGN, value.type)
-    n.name = name
-    return _kid(n, value)
-}
-ret(value: *GpuNode) -> *GpuNode {
-    return _kid(_node(RETURN, value.type), value)
-}
-// if cond { then } (else_ a block, or null).
-iff(cond: *GpuNode, then: *GpuNode, else_: *GpuNode) -> *GpuNode {
-    n = _kid(_kid(_node(IF, ""), cond), then)
-    if else_ != null { _d = _kid(n, else_) }
-    return n
-}
-expr(e: *GpuNode) -> *GpuNode {
-    return _kid(_node(EXPR, e.type), e)
-}
-block() -> *GpuNode {
-    return _node(BLOCK, "")
-}
-add(blk: *GpuNode, stmt: *GpuNode) -> *GpuNode {
-    return _kid(blk, stmt)
-}
-
-shader_new(name: string, param: string, param_type: string) -> *GpuShader {
+// The fragment shader `name`, of the quote's tree.
+fragment(name: string, t: quote.Tree) -> *GpuShader {
     s = heap.new(GpuShader)
     s.name = name
-    s.param = param
-    s.param_type = param_type
-    s.captures = list.new()
-    s.body = block()
+    s.tree = t
     return s
 }
-shader_capture(s: *GpuShader, name: string, type: string) -> *GpuShader {
-    list.add_raw(s.captures, cap(name, type) as ptr)
-    return s
-}
-// The tree `body` as the shader's; the empty block shader_new gave it goes.
-shader_body(s: *GpuShader, body: *GpuNode) -> *GpuShader {
-    if s.body != null && s.body != body && list.size(s.body.kids) == 0 { _node_free(s.body) }
-    s.body = body
-    return s
-}
+
 shader_name(s: *GpuShader) -> string { return s.name }
+shader_tree(s: *GpuShader) -> quote.Tree { return s.tree }
+// The tree's hash (quote.hash): the same for the same shader in every
+// build, what its generated SPIR-V is checked against.
+shader_hash(s: *GpuShader) -> long { return quote.hash(s.tree) }
 
-// The shader and every node of its tree and its captures, each once: a
-// tree holds one node in several places (a local read wherever it is
-// used), so a node is marked as it is reached and freed after the walk.
-// The names and texts it was built from are the caller's.
-const FREED = 0 - 1
-
+// The shader and its tree. Its name is its own copy, as a struct's string
+// field is, and goes with it.
 shader_free(s: *GpuShader) {
     if s == null { return }
-    all = list.new()
-    todo = list.new()
-    k = 0
-    while k < list.size(s.captures) {
-        list.add_raw(todo, list.get_raw(s.captures, k))
-        k = k + 1
-    }
-    if s.body != null { list.add_raw(todo, s.body as ptr) }
-    while list.size(todo) > 0 {
-        last = list.size(todo) - 1
-        n = list.get_raw(todo, last) as *GpuNode
-        list.remove(todo, last)
-        if n.kind != FREED {
-            n.kind = FREED
-            list.add_raw(all, n as ptr)
-            j = 0
-            while j < list.size(n.kids) {
-                list.add_raw(todo, list.get_raw(n.kids, j))
-                j = j + 1
-            }
-        }
-    }
-    k = 0
-    while k < list.size(all) {
-        _node_free(list.get_raw(all, k) as *GpuNode)
-        k = k + 1
-    }
-    list.free(all)
-    list.free(todo)
-    list.free(s.captures)
+    quote.free(s.tree)
     s.name = ""
-    s.param = ""
-    s.param_type = ""
     heap.free(s)
 }
 
-// A node alone. Its strings are its own: stored, a string is kept as a
-// copy the struct owns, and heap.free leaves it; set again, the old one
-// goes (on macOS, 31 let names a FXAA tree, lost).
-_node_free(n: *GpuNode) {
-    n.type = ""
-    n.name = ""
-    n.op = ""
-    n.lit = ""
-    list.free(n.kids)
-    heap.free(n)
+// ── Types ──────────────────────────────────────────────────────────────
+
+// A tree's type as GLSL spells it; "" for one GLSL has no word for. A
+// vector's component is an f32 to Aether and a float to GLSL; a Texture is
+// a sampler.
+fn glsl_type(t: string) -> string {
+    if t == "float" || t == "f32" { return "float" }
+    if t == "int" || t == "bool" || t == "vec2" || t == "vec3" || t == "vec4" { return t }
+    if t == "Texture" { return "sampler2D" }
+    return ""
 }
 
-// ── FXAA, as a tree ────────────────────────────────────────────────────
+fn is_texture(t: string) -> bool { return t == "Texture" }
+
+// std140: a scalar four bytes on four, a vec2 eight on eight, a vec3
+// twelve on sixteen, a vec4 sixteen on sixteen.
+fn std140_align(t: string) -> int {
+    if t == "vec2" { return 8 }
+    if t == "vec3" || t == "vec4" { return 16 }
+    return 4
+}
+fn std140_size(t: string) -> int {
+    if t == "vec2" { return 8 }
+    if t == "vec3" { return 12 }
+    if t == "vec4" { return 16 }
+    return 4
+}
+
+// A name GLSL keeps for itself, given a trailing underscore where a
+// shader uses it: a local called `sample` or `input` is Aether's to use.
+fn glsl_name(n: string) -> string {
+    if n == "sample" || n == "input" || n == "output" || n == "filter" || n == "common" || n == "partition" ||
+        n == "active" || n == "smooth" || n == "flat" || n == "noperspective" || n == "patch" ||
+        n == "uniform" || n == "buffer" || n == "shared" || n == "precise" || n == "invariant" ||
+        n == "attribute" || n == "varying" || n == "layout" || n == "centroid" || n == "texture" ||
+        n == "FragColor" || n == "main" || n == "discard" || n == "half" || n == "fixed" || n == "unsigned" ||
+        n == "lowp" || n == "mediump" || n == "highp" || n == "precision" || n == "subroutine" ||
+        n == "goto" || n == "inline" || n == "noinline" || n == "public" || n == "static" || n == "extern" ||
+        n == "external" || n == "interface" || n == "long" || n == "short" || n == "double" || n == "cast" ||
+        n == "namespace" || n == "using" || n == "union" || n == "enum" || n == "typedef" || n == "template" ||
+        n == "this" || n == "resource" || n == "asm" || n == "class" || n == "volatile" || n == "coherent" ||
+        n == "restrict" || n == "readonly" || n == "writeonly" || n == "in" || n == "out" || n == "inout" {
+        return "${n}_"
+    }
+    if string.starts_with(n, "gl_") == 1 { return "${n}_" }
+    return n
+}
+
+// A called function's name without its module ("shaderlib.dot" is dot).
+fn bare_call(n: string) -> string {
+    at = string.length(n) - 1
+    while at >= 0 && string.char_at(n, at) != 46 { at = at - 1 }
+    if at < 0 { return n }
+    return string.substring(n, at + 1, string.length(n))
+}
+
+// ── The uniform block ──────────────────────────────────────────────────
 //
-// The main() of src/ae3d/vkspirv/glsl/fxaa_vk.frag, node for node: what
-// `quote` will hand over, built by hand until then. Its captures are the
-// renderer's names (texelSize, edgeThreshold, edgeThresholdMin,
-// subpixelQuality, screenTexture); its parameter TexCoords.
+// The captures that are not textures, in the tree's order (the order the
+// body first reads them), at their std140 offsets. The renderer fills a
+// buffer of params_size() with params_write each frame; the generator
+// holds these offsets to the ones glslang reports.
 
-_L(name: string, type: string) -> *GpuNode { return local(name, type) }
-
-// texture(screenTexture, uv).rgb
-_tex_rgb(uv: *GpuNode) -> *GpuNode {
-    return field(call2("texture", "vec4", cap("screenTexture", "sampler2D"), uv), "rgb", "vec3")
+params_count(s: *GpuShader) -> int {
+    n = 0
+    i = 0
+    while i < quote.capture_count(s.tree) {
+        if !is_texture(quote.capture_type(quote.capture(s.tree, i))) { n = n + 1 }
+        i = i + 1
+    }
+    return n
 }
 
-// TexCoords + vec2(x, y) * texelSize
-_nb(x: string, y: string) -> *GpuNode {
-    return bin("+", "vec2", _L("TexCoords", "vec2"),
-        bin("*", "vec2", call2("vec2", "vec2", f(x), f(y)), cap("texelSize", "vec2")))
+// The k-th of them, as a Capture.
+fn param_capture(s: *GpuShader, k: int) -> quote.Capture {
+    n = 0
+    i = 0
+    while i < quote.capture_count(s.tree) {
+        c = quote.capture(s.tree, i)
+        if !is_texture(quote.capture_type(c)) {
+            if n == k { return c }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return null as quote.Capture
 }
 
-_abs(e: *GpuNode) -> *GpuNode { return call1("abs", "float", e) }
-_fl(op: string, a: *GpuNode, c: *GpuNode) -> *GpuNode { return bin(op, "float", a, c) }
+params_name(s: *GpuShader, k: int) -> string { return glsl_name(quote.capture_name(param_capture(s, k))) }
+params_type(s: *GpuShader, k: int) -> string { return glsl_type(quote.capture_type(param_capture(s, k))) }
 
-fxaa_shader() -> *GpuShader {
-    s = shader_new("fxaa", "TexCoords", "vec2")
-    shader_capture(s, "texelSize", "vec2")
-    shader_capture(s, "edgeThreshold", "float")
-    shader_capture(s, "edgeThresholdMin", "float")
-    shader_capture(s, "subpixelQuality", "float")
-    shader_capture(s, "screenTexture", "sampler2D")
-    b = block()
-    add(b, let_("colorCenter", "vec3", _tex_rgb(_L("TexCoords", "vec2"))))
-    add(b, let_("lumaCoeff", "vec3", call3("vec3", "vec3", f("0.299"), f("0.587"), f("0.114"))))
-    add(b, let_("colorN", "vec3", _tex_rgb(_nb("0.0", "-1.0"))))
-    add(b, let_("colorS", "vec3", _tex_rgb(_nb("0.0", "1.0"))))
-    add(b, let_("colorE", "vec3", _tex_rgb(_nb("1.0", "0.0"))))
-    add(b, let_("colorW", "vec3", _tex_rgb(_nb("-1.0", "0.0"))))
-    lc = _L("lumaCoeff", "vec3")
-    add(b, let_("lumaCenter", "float", call2("dot", "float", _L("colorCenter", "vec3"), lc)))
-    add(b, let_("lumaN", "float", call2("dot", "float", _L("colorN", "vec3"), lc)))
-    add(b, let_("lumaS", "float", call2("dot", "float", _L("colorS", "vec3"), lc)))
-    add(b, let_("lumaE", "float", call2("dot", "float", _L("colorE", "vec3"), lc)))
-    add(b, let_("lumaW", "float", call2("dot", "float", _L("colorW", "vec3"), lc)))
-    lC = _L("lumaCenter", "float")
-    lN = _L("lumaN", "float")
-    lS = _L("lumaS", "float")
-    lE = _L("lumaE", "float")
-    lW = _L("lumaW", "float")
-    add(b, let_("lumaMin", "float", call2("min", "float", lC,
-        call2("min", "float", call2("min", "float", lN, lS), call2("min", "float", lE, lW)))))
-    add(b, let_("lumaMax", "float", call2("max", "float", lC,
-        call2("max", "float", call2("max", "float", lN, lS), call2("max", "float", lE, lW)))))
-    add(b, let_("lumaRange", "float", _fl("-", _L("lumaMax", "float"), _L("lumaMin", "float"))))
-    early = block()
-    add(early, ret(call2("vec4", "vec4", _L("colorCenter", "vec3"), f("1.0"))))
-    add(b, iff(bin("<", "bool", _L("lumaRange", "float"),
-        call2("max", "float", cap("edgeThresholdMin", "float"), _fl("*", _L("lumaMax", "float"), cap("edgeThreshold", "float")))),
-        early, null))
-    add(b, let_("lumaDown", "float", _fl("+", lN, lS)))
-    add(b, let_("lumaAcross", "float", _fl("+", lE, lW)))
-    add(b, let_("lumaTotal", "float", _fl("+", _L("lumaDown", "float"), _L("lumaAcross", "float"))))
-    add(b, let_("lumaAvg", "float", _fl("*", _L("lumaTotal", "float"), f("0.25"))))
-    so = _L("subpixelOffset", "float")
-    add(b, let_("subpixelOffset", "float", _fl("/", _abs(_fl("-", _L("lumaAvg", "float"), lC)), _L("lumaRange", "float"))))
-    add(b, assign("subpixelOffset", call3("clamp", "float", so, f("0.0"), f("1.0"))))
-    add(b, assign("subpixelOffset", call3("smoothstep", "float", f("0.0"), f("1.0"), so)))
-    add(b, assign("subpixelOffset", _fl("*", _fl("*", so, so), cap("subpixelQuality", "float"))))
-    m2 = f("-2.0")
-    add(b, let_("edgeHorizontal", "float",
-        _fl("+", _fl("+", _abs(_fl("+", _fl("*", m2, lW), lC)), _fl("*", _abs(_fl("+", _fl("*", f("-2.0"), lC), lE)), f("2.0"))),
-            _abs(_fl("+", _fl("*", f("-2.0"), lE), lC)))))
-    add(b, let_("edgeVertical", "float",
-        _fl("+", _fl("+", _abs(_fl("+", _fl("*", f("-2.0"), lN), lC)), _fl("*", _abs(_fl("+", _fl("*", f("-2.0"), lC), lS)), f("2.0"))),
-            _abs(_fl("+", _fl("*", f("-2.0"), lS), lC)))))
-    add(b, let_("isHorizontal", "bool", bin(">=", "bool", _L("edgeHorizontal", "float"), _L("edgeVertical", "float"))))
-    hz = _L("isHorizontal", "bool")
-    add(b, let_("luma1", "float", choose("float", hz, lS, lE)))
-    add(b, let_("luma2", "float", choose("float", hz, lN, lW)))
-    add(b, let_("gradient1", "float", _fl("-", _L("luma1", "float"), lC)))
-    add(b, let_("gradient2", "float", _fl("-", _L("luma2", "float"), lC)))
-    g1 = _L("gradient1", "float")
-    g2 = _L("gradient2", "float")
-    add(b, let_("is1Steepest", "bool", bin(">=", "bool", _abs(g1), _abs(g2))))
-    add(b, let_("lengthSign", "float", choose("float", _L("is1Steepest", "bool"),
-        call1("sign", "float", g1), call1("sign", "float", g2))))
-    add(b, let_("subpixelBlend", "float", _fl("*", so, _L("lengthSign", "float"))))
-    sb = _L("subpixelBlend", "float")
-    ts = cap("texelSize", "vec2")
-    add(b, let_("offset", "vec2", choose("vec2", hz,
-        call2("vec2", "vec2", f("0.0"), _fl("*", sb, field(ts, "y", "float"))),
-        call2("vec2", "vec2", _fl("*", sb, field(ts, "x", "float")), f("0.0")))))
-    add(b, let_("colorFinal", "vec3", _tex_rgb(bin("+", "vec2", _L("TexCoords", "vec2"), _L("offset", "vec2")))))
-    add(b, ret(call2("vec4", "vec4", _L("colorFinal", "vec3"), f("1.0"))))
-    shader_body(s, b)
-    return s
+fn round_up(v: int, to: int) -> int { return (v + to - 1) / to * to }
+
+params_offset(s: *GpuShader, k: int) -> int {
+    at = 0
+    j = 0
+    while j <= k {
+        t = quote.capture_type(param_capture(s, j))
+        at = round_up(at, std140_align(t))
+        if j < k { at = at + std140_size(t) }
+        j = j + 1
+    }
+    return at
+}
+
+// The block's size, rounded up to sixteen as a buffer of it is; 0 when the
+// shader has no uniforms.
+params_size(s: *GpuShader) -> int {
+    n = params_count(s)
+    if n == 0 { return 0 }
+    last = quote.capture_type(param_capture(s, n - 1))
+    return round_up(params_offset(s, n - 1) + std140_size(last), 16)
+}
+
+// Each uniform's current value, read through its capture's cell, written
+// at its offset in `dst` (params_size bytes) as the GPU reads it: floats as
+// f32, ints and bools as 32-bit ints, vectors as their lanes.
+params_write(s: *GpuShader, dst: ptr) {
+    n = params_count(s)
+    k = 0
+    while k < n {
+        c = param_capture(s, k)
+        t = quote.capture_type(c)
+        at = params_offset(s, k)
+        if t == "float" {
+            ((dst + at) as f32[])[0] = quote.get_float(c) as f32
+        } else if t == "f32" {
+            ((dst + at) as f32[])[0] = quote.get_f32(c)
+        } else if t == "int" {
+            ((dst + at) as int[])[0] = quote.get_int(c)
+        } else if t == "bool" {
+            b = 0
+            if quote.get_bool(c) { b = 1 }
+            ((dst + at) as int[])[0] = b
+        } else {
+            v = quote.get_f32x4(c)
+            p = (dst + at) as f32[]
+            p[0] = v.x
+            p[1] = v.y
+            if t == "vec3" || t == "vec4" { p[2] = v.z }
+            if t == "vec4" { p[3] = v.w }
+        }
+        k = k + 1
+    }
+}
+
+// The textures, in order: the samplers at bindings 1, 2, ... (0 when the
+// shader has no uniform block).
+samplers_count(s: *GpuShader) -> int {
+    n = 0
+    i = 0
+    while i < quote.capture_count(s.tree) {
+        if is_texture(quote.capture_type(quote.capture(s.tree, i))) { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+samplers_name(s: *GpuShader, k: int) -> string {
+    n = 0
+    i = 0
+    while i < quote.capture_count(s.tree) {
+        c = quote.capture(s.tree, i)
+        if is_texture(quote.capture_type(c)) {
+            if n == k { return glsl_name(quote.capture_name(c)) }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
 }
 
 // ── GLSL ───────────────────────────────────────────────────────────────
 
 // How tightly an operator binds, as GLSL has it (higher binds tighter).
-_prec(op: string) -> int {
-    if string.equals(op, "||") == 1 { return 1 }
-    if string.equals(op, "&&") == 1 { return 2 }
-    if string.equals(op, "==") == 1 || string.equals(op, "!=") == 1 { return 3 }
-    if string.equals(op, "<") == 1 || string.equals(op, "<=") == 1 || string.equals(op, ">") == 1 || string.equals(op, ">=") == 1 { return 4 }
-    if string.equals(op, "+") == 1 || string.equals(op, "-") == 1 { return 5 }
-    return 6
+fn prec(op: string) -> int {
+    if op == "||" { return 1 }
+    if op == "^^" { return 2 }
+    if op == "&&" { return 3 }
+    if op == "|" { return 4 }
+    if op == "^" { return 5 }
+    if op == "&" { return 6 }
+    if op == "==" || op == "!=" { return 7 }
+    if op == "<" || op == "<=" || op == ">" || op == ">=" { return 8 }
+    if op == "<<" || op == ">>" { return 9 }
+    if op == "+" || op == "-" { return 10 }
+    return 11
+}
+const PREC_UNARY = 12
+const PREC_POSTFIX = 13
+
+// Where a node is first refused, for last_error.
+fn refuse(t: quote.Tree, n: quote.Node, what: string) {
+    if g_error == "" { g_error = "${quote.source(t)}: line ${quote.line(n)}: ${what}" }
 }
 
 // An expression, parenthesised only where the operator around it binds
-// tighter than its own (`outer`), or as tightly on the right of a
-// non-associative one (`right`).
-_glsl_expr(n: *GpuNode, outer: int, right: int) -> string {
-    k = n.kind
-    if k == LIT || k == LOCAL || k == CAPTURE {
-        if k == LIT { return n.lit }
-        return n.name
+// tighter than its own (`outer`), or as tightly on the right (`right`).
+fn glsl_expr(t: quote.Tree, n: quote.Node, outer: int, right: int) -> string {
+    k = quote.kind(n)
+    if k == quote.LIT { return quote.lit(n) }
+    if k == quote.LOCAL || k == quote.CAPTURE { return glsl_name(quote.name(n)) }
+    if k == quote.FIELD {
+        return "${glsl_expr(t, quote.child(n, 0), PREC_POSTFIX, 0)}.${quote.name(n)}"
     }
-    if k == FIELD {
-        return string.concat(_glsl_expr(_child(n, 0), 8, 0), string.concat(".", n.name))
+    if k == quote.INDEX {
+        return "${glsl_expr(t, quote.child(n, 0), PREC_POSTFIX, 0)}[${glsl_expr(t, quote.child(n, 1), 0, 0)}]"
     }
-    if k == CALL {
+    if k == quote.CALL {
+        name = bare_call(quote.name(n))
+        // rgb(c) is c's swizzle; Aether has no field of three lanes.
+        if name == "rgb" && quote.child_count(n) == 1 {
+            return "${glsl_expr(t, quote.child(n, 0), PREC_POSTFIX, 0)}.rgb"
+        }
         sb = strbuilder.new(32)
-        _a = strbuilder.append(sb, n.name)
-        _a2 = strbuilder.append(sb, "(")
+        strbuilder.append(sb, name)
+        strbuilder.append(sb, "(")
         j = 0
-        while j < list.size(n.kids) {
-            if j > 0 { _c = strbuilder.append(sb, ", ") }
-            _e = strbuilder.append(sb, _glsl_expr(_child(n, j), 0, 0))
+        while j < quote.child_count(n) {
+            if j > 0 { strbuilder.append(sb, ", ") }
+            strbuilder.append(sb, glsl_expr(t, quote.child(n, j), 0, 0))
             j = j + 1
         }
-        _z = strbuilder.append(sb, ")")
+        strbuilder.append(sb, ")")
         return strbuilder.finish(sb)
     }
-    if k == UNARY {
-        return string.concat(n.op, _glsl_expr(_child(n, 0), 7, 0))
+    if k == quote.UNARY {
+        return "${quote.op(n)}${glsl_expr(t, quote.child(n, 0), PREC_UNARY, 0)}"
     }
-    if k == CHOOSE {
-        t = "${_glsl_expr(_child(n, 0), 1, 0)} ? ${_glsl_expr(_child(n, 1), 1, 0)} : ${_glsl_expr(_child(n, 2), 1, 0)}"
-        if outer > 0 { return "(${t})" }
-        return t
+    if k == quote.CHOOSE {
+        e = "${glsl_expr(t, quote.child(n, 0), 1, 0)} ? ${glsl_expr(t, quote.child(n, 1), 1, 0)} : ${glsl_expr(t, quote.child(n, 2), 1, 0)}"
+        if outer > 0 { return "(${e})" }
+        return e
     }
-    // BINARY
-    p = _prec(n.op)
-    t = "${_glsl_expr(_child(n, 0), p, 0)} ${n.op} ${_glsl_expr(_child(n, 1), p, 1)}"
-    if p < outer || (p == outer && right == 1) { return "(${t})" }
-    return t
+    if k == quote.BINARY {
+        p = prec(quote.op(n))
+        e = "${glsl_expr(t, quote.child(n, 0), p, 0)} ${quote.op(n)} ${glsl_expr(t, quote.child(n, 1), p, 1)}"
+        if p < outer || (p == outer && right == 1) { return "(${e})" }
+        return e
+    }
+    refuse(t, n, "a ${quote.kind_name(k)} is not written as GLSL")
+    return "0"
 }
 
-_indent(sb: ptr, depth: int) {
+fn indent(sb: ptr, depth: int) {
     d = 0
     while d < depth {
-        _a = strbuilder.append(sb, "    ")
+        strbuilder.append(sb, "    ")
         d = d + 1
     }
 }
 
-// A block's statements at `depth`; `top` is main's own block, where the
-// last statement's return needs no `return;` after it.
-_glsl_block(sb: ptr, blk: *GpuNode, depth: int, top: int) {
-    n = list.size(blk.kids)
+// A block's statements at `depth`; `top` is main's own block, where a
+// return that is its last statement needs no `return;` after it.
+fn glsl_block(t: quote.Tree, sb: ptr, blk: quote.Node, depth: int, top: bool) {
+    n = quote.child_count(blk)
     j = 0
     while j < n {
-        _glsl_stmt(sb, _child(blk, j), depth, top == 1 && j == n - 1)
+        glsl_stmt(t, sb, quote.child(blk, j), depth, top && j == n - 1)
         j = j + 1
     }
 }
 
-_glsl_stmt(sb: ptr, s: *GpuNode, depth: int, last: bool) {
-    _indent(sb, depth)
-    k = s.kind
-    if k == LET {
-        _a = strbuilder.append(sb, "${s.type} ${s.name} = ${_glsl_expr(_child(s, 0), 0, 0)};\n")
-    } else if k == ASSIGN {
-        _a = strbuilder.append(sb, "${s.name} = ${_glsl_expr(_child(s, 0), 0, 0)};\n")
-    } else if k == EXPR {
-        _a = strbuilder.append(sb, "${_glsl_expr(_child(s, 0), 0, 0)};\n")
-    } else if k == RETURN {
-        _a = strbuilder.append(sb, "FragColor = ${_glsl_expr(_child(s, 0), 0, 0)};\n")
+// A statement where a for loop's header has one: no indent, no `;`.
+fn glsl_clause(t: quote.Tree, s: quote.Node) -> string {
+    k = quote.kind(s)
+    if k == quote.LET {
+        ty = glsl_type(quote.type_of(s))
+        if ty == "" { refuse(t, s, "a local of type ${quote.type_of(s)} has no GLSL type") }
+        return "${ty} ${glsl_name(quote.name(s))} = ${glsl_expr(t, quote.child(s, 0), 0, 0)}"
+    }
+    if k == quote.ASSIGN {
+        return "${glsl_expr(t, quote.child(s, 0), 0, 0)} ${quote.op(s)} ${glsl_expr(t, quote.child(s, 1), 0, 0)}"
+    }
+    if k == quote.EXPR { return glsl_expr(t, quote.child(s, 0), 0, 0) }
+    refuse(t, s, "a ${quote.kind_name(k)} is not a clause")
+    return ""
+}
+
+fn glsl_if(t: quote.Tree, sb: ptr, s: quote.Node, depth: int) {
+    strbuilder.append(sb, "if (${glsl_expr(t, quote.child(s, 0), 0, 0)}) {\n")
+    glsl_block(t, sb, quote.child(s, 1), depth + 1, false)
+    indent(sb, depth)
+    if quote.child_count(s) > 2 {
+        e = quote.child(s, 2)
+        if quote.kind(e) == quote.IF {
+            strbuilder.append(sb, "} else ")
+            glsl_if(t, sb, e, depth)
+            return
+        }
+        strbuilder.append(sb, "} else {\n")
+        glsl_block(t, sb, e, depth + 1, false)
+        indent(sb, depth)
+    }
+    strbuilder.append(sb, "}\n")
+}
+
+fn glsl_stmt(t: quote.Tree, sb: ptr, s: quote.Node, depth: int, last: bool) {
+    indent(sb, depth)
+    k = quote.kind(s)
+    if k == quote.LET || k == quote.ASSIGN || k == quote.EXPR {
+        strbuilder.append(sb, "${glsl_clause(t, s)};\n")
+    } else if k == quote.RETURN {
+        if quote.child_count(s) == 0 {
+            refuse(t, s, "a fragment shader returns its colour")
+            return
+        }
+        strbuilder.append(sb, "FragColor = ${glsl_expr(t, quote.child(s, 0), 0, 0)};\n")
         if !last {
-            _indent(sb, depth)
-            _r = strbuilder.append(sb, "return;\n")
+            indent(sb, depth)
+            strbuilder.append(sb, "return;\n")
         }
-    } else if k == IF {
-        _a = strbuilder.append(sb, "if (${_glsl_expr(_child(s, 0), 0, 0)}) {\n")
-        _glsl_block(sb, _child(s, 1), depth + 1, 0)
-        _indent(sb, depth)
-        if list.size(s.kids) > 2 {
-            _e = strbuilder.append(sb, "} else {\n")
-            _glsl_block(sb, _child(s, 2), depth + 1, 0)
-            _indent(sb, depth)
-        }
-        _z = strbuilder.append(sb, "}\n")
-    } else if k == BLOCK {
-        _a = strbuilder.append(sb, "{\n")
-        _glsl_block(sb, s, depth + 1, 0)
-        _indent(sb, depth)
-        _z = strbuilder.append(sb, "}\n")
+    } else if k == quote.IF {
+        glsl_if(t, sb, s, depth)
+    } else if k == quote.WHILE {
+        strbuilder.append(sb, "while (${glsl_expr(t, quote.child(s, 0), 0, 0)}) {\n")
+        glsl_block(t, sb, quote.child(s, 1), depth + 1, false)
+        indent(sb, depth)
+        strbuilder.append(sb, "}\n")
+    } else if k == quote.FOR {
+        h = "for (${glsl_clause(t, quote.child(s, 0))}; ${glsl_expr(t, quote.child(s, 1), 0, 0)}; ${glsl_clause(t, quote.child(s, 2))})"
+        strbuilder.append(sb, "${h} {\n")
+        glsl_block(t, sb, quote.child(s, 3), depth + 1, false)
+        indent(sb, depth)
+        strbuilder.append(sb, "}\n")
+    } else if k == quote.BREAK {
+        strbuilder.append(sb, "break;\n")
+    } else if k == quote.CONTINUE {
+        strbuilder.append(sb, "continue;\n")
+    } else if k == quote.BLOCK {
+        strbuilder.append(sb, "{\n")
+        glsl_block(t, sb, s, depth + 1, false)
+        indent(sb, depth)
+        strbuilder.append(sb, "}\n")
+    } else {
+        refuse(t, s, "a ${quote.kind_name(k)} is not written as GLSL")
     }
 }
 
-// The fragment shader's GLSL (#version 450, Vulkan bindings): the captures
-// that are not textures in a uniform block at binding 0, each texture a
-// sampler at the next binding, the parameter at location 0, and FragColor.
-emit_glsl(s: *GpuShader) -> string {
-    sb = strbuilder.new(4096)
-    _h = strbuilder.append(sb, "#version 450\n// ${s.name}: written by ae3d.gpu from its tree.\n\n")
-    nc = list.size(s.captures)
-    plain = 0
-    j = 0
-    while j < nc {
-        c = list.get_raw(s.captures, j) as *GpuNode
-        if string.equals(c.type, "sampler2D") == 0 { plain = plain + 1 }
-        j = j + 1
+// What every emit checks first: one parameter, a type GLSL has for each
+// capture, the version of the tree this reads.
+fn emit_ready(s: *GpuShader) -> bool {
+    g_error = ""
+    t = s.tree
+    if quote.version(t) != 1 {
+        g_error = "${quote.source(t)}: a tree of version ${quote.version(t)}; ae3d.gpu reads version 1"
+        return false
     }
-    binding = 0
-    if plain > 0 {
-        _u = strbuilder.append(sb, "layout(std140, set = 0, binding = 0) uniform Params {\n")
-        j = 0
-        while j < nc {
-            c = list.get_raw(s.captures, j) as *GpuNode
-            if string.equals(c.type, "sampler2D") == 0 {
-                _f = strbuilder.append(sb, "    ${c.type} ${c.name};\n")
-            }
-            j = j + 1
+    if quote.param_count(t) != 1 || glsl_type(quote.param_type(t, 0)) == "" {
+        g_error = "${quote.source(t)}: a fragment shader takes one parameter, its varying"
+        return false
+    }
+    i = 0
+    while i < quote.capture_count(t) {
+        c = quote.capture(t, i)
+        if glsl_type(quote.capture_type(c)) == "" {
+            g_error = "${quote.source(t)}: ${quote.capture_name(c)} is a ${quote.capture_type(c)}, which a shader cannot read"
+            return false
         }
-        _ue = strbuilder.append(sb, "};\n")
+        i = i + 1
+    }
+    return true
+}
+
+// The fragment shader's GLSL (#version 450, Vulkan's bindings): the
+// uniforms in a block at binding 0, each texture a sampler at the next
+// binding, the parameter at location 0, and FragColor. "" when the tree
+// has something GLSL is not written for (last_error says what and where).
+emit_glsl(s: *GpuShader) -> string {
+    if !emit_ready(s) { return "" }
+    t = s.tree
+    sb = strbuilder.new(4096)
+    strbuilder.append(sb, "#version 450\n// ${s.name}: written by ae3d.gpu from its quote.\n\n")
+    binding = 0
+    np = params_count(s)
+    if np > 0 {
+        strbuilder.append(sb, "layout(std140, set = 0, binding = 0) uniform Params {\n")
+        k = 0
+        while k < np {
+            strbuilder.append(sb, "    ${params_type(s, k)} ${params_name(s, k)};\n")
+            k = k + 1
+        }
+        strbuilder.append(sb, "};\n")
         binding = 1
     }
-    j = 0
-    while j < nc {
-        c = list.get_raw(s.captures, j) as *GpuNode
-        if string.equals(c.type, "sampler2D") == 1 {
-            _t = strbuilder.append(sb, "layout(set = 0, binding = ${binding}) uniform sampler2D ${c.name};\n")
-            binding = binding + 1
-        }
-        j = j + 1
+    k = 0
+    while k < samplers_count(s) {
+        strbuilder.append(sb, "layout(set = 0, binding = ${binding}) uniform sampler2D ${samplers_name(s, k)};\n")
+        binding = binding + 1
+        k = k + 1
     }
-    _io = strbuilder.append(sb, "\nlayout(location = 0) in ${s.param_type} ${s.param};\nlayout(location = 0) out vec4 FragColor;\n\nvoid main() {\n")
-    _glsl_block(sb, s.body, 1, 1)
-    _end = strbuilder.append(sb, "}\n")
+    strbuilder.append(sb, "\nlayout(location = 0) in ${glsl_type(quote.param_type(t, 0))} ${glsl_name(quote.param_name(t, 0))};\n")
+    strbuilder.append(sb, "layout(location = 0) out vec4 FragColor;\n\nvoid main() {\n")
+    glsl_block(t, sb, quote.body(t), 1, true)
+    strbuilder.append(sb, "}\n")
+    text = strbuilder.finish(sb)
+    if g_error != "" { return "" }
+    return text
+}
+
+// The vertex shader a full-screen pass draws the shader with: the screen
+// quad's position and texture coordinate (the scene's vertex input, at
+// locations 0 and 1), the coordinate handed on as the fragment's parameter.
+emit_screen_vertex(s: *GpuShader) -> string {
+    if !emit_ready(s) { return "" }
+    t = s.tree
+    if glsl_type(quote.param_type(t, 0)) != "vec2" {
+        g_error = "${quote.source(t)}: a full-screen pass hands its shader a vec2"
+        return ""
+    }
+    name = glsl_name(quote.param_name(t, 0))
+    sb = strbuilder.new(512)
+    strbuilder.append(sb, "#version 450\n// ${s.name}'s full-screen pass: written by ae3d.gpu.\n\n")
+    strbuilder.append(sb, "layout(location = 0) in vec3 inPosition;\nlayout(location = 1) in vec2 inTexCoord;\n\n")
+    strbuilder.append(sb, "layout(location = 0) out vec2 ${name};\n\nvoid main() {\n")
+    strbuilder.append(sb, "    ${name} = inTexCoord;\n    gl_Position = vec4(inPosition.xy, 0.0, 1.0);\n}\n")
     return strbuilder.finish(sb)
 }
 
 // ── The CPU back end ───────────────────────────────────────────────────
+//
+// Its own lane-wise builtins in doubles, not ae3d.shaderlib's: a CALL
+// names a function as text, and Aether has no call by name, so running the
+// library's would mean a table from each name to a closure of one
+// signature, one entry per overload GLSL has and Aether does not (vec4 of
+// a vec3 and a float, of a float, of two vec2s, ...): as much code as the
+// lanes below, and in f32 where this is a reference in doubles.
 
 // A value: n lanes of a float, vec2, vec3 or vec4 (n 1 to 4), or a bool
 // (n 0, in x).
@@ -557,10 +517,10 @@ struct GpuVal {
     w: float
 }
 
-v1(x: float) -> *GpuVal { return _val(1, x, 0.0, 0.0, 0.0) }
-v2(x: float, y: float) -> *GpuVal { return _val(2, x, y, 0.0, 0.0) }
-v3(x: float, y: float, z: float) -> *GpuVal { return _val(3, x, y, z, 0.0) }
-v4(x: float, y: float, z: float, w: float) -> *GpuVal { return _val(4, x, y, z, w) }
+v1(x: float) -> *GpuVal { return mkval(1, x, 0.0, 0.0, 0.0) }
+v2(x: float, y: float) -> *GpuVal { return mkval(2, x, y, 0.0, 0.0) }
+v3(x: float, y: float, z: float) -> *GpuVal { return mkval(3, x, y, z, 0.0) }
+v4(x: float, y: float, z: float, w: float) -> *GpuVal { return mkval(4, x, y, z, w) }
 val_n(v: *GpuVal) -> int { return v.n }
 val_x(v: *GpuVal) -> float { return v.x }
 val_y(v: *GpuVal) -> float { return v.y }
@@ -568,7 +528,7 @@ val_z(v: *GpuVal) -> float { return v.z }
 val_w(v: *GpuVal) -> float { return v.w }
 val_bool(v: *GpuVal) -> bool { return v.x != 0.0 }
 
-_val(n: int, x: float, y: float, z: float, w: float) -> *GpuVal {
+fn mkval(n: int, x: float, y: float, z: float, w: float) -> *GpuVal {
     v = heap.new(GpuVal)
     v.n = n
     v.x = x
@@ -578,7 +538,7 @@ _val(n: int, x: float, y: float, z: float, w: float) -> *GpuVal {
     return v
 }
 
-_lane(v: *GpuVal, k: int) -> float {
+fn lane(v: *GpuVal, k: int) -> float {
     if v.n == 1 { return v.x }   // a scalar splats
     if k == 0 { return v.x }
     if k == 1 { return v.y }
@@ -586,111 +546,59 @@ _lane(v: *GpuVal, k: int) -> float {
     return v.w
 }
 
-// An image: w x h pixels of RGBA, each a vec4.
-struct GpuImage {
-    w: int
-    h: int
-    px: ptr      // list of *GpuVal
+fn set_lane(v: *GpuVal, k: int, x: float) {
+    if k == 0 { v.x = x } else if k == 1 { v.y = x } else if k == 2 { v.z = x } else { v.w = x }
 }
 
-image_new(w: int, h: int) -> *GpuImage {
-    img = heap.new(GpuImage)
-    img.w = w
-    img.h = h
-    img.px = list.new()
-    k = 0
-    while k < w * h {
-        list.add_raw(img.px, v4(0.0, 0.0, 0.0, 1.0) as ptr)
-        k = k + 1
-    }
-    return img
-}
-image_set(img: *GpuImage, x: int, y: int, r: float, g: float, b_: float, a: float) {
-    p = list.get_raw(img.px, y * img.w + x) as *GpuVal
-    p.x = r
-    p.y = g
-    p.z = b_
-    p.w = a
-}
-image_get(img: *GpuImage, x: int, y: int) -> *GpuVal {
-    return list.get_raw(img.px, y * img.w + x) as *GpuVal
-}
-image_free(img: *GpuImage) {
-    if img == null { return }
-    k = 0
-    while k < list.size(img.px) {
-        heap.free(list.get_raw(img.px, k))
-        k = k + 1
-    }
-    list.free(img.px)
-    heap.free(img)
-}
-image_w(img: *GpuImage) -> int { return img.w }
-image_h(img: *GpuImage) -> int { return img.h }
-
-_floor(v: float) -> int {
+fn floori(v: float) -> int {
     t = v as int
     if v < 0.0 && t * 1.0 != v { return t - 1 }
     return t
 }
 
-_clampi(v: int, lo: int, hi: int) -> int {
+fn clampi(v: int, lo: int, hi: int) -> int {
     if v < lo { return lo }
     if v > hi { return hi }
     return v
 }
 
-// texture(img, uv): bilinear, texel centres at (i + 0.5) / size, clamped
-// at the edges, as a linear sampler with clamp-to-edge reads.
-_sample(cx: *GpuRun, img: *GpuImage, u: float, v: float) -> *GpuVal {
-    fx = u * img.w - 0.5
-    fy = v * img.h - 0.5
-    x0 = _floor(fx)
-    y0 = _floor(fy)
-    tx = fx - x0
-    ty = fy - y0
-    a = image_get(img, _clampi(x0, 0, img.w - 1), _clampi(y0, 0, img.h - 1))
-    c = image_get(img, _clampi(x0 + 1, 0, img.w - 1), _clampi(y0, 0, img.h - 1))
-    d = image_get(img, _clampi(x0, 0, img.w - 1), _clampi(y0 + 1, 0, img.h - 1))
-    e = image_get(img, _clampi(x0 + 1, 0, img.w - 1), _clampi(y0 + 1, 0, img.h - 1))
-    return _keep(cx, v4(
-        (a.x * (1.0 - tx) + c.x * tx) * (1.0 - ty) + (d.x * (1.0 - tx) + e.x * tx) * ty,
-        (a.y * (1.0 - tx) + c.y * tx) * (1.0 - ty) + (d.y * (1.0 - tx) + e.y * tx) * ty,
-        (a.z * (1.0 - tx) + c.z * tx) * (1.0 - ty) + (d.z * (1.0 - tx) + e.z * tx) * ty,
-        (a.w * (1.0 - tx) + c.w * tx) * (1.0 - ty) + (d.w * (1.0 - tx) + e.w * tx) * ty))
-}
-
 struct GpuBinding {
     name: string
     val: *GpuVal
-    img: *GpuImage
+    img: ptr         // a texture's *shaderlib.ShaderImage
 }
 
-// A run of a shader: the captures' values and textures, the locals as it
-// goes, and every value it makes (freed after each pixel).
+// A run of a shader: the captures' values as the run began, the locals as
+// it goes, and every value it makes (freed after each pixel).
 struct GpuRun {
     s: *GpuShader
     caps: ptr        // list of *GpuBinding
     locals: ptr      // list of *GpuBinding
     arena: ptr       // list of *GpuVal made during a run
-    done: int        // 1 once a return has run
+    flow: int        // 0 on, 1 returned, 2 a break, 3 a continue
     out: *GpuVal
     failed: int
 }
 
+const FLOW_ON = 0
+const FLOW_RETURN = 1
+const FLOW_BREAK = 2
+const FLOW_CONTINUE = 3
+
+// A run of `s`, its captures read from their cells at each cpu_run.
 cpu_new(s: *GpuShader) -> *GpuRun {
     cx = heap.new(GpuRun)
     cx.s = s
     cx.caps = list.new()
     cx.locals = list.new()
     cx.arena = list.new()
-    cx.done = 0
+    cx.flow = FLOW_ON
     cx.out = null
     cx.failed = 0
     return cx
 }
 
-_bind(lst: ptr, name: string, v: *GpuVal, img: *GpuImage) {
+fn bind(lst: ptr, name: string, v: *GpuVal, img: ptr) {
     bd = heap.new(GpuBinding)
     bd.name = name
     bd.val = v
@@ -698,52 +606,77 @@ _bind(lst: ptr, name: string, v: *GpuVal, img: *GpuImage) {
     list.add_raw(lst, bd as ptr)
 }
 
-// A binding alone, its name with it (kept as its own copy, as a node's).
-_binding_free(bd: *GpuBinding) {
+// A binding alone, its name with it (kept as its own copy).
+fn binding_free(bd: *GpuBinding) {
     bd.name = ""
     heap.free(bd)
 }
 
-// A capture's value (a uniform), or a texture's image.
-cpu_set(cx: *GpuRun, name: string, v: *GpuVal) -> *GpuRun {
-    _bind(cx.caps, name, v, null)
-    return cx
-}
-cpu_texture(cx: *GpuRun, name: string, img: *GpuImage) -> *GpuRun {
-    _bind(cx.caps, name, null, img)
-    return cx
-}
-
-_find(lst: ptr, name: string) -> *GpuBinding {
+fn find(lst: ptr, name: string) -> *GpuBinding {
     k = list.size(lst) - 1
     while k >= 0 {
         bd = list.get_raw(lst, k) as *GpuBinding
-        if string.equals(bd.name, name) == 1 { return bd }
+        if bd.name == name { return bd }
         k = k - 1
     }
     return null
 }
 
-_keep(cx: *GpuRun, v: *GpuVal) -> *GpuVal {
+fn keep(cx: *GpuRun, v: *GpuVal) -> *GpuVal {
     list.add_raw(cx.arena, v as ptr)
     return v
 }
 
-_fail(cx: *GpuRun, what: string) -> *GpuVal {
-    if cx.failed == 0 { g_error = what }
+fn fail(cx: *GpuRun, n: quote.Node, what: string) -> *GpuVal {
+    if cx.failed == 0 { g_error = "${quote.source(cx.s.tree)}: line ${quote.line(n)}: ${what}" }
     cx.failed = 1
-    return _keep(cx, v1(0.0))
+    return keep(cx, v1(0.0))
+}
+
+// Every capture's value now, through its cell, into the run's bindings.
+fn read_captures(cx: *GpuRun) {
+    t = cx.s.tree
+    i = 0
+    while i < quote.capture_count(t) {
+        c = quote.capture(t, i)
+        ty = quote.capture_type(c)
+        name = quote.capture_name(c)
+        if ty == "Texture" {
+            tex = quote.cell(c) as *Texture
+            bind(cx.caps, name, null, tex.image)
+        } else if ty == "float" {
+            bind(cx.caps, name, keep(cx, v1(quote.get_float(c))), null)
+        } else if ty == "f32" {
+            bind(cx.caps, name, keep(cx, v1(quote.get_f32(c) as float)), null)
+        } else if ty == "int" {
+            bind(cx.caps, name, keep(cx, v1(quote.get_int(c) * 1.0)), null)
+        } else if ty == "bool" {
+            on = 0.0
+            if quote.get_bool(c) { on = 1.0 }
+            bind(cx.caps, name, keep(cx, mkval(0, on, 0.0, 0.0, 0.0)), null)
+        } else {
+            n = 4
+            if ty == "vec2" { n = 2 }
+            if ty == "vec3" { n = 3 }
+            v = quote.get_f32x4(c)
+            bind(cx.caps, name, keep(cx, mkval(n, v.x as float, v.y as float, v.z as float, v.w as float)), null)
+        }
+        i = i + 1
+    }
 }
 
 // Run the shader for one value of its parameter: the colour it returns, a
 // fresh value the caller frees (heap.free), or null when it could not run
 // (last_error says why).
 cpu_run(cx: *GpuRun, param: *GpuVal) -> *GpuVal {
-    cx.done = 0
+    g_error = ""
+    cx.flow = FLOW_ON
     cx.out = null
     cx.failed = 0
-    _bind(cx.locals, cx.s.param, param, null)
-    _cpu_block(cx, cx.s.body)
+    t = cx.s.tree
+    read_captures(cx)
+    bind(cx.locals, quote.param_name(t, 0), param, null)
+    cpu_block(cx, quote.body(t))
     ok = cx.out != null && cx.failed == 0
     rn = 0
     rx = 0.0
@@ -756,14 +689,22 @@ cpu_run(cx: *GpuRun, param: *GpuVal) -> *GpuVal {
         ry = cx.out.y
         rz = cx.out.z
         rw = cx.out.w
+    } else if cx.failed == 0 {
+        g_error = "${quote.source(t)}: the shader ended without returning a colour"
     }
-    // Everything this run made goes, the parameter's binding with it.
+    // Everything this run made goes, the bindings with it.
     k = 0
     while k < list.size(cx.locals) {
-        _binding_free(list.get_raw(cx.locals, k) as *GpuBinding)
+        binding_free(list.get_raw(cx.locals, k) as *GpuBinding)
         k = k + 1
     }
     list.clear(cx.locals)
+    k = 0
+    while k < list.size(cx.caps) {
+        binding_free(list.get_raw(cx.caps, k) as *GpuBinding)
+        k = k + 1
+    }
+    list.clear(cx.caps)
     k = 0
     while k < list.size(cx.arena) {
         heap.free(list.get_raw(cx.arena, k))
@@ -771,230 +712,339 @@ cpu_run(cx: *GpuRun, param: *GpuVal) -> *GpuVal {
     }
     list.clear(cx.arena)
     if !ok { return null }
-    return _val(rn, rx, ry, rz, rw)
+    return mkval(rn, rx, ry, rz, rw)
 }
 
 cpu_free(cx: *GpuRun) {
-    k = 0
-    while k < list.size(cx.caps) {
-        _binding_free(list.get_raw(cx.caps, k) as *GpuBinding)
-        k = k + 1
-    }
     list.free(cx.caps)
     list.free(cx.locals)
     list.free(cx.arena)
     heap.free(cx)
 }
 
-_cpu_block(cx: *GpuRun, blk: *GpuNode) {
+fn cpu_block(cx: *GpuRun, blk: quote.Node) {
     mark = list.size(cx.locals)
     j = 0
-    while j < list.size(blk.kids) && cx.done == 0 && cx.failed == 0 {
-        _cpu_stmt(cx, _child(blk, j))
+    while j < quote.child_count(blk) && cx.flow == FLOW_ON && cx.failed == 0 {
+        cpu_stmt(cx, quote.child(blk, j))
         j = j + 1
     }
     // The block's own locals go out of scope.
     while list.size(cx.locals) > mark {
         last = list.size(cx.locals) - 1
-        _binding_free(list.get_raw(cx.locals, last) as *GpuBinding)
+        binding_free(list.get_raw(cx.locals, last) as *GpuBinding)
         list.remove(cx.locals, last)
     }
 }
 
-_cpu_stmt(cx: *GpuRun, s: *GpuNode) {
-    k = s.kind
-    if k == LET {
-        _bind(cx.locals, s.name, _cpu_expr(cx, _child(s, 0)), null)
-    } else if k == ASSIGN {
-        bd = _find(cx.locals, s.name)
-        if bd == null { _f = _fail(cx, "assignment to ${s.name}, which is not a local"); return }
-        bd.val = _cpu_expr(cx, _child(s, 0))
-    } else if k == EXPR {
-        _e = _cpu_expr(cx, _child(s, 0))
-    } else if k == RETURN {
-        cx.out = _cpu_expr(cx, _child(s, 0))
-        cx.done = 1
-    } else if k == IF {
-        c = _cpu_expr(cx, _child(s, 0))
-        if c.x != 0.0 {
-            _cpu_block(cx, _child(s, 1))
-        } else if list.size(s.kids) > 2 {
-            _cpu_block(cx, _child(s, 2))
+fn truth(v: *GpuVal) -> bool { return v.x != 0.0 }
+
+// A loop's body run once: false when the loop is to stop (a break, a
+// return, a failure), a continue cleared.
+fn loop_body(cx: *GpuRun, body: quote.Node) -> bool {
+    cpu_block(cx, body)
+    if cx.flow == FLOW_BREAK {
+        cx.flow = FLOW_ON
+        return false
+    }
+    if cx.flow == FLOW_CONTINUE { cx.flow = FLOW_ON }
+    return cx.flow == FLOW_ON && cx.failed == 0
+}
+
+fn cpu_stmt(cx: *GpuRun, s: quote.Node) {
+    k = quote.kind(s)
+    if k == quote.LET {
+        bind(cx.locals, quote.name(s), cpu_expr(cx, quote.child(s, 0)), null)
+    } else if k == quote.ASSIGN {
+        target = quote.child(s, 0)
+        if quote.kind(target) != quote.LOCAL { _f = fail(cx, s, "an assignment to a ${quote.kind_name(quote.kind(target))}"); return }
+        bd = find(cx.locals, quote.name(target))
+        if bd == null { _f2 = fail(cx, s, "an assignment to ${quote.name(target)}, which is not a local"); return }
+        v = cpu_expr(cx, quote.child(s, 1))
+        op = quote.op(s)
+        if op != "=" {
+            v = cpu_binary(cx, s, string.substring(op, 0, string.length(op) - 1), quote.type_of(target), bd.val, v)
         }
-    } else if k == BLOCK {
-        _cpu_block(cx, s)
+        bd.val = v
+    } else if k == quote.EXPR {
+        _e = cpu_expr(cx, quote.child(s, 0))
+    } else if k == quote.RETURN {
+        if quote.child_count(s) == 0 { _f3 = fail(cx, s, "a fragment shader returns its colour"); return }
+        cx.out = cpu_expr(cx, quote.child(s, 0))
+        cx.flow = FLOW_RETURN
+    } else if k == quote.IF {
+        if truth(cpu_expr(cx, quote.child(s, 0))) {
+            cpu_block(cx, quote.child(s, 1))
+        } else if quote.child_count(s) > 2 {
+            e = quote.child(s, 2)
+            if quote.kind(e) == quote.IF { cpu_stmt(cx, e) } else { cpu_block(cx, e) }
+        }
+    } else if k == quote.WHILE {
+        going = true
+        while going && cx.failed == 0 && truth(cpu_expr(cx, quote.child(s, 0))) {
+            going = loop_body(cx, quote.child(s, 1))
+        }
+    } else if k == quote.FOR {
+        // The header's local is the loop's: it goes when the loop does.
+        mark = list.size(cx.locals)
+        cpu_stmt(cx, quote.child(s, 0))
+        going = true
+        while going && cx.failed == 0 && truth(cpu_expr(cx, quote.child(s, 1))) {
+            going = loop_body(cx, quote.child(s, 3))
+            if going { cpu_stmt(cx, quote.child(s, 2)) }
+        }
+        while list.size(cx.locals) > mark {
+            last = list.size(cx.locals) - 1
+            binding_free(list.get_raw(cx.locals, last) as *GpuBinding)
+            list.remove(cx.locals, last)
+        }
+    } else if k == quote.BREAK {
+        cx.flow = FLOW_BREAK
+    } else if k == quote.CONTINUE {
+        cx.flow = FLOW_CONTINUE
+    } else if k == quote.BLOCK {
+        cpu_block(cx, s)
     } else {
-        _f2 = _fail(cx, "a statement of kind ${k} is not run on the CPU yet")
+        _f4 = fail(cx, s, "a ${quote.kind_name(k)} is not run on the CPU")
     }
 }
 
-_cpu_expr(cx: *GpuRun, n: *GpuNode) -> *GpuVal {
-    k = n.kind
-    if k == LIT {
-        if string.equals(n.type, "bool") == 1 { return _keep(cx, _val(0, n.num, 0.0, 0.0, 0.0)) }
-        return _keep(cx, v1(n.num))
+fn cpu_lit(cx: *GpuRun, n: quote.Node) -> *GpuVal {
+    ty = quote.type_of(n)
+    text = quote.lit(n)
+    if ty == "bool" {
+        on = 0.0
+        if text == "true" { on = 1.0 }
+        return keep(cx, mkval(0, on, 0.0, 0.0, 0.0))
     }
-    if k == LOCAL {
-        bd = _find(cx.locals, n.name)
-        if bd == null { return _fail(cx, "no local ${n.name}") }
+    if ty == "float" || ty == "f32" || ty == "int" {
+        v, err = string.to_float(text)
+        if err != "" { return fail(cx, n, "the literal ${text} is not a number") }
+        return keep(cx, v1(v))
+    }
+    return fail(cx, n, "a ${ty} literal is not run on the CPU")
+}
+
+fn cpu_expr(cx: *GpuRun, n: quote.Node) -> *GpuVal {
+    k = quote.kind(n)
+    if k == quote.LIT { return cpu_lit(cx, n) }
+    if k == quote.LOCAL {
+        bd = find(cx.locals, quote.name(n))
+        if bd == null { return fail(cx, n, "no local ${quote.name(n)}") }
         return bd.val
     }
-    if k == CAPTURE {
-        bd = _find(cx.caps, n.name)
-        if bd == null || bd.val == null { return _fail(cx, "no value for the capture ${n.name}") }
+    if k == quote.CAPTURE {
+        bd = find(cx.caps, quote.name(n))
+        if bd == null || bd.val == null { return fail(cx, n, "no value for the capture ${quote.name(n)}") }
         return bd.val
     }
-    if k == FIELD { return _cpu_field(cx, _cpu_expr(cx, _child(n, 0)), n.name) }
-    if k == CHOOSE {
-        c = _cpu_expr(cx, _child(n, 0))
-        if c.x != 0.0 { return _cpu_expr(cx, _child(n, 1)) }
-        return _cpu_expr(cx, _child(n, 2))
+    if k == quote.FIELD { return cpu_field(cx, n, cpu_expr(cx, quote.child(n, 0)), quote.name(n)) }
+    if k == quote.CHOOSE {
+        if truth(cpu_expr(cx, quote.child(n, 0))) { return cpu_expr(cx, quote.child(n, 1)) }
+        return cpu_expr(cx, quote.child(n, 2))
     }
-    if k == UNARY {
-        a = _cpu_expr(cx, _child(n, 0))
-        if string.equals(n.op, "!") == 1 {
-            if a.x != 0.0 { return _keep(cx, _val(0, 0.0, 0.0, 0.0, 0.0)) }
-            return _keep(cx, _val(0, 1.0, 0.0, 0.0, 0.0))
+    if k == quote.UNARY {
+        a = cpu_expr(cx, quote.child(n, 0))
+        if quote.op(n) == "!" {
+            if truth(a) { return keep(cx, mkval(0, 0.0, 0.0, 0.0, 0.0)) }
+            return keep(cx, mkval(0, 1.0, 0.0, 0.0, 0.0))
         }
-        return _keep(cx, _val(a.n, 0.0 - a.x, 0.0 - a.y, 0.0 - a.z, 0.0 - a.w))
+        if quote.op(n) != "-" { return fail(cx, n, "the operator ${quote.op(n)} is not run on the CPU") }
+        return keep(cx, mkval(a.n, 0.0 - a.x, 0.0 - a.y, 0.0 - a.z, 0.0 - a.w))
     }
-    if k == BINARY { return _cpu_binary(cx, n.op, _cpu_expr(cx, _child(n, 0)), _cpu_expr(cx, _child(n, 1))) }
-    if k == CALL { return _cpu_call(cx, n) }
-    return _fail(cx, "an expression of kind ${k} is not run on the CPU yet")
+    if k == quote.BINARY {
+        op = quote.op(n)
+        // && and || take their right side only when it decides.
+        if op == "&&" || op == "||" {
+            a = truth(cpu_expr(cx, quote.child(n, 0)))
+            on = a
+            if op == "&&" && a { on = truth(cpu_expr(cx, quote.child(n, 1))) }
+            if op == "||" && !a { on = truth(cpu_expr(cx, quote.child(n, 1))) }
+            r = 0.0
+            if on { r = 1.0 }
+            return keep(cx, mkval(0, r, 0.0, 0.0, 0.0))
+        }
+        return cpu_binary(cx, n, op, quote.type_of(n), cpu_expr(cx, quote.child(n, 0)), cpu_expr(cx, quote.child(n, 1)))
+    }
+    if k == quote.CALL { return cpu_call(cx, n) }
+    return fail(cx, n, "a ${quote.kind_name(k)} is not run on the CPU")
 }
 
 // A component or a swizzle: x y z w, or r g b a.
-_cpu_field(cx: *GpuRun, v: *GpuVal, name: string) -> *GpuVal {
+fn cpu_field(cx: *GpuRun, n: quote.Node, v: *GpuVal, name: string) -> *GpuVal {
     m = string.length(name)
-    if m < 1 || m > 4 { return _fail(cx, "no field .${name}") }
-    out = _keep(cx, _val(m, 0.0, 0.0, 0.0, 0.0))
+    if m < 1 || m > 4 { return fail(cx, n, "no field .${name}") }
+    out = keep(cx, mkval(m, 0.0, 0.0, 0.0, 0.0))
     j = 0
     while j < m {
         ch = string.char_at(name, j)
-        lane = 0 - 1
-        if ch == 120 || ch == 114 { lane = 0 }    // x r
-        if ch == 121 || ch == 103 { lane = 1 }    // y g
-        if ch == 122 || ch == 98 { lane = 2 }     // z b
-        if ch == 119 || ch == 97 { lane = 3 }     // w a
-        if lane < 0 || lane >= v.n { return _fail(cx, "no field .${name} on a value of ${v.n} lanes") }
-        x = _lane(v, lane)
-        if j == 0 { out.x = x } else if j == 1 { out.y = x } else if j == 2 { out.z = x } else { out.w = x }
+        at = 0 - 1
+        if ch == 120 || ch == 114 { at = 0 }    // x r
+        if ch == 121 || ch == 103 { at = 1 }    // y g
+        if ch == 122 || ch == 98 { at = 2 }     // z b
+        if ch == 119 || ch == 97 { at = 3 }     // w a
+        if at < 0 || at >= v.n { return fail(cx, n, "no field .${name} on a value of ${v.n} lanes") }
+        set_lane(out, j, lane(v, at))
         j = j + 1
     }
     return out
 }
 
-_cpu_binary(cx: *GpuRun, op: string, a: *GpuVal, c: *GpuVal) -> *GpuVal {
-    if string.equals(op, "&&") == 1 || string.equals(op, "||") == 1 {
-        on = 0.0
-        if string.equals(op, "&&") == 1 && a.x != 0.0 && c.x != 0.0 { on = 1.0 }
-        if string.equals(op, "||") == 1 && (a.x != 0.0 || c.x != 0.0) { on = 1.0 }
-        return _keep(cx, _val(0, on, 0.0, 0.0, 0.0))
-    }
-    p = _prec(op)
-    if p == 3 || p == 4 {
-        // Comparisons are of scalars (GLSL's are; a vector's are calls).
-        t = 0
-        if string.equals(op, "<") == 1 && a.x < c.x { t = 1 }
-        if string.equals(op, "<=") == 1 && a.x <= c.x { t = 1 }
-        if string.equals(op, ">") == 1 && a.x > c.x { t = 1 }
-        if string.equals(op, ">=") == 1 && a.x >= c.x { t = 1 }
-        if string.equals(op, "==") == 1 && a.x == c.x { t = 1 }
-        if string.equals(op, "!=") == 1 && a.x != c.x { t = 1 }
-        return _keep(cx, _val(0, t * 1.0, 0.0, 0.0, 0.0))
-    }
-    n = a.n
-    if c.n > n { n = c.n }
-    out = _keep(cx, _val(n, 0.0, 0.0, 0.0, 0.0))
-    j = 0
-    while j < n {
-        x = _lane(a, j)
-        y = _lane(c, j)
+// a op c, of type `ty`: lane-wise, a scalar splatting; a comparison of
+// scalars (GLSL's are; a vector's are calls). An int's division and
+// remainder are whole.
+fn cpu_binary(cx: *GpuRun, n: quote.Node, op: string, ty: string, a: *GpuVal, c: *GpuVal) -> *GpuVal {
+    p = prec(op)
+    if p == 7 || p == 8 {
+        on = false
+        if op == "<" { on = a.x < c.x }
+        if op == "<=" { on = a.x <= c.x }
+        if op == ">" { on = a.x > c.x }
+        if op == ">=" { on = a.x >= c.x }
+        if op == "==" { on = a.x == c.x }
+        if op == "!=" { on = a.x != c.x }
         r = 0.0
-        if string.equals(op, "+") == 1 { r = x + y }
-        if string.equals(op, "-") == 1 { r = x - y }
-        if string.equals(op, "*") == 1 { r = x * y }
-        if string.equals(op, "/") == 1 { r = x / y }
-        if j == 0 { out.x = r } else if j == 1 { out.y = r } else if j == 2 { out.z = r } else { out.w = r }
+        if on { r = 1.0 }
+        return keep(cx, mkval(0, r, 0.0, 0.0, 0.0))
+    }
+    if op != "+" && op != "-" && op != "*" && op != "/" && op != "%" {
+        return fail(cx, n, "the operator ${op} is not run on the CPU")
+    }
+    whole = ty == "int"
+    m = a.n
+    if c.n > m { m = c.n }
+    out = keep(cx, mkval(m, 0.0, 0.0, 0.0, 0.0))
+    j = 0
+    while j < m {
+        x = lane(a, j)
+        y = lane(c, j)
+        r = 0.0
+        if op == "+" { r = x + y }
+        if op == "-" { r = x - y }
+        if op == "*" { r = x * y }
+        if op == "/" {
+            r = x / y
+            if whole { r = (r as int) * 1.0 }
+        }
+        if op == "%" { r = x - ((x / y) as int) * y }
+        set_lane(out, j, r)
         j = j + 1
     }
     return out
 }
 
-_minf(a: float, c: float) -> float {
+fn minf(a: float, c: float) -> float {
     if a < c { return a }
     return c
 }
-_maxf(a: float, c: float) -> float {
+fn maxf(a: float, c: float) -> float {
     if a > c { return a }
     return c
 }
-_absf(a: float) -> float {
-    if a < 0.0 { return 0.0 - a }
-    return a
+
+// The fraction of a texel a GPU's sampler weighs its neighbours by, in
+// bits. Vulkan asks for four at least (subTexelPrecisionBits); Apple's GPUs
+// and lavapipe have eight. A coordinate a rounding off a texel's centre --
+// uv plus an f32 texel -- reads that texel alone there, where in doubles it
+// takes a millionth of the next: enough, on a pixel whose contrast sits on
+// FXAA's threshold, to land on the other side of it (one pixel of a frame
+// on an Apple GPU, five steps of 255 out).
+const SUBTEXEL = 256.0
+
+// texture(img, uv): bilinear, texel centres at (i + 0.5) / size, the
+// weights to the sampler's precision, clamped at the edges, as a linear
+// sampler with clamp-to-edge reads.
+fn sample(cx: *GpuRun, img: *ShaderImage, u: float, v: float) -> *GpuVal {
+    w = image_w(img)
+    h = image_h(img)
+    fx = floori((u * w - 0.5) * SUBTEXEL + 0.5) / SUBTEXEL
+    fy = floori((v * h - 0.5) * SUBTEXEL + 0.5) / SUBTEXEL
+    x0 = floori(fx)
+    y0 = floori(fy)
+    tx = fx - x0
+    ty = fy - y0
+    xa = clampi(x0, 0, w - 1)
+    xb = clampi(x0 + 1, 0, w - 1)
+    ya = clampi(y0, 0, h - 1)
+    yb = clampi(y0 + 1, 0, h - 1)
+    out = keep(cx, mkval(4, 0.0, 0.0, 0.0, 0.0))
+    ch = 0
+    while ch < 4 {
+        top = image_channel(img, xa, ya, ch) * (1.0 - tx) + image_channel(img, xb, ya, ch) * tx
+        bottom = image_channel(img, xa, yb, ch) * (1.0 - tx) + image_channel(img, xb, yb, ch) * tx
+        set_lane(out, ch, top * (1.0 - ty) + bottom * ty)
+        ch = ch + 1
+    }
+    return out
 }
 
-_known(fname: string) -> bool {
-    return string.equals(fname, "min") == 1 || string.equals(fname, "max") == 1 || string.equals(fname, "abs") == 1 ||
-        string.equals(fname, "sign") == 1 || string.equals(fname, "clamp") == 1 || string.equals(fname, "smoothstep") == 1 ||
-        string.equals(fname, "mix") == 1 || string.equals(fname, "fract") == 1 || string.equals(fname, "floor") == 1
-}
-
-// A lane-wise function of one, two or three values.
-_lanes(cx: *GpuRun, fname: string, a: *GpuVal, c: *GpuVal, d: *GpuVal) -> *GpuVal {
-    if !_known(fname) { return _fail(cx, "${fname}() is not run on the CPU yet") }
-    n = a.n
-    if c != null && c.n > n { n = c.n }
-    if d != null && d.n > n { n = d.n }
-    out = _keep(cx, _val(n, 0.0, 0.0, 0.0, 0.0))
+// A builtin of one, two or three values, lane by lane; null for a name
+// that is not one.
+fn cpu_lanes(cx: *GpuRun, n: quote.Node, fname: string, a: *GpuVal, c: *GpuVal, d: *GpuVal) -> *GpuVal {
+    m = a.n
+    if c != null && c.n > m { m = c.n }
+    if d != null && d.n > m { m = d.n }
+    out = keep(cx, mkval(m, 0.0, 0.0, 0.0, 0.0))
     j = 0
-    while j < n {
-        x = _lane(a, j)
+    while j < m {
+        x = lane(a, j)
         y = 0.0
-        if c != null { y = _lane(c, j) }
+        if c != null { y = lane(c, j) }
         z = 0.0
-        if d != null { z = _lane(d, j) }
+        if d != null { z = lane(d, j) }
         r = 0.0
-        if string.equals(fname, "min") == 1 { r = _minf(x, y) }
-        if string.equals(fname, "max") == 1 { r = _maxf(x, y) }
-        if string.equals(fname, "abs") == 1 { r = _absf(x) }
-        if string.equals(fname, "sign") == 1 {
+        if fname == "min" {
+            r = minf(x, y)
+        } else if fname == "max" {
+            r = maxf(x, y)
+        } else if fname == "abs" {
+            r = x
+            if x < 0.0 { r = 0.0 - x }
+        } else if fname == "sign" {
             if x > 0.0 { r = 1.0 } else if x < 0.0 { r = 0.0 - 1.0 }
-        }
-        if string.equals(fname, "clamp") == 1 { r = _minf(_maxf(x, y), z) }
-        if string.equals(fname, "smoothstep") == 1 {
+        } else if fname == "clamp" {
+            r = minf(maxf(x, y), z)
+        } else if fname == "smoothstep" {
             // smoothstep(edge0 = x, edge1 = y, value = z)
-            t = _minf(_maxf((z - x) / (y - x), 0.0), 1.0)
+            t = minf(maxf((z - x) / (y - x), 0.0), 1.0)
             r = t * t * (3.0 - 2.0 * t)
+        } else if fname == "mix" {
+            r = x * (1.0 - z) + y * z
+        } else if fname == "fract" {
+            r = x - floori(x) * 1.0
+        } else if fname == "floor" {
+            r = floori(x) * 1.0
+        } else {
+            return fail(cx, n, "${fname}() is not run on the CPU")
         }
-        if string.equals(fname, "mix") == 1 { r = x * (1.0 - z) + y * z }
-        if string.equals(fname, "fract") == 1 { r = x - _floor(x) * 1.0 }
-        if string.equals(fname, "floor") == 1 { r = _floor(x) * 1.0 }
-        if j == 0 { out.x = r } else if j == 1 { out.y = r } else if j == 2 { out.z = r } else { out.w = r }
+        set_lane(out, j, r)
         j = j + 1
     }
     return out
 }
 
-_cpu_call(cx: *GpuRun, n: *GpuNode) -> *GpuVal {
-    name = n.name
-    argc = list.size(n.kids)
-    if string.equals(name, "texture") == 1 && argc == 2 {
-        tex = _child(n, 0)
-        bd = _find(cx.caps, tex.name)
-        if bd == null || bd.img == null { return _fail(cx, "no image for the texture ${tex.name}") }
-        uv = _cpu_expr(cx, _child(n, 1))
-        return _sample(cx, bd.img, uv.x, uv.y)
+fn cpu_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
+    name = bare_call(quote.name(n))
+    argc = quote.child_count(n)
+    if name == "texture" && argc == 2 {
+        tex = quote.child(n, 0)
+        bd = find(cx.caps, quote.name(tex))
+        if quote.kind(tex) != quote.CAPTURE || bd == null || bd.img == null {
+            return fail(cx, n, "texture() of ${quote.name(tex)}, which has no image")
+        }
+        uv = cpu_expr(cx, quote.child(n, 1))
+        return sample(cx, bd.img as *ShaderImage, uv.x, uv.y)
     }
-    // Constructors: vec2/vec3/vec4 from scalars and vectors in order, or
-    // one scalar splatted.
-    if string.equals(name, "vec2") == 1 || string.equals(name, "vec3") == 1 || string.equals(name, "vec4") == 1 {
+    if name == "rgb" && argc == 1 { return cpu_field(cx, n, cpu_expr(cx, quote.child(n, 0)), "rgb") }
+    // Constructors: from scalars and vectors in order, or one scalar
+    // splatted.
+    if name == "vec2" || name == "vec3" || name == "vec4" {
         want = 2
-        if string.equals(name, "vec3") == 1 { want = 3 }
-        if string.equals(name, "vec4") == 1 { want = 4 }
-        out = _keep(cx, _val(want, 0.0, 0.0, 0.0, 0.0))
+        if name == "vec3" { want = 3 }
+        if name == "vec4" { want = 4 }
+        out = keep(cx, mkval(want, 0.0, 0.0, 0.0, 0.0))
         if argc == 1 {
-            a = _cpu_expr(cx, _child(n, 0))
+            a = cpu_expr(cx, quote.child(n, 0))
             if a.n == 1 {
                 out.x = a.x
                 out.y = a.x
@@ -1006,38 +1056,38 @@ _cpu_call(cx: *GpuRun, n: *GpuNode) -> *GpuVal {
         at = 0
         j = 0
         while j < argc && at < want {
-            a = _cpu_expr(cx, _child(n, j))
+            a = cpu_expr(cx, quote.child(n, j))
             q = 0
             while q < a.n && at < want {
-                x = _lane(a, q)
-                if at == 0 { out.x = x } else if at == 1 { out.y = x } else if at == 2 { out.z = x } else { out.w = x }
+                set_lane(out, at, lane(a, q))
                 at = at + 1
                 q = q + 1
             }
             j = j + 1
         }
-        if at < want { return _fail(cx, "${name}() given ${at} of its ${want} lanes") }
+        if at < want { return fail(cx, n, "${name}() given ${at} of its ${want} lanes") }
         return out
     }
-    if string.equals(name, "dot") == 1 && argc == 2 {
-        a = _cpu_expr(cx, _child(n, 0))
-        c = _cpu_expr(cx, _child(n, 1))
+    if name == "dot" && argc == 2 {
+        a = cpu_expr(cx, quote.child(n, 0))
+        c = cpu_expr(cx, quote.child(n, 1))
         s = 0.0
         j = 0
         while j < a.n {
-            s = s + _lane(a, j) * _lane(c, j)
+            s = s + lane(a, j) * lane(c, j)
             j = j + 1
         }
-        return _keep(cx, v1(s))
+        return keep(cx, v1(s))
     }
     if argc == 1 {
-        return _lanes(cx, name, _cpu_expr(cx, _child(n, 0)), null, null)
+        return cpu_lanes(cx, n, name, cpu_expr(cx, quote.child(n, 0)), null, null)
     }
     if argc == 2 {
-        return _lanes(cx, name, _cpu_expr(cx, _child(n, 0)), _cpu_expr(cx, _child(n, 1)), null)
+        return cpu_lanes(cx, n, name, cpu_expr(cx, quote.child(n, 0)), cpu_expr(cx, quote.child(n, 1)), null)
     }
     if argc == 3 {
-        return _lanes(cx, name, _cpu_expr(cx, _child(n, 0)), _cpu_expr(cx, _child(n, 1)), _cpu_expr(cx, _child(n, 2)))
+        return cpu_lanes(cx, n, name, cpu_expr(cx, quote.child(n, 0)), cpu_expr(cx, quote.child(n, 1)),
+                         cpu_expr(cx, quote.child(n, 2)))
     }
-    return _fail(cx, "${name}() is not run on the CPU yet")
+    return fail(cx, n, "${name}() is not run on the CPU")
 }

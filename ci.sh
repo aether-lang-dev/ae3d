@@ -531,8 +531,12 @@ fi
 # critical path's thirteen minutes.
 if in_tier suites && first_shard; then
 step "modules type-check"
-for module in src/ae3d/*/; do
-    name="$(basename "$module")"
+# A module's own modules too (ae3d.shaders.fxaa, src/ae3d/shaders/fxaa).
+for module in src/ae3d/*/ src/ae3d/*/*/; do
+    [ -f "$module/module.ae" ] || continue
+    name="${module#src/ae3d/}"
+    name="${name%/}"
+    name="${name//\//.}"
     probe="$(mktemp -t ae3d_probe.XXXXXX).ae"
     printf 'import ae3d.%s\nmain() { println("ok") }\n' "$name" > "$probe"
     # The same search path build.sh gives every program: the engine, and
