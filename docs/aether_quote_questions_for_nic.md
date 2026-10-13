@@ -7,7 +7,9 @@ questions that are language design, not bugs, so they want your view before
 anyone builds anything. Three smaller gaps found the same way (a qualified
 struct type such as `*gpu.GpuShader` not parsing, an `INT64_MIN` literal
 clang warns on, and a lane component typed `f32` in a quote's tree) are
-being fixed in an aether PR and are not covered here.
+handled in aether#2891 and are not covered here. (The last stays `f32`:
+it is the honest type of a 32-bit lane, and the docs now say a GLSL back
+end maps both `float` and `f32` to GLSL's `float`.)
 
 Each section: the problem, the options, a recommendation.
 
@@ -117,7 +119,7 @@ or mangle all and keep the old names as aliases for one release.
 
 ## What happens next
 
-The PR for the three small gaps is in progress. Nothing is built for these
+The PR for the three small gaps is aether#2891. Nothing is built for these
 three until you've had a look. If you agree with the recommendations, the
 order would be 1B (it unblocks bloom and most shaders after it), then 3A,
 with 2 decided separately and the naming convention used meanwhile.
