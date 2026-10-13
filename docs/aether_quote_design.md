@@ -310,6 +310,14 @@ From mapping the compiler; nothing here is built yet.
    `glslangValidator` to the same SPIR-V as `fxaa_vk.frag`, and the CPU
    evaluator matches the GPU within a tolerance on a test image. This needs
    no compiler change and settles the node kinds against a real shader.
+   *Done (ae3d main, 31736783, 2026-10-13):* `ae3d.gpu` and
+   `tests/test_gpu.ae`. The GLSL it writes for FXAA reads as the hand-written
+   one, compiles with glslang and passes spirv-val (it is not the same SPIR-V
+   as `fxaa_vk.frag`, which reads its uniforms from the shared `SceneBlock`;
+   this one has a block of its own). The CPU evaluator agrees with FXAA
+   written straight in Aether, with the new vector types, to 2.4e-8 on every
+   pixel of a test image. Still to do here: the same FXAA run on the GPU
+   through ae3d's renderer, against the evaluator.
 2. ~~**Settle the vector-type question** (section 6), in aether.~~ Done:
    distinct types over `f32x4`, after aether#2778 (0.809.0).
 3. **`std.quote` and `AST_QUOTE` in aether**, expressions first, then
