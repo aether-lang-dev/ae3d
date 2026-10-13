@@ -20,3 +20,11 @@
   f32x4, which Aether 0.809 makes work (aether#2778: a scalar variable now
   splats across a lane vector, and two different distinct types no longer
   mix in an operator).
+- And against the GPU (`tests/test_gpu_fxaa.ae`, a GPU suite): the
+  renderer draws a sphere and a cube with FXAA off (twice, the same frame)
+  and on, and gpu.fxaa_shader() runs on the CPU over the plain frame with
+  the pass's own uniforms. Every channel of every pixel is within one step
+  of 255 of what fxaa_vk.frag made on the GPU: on an Apple GPU through
+  MoltenVK, 6110 of 6144 pixels exactly; on lavapipe, 6121 on x86_64 and
+  5957 on arm64, the rest a rounding apart. The smoothstep off by a
+  twentieth is two steps out and fails it.
