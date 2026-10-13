@@ -476,16 +476,18 @@ else
     sed "s/^/        /" /tmp/ae3d_docs.log | head -12
 fi
 
-# The Vulkan shaders are generated from the GLSL in src/ae3d/shaders and
+# The Vulkan shaders are generated from the GLSL in src/ae3d/shaders, and
+# from the trees of the shaders written with `quote` (ae3d.shaders.fxaa), and
 # checked in. An edit to the GLSL without the generator run after it leaves
 # Vulkan on the previous shader, which fails parity in ways that look like
-# real bugs; the check is that the checked-in files are what the source makes.
+# real bugs; the check is that the checked-in files are what the source makes,
+# and that each quoted shader's SPIR-V was made from a tree of its hash.
 step "Vulkan shaders regenerated"
 if ! ./build.sh tools/generate_shaders.ae >/tmp/ae3d_shaders.log 2>&1; then
     fail "generate_shaders (build)"
     sed "s/^/        /" /tmp/ae3d_shaders.log | head -12
 elif ./build/generate_shaders --check >/tmp/ae3d_shaders.log 2>&1; then
-    pass "src/ae3d/vkspirv/glsl and vkscene are what src/ae3d/shaders produces"
+    pass "src/ae3d/vkspirv/glsl and vkscene are what src/ae3d/shaders and the quoted shaders produce"
 else
     fail "generated Vulkan shaders are out of date; run build/generate_shaders"
     sed "s/^/        /" /tmp/ae3d_shaders.log | head -12
@@ -531,8 +533,12 @@ fi
 # critical path's thirteen minutes.
 if in_tier suites && first_shard; then
 step "modules type-check"
-for module in src/ae3d/*/; do
-    name="$(basename "$module")"
+# A module's own modules too (ae3d.shaders.fxaa, src/ae3d/shaders/fxaa).
+for module in src/ae3d/*/ src/ae3d/*/*/; do
+    [ -f "$module/module.ae" ] || continue
+    name="${module#src/ae3d/}"
+    name="${name%/}"
+    name="${name//\//.}"
     probe="$(mktemp -t ae3d_probe.XXXXXX).ae"
     printf 'import ae3d.%s\nmain() { println("ok") }\n' "$name" > "$probe"
     # The same search path build.sh gives every program: the engine, and
