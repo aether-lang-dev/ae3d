@@ -1,0 +1,358 @@
+// ae3d.gpu, held to two things on FXAA (src/ae3d/vkspirv/glsl/fxaa_vk.frag,
+// whose main() is built here as a tree, node for node):
+//
+//   - the GLSL it writes is the text in tests/fixtures/gpu/fxaa.frag, and
+//     glslang compiles it to SPIR-V that spirv-val passes (where glslang is
+//     on PATH: the Vulkan SDK, Homebrew's glslang, Debian's glslang-tools);
+//   - its CPU back end agrees with FXAA written straight in Aether, with the
+//     vector types the language now has (vec2/vec3/vec4 distinct over
+//     f32x4, aether 0.809), on every pixel of an image with edges, flat
+//     ground and a lone bright pixel, both of FXAA's paths taken.
+//
+// AE3D_GPU_WRITE_GOLDEN=1 writes the fixture from what is emitted.
+
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.lanes
+import ae3d.gpu
+
+extern exit(code: int)
+
+type vec2 = distinct f32x4
+type vec3 = distinct f32x4
+type vec4 = distinct f32x4
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+// ── FXAA as a tree ─────────────────────────────────────────────────────
+
+L(name: string, type: string) -> ptr { return gpu.local(name, type) }
+
+// texture(screenTexture, uv).rgb
+tex_rgb(uv: ptr) -> ptr {
+    return gpu.field(gpu.call2("texture", "vec4", gpu.cap("screenTexture", "sampler2D"), uv), "rgb", "vec3")
+}
+
+// TexCoords + vec2(x, y) * texelSize
+nb(x: string, y: string) -> ptr {
+    return gpu.bin("+", "vec2", L("TexCoords", "vec2"),
+        gpu.bin("*", "vec2", gpu.call2("vec2", "vec2", gpu.f(x), gpu.f(y)), gpu.cap("texelSize", "vec2")))
+}
+
+abs_(e: ptr) -> ptr { return gpu.call1("abs", "float", e) }
+fl(op: string, a: ptr, c: ptr) -> ptr { return gpu.bin(op, "float", a, c) }
+
+fxaa_tree() -> ptr {
+    s = gpu.shader_new("fxaa", "TexCoords", "vec2")
+    gpu.shader_capture(s, "texelSize", "vec2")
+    gpu.shader_capture(s, "edgeThreshold", "float")
+    gpu.shader_capture(s, "edgeThresholdMin", "float")
+    gpu.shader_capture(s, "subpixelQuality", "float")
+    gpu.shader_capture(s, "screenTexture", "sampler2D")
+    b = gpu.block()
+    gpu.add(b, gpu.let_("colorCenter", "vec3", tex_rgb(L("TexCoords", "vec2"))))
+    gpu.add(b, gpu.let_("lumaCoeff", "vec3", gpu.call3("vec3", "vec3", gpu.f("0.299"), gpu.f("0.587"), gpu.f("0.114"))))
+    gpu.add(b, gpu.let_("colorN", "vec3", tex_rgb(nb("0.0", "-1.0"))))
+    gpu.add(b, gpu.let_("colorS", "vec3", tex_rgb(nb("0.0", "1.0"))))
+    gpu.add(b, gpu.let_("colorE", "vec3", tex_rgb(nb("1.0", "0.0"))))
+    gpu.add(b, gpu.let_("colorW", "vec3", tex_rgb(nb("-1.0", "0.0"))))
+    lc = L("lumaCoeff", "vec3")
+    gpu.add(b, gpu.let_("lumaCenter", "float", gpu.call2("dot", "float", L("colorCenter", "vec3"), lc)))
+    gpu.add(b, gpu.let_("lumaN", "float", gpu.call2("dot", "float", L("colorN", "vec3"), lc)))
+    gpu.add(b, gpu.let_("lumaS", "float", gpu.call2("dot", "float", L("colorS", "vec3"), lc)))
+    gpu.add(b, gpu.let_("lumaE", "float", gpu.call2("dot", "float", L("colorE", "vec3"), lc)))
+    gpu.add(b, gpu.let_("lumaW", "float", gpu.call2("dot", "float", L("colorW", "vec3"), lc)))
+    lC = L("lumaCenter", "float")
+    lN = L("lumaN", "float")
+    lS = L("lumaS", "float")
+    lE = L("lumaE", "float")
+    lW = L("lumaW", "float")
+    gpu.add(b, gpu.let_("lumaMin", "float", gpu.call2("min", "float", lC,
+        gpu.call2("min", "float", gpu.call2("min", "float", lN, lS), gpu.call2("min", "float", lE, lW)))))
+    gpu.add(b, gpu.let_("lumaMax", "float", gpu.call2("max", "float", lC,
+        gpu.call2("max", "float", gpu.call2("max", "float", lN, lS), gpu.call2("max", "float", lE, lW)))))
+    gpu.add(b, gpu.let_("lumaRange", "float", fl("-", L("lumaMax", "float"), L("lumaMin", "float"))))
+    early = gpu.block()
+    gpu.add(early, gpu.ret(gpu.call2("vec4", "vec4", L("colorCenter", "vec3"), gpu.f("1.0"))))
+    gpu.add(b, gpu.iff(gpu.bin("<", "bool", L("lumaRange", "float"),
+        gpu.call2("max", "float", gpu.cap("edgeThresholdMin", "float"), fl("*", L("lumaMax", "float"), gpu.cap("edgeThreshold", "float")))),
+        early, null))
+    gpu.add(b, gpu.let_("lumaDown", "float", fl("+", lN, lS)))
+    gpu.add(b, gpu.let_("lumaAcross", "float", fl("+", lE, lW)))
+    gpu.add(b, gpu.let_("lumaTotal", "float", fl("+", L("lumaDown", "float"), L("lumaAcross", "float"))))
+    gpu.add(b, gpu.let_("lumaAvg", "float", fl("*", L("lumaTotal", "float"), gpu.f("0.25"))))
+    so = L("subpixelOffset", "float")
+    gpu.add(b, gpu.let_("subpixelOffset", "float", fl("/", abs_(fl("-", L("lumaAvg", "float"), lC)), L("lumaRange", "float"))))
+    gpu.add(b, gpu.assign("subpixelOffset", gpu.call3("clamp", "float", so, gpu.f("0.0"), gpu.f("1.0"))))
+    gpu.add(b, gpu.assign("subpixelOffset", gpu.call3("smoothstep", "float", gpu.f("0.0"), gpu.f("1.0"), so)))
+    gpu.add(b, gpu.assign("subpixelOffset", fl("*", fl("*", so, so), gpu.cap("subpixelQuality", "float"))))
+    m2 = gpu.f("-2.0")
+    gpu.add(b, gpu.let_("edgeHorizontal", "float",
+        fl("+", fl("+", abs_(fl("+", fl("*", m2, lW), lC)), fl("*", abs_(fl("+", fl("*", gpu.f("-2.0"), lC), lE)), gpu.f("2.0"))),
+            abs_(fl("+", fl("*", gpu.f("-2.0"), lE), lC)))))
+    gpu.add(b, gpu.let_("edgeVertical", "float",
+        fl("+", fl("+", abs_(fl("+", fl("*", gpu.f("-2.0"), lN), lC)), fl("*", abs_(fl("+", fl("*", gpu.f("-2.0"), lC), lS)), gpu.f("2.0"))),
+            abs_(fl("+", fl("*", gpu.f("-2.0"), lS), lC)))))
+    gpu.add(b, gpu.let_("isHorizontal", "bool", gpu.bin(">=", "bool", L("edgeHorizontal", "float"), L("edgeVertical", "float"))))
+    hz = L("isHorizontal", "bool")
+    gpu.add(b, gpu.let_("luma1", "float", gpu.choose("float", hz, lS, lE)))
+    gpu.add(b, gpu.let_("luma2", "float", gpu.choose("float", hz, lN, lW)))
+    gpu.add(b, gpu.let_("gradient1", "float", fl("-", L("luma1", "float"), lC)))
+    gpu.add(b, gpu.let_("gradient2", "float", fl("-", L("luma2", "float"), lC)))
+    g1 = L("gradient1", "float")
+    g2 = L("gradient2", "float")
+    gpu.add(b, gpu.let_("is1Steepest", "bool", gpu.bin(">=", "bool", abs_(g1), abs_(g2))))
+    gpu.add(b, gpu.let_("lengthSign", "float", gpu.choose("float", L("is1Steepest", "bool"),
+        gpu.call1("sign", "float", g1), gpu.call1("sign", "float", g2))))
+    gpu.add(b, gpu.let_("subpixelBlend", "float", fl("*", so, L("lengthSign", "float"))))
+    sb = L("subpixelBlend", "float")
+    ts = gpu.cap("texelSize", "vec2")
+    gpu.add(b, gpu.let_("offset", "vec2", gpu.choose("vec2", hz,
+        gpu.call2("vec2", "vec2", gpu.f("0.0"), fl("*", sb, gpu.field(ts, "y", "float"))),
+        gpu.call2("vec2", "vec2", fl("*", sb, gpu.field(ts, "x", "float")), gpu.f("0.0")))))
+    gpu.add(b, gpu.let_("colorFinal", "vec3", tex_rgb(gpu.bin("+", "vec2", L("TexCoords", "vec2"), L("offset", "vec2")))))
+    gpu.add(b, gpu.ret(gpu.call2("vec4", "vec4", L("colorFinal", "vec3"), gpu.f("1.0"))))
+    gpu.shader_body(s, b)
+    return s
+}
+
+// ── FXAA straight in Aether, with the vector types ─────────────────────
+
+var g_img: ptr = null
+var g_aa = 0
+
+v2(x: float, y: float) -> vec2 { return lanes.f32x4(x, y, 0.0, 0.0) as vec2 }
+v3(x: float, y: float, z: float) -> vec3 { return lanes.f32x4(x, y, z, 0.0) as vec3 }
+dot3(a: vec3, c: vec3) -> float { return a.x * c.x + a.y * c.y + a.z * c.z }
+
+floori(v: float) -> int {
+    t = v as int
+    if v < 0.0 && t * 1.0 != v { return t - 1 }
+    return t
+}
+clampi(v: int, hi: int) -> int {
+    if v < 0 { return 0 }
+    if v > hi { return hi }
+    return v
+}
+minf(a: float, c: float) -> float { if a < c { return a } return c }
+maxf(a: float, c: float) -> float { if a > c { return a } return c }
+absf(a: float) -> float { if a < 0.0 { return 0.0 - a } return a }
+signf(a: float) -> float {
+    if a > 0.0 { return 1.0 }
+    if a < 0.0 { return 0.0 - 1.0 }
+    return 0.0
+}
+
+// Bilinear, clamped at the edges: the reference's own, not the module's.
+rgb_at(uv: vec2) -> vec3 {
+    img = g_img
+    w = gpu.image_w(img)
+    h = gpu.image_h(img)
+    fx = uv.x * w - 0.5
+    fy = uv.y * h - 0.5
+    x0 = floori(fx)
+    y0 = floori(fy)
+    tx = fx - x0
+    ty = fy - y0
+    a = gpu.image_get(img, clampi(x0, w - 1), clampi(y0, h - 1))
+    c = gpu.image_get(img, clampi(x0 + 1, w - 1), clampi(y0, h - 1))
+    d = gpu.image_get(img, clampi(x0, w - 1), clampi(y0 + 1, h - 1))
+    e = gpu.image_get(img, clampi(x0 + 1, w - 1), clampi(y0 + 1, h - 1))
+    r = (gpu.val_x(a) * (1.0 - tx) + gpu.val_x(c) * tx) * (1.0 - ty) + (gpu.val_x(d) * (1.0 - tx) + gpu.val_x(e) * tx) * ty
+    g = (gpu.val_y(a) * (1.0 - tx) + gpu.val_y(c) * tx) * (1.0 - ty) + (gpu.val_y(d) * (1.0 - tx) + gpu.val_y(e) * tx) * ty
+    bl = (gpu.val_z(a) * (1.0 - tx) + gpu.val_z(c) * tx) * (1.0 - ty) + (gpu.val_z(d) * (1.0 - tx) + gpu.val_z(e) * tx) * ty
+    return v3(r, g, bl)
+}
+
+fxaa_ref(uv: vec2, texel: vec2, edge: float, edge_min: float, subpixel: float) -> vec3 {
+    luma = v3(0.299, 0.587, 0.114)
+    c = rgb_at(uv)
+    n = rgb_at(uv + v2(0.0, 0.0 - 1.0) * texel)
+    s = rgb_at(uv + v2(0.0, 1.0) * texel)
+    e = rgb_at(uv + v2(1.0, 0.0) * texel)
+    w = rgb_at(uv + v2(0.0 - 1.0, 0.0) * texel)
+    lc = dot3(c, luma)
+    ln = dot3(n, luma)
+    ls = dot3(s, luma)
+    le = dot3(e, luma)
+    lw = dot3(w, luma)
+    lo = minf(lc, minf(minf(ln, ls), minf(le, lw)))
+    hi = maxf(lc, maxf(maxf(ln, ls), maxf(le, lw)))
+    range = hi - lo
+    if range < maxf(edge_min, hi * edge) { return c }
+    g_aa = g_aa + 1
+    avg = (ln + ls + le + lw) * 0.25
+    t = minf(maxf(absf(avg - lc) / range, 0.0), 1.0)
+    blend = t * t * (3.0 - 2.0 * t)
+    blend = blend * blend * subpixel
+    horiz = absf(0.0 - 2.0 * lw + lc) + absf(0.0 - 2.0 * lc + le) * 2.0 + absf(0.0 - 2.0 * le + lc)
+    vert = absf(0.0 - 2.0 * ln + lc) + absf(0.0 - 2.0 * lc + ls) * 2.0 + absf(0.0 - 2.0 * ls + lc)
+    along = horiz >= vert
+    l1 = le
+    l2 = lw
+    if along {
+        l1 = ls
+        l2 = ln
+    }
+    g1 = l1 - lc
+    g2 = l2 - lc
+    dir = signf(g2)
+    if absf(g1) >= absf(g2) { dir = signf(g1) }
+    step = blend * dir
+    off = v2(step * texel.x, 0.0)
+    if along { off = v2(0.0, step * texel.y) }
+    return rgb_at(uv + off)
+}
+
+// ── The test image ─────────────────────────────────────────────────────
+
+make_image() -> ptr {
+    W = 12
+    H = 8
+    img = gpu.image_new(W, H)
+    y = 0
+    while y < H {
+        x = 0
+        while x < W {
+            // Grey ground; white right of a staircase edge; a red block; one
+            // bright pixel on its own in the grey.
+            r = 0.2
+            g = 0.2
+            bl = 0.2
+            if x > 5 + y / 2 {
+                r = 0.95
+                g = 0.95
+                bl = 0.95
+            }
+            if x >= 1 && x <= 3 && y >= 4 && y <= 6 {
+                r = 0.9
+                g = 0.1
+                bl = 0.1
+            }
+            if x == 2 && y == 1 {
+                r = 1.0
+                g = 1.0
+                bl = 1.0
+            }
+            gpu.image_set(img, x, y, r, g, bl, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return img
+}
+
+main() {
+    println("ae3d.gpu: FXAA as a tree")
+    s = fxaa_tree()
+
+    // ── GLSL ──
+    glsl = gpu.emit_glsl(s)
+    golden_path = "tests/fixtures/gpu/fxaa.frag"
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(golden_path, glsl)
+        check("the golden GLSL written", werr == "")
+    }
+    golden, gerr = file.read(golden_path)
+    check("the golden GLSL is there", gerr == "")
+    check("the GLSL written is the golden text", string.equals(glsl, golden) == 1)
+    if string.equals(glsl, golden) == 0 {
+        println("--- emitted ---")
+        println(glsl)
+    }
+
+    tmp = os.temp_dir()
+    frag = string.concat(tmp, "/ae3d_gpu_fxaa.frag")
+    spv = string.concat(tmp, "/ae3d_gpu_fxaa.spv")
+    _w = file.write(frag, glsl)
+    argv = list.new()
+    list.add(argv, "-V")
+    list.add(argv, "-o")
+    list.add(argv, spv)
+    list.add(argv, frag)
+    // A missing program comes back as a status, not an error, so it is
+    // looked for first.
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+    } else {
+        out, status, _err = os.run_capture("glslangValidator", argv, null)
+        check("glslang compiles it to SPIR-V", status == 0)
+        if status != 0 { println(out) }
+        vargv = list.new()
+        list.add(vargv, spv)
+        if string.length(os.which("spirv-val")) == 0 {
+            println("  skip spirv-val (not on PATH)")
+        } else {
+            vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+            check("spirv-val passes the SPIR-V", vstatus == 0)
+            if vstatus != 0 { println(vout) }
+        }
+    }
+
+    // ── The CPU back end against FXAA in Aether ──
+    img = make_image()
+    g_img = img as ptr
+    W = gpu.image_w(img)
+    H = gpu.image_h(img)
+    texel_x = 1.0 / W
+    texel_y = 1.0 / H
+    cx = gpu.cpu_new(s)
+    gpu.cpu_set(cx, "texelSize", gpu.v2(texel_x, texel_y))
+    gpu.cpu_set(cx, "edgeThreshold", gpu.v1(0.125))
+    gpu.cpu_set(cx, "edgeThresholdMin", gpu.v1(0.0312))
+    gpu.cpu_set(cx, "subpixelQuality", gpu.v1(0.75))
+    gpu.cpu_texture(cx, "screenTexture", img)
+    worst = 0.0
+    ran = 0
+    changed = 0
+    y = 0
+    while y < H {
+        x = 0
+        while x < W {
+            u = (x + 0.5) / W
+            v = (y + 0.5) / H
+            uv = gpu.v2(u, v)
+            got = gpu.cpu_run(cx, uv)
+            heap.free(uv)
+            if got != null {
+                ran = ran + 1
+                want = fxaa_ref(v2(u, v), v2(texel_x, texel_y), 0.125, 0.0312, 0.75)
+                d = maxf(maxf(absf(gpu.val_x(got) - want.x), absf(gpu.val_y(got) - want.y)), absf(gpu.val_z(got) - want.z))
+                worst = maxf(worst, d)
+                src = gpu.image_get(img, x, y)
+                if absf(gpu.val_x(got) - gpu.val_x(src)) > 0.0001 { changed = changed + 1 }
+                heap.free(got)
+            } else {
+                println("  cpu_run failed: ${gpu.last_error()}")
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    check("the CPU back end ran every pixel (${ran} of ${W * H})", ran == W * H)
+    check("it agrees with FXAA in Aether on every pixel (worst ${worst})", worst < 0.00001)
+    check("FXAA's edge path was taken (${g_aa} pixels)", g_aa > 0)
+    check("and its flat path (${W * H - g_aa} pixels)", W * H - g_aa > 0)
+    check("FXAA changed some pixels (${changed})", changed > 0)
+    gpu.cpu_free(cx)
+
+    println("${g_checks - g_failures}/${g_checks} checks passed")
+    if g_failures > 0 { exit(1) }
+}

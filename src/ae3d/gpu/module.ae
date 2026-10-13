@@ -1,0 +1,872 @@
+// ae3d.gpu: a shader as a tree of nodes, written out as GLSL or run on the
+// CPU.
+//
+// Step 1 of docs/aether_quote_design.md (on the for_nic branch). The nodes
+// are the shapes std.quote will hand a library once Aether has `quote`:
+// kind, type, name, op, literal text and children, every node carrying the
+// type the checker would give it. Until then a shader is built with the
+// calls below, which is what lets the back ends be proved before the
+// compiler is touched. A back end only ever walks a tree; it never parses.
+//
+//   s = gpu.shader_new("fxaa", "TexCoords", "vec2")
+//   gpu.shader_capture(s, "texelSize", "vec2")      // a uniform
+//   gpu.shader_capture(s, "screenTexture", "sampler2D")
+//   b = gpu.block()
+//   gpu.add(b, gpu.let_("c", "vec3", gpu.field(gpu.call2("texture", "vec4",
+//       gpu.cap("screenTexture", "sampler2D"), gpu.local("TexCoords", "vec2")), "rgb", "vec3")))
+//   gpu.add(b, gpu.ret(gpu.call2("vec4", "vec4", gpu.local("c", "vec3"), gpu.f("1.0"))))
+//   gpu.shader_body(s, b)
+//   glsl = gpu.emit_glsl(s)                         // the fragment shader's text
+//   out = gpu.cpu_run(ctx, uv)                       // one pixel, on the CPU
+//
+// The GLSL back end writes a fragment shader: the captures become a small
+// uniform block (and a sampler binding each for the textures), the
+// parameter the varying at location 0, and a `return` the output colour.
+// The CPU back end runs the same tree over vec values in doubles, with
+// texture() reading an image bilinearly, clamped at its edges.
+
+import std.heap
+import std.list
+import std.string
+import std.strbuilder
+
+exports (
+    Node, Shader, Val, Image, Cpu,
+    BLOCK, LET, ASSIGN, RETURN, IF, EXPR, LIT, LOCAL, CAPTURE, UNARY, BINARY,
+    CHOOSE, CALL, FIELD,
+    f, i, b, local, cap, bin, neg, not_, call1, call2, call3, call4, call, field,
+    choose, let_, assign, ret, iff, expr, block, add,
+    shader_new, shader_capture, shader_body, shader_name,
+    emit_glsl,
+    v1, v2, v3, v4, val_n, val_x, val_y, val_z, val_w, val_bool,
+    image_new, image_set, image_get, image_w, image_h,
+    cpu_new, cpu_set, cpu_texture, cpu_run, cpu_free, last_error
+)
+
+// Node kinds, version 1 of the tree (docs/aether_quote_design.md, section
+// 3). Added to, never renumbered.
+const BLOCK   = 1
+const LET     = 2
+const ASSIGN  = 3
+const RETURN  = 4
+const IF      = 5
+const EXPR    = 9
+const LIT     = 10
+const LOCAL   = 11
+const CAPTURE = 12
+const UNARY   = 13
+const BINARY  = 14
+const CHOOSE  = 15
+const CALL    = 16
+const FIELD   = 17
+
+struct Node {
+    kind: int
+    type: string     // "float", "int", "bool", "vec2", "vec3", "vec4", "sampler2D"
+    name: string     // a local's, a capture's or a field's name; a called function's
+    op: string       // an operator
+    lit: string      // a literal's text, as written
+    num: float       // a literal's value
+    kids: ptr        // list of *Node
+}
+
+struct Shader {
+    name: string
+    param: string        // the varying it is run for (a fragment's position)
+    param_type: string
+    captures: ptr        // list of *Node (CAPTURE: name, type)
+    body: *Node
+}
+
+var g_error = ""
+
+last_error() -> string { return g_error }
+
+_node(kind: int, type: string) -> *Node {
+    n = heap.new(Node)
+    n.kind = kind
+    n.type = type
+    n.name = ""
+    n.op = ""
+    n.lit = ""
+    n.num = 0.0
+    n.kids = list.new()
+    return n
+}
+
+_kid(n: *Node, k: *Node) -> *Node {
+    list.add_raw(n.kids, k as ptr)
+    return n
+}
+
+_child(n: *Node, i: int) -> *Node {
+    return list.get_raw(n.kids, i) as *Node
+}
+
+// ── Building a tree ────────────────────────────────────────────────────
+
+// A float literal from its text ("0.299"), which is what the GLSL shows.
+f(text: string) -> *Node {
+    n = _node(LIT, "float")
+    n.lit = text
+    v, _e = string.to_float(text)
+    n.num = v
+    return n
+}
+
+// An int literal, and a bool one.
+i(v: int) -> *Node {
+    n = _node(LIT, "int")
+    n.lit = "${v}"
+    n.num = v * 1.0
+    return n
+}
+b(v: bool) -> *Node {
+    n = _node(LIT, "bool")
+    n.lit = "false"
+    if v {
+        n.lit = "true"
+        n.num = 1.0
+    }
+    return n
+}
+
+// A local or the parameter, by name; a capture (an outer variable: a
+// uniform, or a texture), by name.
+local(name: string, type: string) -> *Node {
+    n = _node(LOCAL, type)
+    n.name = name
+    return n
+}
+cap(name: string, type: string) -> *Node {
+    n = _node(CAPTURE, type)
+    n.name = name
+    return n
+}
+
+// a op c, of type `type`.
+bin(op: string, type: string, a: *Node, c: *Node) -> *Node {
+    n = _node(BINARY, type)
+    n.op = op
+    return _kid(_kid(n, a), c)
+}
+neg(type: string, a: *Node) -> *Node {
+    n = _node(UNARY, type)
+    n.op = "-"
+    return _kid(n, a)
+}
+not_(a: *Node) -> *Node {
+    n = _node(UNARY, "bool")
+    n.op = "!"
+    return _kid(n, a)
+}
+
+// A call of a function (a builtin such as texture, dot or vec4), recorded,
+// not made.
+call(name: string, type: string) -> *Node {
+    n = _node(CALL, type)
+    n.name = name
+    return n
+}
+call1(name: string, type: string, a: *Node) -> *Node {
+    return _kid(call(name, type), a)
+}
+call2(name: string, type: string, a: *Node, c: *Node) -> *Node {
+    return _kid(_kid(call(name, type), a), c)
+}
+call3(name: string, type: string, a: *Node, c: *Node, d: *Node) -> *Node {
+    return _kid(_kid(_kid(call(name, type), a), c), d)
+}
+call4(name: string, type: string, a: *Node, c: *Node, d: *Node, e: *Node) -> *Node {
+    return _kid(_kid(_kid(_kid(call(name, type), a), c), d), e)
+}
+
+// obj.name: a component (.x) or a swizzle (.rgb).
+field(obj: *Node, name: string, type: string) -> *Node {
+    n = _node(FIELD, type)
+    n.name = name
+    return _kid(n, obj)
+}
+
+// `if c { a } else { d }` as a value (GLSL's ?:).
+choose(type: string, c: *Node, a: *Node, d: *Node) -> *Node {
+    n = _node(CHOOSE, type)
+    return _kid(_kid(_kid(n, c), a), d)
+}
+
+// Statements.
+let_(name: string, type: string, value: *Node) -> *Node {
+    n = _node(LET, type)
+    n.name = name
+    return _kid(n, value)
+}
+assign(name: string, value: *Node) -> *Node {
+    n = _node(ASSIGN, value.type)
+    n.name = name
+    return _kid(n, value)
+}
+ret(value: *Node) -> *Node {
+    return _kid(_node(RETURN, value.type), value)
+}
+// if cond { then } (else_ a block, or null).
+iff(cond: *Node, then: *Node, else_: *Node) -> *Node {
+    n = _kid(_kid(_node(IF, ""), cond), then)
+    if else_ != null { _d = _kid(n, else_) }
+    return n
+}
+expr(e: *Node) -> *Node {
+    return _kid(_node(EXPR, e.type), e)
+}
+block() -> *Node {
+    return _node(BLOCK, "")
+}
+add(blk: *Node, stmt: *Node) -> *Node {
+    return _kid(blk, stmt)
+}
+
+shader_new(name: string, param: string, param_type: string) -> *Shader {
+    s = heap.new(Shader)
+    s.name = name
+    s.param = param
+    s.param_type = param_type
+    s.captures = list.new()
+    s.body = block()
+    return s
+}
+shader_capture(s: *Shader, name: string, type: string) -> *Shader {
+    list.add_raw(s.captures, cap(name, type) as ptr)
+    return s
+}
+shader_body(s: *Shader, body: *Node) -> *Shader {
+    s.body = body
+    return s
+}
+shader_name(s: *Shader) -> string { return s.name }
+
+// ── GLSL ───────────────────────────────────────────────────────────────
+
+// How tightly an operator binds, as GLSL has it (higher binds tighter).
+_prec(op: string) -> int {
+    if string.equals(op, "||") == 1 { return 1 }
+    if string.equals(op, "&&") == 1 { return 2 }
+    if string.equals(op, "==") == 1 || string.equals(op, "!=") == 1 { return 3 }
+    if string.equals(op, "<") == 1 || string.equals(op, "<=") == 1 || string.equals(op, ">") == 1 || string.equals(op, ">=") == 1 { return 4 }
+    if string.equals(op, "+") == 1 || string.equals(op, "-") == 1 { return 5 }
+    return 6
+}
+
+// An expression, parenthesised only where the operator around it binds
+// tighter than its own (`outer`), or as tightly on the right of a
+// non-associative one (`right`).
+_glsl_expr(n: *Node, outer: int, right: int) -> string {
+    k = n.kind
+    if k == LIT || k == LOCAL || k == CAPTURE {
+        if k == LIT { return n.lit }
+        return n.name
+    }
+    if k == FIELD {
+        return string.concat(_glsl_expr(_child(n, 0), 8, 0), string.concat(".", n.name))
+    }
+    if k == CALL {
+        sb = strbuilder.new(32)
+        _a = strbuilder.append(sb, n.name)
+        _a2 = strbuilder.append(sb, "(")
+        j = 0
+        while j < list.size(n.kids) {
+            if j > 0 { _c = strbuilder.append(sb, ", ") }
+            _e = strbuilder.append(sb, _glsl_expr(_child(n, j), 0, 0))
+            j = j + 1
+        }
+        _z = strbuilder.append(sb, ")")
+        return strbuilder.finish(sb)
+    }
+    if k == UNARY {
+        return string.concat(n.op, _glsl_expr(_child(n, 0), 7, 0))
+    }
+    if k == CHOOSE {
+        t = "${_glsl_expr(_child(n, 0), 1, 0)} ? ${_glsl_expr(_child(n, 1), 1, 0)} : ${_glsl_expr(_child(n, 2), 1, 0)}"
+        if outer > 0 { return "(${t})" }
+        return t
+    }
+    // BINARY
+    p = _prec(n.op)
+    t = "${_glsl_expr(_child(n, 0), p, 0)} ${n.op} ${_glsl_expr(_child(n, 1), p, 1)}"
+    if p < outer || (p == outer && right == 1) { return "(${t})" }
+    return t
+}
+
+_indent(sb: ptr, depth: int) {
+    d = 0
+    while d < depth {
+        _a = strbuilder.append(sb, "    ")
+        d = d + 1
+    }
+}
+
+// A block's statements at `depth`; `top` is main's own block, where the
+// last statement's return needs no `return;` after it.
+_glsl_block(sb: ptr, blk: *Node, depth: int, top: int) {
+    n = list.size(blk.kids)
+    j = 0
+    while j < n {
+        _glsl_stmt(sb, _child(blk, j), depth, top == 1 && j == n - 1)
+        j = j + 1
+    }
+}
+
+_glsl_stmt(sb: ptr, s: *Node, depth: int, last: bool) {
+    _indent(sb, depth)
+    k = s.kind
+    if k == LET {
+        _a = strbuilder.append(sb, "${s.type} ${s.name} = ${_glsl_expr(_child(s, 0), 0, 0)};\n")
+    } else if k == ASSIGN {
+        _a = strbuilder.append(sb, "${s.name} = ${_glsl_expr(_child(s, 0), 0, 0)};\n")
+    } else if k == EXPR {
+        _a = strbuilder.append(sb, "${_glsl_expr(_child(s, 0), 0, 0)};\n")
+    } else if k == RETURN {
+        _a = strbuilder.append(sb, "FragColor = ${_glsl_expr(_child(s, 0), 0, 0)};\n")
+        if !last {
+            _indent(sb, depth)
+            _r = strbuilder.append(sb, "return;\n")
+        }
+    } else if k == IF {
+        _a = strbuilder.append(sb, "if (${_glsl_expr(_child(s, 0), 0, 0)}) {\n")
+        _glsl_block(sb, _child(s, 1), depth + 1, 0)
+        _indent(sb, depth)
+        if list.size(s.kids) > 2 {
+            _e = strbuilder.append(sb, "} else {\n")
+            _glsl_block(sb, _child(s, 2), depth + 1, 0)
+            _indent(sb, depth)
+        }
+        _z = strbuilder.append(sb, "}\n")
+    } else if k == BLOCK {
+        _a = strbuilder.append(sb, "{\n")
+        _glsl_block(sb, s, depth + 1, 0)
+        _indent(sb, depth)
+        _z = strbuilder.append(sb, "}\n")
+    }
+}
+
+// The fragment shader's GLSL (#version 450, Vulkan bindings): the captures
+// that are not textures in a uniform block at binding 0, each texture a
+// sampler at the next binding, the parameter at location 0, and FragColor.
+emit_glsl(s: *Shader) -> string {
+    sb = strbuilder.new(4096)
+    _h = strbuilder.append(sb, "#version 450\n// ${s.name}: written by ae3d.gpu from its tree.\n\n")
+    nc = list.size(s.captures)
+    plain = 0
+    j = 0
+    while j < nc {
+        c = list.get_raw(s.captures, j) as *Node
+        if string.equals(c.type, "sampler2D") == 0 { plain = plain + 1 }
+        j = j + 1
+    }
+    binding = 0
+    if plain > 0 {
+        _u = strbuilder.append(sb, "layout(std140, set = 0, binding = 0) uniform Params {\n")
+        j = 0
+        while j < nc {
+            c = list.get_raw(s.captures, j) as *Node
+            if string.equals(c.type, "sampler2D") == 0 {
+                _f = strbuilder.append(sb, "    ${c.type} ${c.name};\n")
+            }
+            j = j + 1
+        }
+        _ue = strbuilder.append(sb, "};\n")
+        binding = 1
+    }
+    j = 0
+    while j < nc {
+        c = list.get_raw(s.captures, j) as *Node
+        if string.equals(c.type, "sampler2D") == 1 {
+            _t = strbuilder.append(sb, "layout(set = 0, binding = ${binding}) uniform sampler2D ${c.name};\n")
+            binding = binding + 1
+        }
+        j = j + 1
+    }
+    _io = strbuilder.append(sb, "\nlayout(location = 0) in ${s.param_type} ${s.param};\nlayout(location = 0) out vec4 FragColor;\n\nvoid main() {\n")
+    _glsl_block(sb, s.body, 1, 1)
+    _end = strbuilder.append(sb, "}\n")
+    return strbuilder.finish(sb)
+}
+
+// ── The CPU back end ───────────────────────────────────────────────────
+
+// A value: n lanes of a float, vec2, vec3 or vec4 (n 1 to 4), or a bool
+// (n 0, in x).
+struct Val {
+    n: int
+    x: float
+    y: float
+    z: float
+    w: float
+}
+
+v1(x: float) -> *Val { return _val(1, x, 0.0, 0.0, 0.0) }
+v2(x: float, y: float) -> *Val { return _val(2, x, y, 0.0, 0.0) }
+v3(x: float, y: float, z: float) -> *Val { return _val(3, x, y, z, 0.0) }
+v4(x: float, y: float, z: float, w: float) -> *Val { return _val(4, x, y, z, w) }
+val_n(v: *Val) -> int { return v.n }
+val_x(v: *Val) -> float { return v.x }
+val_y(v: *Val) -> float { return v.y }
+val_z(v: *Val) -> float { return v.z }
+val_w(v: *Val) -> float { return v.w }
+val_bool(v: *Val) -> bool { return v.x != 0.0 }
+
+_val(n: int, x: float, y: float, z: float, w: float) -> *Val {
+    v = heap.new(Val)
+    v.n = n
+    v.x = x
+    v.y = y
+    v.z = z
+    v.w = w
+    return v
+}
+
+_lane(v: *Val, k: int) -> float {
+    if v.n == 1 { return v.x }   // a scalar splats
+    if k == 0 { return v.x }
+    if k == 1 { return v.y }
+    if k == 2 { return v.z }
+    return v.w
+}
+
+// An image: w x h pixels of RGBA, each a vec4.
+struct Image {
+    w: int
+    h: int
+    px: ptr      // list of *Val
+}
+
+image_new(w: int, h: int) -> *Image {
+    img = heap.new(Image)
+    img.w = w
+    img.h = h
+    img.px = list.new()
+    k = 0
+    while k < w * h {
+        list.add_raw(img.px, v4(0.0, 0.0, 0.0, 1.0) as ptr)
+        k = k + 1
+    }
+    return img
+}
+image_set(img: *Image, x: int, y: int, r: float, g: float, b_: float, a: float) {
+    p = list.get_raw(img.px, y * img.w + x) as *Val
+    p.x = r
+    p.y = g
+    p.z = b_
+    p.w = a
+}
+image_get(img: *Image, x: int, y: int) -> *Val {
+    return list.get_raw(img.px, y * img.w + x) as *Val
+}
+image_w(img: *Image) -> int { return img.w }
+image_h(img: *Image) -> int { return img.h }
+
+_floor(v: float) -> int {
+    t = v as int
+    if v < 0.0 && t * 1.0 != v { return t - 1 }
+    return t
+}
+
+_clampi(v: int, lo: int, hi: int) -> int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// texture(img, uv): bilinear, texel centres at (i + 0.5) / size, clamped
+// at the edges, as a linear sampler with clamp-to-edge reads.
+_sample(cx: *Cpu, img: *Image, u: float, v: float) -> *Val {
+    fx = u * img.w - 0.5
+    fy = v * img.h - 0.5
+    x0 = _floor(fx)
+    y0 = _floor(fy)
+    tx = fx - x0
+    ty = fy - y0
+    a = image_get(img, _clampi(x0, 0, img.w - 1), _clampi(y0, 0, img.h - 1))
+    c = image_get(img, _clampi(x0 + 1, 0, img.w - 1), _clampi(y0, 0, img.h - 1))
+    d = image_get(img, _clampi(x0, 0, img.w - 1), _clampi(y0 + 1, 0, img.h - 1))
+    e = image_get(img, _clampi(x0 + 1, 0, img.w - 1), _clampi(y0 + 1, 0, img.h - 1))
+    return _keep(cx, v4(
+        (a.x * (1.0 - tx) + c.x * tx) * (1.0 - ty) + (d.x * (1.0 - tx) + e.x * tx) * ty,
+        (a.y * (1.0 - tx) + c.y * tx) * (1.0 - ty) + (d.y * (1.0 - tx) + e.y * tx) * ty,
+        (a.z * (1.0 - tx) + c.z * tx) * (1.0 - ty) + (d.z * (1.0 - tx) + e.z * tx) * ty,
+        (a.w * (1.0 - tx) + c.w * tx) * (1.0 - ty) + (d.w * (1.0 - tx) + e.w * tx) * ty))
+}
+
+struct Binding {
+    name: string
+    val: *Val
+    img: *Image
+}
+
+// A run of a shader: the captures' values and textures, the locals as it
+// goes, and every value it makes (freed after each pixel).
+struct Cpu {
+    s: *Shader
+    caps: ptr        // list of *Binding
+    locals: ptr      // list of *Binding
+    arena: ptr       // list of *Val made during a run
+    done: int        // 1 once a return has run
+    out: *Val
+    failed: int
+}
+
+cpu_new(s: *Shader) -> *Cpu {
+    cx = heap.new(Cpu)
+    cx.s = s
+    cx.caps = list.new()
+    cx.locals = list.new()
+    cx.arena = list.new()
+    cx.done = 0
+    cx.out = null
+    cx.failed = 0
+    return cx
+}
+
+_bind(lst: ptr, name: string, v: *Val, img: *Image) {
+    bd = heap.new(Binding)
+    bd.name = name
+    bd.val = v
+    bd.img = img
+    list.add_raw(lst, bd as ptr)
+}
+
+// A capture's value (a uniform), or a texture's image.
+cpu_set(cx: *Cpu, name: string, v: *Val) -> *Cpu {
+    _bind(cx.caps, name, v, null)
+    return cx
+}
+cpu_texture(cx: *Cpu, name: string, img: *Image) -> *Cpu {
+    _bind(cx.caps, name, null, img)
+    return cx
+}
+
+_find(lst: ptr, name: string) -> *Binding {
+    k = list.size(lst) - 1
+    while k >= 0 {
+        bd = list.get_raw(lst, k) as *Binding
+        if string.equals(bd.name, name) == 1 { return bd }
+        k = k - 1
+    }
+    return null
+}
+
+_keep(cx: *Cpu, v: *Val) -> *Val {
+    list.add_raw(cx.arena, v as ptr)
+    return v
+}
+
+_fail(cx: *Cpu, what: string) -> *Val {
+    if cx.failed == 0 { g_error = what }
+    cx.failed = 1
+    return _keep(cx, v1(0.0))
+}
+
+// Run the shader for one value of its parameter: the colour it returns, a
+// fresh value the caller frees (heap.free), or null when it could not run
+// (last_error says why).
+cpu_run(cx: *Cpu, param: *Val) -> *Val {
+    cx.done = 0
+    cx.out = null
+    cx.failed = 0
+    _bind(cx.locals, cx.s.param, param, null)
+    _cpu_block(cx, cx.s.body)
+    ok = cx.out != null && cx.failed == 0
+    rn = 0
+    rx = 0.0
+    ry = 0.0
+    rz = 0.0
+    rw = 0.0
+    if ok {
+        rn = cx.out.n
+        rx = cx.out.x
+        ry = cx.out.y
+        rz = cx.out.z
+        rw = cx.out.w
+    }
+    // Everything this run made goes, the parameter's binding with it.
+    k = 0
+    while k < list.size(cx.locals) {
+        heap.free(list.get_raw(cx.locals, k))
+        k = k + 1
+    }
+    list.clear(cx.locals)
+    k = 0
+    while k < list.size(cx.arena) {
+        heap.free(list.get_raw(cx.arena, k))
+        k = k + 1
+    }
+    list.clear(cx.arena)
+    if !ok { return null }
+    return _val(rn, rx, ry, rz, rw)
+}
+
+cpu_free(cx: *Cpu) {
+    k = 0
+    while k < list.size(cx.caps) {
+        heap.free(list.get_raw(cx.caps, k))
+        k = k + 1
+    }
+    list.free(cx.caps)
+    list.free(cx.locals)
+    list.free(cx.arena)
+    heap.free(cx)
+}
+
+_cpu_block(cx: *Cpu, blk: *Node) {
+    mark = list.size(cx.locals)
+    j = 0
+    while j < list.size(blk.kids) && cx.done == 0 && cx.failed == 0 {
+        _cpu_stmt(cx, _child(blk, j))
+        j = j + 1
+    }
+    // The block's own locals go out of scope.
+    while list.size(cx.locals) > mark {
+        last = list.size(cx.locals) - 1
+        heap.free(list.get_raw(cx.locals, last))
+        list.remove(cx.locals, last)
+    }
+}
+
+_cpu_stmt(cx: *Cpu, s: *Node) {
+    k = s.kind
+    if k == LET {
+        _bind(cx.locals, s.name, _cpu_expr(cx, _child(s, 0)), null)
+    } else if k == ASSIGN {
+        bd = _find(cx.locals, s.name)
+        if bd == null { _f = _fail(cx, "assignment to ${s.name}, which is not a local"); return }
+        bd.val = _cpu_expr(cx, _child(s, 0))
+    } else if k == EXPR {
+        _e = _cpu_expr(cx, _child(s, 0))
+    } else if k == RETURN {
+        cx.out = _cpu_expr(cx, _child(s, 0))
+        cx.done = 1
+    } else if k == IF {
+        c = _cpu_expr(cx, _child(s, 0))
+        if c.x != 0.0 {
+            _cpu_block(cx, _child(s, 1))
+        } else if list.size(s.kids) > 2 {
+            _cpu_block(cx, _child(s, 2))
+        }
+    } else if k == BLOCK {
+        _cpu_block(cx, s)
+    } else {
+        _f2 = _fail(cx, "a statement of kind ${k} is not run on the CPU yet")
+    }
+}
+
+_cpu_expr(cx: *Cpu, n: *Node) -> *Val {
+    k = n.kind
+    if k == LIT {
+        if string.equals(n.type, "bool") == 1 { return _keep(cx, _val(0, n.num, 0.0, 0.0, 0.0)) }
+        return _keep(cx, v1(n.num))
+    }
+    if k == LOCAL {
+        bd = _find(cx.locals, n.name)
+        if bd == null { return _fail(cx, "no local ${n.name}") }
+        return bd.val
+    }
+    if k == CAPTURE {
+        bd = _find(cx.caps, n.name)
+        if bd == null || bd.val == null { return _fail(cx, "no value for the capture ${n.name}") }
+        return bd.val
+    }
+    if k == FIELD { return _cpu_field(cx, _cpu_expr(cx, _child(n, 0)), n.name) }
+    if k == CHOOSE {
+        c = _cpu_expr(cx, _child(n, 0))
+        if c.x != 0.0 { return _cpu_expr(cx, _child(n, 1)) }
+        return _cpu_expr(cx, _child(n, 2))
+    }
+    if k == UNARY {
+        a = _cpu_expr(cx, _child(n, 0))
+        if string.equals(n.op, "!") == 1 {
+            if a.x != 0.0 { return _keep(cx, _val(0, 0.0, 0.0, 0.0, 0.0)) }
+            return _keep(cx, _val(0, 1.0, 0.0, 0.0, 0.0))
+        }
+        return _keep(cx, _val(a.n, 0.0 - a.x, 0.0 - a.y, 0.0 - a.z, 0.0 - a.w))
+    }
+    if k == BINARY { return _cpu_binary(cx, n.op, _cpu_expr(cx, _child(n, 0)), _cpu_expr(cx, _child(n, 1))) }
+    if k == CALL { return _cpu_call(cx, n) }
+    return _fail(cx, "an expression of kind ${k} is not run on the CPU yet")
+}
+
+// A component or a swizzle: x y z w, or r g b a.
+_cpu_field(cx: *Cpu, v: *Val, name: string) -> *Val {
+    m = string.length(name)
+    if m < 1 || m > 4 { return _fail(cx, "no field .${name}") }
+    out = _keep(cx, _val(m, 0.0, 0.0, 0.0, 0.0))
+    j = 0
+    while j < m {
+        ch = string.char_at(name, j)
+        lane = 0 - 1
+        if ch == 120 || ch == 114 { lane = 0 }    // x r
+        if ch == 121 || ch == 103 { lane = 1 }    // y g
+        if ch == 122 || ch == 98 { lane = 2 }     // z b
+        if ch == 119 || ch == 97 { lane = 3 }     // w a
+        if lane < 0 || lane >= v.n { return _fail(cx, "no field .${name} on a value of ${v.n} lanes") }
+        x = _lane(v, lane)
+        if j == 0 { out.x = x } else if j == 1 { out.y = x } else if j == 2 { out.z = x } else { out.w = x }
+        j = j + 1
+    }
+    return out
+}
+
+_cpu_binary(cx: *Cpu, op: string, a: *Val, c: *Val) -> *Val {
+    if string.equals(op, "&&") == 1 || string.equals(op, "||") == 1 {
+        on = 0.0
+        if string.equals(op, "&&") == 1 && a.x != 0.0 && c.x != 0.0 { on = 1.0 }
+        if string.equals(op, "||") == 1 && (a.x != 0.0 || c.x != 0.0) { on = 1.0 }
+        return _keep(cx, _val(0, on, 0.0, 0.0, 0.0))
+    }
+    p = _prec(op)
+    if p == 3 || p == 4 {
+        // Comparisons are of scalars (GLSL's are; a vector's are calls).
+        t = 0
+        if string.equals(op, "<") == 1 && a.x < c.x { t = 1 }
+        if string.equals(op, "<=") == 1 && a.x <= c.x { t = 1 }
+        if string.equals(op, ">") == 1 && a.x > c.x { t = 1 }
+        if string.equals(op, ">=") == 1 && a.x >= c.x { t = 1 }
+        if string.equals(op, "==") == 1 && a.x == c.x { t = 1 }
+        if string.equals(op, "!=") == 1 && a.x != c.x { t = 1 }
+        return _keep(cx, _val(0, t * 1.0, 0.0, 0.0, 0.0))
+    }
+    n = a.n
+    if c.n > n { n = c.n }
+    out = _keep(cx, _val(n, 0.0, 0.0, 0.0, 0.0))
+    j = 0
+    while j < n {
+        x = _lane(a, j)
+        y = _lane(c, j)
+        r = 0.0
+        if string.equals(op, "+") == 1 { r = x + y }
+        if string.equals(op, "-") == 1 { r = x - y }
+        if string.equals(op, "*") == 1 { r = x * y }
+        if string.equals(op, "/") == 1 { r = x / y }
+        if j == 0 { out.x = r } else if j == 1 { out.y = r } else if j == 2 { out.z = r } else { out.w = r }
+        j = j + 1
+    }
+    return out
+}
+
+_minf(a: float, c: float) -> float {
+    if a < c { return a }
+    return c
+}
+_maxf(a: float, c: float) -> float {
+    if a > c { return a }
+    return c
+}
+_absf(a: float) -> float {
+    if a < 0.0 { return 0.0 - a }
+    return a
+}
+
+_known(fname: string) -> bool {
+    return string.equals(fname, "min") == 1 || string.equals(fname, "max") == 1 || string.equals(fname, "abs") == 1 ||
+        string.equals(fname, "sign") == 1 || string.equals(fname, "clamp") == 1 || string.equals(fname, "smoothstep") == 1 ||
+        string.equals(fname, "mix") == 1 || string.equals(fname, "fract") == 1 || string.equals(fname, "floor") == 1
+}
+
+// A lane-wise function of one, two or three values.
+_lanes(cx: *Cpu, fname: string, a: *Val, c: *Val, d: *Val) -> *Val {
+    if !_known(fname) { return _fail(cx, "${fname}() is not run on the CPU yet") }
+    n = a.n
+    if c != null && c.n > n { n = c.n }
+    if d != null && d.n > n { n = d.n }
+    out = _keep(cx, _val(n, 0.0, 0.0, 0.0, 0.0))
+    j = 0
+    while j < n {
+        x = _lane(a, j)
+        y = 0.0
+        if c != null { y = _lane(c, j) }
+        z = 0.0
+        if d != null { z = _lane(d, j) }
+        r = 0.0
+        if string.equals(fname, "min") == 1 { r = _minf(x, y) }
+        if string.equals(fname, "max") == 1 { r = _maxf(x, y) }
+        if string.equals(fname, "abs") == 1 { r = _absf(x) }
+        if string.equals(fname, "sign") == 1 {
+            if x > 0.0 { r = 1.0 } else if x < 0.0 { r = 0.0 - 1.0 }
+        }
+        if string.equals(fname, "clamp") == 1 { r = _minf(_maxf(x, y), z) }
+        if string.equals(fname, "smoothstep") == 1 {
+            // smoothstep(edge0 = x, edge1 = y, value = z)
+            t = _minf(_maxf((z - x) / (y - x), 0.0), 1.0)
+            r = t * t * (3.0 - 2.0 * t)
+        }
+        if string.equals(fname, "mix") == 1 { r = x * (1.0 - z) + y * z }
+        if string.equals(fname, "fract") == 1 { r = x - _floor(x) * 1.0 }
+        if string.equals(fname, "floor") == 1 { r = _floor(x) * 1.0 }
+        if j == 0 { out.x = r } else if j == 1 { out.y = r } else if j == 2 { out.z = r } else { out.w = r }
+        j = j + 1
+    }
+    return out
+}
+
+_cpu_call(cx: *Cpu, n: *Node) -> *Val {
+    name = n.name
+    argc = list.size(n.kids)
+    if string.equals(name, "texture") == 1 && argc == 2 {
+        tex = _child(n, 0)
+        bd = _find(cx.caps, tex.name)
+        if bd == null || bd.img == null { return _fail(cx, "no image for the texture ${tex.name}") }
+        uv = _cpu_expr(cx, _child(n, 1))
+        return _sample(cx, bd.img, uv.x, uv.y)
+    }
+    // Constructors: vec2/vec3/vec4 from scalars and vectors in order, or
+    // one scalar splatted.
+    if string.equals(name, "vec2") == 1 || string.equals(name, "vec3") == 1 || string.equals(name, "vec4") == 1 {
+        want = 2
+        if string.equals(name, "vec3") == 1 { want = 3 }
+        if string.equals(name, "vec4") == 1 { want = 4 }
+        out = _keep(cx, _val(want, 0.0, 0.0, 0.0, 0.0))
+        if argc == 1 {
+            a = _cpu_expr(cx, _child(n, 0))
+            if a.n == 1 {
+                out.x = a.x
+                out.y = a.x
+                out.z = a.x
+                out.w = a.x
+                return out
+            }
+        }
+        at = 0
+        j = 0
+        while j < argc && at < want {
+            a = _cpu_expr(cx, _child(n, j))
+            q = 0
+            while q < a.n && at < want {
+                x = _lane(a, q)
+                if at == 0 { out.x = x } else if at == 1 { out.y = x } else if at == 2 { out.z = x } else { out.w = x }
+                at = at + 1
+                q = q + 1
+            }
+            j = j + 1
+        }
+        if at < want { return _fail(cx, "${name}() given ${at} of its ${want} lanes") }
+        return out
+    }
+    if string.equals(name, "dot") == 1 && argc == 2 {
+        a = _cpu_expr(cx, _child(n, 0))
+        c = _cpu_expr(cx, _child(n, 1))
+        s = 0.0
+        j = 0
+        while j < a.n {
+            s = s + _lane(a, j) * _lane(c, j)
+            j = j + 1
+        }
+        return _keep(cx, v1(s))
+    }
+    if argc == 1 {
+        return _lanes(cx, name, _cpu_expr(cx, _child(n, 0)), null, null)
+    }
+    if argc == 2 {
+        return _lanes(cx, name, _cpu_expr(cx, _child(n, 0)), _cpu_expr(cx, _child(n, 1)), null)
+    }
+    if argc == 3 {
+        return _lanes(cx, name, _cpu_expr(cx, _child(n, 0)), _cpu_expr(cx, _child(n, 1)), _cpu_expr(cx, _child(n, 2)))
+    }
+    return _fail(cx, "${name}() is not run on the CPU yet")
+}
