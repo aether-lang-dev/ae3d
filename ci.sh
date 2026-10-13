@@ -1308,7 +1308,10 @@ elif command -v leaks >/dev/null 2>&1 && in_tier leaks; then
             fi
         else
             fail "$name ($report, $lost from this code)"
-            printf '%s' "$output" | grep -A3 'ROOT LEAK' | sed 's/^/        /' | head -12
+            # Each lost root's whole stack, down to the allocation: three lines
+            # after its heading stopped short of the frames that name what
+            # allocated it, and twelve showed one root of a suite's 37 (#774).
+            printf '%s' "$output" | awk '/^STACK OF .*ROOT LEAK/ { p = 1 } /^====/ { p = 0 } p' | sed 's/^/        /' | head -400
         fi
     done
     rm -rf "$leak_dir"
