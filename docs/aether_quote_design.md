@@ -178,8 +178,9 @@ with the node's line.
 
 ## 6. ae3d's FXAA, written with `quote`
 
-This is the body of `src/ae3d/vkspirv/glsl/fxaa_vk.frag`, which today is GLSL
-text. The uniform block, the sampler and the `in`/`out` declarations
+This is the body of `src/ae3d/vkspirv/glsl/fxaa_vk.frag`, which was GLSL
+text when this was written (since step 4 it is `src/ae3d/shaders/fxaa`,
+and both renderers draw it). The uniform block, the sampler and the `in`/`out` declarations
 disappear. Uniforms are captures, the sampler is a captured texture, the
 `in` is the parameter and the `out` is the return value.
 
@@ -333,6 +334,61 @@ From mapping the compiler; nothing here is built yet.
 4. **FXAA through the real `quote`**, replacing the hand-built tree from step
    1, and then one shader at a time, retiring the duplicated GL and `_vk`
    GLSL as each moves.
+   *FXAA done (ae3d main, 2026-10-13, on Aether 0.810.0):*
+   - `ae3d.shaders.fxaa` is FXAA in Aether: `fxaa(screen, texel, edge,
+     edge_min, subpixel)` returns `fragment("fxaa") quote | uv: vec2 | {...}`,
+     type-checked against `ae3d.shaderlib` (vec2/vec3/vec4 distinct over
+     f32x4, `Texture`, GLSL's builtins as Aether functions whose bodies are
+     what each means; `rgb(c)` stands for `c.rgb`).
+   - `ae3d.gpu` walks the `quote.Tree`; `GpuNode` is gone. It writes GLSL in
+     two dialects (`gpu.VULKAN`, `gpu.GL` for desktop 4.1), the full-screen
+     vertex shader for each, the captures' std140 block (`params_*`) and
+     fills it from their cells (`params_write`); its CPU evaluator reads the
+     captures from their cells and rounds to f32 as a GPU does.
+   - `tools/generate_shaders.ae` compiles the quoted shaders' Vulkan GLSL into
+     `ae3d.vkspirv` beside the others, holds the `Params` offsets to
+     glslang's, and records `quote.hash` of each tree (`FXAA_QUOTED_HASH`);
+     `--check` fails on a stale GLSL text or a tree whose hash moved.
+   - Vulkan: `ae3d.vkquote` draws a quoted full-screen pass with a set of its
+     own (the block at 0, the texture at 1, a mapped block per frame slot,
+     filled from the cells before each draw) and refuses a tree whose hash
+     is not the SPIR-V's. OpenGL compiles the same tree's GL GLSL at start
+     and sets its uniforms by name. Both make the tree again when the frame
+     changes size (the texel is a capture). `fxaa_vk.frag` and the GL
+     `FRAGMENT_FXAA` heredoc are deleted, and FXAA's three floats left the
+     scene block.
+   - Proof: `tests/test_gpu.ae` (golden GLSL for both dialects, glslang and
+     spirv-val, the block's layout, the evaluator against FXAA in Aether)
+     and `tests/test_gpu_fxaa.ae` (the evaluator against both renderers'
+     GPU FXAA, at two frame sizes, within one step of 255, two on Apple's
+     OpenGL over Metal); `test_backend_parity`'s fxaa comparison is
+     unchanged to the channel.
+
+   *The rest, one at a time, in this order*, each adding to `ae3d.gpu` and
+   `ae3d.shaderlib` what it is the first to need, and deleting its `_vk`
+   file and its GL heredoc in the commit that moves it, as FXAA's did:
+   - **the passthrough**, `screen_vk.vert` / `VERTEX_SCREEN`, which every
+     post pass draws with: `gpu.emit_screen_vertex` already writes it for
+     each quoted pass, and the hand-written one goes when the last pass
+     reading it has moved.
+   - **`depth_copy`**: writes depth, not a colour, and reads its texel with
+     `texelFetch` at `gl_FragCoord`: a fragment whose return is its depth,
+     a builtin input, an integer vector type (`ivec2`, distinct over
+     `i32x4`) and a depth sampler.
+   - **the bloom**, down then up: helper functions (`tap`, `luma`, `group`,
+     `past_threshold`). A call in a quote to a function of the program is a
+     `CALL` by name, and the tree does not hold the callee's body, so the
+     emitter has nothing to write for it: inline by hand, or (better, an
+     Aether question) a way to hand the library a function's own tree.
+   - **the composite**: two textures (`ae3d.vkquote` takes one today), and
+     `hazeColumn[4]`, `hazeShape[4]`, a `mat4`: a captured array read by
+     `INDEX`, and a matrix type in the library.
+   - **the sky** (its capture and cloud variants with it): six samplers,
+     3D ones among them, and 25 uniforms, much of them the scene's: probably
+     a captured struct read through `quote.cell(c) as *T` field by field.
+
+   The mesh shaders (scene, water, crowd) wait for step 6: their vertex
+   stage is a quote too, and their uniforms are the scene block.
 5. **MSL**, then a SPIR-V writer of our own (after reading Chris's
    `spirv.inc` for ideas, then writing ours from the SPIR-V spec), with
    glslang and `spirv-val` kept in CI as the checkers.
