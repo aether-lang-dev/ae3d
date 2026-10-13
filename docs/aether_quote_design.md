@@ -316,8 +316,10 @@ From mapping the compiler; nothing here is built yet.
    as `fxaa_vk.frag`, which reads its uniforms from the shared `SceneBlock`;
    this one has a block of its own). The CPU evaluator agrees with FXAA
    written straight in Aether, with the new vector types, to 2.4e-8 on every
-   pixel of a test image. Still to do here: the same FXAA run on the GPU
-   through ae3d's renderer, against the evaluator.
+   pixel of a test image. *And against the GPU (d778da25):* over a frame the
+   renderer drew, the evaluator's FXAA is within one step of 255 of what
+   `fxaa_vk.frag` made on the GPU on every channel of every pixel, on an
+   Apple GPU and on lavapipe (x86_64 and arm64). Step 1 is closed.
 2. ~~**Settle the vector-type question** (section 6), in aether.~~ Done:
    distinct types over `f32x4`, after aether#2778 (0.809.0).
 3. **`std.quote` and `AST_QUOTE` in aether**, expressions first, then
