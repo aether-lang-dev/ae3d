@@ -322,11 +322,14 @@ From mapping the compiler; nothing here is built yet.
    Apple GPU and on lavapipe (x86_64 and arm64). Step 1 is closed.
 2. ~~**Settle the vector-type question** (section 6), in aether.~~ Done:
    distinct types over `f32x4`, after aether#2778 (0.809.0).
-3. **`std.quote` and `AST_QUOTE` in aether**, expressions first, then
-   statements, then captures. Each step has a regression test that prints the
-   tree back as source, and an error test for each rejected construct. Then
-   the doc moves to `aether/docs/quote.md`, beside
-   `closures-and-builder-dsl.md`.
+3. ~~**`std.quote` and `AST_QUOTE` in aether**, expressions first, then
+   statements, then captures.~~ Done: aether#2819, merged 2026-10-13, after
+   0.809.0. The authoritative description is now `aether/docs/quote.md`;
+   this doc is the history. Where it departs from sections 3 to 5 above:
+   `Tree`, `Node` and `Capture` are opaque handles read through accessors;
+   a struct literal's fields are `FIELD_VALUE` nodes; a program-level `var`
+   is a capture at its own address; the errors are E0800 to E0803; and
+   `quote` stayed contextual because the module is itself named `quote`.
 4. **FXAA through the real `quote`**, replacing the hand-built tree from step
    1, and then one shader at a time, retiring the duplicated GL and `_vk`
    GLSL as each moves.
