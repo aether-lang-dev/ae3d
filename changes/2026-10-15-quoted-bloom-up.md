@@ -18,6 +18,9 @@
   `float top@8`, 16 bytes), its two samplers in order, and its CPU run
   against the pass written as Aether on a middle step and the last (exact on
   both). With the level's texture swapped for the sum's, 5 checks fail.
-- `FRAGMENT_BLOOM_UP`, `bloom_up_vk.frag` and `vkpipes.bloom_up` are still
-  there, unused, until the GPU lanes have compared the bloom frames with
-  main's.
+- **`FRAGMENT_BLOOM_UP`, `bloom_up_vk.frag` and `vkpipes.bloom_up` are
+  gone**, and with them `bloomTop` and `texelSize` in the scene block (only
+  the two bloom passes read them) and vkframe's `set_texel`: the block is 16
+  bytes shorter (16240), and every shader over it is regenerated. On an Apple
+  M6 the frames drawn with bloom are byte-identical to main's on both
+  renderers, as for the down pass.
