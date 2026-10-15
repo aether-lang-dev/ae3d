@@ -39,8 +39,10 @@ import ae3d.vkscene
 import ae3d.vkspirv
 import ae3d.vkquote
 import ae3d.vkquote (QuotedPass)
+import ae3d.gpu
 import ae3d.gpu (GpuShader)
 import ae3d.shaders.fxaa
+import ae3d.shaders.bloom
 import ae3d.shaderlib (vec2, Texture)
 import std.io
 
@@ -169,6 +171,11 @@ var g_fxaa = false
 // FXAA's pass, from its quoted shader (ae3d.shaders.fxaa), and the frame
 // size its tree's texel was captured for; null where it would not build.
 var g_fxaa_pass: ptr = null
+// The bloom's down pass, written with quote (ae3d.shaders.bloom): one
+// shader, its texel and level set before each draw, the SSR's two blurs and
+// the pyramid's levels drawn from one ring of sets.
+var g_bloom_down_pass: ptr = null
+const BLOOM_DOWN_DRAWS = 8  // the SSR's 2 blurs + vktargets' BLOOM_LEVELS (6)
 var g_fxaa_w = 0
 var g_fxaa_h = 0
 var g_bloom = false
@@ -624,7 +631,10 @@ start(width: int, height: int) -> bool {
     g_fxaa_w = vktargets.width()
     g_fxaa_h = vktargets.height()
     g_fxaa_pass = vkquote.pass_new(fxaa_shader(g_fxaa_w, g_fxaa_h), vkspirv.FXAA_QUOTED_VERT, vkspirv.FXAA_QUOTED_FRAG,
-                                   vkspirv.FXAA_QUOTED_HASH, vktargets.post_pass()) as ptr
+                                   vkspirv.FXAA_QUOTED_HASH, vktargets.post_pass(), 1) as ptr
+    g_bloom_down_pass = vkquote.pass_new(bloom.bloom_down(Texture { image: null }, vec2(0.0, 0.0), 0, 1.0, 1.0),
+                                         vkspirv.BLOOM_DOWN_QUOTED_VERT, vkspirv.BLOOM_DOWN_QUOTED_FRAG,
+                                         vkspirv.BLOOM_DOWN_QUOTED_HASH, vktargets.hdr_pass(), BLOOM_DOWN_DRAWS) as ptr
     if g_dlss_loaded {
         g_dlss_supported = ae3d_dlss_supported(vkdevice.physical()) == 1
         if !g_dlss_supported { io.stderr_write("ae3d: DLSS: ${ae3d_dlss_last_error()}\n") }
@@ -667,6 +677,8 @@ shutdown() {
     vkpipes.destroy()
     vkquote.pass_free(g_fxaa_pass as *QuotedPass)
     g_fxaa_pass = null
+    vkquote.pass_free(g_bloom_down_pass as *QuotedPass)
+    g_bloom_down_pass = null
     // The hooks' images go with the frame they were sized to.
     run_hooks(2)
     vktargets.dlss_output_destroy()
@@ -1851,7 +1863,7 @@ draw_composite(source: int, bloom: int) {
     vkhost.set_pass_open(true)
     viewport(fw, fh)
     ldr = vktargets.ldr_texture()
-    draw_quoted(g_fxaa_pass as *QuotedPass, vktexture.view(ldr), vktexture.sampler_of(ldr))
+    draw_quoted(g_fxaa_pass as *QuotedPass, 0, vktexture.view(ldr), vktexture.sampler_of(ldr))
     vk.vkCmdEndRenderPass(commands)
     vkhost.set_pass_open(false)
 }
@@ -1870,10 +1882,11 @@ fxaa_shader(w: int, h: int) -> *GpuShader {
 }
 
 // A full-screen draw through a quoted pass, sampling `view`: its own
-// pipeline and set (ae3d.vkquote), the screen quad.
-draw_quoted(p: *QuotedPass, view: ptr, sampler: ptr) {
+// pipeline and the set of its `draw`th draw this frame (ae3d.vkquote), the
+// screen quad.
+draw_quoted(p: *QuotedPass, draw: int, view: ptr, sampler: ptr) {
     if p == null || !vkmesh.drawable(g_screen_quad) || vkmesh.index_count(g_screen_quad) == 0 { return }
-    set = vkquote.prepare(p, g_frame, view, sampler)
+    set = vkquote.prepare(p, g_frame, draw, view, sampler)
     if set == null { return }
     bind_pipeline(vkquote.pipeline(p))
     (g_set_cell as ptr[])[0] = set
@@ -1892,22 +1905,20 @@ draw_quoted(p: *QuotedPass, view: ptr, sampler: ptr) {
 // composite adds; 0 where there are no levels to draw it in.
 bloom_chain(source: int, sw: int, sh: int) -> int {
     levels = vktargets.bloom_levels()
-    down = vkpipes.bloom_down()
     up = vkpipes.bloom_up()
-    if levels < 2 || down == null || up == null || source <= 0 { return 0 }
+    if levels < 2 || g_bloom_down_pass == null || up == null || source <= 0 { return 0 }
     hdr = vktargets.hdr_pass()
     from = source
     from_w = sw
     from_h = sh
     k = 0
     while k < levels {
-        set_texel(from_w, from_h)
         first = 0
         if k == 0 { first = 1 }
-        block_int(vkscene.OFF_BLOOMFIRST, first)
         w = vktargets.bloom_width(k)
         h = vktargets.bloom_height(k)
-        screen_pass(hdr, vktargets.bloom_framebuffer(k, false), w, h, down, from, 0, 0, 0)
+        // Draws 0 and 1 are the SSR's blurs, drawn first in the frame.
+        bloom_down_pass(vktargets.bloom_framebuffer(k, false), w, h, 2 + k, from, from_w, from_h, first)
         from = vktargets.bloom_texture(k, false)
         from_w = w
         from_h = h
@@ -1928,6 +1939,33 @@ bloom_chain(source: int, sw: int, sh: int) -> int {
         k = k - 1
     }
     return from
+}
+
+// The bloom's down pass from `texture`, `tw` by `th` texels, into
+// `framebuffer`, `w` by `h`: its texel and level (`first`, 1 on the
+// pyramid's first) set in its shader, the frame's exposure and threshold
+// with them, then drawn as its `draw`th draw this frame.
+bloom_down_pass(framebuffer: ptr, w: int, h: int, draw: int, texture: int, tw: int, th: int, first: int) {
+    if !vkhost.recording() || vkhost.pass_open() || framebuffer == null || texture <= 0 { return }
+    p = g_bloom_down_pass as *QuotedPass
+    s = vkquote.shader(p)
+    texel_x = 0.0
+    texel_y = 0.0
+    if tw > 0 { texel_x = 1.0 / tw }
+    if th > 0 { texel_y = 1.0 / th }
+    _t = gpu.set_vec2(s, "texel", texel_x, texel_y)
+    _f = gpu.set_int(s, "first", first)
+    _e = gpu.set_float(s, "exposure", g_frame_exposure)
+    _h = gpu.set_float(s, "threshold", g_bloom_threshold)
+    begin_pass(vktargets.hdr_pass(), framebuffer, w, h, 0)
+    vkhost.set_pass_open(true)
+    viewport(w, h)
+    // A pass of the frame's own, not one of the scene's draws: not counted.
+    counted = g_draw_calls
+    draw_quoted(p, draw, vktexture.view(texture), vktexture.sampler_of(texture))
+    g_draw_calls = counted
+    vk.vkCmdEndRenderPass(commands_now())
+    vkhost.set_pass_open(false)
 }
 
 // The multisampled scene resolved into the scene texture by the resolve
@@ -1978,20 +2016,18 @@ frame_end() -> bool {
         // composite then reads that instead of the scene colour, so the
         // bloom it does picks up the mirrored lamps as well.
         ssr_now = g_ssr_enabled && !g_capture_bypass && vkpipes.post(3) != null && vktargets.ssr_framebuffer() != null &&
-                  vktargets.camdepth_framebuffer() != null && vktargets.ssr_reflect_texture() > 0 && vkpipes.bloom_down() != null
+                  vktargets.camdepth_framebuffer() != null && vktargets.ssr_reflect_texture() > 0 && g_bloom_down_pass != null
         if ssr_now {
             // The scene at half its size and a quarter, for the
             // reflection's wide cones (the bloom's plain downsample).
             from = vktargets.post_texture()
             from_w = rw
             from_h = rh
-            block_int(vkscene.OFF_BLOOMFIRST, 0)
             k = 0
             while k < 2 {
-                set_texel(from_w, from_h)
                 bw = vktexture.width_of(vktargets.ssr_blur_texture(k))
                 bh = vktexture.height_of(vktargets.ssr_blur_texture(k))
-                screen_pass(vktargets.hdr_pass(), vktargets.ssr_blur_framebuffer(k), bw, bh, vkpipes.bloom_down(), from, 0, 0, 0)
+                bloom_down_pass(vktargets.ssr_blur_framebuffer(k), bw, bh, k, from, from_w, from_h, 0)
                 from = vktargets.ssr_blur_texture(k)
                 from_w = bw
                 from_h = bh
