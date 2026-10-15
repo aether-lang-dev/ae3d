@@ -39,8 +39,11 @@ import ae3d.vkscene
 import ae3d.vkspirv
 import ae3d.vkquote
 import ae3d.vkquote (QuotedPass)
+import ae3d.gpu
 import ae3d.gpu (GpuShader)
 import ae3d.shaders.fxaa
+import ae3d.shaders.bloom
+import ae3d.shaders.depth
 import ae3d.shaderlib (vec2, Texture)
 import std.io
 
@@ -169,6 +172,22 @@ var g_fxaa = false
 // FXAA's pass, from its quoted shader (ae3d.shaders.fxaa), and the frame
 // size its tree's texel was captured for; null where it would not build.
 var g_fxaa_pass: ptr = null
+// The bloom's down pass, written with quote (ae3d.shaders.bloom): one
+// shader, its texel and level set before each draw, the SSR's two blurs and
+// the pyramid's levels drawn from one ring of sets.
+var g_bloom_down_pass: ptr = null
+// The scene's depth copied into the camera-depth target when the frame has
+// one sample (ae3d.shaders.depth); a frame with more resolves them through
+// vkpipes.depth_resolve.
+var g_depth_copy_pass: ptr = null
+// A quoted draw's textures, in its shader's order, at most QUOTED_TEXTURES.
+const QUOTED_TEXTURES = 4
+var g_quoted_views: ptr = null
+var g_quoted_samplers: ptr = null
+const BLOOM_DOWN_DRAWS = 8  // the SSR's 2 blurs + vktargets' BLOOM_LEVELS (6)
+// Its up pass, the same way: a draw for each level but the coarsest.
+var g_bloom_up_pass: ptr = null
+const BLOOM_UP_DRAWS = 5    // vktargets' BLOOM_LEVELS (6), less one
 var g_fxaa_w = 0
 var g_fxaa_h = 0
 var g_bloom = false
@@ -624,7 +643,19 @@ start(width: int, height: int) -> bool {
     g_fxaa_w = vktargets.width()
     g_fxaa_h = vktargets.height()
     g_fxaa_pass = vkquote.pass_new(fxaa_shader(g_fxaa_w, g_fxaa_h), vkspirv.FXAA_QUOTED_VERT, vkspirv.FXAA_QUOTED_FRAG,
-                                   vkspirv.FXAA_QUOTED_HASH, vktargets.post_pass()) as ptr
+                                   vkspirv.FXAA_QUOTED_HASH, vktargets.post_pass(), 1) as ptr
+    g_bloom_down_pass = vkquote.pass_new(bloom.bloom_down(Texture { image: null }, vec2(0.0, 0.0), 0, 1.0, 1.0),
+                                         vkspirv.BLOOM_DOWN_QUOTED_VERT, vkspirv.BLOOM_DOWN_QUOTED_FRAG,
+                                         vkspirv.BLOOM_DOWN_QUOTED_HASH, vktargets.hdr_pass(), BLOOM_DOWN_DRAWS) as ptr
+    g_bloom_up_pass = vkquote.pass_new(bloom.bloom_up(Texture { image: null }, Texture { image: null }, vec2(0.0, 0.0), 0.0),
+                                       vkspirv.BLOOM_UP_QUOTED_VERT, vkspirv.BLOOM_UP_QUOTED_FRAG,
+                                       vkspirv.BLOOM_UP_QUOTED_HASH, vktargets.hdr_pass(), BLOOM_UP_DRAWS) as ptr
+    g_depth_copy_pass = vkquote.pass_new(depth.depth_copy(Texture { image: null }), vkspirv.DEPTH_COPY_QUOTED_VERT,
+                                         vkspirv.DEPTH_COPY_QUOTED_FRAG, vkspirv.DEPTH_COPY_QUOTED_HASH,
+                                         vktargets.camdepth_pass(), 1) as ptr
+    if g_depth_copy_pass != null {
+        vkquote.set_image_layout(g_depth_copy_pass as *QuotedPass, vk.IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+    }
     if g_dlss_loaded {
         g_dlss_supported = ae3d_dlss_supported(vkdevice.physical()) == 1
         if !g_dlss_supported { io.stderr_write("ae3d: DLSS: ${ae3d_dlss_last_error()}\n") }
@@ -667,6 +698,16 @@ shutdown() {
     vkpipes.destroy()
     vkquote.pass_free(g_fxaa_pass as *QuotedPass)
     g_fxaa_pass = null
+    vkquote.pass_free(g_bloom_down_pass as *QuotedPass)
+    g_bloom_down_pass = null
+    vkquote.pass_free(g_bloom_up_pass as *QuotedPass)
+    g_bloom_up_pass = null
+    vkquote.pass_free(g_depth_copy_pass as *QuotedPass)
+    g_depth_copy_pass = null
+    free(g_quoted_views)
+    free(g_quoted_samplers)
+    g_quoted_views = null
+    g_quoted_samplers = null
     // The hooks' images go with the frame they were sized to.
     run_hooks(2)
     vktargets.dlss_output_destroy()
@@ -953,7 +994,7 @@ frame_begin(r: float, g: float, b: float, a: float) -> bool {
     g_depth_split = false
     g_depth_resolved = false
     wanted = g_ssr_enabled || g_scene_depth_wanted || g_ssao_enabled || g_taa_enabled || g_dlss_mode != 0
-    if wanted && vkpipes.depth_resolve() != null {
+    if wanted && depth_resolvable() {
         ensure_camdepth()
         g_depth_split = vktargets.camdepth_framebuffer() != null
     }
@@ -1635,9 +1676,16 @@ draw_screen(pipeline: ptr, sets: ptr, slot: int, colour: int) {
 // over every triangle, and one that could not draw a picture of a figure
 // (an impostor) or a near figure's real silhouette without paying for it
 // again.
+// Whether the frame's depth can be put in the camera-depth target: by the
+// quoted copy with one sample, by the resolve pipeline with more.
+depth_resolvable() -> bool {
+    if vktargets.samples() == vk.SAMPLE_COUNT_1_BIT { return g_depth_copy_pass != null }
+    return vkpipes.depth_resolve() != null
+}
+
 resolve_scene_depth() -> bool {
     if !vkhost.recording() || !g_depth_split || g_depth_resolved { return false }
-    if vktargets.camdepth_framebuffer() == null || vkpipes.depth_resolve() == null { return false }
+    if vktargets.camdepth_framebuffer() == null || !depth_resolvable() { return false }
     open_scene_pass()
     vk.vkCmdEndRenderPass(commands_now())
     vkhost.set_pass_open(false)
@@ -1649,10 +1697,14 @@ resolve_scene_depth() -> bool {
     begin_pass(vktargets.camdepth_pass(), vktargets.camdepth_framebuffer(), w, h, 1)
     vkhost.set_pass_open(true)
     viewport(w, h)
-    ((vkdesc.block(vkdesc.PROGRAM_SCENE) + vkscene.OFF_DEPTHSAMPLECOUNT) as int[])[0] = vktargets.samples()
-    vkdesc.set_program(vkdesc.PROGRAM_SCENE)
-    draw_screen_with(vkpipes.depth_resolve(), g_resolve_sets, g_frame, vktargets.depth_view(), vktargets.camdepth_sampler(),
-                     vk.IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, null, null)
+    if vktargets.samples() == vk.SAMPLE_COUNT_1_BIT {
+        draw_quoted(g_depth_copy_pass as *QuotedPass, 0, vktargets.depth_view(), vktargets.camdepth_sampler())
+    } else {
+        ((vkdesc.block(vkdesc.PROGRAM_SCENE) + vkscene.OFF_DEPTHSAMPLECOUNT) as int[])[0] = vktargets.samples()
+        vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+        draw_screen_with(vkpipes.depth_resolve(), g_resolve_sets, g_frame, vktargets.depth_view(), vktargets.camdepth_sampler(),
+                         vk.IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, null, null)
+    }
     vk.vkCmdEndRenderPass(commands_now())
     vkhost.set_pass_open(false)
     return true
@@ -1765,16 +1817,6 @@ block_float(offset: int, value: float) {
     ((vkdesc.block(vkdesc.PROGRAM_SCENE) + offset) as f32[])[0] = value as f32
 }
 
-// The texel of what the post passes sample: the scene's size for the
-// passes over the scene, the frame's once an upscaler has written it.
-set_texel(w: int, h: int) {
-    t = (vkdesc.block(vkdesc.PROGRAM_SCENE) + vkscene.OFF_TEXELSIZE) as f32[]
-    t[0] = 0.0
-    t[1] = 0.0
-    if w != 0 { t[0] = (1.0 as f32) / (w as f32) }
-    if h != 0 { t[1] = (1.0 as f32) / (h as f32) }
-}
-
 // A whole number into the scene program's block.
 block_int(offset: int, value: int) {
     ((vkdesc.block(vkdesc.PROGRAM_SCENE) + offset) as int[])[0] = value
@@ -1783,13 +1825,11 @@ block_int(offset: int, value: int) {
 // The post uniforms live in the shared scene block, so every screen pass
 // reads them; set once before the first draws.
 setup_post_uniforms() {
-    set_texel(vktargets.render_width(), vktargets.render_height())
     block_float(vkscene.OFF_FRAMEEXPOSURE, g_frame_exposure)
     bloom = 0
     if g_bloom && !g_capture_bypass { bloom = 1 }
     block_int(vkscene.OFF_ENABLEBLOOM, bloom)
     block_int(vkscene.OFF_COLORSAMPLECOUNT, vktargets.samples())
-    block_float(vkscene.OFF_BLOOMTHRESHOLD, g_bloom_threshold)
     block_float(vkscene.OFF_BLOOMINTENSITY, g_bloom_intensity)
     block_float(vkscene.OFF_SSRROADHEIGHT, g_ssr_road_height)
     block_float(vkscene.OFF_SSRSTRENGTH, g_ssr_strength)
@@ -1851,7 +1891,7 @@ draw_composite(source: int, bloom: int) {
     vkhost.set_pass_open(true)
     viewport(fw, fh)
     ldr = vktargets.ldr_texture()
-    draw_quoted(g_fxaa_pass as *QuotedPass, vktexture.view(ldr), vktexture.sampler_of(ldr))
+    draw_quoted(g_fxaa_pass as *QuotedPass, 0, vktexture.view(ldr), vktexture.sampler_of(ldr))
     vk.vkCmdEndRenderPass(commands)
     vkhost.set_pass_open(false)
 }
@@ -1870,10 +1910,37 @@ fxaa_shader(w: int, h: int) -> *GpuShader {
 }
 
 // A full-screen draw through a quoted pass, sampling `view`: its own
-// pipeline and set (ae3d.vkquote), the screen quad.
-draw_quoted(p: *QuotedPass, view: ptr, sampler: ptr) {
+// pipeline and the set of its `draw`th draw this frame (ae3d.vkquote), the
+// screen quad.
+draw_quoted(p: *QuotedPass, draw: int, view: ptr, sampler: ptr) {
+    quoted_cells()
+    (g_quoted_views as ptr[])[0] = view
+    (g_quoted_samplers as ptr[])[0] = sampler
+    draw_quoted_with(p, draw)
+}
+
+// The same sampling two textures, `view` at binding 1 and `view2` at 2.
+draw_quoted2(p: *QuotedPass, draw: int, view: ptr, sampler: ptr, view2: ptr, sampler2: ptr) {
+    quoted_cells()
+    (g_quoted_views as ptr[])[0] = view
+    (g_quoted_samplers as ptr[])[0] = sampler
+    (g_quoted_views as ptr[])[1] = view2
+    (g_quoted_samplers as ptr[])[1] = sampler2
+    draw_quoted_with(p, draw)
+}
+
+// The arrays a quoted draw names its textures in, made on the first.
+quoted_cells() {
+    if g_quoted_views != null { return }
+    g_quoted_views = calloc(QUOTED_TEXTURES, 8)
+    g_quoted_samplers = calloc(QUOTED_TEXTURES, 8)
+}
+
+// The draw, its textures in g_quoted_views and g_quoted_samplers.
+draw_quoted_with(p: *QuotedPass, draw: int) {
     if p == null || !vkmesh.drawable(g_screen_quad) || vkmesh.index_count(g_screen_quad) == 0 { return }
-    set = vkquote.prepare(p, g_frame, view, sampler)
+    if vkquote.textures(p) > QUOTED_TEXTURES { return }
+    set = vkquote.prepare(p, g_frame, draw, g_quoted_views, g_quoted_samplers)
     if set == null { return }
     bind_pipeline(vkquote.pipeline(p))
     (g_set_cell as ptr[])[0] = set
@@ -1892,22 +1959,18 @@ draw_quoted(p: *QuotedPass, view: ptr, sampler: ptr) {
 // composite adds; 0 where there are no levels to draw it in.
 bloom_chain(source: int, sw: int, sh: int) -> int {
     levels = vktargets.bloom_levels()
-    down = vkpipes.bloom_down()
-    up = vkpipes.bloom_up()
-    if levels < 2 || down == null || up == null || source <= 0 { return 0 }
-    hdr = vktargets.hdr_pass()
+    if levels < 2 || g_bloom_down_pass == null || g_bloom_up_pass == null || source <= 0 { return 0 }
     from = source
     from_w = sw
     from_h = sh
     k = 0
     while k < levels {
-        set_texel(from_w, from_h)
         first = 0
         if k == 0 { first = 1 }
-        block_int(vkscene.OFF_BLOOMFIRST, first)
         w = vktargets.bloom_width(k)
         h = vktargets.bloom_height(k)
-        screen_pass(hdr, vktargets.bloom_framebuffer(k, false), w, h, down, from, 0, 0, 0)
+        // Draws 0 and 1 are the SSR's blurs, drawn first in the frame.
+        bloom_down_pass(vktargets.bloom_framebuffer(k, false), w, h, 2 + k, from, from_w, from_h, first)
         from = vktargets.bloom_texture(k, false)
         from_w = w
         from_h = h
@@ -1915,19 +1978,69 @@ bloom_chain(source: int, sw: int, sh: int) -> int {
     }
     k = levels - 2
     while k >= 0 {
-        set_texel(from_w, from_h)
         top = 0
         if k == 0 { top = levels }
-        block_int(vkscene.OFF_BLOOMTOP, top)
         w = vktargets.bloom_width(k)
         h = vktargets.bloom_height(k)
-        screen_pass(hdr, vktargets.bloom_framebuffer(k, true), w, h, up, from, vktargets.bloom_texture(k, false), 0, 0)
+        // Draw 0 is the first step up, from the coarsest level.
+        bloom_up_pass(vktargets.bloom_framebuffer(k, true), w, h, levels - 2 - k, from, from_w, from_h, vktargets.bloom_texture(k, false), top)
         from = vktargets.bloom_texture(k, true)
         from_w = w
         from_h = h
         k = k - 1
     }
     return from
+}
+
+// The bloom's down pass from `texture`, `tw` by `th` texels, into
+// `framebuffer`, `w` by `h`: its texel and level (`first`, 1 on the
+// pyramid's first) set in its shader, the frame's exposure and threshold
+// with them, then drawn as its `draw`th draw this frame.
+bloom_down_pass(framebuffer: ptr, w: int, h: int, draw: int, texture: int, tw: int, th: int, first: int) {
+    if !vkhost.recording() || vkhost.pass_open() || framebuffer == null || texture <= 0 { return }
+    p = g_bloom_down_pass as *QuotedPass
+    s = vkquote.shader(p)
+    texel_x = 0.0
+    texel_y = 0.0
+    if tw > 0 { texel_x = 1.0 / tw }
+    if th > 0 { texel_y = 1.0 / th }
+    _t = gpu.set_vec2(s, "texel", texel_x, texel_y)
+    _f = gpu.set_int(s, "first", first)
+    _e = gpu.set_float(s, "exposure", g_frame_exposure)
+    _h = gpu.set_float(s, "threshold", g_bloom_threshold)
+    begin_pass(vktargets.hdr_pass(), framebuffer, w, h, 0)
+    vkhost.set_pass_open(true)
+    viewport(w, h)
+    // A pass of the frame's own, not one of the scene's draws: not counted.
+    counted = g_draw_calls
+    draw_quoted(p, draw, vktexture.view(texture), vktexture.sampler_of(texture))
+    g_draw_calls = counted
+    vk.vkCmdEndRenderPass(commands_now())
+    vkhost.set_pass_open(false)
+}
+
+// The bloom's up pass into `framebuffer`, `w` by `h`: the tent of `sum` (the
+// coarser level's, `tw` by `th` texels) added to `level`, this level's
+// downsample, and divided by `top` levels on the last step (0 before); its
+// `draw`th draw this frame.
+bloom_up_pass(framebuffer: ptr, w: int, h: int, draw: int, sum: int, tw: int, th: int, level: int, top: int) {
+    if !vkhost.recording() || vkhost.pass_open() || framebuffer == null || sum <= 0 || level <= 0 { return }
+    p = g_bloom_up_pass as *QuotedPass
+    s = vkquote.shader(p)
+    texel_x = 0.0
+    texel_y = 0.0
+    if tw > 0 { texel_x = 1.0 / tw }
+    if th > 0 { texel_y = 1.0 / th }
+    _t = gpu.set_vec2(s, "texel", texel_x, texel_y)
+    _l = gpu.set_float(s, "top", top * 1.0)
+    begin_pass(vktargets.hdr_pass(), framebuffer, w, h, 0)
+    vkhost.set_pass_open(true)
+    viewport(w, h)
+    counted = g_draw_calls
+    draw_quoted2(p, draw, vktexture.view(sum), vktexture.sampler_of(sum), vktexture.view(level), vktexture.sampler_of(level))
+    g_draw_calls = counted
+    vk.vkCmdEndRenderPass(commands_now())
+    vkhost.set_pass_open(false)
 }
 
 // The multisampled scene resolved into the scene texture by the resolve
@@ -1978,26 +2091,23 @@ frame_end() -> bool {
         // composite then reads that instead of the scene colour, so the
         // bloom it does picks up the mirrored lamps as well.
         ssr_now = g_ssr_enabled && !g_capture_bypass && vkpipes.post(3) != null && vktargets.ssr_framebuffer() != null &&
-                  vktargets.camdepth_framebuffer() != null && vktargets.ssr_reflect_texture() > 0 && vkpipes.bloom_down() != null
+                  vktargets.camdepth_framebuffer() != null && vktargets.ssr_reflect_texture() > 0 && g_bloom_down_pass != null
         if ssr_now {
             // The scene at half its size and a quarter, for the
             // reflection's wide cones (the bloom's plain downsample).
             from = vktargets.post_texture()
             from_w = rw
             from_h = rh
-            block_int(vkscene.OFF_BLOOMFIRST, 0)
             k = 0
             while k < 2 {
-                set_texel(from_w, from_h)
                 bw = vktexture.width_of(vktargets.ssr_blur_texture(k))
                 bh = vktexture.height_of(vktargets.ssr_blur_texture(k))
-                screen_pass(vktargets.hdr_pass(), vktargets.ssr_blur_framebuffer(k), bw, bh, vkpipes.bloom_down(), from, 0, 0, 0)
+                bloom_down_pass(vktargets.ssr_blur_framebuffer(k), bw, bh, k, from, from_w, from_h, 0)
                 from = vktargets.ssr_blur_texture(k)
                 from_w = bw
                 from_h = bh
                 k = k + 1
             }
-            set_texel(rw, rh)
             begin_pass(vktargets.hdr_pass(), vktargets.ssr_framebuffer(), rw, rh, 0)
             vkhost.set_pass_open(true)
             viewport(rw, rh)

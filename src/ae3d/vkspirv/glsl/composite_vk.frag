@@ -170,10 +170,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int hazeCount;
     vec4 hazeColumn[4];
     vec4 hazeShape[4];
-    vec2 texelSize;
-    int bloomFirst;
-    float bloomThreshold;
-    int bloomTop;
     int colorSampleCount;
     float ssrRoadHeight;
     float ssrStrength;
@@ -236,7 +232,7 @@ layout(location = 0) out vec4 FragColor;
 
 
 // A glow around what shows bright: the bloom pyramid's widest blur of the
-// light past the threshold (FRAGMENT_BLOOM_DOWN, FRAGMENT_BLOOM_UP), added
+// light past the threshold (ae3d.shaders.bloom), added
 // to the light before the tone curve.
 
 

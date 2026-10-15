@@ -26,7 +26,8 @@
 //
 // The tree's kinds this version takes: BLOCK, LET, ASSIGN, RETURN, IF,
 // WHILE, FOR, BREAK, CONTINUE, EXPR, LIT, LOCAL, CAPTURE, UNARY, BINARY,
-// CHOOSE, CALL and FIELD; INDEX is written as GLSL but not run, and MAKE
+// CHOOSE, CALL, FIELD and HELPER_CALL (a @quotable function, written out as a
+// GLSL function, quote version 2); INDEX is written as GLSL but not run, and MAKE
 // (a struct literal) is refused with the node's line. A shader owns its
 // tree: shader_free gives it back.
 
@@ -41,18 +42,23 @@ import ae3d.shaderlib (Texture, ShaderImage, image_w, image_h, image_channel)
 exports (
     GpuShader, GpuVal, GpuRun,
     VULKAN, GL,
-    fragment, shader_free, shader_name, shader_tree, shader_hash,
+    fragment, depth_fragment, writes_depth, shader_free, shader_name, shader_tree, shader_hash,
     emit_glsl, emit_screen_vertex,
     params_count, params_name, params_type, params_offset, params_size, params_write,
+    set_float, set_int, set_vec2,
+    call_glsl, call_args,
     samplers_count, samplers_name,
     v1, v2, v3, v4, val_n, val_x, val_y, val_z, val_w, val_bool,
-    cpu_new, cpu_run, cpu_free, last_error
+    cpu_new, cpu_run, cpu_free, cpu_set_viewport, last_error
 )
 
-// A shader: its name and the tree its quote made, which it owns.
+// A shader: its name and the tree its quote made, which it owns, and
+// whether what it returns is the pixel's depth (a float, to gl_FragDepth)
+// rather than its colour (a vec4, to FragColor).
 struct GpuShader {
     name: string
     tree: quote.Tree
+    depth: bool
 }
 
 var g_error = ""
@@ -65,8 +71,19 @@ fragment(name: string, t: quote.Tree) -> *GpuShader {
     s = heap.new(GpuShader)
     s.name = name
     s.tree = t
+    s.depth = false
     return s
 }
+
+// The fragment shader `name` whose quote returns the pixel's depth, a float
+// written to gl_FragDepth; it has no colour output (FRAGMENT_DEPTH_COPY).
+depth_fragment(name: string, t: quote.Tree) -> *GpuShader {
+    s = fragment(name, t)
+    s.depth = true
+    return s
+}
+
+writes_depth(s: *GpuShader) -> bool { return s.depth }
 
 shader_name(s: *GpuShader) -> string { return s.name }
 shader_tree(s: *GpuShader) -> quote.Tree { return s.tree }
@@ -129,6 +146,100 @@ fn glsl_name(n: string) -> string {
     }
     if string.starts_with(n, "gl_") == 1 { return "${n}_" }
     return n
+}
+
+// ── Calls: the one table ─────────────────────────────────────────────
+//
+// Every function a quoted shader may call: its name in Aether (an
+// ae3d.shaderlib export), what GLSL writes for it, and how many arguments it
+// takes. GLSL is written from here and nowhere else, and a call not here is
+// refused by both back ends rather than written as a GLSL call that does not
+// exist. The CPU runs each by its Aether name (cpu_call), so a wrong GLSL
+// entry shows as the CPU and the GPU disagreeing (tests/test_gpu_fxaa,
+// test_backend_parity). One entry a name: Aether overloads nothing here, and
+// where it does a second name maps to the same GLSL (Nic's option A).
+//
+// A GLSL form is a function's name (an identifier), called with the
+// arguments as they are, or else a template, where $0, $1 ... are the arguments: rgb(c) is "$0.rgb"
+// (Aether has no field of three lanes), texel_fetch(t, p) is
+// "texelFetch($0, ivec2($1), 0)", frag_coord() is "gl_FragCoord.xy".
+// Arguments -1: a vector constructor, from lanes and vectors (checked by
+// the CPU, counting lanes).
+const CALL_AETHER[] = ["vec2", "vec3", "vec4", "texture", "rgb", "dot", "min", "max", "abs", "sign", "clamp",
+                       "smoothstep", "mix", "fract", "floor", "frag_coord", "texel_fetch"]
+const CALL_GLSL[] = ["vec2", "vec3", "vec4", "texture", "$0.rgb", "dot", "min", "max", "abs", "sign", "clamp",
+                     "smoothstep", "mix", "fract", "floor", "gl_FragCoord.xy", "texelFetch($0, ivec2($1), 0)"]
+const CALL_ARGS: int[] = [-1, -1, -1, 2, 1, 2, 2, 2, 1, 1, 3, 3, 3, 1, 1, 0, 2]
+const CALL_COUNT = 17
+
+fn call_index(name: string) -> int {
+    i = 0
+    while i < CALL_COUNT {
+        if CALL_AETHER[i] == name { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// What GLSL writes for the function `name` ("" when a shader cannot call
+// it): a function's name, or a template ("$0.rgb").
+call_glsl(name: string) -> string {
+    i = call_index(name)
+    if i < 0 { return "" }
+    return CALL_GLSL[i]
+}
+
+// How many arguments `name` takes; -1 for a vector constructor (any), -2
+// for a name not in the table.
+call_args(name: string) -> int {
+    i = call_index(name)
+    if i < 0 { return -2 }
+    return CALL_ARGS[i]
+}
+
+// Why the call `n` cannot be written or run: "" when the table has it with
+// that many arguments.
+fn call_refused(n: quote.Node) -> string {
+    name = bare_call(quote.name(n))
+    want = call_args(name)
+    if want == -2 { return "${quote.name(n)}() is not a function a shader can call: not an ae3d.shaderlib function in ae3d.gpu's call table, nor @quotable" }
+    got = quote.child_count(n)
+    if want >= 0 && got != want { return "${name}() takes ${want} arguments in a shader, not ${got}" }
+    return ""
+}
+
+// Whether a table form is a function's name (letters, digits, `_`) rather
+// than a template ("$0.rgb", "gl_FragCoord.xy").
+fn is_identifier(g: string) -> bool {
+    i = 0
+    while i < string.length(g) {
+        c = string.char_at(g, i)
+        letter = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+        digit = c >= 48 && c <= 57
+        if !letter && !(digit && i > 0) { return false }
+        i = i + 1
+    }
+    return string.length(g) > 0
+}
+
+// A call written from its table template: each $k the k-th argument,
+// parenthesised as a postfix operand would be (a swizzle binds tightest).
+fn glsl_template(t: quote.Tree, n: quote.Node, g: string) -> string {
+    sb = strbuilder.new(32)
+    i = 0
+    len = string.length(g)
+    while i < len {
+        ch = string.char_at(g, i)
+        if ch == 36 && i + 1 < len {
+            d = string.char_at(g, i + 1) - 48
+            strbuilder.append(sb, glsl_expr(t, quote.child(n, d), PREC_POSTFIX, 0))
+            i = i + 2
+        } else {
+            strbuilder.append(sb, string.substring(g, i, i + 1))
+            i = i + 1
+        }
+    }
+    return strbuilder.finish(sb)
 }
 
 // A called function's name without its module ("shaderlib.dot" is dot).
@@ -229,6 +340,47 @@ params_write(s: *GpuShader, dst: ptr) {
     }
 }
 
+// A capture's value changed from outside the quote, through its cell (the
+// variable it captured): the next params_write and cpu_run read it. One
+// shader drawn several times a frame with other values (the bloom's levels)
+// sets them before each draw. False when the shader has no capture `name` of
+// that type.
+set_float(s: *GpuShader, name: string, v: float) -> bool {
+    cell = typed_cell(s, name, "float")
+    if cell == null { return false }
+    (cell as float[])[0] = v
+    return true
+}
+
+set_int(s: *GpuShader, name: string, v: int) -> bool {
+    cell = typed_cell(s, name, "int")
+    if cell == null { return false }
+    (cell as int[])[0] = v
+    return true
+}
+
+set_vec2(s: *GpuShader, name: string, x: float, y: float) -> bool {
+    cell = typed_cell(s, name, "vec2")
+    if cell == null { return false }
+    lanes4 = cell as f32[]
+    lanes4[0] = x as f32
+    lanes4[1] = y as f32
+    return true
+}
+
+fn typed_cell(s: *GpuShader, name: string, t: string) -> ptr {
+    i = 0
+    while i < quote.capture_count(s.tree) {
+        c = quote.capture(s.tree, i)
+        if quote.capture_name(c) == name {
+            if quote.capture_type(c) != t { return null }
+            return quote.cell(c)
+        }
+        i = i + 1
+    }
+    return null
+}
+
 // The textures, in order: the samplers at bindings 1, 2, ... (0 when the
 // shader has no uniform block).
 samplers_count(s: *GpuShader) -> int {
@@ -291,13 +443,29 @@ fn glsl_expr(t: quote.Tree, n: quote.Node, outer: int, right: int) -> string {
         return "${glsl_expr(t, quote.child(n, 0), PREC_POSTFIX, 0)}[${glsl_expr(t, quote.child(n, 1), 0, 0)}]"
     }
     if k == quote.CALL {
-        name = bare_call(quote.name(n))
-        // rgb(c) is c's swizzle; Aether has no field of three lanes.
-        if name == "rgb" && quote.child_count(n) == 1 {
-            return "${glsl_expr(t, quote.child(n, 0), PREC_POSTFIX, 0)}.rgb"
+        why = call_refused(n)
+        if why != "" {
+            refuse(t, n, why)
+            return ""
         }
+        g = call_glsl(bare_call(quote.name(n)))
+        if !is_identifier(g) { return glsl_template(t, n, g) }
         sb = strbuilder.new(32)
-        strbuilder.append(sb, name)
+        strbuilder.append(sb, g)
+        strbuilder.append(sb, "(")
+        j = 0
+        while j < quote.child_count(n) {
+            if j > 0 { strbuilder.append(sb, ", ") }
+            strbuilder.append(sb, glsl_expr(t, quote.child(n, j), 0, 0))
+            j = j + 1
+        }
+        strbuilder.append(sb, ")")
+        return strbuilder.finish(sb)
+    }
+    if k == quote.HELPER_CALL {
+        // A @quotable function: written out above main by emit_helpers.
+        sb = strbuilder.new(32)
+        strbuilder.append(sb, glsl_name(quote.name(n)))
         strbuilder.append(sb, "(")
         j = 0
         while j < quote.child_count(n) {
@@ -389,7 +557,20 @@ fn glsl_stmt(t: quote.Tree, sb: ptr, s: quote.Node, depth: int, last: bool) {
             refuse(t, s, "a fragment shader returns its colour")
             return
         }
-        strbuilder.append(sb, "FragColor = ${glsl_expr(t, quote.child(s, 0), 0, 0)};\n")
+        if g_in_helper {
+            strbuilder.append(sb, "return ${glsl_expr(t, quote.child(s, 0), 0, 0)};\n")
+            return
+        }
+        if g_depth {
+            rt = quote.type_of(quote.child(s, 0))
+            if rt != "float" && rt != "f32" {
+                refuse(t, s, "a depth fragment shader returns the depth, a float, not a ${rt}")
+                return
+            }
+            strbuilder.append(sb, "gl_FragDepth = ${glsl_expr(t, quote.child(s, 0), 0, 0)};\n")
+        } else {
+            strbuilder.append(sb, "FragColor = ${glsl_expr(t, quote.child(s, 0), 0, 0)};\n")
+        }
         if !last {
             indent(sb, depth)
             strbuilder.append(sb, "return;\n")
@@ -421,13 +602,47 @@ fn glsl_stmt(t: quote.Tree, sb: ptr, s: quote.Node, depth: int, last: bool) {
     }
 }
 
+// Writing a @quotable function's body: a return is the function's, not
+// FragColor.
+var g_in_helper = false
+// Whether the shader being written returns its depth (depth_fragment).
+var g_depth = false
+
+// The @quotable functions the tree reaches (quote version 2), each a GLSL
+// function, callees first as the tree lists them, so each is declared
+// before its use. The same text for both dialects. Errors name the shader's
+// quote, which is where the call that reached the helper is.
+fn emit_helpers(t: quote.Tree, sb: ptr) {
+    i = 0
+    while i < quote.helper_count(t) {
+        h = quote.helper(t, i)
+        ret = glsl_type(quote.return_type(h))
+        if ret == "" { refuse(t, quote.body(h), "${quote.function_name(h)} returns a ${quote.return_type(h)}, which GLSL has no type for") }
+        strbuilder.append(sb, "\n${ret} ${glsl_name(quote.function_name(h))}(")
+        k = 0
+        while k < quote.param_count(h) {
+            if k > 0 { strbuilder.append(sb, ", ") }
+            pt = glsl_type(quote.param_type(h, k))
+            if pt == "" { refuse(t, quote.body(h), "${quote.function_name(h)}'s ${quote.param_name(h, k)} is a ${quote.param_type(h, k)}, which GLSL has no type for") }
+            strbuilder.append(sb, "${pt} ${glsl_name(quote.param_name(h, k))}")
+            k = k + 1
+        }
+        strbuilder.append(sb, ") {\n")
+        g_in_helper = true
+        glsl_block(t, sb, quote.body(h), 1, false)
+        g_in_helper = false
+        strbuilder.append(sb, "}\n")
+        i = i + 1
+    }
+}
+
 // What every emit checks first: one parameter, a type GLSL has for each
 // capture, the version of the tree this reads.
 fn emit_ready(s: *GpuShader) -> bool {
     g_error = ""
     t = s.tree
-    if quote.version(t) != 1 {
-        g_error = "${quote.source(t)}: a tree of version ${quote.version(t)}; ae3d.gpu reads version 1"
+    if quote.version(t) < 1 || quote.version(t) > 2 {
+        g_error = "${quote.source(t)}: a tree of version ${quote.version(t)}; ae3d.gpu reads versions 1 and 2"
         return false
     }
     if quote.param_count(t) != 1 || glsl_type(quote.param_type(t, 0)) == "" {
@@ -497,12 +712,19 @@ emit_glsl(s: *GpuShader, dialect: int) -> string {
         k = k + 1
     }
     input = "${glsl_type(quote.param_type(t, 0))} ${glsl_name(quote.param_name(t, 0))}"
+    emit_helpers(t, sb)
+    // A depth shader has no colour output: what it returns is gl_FragDepth.
+    colour = "out vec4 FragColor;\n"
+    if dialect != GL { colour = "layout(location = 0) ${colour}" }
+    if s.depth { colour = "" }
     if dialect == GL {
-        strbuilder.append(sb, "\nin ${input};\nout vec4 FragColor;\n\nvoid main() {\n")
+        strbuilder.append(sb, "\nin ${input};\n${colour}\nvoid main() {\n")
     } else {
-        strbuilder.append(sb, "\nlayout(location = 0) in ${input};\nlayout(location = 0) out vec4 FragColor;\n\nvoid main() {\n")
+        strbuilder.append(sb, "\nlayout(location = 0) in ${input};\n${colour}\nvoid main() {\n")
     }
+    g_depth = s.depth
     glsl_block(t, sb, quote.body(t), 1, true)
+    g_depth = false
     strbuilder.append(sb, "}\n")
     text = strbuilder.finish(sb)
     if g_error != "" { return "" }
@@ -626,6 +848,9 @@ struct GpuRun {
     flow: int        // 0 on, 1 returned, 2 a break, 3 a continue
     out: *GpuVal
     failed: int
+    param: *GpuVal   // this run's parameter, the pixel's uv
+    view_w: int      // the target's size frag_coord() is a pixel of; 0 unset
+    view_h: int
 }
 
 const FLOW_ON = 0
@@ -643,7 +868,19 @@ cpu_new(s: *GpuShader) -> *GpuRun {
     cx.flow = FLOW_ON
     cx.out = null
     cx.failed = 0
+    cx.param = null
+    cx.view_w = 0
+    cx.view_h = 0
     return cx
+}
+
+// The size of the target the CPU draws into, `w` by `h` pixels: what
+// frag_coord() reads its pixel against (the parameter, at that pixel's
+// centre, times the size). A shader that calls frag_coord() fails to run
+// without it.
+cpu_set_viewport(cx: *GpuRun, w: int, h: int) {
+    cx.view_w = w
+    cx.view_h = h
 }
 
 fn bind(lst: ptr, name: string, v: *GpuVal, img: ptr) {
@@ -723,6 +960,7 @@ cpu_run(cx: *GpuRun, param: *GpuVal) -> *GpuVal {
     cx.failed = 0
     t = cx.s.tree
     read_captures(cx)
+    cx.param = param
     bind(cx.locals, quote.param_name(t, 0), param, null)
     cpu_block(cx, quote.body(t))
     ok = cx.out != null && cx.failed == 0
@@ -915,10 +1153,63 @@ fn cpu_expr(cx: *GpuRun, n: quote.Node) -> *GpuVal {
         return cpu_binary(cx, n, op, quote.type_of(n), cpu_expr(cx, quote.child(n, 0)), cpu_expr(cx, quote.child(n, 1)))
     }
     if k == quote.CALL { return cpu_call(cx, n) }
+    if k == quote.HELPER_CALL { return cpu_helper_call(cx, n) }
     return fail(cx, n, "a ${quote.kind_name(k)} is not run on the CPU")
 }
 
 // A component or a swizzle: x y z w, or r g b a.
+// A @quotable function's call: its arguments in the caller's scope, then its
+// body in a scope of its own parameters alone, its return the call's value.
+// The helper is ordinary Aether too, so a shader's CPU-against-Aether check
+// covers it as it covers the rest.
+fn cpu_helper_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
+    h = quote.helper_named(cx.s.tree, quote.name(n))
+    if (h as ptr) == null { return fail(cx, n, "no helper ${quote.name(n)} in the tree") }
+    if quote.param_count(h) != quote.child_count(n) { return fail(cx, n, "${quote.name(n)} takes ${quote.param_count(h)} arguments") }
+    // A texture argument passes its image; any other its value.
+    args = list.new()
+    imgs = list.new()
+    j = 0
+    while j < quote.child_count(n) {
+        a = quote.child(n, j)
+        if is_texture(quote.param_type(h, j)) {
+            img = texture_image(cx, a)
+            if img == null { list.free(args); list.free(imgs); return fail(cx, n, "${quote.name(n)} is given a texture with no image") }
+            list.add_raw(args, null)
+            list.add_raw(imgs, img)
+        } else {
+            list.add_raw(args, cpu_expr(cx, a) as ptr)
+            list.add_raw(imgs, null)
+        }
+        j = j + 1
+    }
+    saved_locals = cx.locals
+    saved_out = cx.out
+    cx.locals = list.new()
+    j = 0
+    while j < quote.param_count(h) {
+        bind(cx.locals, quote.param_name(h, j), list.get_raw(args, j) as *GpuVal, list.get_raw(imgs, j))
+        j = j + 1
+    }
+    list.free(args)
+    list.free(imgs)
+    cx.out = null
+    cpu_block(cx, quote.body(h))
+    result = cx.out
+    while list.size(cx.locals) > 0 {
+        last = list.size(cx.locals) - 1
+        binding_free(list.get_raw(cx.locals, last) as *GpuBinding)
+        list.remove(cx.locals, last)
+    }
+    list.free(cx.locals)
+    cx.locals = saved_locals
+    cx.out = saved_out
+    if cx.failed != 0 { return keep(cx, v1(0.0)) }
+    if cx.flow != FLOW_RETURN || result == null { return fail(cx, n, "${quote.name(n)} ended without a return") }
+    cx.flow = FLOW_ON
+    return result
+}
+
 fn cpu_field(cx: *GpuRun, n: quote.Node, v: *GpuVal, name: string) -> *GpuVal {
     m = string.length(name)
     if m < 1 || m > 4 { return fail(cx, n, "no field .${name}") }
@@ -1071,19 +1362,64 @@ fn cpu_lanes(cx: *GpuRun, n: quote.Node, fname: string, a: *GpuVal, c: *GpuVal, 
     return out
 }
 
+// The image a texture expression names: a captured texture, or a helper's
+// parameter a texture was passed in as; null when it names neither.
+fn texture_image(cx: *GpuRun, tex: quote.Node) -> ptr {
+    k = quote.kind(tex)
+    if k == quote.CAPTURE {
+        cb = find(cx.caps, quote.name(tex))
+        if cb == null { return null }
+        return cb.img
+    }
+    if k == quote.LOCAL {
+        lb = find(cx.locals, quote.name(tex))
+        if lb == null { return null }
+        return lb.img
+    }
+    return null
+}
+
+// A coordinate as ivec2() takes it, truncated toward zero, then clamped to
+// an image's `size` (texelFetch outside it is undefined; this reads the edge).
+fn clamp_index(v: float, size: int) -> int {
+    i = v as int
+    if i < 0 { return 0 }
+    if i > size - 1 { return size - 1 }
+    return i
+}
+
 fn cpu_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
+    // The same calls the GLSL can be written with, and no others.
+    why = call_refused(n)
+    if why != "" { return fail(cx, n, why) }
     name = bare_call(quote.name(n))
     argc = quote.child_count(n)
     if name == "texture" && argc == 2 {
         tex = quote.child(n, 0)
-        bd = find(cx.caps, quote.name(tex))
-        if quote.kind(tex) != quote.CAPTURE || bd == null || bd.img == null {
+        img = texture_image(cx, tex)
+        if img == null {
             return fail(cx, n, "texture() of ${quote.name(tex)}, which has no image")
         }
         uv = cpu_expr(cx, quote.child(n, 1))
-        return sample(cx, bd.img as *ShaderImage, uv.x, uv.y)
+        return sample(cx, img as *ShaderImage, uv.x, uv.y)
     }
     if name == "rgb" && argc == 1 { return cpu_field(cx, n, cpu_expr(cx, quote.child(n, 0)), "rgb") }
+    if name == "frag_coord" {
+        if cx.view_w <= 0 || cx.view_h <= 0 { return fail(cx, n, "frag_coord() with no viewport (cpu_set_viewport)") }
+        uv = cx.param
+        return keep(cx, mkval(2, uv.x * cx.view_w, uv.y * cx.view_h, 0.0, 0.0))
+    }
+    if name == "texel_fetch" {
+        tex = quote.child(n, 0)
+        img = texture_image(cx, tex)
+        if img == null { return fail(cx, n, "texel_fetch() of ${quote.name(tex)}, which has no image") }
+        p = cpu_expr(cx, quote.child(n, 1))
+        si = img as *ShaderImage
+        x = clamp_index(p.x, image_w(si))
+        y = clamp_index(p.y, image_h(si))
+        return keep(cx, mkval(4, image_channel(si, x, y, 0), image_channel(si, x, y, 1), image_channel(si, x, y, 2),
+                              image_channel(si, x, y, 3)))
+    }
     // Constructors: from scalars and vectors in order, or one scalar
     // splatted.
     if name == "vec2" || name == "vec3" || name == "vec4" {

@@ -1,0 +1,375 @@
+// ae3d.shaders.bloom through ae3d.gpu: the bloom pyramid's down and up passes
+// written with `quote`, their helpers @quotable functions (quote version 2).
+//
+//   - bloom_down comes out as the GLSL in tests/fixtures/gpu/bloom_down.frag
+//     for Vulkan and bloom_down_gl.frag for OpenGL 4.1, each helper a GLSL
+//     function; glslang compiles the first to SPIR-V that spirv-val passes and
+//     takes the second as OpenGL's GLSL (where they are on PATH); its uniform
+//     block is std140 and holds the captures' values;
+//   - the CPU back end runs it to agree with the same pass written as Aether
+//     on the same helpers, on every pixel of an HDR image with a hot pixel,
+//     on the first level (groups weighed, the threshold applied) and after it;
+//   - a shader built for one level and then set to another (gpu.set_int,
+//     set_vec2, set_float: how the renderers draw every level from one
+//     shader) writes the new values into its block and runs them on the CPU;
+//   - bloom_up, two textures (bindings 1 and 2), the same: its GLSL, its
+//     block, and its CPU run against the pass in Aether, on a middle step and
+//     on the last (the sum divided by the levels).
+//
+// On a GPU, tests/test_backend_parity draws a frame with bloom on both
+// renderers (AE3D_PARITY_DUMP writes it, to compare against main's).
+// AE3D_GPU_WRITE_GOLDEN=1 writes the fixtures from what is emitted.
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.quote
+import ae3d.gpu
+import ae3d.gpu (GpuShader)
+import ae3d.shaders.bloom
+import ae3d.shaderlib (vec2, vec3, vec4, Texture, ShaderImage, texture, rgb, image_new, image_set, image_channel, image_free, texture_of)
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+// The down pass straight in Aether, on the module's own helpers: what the
+// quote's body says, so the CPU back end has something to agree with.
+bloom_down_ref(screen: Texture, uv: vec2, texel: vec2, first: int, exposure: float, threshold: float) -> vec3 {
+    a = bloom.tap(screen, uv, texel, vec2(-2.0, -2.0))
+    b = bloom.tap(screen, uv, texel, vec2(0.0, -2.0))
+    c = bloom.tap(screen, uv, texel, vec2(2.0, -2.0))
+    d = bloom.tap(screen, uv, texel, vec2(-1.0, -1.0))
+    e = bloom.tap(screen, uv, texel, vec2(1.0, -1.0))
+    f = bloom.tap(screen, uv, texel, vec2(-2.0, 0.0))
+    g = bloom.tap(screen, uv, texel, vec2(0.0, 0.0))
+    h = bloom.tap(screen, uv, texel, vec2(2.0, 0.0))
+    i = bloom.tap(screen, uv, texel, vec2(-1.0, 1.0))
+    j = bloom.tap(screen, uv, texel, vec2(1.0, 1.0))
+    k = bloom.tap(screen, uv, texel, vec2(-2.0, 2.0))
+    l = bloom.tap(screen, uv, texel, vec2(0.0, 2.0))
+    m = bloom.tap(screen, uv, texel, vec2(2.0, 2.0))
+    sum = bloom.group(first, d, e, i, j) * 0.5 + bloom.group(first, a, b, f, g) * 0.125 + bloom.group(first, b, c, g, h) * 0.125 + bloom.group(first, f, g, k, l) * 0.125 + bloom.group(first, g, h, l, m) * 0.125
+    if first != 0 { sum = bloom.past_threshold(sum, exposure, threshold) }
+    return sum
+}
+
+// The up pass straight in Aether: the coarser sum's tent and this level.
+bloom_up_ref(screen: Texture, level: Texture, uv: vec2, texel: vec2, top: float) -> vec3 {
+    tent = bloom.tap(screen, uv, texel, vec2(0.0, 0.0)) * 4.0 + (bloom.tap(screen, uv, texel, vec2(-1.0, 0.0)) + bloom.tap(screen, uv, texel, vec2(1.0, 0.0)) + bloom.tap(screen, uv, texel, vec2(0.0, -1.0)) + bloom.tap(screen, uv, texel, vec2(0.0, 1.0))) * 2.0 + bloom.tap(screen, uv, texel, vec2(-1.0, -1.0)) + bloom.tap(screen, uv, texel, vec2(1.0, -1.0)) + bloom.tap(screen, uv, texel, vec2(-1.0, 1.0)) + bloom.tap(screen, uv, texel, vec2(1.0, 1.0))
+    sum = rgb(texture(level, uv)) + tent / 16.0
+    if top > 0.0 { sum = sum / top }
+    return sum
+}
+
+// A level's downsample for bloom_up: another pattern, so the two textures
+// cannot stand in for each other unnoticed.
+make_level() -> *ShaderImage {
+    W = 16
+    H = 12
+    img = image_new(W, H)
+    y = 0
+    while y < H {
+        x = 0
+        while x < W {
+            image_set(img, x, y, 0.3 + 0.05 * y, 0.1 + 0.03 * x, 0.7 - 0.02 * x, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return img
+}
+
+// HDR ground: a dim gradient, a bright lamp (well past the threshold), and
+// one hot pixel on its own, the case the first level's weighing is for.
+make_image() -> *ShaderImage {
+    W = 16
+    H = 12
+    img = image_new(W, H)
+    y = 0
+    while y < H {
+        x = 0
+        while x < W {
+            r = 0.05 + 0.02 * x
+            g = 0.04 + 0.01 * y
+            bl = 0.06
+            if x >= 9 && x <= 11 && y >= 3 && y <= 5 {
+                r = 3.0
+                g = 2.5
+                bl = 1.5
+            }
+            if x == 3 && y == 8 {
+                r = 12.0
+                g = 12.0
+                bl = 12.0
+            }
+            image_set(img, x, y, r, g, bl, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return img
+}
+
+absf(a: float) -> float { if a < 0.0 { return 0.0 - a } return a }
+maxf(a: float, c: float) -> float { if a > c { return a } return c }
+
+// glslang -V over `text` (as `stage`), then spirv-val; or, for desktop
+// OpenGL's GLSL (`opengl`), glslang's check of it. Skipped where they are
+// not on PATH.
+compiles(label: string, text: string, stage: string, opengl: bool) {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+        if status != 0 { println(out) }
+        return
+    }
+    check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    if status != 0 { println(out) }
+    if string.length(os.which("spirv-val")) == 0 {
+        println("  skip spirv-val (not on PATH)")
+        return
+    }
+    vargv = list.new()
+    list.add(vargv, spv)
+    vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+    check("spirv-val passes ${label}.${stage}", vstatus == 0)
+    if vstatus != 0 { println(vout) }
+    list.free(vargv)
+}
+
+// `text` is the fixture at `path`; AE3D_GPU_WRITE_GOLDEN=1 writes it.
+golden_is(text: string, path: string) {
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(path, text)
+        check("${path} written", werr == "")
+    }
+    golden, gerr = file.read(path)
+    check("${path} is there", gerr == "")
+    check("the GLSL written is ${path}", text == golden)
+    if text != golden {
+        println("--- emitted ---")
+        println(text)
+    }
+}
+
+// bloom_up's CPU run over every pixel, against bloom_up_ref; built at `top`
+// 7 and set to `top` through its cell.
+cpu_up_against_aether(img: *ShaderImage, lvl: *ShaderImage, W: int, H: int, top: float) -> float {
+    texel = vec2(1.0 / W, 1.0 / H)
+    screen = texture_of(img)
+    level = texture_of(lvl)
+    s = bloom.bloom_up(screen, level, texel, 7.0)
+    if !gpu.set_float(s, "top", top) {
+        gpu.shader_free(s)
+        return -1.0
+    }
+    cx = gpu.cpu_new(s)
+    worst = 0.0
+    y = 0
+    while y < H {
+        x = 0
+        while x < W {
+            u = (x + 0.5) / W
+            v = (y + 0.5) / H
+            uv = gpu.v2(u, v)
+            got = gpu.cpu_run(cx, uv)
+            heap.free(uv)
+            if got == null {
+                println("  cpu_run failed: ${gpu.last_error()}")
+                gpu.cpu_free(cx)
+                gpu.shader_free(s)
+                return -1.0
+            }
+            want = bloom_up_ref(screen, level, vec2(u, v), texel, top)
+            d = maxf(maxf(absf(gpu.val_x(got) - want.x), absf(gpu.val_y(got) - want.y)), absf(gpu.val_z(got) - want.z))
+            worst = maxf(worst, d / maxf(1.0, absf(want.x)))
+            heap.free(got)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    gpu.cpu_free(cx)
+    gpu.shader_free(s)
+    return worst
+}
+
+// The CPU back end over every pixel of `img`, against bloom_down_ref.
+// Returns the worst channel's difference; -1 when a pixel failed to run.
+// The shader is built for the other level, at another texel and exposure,
+// and set to these through its cells, as the renderers do between draws.
+cpu_against_aether(img: *ShaderImage, W: int, H: int, first: int) -> float {
+    texel = vec2(1.0 / W, 1.0 / H)
+    screen = texture_of(img)
+    s = bloom.bloom_down(screen, vec2(0.5, 0.25), 1 - first, 3.0, 1.0)
+    if !gpu.set_vec2(s, "texel", 1.0 / W, 1.0 / H) || !gpu.set_int(s, "first", first) || !gpu.set_float(s, "exposure", 1.0) {
+        println("  a setter refused a capture the shader has")
+        gpu.shader_free(s)
+        return -1.0
+    }
+    cx = gpu.cpu_new(s)
+    worst = 0.0
+    y = 0
+    while y < H {
+        x = 0
+        while x < W {
+            u = (x + 0.5) / W
+            v = (y + 0.5) / H
+            uv = gpu.v2(u, v)
+            got = gpu.cpu_run(cx, uv)
+            heap.free(uv)
+            if got == null {
+                println("  cpu_run failed: ${gpu.last_error()}")
+                gpu.cpu_free(cx)
+                gpu.shader_free(s)
+                return -1.0
+            }
+            want = bloom_down_ref(screen, vec2(u, v), texel, first, 1.0, 1.0)
+            d = maxf(maxf(absf(gpu.val_x(got) - want.x), absf(gpu.val_y(got) - want.y)), absf(gpu.val_z(got) - want.z))
+            // Relative to the value: HDR light runs to 12.
+            worst = maxf(worst, d / maxf(1.0, absf(want.x)))
+            heap.free(got)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    gpu.cpu_free(cx)
+    gpu.shader_free(s)
+    return worst
+}
+
+main() {
+    println("ae3d.gpu: bloom_down written with quote")
+    img = make_image()
+    W = 16
+    H = 12
+    texel = vec2(1.0 / W, 1.0 / H)
+    screen = texture_of(img)
+    s = bloom.bloom_down(screen, texel, 1, 1.0, 1.0)
+
+    // ── The tree ──
+    t = gpu.shader_tree(s)
+    helpers = ""
+    i = 0
+    while i < quote.helper_count(t) {
+        helpers = "${helpers}${quote.function_name(quote.helper(t, i))} "
+        i = i + 1
+    }
+    check("its helpers, callees first (${helpers})", helpers == "bloom_tap bloom_luma bloom_group bloom_past_threshold ")
+    names = ""
+    i = 0
+    while i < quote.capture_count(t) {
+        c = quote.capture(t, i)
+        names = "${names}${quote.capture_name(c)}:${quote.capture_type(c)} "
+        i = i + 1
+    }
+    check("its captures (${names})", names == "screen:Texture texel:vec2 first:int exposure:float threshold:float ")
+
+    // ── GLSL, for Vulkan and for OpenGL ──
+    frag = gpu.emit_glsl(s, gpu.VULKAN)
+    if frag == "" { println("  emit: ${gpu.last_error()}") }
+    golden_is(frag, "tests/fixtures/gpu/bloom_down.frag")
+    compiles("bloom_down", frag, "frag", false)
+    gl_frag = gpu.emit_glsl(s, gpu.GL)
+    if gl_frag == "" { println("  emit: ${gpu.last_error()}") }
+    golden_is(gl_frag, "tests/fixtures/gpu/bloom_down_gl.frag")
+    compiles("bloom_down_gl", gl_frag, "frag", true)
+
+    layout = ""
+    k = 0
+    while k < gpu.params_count(s) {
+        layout = "${layout}${gpu.params_type(s, k)} ${gpu.params_name(s, k)}@${gpu.params_offset(s, k)} "
+        k = k + 1
+    }
+    check("the uniform block is std140 (${layout}${gpu.params_size(s)})",
+          layout == "vec2 texel@0 int first@8 float exposure@12 float threshold@16 " && gpu.params_size(s) == 32)
+    check("one sampler, the screen", gpu.samplers_count(s) == 1 && gpu.samplers_name(s, 0) == "screen")
+    block = calloc(1, 32)
+    gpu.params_write(s, block)
+    p = block as f32[]
+    q = block as int[]
+    check("the block holds the captures' values",
+          absf(p[0] - 1.0 / W) < 0.000001 && absf(p[1] - 1.0 / H) < 0.000001 && q[2] == 1 &&
+          absf(p[3] - 1.0) < 0.000001 && absf(p[4] - 1.0) < 0.000001)
+    // Set to a later level at another size, the block says so.
+    set_ok = gpu.set_int(s, "first", 0) && gpu.set_vec2(s, "texel", 0.5, 0.25) && gpu.set_float(s, "threshold", 2.5)
+    gpu.params_write(s, block)
+    check("set_int, set_vec2 and set_float change the block",
+          set_ok && q[2] == 0 && absf(p[0] - 0.5) < 0.000001 && absf(p[1] - 0.25) < 0.000001 && absf(p[4] - 2.5) < 0.000001)
+    check("a setter refuses a capture of another type or none",
+          !gpu.set_float(s, "first", 1.0) && !gpu.set_int(s, "texel", 1) && !gpu.set_float(s, "nothing", 1.0))
+    free(block)
+    gpu.shader_free(s)
+
+    // ── The CPU back end against the pass in Aether ──
+    first = cpu_against_aether(img, W, H, 1)
+    check("the first level agrees with the pass in Aether (worst ${first})", first >= 0.0 && first < 0.00001)
+    later = cpu_against_aether(img, W, H, 0)
+    check("a later level agrees too (worst ${later})", later >= 0.0 && later < 0.00001)
+
+    // ── bloom_up: two textures ──
+    println("ae3d.gpu: bloom_up written with quote")
+    lvl = make_level()
+    u = bloom.bloom_up(screen, texture_of(lvl), texel, 0.0)
+    up_frag = gpu.emit_glsl(u, gpu.VULKAN)
+    if up_frag == "" { println("  emit: ${gpu.last_error()}") }
+    golden_is(up_frag, "tests/fixtures/gpu/bloom_up.frag")
+    compiles("bloom_up", up_frag, "frag", false)
+    up_gl = gpu.emit_glsl(u, gpu.GL)
+    golden_is(up_gl, "tests/fixtures/gpu/bloom_up_gl.frag")
+    compiles("bloom_up_gl", up_gl, "frag", true)
+    up_layout = ""
+    k = 0
+    while k < gpu.params_count(u) {
+        up_layout = "${up_layout}${gpu.params_type(u, k)} ${gpu.params_name(u, k)}@${gpu.params_offset(u, k)} "
+        k = k + 1
+    }
+    check("its block is std140 (${up_layout}${gpu.params_size(u)})", up_layout == "vec2 texel@0 float top@8 " && gpu.params_size(u) == 16)
+    check("two samplers, the coarser sum then the level",
+          gpu.samplers_count(u) == 2 && gpu.samplers_name(u, 0) == "screen" && gpu.samplers_name(u, 1) == "level")
+    gpu.shader_free(u)
+    middle = cpu_up_against_aether(img, lvl, W, H, 0.0)
+    check("a middle step agrees with the pass in Aether (worst ${middle})", middle >= 0.0 && middle < 0.00001)
+    last = cpu_up_against_aether(img, lvl, W, H, 6.0)
+    check("the last step, divided by the levels, agrees too (worst ${last})", last >= 0.0 && last < 0.00001)
+    image_free(lvl)
+
+    image_free(img)
+    if g_failures > 0 {
+        println("bloom: ${g_failures} of ${g_checks} checks failed")
+        exit(1)
+    }
+    println("bloom: all checks passed (${g_checks})")
+}
