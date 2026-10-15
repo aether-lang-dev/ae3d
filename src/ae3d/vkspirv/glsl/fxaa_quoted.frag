@@ -9,21 +9,24 @@ layout(std140, set = 0, binding = 0) uniform Params {
 };
 layout(set = 0, binding = 1) uniform sampler2D screen;
 
+float fxaa_luma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 FragColor;
 
 void main() {
-    vec3 luma = vec3(0.299, 0.587, 0.114);
     vec3 c = texture(screen, uv).rgb;
     vec3 n = texture(screen, uv + vec2(0.0, -1.0) * texel).rgb;
     vec3 s = texture(screen, uv + vec2(0.0, 1.0) * texel).rgb;
     vec3 e = texture(screen, uv + vec2(1.0, 0.0) * texel).rgb;
     vec3 w = texture(screen, uv + vec2(-1.0, 0.0) * texel).rgb;
-    float lc = dot(c, luma);
-    float ln = dot(n, luma);
-    float ls = dot(s, luma);
-    float le = dot(e, luma);
-    float lw = dot(w, luma);
+    float lc = fxaa_luma(c);
+    float ln = fxaa_luma(n);
+    float ls = fxaa_luma(s);
+    float le = fxaa_luma(e);
+    float lw = fxaa_luma(w);
     float lo = min(lc, min(min(ln, ls), min(le, lw)));
     float hi = max(lc, max(max(ln, ls), max(le, lw)));
     float range = hi - lo;
