@@ -407,7 +407,10 @@ if command -v blender >/dev/null 2>&1 || [ -n "${BLENDER:-}" ]; then
         ./scripts/export_assets.sh "$1" "$fresh" >/tmp/ae3d_export.log 2>&1
         if [ ! -f "$fresh/manifest.json" ]; then
             skip "$2" "the exporter produced nothing (see /tmp/ae3d_export.log)"
-        elif diff -r "$2" "$fresh" >/tmp/ae3d_export_diff.log 2>&1; then
+        # A figure's impostor (impostor_<figure>*) is baked from the exported
+        # scene by tools/bake_impostor.ae, not written by the exporter; the
+        # scenes' bake step checks it.
+        elif diff -r -x 'impostor_*' "$2" "$fresh" >/tmp/ae3d_export_diff.log 2>&1; then
             pass "$2 is what the exporter produces"
         else
             fail "$2 is stale; run ./scripts/export_assets.sh"
