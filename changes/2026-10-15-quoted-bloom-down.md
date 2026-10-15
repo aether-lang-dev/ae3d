@@ -23,5 +23,10 @@
   HDR image with a lamp and a hot pixel, on the first level (worst 6e-8) and
   a later one (0), each from a shader built for the other level and set
   through its cells.
-- `FRAGMENT_BLOOM_DOWN` and `bloom_down_vk.frag` are still there, unused, until
-  the GPU lanes have compared the bloom frames with main's.
+- **`FRAGMENT_BLOOM_DOWN`, `bloom_down_vk.frag` and `vkpipes.bloom_down` are
+  gone**, and with them `bloomFirst` and `bloomThreshold` in the scene block
+  every other pass reads; every shader over it is regenerated. On an Apple M6
+  (Vulkan with 4x MSAA, OpenGL 4.1 over Metal) the frames drawn with bloom
+  are byte-identical to main's on both renderers (`test_backend_parity` with
+  `AE3D_PARITY_DUMP`), and its OpenGL-against-Vulkan bloom comparison reads
+  as main's: 2100 of 147456 channels differ, worst 116.
