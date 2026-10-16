@@ -484,7 +484,9 @@ fi
 # checked in. An edit to the GLSL without the generator run after it leaves
 # Vulkan on the previous shader, which fails parity in ways that look like
 # real bugs; the check is that the checked-in files are what the source makes,
-# and that each quoted shader's SPIR-V was made from a tree of its hash.
+# and that each quoted shader's SPIR-V was made from a tree of its hash. It
+# needs glslang 16.6.0, the version the SPIR-V is made with, and says so when
+# it is not on PATH (scripts/glslang.sh fetches Khronos' build on Linux).
 step "Vulkan shaders regenerated"
 if ! ./build.sh tools/generate_shaders.ae >/tmp/ae3d_shaders.log 2>&1; then
     fail "generate_shaders (build)"
