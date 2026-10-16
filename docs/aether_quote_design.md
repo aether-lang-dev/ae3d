@@ -364,32 +364,35 @@ From mapping the compiler; nothing here is built yet.
      OpenGL over Metal); `test_backend_parity`'s fxaa comparison is
      unchanged to the channel.
 
-   *The rest, one at a time, in this order*, each adding to `ae3d.gpu` and
+   *Since then (ae3d #792, Aether 0.817.0, quote version 2):* the bloom's
+   down and up passes and the one-sample `depth_copy` are quoted too, the
+   bloom's helpers as `@quotable` functions. The bloom's `_vk` files and GL
+   heredocs are gone; `depth_copy_vk.frag` stays until its frames have been
+   compared with main's.
+
+   *The rest, one at a time, in this order* (Nic, 2026-10-16; see
+   `aether_quote_questions_for_nic.md`), each adding to `ae3d.gpu` and
    `ae3d.shaderlib` what it is the first to need, and deleting its `_vk`
    file and its GL heredoc in the commit that moves it, as FXAA's did:
+   - **`depth_resolve`**, the multisampled depth copy: a multisample
+     texture type (`sampler2DMS`, `texelFetch` with a sample index).
+   - **`color_resolve`, `ssr`, `ssao`, `taa`**, one commit each.
+   - **the sky** (its capture and cloud variants with it): six samplers,
+     3D ones among them, and 25 uniforms, much of them the scene's: probably
+     a captured struct read through `quote.cell(c) as *T` field by field.
+   - **3A, module-scoped structs**, in aether (question 3 of the questions
+     doc), before the vertex shaders.
    - **the passthrough**, `screen_vk.vert` / `VERTEX_SCREEN`, which every
      post pass draws with: `gpu.emit_screen_vertex` already writes it for
      each quoted pass, and the hand-written one goes when the last pass
      reading it has moved.
-   - **`depth_copy`**: writes depth, not a colour, and reads its texel with
-     `texelFetch` at `gl_FragCoord`: a fragment whose return is its depth,
-     a builtin input, an integer vector type (`ivec2`, distinct over
-     `i32x4`) and a depth sampler.
-   - **the bloom**, down then up: helper functions (`tap`, `luma`, `group`,
-     `past_threshold`). A call in a quote to a function of the program is a
-     `CALL` by name, and the tree does not hold the callee's body, so the
-     emitter has nothing to write for it: inline by hand, or (better, an
-     Aether question) a way to hand the library a function's own tree.
-   - **the composite**: two textures (`ae3d.vkquote` takes one today), and
-     `hazeColumn[4]`, `hazeShape[4]`, a `mat4`: a captured array read by
-     `INDEX`, and a matrix type in the library.
-   - **the sky** (its capture and cloud variants with it): six samplers,
-     3D ones among them, and 25 uniforms, much of them the scene's: probably
-     a captured struct read through `quote.cell(c) as *T` field by field.
 
-   The mesh shaders (scene, water, crowd) wait for step 6: their vertex
-   stage is a quote too, and their uniforms are the scene block.
-5. **MSL**, then a SPIR-V writer of our own (after reading Chris's
+   **The composite** (two textures, `hazeColumn[4]`, `hazeShape[4]` and a
+   `mat4`) moves with the vertex shaders in step 6, and so do the mesh
+   shaders (scene, water, crowd): their vertex stage is a quote too, and
+   their uniforms are the scene block.
+5. **MSL**, after step 6 (the vertex shaders) (Nic, 2026-10-16; the FXAA-only MSL
+   spike is dropped), then a SPIR-V writer of our own (after reading Chris's
    `spirv.inc` for ideas, then writing ours from the SPIR-V spec), with
    glslang and `spirv-val` kept in CI as the checkers.
 6. **Vertex shaders.** ChrysaLisp's split is worth taking as an idea: a
@@ -397,7 +400,7 @@ From mapping the compiler; nothing here is built yet.
    serves any pixel shader whose inputs it provides. For us the vertex
    quote's return type is a struct of varyings, built with a struct literal
    (`MAKE`, which is why v1 has one), and the pixel quote takes it as its
-   parameter.
+   parameter. The composite moves with them.
 
 ## 10. Open questions for Nic
 

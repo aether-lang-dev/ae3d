@@ -123,3 +123,33 @@ The PR for the three small gaps is aether#2891. Nothing is built for these
 three until you've had a look. If you agree with the recommendations, the
 order would be 1B (it unblocks bloom and most shaders after it), then 3A,
 with 2 decided separately and the naming convention used meanwhile.
+
+## Answered 2026-10-16: the quote-shader update
+
+Paul's update after the bloom and depth_copy moves (ae3d #792, on Aether
+0.817.0) asked four more things. Nic's answers, 2026-10-16:
+
+1. **E0805 stays.** A `@quotable` helper reads only its parameters. Reading
+   an outer variable as an implicit capture would make a helper's meaning
+   depend on the quote that calls it, and would pull the helper's reads into
+   every calling quote's capture set and hash. So `tap` keeps being handed
+   the texture and the texel size. If the verbosity starts to matter, a
+   struct parameter (the texture with its texel size) shortens the call
+   sites without loosening the rule.
+2. **glslang 16.6.0 is canonical** for the checked-in SPIR-V; Debian's
+   12.0.0 is too old to be the reference. CI pins that exact version (the
+   Khronos release binary, cached), `generate_shaders --check` fails when
+   `glslangValidator --version` is not 16.6.0, and `--check` compares the
+   SPIR-V bytes as well as the GLSL text.
+3. **The non-determinism found on main gets an issue each**, measured
+   against main: the clouds over the skybox (two runs on main differ by
+   about 2,000 channels, worst 33 steps of 255) and zombie_city at one
+   sample (bimodal on main: main against itself 55 channels, worst 1; the
+   branch against main about 90, worst 3). Until they are fixed, those two
+   scenes are compared with a tolerance rather than exactly. Owners to come
+   from Nic.
+4. **The order:** depth_resolve first, with a multisample texture type
+   (`sampler2DMS`, `texelFetch` with a sample index); then color_resolve,
+   ssr, ssao, taa and the sky; then 3A, module-scoped structs (in aether);
+   then step 6, the vertex shaders, the composite with them; then MSL; then
+   a SPIR-V writer of our own. The FXAA-only MSL spike is dropped.
