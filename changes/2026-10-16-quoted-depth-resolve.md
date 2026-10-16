@@ -21,6 +21,9 @@
   exactly, the nearest of the first two when told of two, as the body run
   as Aether resolves it. Reading sample 0 whatever the index fails it; so
   does dropping `texel_fetch_ms` from the call table.
-- `FRAGMENT_DEPTH_RESOLVE`, `depth_resolve_vk.frag`, `vkpipes.depth_resolve`
-  and `depthSampleCount` in the scene block stay, unused, until the GPU
-  lanes have compared multisampled frames against main's.
+- **`FRAGMENT_DEPTH_RESOLVE`, `depth_resolve_vk.frag`,
+  `vkpipes.depth_resolve` and `depthSampleCount` are gone.** On an Apple M6
+  at 4x MSAA, 27 of 28 `test_backend_parity` frames are byte-identical to
+  main's on both renderers, every case that reads the depth among them; the
+  28th, the clouds over the skybox, differs less than main does from itself.
+  No validation errors.

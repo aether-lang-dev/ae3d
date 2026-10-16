@@ -14,7 +14,10 @@
   sample and a hard edge against the same weighed mean worked out in
   doubles (worst 7e-8), the lamp's pixel well under its plain mean. Leaving
   the exposure out of the weight fails it.
-- `FRAGMENT_COLOR_RESOLVE`, `color_resolve_vk.frag`, the colour-resolve
-  pipeline in `vkpipes` and `colorSampleCount` in the scene block stay,
-  unused, until the GPU lanes have compared multisampled frames against
-  main's.
+- **`FRAGMENT_COLOR_RESOLVE`, `color_resolve_vk.frag`, the colour-resolve
+  pipeline in `vkpipes` and `colorSampleCount` are gone**, the frames on an
+  Apple M6 at 4x MSAA reading as the depth resolve's do (27 of 28
+  byte-identical to main's on both renderers, the clouds within main's own
+  spread). A multisampled frame whose resolve pass will not build still
+  fails the renderer's start, as the pipeline's did. Every Vulkan shader
+  is regenerated without the two uniforms; the block stays 16240 bytes.
