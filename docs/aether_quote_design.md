@@ -463,7 +463,8 @@ struct SkyOut { colour: vec4, velocity: vec2 }
 sky_vertex(view_projection: mat4, prev_view_projection: mat4) -> *GpuShader {
     return gpu.vertex("sky") quote | v: Vertex | {
         pos = mul(view_projection, vec4(v.position, 1.0))
-        return Varyings { position: vec4(xyz_of(pos.x, pos.y, pos.w), pos.w), dir: v.position,
+        // pos.xyww: the sky at the far plane, whatever its distance.
+        return Varyings { position: vec4(vec3(pos.x, pos.y, pos.w), pos.w), dir: v.position,
                           clip_now: pos, clip_prev: mul(prev_view_projection, vec4(v.position, 0.0)) }
     }
 }
