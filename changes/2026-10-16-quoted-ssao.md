@@ -36,5 +36,11 @@
   not; and run as OpenGL over OpenGL's matrices and depth, the same world
   positions with the image upside down. A transposed `mul` fails it, and so
   does OpenGL's `depth_clip` run as Vulkan's.
-- `FRAGMENT_SSAO`, `ssao_vk.frag` and `vkpipes.ssao` stay, unused, until
-  the GPU lanes have compared frames against main's.
+- **`FRAGMENT_SSAO`, `ssao_vk.frag`, `vkpipes.ssao`, `ssaoRadius` and
+  `ssaoIntensity` are gone.** On an Apple M6, with one sample and with
+  four, 27 of 28 `test_backend_parity` frames are byte-identical to main's
+  on both renderers (the clouds within main's own spread), the occlusion's
+  numbers in its log are main's, and zombie_city and caustics are
+  byte-identical but for Vulkan with one sample, main's own multimodal
+  case. The occlusion is in those frames: zombie_city without it differs
+  by some 17000 channels. No validation errors.

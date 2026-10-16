@@ -173,8 +173,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 hazeShape[4];
     float ssrRoadHeight;
     float ssrStrength;
-    float ssaoRadius;
-    float ssaoIntensity;
     float time;
     float waveSpeedMultiplier;
     float waveHeightMultiplier;
