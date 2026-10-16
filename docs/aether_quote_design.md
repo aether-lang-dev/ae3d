@@ -380,9 +380,12 @@ From mapping the compiler; nothing here is built yet.
    - **`depth_resolve`**, the multisampled depth copy: a multisample
      texture type (`sampler2DMS`, `texelFetch` with a sample index).
    - **`color_resolve`, `ssr`, `ssao`, `taa`**, one commit each.
-   - **the sky** (its capture and cloud variants with it): six samplers,
-     3D ones among them, and 25 uniforms, much of them the scene's: probably
-     a captured struct read through `quote.cell(c) as *T` field by field.
+   - **the sky's light**: `sky_filter` and `sky_irradiance`, screen passes
+     over the capture's mips (`texture_lod`, `texel_fetch_lod`). The sky
+     itself, its capture and its clouds (`sky`, `sky_capture`, `cloud`) move
+     to step 6 (Paul, 2026-10-16): each takes a direction and two clip
+     positions from its own vertex shader and writes a colour and a motion
+     vector, and reads `sampler3D`s.
    - **3A, module-scoped structs**, in aether (question 3 of the questions
      doc), before the vertex shaders.
    - **the passthrough**, `screen_vk.vert` / `VERTEX_SCREEN`, which every
@@ -391,7 +394,9 @@ From mapping the compiler; nothing here is built yet.
      reading it has moved.
 
    **The composite** (two textures, `hazeColumn[4]`, `hazeShape[4]` and a
-   `mat4`) moves with the vertex shaders in step 6, and so do the mesh
+   `mat4`) and **the sky, its capture and its clouds** (varyings from their
+   own vertex shader, two outputs, `sampler3D`) move with the vertex shaders
+   in step 6, and so do the mesh
    shaders (scene, water, crowd): their vertex stage is a quote too, and
    their uniforms are the scene block.
 5. **MSL**, after step 6 (the vertex shaders) (Nic, 2026-10-16; the FXAA-only MSL

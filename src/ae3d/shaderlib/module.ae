@@ -50,6 +50,7 @@ exports (
     min_v3, max_v3, clamp_v3, mix_v3, length_v2, mul, mat4_of, zero_mat4,
     xyz, dot_v2, normalize, cross, distance, sqrt, sin, cos, depth_clip, screen_y_sign,
     texture_size, floor_v2, fract_v2, clamp_v2, length_v3, reflect, pow,
+    texture_lod, texel_fetch_lod, log2, image_mip_chain, image_level,
     frag_coord, texel_fetch, texel_fetch_ms, set_frag_coord,
     image_new, image_set, image_channel, image_w, image_h, image_free, texture_of,
     image_ms_new, image_ms_sample, image_ms_samples, image_ms_free, texture_ms_of
@@ -61,6 +62,7 @@ extern free(p: ptr)
 @extern("sin") c_sin(x: float) -> float
 @extern("cos") c_cos(x: float) -> float
 @extern("pow") c_pow(x: float, y: float) -> float
+@extern("log2") c_log2(x: float) -> float
 
 type vec2 = distinct f32x4
 type vec3 = distinct f32x4
@@ -85,6 +87,8 @@ struct ShaderImage {
     w: int
     h: int
     px: ptr          // w * h * 4 doubles, RGBA
+    levels: int      // its mips, level 0 itself; 1 until image_mip_chain
+    mips: ptr        // *ShaderImage[levels]: [0] the image, then each half
 }
 
 // A multisampled texture a shader reads a sample at a time. `image` is the
@@ -106,6 +110,7 @@ image_new(w: int, h: int) -> *ShaderImage {
     img.w = w
     img.h = h
     img.px = calloc(w * h * 4, 8)
+    img.levels = 1
     k = 0
     while k < w * h {
         (img.px as float[])[k * 4 + 3] = 1.0
@@ -129,8 +134,67 @@ image_w(img: *ShaderImage) -> int { return img.w }
 image_h(img: *ShaderImage) -> int { return img.h }
 image_free(img: *ShaderImage) {
     if img == null { return }
+    if img.mips != null {
+        k = 1
+        while k < img.levels {
+            sub = (img.mips as ptr[])[k] as *ShaderImage
+            free(sub.px)
+            free(sub as ptr)
+            k = k + 1
+        }
+        free(img.mips)
+    }
     free(img.px)
     free(img as ptr)
+}
+
+// The image's mips made, `levels` of them counting itself: each half the
+// one above, a texel the mean of the four it covers -- a linear blit's
+// halving of a power-of-two image, as the GPU's mip chains are made
+// (vktexture.mip_chain). A side of one stays one.
+image_mip_chain(img: *ShaderImage, levels: int) {
+    if img == null || levels < 1 || img.mips != null { return }
+    img.mips = calloc(levels, 8)
+    (img.mips as ptr[])[0] = img as ptr
+    img.levels = levels
+    above = img
+    k = 1
+    while k < levels {
+        w = above.w / 2
+        h = above.h / 2
+        if w < 1 { w = 1 }
+        if h < 1 { h = 1 }
+        sub = image_new(w, h)
+        y = 0
+        while y < h {
+            x = 0
+            while x < w {
+                xa = clampi(x * 2, above.w - 1)
+                xb = clampi(x * 2 + 1, above.w - 1)
+                ya = clampi(y * 2, above.h - 1)
+                yb = clampi(y * 2 + 1, above.h - 1)
+                c = 0
+                while c < 4 {
+                    v = (image_channel(above, xa, ya, c) + image_channel(above, xb, ya, c) +
+                         image_channel(above, xa, yb, c) + image_channel(above, xb, yb, c)) * 0.25
+                    (sub.px as float[])[(y * w + x) * 4 + c] = v
+                    c = c + 1
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        (img.mips as ptr[])[k] = sub as ptr
+        above = sub
+        k = k + 1
+    }
+}
+
+// Level `k` of the image's mips (clamped to those it has).
+image_level(img: *ShaderImage, k: int) -> *ShaderImage {
+    if img.mips == null || k <= 0 { return img }
+    if k >= img.levels { return (img.mips as ptr[])[img.levels - 1] as *ShaderImage }
+    return (img.mips as ptr[])[k] as *ShaderImage
 }
 
 // A multisampled picture of `samples` samples, each w by h, as image_new
@@ -351,6 +415,42 @@ texel_fetch_ms(t: TextureMS, pixel: vec2, sample: int) -> vec4 {
 texture(t: Texture, uv: vec2) -> vec4 {
     img = t.image as *ShaderImage
     if img == null { return lanes.splat4(0.0) as vec4 }
+    return bilinear(img, uv)
+}
+
+// textureLod(t, uv, lod): trilinear, the two levels about `lod` each read
+// bilinearly and mixed by its fraction (to 1/256, as a sampler's is),
+// `lod` clamped to the levels the image has.
+texture_lod(t: Texture, uv: vec2, lod: float) -> vec4 {
+    img = t.image as *ShaderImage
+    if img == null { return lanes.splat4(0.0) as vec4 }
+    top = (img.levels - 1) * 1.0
+    l = clamp(lod, 0.0, top)
+    k = floor(l) as int
+    f = floor((l - k) * 256.0 + 0.5) / 256.0
+    a = bilinear(image_level(img, k), uv) as f32x4
+    if f <= 0.0 { return a as vec4 }
+    b = bilinear(image_level(img, k + 1), uv) as f32x4
+    return (a * lanes.splat4(1.0 - f) + b * lanes.splat4(f)) as vec4
+}
+
+// texelFetch(t, ivec2(x, y), int(level)): one texel of a level, unfiltered,
+// clamped at its edges. Floats, each truncated as ivec2() and int() do: a
+// quote has no cast, and a loop that counts in floats hands them over as
+// they are.
+texel_fetch_lod(t: Texture, x: float, y: float, level: float) -> vec4 {
+    img = t.image as *ShaderImage
+    if img == null { return lanes.splat4(0.0) as vec4 }
+    m = image_level(img, level as int)
+    xi = clampi(x as int, m.w - 1)
+    yi = clampi(y as int, m.h - 1)
+    return lanes.f32x4(image_channel(m, xi, yi, 0), image_channel(m, xi, yi, 1), image_channel(m, xi, yi, 2),
+                       image_channel(m, xi, yi, 3)) as vec4
+}
+
+log2(x: float) -> float { return c_log2(x) }
+
+fn bilinear(img: *ShaderImage, uv: vec2) -> vec4 {
     u = uv as f32x4
     // The weights to 1/256 of a texel, as a GPU's sampler has them
     // (ae3d.gpu's SUBTEXEL says why that matters).

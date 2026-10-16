@@ -1,0 +1,373 @@
+// ae3d.shaders.sky through ae3d.gpu: the sky's irradiance and its
+// prefiltered reflections, made from the capture, written with `quote`.
+//
+//   - sky_filter and sky_irradiance come out as the GLSL in
+//     tests/fixtures/gpu/sky_filter.frag, sky_irradiance.frag and their _gl
+//     twins: one sampler, the capture, read through textureLod and
+//     texelFetch at a level; the octahedral helpers as GLSL functions;
+//     glslang and spirv-val pass them;
+//   - radical_inverse, counted in halves, is the 32-bit bit reversal the
+//     hand-written filter used, exactly, for each of its 48 samples;
+//   - on the CPU, over a sky of one colour the irradiance is pi times it and
+//     every roughness level is the colour itself;
+//   - over a sky with a sun in it, the CPU runs both as the passes written as
+//     Aether over ae3d.shaderlib do.
+//
+// On a GPU, both are drawn when the sky is captured: the suites that light by
+// the sky. AE3D_GPU_WRITE_GOLDEN=1 writes the fixtures.
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.lanes
+import std.quote
+import ae3d.gpu
+import ae3d.shaders.sky
+import ae3d.shaderlib
+import ae3d.shaderlib (vec2, vec3, vec4, Texture, ShaderImage, frag_coord, set_frag_coord, rgb, dot, normalize, cross,
+                       abs, max, length_v3, texture_lod, texel_fetch_lod, image_new, image_set, image_channel,
+                       image_free, texture_of, image_mip_chain)
+
+extern exit(code: int)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+absf(a: float) -> float { if a < 0.0 { return 0.0 - a } return a }
+
+// glslang -V over `text` (as `stage`), then spirv-val; or, for desktop
+// OpenGL's GLSL (`opengl`), glslang's check of it. Skipped where they are
+// not on PATH.
+compiles(label: string, text: string, stage: string, opengl: bool) {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+        if status != 0 { println(out) }
+        return
+    }
+    check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    if status != 0 { println(out) }
+    if string.length(os.which("spirv-val")) == 0 {
+        println("  skip spirv-val (not on PATH)")
+        return
+    }
+    vargv = list.new()
+    list.add(vargv, spv)
+    vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+    check("spirv-val passes ${label}.${stage}", vstatus == 0)
+    if vstatus != 0 { println(vout) }
+    list.free(vargv)
+}
+
+// `text` is the fixture at `path`; AE3D_GPU_WRITE_GOLDEN=1 writes it.
+golden_is(text: string, path: string) {
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(path, text)
+        check("${path} written", werr == "")
+    }
+    golden, gerr = file.read(path)
+    check("${path} is there", gerr == "")
+    check("the GLSL written is ${path}", text == golden)
+    if text != golden {
+        println("--- emitted ---")
+        println(text)
+    }
+}
+
+
+const SIZE = 256
+const LEVELS = 9
+const PI = 3.14159265
+
+fn f3(v: vec3) -> f32x4 { return v as f32x4 }
+fn f4(v: vec4) -> f32x4 { return v as f32x4 }
+fn v3(x: f32x4) -> vec3 { return x as vec3 }
+
+// A capture: every texel the colour of its direction, `sun` false for one
+// colour everywhere, else a sky brightening upward with a sun in it.
+make_capture(sun: bool) -> *ShaderImage {
+    img = image_new(SIZE, SIZE)
+    y = 0
+    while y < SIZE {
+        x = 0
+        while x < SIZE {
+            r = 0.4
+            g = 0.6
+            b = 0.9
+            if sun {
+                d = f3(sky.oct_texel_direction(vec2((x + 0.5) / SIZE, (y + 0.5) / SIZE), SIZE * 1.0))
+                lit = max(d.x * 0.3 + d.y * 0.8 + d.z * 0.5, 0.0)
+                r = 0.1 + 0.3 * max(d.y, 0.0) + 40.0 * lit * lit * lit * lit * lit * lit * lit * lit
+                g = 0.15 + 0.4 * max(d.y, 0.0) + 35.0 * lit * lit * lit * lit * lit * lit * lit * lit
+                b = 0.3 + 0.6 * max(d.y, 0.0) + 28.0 * lit * lit * lit * lit * lit * lit * lit * lit
+            }
+            image_set(img, x, y, r, g, b, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image_mip_chain(img, LEVELS)
+    return img
+}
+
+// The bits of i reversed in 32, as a fraction: the hand-written filter's.
+reversed(i: int) -> float {
+    r = 0.0
+    f = 0.5
+    k = 0
+    while k < 32 {
+        if ((i >> k) & 1) == 1 { r = r + f }
+        f = f * 0.5
+        k = k + 1
+    }
+    return r
+}
+
+// sky_filter written as Aether, step for step as the quote is.
+filter_reference(capture: Texture, level_size: float, roughness: float) -> vec4 {
+    fc = frag_coord() as f32x4
+    n = sky.oct_texel_direction(vec2(fc.x / level_size, fc.y / level_size), 256.0)
+    if roughness <= 0.0 { return vec4(rgb(texture_lod(capture, sky.oct_uv(n, 256.0), 0.0)), 1.0) }
+    a = roughness * roughness
+    up = vec3(1.0, 0.0, 0.0)
+    if abs(f3(n).y) < 0.999 { up = vec3(0.0, 1.0, 0.0) }
+    t = normalize(cross(up, n))
+    b = cross(n, t)
+    texel = 4.0 * PI / ((256.0 - 2.0) * (256.0 - 2.0))
+    sum = lanes.splat4(0.0)
+    weight = 0.0
+    i = 0.0
+    while i < 48.0 {
+        xi_x = (i + 0.5) / 48.0
+        xi_y = sky.radical_inverse(i)
+        i = i + 1.0
+        phi = 6.28318531 * xi_y
+        cos_theta = shaderlib.sqrt((1.0 - xi_x) / (1.0 + (a * a - 1.0) * xi_x))
+        sin_theta = shaderlib.sqrt(1.0 - cos_theta * cos_theta)
+        h = v3(f3(t) * lanes.splat4(sin_theta * shaderlib.cos(phi)) + f3(b) * lanes.splat4(sin_theta * shaderlib.sin(phi)) +
+               f3(n) * lanes.splat4(cos_theta))
+        l = v3(f3(h) * lanes.splat4(2.0 * dot(n, h)) - f3(n))
+        n_dot_l = dot(n, l)
+        if n_dot_l <= 0.0 { continue }
+        d = cos_theta * cos_theta * (a * a - 1.0) + 1.0
+        pdf = a * a / (PI * d * d) / 4.0
+        sample_angle = 1.0 / (48.0 * pdf + 0.000001)
+        lod = max(0.5 * shaderlib.log2(sample_angle / texel) + 1.0, 0.0)
+        sum = sum + f3(rgb(texture_lod(capture, sky.oct_uv(l, 256.0), lod))) * lanes.splat4(n_dot_l)
+        weight = weight + n_dot_l
+    }
+    return vec4(v3(sum / lanes.splat4(max(weight, 0.000001))), 1.0)
+}
+
+// sky_irradiance written as Aether, with no ground.
+irradiance_reference(capture: Texture) -> vec4 {
+    fc = frag_coord() as f32x4
+    n = sky.oct_texel_direction(vec2(fc.x / 16.0, fc.y / 16.0), 16.0)
+    sum = lanes.splat4(0.0)
+    total = 0.0
+    y = 0.0
+    while y < 16.0 {
+        x = 0.0
+        while x < 16.0 {
+            q = sky.capture_q(x, y)
+            len = length_v3(q)
+            angle = 1.0 / (len * len * len)
+            l = v3(f3(q) / lanes.splat4(len))
+            seen = f3(rgb(texel_fetch_lod(capture, x, y, 4.0)))
+            sum = sum + seen * lanes.splat4(max(dot(n, l), 0.0) * angle)
+            total = total + angle
+            x = x + 1.0
+        }
+        y = y + 1.0
+    }
+    return vec4(v3(sum * lanes.splat4(4.0 * PI / total)), 1.0)
+}
+
+// The worst relative difference of the shader's run against `want` over a
+// target `size` a side (reference 0 none: then against `flat` per channel).
+fn rel(a: float, b: float) -> float { return absf(a - b) / (absf(b) + 0.001) }
+
+main() {
+    println("ae3d.gpu: sky_filter and sky_irradiance written with quote")
+
+    // ── radical_inverse is the bit reversal ──
+    exact = 0
+    i = 0
+    while i < 48 {
+        if sky.radical_inverse(i * 1.0) == reversed(i) { exact = exact + 1 }
+        i = i + 1
+    }
+    check("radical_inverse is the 32-bit reversal for every one of the 48 samples (${exact})", exact == 48)
+
+    flat = make_capture(false)
+    tf = texture_of(flat)
+    f = sky.sky_filter(tf, 64.0, 0.4)
+    ir = sky.sky_irradiance(tf, vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, 0.0))
+    check("each reads the capture, its one sampler",
+          gpu.samplers_count(f) == 1 && gpu.samplers_name(f, 0) == "capture" && gpu.samplers_count(ir) == 1)
+    ftext = gpu.emit_glsl(f, gpu.VULKAN)
+    if ftext == "" { println("  emit: ${gpu.last_error()}") }
+    golden_is(ftext, "tests/fixtures/gpu/sky_filter.frag")
+    itext = gpu.emit_glsl(ir, gpu.VULKAN)
+    if itext == "" { println("  emit: ${gpu.last_error()}") }
+    golden_is(itext, "tests/fixtures/gpu/sky_irradiance.frag")
+    check("textureLod for texture_lod, texelFetch at a level for texel_fetch_lod",
+          string.contains(ftext, "textureLod(capture, sky_oct_uv(l, 256.0), lod)") != 0 &&
+          string.contains(itext, "texelFetch(capture, ivec2(x, y), int(4.0))") != 0)
+    compiles("sky_filter", ftext, "frag", false)
+    compiles("sky_irradiance", itext, "frag", false)
+    compiles("sky_filter", gpu.emit_screen_vertex(f, gpu.VULKAN), "vert", false)
+    gl_f = gpu.emit_glsl(f, gpu.GL)
+    golden_is(gl_f, "tests/fixtures/gpu/sky_filter_gl.frag")
+    compiles("sky_filter_gl", gl_f, "frag", true)
+    gl_i = gpu.emit_glsl(ir, gpu.GL)
+    golden_is(gl_i, "tests/fixtures/gpu/sky_irradiance_gl.frag")
+    compiles("sky_irradiance_gl", gl_i, "frag", true)
+
+    // ── A sky of one colour: irradiance pi times it, every level it ──
+    icx = gpu.cpu_new(ir)
+    gpu.cpu_set_viewport(icx, 16, 16)
+    worst_i = 0.0
+    y = 0
+    while y < 16 {
+        x = 0
+        while x < 16 {
+            uv = gpu.v2((x + 0.5) / 16.0, (y + 0.5) / 16.0)
+            got = gpu.cpu_run(icx, uv)
+            heap.free(uv)
+            if got != null {
+                worst_i = max(worst_i, max(rel(gpu.val_x(got), PI * 0.4), rel(gpu.val_z(got), PI * 0.9)))
+                heap.free(got)
+            } else {
+                println("  cpu_run failed: ${gpu.last_error()}")
+                worst_i = 1.0
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    check("under a sky of one colour the irradiance is pi times it (worst ${worst_i})", worst_i < 0.02)
+    gpu.cpu_free(icx)
+    fcx = gpu.cpu_new(f)
+    gpu.cpu_set_viewport(fcx, 64, 64)
+    worst_f = 0.0
+    y = 0
+    while y < 64 {
+        x = 0
+        while x < 64 {
+            uv = gpu.v2((x + 0.5) / 64.0, (y + 0.5) / 64.0)
+            got = gpu.cpu_run(fcx, uv)
+            heap.free(uv)
+            if got != null {
+                worst_f = max(worst_f, max(rel(gpu.val_x(got), 0.4), rel(gpu.val_z(got), 0.9)))
+                heap.free(got)
+            } else {
+                println("  cpu_run failed: ${gpu.last_error()}")
+                worst_f = 1.0
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    check("and a rough level of it is the colour itself (worst ${worst_f})", worst_f < 0.000001)
+    gpu.cpu_free(fcx)
+    gpu.shader_free(f)
+    gpu.shader_free(ir)
+
+    // ── A sky with a sun: against the passes written as Aether ──
+    sunny = make_capture(true)
+    ts = texture_of(sunny)
+    sf = sky.sky_filter(ts, 64.0, 0.4)
+    si = sky.sky_irradiance(ts, vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, 0.0))
+    scx = gpu.cpu_new(sf)
+    gpu.cpu_set_viewport(scx, 64, 64)
+    worst_s = 0.0
+    off_s = 0
+    y = 0
+    while y < 64 {
+        x = 0
+        while x < 64 {
+            uv = gpu.v2((x + 0.5) / 64.0, (y + 0.5) / 64.0)
+            got = gpu.cpu_run(scx, uv)
+            heap.free(uv)
+            set_frag_coord(x + 0.5, y + 0.5)
+            want = f4(filter_reference(ts, 64.0, 0.4))
+            if got != null {
+                d = max(rel(gpu.val_x(got), want.x), rel(gpu.val_z(got), want.z))
+                worst_s = max(worst_s, d)
+                if d > 0.0001 { off_s = off_s + 1 }
+                heap.free(got)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    // The evaluator holds f32s where the reference keeps doubles, and a
+    // sampler's weights come in 256ths of a texel (gpu's SUBTEXEL): beside
+    // the sun, where a texel's step is steep, the two can land a 256th
+    // apart. That is 12 of the 14 pixels past 1e-4 here (held unrounded,
+    // 2 are left); none is off by a thousandth.
+    check("the CPU filters the sunny sky as the pass written as Aether does (${off_s} of 4096 past 1e-4, worst ${worst_s})",
+          worst_s < 0.001 && off_s * 200 <= 4096)
+    gpu.cpu_free(scx)
+    sicx = gpu.cpu_new(si)
+    gpu.cpu_set_viewport(sicx, 16, 16)
+    worst_t = 0.0
+    y = 0
+    while y < 16 {
+        x = 0
+        while x < 16 {
+            uv = gpu.v2((x + 0.5) / 16.0, (y + 0.5) / 16.0)
+            got = gpu.cpu_run(sicx, uv)
+            heap.free(uv)
+            set_frag_coord(x + 0.5, y + 0.5)
+            want = f4(irradiance_reference(ts))
+            if got != null {
+                worst_t = max(worst_t, max(rel(gpu.val_x(got), want.x), rel(gpu.val_z(got), want.z)))
+                heap.free(got)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    check("and finds its irradiance as the pass written as Aether does (worst ${worst_t})", worst_t < 0.0001)
+    gpu.cpu_free(sicx)
+    gpu.shader_free(sf)
+    gpu.shader_free(si)
+    image_free(flat)
+    image_free(sunny)
+    if g_failures > 0 {
+        println("sky: ${g_failures} of ${g_checks} checks failed")
+        exit(1)
+    }
+    println("sky: all checks passed (${g_checks})")
+}

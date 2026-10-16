@@ -1,0 +1,225 @@
+// ae3d.shaders.sky: the sky's light made from its capture, written with
+// `quote`.
+//
+// Each frame the sky is drawn into an octahedral map (the capture) and halved
+// down its mips; from it the scene's light (ae3d.vksky, the OpenGL renderer's
+// sky passes):
+//
+//   - sky_irradiance: the irradiance onto every normal, a 16-texel map, the
+//     capture's 16-texel mip cosine-convolved, the ground under the horizon
+//     lit by the sky over it and the sun when it has an albedo (#740). It was
+//     shaders/module.ae's FRAGMENT_SKY_IRRADIANCE.
+//   - sky_filter: the reflections, the capture prefiltered by GGX into
+//     roughness levels, one pass a level. It was FRAGMENT_SKY_FILTER.
+//
+// The octahedral map (ae3d.skylight, whose arithmetic this must match): the
+// upper hemisphere in the square's inner diamond, the lower folded into its
+// corners, one texel of gutter around each level holding the sky just across
+// the fold, so a filtered read at an edge is still the sky. The capture is 256
+// texels a side, its irradiance 16.
+//
+//   capture        the capture, with its mips
+//   level_size     sky_filter: the level's size in texels
+//   roughness      sky_filter: the level's roughness (0: the capture as it is)
+//   ground_albedo  sky_irradiance: the ground's (0 for none: the capture's own
+//                  lower half kept)
+//   ground_sun     sky_irradiance: the sun's light onto level ground
+
+import std.quote
+import ae3d.gpu (GpuShader, fragment)
+import ae3d.shaderlib (vec2, vec3, vec4, Texture, frag_coord, rgb, dot, normalize, cross, sqrt, sin, cos, abs, max,
+                       clamp, floor, log2, length_v3, texture_lod, texel_fetch_lod)
+
+exports (sky_filter, sky_irradiance, oct_decode, oct_encode, oct_uv, oct_texel_direction, radical_inverse, capture_q)
+
+// The direction a point of the octahedral square stands for.
+@quotable
+oct_decode(p: vec2) -> vec3 {
+    d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y)
+    if d.y < 0.0 {
+        d = vec3((1.0 - abs(d.z)) * (if (d.x >= 0.0) { 1.0 } else { -1.0 }), d.y,
+                 (1.0 - abs(d.x)) * (if (d.z >= 0.0) { 1.0 } else { -1.0 }))
+    }
+    return normalize(d)
+}
+
+// The point of the square a direction is.
+@quotable
+oct_encode(d: vec3) -> vec2 {
+    e = d / (abs(d.x) + abs(d.y) + abs(d.z))
+    p = vec2(e.x, e.z)
+    if e.y < 0.0 {
+        p = vec2((1.0 - abs(p.y)) * (if (p.x >= 0.0) { 1.0 } else { -1.0 }),
+                 (1.0 - abs(p.x)) * (if (p.y >= 0.0) { 1.0 } else { -1.0 }))
+    }
+    return p
+}
+
+// Where direction d is read in a level `size` texels a side.
+@quotable
+oct_uv(d: vec3, size: float) -> vec2 {
+    e = oct_encode(d)
+    return vec2(((e.x * 0.5 + 0.5) * (size - 2.0) + 1.0) / size, ((e.y * 0.5 + 0.5) * (size - 2.0) + 1.0) / size)
+}
+
+// The direction a texel of a level `size` a side stands for, at texture
+// coordinate uv: a gutter texel's folded back across the edge it lies past.
+@quotable
+oct_texel_direction(uv: vec2, size: float) -> vec3 {
+    px = ((uv.x * size - 1.0) / (size - 2.0)) * 2.0 - 1.0
+    py = ((uv.y * size - 1.0) / (size - 2.0)) * 2.0 - 1.0
+    if px > 1.0 {
+        px = 2.0 - px
+        py = -py
+    }
+    if px < -1.0 {
+        px = -2.0 - px
+        py = -py
+    }
+    if py > 1.0 {
+        py = 2.0 - py
+        px = -px
+    }
+    if py < -1.0 {
+        py = -2.0 - py
+        px = -px
+    }
+    return oct_decode(vec2(px, py))
+}
+
+// Sample i's second coordinate: i's bits reversed about the binary point
+// (Van der Corput). Counted in halves, which is exact for the counts a
+// filter takes, as the 32-bit reversal it replaces is.
+@quotable
+radical_inverse(i: float) -> float {
+    r = 0.0
+    f = 0.5
+    n = i
+    while n >= 1.0 {
+        half = floor(n * 0.5)
+        if n - half * 2.0 >= 1.0 {
+            r = r + f
+        }
+        f = f * 0.5
+        n = half
+    }
+    return r
+}
+
+// The capture's texel x, y of its 16-texel level as a point of the
+// octahedron, not yet unit: its direction is it over its length, and the
+// solid angle it stands for one over the length cubed (unnormalised).
+@quotable
+capture_q(x: float, y: float) -> vec3 {
+    u = (x + 0.5) / 16.0
+    v = (y + 0.5) / 16.0
+    px = clamp(((u * 256.0 - 1.0) / (256.0 - 2.0)) * 2.0 - 1.0, -1.0, 1.0)
+    py = clamp(((v * 256.0 - 1.0) / (256.0 - 2.0)) * 2.0 - 1.0, -1.0, 1.0)
+    q = vec3(px, 1.0 - abs(px) - abs(py), py)
+    if q.y < 0.0 {
+        q = vec3((1.0 - abs(q.z)) * (if (q.x >= 0.0) { 1.0 } else { -1.0 }), q.y,
+                 (1.0 - abs(q.x)) * (if (q.z >= 0.0) { 1.0 } else { -1.0 }))
+    }
+    return q
+}
+
+// A level of the reflections: the capture seen through GGX at the level's
+// roughness, 48 samples importance-sampled about the normal. Laid out as
+// level 0 is, whatever this level's size, so the scene reads every level at
+// one coordinate.
+sky_filter(capture: Texture, level_size: float, roughness: float) -> *GpuShader {
+    return fragment("sky_filter") quote | uv_in: vec2 | {
+        fc = frag_coord()
+        n = oct_texel_direction(vec2(fc.x / level_size, fc.y / level_size), 256.0)
+        if roughness <= 0.0 {
+            return vec4(rgb(texture_lod(capture, oct_uv(n, 256.0), 0.0)), 1.0)
+        }
+        a = roughness * roughness
+        up = if (abs(n.y) < 0.999) { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
+        t = normalize(cross(up, n))
+        b = cross(n, t)
+        // A texel of the capture's level 0, as solid angle: the whole sphere
+        // over its inner texels.
+        texel = 4.0 * 3.14159265 / ((256.0 - 2.0) * (256.0 - 2.0))
+        sum = vec3(0.0, 0.0, 0.0)
+        weight = 0.0
+        i = 0.0
+        while i < 48.0 {
+            xi_x = (i + 0.5) / 48.0
+            xi_y = radical_inverse(i)
+            i = i + 1.0
+            phi = 6.28318531 * xi_y
+            cos_theta = sqrt((1.0 - xi_x) / (1.0 + (a * a - 1.0) * xi_x))
+            sin_theta = sqrt(1.0 - cos_theta * cos_theta)
+            h = t * (sin_theta * cos(phi)) + b * (sin_theta * sin(phi)) + n * cos_theta
+            l = h * (2.0 * dot(n, h)) - n
+            n_dot_l = dot(n, l)
+            if n_dot_l <= 0.0 {
+                continue
+            }
+            // With the view along the normal, the pdf of L is D(H) / 4.
+            d = cos_theta * cos_theta * (a * a - 1.0) + 1.0
+            pdf = a * a / (3.14159265 * d * d) / 4.0
+            sample_angle = 1.0 / (48.0 * pdf + 0.000001)
+            lod = max(0.5 * log2(sample_angle / texel) + 1.0, 0.0)
+            sum = sum + rgb(texture_lod(capture, oct_uv(l, 256.0), lod)) * n_dot_l
+            weight = weight + n_dot_l
+        }
+        return vec4(sum / max(weight, 0.000001), 1.0)
+    }
+}
+
+// The irradiance map: every texel of the capture's 16-texel level (its
+// fourth mip) weighed by its solid angle and the cosine to this texel's
+// normal. With a ground, what lies under the horizon is the ground, lit by
+// the sky over it and the sun and giving back its albedo's share of that
+// evenly (Lambert: over pi).
+sky_irradiance(capture: Texture, ground_albedo: vec3, ground_sun: vec3) -> *GpuShader {
+    return fragment("sky_irradiance") quote | uv_in: vec2 | {
+        fc = frag_coord()
+        n = oct_texel_direction(vec2(fc.x / 16.0, fc.y / 16.0), 16.0)
+        grounded = ground_albedo.x + ground_albedo.y + ground_albedo.z > 0.0
+        ground = vec3(0.0, 0.0, 0.0)
+        if grounded {
+            up = vec3(0.0, 0.0, 0.0)
+            whole = 0.0
+            y = 0.0
+            while y < 16.0 {
+                x = 0.0
+                while x < 16.0 {
+                    q = capture_q(x, y)
+                    len = length_v3(q)
+                    angle = 1.0 / (len * len * len)
+                    l = q / len
+                    if l.y > 0.0 {
+                        up = up + rgb(texel_fetch_lod(capture, x, y, 4.0)) * l.y * angle
+                    }
+                    whole = whole + angle
+                    x = x + 1.0
+                }
+                y = y + 1.0
+            }
+            up = up * (4.0 * 3.14159265 / whole)
+            ground = ground_albedo * (up + ground_sun) / 3.14159265
+        }
+        sum = vec3(0.0, 0.0, 0.0)
+        total = 0.0
+        y = 0.0
+        while y < 16.0 {
+            x = 0.0
+            while x < 16.0 {
+                q = capture_q(x, y)
+                len = length_v3(q)
+                angle = 1.0 / (len * len * len)
+                l = q / len
+                seen = if (grounded && l.y < 0.0) { ground } else { rgb(texel_fetch_lod(capture, x, y, 4.0)) }
+                sum = sum + seen * max(dot(n, l), 0.0) * angle
+                total = total + angle
+                x = x + 1.0
+            }
+            y = y + 1.0
+        }
+        // The weights cover the sphere once: what they sum to stands for 4 pi.
+        return vec4(sum * (4.0 * 3.14159265 / total), 1.0)
+    }
+}
