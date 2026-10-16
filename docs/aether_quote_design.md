@@ -367,8 +367,11 @@ From mapping the compiler; nothing here is built yet.
    *Since then (ae3d #792, Aether 0.817.0, quote version 2):* the bloom's
    down and up passes and the one-sample `depth_copy` are quoted too, the
    bloom's helpers as `@quotable` functions. The bloom's `_vk` files and GL
-   heredocs are gone; `depth_copy_vk.frag` stays until its frames have been
-   compared with main's.
+   heredocs are gone, and `depth_copy_vk.frag` went once its one-sample
+   frames matched main's (M6, 2026-10-16). After that, on
+   `wip/quote-depth-resolve`: `depth_resolve` (TextureMS, a sampler2DMS),
+   `color_resolve`, `taa` and `ssao`, the last bringing `mat4` and calls each
+   dialect writes its own way (`depth_clip`, `screen_y_sign`).
 
    *The rest, one at a time, in this order* (Nic, 2026-10-16; see
    `aether_quote_questions_for_nic.md`), each adding to `ae3d.gpu` and

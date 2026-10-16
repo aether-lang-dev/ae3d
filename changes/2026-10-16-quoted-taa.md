@@ -25,6 +25,11 @@
   shaderlib (worst 1.3e-7), with history and with none. Dropping the
   history's clamp fails it; so does running `min_v3` and the rest as
   themselves rather than as GLSL's name.
-- `FRAGMENT_TAA`, `taa_vk.frag`, `vkpipes.taa` and `taaBlend` in the scene
-  block stay, unused, until the GPU lanes have compared frames against
-  main's.
+- **`FRAGMENT_TAA`, `taa_vk.frag`, `vkpipes.taa` and `taaBlend` are gone**
+  (the scene block is 16224 bytes). On an Apple M6, with one sample and
+  with four, 27 of 28 `test_backend_parity` frames are byte-identical to
+  main's on both renderers, the clouds over the skybox within main's own
+  run-to-run spread; zombie_city with TAA on is byte-identical but for
+  Vulkan with one sample, where main is bimodal against itself;
+  `test_taa` and `test_velocity` print main's numbers. No validation
+  errors.
