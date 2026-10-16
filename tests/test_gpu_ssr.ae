@@ -1,0 +1,387 @@
+// ae3d.shaders.ssr through ae3d.gpu: the wet road's reflection written with
+// `quote`, its noise, puddles and cone @quotable helpers.
+//
+//   - ssr comes out as the GLSL in tests/fixtures/gpu/ssr.frag for Vulkan and
+//     ssr_gl.frag for OpenGL 4.1: three samplers (the scene, its depth, the
+//     blurred copy), two mat4s, ssao's world_at among its helpers; glslang
+//     and spirv-val pass it;
+//   - the CPU back end runs it over a road under a lit wall seen by a real
+//     camera (Vulkan's matrices as its renderer corrects them): with strength
+//     0 every pixel is the scene's; off the road nothing changes; on the road
+//     below the wall the wall's light is added; and the pixels agree with
+//     the pass written as Aether over ae3d.shaderlib.
+//
+// On a GPU, the pass is drawn when the reflection is on: tests/test_ssr and
+// tests/test_backend_parity. AE3D_GPU_WRITE_GOLDEN=1 writes the fixtures.
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.lanes
+import std.quote
+import ae3d.core
+import ae3d.core (Mat4, Vec3, Vec4)
+import ae3d.gpu
+import ae3d.shaders.ssr
+import ae3d.shaders.ssao
+import ae3d.shaderlib
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, ShaderImage, texture, rgb, mul, xyz, normalize, distance, abs,
+                       min, max, clamp, mix, reflect, texture_size, length_v3, image_new, image_set, image_channel,
+                       image_free, texture_of, mat4_of)
+
+extern exit(code: int)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+absf(a: float) -> float { if a < 0.0 { return 0.0 - a } return a }
+
+// glslang -V over `text` (as `stage`), then spirv-val; or, for desktop
+// OpenGL's GLSL (`opengl`), glslang's check of it. Skipped where they are
+// not on PATH.
+compiles(label: string, text: string, stage: string, opengl: bool) {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+        if status != 0 { println(out) }
+        return
+    }
+    check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    if status != 0 { println(out) }
+    if string.length(os.which("spirv-val")) == 0 {
+        println("  skip spirv-val (not on PATH)")
+        return
+    }
+    vargv = list.new()
+    list.add(vargv, spv)
+    vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+    check("spirv-val passes ${label}.${stage}", vstatus == 0)
+    if vstatus != 0 { println(vout) }
+    list.free(vargv)
+}
+
+// `text` is the fixture at `path`; AE3D_GPU_WRITE_GOLDEN=1 writes it.
+golden_is(text: string, path: string) {
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(path, text)
+        check("${path} written", werr == "")
+    }
+    golden, gerr = file.read(path)
+    check("${path} is there", gerr == "")
+    check("the GLSL written is ${path}", text == golden)
+    if text != golden {
+        println("--- emitted ---")
+        println(text)
+    }
+}
+
+
+const W = 96
+const H = 64
+const STRENGTH = 1.0
+const ROAD = 0.0
+
+fn f2(v: vec2) -> f32x4 { return v as f32x4 }
+fn f3(v: vec3) -> f32x4 { return v as f32x4 }
+fn f4(v: vec4) -> f32x4 { return v as f32x4 }
+fn v3(x: f32x4) -> vec3 { return x as vec3 }
+
+// An OpenGL-shaped matrix as the Vulkan renderer puts it in its block
+// (vkdesc.clip_correct): clip y down, z in 0..1.
+vulkan_clip(m: Mat4) -> Mat4 {
+    return Mat4 {
+        m0: m.m0, m1: 0.0 - m.m1, m2: 0.5 * (m.m2 + m.m3), m3: m.m3,
+        m4: m.m4, m5: 0.0 - m.m5, m6: 0.5 * (m.m6 + m.m7), m7: m.m7,
+        m8: m.m8, m9: 0.0 - m.m9, m10: 0.5 * (m.m10 + m.m11), m11: m.m11,
+        m12: m.m12, m13: 0.0 - m.m13, m14: 0.5 * (m.m14 + m.m15), m15: m.m15
+    }
+}
+
+// The world point at clip-space x, y, z: through the inverse, divided by w.
+unproject(inv: Mat4, x: float, y: float, z: float) -> Vec3 {
+    v = core.mat4_mul_v4(inv, Vec4 { x: x, y: y, z: z, w: 1.0 })
+    return core.vec3(v.x / v.w, v.y / v.w, v.z / v.w)
+}
+
+// The pass written as Aether, step for step as the quote is.
+reference(screen: Texture, depth: Texture, blur: Texture, strength: float, inv: mat4, vp: mat4, eye: vec3,
+          uv: vec2) -> vec4 {
+    scene = rgb(texture(screen, uv))
+    if strength <= 0.0 { return vec4(scene, 1.0) }
+    u = f2(uv)
+    p = ssao.world_at(inv, uv, f4(texture(depth, uv)).x)
+    size = f2(texture_size(depth))
+    texel = vec2(1.0 / size.x, 1.0 / size.y)
+    t = f2(texel)
+    here = f4(mul(inv, vec4(vec3(u.x * 2.0 - 1.0, u.y * 2.0 - 1.0, 0.0), 1.0)))
+    next = f4(mul(inv, vec4(vec3((u.x + t.x) * 2.0 - 1.0, (u.y + t.y) * 2.0 - 1.0, 0.0), 1.0)))
+    a = normalize(v3(f3(xyz(next as vec4)) / lanes.splat4(next.w) - f3(eye)))
+    b = normalize(v3(f3(xyz(here as vec4)) / lanes.splat4(here.w) - f3(eye)))
+    pixel_angle = length_v3(v3(f3(a) - f3(b)))
+    tolerance = 0.06 + distance(eye, p) * pixel_angle
+    if abs(f3(p).y - ROAD) > tolerance { return vec4(scene, 1.0) }
+    v = normalize(v3(f3(p) - f3(eye)))
+    r = reflect(v, vec3(0.0, 1.0, 0.0))
+    cos_look = clamp(0.0 - f3(v).y, 0.0, 1.0)
+    fresnel = 0.02 + 0.98 * shaderlib.pow(1.0 - cos_look, 5.0)
+    pool = ssr.puddle(vec2(f3(p).x, f3(p).z))
+    wet = mix(0.6, 1.0, pool)
+    rough = mix(0.35, 0.02, pool)
+    step_len = 0.25
+    pos = f3(p) + f3(r) * lanes.splat4(step_len)
+    prev = f3(p)
+    hit = f3(scene)
+    edge_fade = 0.0
+    i = 0
+    while i < 64 {
+        clip = f4(mul(vp, vec4(v3(pos), 1.0)))
+        if clip.w <= 0.0 { break }
+        sx = clip.x / clip.w * 0.5 + 0.5
+        sy = clip.y / clip.w * 0.5 + 0.5
+        if sx < 0.0 || sx > 1.0 || sy < 0.0 || sy > 1.0 { break }
+        suv = vec2(sx, sy)
+        behind = distance(eye, v3(pos)) - distance(eye, ssao.world_at(inv, suv, f4(texture(depth, suv)).x))
+        if behind > 0.03 && behind < step_len * 2.0 + 0.2 {
+            lo = prev
+            hi = pos
+            k = 0
+            while k < 4 {
+                mid = (lo + hi) * lanes.splat4(0.5)
+                mclip = f4(mul(vp, vec4(v3(mid), 1.0)))
+                muv = vec2(mclip.x / mclip.w * 0.5 + 0.5, mclip.y / mclip.w * 0.5 + 0.5)
+                if distance(eye, v3(mid)) > distance(eye, ssao.world_at(inv, muv, f4(texture(depth, muv)).x)) {
+                    hi = mid
+                } else {
+                    lo = mid
+                }
+                k = k + 1
+            }
+            hclip = f4(mul(vp, vec4(v3(hi), 1.0)))
+            hx = hclip.x / hclip.w * 0.5 + 0.5
+            hy = hclip.y / hclip.w * 0.5 + 0.5
+            travelled = distance(p, v3(hi))
+            radius = min(rough * travelled / max(distance(eye, v3(hi)), 0.5) * 0.35, 0.06)
+            hit = f3(ssr.reflection_at(screen, blur, vec2(hx, hy), radius, vec2(u.x * 1024.0, u.y * 1024.0)))
+            edge = min(min(hx, 1.0 - hx), min(hy, 1.0 - hy))
+            edge_fade = clamp(edge * 8.0, 0.0, 1.0)
+            break
+        }
+        prev = pos
+        pos = pos + f3(r) * lanes.splat4(step_len)
+        step_len = step_len * 1.05
+        i = i + 1
+    }
+    return vec4(v3(f3(scene) + hit * lanes.splat4(strength * fresnel * wet * edge_fade)), 1.0)
+}
+
+// What a camera sees of a road (y = 0) running to a lit wall (z = -4, up to
+// y = 3), the sky past them: each pixel's colour, and its hit's clip z over
+// w as Vulkan stores it (1, the far plane, for the sky). Kind 0 sky, 1 road,
+// 2 wall, 3 the wall's foot (within half a metre of the road, which the pass
+// may take for the road: its tolerance grows with the distance), in `kinds`.
+make_scene(vp: Mat4, inv: Mat4, colour: *ShaderImage, depth: *ShaderImage, kinds: ptr) {
+    y = 0
+    while y < H {
+        x = 0
+        while x < W {
+            nx = (x + 0.5) / W * 2.0 - 1.0
+            ny = (y + 0.5) / H * 2.0 - 1.0
+            a = unproject(inv, nx, ny, 0.0)
+            b = unproject(inv, nx, ny, 1.0)
+            dx = b.x - a.x
+            dy = b.y - a.y
+            dz = b.z - a.z
+            best = 2.0
+            kind = 0
+            if dy < 0.0 && a.y > 0.0 {
+                best = a.y / (0.0 - dy)
+                kind = 1
+            }
+            if dz < 0.0 && a.z > -4.0 {
+                tw = (-4.0 - a.z) / dz
+                wy = a.y + dy * tw
+                if tw < best && wy > 0.0 && wy < 3.0 {
+                    best = tw
+                    kind = 2
+                    if wy < 0.5 { kind = 3 }
+                }
+            }
+            d = 1.0
+            if best <= 1.0 {
+                hx = a.x + dx * best
+                hy = a.y + dy * best
+                hz = a.z + dz * best
+                cz = vp.m2 * hx + vp.m6 * hy + vp.m10 * hz + vp.m14
+                cw = vp.m3 * hx + vp.m7 * hy + vp.m11 * hz + vp.m15
+                d = cz / cw
+            } else {
+                kind = 0
+            }
+            if kind == 0 { image_set(colour, x, y, 0.3, 0.5, 0.9, 1.0) }
+            if kind == 1 { image_set(colour, x, y, 0.05, 0.05, 0.06, 1.0) }
+            if kind >= 2 { image_set(colour, x, y, 4.0, 3.0, 2.0, 1.0) }
+            image_set(depth, x, y, d, 0.0, 0.0, 1.0)
+            (kinds as int[])[y * W + x] = kind
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+main() {
+    println("ae3d.gpu: ssr written with quote")
+    proj = core.mat4_perspective(1.0, W * 1.0 / H, 0.1, 50.0)
+    eye = core.vec3(0.3, 1.4, 4.0)
+    view = core.mat4_look_at(eye, core.vec3(0.0, 0.4, -4.0), core.vec3(0.0, 1.0, 0.0))
+    glm = core.mat4_mul(proj, view)
+    vkm = vulkan_clip(glm)
+    vk_invm = core.mat4_inverse(vkm)
+    vp = mat4_of(&vkm)
+    inv = mat4_of(&vk_invm)
+    eye3 = vec3(eye.x, eye.y, eye.z)
+    colour = image_new(W, H)
+    depth = image_new(W, H)
+    kinds = calloc_ints(W * H)
+    make_scene(vkm, vk_invm, colour, depth, kinds)
+    sc = texture_of(colour)
+    dp = texture_of(depth)
+
+    s = ssr.ssr(sc, dp, sc, STRENGTH, ROAD, inv, vp, eye3)
+    check("three samplers in the order the body reads them, two mat4s",
+          gpu.samplers_count(s) == 3 && gpu.samplers_name(s, 0) == "screen" && gpu.samplers_name(s, 1) == "depth" &&
+          gpu.samplers_name(s, 2) == "blur" && gpu.params_count(s) == 5)
+    frag = gpu.emit_glsl(s, gpu.VULKAN)
+    if frag == "" { println("  emit: ${gpu.last_error()}") }
+    golden_is(frag, "tests/fixtures/gpu/ssr.frag")
+    check("ssao's world_at and its own helpers as GLSL functions, textureSize for texture_size",
+          string.contains(frag, "vec3 ssao_world_at(mat4 inv_view_projection, vec2 uv, float depth)") != 0 &&
+          string.contains(frag, "vec3 ssr_reflection_at(sampler2D screen, sampler2D blur,") != 0 &&
+          string.contains(frag, "vec2(textureSize(depth, 0))") != 0)
+    compiles("ssr", frag, "frag", false)
+    compiles("ssr", gpu.emit_screen_vertex(s, gpu.VULKAN), "vert", false)
+    gl_frag = gpu.emit_glsl(s, gpu.GL)
+    if gl_frag == "" { println("  emit: ${gpu.last_error()}") }
+    golden_is(gl_frag, "tests/fixtures/gpu/ssr_gl.frag")
+    compiles("ssr_gl", gl_frag, "frag", true)
+
+    cx = gpu.cpu_new(s)
+    off_road_same = 0
+    off_road = 0
+    lit = 0
+    road = 0
+    same_lit = 0
+    added = 0.0
+    want_added = 0.0
+    y = 0
+    while y < H {
+        x = 0
+        while x < W {
+            u = (x + 0.5) / W
+            v = (y + 0.5) / H
+            uv = gpu.v2(u, v)
+            got = gpu.cpu_run(cx, uv)
+            heap.free(uv)
+            if got == null {
+                println("  cpu_run failed: ${gpu.last_error()}")
+            } else {
+                kind = (kinds as int[])[y * W + x]
+                base = image_channel(colour, x, y, 0)
+                if kind == 0 || kind == 2 {
+                    off_road = off_road + 1
+                    if absf(gpu.val_x(got) - base) < 0.000001 { off_road_same = off_road_same + 1 }
+                } else if kind == 1 {
+                    road = road + 1
+                    if gpu.val_x(got) > base + 0.01 { lit = lit + 1 }
+                }
+                want = f4(reference(sc, dp, sc, STRENGTH, inv, vp, eye3, vec2(u, v)))
+                if (gpu.val_x(got) > base + 0.01) == (want.x > base + 0.01) { same_lit = same_lit + 1 }
+                added = added + gpu.val_x(got) - base
+                want_added = want_added + want.x - base
+                heap.free(got)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    check("off the road nothing changes (${off_road_same} of ${off_road})", off_road > 0 && off_road_same == off_road)
+    check("on the road below the wall its light is added (${lit} of ${road} road pixels)", lit > road / 20)
+    // Pixel for pixel the two cannot agree: where the puddles lie is
+    // fract(sin(x) * 43758.5) over the road's metres, x near a thousand,
+    // where the evaluator's f32 (a GPU's too) and the reference's doubles are
+    // far enough apart that the fraction is another random number -- so a
+    // pixel's wetness and roughness differ, and with them its cone. (Held to
+    // one puddle value in both, the mismatched road pixels fall from about
+    // 240 to 46, the worst from 0.43 to 0.05; what is left is f32 rounding at
+    // the march's hit tests.) What the hash cannot move is where the rays
+    // find the wall and how much of its light comes back.
+    check("the CPU finds the reflection where the pass written as Aether does (${same_lit} of ${W * H} pixels)",
+          same_lit * 1000 >= W * H * 998)
+    check("and adds as much light (${added} against ${want_added})",
+          want_added > 0.0 && absf(added - want_added) < want_added * 0.02)
+    gpu.cpu_free(cx)
+    gpu.shader_free(s)
+
+    // Strength 0: a passthrough.
+    off = ssr.ssr(sc, dp, sc, 0.0, ROAD, inv, vp, eye3)
+    ocx = gpu.cpu_new(off)
+    same = 0
+    y = 0
+    while y < H {
+        x = 0
+        while x < W {
+            uv = gpu.v2((x + 0.5) / W, (y + 0.5) / H)
+            got = gpu.cpu_run(ocx, uv)
+            heap.free(uv)
+            if got != null {
+                if absf(gpu.val_x(got) - image_channel(colour, x, y, 0)) < 0.000001 &&
+                   absf(gpu.val_z(got) - image_channel(colour, x, y, 2)) < 0.000001 { same = same + 1 }
+                heap.free(got)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    check("with strength 0 every pixel is the scene's (${same} of ${W * H})", same == W * H)
+    gpu.cpu_free(ocx)
+    gpu.shader_free(off)
+
+    image_free(colour)
+    image_free(depth)
+    if g_failures > 0 {
+        println("ssr: ${g_failures} of ${g_checks} checks failed")
+        exit(1)
+    }
+    println("ssr: all checks passed (${g_checks})")
+}
+
+extern calloc(count: int, size: int) -> ptr
+calloc_ints(n: int) -> ptr { return calloc(n, 4) }

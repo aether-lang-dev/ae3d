@@ -1,0 +1,186 @@
+// ae3d.shaders.ssr: screen-space reflection on the wet road, written with
+// `quote`.
+//
+// The wet road is a flat mirror: a pixel whose world height, rebuilt from the
+// depth, is the road's reflects the scene above it. The view ray is reflected
+// about the road's up-normal and marched in world space, each step projected
+// to the screen and tested against the depth; where the ray enters what was
+// drawn it has met a surface, and that pixel's colour is the reflection,
+// added to the scene. Everything off the road passes through untouched, and
+// with strength zero the pass is a passthrough, so it is safe to run and only
+// shows where a scene has asked for it (#491). It was shaders/module.ae's
+// FRAGMENT_SSR.
+//
+//   screen               the scene
+//   depth                its depth
+//   blur                 the scene at a quarter of its size, for wide cones
+//   strength             how much of the mirrored light is added (0: none)
+//   road_height          the road's world height
+//   inv_view_projection  the camera's, from clip space back to the world
+//   view_projection      the camera's
+//   view_pos             the eye
+
+import std.quote
+import ae3d.gpu (GpuShader, fragment)
+import ae3d.shaders.ssao (world_at)
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, texture, rgb, mul, xyz, dot, dot_v2, normalize, distance,
+                       sin, cos, abs, min, max, clamp, mix, smoothstep, fract, pow, reflect, texture_size, floor_v2,
+                       fract_v2, clamp_v2, length_v3)
+
+exports (ssr, hash2, value_noise, puddle, reflection_at)
+
+// A wet road is not a mirror. Puddles are: still water, a sharp reflection.
+// The damp tarmac between them reflects too, dimmer and blurred by its own
+// grain. Where the puddles lie is value noise over the road's metres, so
+// they are the same from every camera and every frame.
+@quotable
+hash2(p: vec2) -> float {
+    return fract(sin(dot_v2(p, vec2(127.1, 311.7))) * 43758.5453)
+}
+
+@quotable
+value_noise(p: vec2) -> float {
+    i = floor_v2(p)
+    f = fract_v2(p)
+    f = f * f * (vec2(3.0, 3.0) - f * 2.0)
+    return mix(mix(hash2(i), hash2(i + vec2(1.0, 0.0)), f.x),
+               mix(hash2(i + vec2(0.0, 1.0)), hash2(i + vec2(1.0, 1.0)), f.x), f.y)
+}
+
+// 0 on the damp tarmac, 1 in a puddle, the edge a hand's width wide.
+@quotable
+puddle(xz: vec2) -> float {
+    n = value_noise(xz * 0.35) * 0.6 + value_noise(xz * 0.9) * 0.3 + value_noise(xz * 2.7) * 0.1
+    return smoothstep(0.55, 0.62, n)
+}
+
+// The reflection at a hit, blurred by the surface's roughness over the
+// distance the ray travelled: a cone, not a line, so a far facade mirrored in
+// damp tarmac is a soft shape and a near lamp in a puddle is sharp. Eight
+// taps on a disc, turned by a per-pixel angle so the eight do not line up
+// from one pixel to the next. A cone wider than eight pixels reads the
+// quarter-size copy: the same taps, each the light of the texels it stands
+// for already averaged, out of an image small enough to stay in the cache.
+@quotable
+reflection_at(screen: Texture, blur: Texture, uv: vec2, radius: float, seed: vec2) -> vec3 {
+    if radius < 0.0005 {
+        return rgb(texture(screen, uv))
+    }
+    turn = hash2(seed) * 6.2831853
+    c = cos(turn)
+    s = sin(turn)
+    size = texture_size(screen)
+    aspect = vec2(1.0, size.x / size.y)
+    wide = radius * size.x > 8.0
+    sum = vec3(0.0, 0.0, 0.0)
+    i = 0.0
+    while i < 8.0 {
+        a = i * 0.7853982
+        r = radius * (0.35 + 0.65 * (i + 1.0) / 8.0)
+        d = vec2(cos(a), sin(a)) * r
+        d = vec2(d.x * c - d.y * s, d.x * s + d.y * c) * aspect
+        at = clamp_v2(uv + d, vec2(0.001, 0.001), vec2(0.999, 0.999))
+        sum = sum + (if wide { rgb(texture(blur, at)) } else { rgb(texture(screen, at)) })
+        i = i + 1.0
+    }
+    return sum * 0.125
+}
+
+ssr(screen: Texture, depth: Texture, blur: Texture, strength: float, road_height: float, inv_view_projection: mat4,
+    view_projection: mat4, view_pos: vec3) -> *GpuShader {
+    return fragment("ssr") quote | uv: vec2 | {
+        scene = rgb(texture(screen, uv))
+        if strength <= 0.0 {
+            return vec4(scene, 1.0)
+        }
+        p = world_at(inv_view_projection, uv, texture(depth, uv).x)
+        // Only the flat wet surface reflects. A multisampled frame's depth is
+        // a sample's, not the pixel centre's, so on a road seen at a slant
+        // the height rebuilt from it is off by up to what one pixel spans
+        // there: the angle a pixel subtends times the distance. That, past a
+        // few centimetres, is still the road.
+        size = texture_size(depth)
+        texel = vec2(1.0 / size.x, 1.0 / size.y)
+        here = mul(inv_view_projection, vec4(vec3(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, 0.0), 1.0))
+        next = mul(inv_view_projection, vec4(vec3((uv.x + texel.x) * 2.0 - 1.0, (uv.y + texel.y) * 2.0 - 1.0, 0.0), 1.0))
+        pixel_angle = length_v3(normalize(xyz(next) / next.w - view_pos) - normalize(xyz(here) / here.w - view_pos))
+        tolerance = 0.06 + distance(view_pos, p) * pixel_angle
+        if abs(p.y - road_height) > tolerance {
+            return vec4(scene, 1.0)
+        }
+
+        v = normalize(p - view_pos)
+        r = reflect(v, vec3(0.0, 1.0, 0.0))
+        // Water is a dielectric: two percent straight down, most of the light
+        // at a grazing look. The frame is radiance, so a lamp in it is a
+        // thousand times brighter than the tarmac, and two percent of it is
+        // the streak every wet street has.
+        cos_look = clamp(-v.y, 0.0, 1.0)
+        fresnel = 0.02 + 0.98 * pow(1.0 - cos_look, 5.0)
+        pool = puddle(vec2(p.x, p.z))
+        wet = mix(0.6, 1.0, pool)
+        rough = mix(0.35, 0.02, pool)
+        step_len = 0.25
+        pos = p + r * step_len
+        prev = p
+        hit = scene
+        edge_fade = 0.0
+        i = 0
+        while i < 64 {
+            clip = mul(view_projection, vec4(pos, 1.0))
+            if clip.w <= 0.0 {
+                break
+            }
+            suv = vec2(clip.x / clip.w * 0.5 + 0.5, clip.y / clip.w * 0.5 + 0.5)
+            if suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0 {
+                break
+            }
+            behind = distance(view_pos, pos) - distance(view_pos, world_at(inv_view_projection, suv, texture(depth, suv).x))
+            // A hit is the ray entering a surface, not the ray anywhere
+            // behind one: without a thickness every step that passed behind
+            // a figure counted, and the figure smeared into a stripe down to
+            // the bottom of the frame.
+            if behind > 0.03 && behind < step_len * 2.0 + 0.2 {
+                // Bisect between the last step outside and this one inside,
+                // so the hit is the surface and not a quarter-metre band.
+                lo = prev
+                hi = pos
+                k = 0
+                while k < 4 {
+                    mid = (lo + hi) * 0.5
+                    mclip = mul(view_projection, vec4(mid, 1.0))
+                    muv = vec2(mclip.x / mclip.w * 0.5 + 0.5, mclip.y / mclip.w * 0.5 + 0.5)
+                    if distance(view_pos, mid) > distance(view_pos, world_at(inv_view_projection, muv, texture(depth, muv).x)) {
+                        hi = mid
+                    } else {
+                        lo = mid
+                    }
+                    k = k + 1
+                }
+                hclip = mul(view_projection, vec4(hi, 1.0))
+                huv = vec2(hclip.x / hclip.w * 0.5 + 0.5, hclip.y / hclip.w * 0.5 + 0.5)
+                // The cone's footprint at the hit, in screen space: wider the
+                // rougher the surface and the further the ray went, narrower
+                // the further the hit is from the eye.
+                travelled = distance(p, hi)
+                radius = min(rough * travelled / max(distance(view_pos, hi), 0.5) * 0.35, 0.06)
+                hit = reflection_at(screen, blur, huv, radius, uv * 1024.0)
+                // Fade toward the screen edges so the reflection does not cut
+                // hard.
+                edge = min(min(huv.x, 1.0 - huv.x), min(huv.y, 1.0 - huv.y))
+                edge_fade = clamp(edge * 8.0, 0.0, 1.0)
+                break
+            }
+            prev = pos
+            pos = pos + r * step_len
+            // Longer steps further out, so the march reaches the far facades
+            // within its budget while the near ones are still found finely.
+            step_len = step_len * 1.05
+            i = i + 1
+        }
+        // The mirrored light, added where a ray found something: nothing is
+        // subtracted, so a ray that finds nothing (the open sky) adds
+        // nothing, and the road never goes dark for being wet.
+        return vec4(scene + hit * (strength * fresnel * wet * edge_fade), 1.0)
+    }
+}
