@@ -1,6 +1,6 @@
 ### The sky's light is made by shaders written with quote
 
-- **`ae3d.shaders.sky.sky_irradiance`** and **`sky_filter`** are
+- **`ae3d.shaders.skyprobe.sky_irradiance`** and **`sky_filter`** are
   `FRAGMENT_SKY_IRRADIANCE` and `FRAGMENT_SKY_FILTER` as Aether: the
   irradiance onto every normal from the capture's 16-texel mip (the ground
   under the horizon lit when it has an albedo), and the capture
@@ -20,6 +20,17 @@
   a level, its size and roughness set before each), the ground copied from
   the scene block as the pass read it; on OpenGL from the tree's GLSL with
   `quoted_uniforms`.
+- **The module is `ae3d.shaders.skyprobe`, not `ae3d.shaders.sky`**: with
+  `ae3d.sky` in the same program (every engine program), aetherc prefixed
+  the shader module's functions, the prefixed names went into the quote
+  tree's helpers, and the tree hashed otherwise than `generate_shaders`'
+  had: Vulkan refused both sky passes and no engine program started, while
+  every test of the shaders alone passed. `tests/test_quoted_hashes.ae`
+  now builds every quoted shader in a program importing the whole engine
+  and holds its hash to the one the SPIR-V was made from (on the old name,
+  both sky shaders fail it). `test_engine_skybox` fails, rather than skips,
+  when the engine had a window and the renderer would not start on it
+  (`engine.engine_renderer_failed`).
 - **The sky itself, its capture and its clouds move to step 6** (Paul,
   2026-10-16): each takes its direction and two clip positions from its
   own vertex shader and writes a colour and a motion vector.

@@ -443,6 +443,16 @@ Probed on 0.817.0, so none of this needs a quote version bump:
   `g_haze.columns[i]` is `(INDEX :float (FIELD columns :float[4] (CAPTURE
   g_haze :Haze)) (LOCAL i :int))`.
 
+**A shader module's last name must be no other ae3d module's.** A
+program importing two modules called `sky` (`ae3d.sky`, and a shader module
+`ae3d.shaders.sky`) had aetherc prefix one module's functions, and the
+prefixed names went into the quote tree's helpers, so the tree's hash, and
+the SPIR-V it keys, depended on what else the program imported: the engine's
+programs refused the sky's passes (M6, 2026-10-16). The shader module is
+`ae3d.shaders.skyprobe`; aether is to make a helper's name in a tree
+independent of the program, and until a release has that, the names stay
+apart.
+
 Still outside the subset (E0800), and designed around rather than asked
 for: array literals, casts (`float(i)` -- loops count in floats, as
 step 4's do), `out` parameters (a helper returns a struct instead).
@@ -450,7 +460,7 @@ step 4's do), `out` parameters (a helper returns a struct instead).
 ### The shapes
 
 ```aether
-// ae3d.shaders.sky
+// ae3d.shaders.skydome
 struct Vertex { position: vec3 }
 struct Varyings {
     position: vec4      // the clip position: gl_Position, not an output
