@@ -15,11 +15,19 @@
   levels as a linear blit halves them (each texel the mean of four),
   `texture_lod` reads them trilinearly and `texel_fetch_lod` a texel of
   one; `log2` joins the builtins.
-- **Both renderers draw them**: on Vulkan `ae3d.vksky` through two quoted
-  passes (`vkframe.quoted_screen_pass`; the filter a ring of six draws, one
-  a level, its size and roughness set before each), the ground copied from
-  the scene block as the pass read it; on OpenGL from the tree's GLSL with
-  `quoted_uniforms`.
+- **Both renderers draw the irradiance**: on Vulkan `ae3d.vksky` through a
+  quoted pass (`vkframe.quoted_screen_pass`), the ground copied from the
+  scene block as the pass read it; on OpenGL from the tree's GLSL with
+  `quoted_uniforms`. Its frames are main's on both renderers.
+- **The filter is written but not drawn yet.** Its `radical_inverse` counts
+  in halves, the same values as the 32-bit reversal it replaces, yet on an
+  Apple M6 (MoltenVK) it left 16 of 28 Vulkan parity frames a step off in a
+  few channels; main's uint reversal swapped in by hand made them exact.
+  Quote cannot carry a uint32 yet (an aether PR is under way), so both
+  renderers draw `FRAGMENT_SKY_FILTER` until a release that can, and the
+  quoted filter, its SPIR-V and `test_gpu_sky` wait in the tree for it
+  (Paul, 2026-10-17). Writing the rest of the filter in the hand-written
+  one's shape made OpenGL inexact as well, so it keeps step 4's shape.
 - **The module is `ae3d.shaders.skyprobe`, not `ae3d.shaders.sky`**: with
   `ae3d.sky` in the same program (every engine program), aetherc prefixed
   the shader module's functions, the prefixed names went into the quote
@@ -45,6 +53,5 @@
   evaluator and the doubles land a 256th of a sampler's weight apart). A
   `texture_lod` that reads only the top level fails it; so does an
   irradiance without its cosine.
-- `FRAGMENT_SKY_FILTER`, `FRAGMENT_SKY_IRRADIANCE`, their `_vk` files and
-  `vkpipes`' two pipelines stay, unused, until the GPU lanes have compared
-  frames against main's.
+- `FRAGMENT_SKY_IRRADIANCE`, its `_vk` file and `vkpipes`' irradiance
+  pipeline stay, unused, until they are cleaned up with the filter's.
