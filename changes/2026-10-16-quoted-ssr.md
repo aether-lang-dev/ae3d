@@ -26,5 +26,13 @@
   near a thousand, which f32 and doubles put in different places. A
   reflection about the wrong normal fails it, and so does a `reflect` on
   the CPU that does not double its dot product.
-- `FRAGMENT_SSR`, `ssr_vk.frag` and the SSR pipeline in `vkpipes` stay,
-  unused, until the GPU lanes have compared frames against main's.
+- **`FRAGMENT_SSR`, `ssr_vk.frag`, the SSR pipeline in `vkpipes`,
+  `ssrRoadHeight` and `ssrStrength` are gone** (the scene block is 16208
+  bytes). On an Apple M6, with one sample and with four, 27 of 28
+  `test_backend_parity` frames are byte-identical to main's on both
+  renderers (the clouds within main's own spread), the wet ground's
+  reflection numbers in its log are main's, and zombie_city and
+  street_drive are byte-identical but for Vulkan with one sample, main's
+  own flicker. The reflection is in those frames: zombie_city without it
+  differs by some 45000 channels, street_drive by 40000. No validation
+  errors.
