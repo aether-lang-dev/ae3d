@@ -84,6 +84,9 @@ extern ae3d_dlss_last_error() -> string
 extern ae3d_dlss_shutdown()
 
 const FRAMES = 2
+// The most swapchain images a frame presents to, each with its own
+// semaphore that the frame's submit signals and its present waits on.
+const PRESENT_IMAGES = 16
 // Timestamps a frame, and the stages they split its time into: 0 shadow
 // (all of 8 to 10), 1 scene (all of 3 to 7), 2 post, 3 camera depth, 4 sky,
 // 5 opaque, 6 occlusion, 7 transparent, and the shadow stage's own split:
@@ -110,7 +113,12 @@ const DLSS_IMAGE_BYTES = 48
 var g_ready = false
 var g_commands: ptr = null         // VkCommandBuffer[FRAMES]
 var g_image_available: ptr = null  // VkSemaphore[FRAMES]
-var g_render_finished: ptr = null  // VkSemaphore[FRAMES]
+// One a swapchain image, not one a frame in flight: a present holds its
+// semaphore until the image comes back from the swapchain, which may be
+// after the frame slot has come round again, so a semaphore a slot was
+// signalling while the swapchain still waited on it (VUID-vkQueueSubmit-
+// pSignalSemaphores-00067). Made the first time an image is drawn to.
+var g_render_finished: ptr = null  // VkSemaphore[PRESENT_IMAGES]
 var g_in_flight: ptr = null        // VkFence[FRAMES]
 var g_frame = 0
 var g_image_index = 0
@@ -274,7 +282,7 @@ scratch() {
     g_cell = calloc(4, 8)
     g_commands = calloc(FRAMES, 8)
     g_image_available = calloc(FRAMES, 8)
-    g_render_finished = calloc(FRAMES, 8)
+    g_render_finished = calloc(PRESENT_IMAGES, 8)
     g_in_flight = calloc(FRAMES, 8)
     g_stamped = calloc(FRAMES, 4)
     g_pass_ms = calloc(STAGES, 8)
@@ -302,7 +310,7 @@ hook_at(i: int) -> *FrameHook { return (g_hooks + i * sizeof(FrameHook)) as *Fra
 // given `context`. Run by their stage, and in the order added within one;
 // false when there is no room for another. Kept across starts: installed
 // once a process, they are the next device's too.
-add_hooks(stage: int, record: ptr, collect: ptr, release_fn: ptr, context: ptr) -> bool {
+add_hooks(stage: int, record: @keep ptr, collect: @keep ptr, release_fn: @keep ptr, context: @keep ptr) -> bool {
     scratch()
     if g_hook_count >= MAX_HOOKS { return false }
     at = g_hook_count
@@ -502,7 +510,6 @@ create_commands() -> bool {
     i = 0
     while i < FRAMES && ok {
         ok = vk.vkCreateSemaphore(d, semaphore as ptr, null, g_image_available + i * 8) == vk.SUCCESS
-        ok = ok && vk.vkCreateSemaphore(d, semaphore as ptr, null, g_render_finished + i * 8) == vk.SUCCESS
         ok = ok && vk.vkCreateFence(d, fence as ptr, null, g_in_flight + i * 8) == vk.SUCCESS
         (g_stamped as int[])[i] = 0
         i = i + 1
@@ -533,8 +540,9 @@ create_commands() -> bool {
 
 // A white pixel and one identity instance, so a draw with no texture and no
 // instance buffer still has something to bind: the shader always samples
-// and always reads an instance matrix; and one unused joint and weight,
-// for the draws whose pipeline strides zero through it.
+// and always reads an instance matrix; and one unused joint, weight and
+// second UV, bound at 2 for a draw with no skin of its own (a plain
+// pipeline names no binding 2 since the portability fix; ae3d.vkpipes).
 create_defaults() -> bool {
     white = calloc(1, 4)
     (white as byte[])[0] = 255
@@ -711,11 +719,15 @@ shutdown() {
     i = 0
     while i < FRAMES {
         if (g_image_available as ptr[])[i] != null { vk.vkDestroySemaphore(d, (g_image_available as ptr[])[i], null) }
-        if (g_render_finished as ptr[])[i] != null { vk.vkDestroySemaphore(d, (g_render_finished as ptr[])[i], null) }
         if (g_in_flight as ptr[])[i] != null { vk.vkDestroyFence(d, (g_in_flight as ptr[])[i], null) }
         (g_image_available as ptr[])[i] = null
-        (g_render_finished as ptr[])[i] = null
         (g_in_flight as ptr[])[i] = null
+        i = i + 1
+    }
+    i = 0
+    while i < PRESENT_IMAGES {
+        if (g_render_finished as ptr[])[i] != null { vk.vkDestroySemaphore(d, (g_render_finished as ptr[])[i], null) }
+        (g_render_finished as ptr[])[i] = null
         i = i + 1
     }
     vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: g_identity_buffer, memory: g_identity_memory })
@@ -906,7 +918,7 @@ viewport_at(x: int, y: int, w: int, h: int) {
 }
 
 // A pass begun over `framebuffer`, `w` by `h`, with `clear_count` clears.
-begin_pass(pass: ptr, framebuffer: ptr, w: int, h: int, clear_count: int) {
+begin_pass(pass: @keep ptr, framebuffer: @keep ptr, w: int, h: int, clear_count: int) {
     b = g_begin as *VkRenderPassBeginInfo
     memset(g_begin, 0, sizeof(VkRenderPassBeginInfo) as long)
     b.sType = vk.STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
@@ -955,6 +967,22 @@ open_scene_pass() {
     vkhost.set_pass_open(true)
 }
 
+// The semaphore image `index`'s present waits on, made the first time the
+// image is drawn to; false, with the reason, when it cannot be.
+present_semaphore(index: int) -> bool {
+    if index < 0 || index >= PRESENT_IMAGES {
+        vkdevice.fail("swapchain image ${index} is past the ${PRESENT_IMAGES} this backend presents to")
+        return false
+    }
+    if (g_render_finished as ptr[])[index] != null { return true }
+    info = calloc(1, sizeof(VkSemaphoreCreateInfo)) as *VkSemaphoreCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+    ok = vk.vkCreateSemaphore(vkdevice.device(), info as ptr, null, g_render_finished + index * 8) == vk.SUCCESS
+    free(info as ptr)
+    if !ok { vkdevice.fail("could not create a present semaphore") }
+    return ok
+}
+
 // A frame begun: the uploads flushed, a pending resize done, the slot's
 // fence waited on and its stamps and the hooks' results collected, the
 // next image acquired (a swapchain out of date is remade and the frame
@@ -984,6 +1012,7 @@ frame_begin(r: float, g: float, b: float, a: float) -> bool {
             return false
         }
         g_image_index = (g_cell as uint32[])[0] as int
+        if !present_semaphore(g_image_index) { return false }
     }
     vk.vkResetFences(d, 1, fence)
     commands = commands_now()
@@ -1074,7 +1103,7 @@ set_now(texture: int) -> ptr {
                           vktargets.lamp_view(), vktargets.lamp_sampler(), g_damage_mask, g_own_binding2)
 }
 
-bind_pipeline(pipeline: ptr) {
+bind_pipeline(pipeline: @keep ptr) {
     if pipeline != g_bound_pipeline {
         vk.vkCmdBindPipeline(commands_now(), vk.PIPELINE_BIND_POINT_GRAPHICS, pipeline)
         g_bound_pipeline = pipeline
@@ -1082,14 +1111,14 @@ bind_pipeline(pipeline: ptr) {
     }
 }
 
-bind_set(set: ptr, offset: int) {
+bind_set(set: @keep ptr, offset: int) {
     (g_set_cell as ptr[])[0] = set
     (g_dynamic as uint32[])[0] = offset
     vk.vkCmdBindDescriptorSets(commands_now(), vk.PIPELINE_BIND_POINT_GRAPHICS, vkpipes.layout(), 0, 1, g_set_cell, 1,
                                g_dynamic)
 }
 
-bind_vertices(binding: int, buffer: ptr) {
+bind_vertices(binding: int, buffer: @keep ptr) {
     (g_buffers as ptr[])[0] = buffer
     (g_offsets as long[])[0] = 0
     vk.vkCmdBindVertexBuffers(commands_now(), binding, 1, g_buffers, g_offsets)
@@ -1106,13 +1135,13 @@ empty_skin_buffer() -> ptr { return g_empty_skin_buffer }
 // been filling, the set for its texture, normal map and bank, the pipeline
 // bound when it changed, and the mesh with its instances -- a stream, or
 // the one identity -- and its skin, or the unused one.
-draw_pipeline(pipeline: ptr, handle: int, texture: int, instances: int, instance_count: int) {
+draw_pipeline(pipeline: @keep ptr, handle: int, texture: int, instances: int, instance_count: int) {
     draw_pipeline_range(pipeline, handle, texture, instances, instance_count, 0, 0 - 1)
 }
 
 // The same, of `index_count` indices from `first_index` -- a material
 // group's run of the mesh -- or the whole of it when the count is negative.
-draw_pipeline_range(pipeline: ptr, handle: int, texture: int, instances: int, instance_count: int,
+draw_pipeline_range(pipeline: @keep ptr, handle: int, texture: int, instances: int, instance_count: int,
                     first_index: int, index_count: int) {
     if !vkhost.recording() || !vkmesh.in_range(handle) { return }
     open_scene_pass()
@@ -1209,7 +1238,7 @@ draw_range(handle: int, texture: int, instances: int, instance_count: int, first
 // command at `offset` in `draws`. The pipeline is the one the mesh and the
 // pose bank would have chosen for a lit draw, or the crowd's depth one in
 // the shadow pass (`shadow`), where only it draws.
-draw_indirect(handle: int, texture: int, instances: ptr, draws: ptr, offset: long, shadow: bool) {
+draw_indirect(handle: int, texture: int, instances: @keep ptr, draws: ptr, offset: long, shadow: bool) {
     if shadow && (vkpipes.shadow() == null || !g_in_shadow_pass) { return }
     if !vkhost.recording() || !vkmesh.in_range(handle) { return }
     if !shadow { open_scene_pass() }
@@ -1289,7 +1318,7 @@ draw_cut(handle: int, texture: int, instances: int, indices: ptr, draws: ptr, fi
 // figure's slot above its vertex, the vertices, the skin and the figures
 // read through `pulled` (vkpipes.pull_set_layout's) by the crowd's pulling
 // pipeline. The block's pullVertexBits is the caller's to have set.
-draw_pulled(texture: int, pulled: ptr, indices: ptr, draws: ptr, command: int) {
+draw_pulled(texture: int, pulled: @keep ptr, indices: ptr, draws: ptr, command: int) {
     if !vkhost.recording() || pulled == null { return }
     pipeline = vkpipes.crowd_pull(g_cull)
     if pipeline == null { return }
@@ -1333,7 +1362,7 @@ draw_sky(handle: int, texture: int, clouds: int) {
 // image at binding 1, last frame's clouds at 2, their weather at 3, shape
 // at 4 and detail at 9. Before the scene pass, which it must not be
 // recorded in.
-cloud_pass(framebuffer: ptr, w: int, h: int, sky: int, history: int, weather: int, shape: int, detail: int) {
+cloud_pass(framebuffer: @keep ptr, w: int, h: int, sky: int, history: int, weather: int, shape: int, detail: int) {
     if vkpipes.clouds() == null { return }
     g_own_binding2 = history
     screen_pass(vktargets.hdr_pass(), framebuffer, w, h, vkpipes.clouds(), sky, weather, shape, detail)
@@ -1345,7 +1374,7 @@ cloud_pass(framebuffer: ptr, w: int, h: int, sky: int, history: int, weather: in
 // past zero, `extra3`, `extra4` and `extra9` at 3, 4 and 9 (the sky's
 // clouds read their weather, shape and detail there). Outside the scene pass, which it must not be
 // recorded in; the scene program's block is what the draw reads.
-screen_pass(pass: ptr, framebuffer: ptr, w: int, h: int, pipeline: ptr, texture: int, extra3: int, extra4: int, extra9: int) {
+screen_pass(pass: @keep ptr, framebuffer: @keep ptr, w: int, h: int, pipeline: @keep ptr, texture: int, extra3: int, extra4: int, extra9: int) {
     if !vkhost.recording() || vkhost.pass_open() || pipeline == null || framebuffer == null { return }
     normal_was = g_normal_map
     bank_was = g_pose_bank
@@ -1394,7 +1423,7 @@ quoted_hash(name: string) -> long {
 // A full-screen draw of the frame's own through a quoted pass, as
 // screen_pass draws through a pipeline: `p`'s `draw`th draw this frame into
 // `framebuffer`, `w` by `h`, sampling `texture` (ae3d.vksky's sky light).
-quoted_screen_pass(pass: ptr, framebuffer: ptr, w: int, h: int, p: ptr, draw: int, texture: int) {
+quoted_screen_pass(pass: @keep ptr, framebuffer: @keep ptr, w: int, h: int, p: ptr, draw: int, texture: int) {
     if !vkhost.recording() || vkhost.pass_open() || p == null || framebuffer == null || !vktexture.valid(texture) { return }
     begin_pass(pass, framebuffer, w, h, 0)
     vkhost.set_pass_open(true)
@@ -1496,7 +1525,7 @@ lamp_shadow_begin() -> bool { return lamp_pass_begin(vktargets.lamp_framebuffer(
 // The lamps' static layer's pass: as the atlas's, on the layer beneath.
 lamp_static_begin() -> bool { return lamp_pass_begin(vktargets.lamp_static_framebuffer()) }
 
-lamp_pass_begin(framebuffer: ptr) -> bool {
+lamp_pass_begin(framebuffer: @keep ptr) -> bool {
     if !vkhost.recording() || framebuffer == null { return false }
     if vkhost.pass_open() { return false }
     size = vktargets.LAMP_SHADOW_SIZE
@@ -1526,7 +1555,7 @@ lamp_shadow_tile(x: int, y: int, size: int) {
 }
 
 // One image barrier of a lamps' atlas's depth into `at`.
-lamp_barrier(at: ptr, image: ptr, old: int, new_layout: int, src_access: int, dst_access: int) {
+lamp_barrier(at: ptr, image: @keep ptr, old: int, new_layout: int, src_access: int, dst_access: int) {
     b = at as *VkImageMemoryBarrier
     b.sType = vk.STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
     b.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
@@ -1656,7 +1685,7 @@ scene_depth_ready() -> bool {
 // at 3 `third` (the temporal pass's history) or the default texture, and
 // the frame's motion vectors at 4; through its own set at `slot`, written
 // every draw because both images are remade on resize.
-draw_screen_with(pipeline: ptr, sets: ptr, slot: int, view: ptr, sampler: ptr, layout: int, third: ptr, third_sampler: ptr) {
+draw_screen_with(pipeline: @keep ptr, sets: ptr, slot: int, view: @keep ptr, sampler: @keep ptr, layout: int, third: @keep ptr, third_sampler: @keep ptr) {
     if pipeline == null || !vkmesh.drawable(g_screen_quad) { return }
     if view == null || sampler == null { return }
     if vkmesh.index_count(g_screen_quad) == 0 { return }
@@ -1725,7 +1754,7 @@ draw_screen_with(pipeline: ptr, sets: ptr, slot: int, view: ptr, sampler: ptr, l
     g_draw_calls = g_draw_calls + 1
 }
 
-screen_image(images: ptr, index: int, view: ptr, sampler: ptr, layout: int) {
+screen_image(images: ptr, index: int, view: @keep ptr, sampler: @keep ptr, layout: int) {
     info = (images + index * sizeof(VkDescriptorImageInfo)) as *VkDescriptorImageInfo
     info.imageLayout = layout
     info.imageView = view
@@ -1733,7 +1762,7 @@ screen_image(images: ptr, index: int, view: ptr, sampler: ptr, layout: int) {
 }
 
 // A full-screen draw of a texture.
-draw_screen(pipeline: ptr, sets: ptr, slot: int, colour: int) {
+draw_screen(pipeline: @keep ptr, sets: ptr, slot: int, colour: int) {
     if !vktexture.valid(colour) { return }
     draw_screen_with(pipeline, sets, slot, vktexture.view(colour), vktexture.sampler_of(colour),
                      vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, null, null)
@@ -1993,7 +2022,7 @@ fxaa_shader(w: int, h: int) -> *GpuShader {
 // A full-screen draw through a quoted pass, sampling `view`: its own
 // pipeline and the set of its `draw`th draw this frame (ae3d.vkquote), the
 // screen quad.
-draw_quoted(p: *QuotedPass, draw: int, view: ptr, sampler: ptr) {
+draw_quoted(p: *QuotedPass, draw: int, view: @keep ptr, sampler: @keep ptr) {
     quoted_cells()
     (g_quoted_views as ptr[])[0] = view
     (g_quoted_samplers as ptr[])[0] = sampler
@@ -2001,7 +2030,7 @@ draw_quoted(p: *QuotedPass, draw: int, view: ptr, sampler: ptr) {
 }
 
 // The same sampling two textures, `view` at binding 1 and `view2` at 2.
-draw_quoted2(p: *QuotedPass, draw: int, view: ptr, sampler: ptr, view2: ptr, sampler2: ptr) {
+draw_quoted2(p: *QuotedPass, draw: int, view: @keep ptr, sampler: @keep ptr, view2: @keep ptr, sampler2: @keep ptr) {
     quoted_cells()
     (g_quoted_views as ptr[])[0] = view
     (g_quoted_samplers as ptr[])[0] = sampler
@@ -2011,7 +2040,8 @@ draw_quoted2(p: *QuotedPass, draw: int, view: ptr, sampler: ptr, view2: ptr, sam
 }
 
 // The same sampling three, `view` at binding 1, `view2` at 2, `view3` at 3.
-draw_quoted3(p: *QuotedPass, draw: int, view: ptr, sampler: ptr, view2: ptr, sampler2: ptr, view3: ptr, sampler3: ptr) {
+draw_quoted3(p: *QuotedPass, draw: int, view: @keep ptr, sampler: @keep ptr, view2: @keep ptr, sampler2: @keep ptr, view3: @keep ptr,
+             sampler3: @keep ptr) {
     quoted_cells()
     (g_quoted_views as ptr[])[0] = view
     (g_quoted_samplers as ptr[])[0] = sampler
@@ -2089,7 +2119,7 @@ bloom_chain(source: int, sw: int, sh: int) -> int {
 // `framebuffer`, `w` by `h`: its texel and level (`first`, 1 on the
 // pyramid's first) set in its shader, the frame's exposure and threshold
 // with them, then drawn as its `draw`th draw this frame.
-bloom_down_pass(framebuffer: ptr, w: int, h: int, draw: int, texture: int, tw: int, th: int, first: int) {
+bloom_down_pass(framebuffer: @keep ptr, w: int, h: int, draw: int, texture: int, tw: int, th: int, first: int) {
     if !vkhost.recording() || vkhost.pass_open() || framebuffer == null || texture <= 0 { return }
     p = g_bloom_down_pass as *QuotedPass
     s = vkquote.shader(p)
@@ -2116,7 +2146,7 @@ bloom_down_pass(framebuffer: ptr, w: int, h: int, draw: int, texture: int, tw: i
 // coarser level's, `tw` by `th` texels) added to `level`, this level's
 // downsample, and divided by `top` levels on the last step (0 before); its
 // `draw`th draw this frame.
-bloom_up_pass(framebuffer: ptr, w: int, h: int, draw: int, sum: int, tw: int, th: int, level: int, top: int) {
+bloom_up_pass(framebuffer: @keep ptr, w: int, h: int, draw: int, sum: int, tw: int, th: int, level: int, top: int) {
     if !vkhost.recording() || vkhost.pass_open() || framebuffer == null || sum <= 0 || level <= 0 { return }
     p = g_bloom_up_pass as *QuotedPass
     s = vkquote.shader(p)
@@ -2174,7 +2204,6 @@ frame_end() -> bool {
     vk.vkCmdEndRenderPass(commands)
     vkhost.set_pass_open(false)
     stamp_through(8)
-    slot = g_frame
 
     if g_post_active {
         post_sets_current()
@@ -2304,7 +2333,7 @@ frame_end() -> bool {
         submit.pWaitSemaphores = g_image_available + g_frame * 8
         submit.pWaitDstStageMask = wait_stage
         submit.signalSemaphoreCount = 1
-        submit.pSignalSemaphores = g_render_finished + g_frame * 8
+        submit.pSignalSemaphores = g_render_finished + g_image_index * 8
     }
     submit.commandBufferCount = 1
     submit.pCommandBuffers = g_commands + g_frame * 8
@@ -2326,7 +2355,7 @@ frame_end() -> bool {
     present = calloc(1, sizeof(VkPresentInfoKHR)) as *VkPresentInfoKHR
     present.sType = vk.STRUCTURE_TYPE_PRESENT_INFO_KHR
     present.waitSemaphoreCount = 1
-    present.pWaitSemaphores = g_render_finished + g_frame * 8
+    present.pWaitSemaphores = g_render_finished + g_image_index * 8
     present.swapchainCount = 1
     (g_cell as ptr[])[0] = vktargets.swapchain()
     present.pSwapchains = g_cell
@@ -2497,7 +2526,7 @@ dlss_camera(view: ptr, projection: ptr, prev_view: ptr, prev_projection: ptr, ji
 }
 
 // One of the four images DLSS is handed, at `index`.
-dlss_image(index: int, image: ptr, memory: ptr, view: ptr, layout: int, w: int, h: int, format: int, usage: int) {
+dlss_image(index: int, image: @keep ptr, memory: @keep ptr, view: @keep ptr, layout: int, w: int, h: int, format: int, usage: int) {
     at = g_dlss_images + index * DLSS_IMAGE_BYTES
     handles = at as ptr[]
     handles[0] = image

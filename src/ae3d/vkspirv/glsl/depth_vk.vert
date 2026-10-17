@@ -216,8 +216,14 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
 };
 layout (location = 0) in vec3 inPosition;
 layout (location = 3) in mat4 instanceModel;
+#ifdef AE3D_UNSKINNED
+// Vulkan's plain shadow pipelines name no skin stream (ae3d.vkpipes).
+const vec4 inJoints = vec4(0.0);
+const vec4 inWeights = vec4(0.0);
+#else
 layout (location = 8) in vec4 inJoints;
 layout (location = 9) in vec4 inWeights;
+#endif
 
 
 
