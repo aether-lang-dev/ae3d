@@ -14,10 +14,13 @@
 - **The full-screen pass's vertex shader is one** (`gpu.screen_vertex`,
   `ScreenVertex` to `ScreenVaryings`), and `emit_screen_vertex` writes it
   for each quoted pass, its varying under the pass's parameter's name. Its
-  position is a vec3 on both renderers: OpenGL's quad gives two
-  components, and the third reads 0, as the GL spec fills it.
+  position is a vec3 on both renderers, as both quads give it (OpenGL's
+  is a mesh like any other, three floats, z 0; the hand-written shader
+  read it as a vec2). On an Apple M6 the frames are main's, and OpenGL
+  reports the quoted program's inPosition a vec3 at location 0.
 - `tests/test_gpu_vertex.ae`: the GLSL for Vulkan and OpenGL 4.1 (golden
   fixtures; glslang and spirv-val), the varying named for the pass it
-  feeds, the quad's four corners on the CPU, and both refusals. A position
+  feeds, the quad's four corners on the CPU, and both refusals (13
+  checks). A position
   at the wrong location fails it; so does a CPU that drops an output's
   lane.
