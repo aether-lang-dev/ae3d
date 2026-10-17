@@ -1,0 +1,418 @@
+// ae3d.shaders.composite through ae3d.gpu: the frame's tone curve, written
+// with `quote` (step 6).
+//
+//   - the composite comes out as the GLSL in tests/fixtures/gpu/composite.frag
+//     and its _gl twin, and glslang and spirv-val pass it;
+//   - its block holds the captures at their std140 places, the camera a
+//     mat4 at a sixteen-byte boundary, and its two textures are the light
+//     and the bloom, in that order;
+//   - haze_screen's `out float w` is a HazePoint, a GLSL struct its helper
+//     returns;
+//   - on the CPU it draws what the same shader written as plain Aether over
+//     ae3d.shaderlib does, but for the grain (a hash of the pixel's place,
+//     which f32 and doubles hash apart): the light alone, with the bloom
+//     added, rippled by two columns of hot air and by four (a count of two
+//     cutting the loop short of the rest), and a capture passed through as
+//     data; the haze's noise is hashed the same way, so a pixel the hot air
+//     moves is held to have moved, and every other to the reference;
+//   - the tone curve is ACES, then the sRGB encoding.
+//
+// On a GPU, every frame either renderer draws goes through it
+// (test_backend_parity, test_heat_haze, ...). AE3D_GPU_WRITE_GOLDEN=1 writes
+// the fixtures.
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.lanes
+import std.quote
+import ae3d.gpu
+import ae3d.gpu (GpuShader, GpuVal)
+import ae3d.shaders.composite
+import ae3d.shaders.composite (HazePoint)
+import ae3d.shaderlib
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, ShaderImage, texture, rgb, xy, xyz, dot_v2, mul, m4_at,
+                       splat2, splat3, splat4, float_of, frag_coord, set_frag_coord, image_new, image_set, image_free,
+                       texture_of, zero_mat4)
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+absf(a: float) -> float { if a < 0.0 { return 0.0 - a } return a }
+maxf(a: float, b: float) -> float { if a > b { return a } return b }
+
+// glslang -V over `text` (as `stage`), then spirv-val; or, for desktop
+// OpenGL's GLSL (`opengl`), glslang's check of it. Skipped where they are
+// not on PATH.
+compiles(label: string, text: string, stage: string, opengl: bool) {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+        if status != 0 { println(out) }
+        return
+    }
+    check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    if status != 0 { println(out) }
+    if string.length(os.which("spirv-val")) == 0 {
+        println("  skip spirv-val (not on PATH)")
+        return
+    }
+    vargv = list.new()
+    list.add(vargv, spv)
+    vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+    check("spirv-val passes ${label}.${stage}", vstatus == 0)
+    if vstatus != 0 { println(vout) }
+    list.free(vargv)
+}
+
+// `text` is the fixture at `path`; AE3D_GPU_WRITE_GOLDEN=1 writes it.
+golden_is(text: string, path: string) {
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(path, text)
+        check("${path} written", werr == "")
+    }
+    golden, gerr = file.read(path)
+    check("${path} is there", gerr == "")
+    check("the GLSL written is ${path}", text == golden)
+    if text != golden {
+        println("--- emitted ---")
+        println(text)
+    }
+}
+
+// ── The pictures it reads ─────────────────────────────────────────────
+
+// The light, 48 by 32: dark to bright across, a hot patch past one, and
+// stripes, so a pixel pulled sideways by the haze reads otherwise.
+light() -> *ShaderImage {
+    img = image_new(48, 32)
+    y = 0
+    while y < 32 {
+        x = 0
+        while x < 48 {
+            stripe = 0.0
+            if x % 4 < 2 { stripe = 0.25 }
+            hot = 0.0
+            if x > 30 && x < 38 && y > 10 && y < 20 { hot = 2.5 }
+            image_set(img, x, y, 0.02 + x * 0.03 + stripe + hot, 0.05 + y * 0.02 + hot * 0.6, 0.1 + stripe * 0.5, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return img
+}
+
+// The bloom's blur, 24 by 16, softer and lower.
+glow() -> *ShaderImage {
+    img = image_new(24, 16)
+    y = 0
+    while y < 16 {
+        x = 0
+        while x < 24 {
+            image_set(img, x, y, 0.1 + 0.02 * x, 0.08 + 0.01 * y, 0.05, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return img
+}
+
+// A camera over the columns: a perspective looking down -z from (0, 1.5, 6),
+// as column-major columns.
+camera() -> mat4 {
+    c = calloc(16, 8) as float[]
+    // projection (fov ~60, aspect 1.5, near 0.1, far 100) times a view
+    // translated by (0, -1.5, -6).
+    f = 1.7320508
+    a = 1.5
+    p0 = f / a
+    p5 = f
+    p10 = 0.0 - 100.1 / 99.9
+    p14 = 0.0 - 2.0 * 100.0 * 0.1 / 99.9
+    c[0] = p0
+    c[5] = p5
+    c[10] = p10
+    c[11] = 0.0 - 1.0
+    c[14] = p14
+    // the view's translation through the projection
+    c[13] = p5 * (0.0 - 1.5)
+    c[14] = p10 * (0.0 - 6.0) + p14
+    c[15] = 6.0
+    m = shaderlib.mat4_of(c as ptr)
+    free(c as ptr)
+    return m
+}
+
+// ── The composite as plain Aether ─────────────────────────────────────
+
+struct Columns {
+    c0: vec4
+    c1: vec4
+    c2: vec4
+    c3: vec4
+    s0: vec4
+    s1: vec4
+    s2: vec4
+    s3: vec4
+}
+
+// What the composite draws at `uv` (frag_coord set), written as Aether.
+reference(screen: Texture, bloom: Texture, frame_exposure: float, capture_channel: int, bloom_on: int,
+          bloom_intensity: float, haze_count: int, h: Columns, vp: mat4, uv: vec2) -> vec4 {
+    at = uv
+    if haze_count > 0 && capture_channel == 0 {
+        offset = vec2(0.0, 0.0)
+        k = 0
+        while k < 4 {
+            kk = k
+            k = k + 1
+            if kk >= haze_count { break }
+            column = composite.haze_column(kk, h.c0, h.c1, h.c2, h.c3)
+            shape = composite.haze_column(kk, h.s0, h.s1, h.s2, h.s3)
+            hb = composite.haze_screen(vp, xyz(column))
+            ht = composite.haze_screen(vp, xyz(column) + vec3(0.0, shape.x, 0.0))
+            if hb.w <= 0.0 || ht.w <= 0.0 { continue }
+            b = hb.at
+            axis = ht.at - b
+            len2 = dot_v2(axis, axis)
+            if len2 < 1e-10 { continue }
+            along = dot_v2(uv - b, axis) / len2
+            width = column.w * shaderlib.abs(m4_at(vp, 0, 0)) / hb.w * 0.5 * (1.0 + 0.6 * along)
+            across = shaderlib.abs(uv.x - (b.x + axis.x * along)) / shaderlib.max(width, 1e-6)
+            if along < 0.0 || along > 1.0 || across > 1.0 { continue }
+            amount = shape.y * shaderlib.smoothstep(0.0, 0.08, along) * (1.0 - along) * (1.0 - across * across)
+            q = vec2(across * 3.0 + float_of(kk) * 7.1, along * 7.0 - shape.z)
+            n = vec2(composite.haze_noise(q * 2.3), composite.haze_noise(q * 2.3 + vec2(17.3, 5.9))) - splat2(0.5)
+            offset = offset + n * amount * width * 0.18
+        }
+        at = at + offset
+    }
+    radiance = rgb(texture(screen, at))
+    if capture_channel != 0 { return vec4(radiance, 1.0) }
+    if bloom_on != 0 { radiance = radiance + rgb(texture(bloom, at)) * bloom_intensity }
+    shown = composite.aces(radiance * frame_exposure)
+    shown = vec3(composite.srgb_encode(shown.x), composite.srgb_encode(shown.y), composite.srgb_encode(shown.z))
+    noise = shaderlib.fract(shaderlib.sin(dot_v2(frag_coord(), vec2(12.9898, 78.233))) * 43758.5453) - 0.5
+    return vec4(shown + splat3(noise / 255.0), 1.0)
+}
+
+// The grain is a hash of the pixel's place: fract(sin(...) * 43758.5453),
+// which turns the last bit of its argument into any value at all, and the
+// evaluator rounds to f32 as a GPU does where plain Aether holds doubles.
+// So the two are held equal but for the grain: each colour lane apart by
+// the same amount, and that amount within the grain's own range (a step of
+// 255, the two grains being half a step either way). The heat haze hashes
+// its noise the same way, so a pixel the hot air moves is only held to have
+// moved; every pixel it leaves is held to the reference.
+const GRAIN = 0.0040    // 1/255 and a little
+const LANE = 0.0001
+
+// Whether `got` is `want` but for the grain.
+same_but_grain(got: *GpuVal, want: vec4) -> bool {
+    w = want as f32x4
+    dr = gpu.val_x(got) - w.x
+    dg = gpu.val_y(got) - w.y
+    db = gpu.val_z(got) - w.z
+    return absf(dr - dg) < LANE && absf(dr - db) < LANE && absf(dr) < GRAIN && absf(gpu.val_w(got) - w.w) < LANE
+}
+
+// Whether two colours differ by more than the grain can make them.
+apart_past_grain(a: vec4, b: vec4) -> bool {
+    p = a as f32x4
+    q = b as f32x4
+    return absf(p.x - q.x) > 2.0 * GRAIN || absf(p.y - q.y) > 2.0 * GRAIN || absf(p.z - q.z) > 2.0 * GRAIN
+}
+
+// Whether `uv` lies in any of the first `count` columns: what the hot air
+// can move, found from the columns' geometry alone (no hash).
+in_haze(uv: vec2, count: int, h: Columns, vp: mat4) -> bool {
+    k = 0
+    while k < count && k < 4 {
+        column = composite.haze_column(k, h.c0, h.c1, h.c2, h.c3)
+        shape = composite.haze_column(k, h.s0, h.s1, h.s2, h.s3)
+        k = k + 1
+        hb = composite.haze_screen(vp, xyz(column))
+        ht = composite.haze_screen(vp, xyz(column) + vec3(0.0, shape.x, 0.0))
+        if hb.w <= 0.0 || ht.w <= 0.0 { continue }
+        axis = ht.at - hb.at
+        len2 = dot_v2(axis, axis)
+        if len2 < 1e-10 { continue }
+        along = dot_v2(uv - hb.at, axis) / len2
+        width = column.w * shaderlib.abs(m4_at(vp, 0, 0)) / hb.w * 0.5 * (1.0 + 0.6 * along)
+        across = shaderlib.abs(uv.x - (hb.at.x + axis.x * along)) / shaderlib.max(width, 1e-6)
+        if along >= 0.0 && along <= 1.0 && across <= 1.0 { return true }
+    }
+    return false
+}
+
+// One case on the CPU over a 24 by 16 grid of the frame, against the
+// reference: `right`, the pixels drawn as it draws them (but for the grain);
+// `clear`, the pixels outside every column; `clear_right`, those the
+// evaluator draws as the reference does; `hazy`, the pixels in a column;
+// `rippled`, those the evaluator draws past the grain from the reference
+// with no haze; and `moved`, the pixels the reference draws past the grain
+// from itself with `alt_count` columns and bloom `alt_bloom`.
+struct Ran {
+    right: int
+    clear: int
+    clear_right: int
+    hazy: int
+    rippled: int
+    moved: int
+}
+
+run_case(screen: Texture, bloom: Texture, exposure: float, channel: int, bloom_on: int, intensity: float, count: int,
+         h: Columns, vp: mat4, alt_count: int, alt_bloom: int) -> Ran {
+    s = composite.composite(screen, bloom, exposure, channel, bloom_on, intensity, count, h.c0, h.c1, h.c2, h.c3, h.s0,
+                            h.s1, h.s2, h.s3, vp)
+    cx = gpu.cpu_new(s)
+    r = Ran { right: 0, clear: 0, clear_right: 0, hazy: 0, rippled: 0, moved: 0 }
+    y = 0
+    while y < 16 {
+        x = 0
+        while x < 24 {
+            fx = x * 2.0 + 0.5
+            fy = y * 2.0 + 0.5
+            uv = vec2(fx / 48.0, fy / 32.0)
+            gpu.cpu_set_frag_coord(cx, fx, fy)
+            set_frag_coord(fx, fy)
+            pa = gpu.v2(fx / 48.0, fy / 32.0)
+            got = gpu.cpu_run(cx, pa)
+            heap.free(pa)
+            want = reference(screen, bloom, exposure, channel, bloom_on, intensity, count, h, vp, uv)
+            other = reference(screen, bloom, exposure, channel, alt_bloom, intensity, alt_count, h, vp, uv)
+            calm = reference(screen, bloom, exposure, channel, bloom_on, intensity, 0, h, vp, uv)
+            if apart_past_grain(want, other) { r.moved = r.moved + 1 }
+            hazy = channel == 0 && in_haze(uv, count, h, vp)
+            if hazy { r.hazy = r.hazy + 1 } else { r.clear = r.clear + 1 }
+            if got == null {
+                println("  cpu_run composite: ${gpu.last_error()}")
+            } else {
+                ok = same_but_grain(got, want)
+                if ok { r.right = r.right + 1 }
+                if !hazy && ok { r.clear_right = r.clear_right + 1 }
+                g = vec4(vec3(gpu.val_x(got), gpu.val_y(got), gpu.val_z(got)), gpu.val_w(got))
+                if hazy && apart_past_grain(g, calm) { r.rippled = r.rippled + 1 }
+                gpu.val_free(got)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    gpu.cpu_free(cx)
+    gpu.shader_free(s)
+    return r
+}
+
+main() {
+    println("composite: the frame's tone curve written with quote")
+    z = splat4(0.0)
+    blank = composite.composite(Texture { image: null }, Texture { image: null }, 1.0, 0, 0, 0.0, 0, z, z, z, z, z, z,
+                                z, z, zero_mat4())
+    _l = gpu.link(gpu.screen_vertex(), blank)
+    vk = gpu.emit_glsl(blank, gpu.VULKAN)
+    gl = gpu.emit_glsl(blank, gpu.GL)
+    if vk == "" || gl == "" { println("  emit composite: ${gpu.last_error()}") }
+    golden_is(vk, "tests/fixtures/gpu/composite.frag")
+    compiles("composite", vk, "frag", false)
+    golden_is(gl, "tests/fixtures/gpu/composite_gl.frag")
+    compiles("composite_gl", gl, "frag", true)
+
+    // The block: ints first as the body reads them, the eight columns on
+    // sixteen-byte boundaries, the camera after them, the floats last.
+    check("the block holds its fourteen captures (${gpu.params_count(blank)})", gpu.params_count(blank) == 14)
+    check("the columns are vec4s on sixteen-byte boundaries, the camera a mat4 after them",
+          gpu.params_type(blank, 2) == "vec4" && gpu.params_offset(blank, 2) == 16 &&
+          gpu.params_offset(blank, 9) == 128 && gpu.params_type(blank, 10) == "mat4" &&
+          gpu.params_offset(blank, 10) == 144)
+    check("its two textures are the light and the bloom, in that order",
+          gpu.samplers_count(blank) == 2 && gpu.samplers_name(blank, 0) == "screen" &&
+          gpu.samplers_name(blank, 1) == "bloom")
+    check("haze_screen's out float is a HazePoint it returns",
+          string.contains(vk, "struct HazePoint {\n    vec2 at;\n    float w;\n};") != 0 &&
+          string.contains(vk, "return HazePoint(c.xy / max(c.w, 0.0001) * 0.5 + vec2(0.5), c.w);") != 0)
+    check("the grain is the hand-written one's, over gl_FragCoord",
+          string.contains(vk, "fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5") != 0)
+
+    // ── On the CPU ──
+    li = light()
+    gw = glow()
+    screen = texture_of(li)
+    bloom = texture_of(gw)
+    vp = camera()
+    // Two columns of hot air in front of the camera, a third and fourth that
+    // a count of two leaves out.
+    h = Columns { c0: vec4(vec3(-0.6, 0.0, 0.0), 1.5), c1: vec4(vec3(0.9, 0.2, -1.0), 1.2),
+                  c2: vec4(vec3(0.0, 0.0, 2.0), 0.8), c3: vec4(vec3(-2.0, 0.0, -3.0), 0.6),
+                  s0: vec4(vec3(2.0, 5.0, 1.3), 0.0), s1: vec4(vec3(1.5, 4.0, 0.4), 0.0),
+                  s2: vec4(vec3(2.5, 4.5, 2.2), 0.0), s3: vec4(vec3(1.0, 3.0, 0.1), 0.0) }
+    plain = run_case(screen, bloom, 1.4, 0, 0, 0.0, 0, h, vp, 0, 0)
+    check("the CPU tones the light as the shader written as Aether does, but for the grain (${plain.right} of 384)",
+          plain.right == 384)
+    bloomed = run_case(screen, bloom, 1.4, 0, 1, 0.35, 0, h, vp, 0, 0)
+    check("and with the bloom added (${bloomed.right} of 384)", bloomed.right == 384)
+    check("the bloom brightens most of the frame (${bloomed.moved} of 384)", bloomed.moved > 200)
+    hazed = run_case(screen, bloom, 1.4, 0, 1, 0.35, 2, h, vp, 0, 1)
+    check("two columns of hot air stand over some of the frame (${hazed.hazy} of 384)", hazed.hazy > 8 && hazed.hazy < 200)
+    check("the CPU draws every pixel outside them as Aether does (${hazed.clear_right} of ${hazed.clear})",
+          hazed.clear_right == hazed.clear)
+    check("and ripples most inside them (${hazed.rippled} of ${hazed.hazy}), as Aether's does (${hazed.moved})",
+          hazed.rippled * 2 > hazed.hazy && hazed.moved * 2 > hazed.hazy)
+    four = run_case(screen, bloom, 1.4, 0, 1, 0.35, 4, h, vp, 2, 1)
+    check("four columns stand over more of it than two (${four.hazy} against ${hazed.hazy})", four.hazy > hazed.hazy)
+    check("the CPU draws every pixel outside the four as Aether does (${four.clear_right} of ${four.clear})",
+          four.clear_right == four.clear)
+    check("a count of two leaves the other two out: their pixels move with four (${four.moved})", four.moved > 0)
+    captured = run_case(screen, bloom, 1.4, 3, 1, 0.35, 2, h, vp, 0, 0)
+    check("a capture is passed through as data, no haze, bloom, curve or grain (${captured.right} of 384)",
+          captured.right == 384 && captured.moved == 0)
+
+    // The curve itself, at three points: black stays black, the grain aside;
+    // ACES of one is 0.8038; the sRGB encoding of it is 0.9082.
+    a1 = composite.aces(splat3(1.0)) as f32x4
+    check("ACES of one is 0.8038 (${a1.x})", absf(a1.x - 0.80377) < 0.0001)
+    check("the sRGB encoding is linear below 0.0031308 and a power above",
+          absf(composite.srgb_encode(0.002) - 0.02584) < 0.00001 && absf(composite.srgb_encode(0.8038) - 0.9082) < 0.0005)
+
+    gpu.shader_free(blank)
+    image_free(gw)
+    image_free(li)
+    if g_failures > 0 {
+        println("composite: ${g_failures} of ${g_checks} checks failed")
+        exit(1)
+    }
+    println("composite: all checks passed (${g_checks})")
+}
