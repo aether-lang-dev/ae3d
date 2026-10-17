@@ -152,18 +152,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 ddgiBase[2];
     vec4 ddgiSpacing;
     vec4 ddgiAtlas;
-    mat4 projection;
-    mat4 view;
-    vec3 cloudSunColor;
-    vec3 skySun;
-    int cloudFrame;
-    int skyProcedural;
-    float skyOvercast;
-    vec3 skyOvercastColor;
-    vec3 skyFlat;
-    float skyTurbidity;
-    vec2 cloudPassSize;
-    int cloudHistoryOn;
     float frameExposure;
     bool enableBloom;
     float bloomIntensity;
@@ -191,6 +179,8 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float waterLevel;
     vec3 skyColor;
     vec3 horizonColor;
+    float skyOvercast;
+    vec3 skyOvercastColor;
     bool enableWaterReflection;
     float waterReflectionIntensity;
     int hasSkyTexture;

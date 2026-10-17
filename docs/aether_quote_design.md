@@ -550,7 +550,8 @@ sky(...) -> *GpuShader {
    both renderers with frames byte-identical to the hand-written ones (the
    clouds within #793's noise). On Vulkan the sky is a linked pair
    (`vkquote.pair_new`, the vertex shader's block at set 1); its values are
-   copied from the scene block word for word until the block splits. The
+   copied word for word, from the scene block and, for those only the sky
+   read, from `vkframe`'s sky words; the hand-written sky family is gone. The
    capture needed an octahedral decode a vector at a time, as the
    hand-written one is: skyprobe's, a lane at a time, rounded a few
    directions otherwise on MoltenVK.

@@ -22,16 +22,24 @@ renderers. The frames are main's.
 - **Vulkan**: `vkquote.pair_new` draws a linked pair, the vertex shader's
   captures a block of their own at set 1, into the scene pass's two
   attachments, depth-tested and not written. The sky, the capture and the
-  cloud pass copy what they are drawn from out of the scene program's
-  block word for word (`gpu.set_*_f32`), as the hand-written shader read
-  it. A quoted pass takes five textures (the clouds').
+  cloud pass copy what they are drawn from word for word
+  (`gpu.set_*_f32`), as the hand-written shader read it: out of the scene
+  program's block, and the sky's own values out of `vkframe.sky_words`. A quoted pass takes five textures (the clouds').
 - **OpenGL** compiles the same trees' GLSL at start, the sky's program
   from its pair, and sets their uniforms by name before each draw.
 - The generator writes `sky_quoted`, `sky_capture_quoted` and
   `cloud_quoted`, the sky's vertex shader from its own quote
   (`SKY_QUOTED_VERTEX_HASH`, its VertexParams offsets held to glslang's).
-  The hand-written `sky_vk.*`, `sky_capture_vk.frag`, `cloud_vk.frag` and
-  VERTEX_SKYBOX / FRAGMENT_SKYBOX stay until a cleanup commit after this.
+- **`VERTEX_SKYBOX`, `FRAGMENT_SKYBOX`, `sky_vk.*`, `sky_capture_vk.frag`,
+  `cloud_vk.frag` and `vkpipes`' three sky pipelines are gone** (with
+  `vkframe.screen_pass`, which only the hand-written capture and clouds
+  drew through), and with them ten uniforms of the scene block only they
+  read: `projection`, `view`, `cloudSunColor`, `skySun`, `cloudFrame`,
+  `skyProcedural`, `skyFlat`, `skyTurbidity`, `cloudPassSize` and
+  `cloudHistoryOn` (183 uniforms, 15952 bytes; 53 shaders). The renderer
+  sets them in the sky's own words instead (`vkframe.set_sky_*`, the same
+  32-bit words), which the quoted passes copy from and `vksky` watches for
+  a new capture.
 - `tests/test_gpu_skydome.ae`, 46 checks: golden GLSL for all four in both
   dialects (glslang and spirv-val), the link and its locations, the two
   outputs, the CloudSample struct, and on the CPU the vertex shader and
