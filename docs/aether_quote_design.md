@@ -367,8 +367,11 @@ From mapping the compiler; nothing here is built yet.
    *Since then (ae3d #792, Aether 0.817.0, quote version 2):* the bloom's
    down and up passes and the one-sample `depth_copy` are quoted too, the
    bloom's helpers as `@quotable` functions. The bloom's `_vk` files and GL
-   heredocs are gone; `depth_copy_vk.frag` stays until its frames have been
-   compared with main's.
+   heredocs are gone, and `depth_copy_vk.frag` went once its one-sample
+   frames matched main's (M6, 2026-10-16). After that, on
+   `wip/quote-depth-resolve`: `depth_resolve` (TextureMS, a sampler2DMS),
+   `color_resolve`, `taa` and `ssao`, the last bringing `mat4` and calls each
+   dialect writes its own way (`depth_clip`, `screen_y_sign`).
 
    *The rest, one at a time, in this order* (Nic, 2026-10-16; see
    `aether_quote_questions_for_nic.md`), each adding to `ae3d.gpu` and
@@ -377,9 +380,12 @@ From mapping the compiler; nothing here is built yet.
    - **`depth_resolve`**, the multisampled depth copy: a multisample
      texture type (`sampler2DMS`, `texelFetch` with a sample index).
    - **`color_resolve`, `ssr`, `ssao`, `taa`**, one commit each.
-   - **the sky** (its capture and cloud variants with it): six samplers,
-     3D ones among them, and 25 uniforms, much of them the scene's: probably
-     a captured struct read through `quote.cell(c) as *T` field by field.
+   - **the sky's light**: `sky_filter` and `sky_irradiance`, screen passes
+     over the capture's mips (`texture_lod`, `texel_fetch_lod`). The sky
+     itself, its capture and its clouds (`sky`, `sky_capture`, `cloud`) move
+     to step 6 (Paul, 2026-10-16): each takes a direction and two clip
+     positions from its own vertex shader and writes a colour and a motion
+     vector, and reads `sampler3D`s.
    - **3A, module-scoped structs**, in aether (question 3 of the questions
      doc), before the vertex shaders.
    - **the passthrough**, `screen_vk.vert` / `VERTEX_SCREEN`, which every
@@ -388,7 +394,9 @@ From mapping the compiler; nothing here is built yet.
      reading it has moved.
 
    **The composite** (two textures, `hazeColumn[4]`, `hazeShape[4]` and a
-   `mat4`) moves with the vertex shaders in step 6, and so do the mesh
+   `mat4`) and **the sky, its capture and its clouds** (varyings from their
+   own vertex shader, two outputs, `sampler3D`) move with the vertex shaders
+   in step 6, and so do the mesh
    shaders (scene, water, crowd): their vertex stage is a quote too, and
    their uniforms are the scene block.
 5. **MSL**, after step 6 (the vertex shaders) (Nic, 2026-10-16; the FXAA-only MSL
@@ -400,7 +408,8 @@ From mapping the compiler; nothing here is built yet.
    serves any pixel shader whose inputs it provides. For us the vertex
    quote's return type is a struct of varyings, built with a struct literal
    (`MAKE`, which is why v1 has one), and the pixel quote takes it as its
-   parameter. The composite moves with them.
+   parameter. The composite moves with them, and so do the sky, its capture
+   and its clouds. Designed in section 11.
 
 ## 10. Open questions for Nic
 
@@ -415,3 +424,160 @@ vector-type one is settled (section 6).
 - **Should a quote be allowed outside the trailing position**, as a value
   (`q = quote |x: float| -> x * 2.0`)? It costs little once the trailing form
   exists, and the test-failure use (section 8) wants it.
+
+## 11. Step 6, designed: vertex shaders, varyings, the scene block
+
+Design only; nothing here is built. Written 2026-10-16 after step 4's
+post-process passes moved (`wip/quote-depth-resolve`), assuming 3A
+(module-scoped structs, aether#2939): each shader module declares its own
+`Vertex`, `Varyings` and outputs, and two modules' `Varyings` are two types.
+
+### What Aether already gives it
+
+Probed on 0.817.0, so none of this needs a quote version bump:
+
+- **A struct parameter and a struct literal returned**: `quote | v: V | ->
+  V { p: v.q, q: v.p * 2.0 }` is `(param v :V)` and `(RETURN :V (MAKE :V
+  (FIELD_VALUE p ...) ...))`, every `FIELD` typed.
+- **A captured struct holding a fixed-size array, indexed by a local**:
+  `g_haze.columns[i]` is `(INDEX :float (FIELD columns :float[4] (CAPTURE
+  g_haze :Haze)) (LOCAL i :int))`.
+
+**A shader module's last name must be no other ae3d module's.** A
+program importing two modules called `sky` (`ae3d.sky`, and a shader module
+`ae3d.shaders.sky`) had aetherc prefix one module's functions, and the
+prefixed names went into the quote tree's helpers, so the tree's hash, and
+the SPIR-V it keys, depended on what else the program imported: the engine's
+programs refused the sky's passes (M6, 2026-10-16). The shader module is
+`ae3d.shaders.skyprobe`; aether is to make a helper's name in a tree
+independent of the program, and until a release has that, the names stay
+apart.
+
+Still outside the subset (E0800), and designed around rather than asked
+for: array literals, casts (`float(i)` -- loops count in floats, as
+step 4's do), `out` parameters (a helper returns a struct instead).
+
+### The shapes
+
+```aether
+// ae3d.shaders.skydome
+struct Vertex { position: vec3 }
+struct Varyings {
+    position: vec4      // the clip position: gl_Position, not an output
+    dir: vec3
+    clip_now: vec4
+    clip_prev: vec4
+}
+struct SkyOut { colour: vec4, velocity: vec2 }
+
+sky_vertex(view_projection: mat4, prev_view_projection: mat4) -> *GpuShader {
+    return gpu.vertex("sky") quote | v: Vertex | {
+        pos = mul(view_projection, vec4(v.position, 1.0))
+        // pos.xyww: the sky at the far plane, whatever its distance.
+        return Varyings { position: vec4(vec3(pos.x, pos.y, pos.w), pos.w), dir: v.position,
+                          clip_now: pos, clip_prev: mul(prev_view_projection, vec4(v.position, 0.0)) }
+    }
+}
+sky(...) -> *GpuShader {
+    return gpu.fragment_of("sky", SkyOut) quote | f: Varyings | { ... return SkyOut { colour: c, velocity: m } }
+}
+```
+
+- **The vertex quote** (`gpu.vertex`) takes one struct, its vertex
+  attributes, and returns a struct of varyings built with `MAKE`. A field
+  named `position` is `gl_Position` (vec4); every other field is an `out`
+  at the location of its place among them, `flat` when it is an int or a
+  bool (GLSL does not interpolate those).
+- **The pixel quote** takes a struct of varyings. Its fields are matched to
+  a vertex shader's **by name and type**, not by struct identity: one
+  vertex shader serves any pixel shader whose inputs it provides (the
+  ChrysaLisp split). The pixel shader declares only the varyings it reads,
+  at the vertex shader's locations. `gpu.link(vertex, pixel)` checks the
+  pair (a missing or mistyped field is refused, naming it) and gives the
+  locations; a pipeline is built from a linked pair.
+- **Outputs**: a pixel quote returning a vec4 is `FragColor`, as today. One
+  returning a struct writes each field to the `out` at its place
+  (`layout(location = k)`): the sky's colour at 0 and motion vector at 1,
+  as `FragColor` and `outVelocity` are now. A depth shader stays a float.
+- **Vertex attributes** are not numbered by field order: the pipelines'
+  vertex input state is fixed (position 0, uv 1, normal 2, `instanceModel`
+  3..6, `instanceColor` 7, joints 8, weights 9, occlusion 10,
+  `instancePhase` 11, mask uv 12, `instanceExtras` 13). `ae3d.gpu` keeps one
+  table of attribute names to locations, as it keeps one table of calls
+  (Nic's option A again); a `Vertex` field not in it is refused. A mat4
+  attribute takes four locations.
+- **Structs inside the tree** (a helper's struct return, a struct local) are
+  written as GLSL `struct` declarations, named as helpers are
+  (`sky_CloudSample`), so `out` parameters become struct returns:
+  `cloudDensity(..., out float heightFraction)` returns
+  `CloudSample { density, height }`.
+
+### What the back ends grow
+
+1. **Struct values on the CPU.** The evaluator's values are up to four
+   lanes; a struct value becomes a list of named field values (a vec4, a
+   float, a mat4 cell). `cpu_run` of a vertex shader takes the attribute
+   struct and returns the varyings struct; of a pixel shader, takes a
+   varyings struct and returns its colour or output struct. The CPU does
+   not rasterise: a test feeds the pixel stage the varyings it chooses, and
+   holds each stage to the same stage written as plain Aether, as step 4's
+   tests do.
+2. **Captured arrays and structs in the block.** std140 as glslang has it:
+   an array's stride rounded up to 16 (`float waveAmplitudes[4]` is 64
+   bytes, not 16), a struct aligned to 16 and its size rounded to 16. The
+   cell's layout is Aether's (`float[4]` is four packed f32s), so
+   `params_write` repacks element by element; the generator already holds
+   every offset to glslang's.
+3. **`Texture3D`** (`sampler3D`), read by `texture_3d(t, p)`; on the CPU a
+   `ShaderImage3D`, trilinear across its slices.
+4. **`emit_glsl` of a vertex shader**, both dialects; `emit_screen_vertex`
+   becomes the first vertex quote (below).
+
+### Order, one commit and one GPU run each
+
+1. **The screen vertex shader** as a vertex quote: `Vertex { position:
+   vec3, uv: vec2 }` to `Varyings { position, uv }`. Every quoted pass
+   already uses a generated screen vertex shader; this one replaces
+   `gpu.emit_screen_vertex`, and with it `VERTEX_SCREEN` and
+   `screen_vk.vert` once no hand-written pass uses them (the passthrough
+   step 4 left).
+2. **The sky family**: `sky_vk.vert` as `sky_vertex`, then `sky`,
+   `sky_capture` and `cloud` (one source today, three variants: three quote
+   functions sharing `@quotable` helpers). New with them: struct outputs
+   (colour and motion), `Texture3D`, struct-returning helpers. About 670
+   lines of GLSL; the clouds' march is most of it.
+3. **The composite**: two textures, `mat4`, and `hazeColumn[4]` /
+   `hazeShape[4]` as a captured struct with array fields.
+4. **Water**, then **the crowd**, then **the scene**: the mesh shaders, and
+   with them the scene block.
+
+### The scene block
+
+Today 197 uniforms and 16208 bytes (step 4 took 17 out), every one shared
+by every hand-written shader. Each mesh shader's captures replace it as
+that shader moves, grouped into structs by what changes together, so one
+`gpu.set_*` or one block copy sets a group:
+
+- `Camera` (view, projection, view-projection, its inverse, last frame's,
+  the eye, jitter): set once a frame. On Vulkan from the same corrected
+  matrices `vkdesc.set_clip_mat4` writes now, as step 4's passes copy them.
+- `Lights` (`lights: Light[16]`, `count`, the cascades): once a frame.
+- `Material` (the ~40 material and surface fields): per draw, through the
+  pass's ring of blocks (`vkquote`'s `draws`), as the bloom's levels are.
+- `Skin` (`bones: mat4[96]`, last frame's rows): per draw, only in the
+  skinned variants.
+- `Wounds`, `Damage`, `Water` and `Crowd` likewise, each only in the shader
+  that reads it.
+
+A `Light[16]` array of structs is the one shape not probed yet; if quote
+types it as anything but `Light[16]`, that is an aether issue to file
+before the scene shader moves. The block goes when the last shader reading
+it does, and with it `vkscene` and `vkdesc`'s single scene program.
+
+### What it buys MSL (step 5, after this)
+
+Metal's stage-in and stage-out are structs (`[[stage_in]]`, a returned
+struct with `[[position]]`), so varyings designed as structs map across as
+they are. The attribute table becomes `[[attribute(n)]]`, and the block's
+structs Metal's argument buffers.
+

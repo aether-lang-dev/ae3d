@@ -1,0 +1,243 @@
+// ae3d.shaders.taa through ae3d.gpu: the temporal pass written with `quote`,
+// its fold and unfold @quotable helpers.
+//
+//   - taa comes out as the GLSL in tests/fixtures/gpu/taa.frag for Vulkan and
+//     taa_gl.frag for OpenGL 4.1: three samplers (the frame, the motion
+//     vectors, the history), the helpers as GLSL functions, min_v3 and the
+//     rest as GLSL's one name; glslang and spirv-val pass it;
+//   - the CPU back end runs it over an HDR frame with a lamp, a history that
+//     differs from it, and motion vectors that move part of the frame by
+//     fractions of a pixel and send one column off the screen, against the
+//     same pass written as Aether over ae3d.shaderlib (to f32 rounding):
+//     with history, and with none (blend 1, the frame itself).
+//
+// On a GPU, the pass is drawn when TAA is on: tests/test_backend_parity and
+// the suites that turn it on. AE3D_GPU_WRITE_GOLDEN=1 writes the fixtures.
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.lanes
+import std.quote
+import ae3d.gpu
+import ae3d.shaders.taa
+import ae3d.shaderlib (vec2, vec3, vec4, Texture, ShaderImage, texture, rgb, xy, max, clamp, min_v3, max_v3,
+                       clamp_v3, mix_v3, length_v2, image_new, image_set, image_free, texture_of)
+
+extern exit(code: int)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+absf(a: float) -> float { if a < 0.0 { return 0.0 - a } return a }
+
+// glslang -V over `text` (as `stage`), then spirv-val; or, for desktop
+// OpenGL's GLSL (`opengl`), glslang's check of it. Skipped where they are
+// not on PATH.
+compiles(label: string, text: string, stage: string, opengl: bool) {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+        if status != 0 { println(out) }
+        return
+    }
+    check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    if status != 0 { println(out) }
+    if string.length(os.which("spirv-val")) == 0 {
+        println("  skip spirv-val (not on PATH)")
+        return
+    }
+    vargv = list.new()
+    list.add(vargv, spv)
+    vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+    check("spirv-val passes ${label}.${stage}", vstatus == 0)
+    if vstatus != 0 { println(vout) }
+    list.free(vargv)
+}
+
+// `text` is the fixture at `path`; AE3D_GPU_WRITE_GOLDEN=1 writes it.
+golden_is(text: string, path: string) {
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(path, text)
+        check("${path} written", werr == "")
+    }
+    golden, gerr = file.read(path)
+    check("${path} is there", gerr == "")
+    check("the GLSL written is ${path}", text == golden)
+    if text != golden {
+        println("--- emitted ---")
+        println(text)
+    }
+}
+
+
+const W = 12
+const H = 7
+const EXPOSURE = 1.3
+
+fn f4(v: vec4) -> f32x4 { return v as f32x4 }
+fn f3(v: vec3) -> f32x4 { return v as f32x4 }
+fn f2(v: vec2) -> f32x4 { return v as f32x4 }
+
+// The pass written as Aether, step for step as the quote is.
+reference(screen: Texture, velocity: Texture, history: Texture, size: vec2, blend: float, uv: vec2) -> vec4 {
+    s = f2(size)
+    px = vec2(1.0 / s.x, 1.0 / s.y)
+    current = rgb(texture(screen, uv))
+    if blend >= 0.999 { return vec4(current, 1.0) }
+    prev_uv = (f2(uv) - f2(xy(texture(velocity, uv)))) as vec2
+    p = f2(prev_uv)
+    if p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0 { return vec4(current, 1.0) }
+    past = taa.fold(rgb(texture(history, prev_uv)), EXPOSURE)
+    now = taa.fold(current, EXPOSURE)
+    low = now
+    high = now
+    y = -1.0
+    while y <= 1.0 {
+        x = -1.0
+        while x <= 1.0 {
+            if x != 0.0 || y != 0.0 {
+                at = (f2(uv) + f2(vec2(x, y)) * f2(px)) as vec2
+                c = taa.fold(rgb(texture(screen, at)), EXPOSURE)
+                low = min_v3(low, c)
+                high = max_v3(high, c)
+            }
+            x = x + 1.0
+        }
+        y = y + 1.0
+    }
+    past = clamp_v3(past, low, high)
+    travel = length_v2(((p - f2(uv)) * s) as vec2)
+    weight = clamp(blend + travel * 0.02, blend, 1.0)
+    return vec4(taa.unfold(mix_v3(past, now, weight), EXPOSURE), 1.0)
+}
+
+// The worst difference, relative to the value's size, between the CPU's run
+// and the reference over every pixel; -1 when a run fails.
+worst_against_reference(screen: *ShaderImage, velocity: *ShaderImage, history: *ShaderImage, blend: float) -> float {
+    size = vec2(W * 1.0, H * 1.0)
+    s = taa.taa(texture_of(screen), texture_of(velocity), texture_of(history), size, blend, EXPOSURE)
+    cx = gpu.cpu_new(s)
+    worst = 0.0
+    y = 0
+    while y < H {
+        x = 0
+        while x < W {
+            u = (x + 0.5) / W
+            v = (y + 0.5) / H
+            uv = gpu.v2(u, v)
+            got = gpu.cpu_run(cx, uv)
+            heap.free(uv)
+            if got == null || gpu.val_n(got) != 4 {
+                println("  cpu_run failed: ${gpu.last_error()}")
+                gpu.cpu_free(cx)
+                gpu.shader_free(s)
+                return -1.0
+            }
+            want = f4(reference(texture_of(screen), texture_of(velocity), texture_of(history), size, blend, vec2(u, v)))
+            d = absf(gpu.val_x(got) - want.x) / (1.0 + absf(want.x))
+            d = max(d, absf(gpu.val_y(got) - want.y) / (1.0 + absf(want.y)))
+            d = max(d, absf(gpu.val_z(got) - want.z) / (1.0 + absf(want.z)))
+            d = max(d, absf(gpu.val_w(got) - want.w))
+            if d > worst { worst = d }
+            heap.free(got)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    gpu.cpu_free(cx)
+    gpu.shader_free(s)
+    return worst
+}
+
+main() {
+    println("ae3d.gpu: taa written with quote")
+    screen = image_new(W, H)
+    history = image_new(W, H)
+    velocity = image_new(W, H)
+    y = 0
+    while y < H {
+        x = 0
+        while x < W {
+            image_set(screen, x, y, 0.1 + 0.08 * x, 0.4 - 0.03 * y, 0.2 + 0.05 * ((x + y) % 3), 1.0)
+            // The history a little off this frame, so the clamp has work.
+            image_set(history, x, y, 0.3 + 0.05 * y, 0.1 + 0.06 * x, 0.25, 1.0)
+            // The left part moved by fractions of a pixel, the last column
+            // so far its history is off the screen, the rest still.
+            mx = 0.0
+            my = 0.0
+            if x < 5 {
+                mx = 1.5 / W
+                my = 0.0 - 0.5 / H
+            }
+            if x == W - 1 { mx = 0.0 - 2.0 }
+            image_set(velocity, x, y, mx, my, 0.0, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    // A lamp, forty times the rest.
+    image_set(screen, 3, 3, 40.0, 35.0, 28.0, 1.0)
+
+    s = taa.taa(texture_of(screen), texture_of(velocity), texture_of(history), vec2(W * 1.0, H * 1.0), 0.1, EXPOSURE)
+    check("three samplers in the order the body reads them",
+          gpu.samplers_count(s) == 3 && gpu.samplers_name(s, 0) == "screen" && gpu.samplers_name(s, 1) == "velocity" &&
+          gpu.samplers_name(s, 2) == "history")
+    frag = gpu.emit_glsl(s, gpu.VULKAN)
+    if frag == "" { println("  emit: ${gpu.last_error()}") }
+    golden_is(frag, "tests/fixtures/gpu/taa.frag")
+    check("the vector builtins by GLSL's one name",
+          string.contains(frag, "low = min(low, c);") != 0 && string.contains(frag, "past = clamp(past, low, high);") != 0 &&
+          string.contains(frag, "mix(past, now, weight)") != 0 && string.contains(frag, "length((prev_uv - uv) * screen_size)") != 0 &&
+          string.contains(frag, "texture(velocity, uv).xy") != 0)
+    compiles("taa", frag, "frag", false)
+    compiles("taa", gpu.emit_screen_vertex(s, gpu.VULKAN), "vert", false)
+    gl_frag = gpu.emit_glsl(s, gpu.GL)
+    if gl_frag == "" { println("  emit: ${gpu.last_error()}") }
+    golden_is(gl_frag, "tests/fixtures/gpu/taa_gl.frag")
+    compiles("taa_gl", gl_frag, "frag", true)
+    gpu.shader_free(s)
+
+    worst = worst_against_reference(screen, velocity, history, 0.1)
+    check("the CPU runs it as the pass written as Aether does, with history (worst ${worst})", worst >= 0.0 && worst < 0.00001)
+    first = worst_against_reference(screen, velocity, history, 1.0)
+    check("and with none, the frame itself (worst ${first})", first >= 0.0 && first < 0.00001)
+
+    image_free(screen)
+    image_free(history)
+    image_free(velocity)
+    if g_failures > 0 {
+        println("taa: ${g_failures} of ${g_checks} checks failed")
+        exit(1)
+    }
+    println("taa: all checks passed (${g_checks})")
+}

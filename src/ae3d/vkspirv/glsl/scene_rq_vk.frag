@@ -174,13 +174,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int hazeCount;
     vec4 hazeColumn[4];
     vec4 hazeShape[4];
-    int colorSampleCount;
-    float ssrRoadHeight;
-    float ssrStrength;
-    float ssaoRadius;
-    float ssaoIntensity;
-    int depthSampleCount;
-    float taaBlend;
     float time;
     float waveSpeedMultiplier;
     float waveHeightMultiplier;
@@ -1802,7 +1795,7 @@ layout(set = 0, binding = 13) uniform sampler2D occlusionMap;
 
 
 #endif
-// Whether the occlusion map holds the last frame's (FRAGMENT_SSAO): one
+// Whether the occlusion map holds the last frame's (ae3d.shaders.ssao): one
 // when the screen's occlusion is on and a frame has been drawn to find it.
 
 

@@ -26,6 +26,7 @@
   f32) as the body run as Aether copies it, the refusal without a viewport,
   and a depth shader returning a colour refused. Reading the texel at y, x
   instead fails it; so does dropping the return-type check.
-- `FRAGMENT_DEPTH_COPY` and `depth_copy_vk.frag` are still generated, unused,
-  until the GPU lanes have compared frames drawn with one sample against
-  main's.
+- **`FRAGMENT_DEPTH_COPY` and `depth_copy_vk.frag` are gone**, the frames
+  drawn with one sample on an Apple M6 matching main's on both renderers.
+  `test_backend_parity` takes `AE3D_MSAA=0` to compare both renderers with
+  one sample.

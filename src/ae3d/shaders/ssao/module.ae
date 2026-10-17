@@ -1,0 +1,131 @@
+// ae3d.shaders.ssao: ambient occlusion from the scene's own depth, written
+// with `quote`.
+//
+// The corners, the feet of things and the ground under a canopy, by how much
+// of the hemisphere over them the depth says is filled. Drawn before the
+// scene from the last frame's depth (#655), into the occlusion map the scene
+// shader reads: the occlusion in red, and in green the depth it was found at
+// (clip w, the last frame's view depth) for a surface to tell it is the one
+// that was there. The positions are rebuilt with this frame's matrices: the
+// last frame's geometry moved rigidly by the camera's step, so every sample
+// still lands on the image it was drawn in. It darkens the light from the sky
+// and nothing else; a lamp shining into a corner shines into it. It was
+// shaders/module.ae's FRAGMENT_SSAO.
+//
+//   depth                the scene's depth
+//   screen_size          the target's size in pixels
+//   radius, intensity    how far the samples reach, and how dark a filled
+//                        hemisphere makes the light (0: the pass is off)
+//   inv_view_projection  the camera's, from clip space back to the world
+//   view_projection      the camera's
+//   view_pos             the eye
+
+import std.quote
+import ae3d.gpu (GpuShader, fragment)
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, texture, frag_coord, mul, xyz, dot_v2, normalize, cross,
+                       distance, sqrt, sin, cos, abs, max, clamp, mix, smoothstep, fract, depth_clip, screen_y_sign)
+
+exports (ssao, world_at, dither)
+
+// The world position the depth `depth` at screen `uv` was written from.
+@quotable
+world_at(inv_view_projection: mat4, uv: vec2, depth: float) -> vec3 {
+    world = mul(inv_view_projection, vec4(vec3(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth_clip(depth)), 1.0))
+    return xyz(world) / world.w
+}
+
+// Interleaved gradient noise: a different turn of the sample spiral at every
+// pixel, so the twelve samples read as grain and not as a pattern.
+@quotable
+dither(pixel: vec2) -> float {
+    return fract(52.9829189 * fract(dot_v2(pixel, vec2(0.06711056, 0.00583715))))
+}
+
+ssao(depth: Texture, screen_size: vec2, radius: float, intensity: float, inv_view_projection: mat4,
+     view_projection: mat4, view_pos: vec3) -> *GpuShader {
+    return fragment("ssao") quote | uv_in: vec2 | {
+        fc = frag_coord()
+        uv = vec2(fc.x / screen_size.x, fc.y / screen_size.y)
+        d = texture(depth, uv).x
+        p = world_at(inv_view_projection, uv, d)
+        if d >= 0.99999 || intensity <= 0.0 {
+            return vec4(vec3(1.0, 0.0, 0.0), 1.0)
+        }
+        // The surface's normal from the slope of its own depth: the
+        // neighbour a pixel over on each axis, whichever of the two sides is
+        // nearer in depth, so a silhouette does not bend the normal of what
+        // stands in front of it. Oriented by the screen's axes and not by
+        // facing it toward the camera: at a grazing view of a rough surface
+        // the two are a hair apart, and facing it flipped one pixel in fifty
+        // into the ground.
+        px = vec2(1.0 / screen_size.x, 1.0 / screen_size.y)
+        ul = uv - vec2(px.x, 0.0)
+        dl = texture(depth, ul).x
+        pl = world_at(inv_view_projection, ul, dl)
+        ur = uv + vec2(px.x, 0.0)
+        dr = texture(depth, ur).x
+        pr = world_at(inv_view_projection, ur, dr)
+        // The neighbours below and above on the screen, whichever way the
+        // screen's y runs: a tie between the two then picks the same
+        // neighbour on both backends (#494).
+        above = vec2(0.0, px.y * screen_y_sign())
+        ud = uv - above
+        dd = texture(depth, ud).x
+        pd = world_at(inv_view_projection, ud, dd)
+        uu = uv + above
+        du = texture(depth, uu).x
+        pu = world_at(inv_view_projection, uu, du)
+        dx = if (abs(dl - d) < abs(dr - d)) { p - pl } else { pr - p }
+        dy = if (abs(dd - d) < abs(du - d)) { p - pd } else { pu - p }
+        n = normalize(cross(dx, dy))
+        eye = distance(view_pos, p)
+
+        up = if (abs(n.y) < 0.99) { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
+        t = normalize(cross(up, n))
+        b = cross(n, t)
+        // Counted from the same corner on both backends, so the grain the two
+        // draw is the same grain.
+        pixel = if (screen_y_sign() < 0.0) { vec2(fc.x, screen_size.y - fc.y) } else { fc }
+        turn = dither(pixel) * 6.2831853
+
+        occlusion = 0.0
+        i = 0.0
+        while i < 12.0 {
+            f = (i + 0.5) / 12.0
+            i = i + 1.0
+            a = turn + f * 15.0796     // two and a bit turns of a spiral
+            r = sqrt(f)
+            h = sqrt(1.0 - r * r)      // cosine-weighted over the hemisphere
+            dir = t * (cos(a) * r) + b * (sin(a) * r) + n * h
+            // More samples close in, where a step or a foot shadows, and a
+            // few out to the full radius.
+            reach = radius * mix(0.1, 1.0, f * f)
+            s = p + dir * reach
+            clip = mul(view_projection, vec4(s, 1.0))
+            if clip.w <= 0.0 {
+                continue
+            }
+            suv = vec2(clip.x / clip.w * 0.5 + 0.5, clip.y / clip.w * 0.5 + 0.5)
+            if suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0 {
+                continue
+            }
+            sd = texture(depth, suv).x
+            scene_dist = distance(view_pos, world_at(inv_view_projection, suv, sd))
+            sample_dist = distance(view_pos, s)
+            // The sample is inside something when the scene is nearer the
+            // eye along its line than the sample is; the tolerance keeps a
+            // flat floor from shadowing itself, and grows with distance.
+            if sample_dist - scene_dist > 0.03 * reach + eye * 0.01 {
+                // Only a neighbour: what stands far in front of the point --
+                // a branch over a field -- is not touching it.
+                occlusion = occlusion + smoothstep(0.0, 1.0, radius / max(abs(eye - scene_dist), 0.0001))
+            }
+        }
+        occlusion = occlusion / 12.0
+        ao = clamp(1.0 - occlusion * intensity, 0.0, 1.0)
+        // Gone in the distance, where the radius is a few pixels and the
+        // depth has no room left to tell a corner from a plane.
+        ao = mix(ao, 1.0, smoothstep(radius * 40.0, radius * 120.0, eye))
+        return vec4(vec3(ao, mul(view_projection, vec4(p, 1.0)).w, 0.0), 1.0)
+    }
+}

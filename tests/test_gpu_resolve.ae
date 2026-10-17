@@ -1,0 +1,229 @@
+// ae3d.shaders.resolve through ae3d.gpu: the multisampled scene's colour
+// resolved, written with `quote`.
+//
+//   - color_resolve comes out as the GLSL in tests/fixtures/gpu/
+//     color_resolve.frag for Vulkan and color_resolve_gl.frag for OpenGL 4.1:
+//     its sample count and exposure in the block, one sampler2DMS read a
+//     sample at a time; glslang compiles the first (and its vertex shader) to
+//     SPIR-V that spirv-val passes, and takes the second as OpenGL's GLSL;
+//   - the CPU back end resolves every pixel of an HDR image with a hot sample
+//     at an edge to the samples' mean weighed by 1 / (1 + luma * exposure),
+//     as worked out here in doubles, to f32 rounding; the hot pixel comes out
+//     far below its plain mean, which is what the weighing is for.
+//
+// On a GPU, the resolve is drawn when the frame has more than one sample:
+// tests/test_backend_parity and every suite drawn with MSAA.
+// AE3D_GPU_WRITE_GOLDEN=1 writes the fixtures from what is emitted.
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.quote
+import ae3d.gpu
+import ae3d.shaders.resolve
+import ae3d.shaderlib (ShaderImageMS, image_set, image_channel, image_ms_new, image_ms_sample, image_ms_free,
+                       texture_ms_of)
+
+extern exit(code: int)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+absf(a: float) -> float { if a < 0.0 { return 0.0 - a } return a }
+
+// glslang -V over `text` (as `stage`), then spirv-val; or, for desktop
+// OpenGL's GLSL (`opengl`), glslang's check of it. Skipped where they are
+// not on PATH.
+compiles(label: string, text: string, stage: string, opengl: bool) {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+        if status != 0 { println(out) }
+        return
+    }
+    check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    if status != 0 { println(out) }
+    if string.length(os.which("spirv-val")) == 0 {
+        println("  skip spirv-val (not on PATH)")
+        return
+    }
+    vargv = list.new()
+    list.add(vargv, spv)
+    vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+    check("spirv-val passes ${label}.${stage}", vstatus == 0)
+    if vstatus != 0 { println(vout) }
+    list.free(vargv)
+}
+
+// `text` is the fixture at `path`; AE3D_GPU_WRITE_GOLDEN=1 writes it.
+golden_is(text: string, path: string) {
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(path, text)
+        check("${path} written", werr == "")
+    }
+    golden, gerr = file.read(path)
+    check("${path} is there", gerr == "")
+    check("the GLSL written is ${path}", text == golden)
+    if text != golden {
+        println("--- emitted ---")
+        println(text)
+    }
+}
+
+
+const W = 11
+const H = 6
+const SAMPLES = 4
+const EXPOSURE = 1.7
+
+// An HDR scene: a gradient, a pixel whose one sample is a lamp (40 times as
+// bright as the rest), and an edge where half the samples see each side.
+make_scene() -> *ShaderImageMS {
+    ms = image_ms_new(W, H, SAMPLES)
+    y = 0
+    while y < H {
+        x = 0
+        while x < W {
+            k = 0
+            while k < SAMPLES {
+                r = 0.05 + 0.09 * x + 0.011 * k
+                g = 0.3 + 0.07 * y
+                b = 0.6 - 0.04 * x + 0.02 * k
+                if x == 7 && k >= 2 {
+                    r = 0.02
+                    g = 0.03
+                    b = 0.01
+                }
+                if x == 3 && y == 2 && k == 1 {
+                    r = 40.0
+                    g = 36.0
+                    b = 30.0
+                }
+                image_set(image_ms_sample(ms, k), x, y, r, g, b, 1.0)
+                k = k + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return ms
+}
+
+// Channel `c` of the resolve at x, y as it should be, in doubles; `weighed`
+// false gives the plain mean.
+resolved(ms: *ShaderImageMS, x: int, y: int, c: int, weighed: bool) -> float {
+    sum = 0.0
+    weights = 0.0
+    k = 0
+    while k < SAMPLES {
+        img = image_ms_sample(ms, k)
+        luma = (image_channel(img, x, y, 0) * 0.2126 + image_channel(img, x, y, 1) * 0.7152 +
+                image_channel(img, x, y, 2) * 0.0722) * EXPOSURE
+        w = 1.0
+        if weighed { w = 1.0 / (1.0 + luma) }
+        sum = sum + image_channel(img, x, y, c) * w
+        weights = weights + w
+        k = k + 1
+    }
+    return sum / weights
+}
+
+main() {
+    println("ae3d.gpu: color_resolve written with quote")
+    ms = make_scene()
+    s = resolve.color_resolve(texture_ms_of(ms), SAMPLES, EXPOSURE)
+    check("its sample count and exposure in the block, one sampler, the colour",
+          gpu.params_count(s) == 2 && gpu.params_name(s, 0) == "samples" && gpu.params_name(s, 1) == "exposure" &&
+          gpu.samplers_count(s) == 1 && gpu.samplers_name(s, 0) == "colour")
+
+    frag = gpu.emit_glsl(s, gpu.VULKAN)
+    if frag == "" { println("  emit: ${gpu.last_error()}") }
+    golden_is(frag, "tests/fixtures/gpu/color_resolve.frag")
+    check("a sampler2DMS read a sample at a time",
+          string.contains(frag, "uniform sampler2DMS colour;") != 0 &&
+          string.contains(frag, "texelFetch(colour, ivec2(gl_FragCoord.xy), s)") != 0)
+    compiles("color_resolve", frag, "frag", false)
+    compiles("color_resolve", gpu.emit_screen_vertex(s, gpu.VULKAN), "vert", false)
+    gl_frag = gpu.emit_glsl(s, gpu.GL)
+    if gl_frag == "" { println("  emit: ${gpu.last_error()}") }
+    golden_is(gl_frag, "tests/fixtures/gpu/color_resolve_gl.frag")
+    compiles("color_resolve_gl", gl_frag, "frag", true)
+
+    // ── The CPU: every pixel, every channel ──
+    cx = gpu.cpu_new(s)
+    gpu.cpu_set_viewport(cx, W, H)
+    worst = 0.0
+    ran = 0
+    hot = 0.0
+    y = 0
+    while y < H {
+        x = 0
+        while x < W {
+            uv = gpu.v2((x + 0.5) / W, (y + 0.5) / H)
+            got = gpu.cpu_run(cx, uv)
+            heap.free(uv)
+            if got != null && gpu.val_n(got) == 4 {
+                ran = ran + 1
+                c = 0
+                while c < 4 {
+                    v = gpu.val_x(got)
+                    if c == 1 { v = gpu.val_y(got) }
+                    if c == 2 { v = gpu.val_z(got) }
+                    if c == 3 { v = gpu.val_w(got) }
+                    want = resolved(ms, x, y, c, true)
+                    d = absf(v - want) / (1.0 + absf(want))
+                    if d > worst { worst = d }
+                    if x == 3 && y == 2 && c == 0 { hot = v }
+                    c = c + 1
+                }
+            } else {
+                println("  cpu_run failed: ${gpu.last_error()}")
+            }
+            if got != null { heap.free(got) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    check("the CPU resolves every pixel (${ran} of ${W * H})", ran == W * H)
+    check("each sample weighed by its brightness, to f32 rounding (worst ${worst})", worst < 0.000002)
+    plain = resolved(ms, 3, 2, 0, false)
+    check("the lamp's pixel well under its plain mean (${hot} against ${plain})", hot < plain * 0.25)
+    gpu.cpu_free(cx)
+    gpu.shader_free(s)
+    image_ms_free(ms)
+
+    if g_failures > 0 {
+        println("resolve: ${g_failures} of ${g_checks} checks failed")
+        exit(1)
+    }
+    println("resolve: all checks passed (${g_checks})")
+}

@@ -44,7 +44,11 @@ import ae3d.gpu (GpuShader)
 import ae3d.shaders.fxaa
 import ae3d.shaders.bloom
 import ae3d.shaders.depth
-import ae3d.shaderlib (vec2, Texture)
+import ae3d.shaders.resolve
+import ae3d.shaders.taa
+import ae3d.shaders.ssao
+import ae3d.shaders.ssr
+import ae3d.shaderlib (vec2, vec3, Texture, TextureMS, zero_mat4)
 import std.io
 
 exports (
@@ -55,7 +59,7 @@ exports (
     offscreen_width, offscreen_height, draw, draw_range, set_additive, draw_indirect, draw_cut, draw_pulled, draw_sky, cloud_pass, set_screen_quad, set_blend, set_normal_map, set_pose_bank, set_damage_mask,
     set_face_culling, set_shadows, shadows, shadow_begin, shadow_draw, shadow_end, shadow_viewport, shadow_done,
     lamp_shadow_begin, lamp_shadow_tile, lamp_static_begin, lamp_copy, lamp_shadow_generation,
-    clusters_reserve, clusters_lights, clusters_words, set_post, post_active, set_frame_exposure, frame_exposure, composited, screen_pass,
+    clusters_reserve, clusters_lights, clusters_words, set_post, post_active, set_frame_exposure, frame_exposure, composited, screen_pass, quoted_screen_pass, quoted_hash,
     set_bloom_intensity, bloom_intensity, draw_calls, pass_ms, pipeline_binds, set_binds, sample_count,
     set_samples, set_scene_depth, scene_depth_ready, resolve_scene_depth, velocity_texture, set_render_scale,
     render_scale, set_taa, taa, taa_history, set_ssr, ssr, set_ssr_params, ssr_road_height, ssr_strength, set_ssao, ssao, ssao_radius,
@@ -185,9 +189,19 @@ var g_fxaa_pass: ptr = null
 // the pyramid's levels drawn from one ring of sets.
 var g_bloom_down_pass: ptr = null
 // The scene's depth copied into the camera-depth target when the frame has
-// one sample (ae3d.shaders.depth); a frame with more resolves them through
-// vkpipes.depth_resolve.
+// one sample, and resolved into it (the nearest of a pixel's samples) when
+// it has more (ae3d.shaders.depth).
 var g_depth_copy_pass: ptr = null
+var g_depth_resolve_pass: ptr = null
+// The multisampled scene's colour resolved into the scene texture, each
+// sample weighed by how bright it shows (ae3d.shaders.resolve).
+var g_colour_resolve_pass: ptr = null
+// The temporal pass (ae3d.shaders.taa): this frame folded into the history.
+var g_taa_pass: ptr = null
+// The screen's occlusion (ae3d.shaders.ssao).
+var g_ssao_pass: ptr = null
+// The wet road's reflection (ae3d.shaders.ssr).
+var g_ssr_pass: ptr = null
 // A quoted draw's textures, in its shader's order, at most QUOTED_TEXTURES.
 const QUOTED_TEXTURES = 4
 var g_quoted_views: ptr = null
@@ -215,11 +229,6 @@ var g_scene_depth_wanted = false
 
 // The post chain's own sets, per frame slot, written every draw, dropped
 // when the camera depth they bind is remade (vktargets.camdepth_serial).
-var g_ssr_sets: ptr = null         // VkDescriptorSet[FRAMES]
-var g_ssao_sets: ptr = null
-var g_resolve_sets: ptr = null
-var g_colour_resolve_sets: ptr = null
-var g_taa_sets: ptr = null         // VkDescriptorSet[2 * FRAMES]
 var g_show_sets: ptr = null
 var g_sets_serial = 0 - 1
 
@@ -279,11 +288,6 @@ scratch() {
     g_pass_ms = calloc(STAGES, 8)
     g_ticks = calloc(STAMPS, 8)
     g_scene_clear = calloc(4, 4)
-    g_ssr_sets = calloc(FRAMES, 8)
-    g_ssao_sets = calloc(FRAMES, 8)
-    g_resolve_sets = calloc(FRAMES, 8)
-    g_colour_resolve_sets = calloc(FRAMES, 8)
-    g_taa_sets = calloc(2 * FRAMES, 8)
     g_show_sets = calloc(FRAMES, 8)
     g_dlss_camera = calloc(1, DLSS_CAMERA_BYTES)
     g_dlss_images = calloc(4, DLSS_IMAGE_BYTES)
@@ -664,6 +668,33 @@ start(width: int, height: int) -> bool {
     if g_depth_copy_pass != null {
         vkquote.set_image_layout(g_depth_copy_pass as *QuotedPass, vk.IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
     }
+    g_depth_resolve_pass = vkquote.pass_new(depth.depth_resolve(TextureMS { image: null }, 1),
+                                            vkspirv.DEPTH_RESOLVE_QUOTED_VERT, vkspirv.DEPTH_RESOLVE_QUOTED_FRAG,
+                                            vkspirv.DEPTH_RESOLVE_QUOTED_HASH, vktargets.camdepth_pass(), 1) as ptr
+    if g_depth_resolve_pass != null {
+        vkquote.set_image_layout(g_depth_resolve_pass as *QuotedPass, vk.IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+    }
+    g_colour_resolve_pass = vkquote.pass_new(resolve.color_resolve(TextureMS { image: null }, 1, 1.0),
+                                             vkspirv.COLOR_RESOLVE_QUOTED_VERT, vkspirv.COLOR_RESOLVE_QUOTED_FRAG,
+                                             vkspirv.COLOR_RESOLVE_QUOTED_HASH, vktargets.hdr_pass(), 1) as ptr
+    // A multisampled frame is shown through its resolve: without one there
+    // is no frame, as without the composite.
+    if vktargets.samples() != vk.SAMPLE_COUNT_1_BIT && g_colour_resolve_pass == null {
+        vkdevice.fail("colour resolve pass failed")
+        return false
+    }
+    g_taa_pass = vkquote.pass_new(taa.taa(Texture { image: null }, Texture { image: null }, Texture { image: null },
+                                          vec2(0.0, 0.0), 1.0, 1.0),
+                                  vkspirv.TAA_QUOTED_VERT, vkspirv.TAA_QUOTED_FRAG, vkspirv.TAA_QUOTED_HASH,
+                                  vktargets.hdr_pass(), 1) as ptr
+    g_ssao_pass = vkquote.pass_new(ssao.ssao(Texture { image: null }, vec2(0.0, 0.0), 0.0, 0.0, zero_mat4(), zero_mat4(),
+                                             vec3(0.0, 0.0, 0.0)),
+                                   vkspirv.SSAO_QUOTED_VERT, vkspirv.SSAO_QUOTED_FRAG, vkspirv.SSAO_QUOTED_HASH,
+                                   vktargets.hdr_pass(), 1) as ptr
+    g_ssr_pass = vkquote.pass_new(ssr.ssr(Texture { image: null }, Texture { image: null }, Texture { image: null }, 0.0,
+                                          0.0, zero_mat4(), zero_mat4(), vec3(0.0, 0.0, 0.0)),
+                                  vkspirv.SSR_QUOTED_VERT, vkspirv.SSR_QUOTED_FRAG, vkspirv.SSR_QUOTED_HASH,
+                                  vktargets.hdr_pass(), 1) as ptr
     if g_dlss_loaded {
         g_dlss_supported = ae3d_dlss_supported(vkdevice.physical()) == 1
         if !g_dlss_supported { io.stderr_write("ae3d: DLSS: ${ae3d_dlss_last_error()}\n") }
@@ -716,6 +747,16 @@ shutdown() {
     g_bloom_up_pass = null
     vkquote.pass_free(g_depth_copy_pass as *QuotedPass)
     g_depth_copy_pass = null
+    vkquote.pass_free(g_depth_resolve_pass as *QuotedPass)
+    g_depth_resolve_pass = null
+    vkquote.pass_free(g_colour_resolve_pass as *QuotedPass)
+    g_colour_resolve_pass = null
+    vkquote.pass_free(g_taa_pass as *QuotedPass)
+    g_taa_pass = null
+    vkquote.pass_free(g_ssao_pass as *QuotedPass)
+    g_ssao_pass = null
+    vkquote.pass_free(g_ssr_pass as *QuotedPass)
+    g_ssr_pass = null
     free(g_quoted_views)
     free(g_quoted_samplers)
     g_quoted_views = null
@@ -759,11 +800,6 @@ post_sets_current() {
     serial = vktargets.camdepth_serial()
     if serial == g_sets_serial { return }
     g_sets_serial = serial
-    memset(g_ssr_sets, 0, (FRAMES * 8) as long)
-    memset(g_ssao_sets, 0, (FRAMES * 8) as long)
-    memset(g_resolve_sets, 0, (FRAMES * 8) as long)
-    memset(g_colour_resolve_sets, 0, (FRAMES * 8) as long)
-    memset(g_taa_sets, 0, (2 * FRAMES * 8) as long)
 }
 
 // The camera depth made at the scene's size where something reads it and
@@ -1361,6 +1397,44 @@ screen_pass(pass: @keep ptr, framebuffer: @keep ptr, w: int, h: int, pipeline: @
     g_damage_mask = mask_was
 }
 
+// The hash the SPIR-V of the quoted shader `name` (fxaa, sky_filter, ...)
+// was made from, as ae3d.vkspirv holds it; 0 for a name it has not. For
+// tests/test_quoted_hashes, which holds each tree built in the engine's
+// company to it: a program importing ae3d.vkspirv itself takes its memcpy
+// declaration for every module's.
+quoted_hash(name: string) -> long {
+    match name {
+        "fxaa" -> { return vkspirv.FXAA_QUOTED_HASH }
+        "bloom_down" -> { return vkspirv.BLOOM_DOWN_QUOTED_HASH }
+        "bloom_up" -> { return vkspirv.BLOOM_UP_QUOTED_HASH }
+        "depth_copy" -> { return vkspirv.DEPTH_COPY_QUOTED_HASH }
+        "depth_resolve" -> { return vkspirv.DEPTH_RESOLVE_QUOTED_HASH }
+        "color_resolve" -> { return vkspirv.COLOR_RESOLVE_QUOTED_HASH }
+        "taa" -> { return vkspirv.TAA_QUOTED_HASH }
+        "ssao" -> { return vkspirv.SSAO_QUOTED_HASH }
+        "ssr" -> { return vkspirv.SSR_QUOTED_HASH }
+        "sky_filter" -> { return vkspirv.SKY_FILTER_QUOTED_HASH }
+        "sky_irradiance" -> { return vkspirv.SKY_IRRADIANCE_QUOTED_HASH }
+        _ -> { return 0 as long }
+    }
+    return 0 as long
+}
+
+// A full-screen draw of the frame's own through a quoted pass, as
+// screen_pass draws through a pipeline: `p`'s `draw`th draw this frame into
+// `framebuffer`, `w` by `h`, sampling `texture` (ae3d.vksky's sky light).
+quoted_screen_pass(pass: @keep ptr, framebuffer: @keep ptr, w: int, h: int, p: ptr, draw: int, texture: int) {
+    if !vkhost.recording() || vkhost.pass_open() || p == null || framebuffer == null || !vktexture.valid(texture) { return }
+    begin_pass(pass, framebuffer, w, h, 0)
+    vkhost.set_pass_open(true)
+    viewport(w, h)
+    counted = g_draw_calls
+    draw_quoted(p as *QuotedPass, draw, vktexture.view(texture), vktexture.sampler_of(texture))
+    g_draw_calls = counted
+    vk.vkCmdEndRenderPass(commands_now())
+    vkhost.set_pass_open(false)
+}
+
 // The opaque draws are done: the renderer says so before the sky, which
 // is drawn after them so the depth test spares it the pixels they cover.
 mark_opaque_done() {
@@ -1706,10 +1780,10 @@ draw_screen(pipeline: @keep ptr, sets: ptr, slot: int, colour: int) {
 // (an impostor) or a near figure's real silhouette without paying for it
 // again.
 // Whether the frame's depth can be put in the camera-depth target: by the
-// quoted copy with one sample, by the resolve pipeline with more.
+// quoted copy with one sample, by the quoted resolve with more.
 depth_resolvable() -> bool {
     if vktargets.samples() == vk.SAMPLE_COUNT_1_BIT { return g_depth_copy_pass != null }
-    return vkpipes.depth_resolve() != null
+    return g_depth_resolve_pass != null
 }
 
 resolve_scene_depth() -> bool {
@@ -1729,10 +1803,10 @@ resolve_scene_depth() -> bool {
     if vktargets.samples() == vk.SAMPLE_COUNT_1_BIT {
         draw_quoted(g_depth_copy_pass as *QuotedPass, 0, vktargets.depth_view(), vktargets.camdepth_sampler())
     } else {
-        ((vkdesc.block(vkdesc.PROGRAM_SCENE) + vkscene.OFF_DEPTHSAMPLECOUNT) as int[])[0] = vktargets.samples()
-        vkdesc.set_program(vkdesc.PROGRAM_SCENE)
-        draw_screen_with(vkpipes.depth_resolve(), g_resolve_sets, g_frame, vktargets.depth_view(), vktargets.camdepth_sampler(),
-                         vk.IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, null, null)
+        p = g_depth_resolve_pass as *QuotedPass
+        // A sample count's flag bit is the count (VK_SAMPLE_COUNT_4_BIT is 4).
+        _n = gpu.set_int(vkquote.shader(p), "samples", vktargets.samples())
+        draw_quoted(p, 0, vktargets.depth_view(), vktargets.camdepth_sampler())
     }
     vk.vkCmdEndRenderPass(commands_now())
     vkhost.set_pass_open(false)
@@ -1824,17 +1898,27 @@ taa_history() -> bool { return g_taa_enabled && vktargets.taa_history_valid() }
 // where each surface was then. Only where there is a last frame's depth of
 // the camera depth's present size; true when the map holds this frame's.
 occlusion_pass() -> bool {
-    if !vkhost.recording() || vkhost.pass_open() || !g_ssao_enabled || vkpipes.ssao() == null || g_capture_bypass { return false }
+    if !vkhost.recording() || vkhost.pass_open() || !g_ssao_enabled || g_ssao_pass == null || g_capture_bypass { return false }
     if !g_occlusion_history || vktargets.occlusion_framebuffer() == null || vktargets.camdepth_view() == null { return false }
-    block_float(vkscene.OFF_SSAORADIUS, g_ssao_radius)
-    block_float(vkscene.OFF_SSAOINTENSITY, g_ssao_intensity)
-    vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+    // The camera as the scene block holds it now, Vulkan's clip correction
+    // in its matrices: what the pass read from the block before it was
+    // quoted, at the same moment.
+    s = vkquote.shader(g_ssao_pass as *QuotedPass)
+    block = vkdesc.block(vkdesc.PROGRAM_SCENE)
+    size = (block + vkscene.OFF_SCREENSIZE) as f32[]
+    eye = (block + vkscene.OFF_VIEWPOS) as f32[]
+    _r = gpu.set_float(s, "radius", g_ssao_radius)
+    _i = gpu.set_float(s, "intensity", g_ssao_intensity)
+    _z = gpu.set_vec2(s, "screen_size", size[0] as float, size[1] as float)
+    _e = gpu.set_vec3(s, "view_pos", eye[0] as float, eye[1] as float, eye[2] as float)
+    _v = gpu.set_mat4_f32(s, "view_projection", block + vkscene.OFF_VIEWPROJECTION)
+    _n = gpu.set_mat4_f32(s, "inv_view_projection", block + vkscene.OFF_INVVIEWPROJECTION)
     w = vktargets.render_width()
     h = vktargets.render_height()
     begin_pass(vktargets.hdr_pass(), vktargets.occlusion_framebuffer(), w, h, 0)
     vkhost.set_pass_open(true)
     viewport(w, h)
-    draw_screen(vkpipes.ssao(), g_ssao_sets, g_frame, g_default_texture)
+    draw_quoted(g_ssao_pass as *QuotedPass, 0, vktargets.camdepth_view(), vktargets.camdepth_sampler())
     vk.vkCmdEndRenderPass(commands_now())
     vkhost.set_pass_open(false)
     return true
@@ -1858,10 +1942,7 @@ setup_post_uniforms() {
     bloom = 0
     if g_bloom && !g_capture_bypass { bloom = 1 }
     block_int(vkscene.OFF_ENABLEBLOOM, bloom)
-    block_int(vkscene.OFF_COLORSAMPLECOUNT, vktargets.samples())
     block_float(vkscene.OFF_BLOOMINTENSITY, g_bloom_intensity)
-    block_float(vkscene.OFF_SSRROADHEIGHT, g_ssr_road_height)
-    block_float(vkscene.OFF_SSRSTRENGTH, g_ssr_strength)
     vkdesc.set_program(vkdesc.PROGRAM_SCENE)
 }
 
@@ -1955,6 +2036,19 @@ draw_quoted2(p: *QuotedPass, draw: int, view: @keep ptr, sampler: @keep ptr, vie
     (g_quoted_samplers as ptr[])[0] = sampler
     (g_quoted_views as ptr[])[1] = view2
     (g_quoted_samplers as ptr[])[1] = sampler2
+    draw_quoted_with(p, draw)
+}
+
+// The same sampling three, `view` at binding 1, `view2` at 2, `view3` at 3.
+draw_quoted3(p: *QuotedPass, draw: int, view: @keep ptr, sampler: @keep ptr, view2: @keep ptr, sampler2: @keep ptr, view3: @keep ptr,
+             sampler3: @keep ptr) {
+    quoted_cells()
+    (g_quoted_views as ptr[])[0] = view
+    (g_quoted_samplers as ptr[])[0] = sampler
+    (g_quoted_views as ptr[])[1] = view2
+    (g_quoted_samplers as ptr[])[1] = sampler2
+    (g_quoted_views as ptr[])[2] = view3
+    (g_quoted_samplers as ptr[])[2] = sampler3
     draw_quoted_with(p, draw)
 }
 
@@ -2076,15 +2170,18 @@ bloom_up_pass(framebuffer: @keep ptr, w: int, h: int, draw: int, sum: int, tw: i
 // shader, each sample weighed by how bright it shows. Nothing when the frame
 // has one sample: the scene was drawn into the scene texture itself.
 resolve_scene_colour() {
-    if vktargets.samples() == vk.SAMPLE_COUNT_1_BIT || vkpipes.post(2) == null { return }
+    if vktargets.samples() == vk.SAMPLE_COUNT_1_BIT || g_colour_resolve_pass == null { return }
     if vktargets.resolve_framebuffer() == null || vktargets.colour_samples_view() == null { return }
     rw = vktargets.render_width()
     rh = vktargets.render_height()
     begin_pass(vktargets.hdr_pass(), vktargets.resolve_framebuffer(), rw, rh, 0)
     vkhost.set_pass_open(true)
     viewport(rw, rh)
-    draw_screen_with(vkpipes.post(2), g_colour_resolve_sets, g_frame, vktargets.colour_samples_view(), g_nearest_sampler,
-                     vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, null, null)
+    p = g_colour_resolve_pass as *QuotedPass
+    s = vkquote.shader(p)
+    _n = gpu.set_int(s, "samples", vktargets.samples())
+    _e = gpu.set_float(s, "exposure", g_frame_exposure)
+    draw_quoted(p, 0, vktargets.colour_samples_view(), g_nearest_sampler)
     vk.vkCmdEndRenderPass(commands_now())
     vkhost.set_pass_open(false)
 }
@@ -2107,7 +2204,6 @@ frame_end() -> bool {
     vk.vkCmdEndRenderPass(commands)
     vkhost.set_pass_open(false)
     stamp_through(8)
-    slot = g_frame
 
     if g_post_active {
         post_sets_current()
@@ -2119,7 +2215,7 @@ frame_end() -> bool {
         // targets are made. It mirrors the scene into the intermediate; the
         // composite then reads that instead of the scene colour, so the
         // bloom it does picks up the mirrored lamps as well.
-        ssr_now = g_ssr_enabled && !g_capture_bypass && vkpipes.post(3) != null && vktargets.ssr_framebuffer() != null &&
+        ssr_now = g_ssr_enabled && !g_capture_bypass && g_ssr_pass != null && vktargets.ssr_framebuffer() != null &&
                   vktargets.camdepth_framebuffer() != null && vktargets.ssr_reflect_texture() > 0 && g_bloom_down_pass != null
         if ssr_now {
             // The scene at half its size and a quarter, for the
@@ -2141,8 +2237,19 @@ frame_end() -> bool {
             vkhost.set_pass_open(true)
             viewport(rw, rh)
             post = vktargets.post_texture()
-            draw_screen_with(vkpipes.post(3), g_ssr_sets, slot, vktexture.view(post), vktexture.sampler_of(post),
-                             vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vktexture.view(from), vktexture.sampler_of(from))
+            // The camera as the scene block holds it, as the pass read it
+            // there before it was quoted.
+            ssr_shader = vkquote.shader(g_ssr_pass as *QuotedPass)
+            scene_block = vkdesc.block(vkdesc.PROGRAM_SCENE)
+            eye = (scene_block + vkscene.OFF_VIEWPOS) as f32[]
+            _st = gpu.set_float(ssr_shader, "strength", g_ssr_strength)
+            _rh = gpu.set_float(ssr_shader, "road_height", g_ssr_road_height)
+            _ey = gpu.set_vec3(ssr_shader, "view_pos", eye[0] as float, eye[1] as float, eye[2] as float)
+            _vp = gpu.set_mat4_f32(ssr_shader, "view_projection", scene_block + vkscene.OFF_VIEWPROJECTION)
+            _iv = gpu.set_mat4_f32(ssr_shader, "inv_view_projection", scene_block + vkscene.OFF_INVVIEWPROJECTION)
+            draw_quoted3(g_ssr_pass as *QuotedPass, 0, vktexture.view(post), vktexture.sampler_of(post),
+                         vktargets.camdepth_view(), vktargets.camdepth_sampler(), vktexture.view(from),
+                         vktexture.sampler_of(from))
             vk.vkCmdEndRenderPass(commands)
             vkhost.set_pass_open(false)
         }
@@ -2165,14 +2272,13 @@ frame_end() -> bool {
         // The temporal pass: this frame folded into the history, written
         // into the other history texture, which the composite then reads and
         // the next frame reads back as its history.
-        if g_dlss_mode == 0 && g_taa_enabled && !g_capture_bypass && vkpipes.taa() != null && vktargets.taa_framebuffer(0) != null &&
+        if g_dlss_mode == 0 && g_taa_enabled && !g_capture_bypass && g_taa_pass != null && vktargets.taa_framebuffer(0) != null &&
            vktargets.taa_framebuffer(1) != null && vktargets.camdepth_framebuffer() != null && source > 0 {
             cur = vktargets.taa_current()
             old = 1 - cur
             history = vktargets.taa_texture(old)
             blend = 1.0
             if vktargets.taa_history_valid() { blend = 0.1 }
-            block_float(vkscene.OFF_TAABLEND, blend)
             begin_pass(vktargets.hdr_pass(), vktargets.taa_framebuffer(cur), rw, rh, 0)
             vkhost.set_pass_open(true)
             viewport(rw, rh)
@@ -2181,9 +2287,15 @@ frame_end() -> bool {
             // its place: the history texture has never been written, and
             // binding it undefined was an error on every such frame (#405).
             if !vktargets.taa_history_valid() { history = source }
-            draw_screen_with(vkpipes.taa(), g_taa_sets, cur * FRAMES + slot, vktexture.view(source),
-                             vktexture.sampler_of(source), vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                             vktexture.view(history), vktexture.sampler_of(history))
+            taa_shader = vkquote.shader(g_taa_pass as *QuotedPass)
+            _z = gpu.set_vec2(taa_shader, "screen_size", rw * 1.0, rh * 1.0)
+            _b = gpu.set_float(taa_shader, "blend", blend)
+            _e = gpu.set_float(taa_shader, "exposure", g_frame_exposure)
+            motion = vktargets.velocity_texture()
+            if motion == 0 { motion = g_default_texture }
+            draw_quoted3(g_taa_pass as *QuotedPass, 0, vktexture.view(source), vktexture.sampler_of(source),
+                         vktexture.view(motion), vktexture.sampler_of(motion), vktexture.view(history),
+                         vktexture.sampler_of(history))
             vk.vkCmdEndRenderPass(commands)
             vkhost.set_pass_open(false)
             source = vktargets.taa_texture(cur)
