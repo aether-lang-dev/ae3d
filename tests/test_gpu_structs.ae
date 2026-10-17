@@ -1,0 +1,489 @@
+// ae3d.gpu's structs (step 6, the sky family's pieces): what a shader with
+// varyings of its own, two outputs and a 3D texture is written with.
+//
+//   - a helper returning a struct is a GLSL struct and a function returning
+//     it (tests/fixtures/gpu/structs.frag): `out` parameters become struct
+//     returns; a literal that leaves a field out is refused;
+//   - a pixel shader returning a struct literal writes each field to the out
+//     at its place, out_colour at 0 and out_velocity at 1, and the CPU gives
+//     the struct back;
+//   - gpu.link matches the fields a pixel shader reads to a vertex shader's
+//     varyings by name and type: the pixel shader is written with those
+//     alone, at the vertex shader's locations; a field it does not hand on,
+//     one of another type, and `position` are refused, as is writing a pixel
+//     shader that takes varyings before it is linked;
+//   - a vertex shader's captures are a block of their own at set 1 (Vulkan),
+//     uniforms by name (OpenGL); the CPU runs it, a product of two captured
+//     matrices included;
+//   - texture_3d is a sampler3D, trilinear and wrapped on the CPU as
+//     shaderlib's texture_3d is in plain Aether;
+//   - the builtins the sky adds run on the CPU as shaderlib's do.
+//
+// glslang and spirv-val pass every shader written. AE3D_GPU_WRITE_GOLDEN=1
+// writes the fixtures.
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.lanes
+import std.quote
+import ae3d.gpu
+import ae3d.gpu (GpuShader, GpuVal, vertex, fragment)
+import ae3d.shaderlib
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture3D, ShaderImage3D, texture_3d, mul, mul_m4, m4_at,
+                       mul_transpose3, splat3, splat4, mix_v4, floor_v3, normalize_v2, xz, dot, xy, image3d_new, image3d_set, image3d_free, texture3d_of)
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+absf(a: float) -> float { if a < 0.0 { return 0.0 - a } return a }
+
+// glslang -V over `text` (as `stage`), then spirv-val; or, for desktop
+// OpenGL's GLSL (`opengl`), glslang's check of it. Skipped where they are
+// not on PATH.
+compiles(label: string, text: string, stage: string, opengl: bool) {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+        if status != 0 { println(out) }
+        return
+    }
+    check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    if status != 0 { println(out) }
+    if string.length(os.which("spirv-val")) == 0 {
+        println("  skip spirv-val (not on PATH)")
+        return
+    }
+    vargv = list.new()
+    list.add(vargv, spv)
+    vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+    check("spirv-val passes ${label}.${stage}", vstatus == 0)
+    if vstatus != 0 { println(vout) }
+    list.free(vargv)
+}
+
+// `text` is the fixture at `path`; AE3D_GPU_WRITE_GOLDEN=1 writes it.
+golden_is(text: string, path: string) {
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(path, text)
+        check("${path} written", werr == "")
+    }
+    golden, gerr = file.read(path)
+    check("${path} is there", gerr == "")
+    check("the GLSL written is ${path}", text == golden)
+    if text != golden {
+        println("--- emitted ---")
+        println(text)
+    }
+}
+
+// ── The shaders ───────────────────────────────────────────────────────
+
+// A sample of a cloud: what cloudDensity gave back, its density, and through
+// an `out` parameter how far up the layer the point is.
+struct Sample {
+    density: float
+    height: float
+}
+
+@quotable
+sample_at(p: vec3, thick: bool) -> Sample {
+    h = p.y * 0.5
+    if p.x <= 0.0 { return Sample { density: 0.0, height: h } }
+    d = p.x * 2.0
+    if thick { d = d + 1.0 }
+    return Sample { density: d, height: h }
+}
+
+// One that leaves a field out.
+@quotable
+sample_short(p: vec3) -> Sample {
+    return Sample { density: p.x }
+}
+
+struct SkyVertex {
+    position: vec3
+}
+struct SkyVaryings {
+    position: vec4
+    tex_coords: vec3
+    clip_now: vec4
+    clip_prev: vec4
+    layer: int
+}
+struct TwoOut {
+    colour: vec4
+    velocity: vec2
+}
+
+// A vertex shader with captures: the camera's matrices.
+sky_like_vertex(projection: mat4, view: mat4, prev: mat4) -> *GpuShader {
+    return vertex("sky_like") quote | v: SkyVertex | {
+        pos = mul(mul_m4(projection, view), vec4(v.position, 1.0))
+        return SkyVaryings { position: vec4(vec3(pos.x, pos.y, pos.w), pos.w), tex_coords: v.position, clip_now: pos,
+                             clip_prev: mul(prev, vec4(v.position, 0.0)), layer: 3 }
+    }
+}
+
+// A pixel shader of those varyings, two of them read, and two outputs.
+two_out(gain: float) -> *GpuShader {
+    return fragment("two_out") quote | f: SkyVaryings | {
+        s = sample_at(f.tex_coords, true)
+        c = vec4(f.tex_coords * s.density, s.height * gain)
+        return TwoOut { colour: c, velocity: xy(f.clip_prev) }
+    }
+}
+
+// The same in plain Aether: what the CPU is held to.
+two_out_reference(tex_coords: vec3, clip_prev: vec4, gain: float) -> TwoOut {
+    s = sample_at(tex_coords, true)
+    c = vec4(tex_coords * s.density, s.height * gain)
+    return TwoOut { colour: c, velocity: xy(clip_prev) }
+}
+
+struct OtherVaryings {
+    position: vec4
+    tex_coords: vec2
+    shade: float
+}
+// A pixel shader reading a varying the sky's vertex shader has as a vec3.
+wrong_type() -> *GpuShader {
+    return fragment("wrong_type") quote | f: OtherVaryings | { return vec4(vec3(f.tex_coords.x, f.tex_coords.y, 0.0), 1.0) }
+}
+// One reading a varying it does not hand on.
+missing() -> *GpuShader {
+    return fragment("missing") quote | f: OtherVaryings | { return splat4(f.shade) }
+}
+// One reading the clip position.
+reads_position() -> *GpuShader {
+    return fragment("reads_position") quote | f: OtherVaryings | { return f.position }
+}
+// One reading none: it links to any vertex shader.
+reads_none(level: float) -> *GpuShader {
+    return fragment("reads_none") quote | f: OtherVaryings | { return splat4(level) }
+}
+// A literal leaving a field out.
+short_literal() -> *GpuShader {
+    return fragment("short") quote | uv: vec2 | {
+        s = sample_short(vec3(uv.x, uv.y, 0.0))
+        return splat4(s.density + s.height)
+    }
+}
+
+// A 3D texture read, and the builtins the sky adds.
+sampled(shape: Texture3D, at: vec3) -> *GpuShader {
+    return fragment("sampled") quote | uv: vec2 | {
+        return texture_3d(shape, at + vec3(uv.x, uv.y, 0.0))
+    }
+}
+
+builtins(m: mat4, x: float) -> *GpuShader {
+    return fragment("builtins") quote | uv: vec2 | {
+        e = shaderlib.exp(x) + shaderlib.acos(x * 0.5) + shaderlib.asin(x * 0.25) + shaderlib.atan2(uv.y, uv.x - 1.0) +
+            shaderlib.tan(x * 0.3)
+        f = floor_v3(vec3(x * 3.7, -x * 2.2, uv.x * 9.1))
+        g = normalize_v2(xz(vec3(uv.x + 0.3, 1.0, uv.y - 0.6)))
+        t = mul_transpose3(m, vec3(uv.x, uv.y, 1.0))
+        h = m4_at(m, 2, 0) + m4_at(m, 1, 1)
+        w = mix_v4(splat4(e), vec4(f + t, h), 0.25)
+        return vec4(vec3(w.x + g.x, w.y + g.y, w.z), w.w + dot(splat3(0.5), t))
+    }
+}
+
+builtins_reference(m: mat4, x: float, uv: vec2) -> vec4 {
+    u = uv as f32x4
+    // shaderlib's by its module: a program that imports exp, sqrt ... by name
+    // loses ae3d.gpu's externs of the same names (Aether 0.822.0).
+    e = shaderlib.exp(x) + shaderlib.acos(x * 0.5) + shaderlib.asin(x * 0.25) + shaderlib.atan2(u.y, u.x - 1.0) +
+        shaderlib.tan(x * 0.3)
+    f = floor_v3(vec3(x * 3.7, -x * 2.2, u.x * 9.1))
+    g = normalize_v2(xz(vec3(u.x + 0.3, 1.0, u.y - 0.6)))
+    t = mul_transpose3(m, vec3(u.x, u.y, 1.0))
+    h = m4_at(m, 2, 0) + m4_at(m, 1, 1)
+    w = mix_v4(splat4(e), vec4(f + t, h), 0.25) as f32x4
+    gg = g as f32x4
+    return vec4(vec3(w.x + gg.x, w.y + gg.y, w.z), w.w + dot(splat3(0.5), t))
+}
+
+// A matrix whose every element is distinct.
+some_matrix(seed: float) -> mat4 {
+    cells = calloc(16, 8)
+    d = cells as float[]
+    k = 0
+    while k < 16 {
+        d[k] = seed + k * 0.37 - (k * k) * 0.021
+        k = k + 1
+    }
+    m = shaderlib.mat4_of(cells)
+    free(cells)
+    return m
+}
+
+lanes_of(v: vec4) -> f32x4 { return v as f32x4 }
+
+// How far the CPU's value `got` (4 lanes) is from `want`, the worst lane.
+apart(got: *GpuVal, want: vec4) -> float {
+    w = want as f32x4
+    worst = absf(gpu.val_x(got) - w.x)
+    if absf(gpu.val_y(got) - w.y) > worst { worst = absf(gpu.val_y(got) - w.y) }
+    if absf(gpu.val_z(got) - w.z) > worst { worst = absf(gpu.val_z(got) - w.z) }
+    if absf(gpu.val_w(got) - w.w) > worst { worst = absf(gpu.val_w(got) - w.w) }
+    return worst
+}
+
+main() {
+    println("ae3d.gpu: structs, varyings, outputs and 3D textures")
+
+    // The vertex shader and its captures.
+    p = some_matrix(0.1)
+    v = some_matrix(-0.4)
+    prev = some_matrix(0.7)
+    vs = sky_like_vertex(p, v, prev)
+    vk_vert = gpu.emit_vertex_glsl(vs, gpu.VULKAN, "", "")
+    if vk_vert == "" { println("  emit: ${gpu.last_error()}") }
+    golden_is(vk_vert, "tests/fixtures/gpu/structs.vert")
+    check("a vertex shader's captures in VertexParams at set 1, the varyings at their places, the int flat",
+          string.contains(vk_vert, "layout(std140, set = 1, binding = 0) uniform VertexParams {") != 0 &&
+          string.contains(vk_vert, "    mat4 projection;") != 0 &&
+          string.contains(vk_vert, "layout(location = 0) out vec3 tex_coords;") != 0 &&
+          string.contains(vk_vert, "layout(location = 2) out vec4 clip_prev;") != 0 &&
+          string.contains(vk_vert, "layout(location = 3) flat out int layer;") != 0 &&
+          string.contains(vk_vert, "vec4 pos = ((projection * view) * vec4(inPosition, 1.0));") != 0)
+    compiles("structs", vk_vert, "vert", false)
+    gl_vert = gpu.emit_vertex_glsl(vs, gpu.GL, "", "")
+    check("OpenGL's has its captures as uniforms by name", string.contains(gl_vert, "uniform mat4 prev;") != 0)
+    compiles("structs_gl", gl_vert, "vert", true)
+
+    // The CPU runs it: a corner of the cube through the product.
+    cv = gpu.cpu_new(vs)
+    corner = gpu.v3(1.0, -1.0, 1.0)
+    gpu.cpu_vertex_attr(cv, "position", corner)
+    ran = gpu.cpu_run_vertex(cv)
+    if !ran { println("  cpu_run_vertex: ${gpu.last_error()}") }
+    want_pos = mul(mul_m4(p, v), vec4(vec3(1.0, -1.0, 1.0), 1.0)) as f32x4
+    want_prev = mul(prev, vec4(vec3(1.0, -1.0, 1.0), 0.0)) as f32x4
+    pos = gpu.cpu_varying(cv, "position")
+    now = gpu.cpu_varying(cv, "clip_now")
+    pv = gpu.cpu_varying(cv, "clip_prev")
+    layer = gpu.cpu_varying(cv, "layer")
+    ok = ran && pos != null && now != null && pv != null && layer != null
+    if ok {
+        ok = absf(gpu.val_x(now) - want_pos.x) < 1e-4 && absf(gpu.val_w(now) - want_pos.w) < 1e-4 &&
+             gpu.val_z(pos) == gpu.val_w(now) && gpu.val_w(pos) == gpu.val_w(now) &&
+             absf(gpu.val_y(pv) - want_prev.y) < 1e-4 && gpu.val_x(layer) == 3.0
+    }
+    check("the CPU runs it, projection times view and the far plane's xyww, as plain Aether does", ok)
+    heap.free(corner)
+    gpu.cpu_free(cv)
+
+    // The pixel shader: unlinked it is refused; linked, written with its two
+    // varyings at the vertex shader's locations and its two outputs.
+    ps = two_out(0.75)
+    unlinked = gpu.emit_glsl(ps, gpu.VULKAN)
+    check("a pixel shader of varyings is not written before it is linked (${gpu.last_error()})",
+          unlinked == "" && string.contains(gpu.last_error(), "gpu.link") != 0)
+    check("gpu.link pairs it with the vertex shader", gpu.link(vs, ps))
+    check("its varyings at the vertex shader's locations (tex_coords 0, clip_prev 2; clip_now not read)",
+          gpu.varying_location(ps, "tex_coords") == 0 && gpu.varying_location(ps, "clip_prev") == 2 &&
+          gpu.varying_location(ps, "clip_now") == 0 - 1)
+    vk_frag = gpu.emit_glsl(ps, gpu.VULKAN)
+    if vk_frag == "" { println("  emit: ${gpu.last_error()}") }
+    golden_is(vk_frag, "tests/fixtures/gpu/structs.frag")
+    check("a helper's struct is a GLSL struct, built by its constructor in the declaration's order",
+          string.contains(vk_frag, "struct Sample {\n    float density;\n    float height;\n};") != 0 &&
+          string.contains(vk_frag, "Sample sample_at(vec3 p, bool thick) {") != 0 &&
+          string.contains(vk_frag, "return Sample(0.0, h);") != 0 &&
+          string.contains(vk_frag, "Sample s = sample_at(tex_coords, true);") != 0)
+    check("two outputs, each at its place, and only the varyings read",
+          string.contains(vk_frag, "layout(location = 0) out vec4 out_colour;") != 0 &&
+          string.contains(vk_frag, "layout(location = 1) out vec2 out_velocity;") != 0 &&
+          string.contains(vk_frag, "layout(location = 2) in vec4 clip_prev;") != 0 &&
+          string.contains(vk_frag, "clip_now") == 0 && string.contains(vk_frag, "FragColor") == 0 &&
+          string.contains(vk_frag, "out_velocity = clip_prev.xy;") != 0)
+    compiles("structs", vk_frag, "frag", false)
+    gl_frag = gpu.emit_glsl(ps, gpu.GL)
+    check("OpenGL's reads them by name", string.contains(gl_frag, "\nin vec3 tex_coords;\n") != 0)
+    compiles("structs_gl", gl_frag, "frag", true)
+    check("two outputs counted", gpu.outputs_count(ps) == 2)
+
+    // The CPU gives the struct back, as plain Aether makes it.
+    cp = gpu.cpu_new(ps)
+    worst = 0.0
+    right = 0
+    k = 0
+    while k < 8 {
+        tc = vec3(k * 0.3 - 1.0, 0.25 + k * 0.1, 0.5 - k * 0.05)
+        cp4 = vec4(vec3(k * 0.2, -0.3, 0.1), 2.0)
+        vary = gpu.vstruct()
+        t4 = tc as f32x4
+        c4 = cp4 as f32x4
+        gpu.val_set(vary, "tex_coords", gpu.v3(t4.x, t4.y, t4.z))
+        gpu.val_set(vary, "clip_prev", gpu.v4(c4.x, c4.y, c4.z, c4.w))
+        out = gpu.cpu_run(cp, vary)
+        if out == null { println("  cpu_run: ${gpu.last_error()}") }
+        want = two_out_reference(tc, cp4, 0.75)
+        if out != null && gpu.val_is_struct(out) {
+            colour = gpu.val_field(out, "colour")
+            vel = gpu.val_field(out, "velocity")
+            wv = want.velocity as f32x4
+            if colour != null && vel != null {
+                d = apart(colour, want.colour)
+                if d > worst { worst = d }
+                if d < 1e-6 && gpu.val_x(vel) == wv.x && gpu.val_y(vel) == wv.y { right = right + 1 }
+            }
+        }
+        gpu.val_free(out)
+        gpu.val_free(vary)
+        k = k + 1
+    }
+    check("the CPU returns both outputs as plain Aether does (${right} of 8, worst ${worst})", right == 8)
+    gpu.cpu_free(cp)
+
+    // What link refuses.
+    wt = wrong_type()
+    linked_wt = gpu.link(vs, wt)
+    check("a varying of another type is refused (${gpu.last_error()})",
+          !linked_wt && string.contains(gpu.last_error(), "reads tex_coords as a vec2") != 0)
+    gpu.shader_free(wt)
+    mi = missing()
+    linked_mi = gpu.link(vs, mi)
+    check("a varying the vertex shader does not hand on is refused (${gpu.last_error()})",
+          !linked_mi && string.contains(gpu.last_error(), "reads shade, which sky_like does not hand on") != 0)
+    gpu.shader_free(mi)
+    rp = reads_position()
+    linked_rp = gpu.link(vs, rp)
+    check("position is refused, it is gl_Position (${gpu.last_error()})",
+          !linked_rp && string.contains(gpu.last_error(), "reads position") != 0)
+    gpu.shader_free(rp)
+    rn = reads_none(0.5)
+    check("a pixel shader reading none links to the screen's vertex shader",
+          gpu.link(gpu.screen_vertex(), rn) && string.contains(gpu.emit_glsl(rn, gpu.VULKAN), "\nlayout(location = 0) out vec4 FragColor;\n") != 0)
+    check("and is drawn with the screen's vertex shader as it is",
+          gpu.emit_screen_vertex(rn, gpu.VULKAN) == gpu.emit_vertex_glsl(gpu.screen_vertex(), gpu.VULKAN, "", ""))
+    gpu.shader_free(rn)
+    sl = short_literal()
+    st = gpu.emit_glsl(sl, gpu.VULKAN)
+    check("a struct literal leaving a field out is refused (${gpu.last_error()})",
+          st == "" && string.contains(gpu.last_error(), "leaves out height") != 0)
+    gpu.shader_free(sl)
+
+    // texture_3d: a 4x4x4 picture with a gradient that wraps.
+    img = image3d_new(4, 4, 4)
+    z = 0
+    while z < 4 {
+        y = 0
+        while y < 4 {
+            x = 0
+            while x < 4 {
+                image3d_set(img, x, y, z, x * 0.25, y * 0.25, z * 0.25, ((x + y + z) % 3) * 0.5)
+                x = x + 1
+            }
+            y = y + 1
+        }
+        z = z + 1
+    }
+    shape = texture3d_of(img)
+    at = vec3(0.9, -0.2, 0.33)
+    sh = sampled(shape, at)
+    sv = gpu.emit_glsl(sh, gpu.VULKAN)
+    check("a Texture3D is a sampler3D, read by texture()",
+          string.contains(sv, "uniform sampler3D shape;") != 0 && string.contains(sv, "texture(shape, ") != 0)
+    compiles("sampled", sv, "frag", false)
+    cs = gpu.cpu_new(sh)
+    right = 0
+    worst = 0.0
+    k = 0
+    while k < 16 {
+        u = k * 0.071
+        w = 0.5 - k * 0.043
+        pa = gpu.v2(u, w)
+        got = gpu.cpu_run(cs, pa)
+        heap.free(pa)
+        want3 = texture_3d(shape, at + vec3(u, w, 0.0))
+        if got != null {
+            d = apart(got, want3)
+            if d > worst { worst = d }
+            if d < 1e-6 { right = right + 1 }
+        }
+        gpu.val_free(got)
+        k = k + 1
+    }
+    check("the CPU samples it trilinearly, wrapped, as shaderlib's texture_3d (${right} of 16, worst ${worst})", right == 16)
+    gpu.cpu_free(cs)
+    gpu.shader_free(sh)
+    image3d_free(img)
+
+    // The builtins.
+    m = some_matrix(0.3)
+    bs = builtins(m, 0.6)
+    bv = gpu.emit_glsl(bs, gpu.VULKAN)
+    check("they are GLSL's: atan, transpose(mat3()), m[c][r], a product",
+          string.contains(bv, "atan(uv.y, uv.x - 1.0)") != 0 && string.contains(bv, "(transpose(mat3(m)) * vec3(uv.x, uv.y, 1.0))") != 0 &&
+          string.contains(bv, "m[2][0] + m[1][1]") != 0 && string.contains(bv, "floor(vec3(") != 0)
+    compiles("builtins", bv, "frag", false)
+    compiles("builtins_gl", gpu.emit_glsl(bs, gpu.GL), "frag", true)
+    cb = gpu.cpu_new(bs)
+    right = 0
+    worst = 0.0
+    k = 0
+    while k < 12 {
+        uv = vec2(0.05 + k * 0.08, 0.9 - k * 0.07)
+        u4 = uv as f32x4
+        pb = gpu.v2(u4.x, u4.y)
+        got = gpu.cpu_run(cb, pb)
+        heap.free(pb)
+        if got == null { println("  cpu_run: ${gpu.last_error()}") }
+        wantb = builtins_reference(m, 0.6, uv)
+        if got != null {
+            d = apart(got, wantb)
+            if d > worst { worst = d }
+            if d < 1e-4 { right = right + 1 }
+        }
+        gpu.val_free(got)
+        k = k + 1
+    }
+    check("the CPU runs them as shaderlib does (${right} of 12, worst ${worst})", right == 12)
+    gpu.cpu_free(cb)
+    gpu.shader_free(bs)
+
+    gpu.shader_free(ps)
+    gpu.shader_free(vs)
+    if g_failures > 0 {
+        println("structs: ${g_failures} of ${g_checks} checks failed")
+        exit(1)
+    }
+    println("structs: all checks passed (${g_checks})")
+}
