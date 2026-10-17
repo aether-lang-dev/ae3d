@@ -7,7 +7,7 @@ uniform float edge;
 uniform float subpixel;
 uniform sampler2D screen;
 
-float fxaa_luma(vec3 c) {
+float ae3d_shaders_fxaa_luma(vec3 c) {
     return dot(c, vec3(0.299, 0.587, 0.114));
 }
 
@@ -20,11 +20,11 @@ void main() {
     vec3 s = texture(screen, uv + vec2(0.0, 1.0) * texel).rgb;
     vec3 e = texture(screen, uv + vec2(1.0, 0.0) * texel).rgb;
     vec3 w = texture(screen, uv + vec2(-1.0, 0.0) * texel).rgb;
-    float lc = fxaa_luma(c);
-    float ln = fxaa_luma(n);
-    float ls = fxaa_luma(s);
-    float le = fxaa_luma(e);
-    float lw = fxaa_luma(w);
+    float lc = ae3d_shaders_fxaa_luma(c);
+    float ln = ae3d_shaders_fxaa_luma(n);
+    float ls = ae3d_shaders_fxaa_luma(s);
+    float le = ae3d_shaders_fxaa_luma(e);
+    float lw = ae3d_shaders_fxaa_luma(w);
     float lo = min(lc, min(min(ln, ls), min(le, lw)));
     float hi = max(lc, max(max(ln, ls), max(le, lw)));
     float range = hi - lo;

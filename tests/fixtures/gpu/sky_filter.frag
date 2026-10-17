@@ -7,7 +7,7 @@ layout(std140, set = 0, binding = 0) uniform Params {
 };
 layout(set = 0, binding = 1) uniform sampler2D capture;
 
-vec3 skyprobe_oct_decode(vec2 p) {
+vec3 ae3d_shaders_skyprobe_oct_decode(vec2 p) {
     vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
     if (d.y < 0.0) {
         d = vec3((1.0 - abs(d.z)) * (d.x >= 0.0 ? 1.0 : -1.0), d.y, (1.0 - abs(d.x)) * (d.z >= 0.0 ? 1.0 : -1.0));
@@ -15,7 +15,7 @@ vec3 skyprobe_oct_decode(vec2 p) {
     return normalize(d);
 }
 
-vec3 skyprobe_oct_texel_direction(vec2 uv, float size) {
+vec3 ae3d_shaders_skyprobe_oct_texel_direction(vec2 uv, float size) {
     float px = (uv.x * size - 1.0) / (size - 2.0) * 2.0 - 1.0;
     float py = (uv.y * size - 1.0) / (size - 2.0) * 2.0 - 1.0;
     if (px > 1.0) {
@@ -34,10 +34,10 @@ vec3 skyprobe_oct_texel_direction(vec2 uv, float size) {
         py = -2.0 - py;
         px = -px;
     }
-    return skyprobe_oct_decode(vec2(px, py));
+    return ae3d_shaders_skyprobe_oct_decode(vec2(px, py));
 }
 
-vec2 skyprobe_oct_encode(vec3 d) {
+vec2 ae3d_shaders_skyprobe_oct_encode(vec3 d) {
     vec3 e = d / (abs(d.x) + abs(d.y) + abs(d.z));
     vec2 p = vec2(e.x, e.z);
     if (e.y < 0.0) {
@@ -46,24 +46,19 @@ vec2 skyprobe_oct_encode(vec3 d) {
     return p;
 }
 
-vec2 skyprobe_oct_uv(vec3 d, float size) {
-    vec2 e = skyprobe_oct_encode(d);
+vec2 ae3d_shaders_skyprobe_oct_uv(vec3 d, float size) {
+    vec2 e = ae3d_shaders_skyprobe_oct_encode(d);
     return vec2(((e.x * 0.5 + 0.5) * (size - 2.0) + 1.0) / size, ((e.y * 0.5 + 0.5) * (size - 2.0) + 1.0) / size);
 }
 
-float skyprobe_radical_inverse(float i) {
-    float r = 0.0;
-    float f = 0.5;
-    float n = i;
-    while (n >= 1.0) {
-        float half_ = floor(n * 0.5);
-        if (n - half_ * 2.0 >= 1.0) {
-            r = r + f;
-        }
-        f = f * 0.5;
-        n = half_;
-    }
-    return r;
+float ae3d_shaders_skyprobe_radical_inverse(float i) {
+    uint bits = uint(i);
+    bits = bits << 16u | bits >> 16u;
+    bits = (bits & 0x55555555u) << 1u | (bits & 0xAAAAAAAAu) >> 1u;
+    bits = (bits & 0x33333333u) << 2u | (bits & 0xCCCCCCCCu) >> 2u;
+    bits = (bits & 0x0F0F0F0Fu) << 4u | (bits & 0xF0F0F0F0u) >> 4u;
+    bits = (bits & 0x00FF00FFu) << 8u | (bits & 0xFF00FF00u) >> 8u;
+    return float(bits) * 2.3283064365386963e-10;
 }
 
 layout(location = 0) in vec2 uv_in;
@@ -71,9 +66,9 @@ layout(location = 0) out vec4 FragColor;
 
 void main() {
     vec2 fc = gl_FragCoord.xy;
-    vec3 n = skyprobe_oct_texel_direction(vec2(fc.x / level_size, fc.y / level_size), 256.0);
+    vec3 n = ae3d_shaders_skyprobe_oct_texel_direction(vec2(fc.x / level_size, fc.y / level_size), 256.0);
     if (roughness <= 0.0) {
-        FragColor = vec4(textureLod(capture, skyprobe_oct_uv(n, 256.0), 0.0).rgb, 1.0);
+        FragColor = vec4(textureLod(capture, ae3d_shaders_skyprobe_oct_uv(n, 256.0), 0.0).rgb, 1.0);
         return;
     }
     float a = roughness * roughness;
@@ -86,7 +81,7 @@ void main() {
     float i = 0.0;
     while (i < 48.0) {
         float xi_x = (i + 0.5) / 48.0;
-        float xi_y = skyprobe_radical_inverse(i);
+        float xi_y = ae3d_shaders_skyprobe_radical_inverse(i);
         i = i + 1.0;
         float phi = 6.28318531 * xi_y;
         float cos_theta = sqrt((1.0 - xi_x) / (1.0 + (a * a - 1.0) * xi_x));
@@ -101,7 +96,7 @@ void main() {
         float pdf = a * a / (3.14159265 * d * d) / 4.0;
         float sample_angle = 1.0 / (48.0 * pdf + 0.000001);
         float lod = max(0.5 * log2(sample_angle / texel) + 1.0, 0.0);
-        sum = sum + textureLod(capture, skyprobe_oct_uv(l, 256.0), lod).rgb * n_dot_l;
+        sum = sum + textureLod(capture, ae3d_shaders_skyprobe_oct_uv(l, 256.0), lod).rgb * n_dot_l;
         weight = weight + n_dot_l;
     }
     FragColor = vec4(sum / max(weight, 0.000001), 1.0);
