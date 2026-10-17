@@ -6,9 +6,9 @@
 // by blits, and from it two things the scene shader reads:
 //
 //   - the irradiance onto every normal, a small octahedral map, the
-//     capture's mip of that size cosine-convolved (FRAGMENT_SKY_IRRADIANCE);
+//     capture's mip of that size cosine-convolved (ae3d.shaders.skyprobe);
 //   - the reflections, the capture prefiltered by GGX into roughness levels
-//     (FRAGMENT_SKY_FILTER), one pass a level.
+//     (ae3d.shaders.skyprobe), one pass a level.
 //
 // With the split-sum table (ae3d.skylight, made once) they are bindings 10,
 // 11 and 12 of every set (ae3d.vkdesc). All in the frame, so the first
@@ -34,7 +34,7 @@ import ae3d.shaders.skyprobe
 import ae3d.shaderlib (Texture, vec3)
 
 exports (
-    start, stop, capture, irradiance_at, reflections_view, reflections_sampler
+    start, stop, capture, irradiance_at, reflections_view, reflections_sampler, set_ground
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -72,12 +72,15 @@ var g_irradiance_view: ptr = null
 var g_irradiance_sampler: ptr = null
 var g_irradiance_framebuffer: ptr = null
 var g_table = 0                      // the split-sum table, in the texture table
-// The irradiance made from the capture, written with quote
-// (ae3d.shaders.skyprobe): one draw a capture. The reflections' levels are
-// still FRAGMENT_SKY_FILTER's (vkpipes.sky_filter): the quoted filter's
-// radical_inverse waits for quote to carry uint32 (Paul, 2026-10-17), and
-// counted in halves it came out a step off in a few texels on Vulkan.
+// The irradiance and the reflections' levels made from the capture, written
+// with quote (ae3d.shaders.skyprobe): one draw a capture, and one a level.
 var g_irradiance_pass: ptr = null
+// The ground the irradiance sees under the horizon (#740): its albedo, then
+// the sun's light onto level ground, six f32s as the renderer gives them
+// (set_ground). They were the scene block's groundAlbedo and groundSun,
+// which only the hand-written irradiance read.
+var g_ground: ptr = null
+var g_filter_pass: ptr = null
 
 // A view of one level of `image`.
 level_view(image: @keep ptr, level: int) -> ptr {
@@ -244,6 +247,10 @@ start() -> bool {
                                          vkspirv.SKY_IRRADIANCE_QUOTED_VERT, vkspirv.SKY_IRRADIANCE_QUOTED_FRAG,
                                          vkspirv.SKY_IRRADIANCE_QUOTED_HASH, vktargets.hdr_pass(), 1) as ptr
     if g_irradiance_pass == null { return failed("sky irradiance pass failed") }
+    g_filter_pass = vkquote.pass_new(skyprobe.sky_filter(Texture { image: null }, SIZE * 1.0, 0.0),
+                                     vkspirv.SKY_FILTER_QUOTED_VERT, vkspirv.SKY_FILTER_QUOTED_FRAG,
+                                     vkspirv.SKY_FILTER_QUOTED_HASH, vktargets.hdr_pass(), LEVELS) as ptr
+    if g_filter_pass == null { return failed("sky filter pass failed") }
 
     commands = vkhost.once_begin()
     blacked(commands, g_capture_image, CAPTURE_LEVELS)
@@ -289,6 +296,8 @@ stop() {
     if g_table != 0 { vkdesc.texture_destroy(g_table) }
     vkquote.pass_free(g_irradiance_pass as *QuotedPass)
     g_irradiance_pass = null
+    vkquote.pass_free(g_filter_pass as *QuotedPass)
+    g_filter_pass = null
     vkdesc.set_sky_light(null, null, null, null, null, null)
     g_capture = 0
     g_captured = false
@@ -307,6 +316,20 @@ stop() {
     g_irradiance_sampler = null
     g_irradiance_framebuffer = null
     g_table = 0
+}
+
+// The ground under the horizon for this frame's capture: its albedo (0 for
+// none: the capture's own lower half kept) and the sun's light onto level
+// ground. Set before capture(), as the sky's own values are.
+set_ground(albedo: Vec3, sun: Vec3) {
+    if g_ground == null { g_ground = calloc(6, 4) }
+    w = g_ground as f32[]
+    w[0] = albedo.x as f32
+    w[1] = albedo.y as f32
+    w[2] = albedo.z as f32
+    w[3] = sun.x as f32
+    w[4] = sun.y as f32
+    w[5] = sun.z as f32
 }
 
 // This frame's sky captured and turned into its light, recorded before the
@@ -335,16 +358,24 @@ inputs_now(sky: int, weather: int, shape: int) {
         at = at + 1
         k = k + 1
     }
-    vectors = [vkscene.OFF_SKYFLAT, vkscene.OFF_SKYSUN, vkscene.OFF_CLOUDSUN, vkscene.OFF_CLOUDSUNCOLOR, vkscene.OFF_SKYOVERCASTCOLOR,
-               vkscene.OFF_GROUNDALBEDO, vkscene.OFF_GROUNDSUN]
+    vectors = [vkscene.OFF_SKYFLAT, vkscene.OFF_SKYSUN, vkscene.OFF_CLOUDSUN, vkscene.OFF_CLOUDSUNCOLOR, vkscene.OFF_SKYOVERCASTCOLOR]
     k = 0
-    while k < 7 {
+    while k < 5 {
         c = 0
         while c < 3 {
             words[at] = ((block + vectors[k] + c * 4) as int[])[0]
             at = at + 1
             c = c + 1
         }
+        k = k + 1
+    }
+    // The ground, as set_ground holds it, in the same words it held in the
+    // block.
+    k = 0
+    while k < 6 {
+        words[at] = 0
+        if g_ground != null { words[at] = (g_ground as int[])[k] }
+        at = at + 1
         k = k + 1
     }
     // The clouds' drift and the eye by steps: the sky's light follows the
@@ -383,22 +414,20 @@ capture(sky: int, weather: int, shape: int, detail: int) {
          vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT)
     vktexture.mip_chain(commands, g_capture_image, SIZE, SIZE, CAPTURE_LEVELS)
 
-    // The ground as the scene block holds it, as the pass read it there
-    // before it was quoted.
+    // The ground as the renderer set it (set_ground).
     irradiance_shader = vkquote.shader(g_irradiance_pass as *QuotedPass)
-    block = vkdesc.block(vkdesc.PROGRAM_SCENE)
-    albedo = (block + vkscene.OFF_GROUNDALBEDO) as f32[]
-    sun = (block + vkscene.OFF_GROUNDSUN) as f32[]
-    _a = gpu.set_vec3(irradiance_shader, "ground_albedo", albedo[0] as float, albedo[1] as float, albedo[2] as float)
-    _s = gpu.set_vec3(irradiance_shader, "ground_sun", sun[0] as float, sun[1] as float, sun[2] as float)
+    if g_ground == null { set_ground(core.vec3(0.0, 0.0, 0.0), core.vec3(0.0, 0.0, 0.0)) }
+    ground = g_ground as f32[]
+    _a = gpu.set_vec3(irradiance_shader, "ground_albedo", ground[0] as float, ground[1] as float, ground[2] as float)
+    _s = gpu.set_vec3(irradiance_shader, "ground_sun", ground[3] as float, ground[4] as float, ground[5] as float)
     vkframe.quoted_screen_pass(pass, g_irradiance_framebuffer, IRRADIANCE, IRRADIANCE, g_irradiance_pass, 0, g_capture)
+    filter_shader = vkquote.shader(g_filter_pass as *QuotedPass)
     k = 0
     while k < LEVELS {
         size = SIZE >> k
-        vkdesc.set_program(vkdesc.PROGRAM_SCENE)
-        vkdesc.set_float(vkscene.OFF_SKYLEVELSIZE, size as float)
-        vkdesc.set_float(vkscene.OFF_SKYROUGHNESS, (k as float) / ((LEVELS - 1) as float))
-        vkframe.screen_pass(pass, (g_lit_framebuffers as ptr[])[k], size, size, vkpipes.sky_filter(), g_capture, 0, 0, 0)
+        _z = gpu.set_float(filter_shader, "level_size", size as float)
+        _r = gpu.set_float(filter_shader, "roughness", (k as float) / ((LEVELS - 1) as float))
+        vkframe.quoted_screen_pass(pass, (g_lit_framebuffers as ptr[])[k], size, size, g_filter_pass, k, g_capture)
         k = k + 1
     }
 }

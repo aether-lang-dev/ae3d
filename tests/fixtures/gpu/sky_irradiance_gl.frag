@@ -5,7 +5,7 @@ uniform vec3 ground_albedo;
 uniform vec3 ground_sun;
 uniform sampler2D capture;
 
-vec3 skyprobe_oct_decode(vec2 p) {
+vec3 ae3d_shaders_skyprobe_oct_decode(vec2 p) {
     vec3 d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
     if (d.y < 0.0) {
         d = vec3((1.0 - abs(d.z)) * (d.x >= 0.0 ? 1.0 : -1.0), d.y, (1.0 - abs(d.x)) * (d.z >= 0.0 ? 1.0 : -1.0));
@@ -13,7 +13,7 @@ vec3 skyprobe_oct_decode(vec2 p) {
     return normalize(d);
 }
 
-vec3 skyprobe_oct_texel_direction(vec2 uv, float size) {
+vec3 ae3d_shaders_skyprobe_oct_texel_direction(vec2 uv, float size) {
     float px = (uv.x * size - 1.0) / (size - 2.0) * 2.0 - 1.0;
     float py = (uv.y * size - 1.0) / (size - 2.0) * 2.0 - 1.0;
     if (px > 1.0) {
@@ -32,10 +32,10 @@ vec3 skyprobe_oct_texel_direction(vec2 uv, float size) {
         py = -2.0 - py;
         px = -px;
     }
-    return skyprobe_oct_decode(vec2(px, py));
+    return ae3d_shaders_skyprobe_oct_decode(vec2(px, py));
 }
 
-vec3 skyprobe_capture_q(float x, float y) {
+vec3 ae3d_shaders_skyprobe_capture_q(float x, float y) {
     float u = (x + 0.5) / 16.0;
     float v = (y + 0.5) / 16.0;
     float px = clamp((u * 256.0 - 1.0) / (256.0 - 2.0) * 2.0 - 1.0, -1.0, 1.0);
@@ -52,7 +52,7 @@ out vec4 FragColor;
 
 void main() {
     vec2 fc = gl_FragCoord.xy;
-    vec3 n = skyprobe_oct_texel_direction(vec2(fc.x / 16.0, fc.y / 16.0), 16.0);
+    vec3 n = ae3d_shaders_skyprobe_oct_texel_direction(vec2(fc.x / 16.0, fc.y / 16.0), 16.0);
     bool grounded = ground_albedo.x + ground_albedo.y + ground_albedo.z > 0.0;
     vec3 ground = vec3(0.0, 0.0, 0.0);
     if (grounded) {
@@ -62,7 +62,7 @@ void main() {
         while (y < 16.0) {
             float x = 0.0;
             while (x < 16.0) {
-                vec3 q = skyprobe_capture_q(x, y);
+                vec3 q = ae3d_shaders_skyprobe_capture_q(x, y);
                 float len = length(q);
                 float angle = 1.0 / (len * len * len);
                 vec3 l = q / len;
@@ -83,7 +83,7 @@ void main() {
     while (y < 16.0) {
         float x = 0.0;
         while (x < 16.0) {
-            vec3 q = skyprobe_capture_q(x, y);
+            vec3 q = ae3d_shaders_skyprobe_capture_q(x, y);
             float len = length(q);
             float angle = 1.0 / (len * len * len);
             vec3 l = q / len;

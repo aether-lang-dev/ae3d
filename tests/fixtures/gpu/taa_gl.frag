@@ -8,11 +8,11 @@ uniform sampler2D screen;
 uniform sampler2D velocity;
 uniform sampler2D history;
 
-vec3 taa_fold(vec3 c, float exposure) {
+vec3 ae3d_shaders_taa_fold(vec3 c, float exposure) {
     return c / (1.0 + dot(c * exposure, vec3(0.2126, 0.7152, 0.0722)));
 }
 
-vec3 taa_unfold(vec3 c, float exposure) {
+vec3 ae3d_shaders_taa_unfold(vec3 c, float exposure) {
     return c / max(1.0 - dot(c * exposure, vec3(0.2126, 0.7152, 0.0722)), 0.0001);
 }
 
@@ -31,8 +31,8 @@ void main() {
         FragColor = vec4(current, 1.0);
         return;
     }
-    vec3 past = taa_fold(texture(history, prev_uv).rgb, exposure);
-    vec3 now = taa_fold(current, exposure);
+    vec3 past = ae3d_shaders_taa_fold(texture(history, prev_uv).rgb, exposure);
+    vec3 now = ae3d_shaders_taa_fold(current, exposure);
     vec3 low = now;
     vec3 high = now;
     float y = -1.0;
@@ -40,7 +40,7 @@ void main() {
         float x = -1.0;
         while (x <= 1.0) {
             if (x != 0.0 || y != 0.0) {
-                vec3 c = taa_fold(texture(screen, uv + vec2(x, y) * px).rgb, exposure);
+                vec3 c = ae3d_shaders_taa_fold(texture(screen, uv + vec2(x, y) * px).rgb, exposure);
                 low = min(low, c);
                 high = max(high, c);
             }
@@ -51,5 +51,5 @@ void main() {
     past = clamp(past, low, high);
     float travel = length((prev_uv - uv) * screen_size);
     float weight = clamp(blend + travel * 0.02, blend, 1.0);
-    FragColor = vec4(taa_unfold(mix(past, now, weight), exposure), 1.0);
+    FragColor = vec4(ae3d_shaders_taa_unfold(mix(past, now, weight), exposure), 1.0);
 }

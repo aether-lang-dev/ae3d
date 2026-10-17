@@ -27,11 +27,20 @@
 #     side and the closest pair is held to 4 steps on at most 400 channels,
 #     so another mode does not fail a change that did not cause it.
 #
+# Each tree is built with the Aether release it pins (AETHER_REF in its
+# .github/workflows/ci.yml). One toolchain for both drew nothing on Vulkan
+# when the pins differed: a release that names a quote's helpers otherwise
+# (aether#2943) hashes the other tree's quoted shaders otherwise, and its
+# Vulkan refuses their SPIR-V. A pin the toolchain on PATH is gets that one;
+# another is built once from an Aether checkout (AE3D_AETHER_SRC, ../aether
+# by default) at its tag, under build/frames_against/aether-<tag>. With no
+# checkout, or no such tag in it, this says so and stops (exit 2) rather
+# than compare frames from the wrong compiler.
+#
 # Exits 0 when every frame matches, 1 naming those that do not, 2 when
 # something could not be built or drawn. Needs a GPU (a software rasteriser
-# draws it too, slowly) and the Aether toolchain, the same one for both trees;
-# the frames are kept under
-# build/frames_against/ to be looked at.
+# draws it too, slowly); the frames are kept under build/frames_against/ to
+# be looked at.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -65,9 +74,51 @@ if [ "$(git -C "$THERE/deps/aephysics" rev-parse HEAD 2>/dev/null)" != "$want" ]
     git -C "$THERE/deps/aephysics" checkout --quiet "$want" || exit 2
 fi
 
-build() {   # build <tree>: the programs this draws with
+# The Aether release a tree pins, as its CI builds it.
+pin_of() {  # pin_of <tree>
+    sed -n 's/^  AETHER_REF: *//p' "$1/.github/workflows/ci.yml" | head -1
+}
+# The release the toolchain on PATH is (v0.821.0), or nothing.
+ON_PATH="$(aetherc --version 2>/dev/null | sed -n 's/.* v\([0-9][0-9.]*\).*/v\1/p')"
+AETHER_SRC="${AE3D_AETHER_SRC:-$ROOT/../aether}"
+
+# The directory of an Aether built at `pin`, printed; "" for the one on PATH.
+# Built once, from AETHER_SRC at the tag, and kept.
+toolchain_for() {  # toolchain_for <pin>
+    if [ -z "$1" ] || [ "$1" = "$ON_PATH" ]; then
+        echo ""
+        return 0
+    fi
+    local dir="$OUT/aether-$1"
+    if [ ! -x "$dir/build/aetherc" ]; then
+        if ! git -C "$AETHER_SRC" rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1; then
+            echo "frames_against: a tree pins Aether $1, the toolchain on PATH is ${ON_PATH:-none}," >&2
+            echo "  and $AETHER_SRC has no $1 to build it from (AE3D_AETHER_SRC names an aether" >&2
+            echo "  checkout; git -C it fetch --tags)" >&2
+            return 2
+        fi
+        rm -rf "$dir"
+        git -C "$AETHER_SRC" worktree add --detach "$dir" "$1" >/dev/null 2>&1 || return 2
+        echo "frames_against: building Aether $1 for a tree that pins it" >&2
+        make -C "$dir" -j"$(nproc 2>/dev/null || echo 4)" >"$OUT/aether-$1.log" 2>&1 || {
+            echo "frames_against: Aether $1 did not build (see $OUT/aether-$1.log)" >&2
+            return 2
+        }
+    fi
+    echo "$dir"
+}
+
+build() {   # build <tree>: the programs this draws with, by the Aether it pins
+    local pin dir
+    pin="$(pin_of "$1")"
+    dir="$(toolchain_for "$pin")" || exit 2
+    echo "frames_against: $1 with Aether ${pin:-as on PATH}${dir:+ (built at $dir)}"
     for program in tests/test_backend_parity.ae examples/zombie_city.ae tools/ae3d_agent.ae; do
-        (cd "$1" && ./build.sh "$program" >"$OUT/build.log" 2>&1) || {
+        if [ -n "$dir" ]; then
+            (cd "$1" && PATH="$dir/build:$PATH" AETHER_HOME="$dir" ./build.sh "$program" >"$OUT/build.log" 2>&1)
+        else
+            (cd "$1" && ./build.sh "$program" >"$OUT/build.log" 2>&1)
+        fi || {
             echo "frames_against: $program did not build in $1"
             tail -5 "$OUT/build.log"
             exit 2
