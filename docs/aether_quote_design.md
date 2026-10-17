@@ -546,6 +546,14 @@ sky(...) -> *GpuShader {
    functions sharing `@quotable` helpers). New with them: struct outputs
    (colour and motion), `Texture3D`, struct-returning helpers. About 670
    lines of GLSL; the clouds' march is most of it.
+   *Done (2026-10-17, on Aether 0.822.0):* `ae3d.shaders.skydome`, drawn on
+   both renderers with frames byte-identical to the hand-written ones (the
+   clouds within #793's noise). On Vulkan the sky is a linked pair
+   (`vkquote.pair_new`, the vertex shader's block at set 1); its values are
+   copied from the scene block word for word until the block splits. The
+   capture needed an octahedral decode a vector at a time, as the
+   hand-written one is: skyprobe's, a lane at a time, rounded a few
+   directions otherwise on MoltenVK.
 3. **The composite**: two textures, `mat4`, and `hazeColumn[4]` /
    `hazeShape[4]` as a captured struct with array fields.
 4. **Water**, then **the crowd**, then **the scene**: the mesh shaders, and

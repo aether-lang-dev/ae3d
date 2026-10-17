@@ -26,10 +26,25 @@
 //
 // The tree's kinds this version takes: BLOCK, LET, ASSIGN, RETURN, IF,
 // WHILE, FOR, BREAK, CONTINUE, EXPR, LIT, LOCAL, CAPTURE, UNARY, BINARY,
-// CHOOSE, CALL, FIELD and HELPER_CALL (a @quotable function, written out as a
-// GLSL function, quote version 2); INDEX is written as GLSL but not run, and MAKE
-// (a struct literal) is refused with the node's line. A shader owns its
-// tree: shader_free gives it back.
+// CHOOSE, CALL, FIELD, MAKE (a struct literal) and HELPER_CALL (a @quotable
+// function, written out as a GLSL function, quote version 2); INDEX is
+// written as GLSL but not run. A shader owns its tree: shader_free gives it
+// back.
+//
+// Structs (step 6, docs/aether_quote_design.md section 11):
+//
+//   - a vertex shader returns a struct literal of its varyings, `position`
+//     its gl_Position, the others outs at the locations of their places;
+//   - a pixel shader may take a struct of varyings: gpu.link(vertex, pixel)
+//     matches the fields it reads to the vertex shader's by name and type,
+//     and it is written with only those, at the vertex shader's locations;
+//   - a pixel shader returning a struct literal writes each field to the out
+//     at its place (`out_<field>`, location 0, 1, ...): the sky's colour and
+//     motion vector;
+//   - any other struct the tree builds (a helper's struct return, a struct
+//     local) is a GLSL struct, declared once from its literals, every literal
+//     setting every field: so a helper returns a struct where GLSL's would
+//     have had an `out` parameter.
 
 import std.heap
 import std.list
@@ -37,27 +52,34 @@ import std.lanes
 import std.quote
 import std.string
 import std.strbuilder
-import ae3d.shaderlib (vec2, vec3, vec4, Texture, TextureMS, ShaderImage, ShaderImageMS, image_w, image_h, image_channel,
-                       image_ms_sample, image_ms_samples, image_level)
+import ae3d.shaderlib (vec2, vec3, vec4, Texture, TextureMS, Texture3D, ShaderImage, ShaderImageMS, ShaderImage3D, image_w,
+                       image_h, image_channel, image_ms_sample, image_ms_samples, image_level, image3d_channel)
 
 extern sqrt(x: float) -> float
 extern sin(x: float) -> float
 extern cos(x: float) -> float
+extern tan(x: float) -> float
+extern asin(x: float) -> float
+extern acos(x: float) -> float
+extern atan2(y: float, x: float) -> float
+extern exp(x: float) -> float
 extern pow(x: float, y: float) -> float
 extern log2(x: float) -> float
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
 
 exports (
     GpuShader, GpuVal, GpuRun,
     VULKAN, GL,
-    fragment, vertex, depth_fragment, emit_vertex_glsl, screen_vertex,
+    fragment, vertex, depth_fragment, emit_vertex_glsl, screen_vertex, link, linked, varying_location,
     cpu_vertex_attr, cpu_run_vertex, cpu_varying, ScreenVertex, ScreenVaryings, VERTEX_STAGE, FRAGMENT_STAGE, writes_depth, shader_free, shader_name, shader_tree, shader_hash,
-    emit_glsl, emit_screen_vertex,
+    emit_glsl, emit_screen_vertex, outputs_count,
     params_count, params_name, params_type, params_offset, params_size, params_write,
-    set_float, set_int, set_vec2, set_vec3, set_mat4, set_mat4_f32,
+    set_float, set_int, set_vec2, set_vec3, set_mat4, set_mat4_f32, set_float_f32, set_vec2_f32, set_vec3_f32,
     call_glsl, call_glsl_for, call_args, cpu_set_dialect,
-    samplers_count, samplers_name,
-    v1, v2, v3, v4, val_n, val_x, val_y, val_z, val_w, val_bool,
-    cpu_new, cpu_run, cpu_free, cpu_set_viewport, last_error
+    samplers_count, samplers_name, samplers_type,
+    v1, v2, v3, v4, vstruct, val_set, val_field, val_free, val_is_struct, val_n, val_x, val_y, val_z, val_w, val_bool,
+    cpu_new, cpu_run, cpu_free, cpu_set_viewport, cpu_set_frag_coord, last_error
 )
 
 // A shader: its name and the tree its quote made, which it owns, and
@@ -68,6 +90,47 @@ struct GpuShader {
     tree: quote.Tree
     depth: bool
     stage: int       // FRAGMENT_STAGE, or VERTEX_STAGE (vertex)
+    links: ptr       // a pixel shader of a struct of varyings, once linked: list of *GpuField, located
+}
+
+// A struct's field, or a linked pixel shader's varying: its name, its type
+// and where it is (its place among the varyings, for a link).
+struct GpuField {
+    name: string
+    type: string
+    location: int
+}
+
+fn field_new(name: string, t: string, location: int) -> *GpuField {
+    f = heap.new(GpuField)
+    f.name = name
+    f.type = t
+    f.location = location
+    return f
+}
+
+fn fields_free(l: ptr) {
+    if l == null { return }
+    k = 0
+    while k < list.size(l) {
+        f = list.get_raw(l, k) as *GpuField
+        f.name = ""
+        f.type = ""
+        heap.free(f)
+        k = k + 1
+    }
+    list.free(l)
+}
+
+fn field_named(l: ptr, name: string) -> *GpuField {
+    if l == null { return null }
+    k = 0
+    while k < list.size(l) {
+        f = list.get_raw(l, k) as *GpuField
+        if f.name == name { return f }
+        k = k + 1
+    }
+    return null
 }
 
 const FRAGMENT_STAGE = 0
@@ -85,6 +148,7 @@ fragment(name: string, t: quote.Tree) -> *GpuShader {
     s.tree = t
     s.depth = false
     s.stage = FRAGMENT_STAGE
+    s.links = null
     return s
 }
 
@@ -118,8 +182,119 @@ shader_hash(s: *GpuShader) -> long { return quote.hash(s.tree) }
 shader_free(s: *GpuShader) {
     if s == null { return }
     quote.free(s.tree)
+    fields_free(s.links)
+    s.links = null
     s.name = ""
     heap.free(s)
+}
+
+// ── Linking a vertex shader to a pixel shader ──────────────────────────
+//
+// A pixel shader that takes a struct of varyings reads some of its fields;
+// each must be a varying the vertex shader hands on, by name and type (not
+// by struct: one vertex shader serves any pixel shader whose inputs it
+// provides). link records where each is, the vertex shader's location, and
+// the pixel shader is then written with those inputs alone. False, naming
+// the field, when the vertex shader does not hand one on or hands it on as
+// another type; a pixel shader that reads none links to any vertex shader
+// (a screen pass's that works from frag_coord()).
+
+link(vs: *GpuShader, ps: *GpuShader) -> bool {
+    g_error = ""
+    if vs == null || ps == null || vs.stage != VERTEX_STAGE || ps.stage != FRAGMENT_STAGE {
+        g_error = "link: a vertex shader and a pixel shader"
+        return false
+    }
+    pt = ps.tree
+    if quote.param_count(pt) != 1 || glsl_type(quote.param_type(pt, 0)) != "" {
+        g_error = "${quote.source(pt)}: ${ps.name} takes no struct of varyings to link"
+        return false
+    }
+    mk = returned_make(quote.body(vs.tree))
+    if (mk as ptr) == null {
+        g_error = "${quote.source(vs.tree)}: a vertex shader returns its varyings as a struct literal"
+        return false
+    }
+    // Every field the pixel shader reads, in the vertex shader's order.
+    reads = list.new()
+    param = quote.param_name(pt, 0)
+    why = varying_reads(quote.body(pt), param, reads)
+    links = list.new()
+    loc = 0
+    j = 0
+    while j < quote.child_count(mk) && why == "" {
+        fv = quote.child(mk, j)
+        if quote.name(fv) != "position" {
+            r = field_named(reads, quote.name(fv))
+            if r != null {
+                if scalar_name(r.type) != scalar_name(quote.type_of(fv)) {
+                    why = "${ps.name} reads ${r.name} as a ${scalar_name(r.type)}; ${vs.name} hands it on as a ${scalar_name(quote.type_of(fv))}"
+                }
+                list.add_raw(links, field_new(r.name, scalar_name(r.type), loc) as ptr)
+            }
+            loc = loc + 1
+        }
+        j = j + 1
+    }
+    k = 0
+    while k < list.size(reads) && why == "" {
+        r = list.get_raw(reads, k) as *GpuField
+        if r.name == "position" {
+            why = "${ps.name} reads position, which is gl_Position and not a varying (frag_coord() is the pixel)"
+        } else if field_named(links, r.name) == null {
+            why = "${ps.name} reads ${r.name}, which ${vs.name} does not hand on"
+        }
+        k = k + 1
+    }
+    fields_free(reads)
+    if why != "" {
+        fields_free(links)
+        g_error = "${quote.source(pt)}: ${why}"
+        return false
+    }
+    fields_free(ps.links)
+    ps.links = links
+    return true
+}
+
+// Whether the pixel shader `s` takes a struct of varyings and has been linked.
+linked(s: *GpuShader) -> bool { return s.links != null }
+
+// Where the linked pixel shader `s` reads the varying `name`; -1 when it does
+// not read it.
+varying_location(s: *GpuShader, name: string) -> int {
+    f = field_named(s.links, name)
+    if f == null { return 0 - 1 }
+    return f.location
+}
+
+// f32 and float are one type to GLSL.
+fn scalar_name(t: string) -> string {
+    if t == "f32" { return "float" }
+    return t
+}
+
+// The fields of the parameter `param` that `n` reads, each once, into
+// `reads`. Why it cannot be written, "" when it can: the struct read whole
+// (handed to a helper, say), which GLSL has no struct for.
+fn varying_reads(n: quote.Node, param: string, reads: ptr) -> string {
+    k = quote.kind(n)
+    if k == quote.FIELD && quote.kind(quote.child(n, 0)) == quote.LOCAL && quote.name(quote.child(n, 0)) == param {
+        if field_named(reads, quote.name(n)) == null {
+            list.add_raw(reads, field_new(quote.name(n), quote.type_of(n), 0) as ptr)
+        }
+        return ""
+    }
+    if k == quote.LOCAL && quote.name(n) == param {
+        return "the varyings ${param} are read a field at a time, not handed on whole"
+    }
+    j = 0
+    while j < quote.child_count(n) {
+        why = varying_reads(quote.child(n, j), param, reads)
+        if why != "" { return why }
+        j = j + 1
+    }
+    return ""
 }
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -133,10 +308,169 @@ fn glsl_type(t: string) -> string {
     if t == "uint32" { return "uint" }
     if t == "Texture" { return "sampler2D" }
     if t == "TextureMS" { return "sampler2DMS" }
+    if t == "Texture3D" { return "sampler3D" }
+    // A struct the tree being written builds, by its own name.
+    if struct_named(t) != null { return t }
     return ""
 }
 
-fn is_texture(t: string) -> bool { return t == "Texture" || t == "TextureMS" }
+fn is_texture(t: string) -> bool { return t == "Texture" || t == "TextureMS" || t == "Texture3D" }
+
+// ── Structs inside the tree ────────────────────────────────────────────
+//
+// While a shader is written: each struct its tree builds that is not its
+// interface (the vertex shader's varyings, the pixel shader's outputs), with
+// its fields in the order of its first literal. A GLSL struct's constructor
+// takes every field in order, so a literal that leaves one out is refused.
+
+struct GpuStruct {
+    name: string
+    fields: ptr      // list of *GpuField
+}
+
+var g_structs: ptr = null    // list of *GpuStruct, while a shader is written
+
+fn struct_named(name: string) -> *GpuStruct {
+    if g_structs == null { return null }
+    k = 0
+    while k < list.size(g_structs) {
+        st = list.get_raw(g_structs, k) as *GpuStruct
+        if st.name == name { return st }
+        k = k + 1
+    }
+    return null
+}
+
+fn structs_free() {
+    if g_structs == null { return }
+    k = 0
+    while k < list.size(g_structs) {
+        st = list.get_raw(g_structs, k) as *GpuStruct
+        fields_free(st.fields)
+        st.name = ""
+        heap.free(st)
+        k = k + 1
+    }
+    list.free(g_structs)
+    g_structs = null
+}
+
+// The structs `n` builds, inner first, so each is declared before a struct
+// holding it; `skip` is the interface's type ("" for none), which is not.
+fn collect_structs(n: quote.Node, skip: string) {
+    j = 0
+    while j < quote.child_count(n) {
+        collect_structs(quote.child(n, j), skip)
+        j = j + 1
+    }
+    if quote.kind(n) != quote.MAKE || quote.type_of(n) == skip { return }
+    st = struct_named(quote.type_of(n))
+    if st == null {
+        st = heap.new(GpuStruct)
+        st.name = quote.type_of(n)
+        st.fields = list.new()
+        list.add_raw(g_structs, st as ptr)
+    }
+    j = 0
+    while j < quote.child_count(n) {
+        fv = quote.child(n, j)
+        if field_named(st.fields, quote.name(fv)) == null {
+            list.add_raw(st.fields, field_new(quote.name(fv), scalar_name(quote.type_of(fv)), 0) as ptr)
+        }
+        j = j + 1
+    }
+}
+
+// The fields read of each struct being written that no literal of it sets:
+// a field of it all the same, which every literal is then refused for
+// leaving out.
+fn collect_reads(n: quote.Node) {
+    j = 0
+    while j < quote.child_count(n) {
+        collect_reads(quote.child(n, j))
+        j = j + 1
+    }
+    if quote.kind(n) != quote.FIELD { return }
+    st = struct_named(quote.type_of(quote.child(n, 0)))
+    if st != null && field_named(st.fields, quote.name(n)) == null {
+        list.add_raw(st.fields, field_new(quote.name(n), scalar_name(quote.type_of(n)), 0) as ptr)
+    }
+}
+
+// The structs of the tree `t`, its helpers' and its body's; `skip` the
+// interface's type.
+fn structs_of(t: quote.Tree, skip: string) {
+    structs_free()
+    g_structs = list.new()
+    k = 0
+    while k < quote.helper_count(t) {
+        collect_structs(quote.body(quote.helper(t, k)), skip)
+        k = k + 1
+    }
+    collect_structs(quote.body(t), skip)
+    k = 0
+    while k < quote.helper_count(t) {
+        collect_reads(quote.body(quote.helper(t, k)))
+        k = k + 1
+    }
+    collect_reads(quote.body(t))
+}
+
+// The declarations of the structs being written, in order.
+fn emit_structs(t: quote.Tree, sb: ptr) {
+    k = 0
+    while k < list.size(g_structs) {
+        st = list.get_raw(g_structs, k) as *GpuStruct
+        strbuilder.append(sb, "\nstruct ${st.name} {\n")
+        j = 0
+        while j < list.size(st.fields) {
+            f = list.get_raw(st.fields, j) as *GpuField
+            ty = glsl_type(f.type)
+            if ty == "" { refuse(t, quote.body(t), "${st.name}'s ${f.name} is a ${f.type}, which GLSL has no type for") }
+            strbuilder.append(sb, "    ${ty} ${glsl_name(f.name)};\n")
+            j = j + 1
+        }
+        strbuilder.append(sb, "};\n")
+        k = k + 1
+    }
+}
+
+// A struct literal as GLSL's constructor: its fields in the declaration's
+// order, each one the literal sets.
+fn glsl_make(t: quote.Tree, n: quote.Node) -> string {
+    st = struct_named(quote.type_of(n))
+    if st == null {
+        refuse(t, n, "a ${quote.type_of(n)} literal is not written as GLSL here")
+        return ""
+    }
+    sb = strbuilder.new(64)
+    strbuilder.append(sb, "${st.name}(")
+    j = 0
+    while j < list.size(st.fields) {
+        f = list.get_raw(st.fields, j) as *GpuField
+        if j > 0 { strbuilder.append(sb, ", ") }
+        v = make_value(n, f.name)
+        if (v as ptr) == null {
+            refuse(t, n, "a ${st.name} literal sets every field in a shader; this one leaves out ${f.name}")
+        } else {
+            strbuilder.append(sb, glsl_expr(t, v, 0, 0))
+        }
+        j = j + 1
+    }
+    strbuilder.append(sb, ")")
+    return strbuilder.finish(sb)
+}
+
+// The value a struct literal gives the field `name`, or a null node.
+fn make_value(mk: quote.Node, name: string) -> quote.Node {
+    j = 0
+    while j < quote.child_count(mk) {
+        fv = quote.child(mk, j)
+        if quote.name(fv) == name { return quote.child(fv, 0) }
+        j = j + 1
+    }
+    return null as quote.Node
+}
 
 // std140: a scalar four bytes on four, a vec2 eight on eight, a vec3
 // twelve on sixteen, a vec4 sixteen on sixteen.
@@ -206,7 +540,10 @@ const CALL_AETHER[] = ["vec2", "vec3", "vec4", "texture", "rgb",
                        "texture_size", "floor_v2", "fract_v2", "clamp_v2", "length_v3",
                        "reflect", "pow", "texture_lod", "texel_fetch_lod", "log2",
                        "float_of", "zx", "yx", "abs_v2", "uint_of",
-                       "float_of_uint"]
+                       "float_of_uint", "exp", "acos", "asin", "atan2",
+                       "tan", "floor_v3", "splat2", "splat3", "splat4",
+                       "mix_v4", "mul_m4", "m4_at", "mul_transpose3", "normalize_v2",
+                       "texture_3d", "xz"]
 const CALL_GLSL[] = ["vec2", "vec3", "vec4", "texture", "$0.rgb",
                      "dot", "min", "max", "abs", "sign",
                      "clamp", "smoothstep", "mix", "fract", "floor",
@@ -217,7 +554,10 @@ const CALL_GLSL[] = ["vec2", "vec3", "vec4", "texture", "$0.rgb",
                      "vec2(textureSize($0, 0))", "floor", "fract", "clamp", "length",
                      "reflect", "pow", "textureLod", "texelFetch($0, ivec2($1, $2), int($3))", "log2",
                      "float($0)", "$0.zx", "$0.yx", "abs", "uint($0)",
-                     "float($0)"]
+                     "float($0)", "exp", "acos", "asin", "atan",
+                     "tan", "floor", "vec2", "vec3", "vec4",
+                     "mix", "($0 * $1)", "$0[$1][$2]", "(transpose(mat3($0)) * $1)", "normalize",
+                     "texture", "$0.xz"]
 const CALL_GL[] = ["", "", "", "", "",
                    "", "", "", "", "",
                    "", "", "", "", "",
@@ -228,7 +568,10 @@ const CALL_GL[] = ["", "", "", "", "",
                    "", "", "", "", "",
                    "", "", "", "", "",
                    "", "", "", "", "",
-                   ""]
+                   "", "", "", "", "",
+                   "", "", "", "", "",
+                   "", "", "", "", "",
+                   "", ""]
 const CALL_ARGS: int[] = [-1, -1, -1, 2, 1,
                           2, 2, 2, 1, 1,
                           3, 3, 3, 1, 1,
@@ -239,8 +582,11 @@ const CALL_ARGS: int[] = [-1, -1, -1, 2, 1,
                           1, 1, 1, 3, 1,
                           2, 2, 3, 4, 1,
                           1, 1, 1, 1, 1,
-                          1]
-const CALL_COUNT = 51
+                          1, 1, 1, 1, 2,
+                          1, 1, 1, 1, 1,
+                          3, 2, 3, 2, 1,
+                          2, 1]
+const CALL_COUNT = 67
 
 fn call_index(name: string) -> int {
     i = 0
@@ -480,6 +826,33 @@ set_mat4_f32(s: *GpuShader, name: string, m: ptr) -> bool {
     return true
 }
 
+// A float, vec2 or vec3 capture set from the f32s at `p`, as a uniform block
+// holds them: the scene block's words a hand-written shader read, copied to
+// a quoted one's captures bit for bit.
+set_float_f32(s: *GpuShader, name: string, p: ptr) -> bool {
+    cell = typed_cell(s, name, "float")
+    if cell == null || p == null { return false }
+    (cell as float[])[0] = ((p as f32[])[0]) as float
+    return true
+}
+
+set_vec2_f32(s: *GpuShader, name: string, p: ptr) -> bool {
+    cell = typed_cell(s, name, "vec2")
+    if cell == null || p == null { return false }
+    (cell as f32[])[0] = (p as f32[])[0]
+    (cell as f32[])[1] = (p as f32[])[1]
+    return true
+}
+
+set_vec3_f32(s: *GpuShader, name: string, p: ptr) -> bool {
+    cell = typed_cell(s, name, "vec3")
+    if cell == null || p == null { return false }
+    (cell as f32[])[0] = (p as f32[])[0]
+    (cell as f32[])[1] = (p as f32[])[1]
+    (cell as f32[])[2] = (p as f32[])[2]
+    return true
+}
+
 // A mat4 capture set from sixteen doubles in column order (ae3d.core's
 // Mat4's), each held as the f32 a GPU reads.
 set_mat4(s: *GpuShader, name: string, m: ptr) -> bool {
@@ -533,7 +906,7 @@ samplers_name(s: *GpuShader, k: int) -> string {
     return ""
 }
 // The k'th texture's sampler type: sampler2D, or sampler2DMS.
-fn samplers_type(s: *GpuShader, k: int) -> string {
+samplers_type(s: *GpuShader, k: int) -> string {
     n = 0
     i = 0
     while i < quote.capture_count(s.tree) {
@@ -591,8 +964,14 @@ fn glsl_expr(t: quote.Tree, n: quote.Node, outer: int, right: int) -> string {
             }
             return ATTR_GLSL[i]
         }
-        return "${glsl_expr(t, quote.child(n, 0), PREC_POSTFIX, 0)}.${quote.name(n)}"
+        // A linked pixel shader's varying: its input, by the field's name.
+        o = quote.child(n, 0)
+        if g_pixel_param != "" && quote.kind(o) == quote.LOCAL && quote.name(o) == g_pixel_param {
+            return glsl_name(quote.name(n))
+        }
+        return "${glsl_expr(t, o, PREC_POSTFIX, 0)}.${glsl_name(quote.name(n))}"
     }
+    if k == quote.MAKE { return glsl_make(t, n) }
     if k == quote.INDEX {
         return "${glsl_expr(t, quote.child(n, 0), PREC_POSTFIX, 0)}[${glsl_expr(t, quote.child(n, 1), 0, 0)}]"
     }
@@ -745,6 +1124,26 @@ fn glsl_stmt(t: quote.Tree, sb: ptr, s: quote.Node, depth: int, last: bool) {
             }
             return
         }
+        if g_outputs {
+            // A pixel shader's struct: each field to its out.
+            mk = quote.child(s, 0)
+            if quote.kind(mk) != quote.MAKE {
+                refuse(t, s, "a pixel shader returns its outputs as a struct literal")
+                return
+            }
+            j = 0
+            while j < quote.child_count(mk) {
+                fv = quote.child(mk, j)
+                if j > 0 { indent(sb, depth) }
+                strbuilder.append(sb, "out_${quote.name(fv)} = ${glsl_expr(t, quote.child(fv, 0), 0, 0)};\n")
+                j = j + 1
+            }
+            if !last {
+                indent(sb, depth)
+                strbuilder.append(sb, "return;\n")
+            }
+            return
+        }
         if g_depth {
             rt = quote.type_of(quote.child(s, 0))
             if rt != "float" && rt != "f32" {
@@ -793,6 +1192,11 @@ var g_in_helper = false
 var g_dialect = 0
 // Whether the shader being written returns its depth (depth_fragment).
 var g_depth = false
+// Whether the pixel shader being written returns a struct of outputs.
+var g_outputs = false
+// The linked pixel shader's parameter, a struct of varyings, while it is
+// written: its fields are its inputs.
+var g_pixel_param = ""
 
 // The @quotable functions the tree reaches (quote version 2), each a GLSL
 // function, callees first as the tree lists them, so each is declared
@@ -836,8 +1240,12 @@ fn emit_ready(s: *GpuShader) -> bool {
             g_error = "${quote.source(t)}: a vertex shader takes one parameter, its vertex's attributes"
             return false
         }
-    } else if quote.param_count(t) != 1 || glsl_type(quote.param_type(t, 0)) == "" {
+    } else if quote.param_count(t) != 1 {
         g_error = "${quote.source(t)}: a fragment shader takes one parameter, its varying"
+        return false
+    } else if glsl_type(quote.param_type(t, 0)) == "" && s.links == null {
+        // A struct of varyings: written once it is linked to its vertex shader.
+        g_error = "${quote.source(t)}: ${s.name} takes a struct of varyings; gpu.link it to its vertex shader first"
         return false
     }
     i = 0
@@ -962,8 +1370,8 @@ emit_vertex_glsl(s: *GpuShader, dialect: int, from: string, to: string) -> strin
         g_error = "${quote.source(t)}: ${s.name} is not a vertex shader"
         return ""
     }
-    if quote.capture_count(t) > 0 {
-        g_error = "${quote.source(t)}: a vertex shader's captures are not written yet"
+    if samplers_count(s) > 0 {
+        g_error = "${quote.source(t)}: a vertex shader samples no texture"
         return ""
     }
     mk = returned_make(quote.body(t))
@@ -987,6 +1395,7 @@ emit_vertex_glsl(s: *GpuShader, dialect: int, from: string, to: string) -> strin
         strbuilder.append(sb, "#version 450\n")
     }
     strbuilder.append(sb, "// ${s.name}: written by ae3d.gpu from its quote.\n\n")
+    emit_vertex_params(s, sb, dialect)
     // The attributes it reads, in the table's order: each at its location,
     // typed as its first read is.
     i = 0
@@ -1006,22 +1415,51 @@ emit_vertex_glsl(s: *GpuShader, dialect: int, from: string, to: string) -> strin
         fv = quote.child(mk, j)
         if quote.name(fv) != "position" {
             decl = "out ${glsl_type(quote.type_of(fv))} ${varying_name(quote.name(fv))};\n"
+            // A whole number is not interpolated.
+            if quote.type_of(fv) == "int" { decl = "flat ${decl}" }
+            if quote.type_of(fv) == "bool" { refuse(t, fv, "a varying is not a bool in GLSL; hand on an int") }
             if dialect != GL { decl = "layout(location = ${loc}) ${decl}" }
             strbuilder.append(sb, decl)
             loc = loc + 1
         }
         j = j + 1
     }
+    structs_of(t, quote.type_of(mk))
+    emit_structs(t, sb)
     emit_helpers(t, sb)
     strbuilder.append(sb, "\nvoid main() {\n")
     glsl_block(t, sb, quote.body(t), 1, true)
     strbuilder.append(sb, "}\n")
+    structs_free()
     g_vertex_param = ""
     g_varying_from = ""
     g_varying_to = ""
     text = strbuilder.finish(sb)
     if g_error != "" { return "" }
     return text
+}
+
+// A vertex shader's captures: a std140 block of their own, VertexParams, at
+// set 1, binding 0, on Vulkan (set 0 is the pixel shader's, its Params and
+// its textures), each a uniform by name on OpenGL. None, nothing written.
+fn emit_vertex_params(s: *GpuShader, sb: ptr, dialect: int) {
+    np = params_count(s)
+    if np == 0 { return }
+    if dialect == GL {
+        k = 0
+        while k < np {
+            strbuilder.append(sb, "uniform ${params_type(s, k)} ${params_name(s, k)};\n")
+            k = k + 1
+        }
+    } else {
+        strbuilder.append(sb, "layout(std140, set = 1, binding = 0) uniform VertexParams {\n")
+        k = 0
+        while k < np {
+            strbuilder.append(sb, "    ${params_type(s, k)} ${params_name(s, k)};\n")
+            k = k + 1
+        }
+        strbuilder.append(sb, "};\n")
+    }
 }
 
 emit_glsl(s: *GpuShader, dialect: int) -> string {
@@ -1063,24 +1501,74 @@ emit_glsl(s: *GpuShader, dialect: int) -> string {
         binding = binding + 1
         k = k + 1
     }
-    input = "${glsl_type(quote.param_type(t, 0))} ${glsl_name(quote.param_name(t, 0))}"
+    // A struct of outputs, returned as a literal: its fields, each to its out.
+    outs = returned_make(quote.body(t))
+    out_type = ""
+    if (outs as ptr) != null && !s.depth { out_type = quote.type_of(outs) }
+    structs_of(t, out_type)
+    emit_structs(t, sb)
     emit_helpers(t, sb)
     // A depth shader has no colour output: what it returns is gl_FragDepth.
     colour = "out vec4 FragColor;\n"
     if dialect != GL { colour = "layout(location = 0) ${colour}" }
     if s.depth { colour = "" }
-    if dialect == GL {
-        strbuilder.append(sb, "\nin ${input};\n${colour}\nvoid main() {\n")
+    if out_type != "" { colour = output_decls(outs) }
+    if s.links != null {
+        // The varyings it reads, at the vertex shader's locations.
+        strbuilder.append(sb, "\n")
+        k = 0
+        while k < list.size(s.links) {
+            f = list.get_raw(s.links, k) as *GpuField
+            decl = "in ${glsl_type(f.type)} ${glsl_name(f.name)};\n"
+            if f.type == "int" { decl = "flat ${decl}" }
+            if dialect != GL { decl = "layout(location = ${f.location}) ${decl}" }
+            strbuilder.append(sb, decl)
+            k = k + 1
+        }
+        strbuilder.append(sb, "${colour}\nvoid main() {\n")
+        g_pixel_param = quote.param_name(t, 0)
     } else {
-        strbuilder.append(sb, "\nlayout(location = 0) in ${input};\n${colour}\nvoid main() {\n")
+        input = "${glsl_type(quote.param_type(t, 0))} ${glsl_name(quote.param_name(t, 0))}"
+        if dialect == GL {
+            strbuilder.append(sb, "\nin ${input};\n${colour}\nvoid main() {\n")
+        } else {
+            strbuilder.append(sb, "\nlayout(location = 0) in ${input};\n${colour}\nvoid main() {\n")
+        }
     }
     g_depth = s.depth
+    g_outputs = out_type != ""
     glsl_block(t, sb, quote.body(t), 1, true)
     g_depth = false
+    g_outputs = false
+    g_pixel_param = ""
+    structs_free()
     strbuilder.append(sb, "}\n")
     text = strbuilder.finish(sb)
     if g_error != "" { return "" }
     return text
+}
+
+// A pixel shader's outs, one for each field of the struct literal it
+// returns, at the locations of their places, in both dialects (OpenGL 4.1 has
+// explicit output locations too): out_<field>.
+fn output_decls(mk: quote.Node) -> string {
+    sb = strbuilder.new(128)
+    j = 0
+    while j < quote.child_count(mk) {
+        fv = quote.child(mk, j)
+        strbuilder.append(sb, "layout(location = ${j}) out ${glsl_type(quote.type_of(fv))} out_${quote.name(fv)};\n")
+        j = j + 1
+    }
+    return strbuilder.finish(sb)
+}
+
+// How many outputs the pixel shader writes: its struct's fields, or 1 (its
+// colour), or 0 (a depth shader).
+outputs_count(s: *GpuShader) -> int {
+    if s.depth { return 0 }
+    mk = returned_make(quote.body(s.tree))
+    if (mk as ptr) == null { return 1 }
+    return quote.child_count(mk)
 }
 
 // The vertex shader a full-screen pass draws the shader with, in
@@ -1091,6 +1579,8 @@ emit_glsl(s: *GpuShader, dialect: int) -> string {
 emit_screen_vertex(s: *GpuShader, dialect: int) -> string {
     if !emit_ready(s) { return "" }
     t = s.tree
+    // A pass linked to the screen vertex shader reads its varyings by name.
+    if s.links != null { return emit_vertex_glsl(screen_vertex(), dialect, "", "") }
     if glsl_type(quote.param_type(t, 0)) != "vec2" {
         g_error = "${quote.source(t)}: a full-screen pass hands its shader a vec2"
         return ""
@@ -1139,20 +1629,117 @@ fn screen_vertex_quote() -> *GpuShader {
 // lanes below, and with f32's ops where this works between roundings in
 // doubles.
 
-// A value: n lanes of a float, vec2, vec3 or vec4 (n 1 to 4), or a bool
-// (n 0, in x).
+// A value: n lanes of a float, vec2, vec3 or vec4 (n 1 to 4), a bool (n 0,
+// in x), a struct (n STRUCT_LANES: its fields, each named, in `fields`) or a
+// mat4 (n MAT_LANES: sixteen f32s in column order at `mat`, a run's own).
 struct GpuVal {
     n: int
     x: float
     y: float
     z: float
     w: float
+    fields: ptr      // a struct's: list of *GpuBinding
+    mat: ptr         // a mat4's columns
 }
+
+const STRUCT_LANES = -1
+const MAT_LANES = 16
 
 v1(x: float) -> *GpuVal { return mkval(1, x, 0.0, 0.0, 0.0) }
 v2(x: float, y: float) -> *GpuVal { return mkval(2, x, y, 0.0, 0.0) }
 v3(x: float, y: float, z: float) -> *GpuVal { return mkval(3, x, y, z, 0.0) }
 v4(x: float, y: float, z: float, w: float) -> *GpuVal { return mkval(4, x, y, z, w) }
+
+// A struct value with no fields yet: a pixel shader's varyings, for cpu_run
+// (val_set gives it each). val_free frees it and its fields.
+vstruct() -> *GpuVal {
+    v = heap.new(GpuVal)
+    v.n = STRUCT_LANES
+    v.fields = list.new()
+    return v
+}
+
+// The struct `s`'s field `name` is `val`, which it then owns.
+val_set(s: *GpuVal, name: string, val: @keep *GpuVal) {
+    if s == null || s.n != STRUCT_LANES { return }
+    bind(s.fields, name, val, null)
+}
+
+val_is_struct(v: *GpuVal) -> bool { return v != null && v.n == STRUCT_LANES }
+
+// The struct `v`'s field `name`, or null.
+val_field(v: *GpuVal, name: string) -> *GpuVal {
+    if v == null || v.n != STRUCT_LANES { return null }
+    b = find(v.fields, name)
+    if b == null { return null }
+    return b.val
+}
+
+// A value a caller owns gone, a struct's fields with it: what cpu_run
+// returns, or a vstruct.
+val_free(v: *GpuVal) {
+    if v == null { return }
+    if v.fields != null {
+        k = 0
+        while k < list.size(v.fields) {
+            bd = list.get_raw(v.fields, k) as *GpuBinding
+            val_free(bd.val)
+            binding_free(bd)
+            k = k + 1
+        }
+        list.free(v.fields)
+    }
+    if v.mat != null { free(v.mat) }
+    heap.free(v)
+}
+
+// A copy of `v` the caller owns, a struct's fields copied with it.
+fn val_copy(v: *GpuVal) -> *GpuVal {
+    if v.n == STRUCT_LANES {
+        c = vstruct()
+        k = 0
+        while k < list.size(v.fields) {
+            copy_field(c, list.get_raw(v.fields, k) as *GpuBinding)
+            k = k + 1
+        }
+        return c
+    }
+    if v.n == MAT_LANES {
+        m = heap.new(GpuVal)
+        m.n = MAT_LANES
+        m.mat = calloc(16, 4)
+        j = 0
+        while j < 16 {
+            (m.mat as f32[])[j] = (v.mat as f32[])[j]
+            j = j + 1
+        }
+        return m
+    }
+    return mkval(v.n, v.x, v.y, v.z, v.w)
+}
+
+// One field of a struct copied into `c`. Its own function, not the loop's
+// body: in a loop, the name read for the call (whose other argument is a
+// call) was released at the end of each pass and again at the start of the
+// next (Aether 0.822.0), and the copy kept a freed name.
+fn copy_field(c: *GpuVal, bd: *GpuBinding) {
+    val_set(c, bd.name, val_copy(bd.val))
+}
+
+// A value of a run's arena let go: a struct's own list of bindings (its
+// fields' values are the arena's too) or a matrix's columns, then the value.
+fn arena_free(v: *GpuVal) {
+    if v.fields != null {
+        k = 0
+        while k < list.size(v.fields) {
+            binding_free(list.get_raw(v.fields, k) as *GpuBinding)
+            k = k + 1
+        }
+        list.free(v.fields)
+    }
+    if v.mat != null { free(v.mat) }
+    heap.free(v)
+}
 val_n(v: *GpuVal) -> int { return v.n }
 val_x(v: *GpuVal) -> float { return v.x }
 val_y(v: *GpuVal) -> float { return v.y }
@@ -1224,6 +1811,9 @@ struct GpuRun {
     dialect: int     // VULKAN or GL: which form depth_clip and screen_y_sign run as
     attrs: ptr       // a vertex run's attributes (list of *GpuBinding); null for a pixel's
     outs: ptr        // a vertex run's outputs (list of *GpuBinding, values owned)
+    frag_on: bool    // frag_coord() is frag_x, frag_y (cpu_set_frag_coord), not the uv's pixel
+    frag_x: float
+    frag_y: float
 }
 
 const FLOW_ON = 0
@@ -1258,11 +1848,20 @@ cpu_set_viewport(cx: *GpuRun, w: int, h: int) {
     cx.view_h = h
 }
 
+// The pixel frag_coord() is for the next runs, x, y (its centre: + 0.5):
+// for a pass whose parameter is not the uv of a screen quad, which works from
+// the pixel (the sky's capture, the clouds).
+cpu_set_frag_coord(cx: *GpuRun, x: float, y: float) {
+    cx.frag_on = true
+    cx.frag_x = x
+    cx.frag_y = y
+}
+
 // The dialect the run's depth_clip and screen_y_sign are, VULKAN (as a run
 // is made) or GL.
 cpu_set_dialect(cx: *GpuRun, dialect: int) { cx.dialect = dialect }
 
-fn bind(lst: ptr, name: string, v: *GpuVal, img: @keep ptr) {
+fn bind(lst: ptr, name: string, v: @keep *GpuVal, img: @keep ptr) {
     bd = heap.new(GpuBinding)
     bd.name = name
     bd.val = v
@@ -1314,6 +1913,9 @@ fn read_captures(cx: *GpuRun) {
         } else if ty == "TextureMS" {
             ms = quote.cell(c) as *TextureMS
             bind(cx.caps, name, null, ms.image)
+        } else if ty == "Texture3D" {
+            t3 = quote.cell(c) as *Texture3D
+            bind(cx.caps, name, null, t3.image)
         } else if ty == "float" {
             bind(cx.caps, name, keep(cx, v1(quote.get_float(c))), null)
         } else if ty == "f32" {
@@ -1335,8 +1937,9 @@ fn read_captures(cx: *GpuRun) {
     }
 }
 
-// Run the shader for one value of its parameter: the colour it returns, a
-// fresh value the caller frees (heap.free), or null when it could not run
+// Run the shader for one value of its parameter (a struct of varyings is a
+// vstruct): the colour it returns, or its struct of outputs (val_field), a
+// fresh value the caller frees (val_free), or null when it could not run
 // (last_error says why).
 cpu_run(cx: *GpuRun, param: *GpuVal) -> *GpuVal {
     g_error = ""
@@ -1349,17 +1952,10 @@ cpu_run(cx: *GpuRun, param: *GpuVal) -> *GpuVal {
     bind(cx.locals, quote.param_name(t, 0), param, null)
     cpu_block(cx, quote.body(t))
     ok = cx.out != null && cx.failed == 0
-    rn = 0
-    rx = 0.0
-    ry = 0.0
-    rz = 0.0
-    rw = 0.0
+    result = null as *GpuVal
     if ok {
-        rn = cx.out.n
-        rx = cx.out.x
-        ry = cx.out.y
-        rz = cx.out.z
-        rw = cx.out.w
+        // Its own copy, past the arena: a struct's fields with it.
+        result = val_copy(cx.out)
     } else if cx.failed == 0 {
         g_error = "${quote.source(t)}: the shader ended without returning a colour"
     }
@@ -1378,12 +1974,11 @@ cpu_run(cx: *GpuRun, param: *GpuVal) -> *GpuVal {
     list.clear(cx.caps)
     k = 0
     while k < list.size(cx.arena) {
-        heap.free(list.get_raw(cx.arena, k))
+        arena_free(list.get_raw(cx.arena, k) as *GpuVal)
         k = k + 1
     }
     list.clear(cx.arena)
-    if !ok { return null }
-    return mkval(rn, rx, ry, rz, rw)
+    return result
 }
 
 // A vertex run's outputs let go.
@@ -1391,7 +1986,7 @@ fn drop_outs(cx: *GpuRun) {
     k = 0
     while k < list.size(cx.outs) {
         bd = list.get_raw(cx.outs, k) as *GpuBinding
-        heap.free(bd.val)
+        val_free(bd.val)
         binding_free(bd)
         k = k + 1
     }
@@ -1441,7 +2036,7 @@ cpu_run_vertex(cx: *GpuRun) -> bool {
     list.clear(cx.caps)
     k = 0
     while k < list.size(cx.arena) {
-        heap.free(list.get_raw(cx.arena, k))
+        arena_free(list.get_raw(cx.arena, k) as *GpuVal)
         k = k + 1
     }
     list.clear(cx.arena)
@@ -1642,6 +2237,17 @@ fn cpu_expr(cx: *GpuRun, n: quote.Node) -> *GpuVal {
         return cpu_binary(cx, n, op, quote.type_of(n), cpu_expr(cx, quote.child(n, 0)), cpu_expr(cx, quote.child(n, 1)))
     }
     if k == quote.CALL { return cpu_call(cx, n) }
+    if k == quote.MAKE {
+        // A struct literal: its fields, each its value, the arena's.
+        v = keep(cx, vstruct())
+        j = 0
+        while j < quote.child_count(n) {
+            fv = quote.child(n, j)
+            bind(v.fields, quote.name(fv), cpu_expr(cx, quote.child(fv, 0)), null)
+            j = j + 1
+        }
+        return v
+    }
     if k == quote.HELPER_CALL { return cpu_helper_call(cx, n) }
     return fail(cx, n, "a ${quote.kind_name(k)} is not run on the CPU")
 }
@@ -1663,6 +2269,7 @@ fn cpu_helper_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
         a = quote.child(n, j)
         if is_texture(quote.param_type(h, j)) || quote.param_type(h, j) == "mat4" {
             img = texture_image(cx, a)
+            if img == null && quote.param_type(h, j) == "mat4" { img = matrix_of(cx, a) }
             if img == null { list.free(args); list.free(imgs); return fail(cx, n, "${quote.name(n)} is given a texture with no image") }
             list.add_raw(args, null)
             list.add_raw(imgs, img)
@@ -1700,6 +2307,11 @@ fn cpu_helper_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
 }
 
 fn cpu_field(cx: *GpuRun, n: quote.Node, v: *GpuVal, name: string) -> *GpuVal {
+    if v.n == STRUCT_LANES {
+        f = val_field(v, name)
+        if f == null { return fail(cx, n, "no field ${name} in the struct") }
+        return f
+    }
     m = string.length(name)
     if m < 1 || m > 4 { return fail(cx, n, "no field .${name}") }
     out = keep(cx, mkval(m, 0.0, 0.0, 0.0, 0.0))
@@ -1887,6 +2499,14 @@ fn cpu_lanes(cx: *GpuRun, n: quote.Node, fname: string, a: *GpuVal, c: *GpuVal, 
             r = pow(x, y)
         } else if fname == "log2" {
             r = log2(x)
+        } else if fname == "exp" {
+            r = exp(x)
+        } else if fname == "tan" {
+            r = tan(x)
+        } else if fname == "asin" {
+            r = asin(x)
+        } else if fname == "acos" {
+            r = acos(x)
         } else {
             return fail(cx, n, "${fname}() is not run on the CPU")
         }
@@ -1933,6 +2553,61 @@ fn dot_of(v: *GpuVal) -> float {
     return d
 }
 
+// The columns of the matrix `m` names: a captured mat4's cell, a helper's
+// mat4 parameter, or a product made in the run (mul_m4); null for none.
+fn matrix_of(cx: *GpuRun, m: quote.Node) -> ptr {
+    k = quote.kind(m)
+    if k == quote.CAPTURE || k == quote.LOCAL {
+        img = texture_image(cx, m)
+        if img != null { return img }
+        if k == quote.CAPTURE { return null }
+    }
+    v = cpu_expr(cx, m)
+    if v.n != MAT_LANES { return null }
+    return v.mat
+}
+
+// The texel of a 3D image at x, y, z, each wrapped into it, as a REPEAT
+// sampler reads (the clouds' noise tiles).
+fn wrapi(v: int, size: int) -> int {
+    r = v % size
+    if r < 0 { r = r + size }
+    return r
+}
+
+// texture(img, p) of a sampler3D: trilinear, texel centres at (i + 0.5) /
+// size, the weights to the sampler's precision, wrapped at the edges (the
+// clouds' shape and detail are tileable, their samplers REPEAT). Level 0
+// only: the CPU has no derivatives to choose a mip by.
+fn sample3d(cx: *GpuRun, img: *ShaderImage3D, u: float, v: float, w: float) -> *GpuVal {
+    fx = floori((u * img.w - 0.5) * SUBTEXEL + 0.5) / SUBTEXEL
+    fy = floori((v * img.h - 0.5) * SUBTEXEL + 0.5) / SUBTEXEL
+    fz = floori((w * img.d - 0.5) * SUBTEXEL + 0.5) / SUBTEXEL
+    x0 = floori(fx)
+    y0 = floori(fy)
+    z0 = floori(fz)
+    tx = fx - x0
+    ty = fy - y0
+    tz = fz - z0
+    xa = wrapi(x0, img.w)
+    xb = wrapi(x0 + 1, img.w)
+    ya = wrapi(y0, img.h)
+    yb = wrapi(y0 + 1, img.h)
+    za = wrapi(z0, img.d)
+    zb = wrapi(z0 + 1, img.d)
+    out = keep(cx, mkval(4, 0.0, 0.0, 0.0, 0.0))
+    ch = 0
+    while ch < 4 {
+        near = (image3d_channel(img, xa, ya, za, ch) * (1.0 - tx) + image3d_channel(img, xb, ya, za, ch) * tx) * (1.0 - ty) +
+               (image3d_channel(img, xa, yb, za, ch) * (1.0 - tx) + image3d_channel(img, xb, yb, za, ch) * tx) * ty
+        far = (image3d_channel(img, xa, ya, zb, ch) * (1.0 - tx) + image3d_channel(img, xb, ya, zb, ch) * tx) * (1.0 - ty) +
+              (image3d_channel(img, xa, yb, zb, ch) * (1.0 - tx) + image3d_channel(img, xb, yb, zb, ch) * tx) * ty
+        set_lane(out, ch, near * (1.0 - tz) + far * tz)
+        ch = ch + 1
+    }
+    return out
+}
+
 fn cpu_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
     // The same calls the GLSL can be written with, and no others.
     why = call_refused(n)
@@ -1956,8 +2631,8 @@ fn cpu_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
     if name == "rgb" && argc == 1 { return cpu_field(cx, n, cpu_expr(cx, quote.child(n, 0)), "rgb") }
     if name == "mul" && argc == 2 {
         mn = quote.child(n, 0)
-        m = texture_image(cx, mn)
-        if m == null { return fail(cx, n, "mul() of ${quote.name(mn)}: a matrix is a capture or a helper's parameter") }
+        m = matrix_of(cx, mn)
+        if m == null { return fail(cx, n, "mul() of ${quote.name(mn)}: a matrix is a capture, a helper's parameter or a product") }
         v = cpu_expr(cx, quote.child(n, 1))
         cols = m as f32[]
         out = keep(cx, mkval(4, 0.0, 0.0, 0.0, 0.0))
@@ -1969,6 +2644,68 @@ fn cpu_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
         }
         return out
     }
+    if name == "mul_m4" && argc == 2 {
+        // a * b, each element the f32 a GPU holds.
+        a = matrix_of(cx, quote.child(n, 0))
+        b = matrix_of(cx, quote.child(n, 1))
+        if a == null || b == null { return fail(cx, n, "mul_m4() of a matrix that is not a capture, a parameter or a product") }
+        p = keep(cx, heap.new(GpuVal))
+        p.n = MAT_LANES
+        p.mat = calloc(16, 4)
+        ac = a as f32[]
+        bc = b as f32[]
+        col = 0
+        while col < 4 {
+            row = 0
+            while row < 4 {
+                e = 0.0
+                k = 0
+                while k < 4 {
+                    e = e + (ac[k * 4 + row] as float) * (bc[col * 4 + k] as float)
+                    k = k + 1
+                }
+                (p.mat as f32[])[col * 4 + row] = e as f32
+                row = row + 1
+            }
+            col = col + 1
+        }
+        return p
+    }
+    if name == "m4_at" && argc == 3 {
+        m = matrix_of(cx, quote.child(n, 0))
+        if m == null { return fail(cx, n, "m4_at() of a matrix that is not a capture, a parameter or a product") }
+        c = floori(cpu_expr(cx, quote.child(n, 1)).x)
+        r = floori(cpu_expr(cx, quote.child(n, 2)).x)
+        if c < 0 || c > 3 || r < 0 || r > 3 { return fail(cx, n, "m4_at() past the matrix") }
+        return keep(cx, v1(((m as f32[])[c * 4 + r]) as float))
+    }
+    if name == "mul_transpose3" && argc == 2 {
+        // transpose(mat3(m)) * e: lane i the dot of column i's first three with e.
+        m = matrix_of(cx, quote.child(n, 0))
+        if m == null { return fail(cx, n, "mul_transpose3() of a matrix that is not a capture, a parameter or a product") }
+        e = cpu_expr(cx, quote.child(n, 1))
+        cols = m as f32[]
+        out = keep(cx, mkval(3, 0.0, 0.0, 0.0, 0.0))
+        i = 0
+        while i < 3 {
+            set_lane(out, i, (cols[i * 4] as float) * e.x + (cols[i * 4 + 1] as float) * e.y + (cols[i * 4 + 2] as float) * e.z)
+            i = i + 1
+        }
+        return out
+    }
+    if name == "texture_3d" && argc == 2 {
+        tex = quote.child(n, 0)
+        img = texture_image(cx, tex)
+        if img == null { return fail(cx, n, "texture_3d() of ${quote.name(tex)}, which has no image") }
+        p = cpu_expr(cx, quote.child(n, 1))
+        return sample3d(cx, img as *ShaderImage3D, p.x, p.y, p.z)
+    }
+    if name == "atan2" && argc == 2 {
+        y = cpu_expr(cx, quote.child(n, 0))
+        x = cpu_expr(cx, quote.child(n, 1))
+        return keep(cx, v1(atan2(y.x, x.x)))
+    }
+    if name == "xz" && argc == 1 { return cpu_field(cx, n, cpu_expr(cx, quote.child(n, 0)), "xz") }
     if name == "xy" && argc == 1 { return cpu_field(cx, n, cpu_expr(cx, quote.child(n, 0)), "xy") }
     if name == "float_of" && argc == 1 { return keep(cx, v1(cpu_expr(cx, quote.child(n, 0)).x)) }
     // uint(x): a float or int truncated toward zero, then wrapped to 32 bits;
@@ -2081,6 +2818,7 @@ fn cpu_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
         return keep(cx, v1(0.0 - 1.0))
     }
     if name == "frag_coord" {
+        if cx.frag_on { return keep(cx, mkval(2, cx.frag_x, cx.frag_y, 0.0, 0.0)) }
         if cx.view_w <= 0 || cx.view_h <= 0 { return fail(cx, n, "frag_coord() with no viewport (cpu_set_viewport)") }
         uv = cx.param
         return keep(cx, mkval(2, uv.x * cx.view_w, uv.y * cx.view_h, 0.0, 0.0))
@@ -2113,6 +2851,9 @@ fn cpu_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
     }
     // Constructors: from scalars and vectors in order, or one scalar
     // splatted.
+    if name == "splat2" { name = "vec2" }
+    if name == "splat3" { name = "vec3" }
+    if name == "splat4" { name = "vec4" }
     if name == "vec2" || name == "vec3" || name == "vec4" {
         want = 2
         if name == "vec3" { want = 3 }

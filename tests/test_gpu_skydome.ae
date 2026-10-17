@@ -1,0 +1,600 @@
+// ae3d.shaders.skydome through ae3d.gpu: the sky, its capture and its
+// clouds, written with `quote` (step 6).
+//
+//   - sky_vertex, sky, sky_capture and cloud come out as the GLSL in
+//     tests/fixtures/gpu/skydome*.{vert,frag} and their _gl twins, and
+//     glslang and spirv-val pass them;
+//   - the sky links to its vertex shader by its varyings' names, all three
+//     read at the hand-written shader's locations (TexCoords 0, ClipNow 1,
+//     ClipPrev 2), and writes two outputs, its colour at 0 and its motion
+//     at 1; the capture and the clouds read no varyings and link to the
+//     screen's vertex shader, writing one;
+//   - cloudDensity's `out float heightFraction` is a CloudSample, a GLSL
+//     struct its helper returns;
+//   - on the CPU, the vertex shader puts the cube at the far plane (xyww) as
+//     the product written as Aether does; the sky, painted, procedural by
+//     day and by night, flat and overcast, with what the cloud pass left
+//     over it, and its motion vector; the capture with its clouds marched
+//     through 3D noise; and the cloud pass, its history folded in: each as
+//     the same shader written as plain Aether over ae3d.shaderlib does.
+//
+// On a GPU, all three are drawn by the suites the sky lights (test_sky,
+// test_clouds, test_sky_light, ...). AE3D_GPU_WRITE_GOLDEN=1 writes the
+// fixtures.
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.lanes
+import std.quote
+import ae3d.gpu
+import ae3d.gpu (GpuShader, GpuVal)
+import ae3d.shaders.skydome
+import ae3d.shaders.skydome (SkyOut)
+import ae3d.shaderlib
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, Texture3D, ShaderImage, ShaderImage3D, rgb, xy, splat2, splat4,
+                       mul, mul_m4, m4_at, mul_transpose3, mix_v4, image_new, image_set, image_free, texture_of,
+                       image_mip_chain, image3d_new, image3d_set, image3d_free, texture3d_of, set_frag_coord, float_of)
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+absf(a: float) -> float { if a < 0.0 { return 0.0 - a } return a }
+maxf(a: float, b: float) -> float { if a > b { return a } return b }
+
+// glslang -V over `text` (as `stage`), then spirv-val; or, for desktop
+// OpenGL's GLSL (`opengl`), glslang's check of it. Skipped where they are
+// not on PATH.
+compiles(label: string, text: string, stage: string, opengl: bool) {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+        if status != 0 { println(out) }
+        return
+    }
+    check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    if status != 0 { println(out) }
+    if string.length(os.which("spirv-val")) == 0 {
+        println("  skip spirv-val (not on PATH)")
+        return
+    }
+    vargv = list.new()
+    list.add(vargv, spv)
+    vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+    check("spirv-val passes ${label}.${stage}", vstatus == 0)
+    if vstatus != 0 { println(vout) }
+    list.free(vargv)
+}
+
+// `text` is the fixture at `path`; AE3D_GPU_WRITE_GOLDEN=1 writes it.
+golden_is(text: string, path: string) {
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(path, text)
+        check("${path} written", werr == "")
+    }
+    golden, gerr = file.read(path)
+    check("${path} is there", gerr == "")
+    check("the GLSL written is ${path}", text == golden)
+    if text != golden {
+        println("--- emitted ---")
+        println(text)
+    }
+}
+
+// Each shader's GLSL in both dialects against its fixtures, and compiled.
+written(label: string, vk: string, gl: string, stage: string) {
+    if vk == "" || gl == "" { println("  emit ${label}: ${gpu.last_error()}") }
+    golden_is(vk, "tests/fixtures/gpu/${label}.${stage}")
+    compiles(label, vk, stage, false)
+    golden_is(gl, "tests/fixtures/gpu/${label}_gl.${stage}")
+    compiles("${label}_gl", gl, stage, true)
+}
+
+// ── The pictures the shaders read ─────────────────────────────────────
+
+// A painted sky, 32 by 16, its mips made: blue overhead to a pale horizon, a
+// warm band on one side, so u and v and a coarse level each read otherwise.
+painted() -> *ShaderImage {
+    img = image_new(32, 16)
+    y = 0
+    while y < 16 {
+        x = 0
+        while x < 32 {
+            up = y / 15.0
+            warm = 0.0
+            if x > 20 && x < 26 { warm = 0.3 }
+            image_set(img, x, y, 0.55 + warm - up * 0.35, 0.65 - up * 0.2, 0.75 + up * 0.2, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image_mip_chain(img, 5)
+    return img
+}
+
+// What a cloud pass left (or its history): premultiplied cloud, a patch of it.
+cloudy(w: int, h: int, seed: float) -> *ShaderImage {
+    img = image_new(w, h)
+    y = 0
+    while y < h {
+        x = 0
+        while x < w {
+            a = 0.0
+            if (x + y) % 3 != 0 { a = 0.2 + 0.1 * ((x * 7 + y * 3) % 5) + seed * 0.1 }
+            image_set(img, x, y, a * 0.9, a * 0.85, a * 0.8 + seed * 0.05, a)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return img
+}
+
+// The weather: the cloud field high in red, the kind in green, the banks in
+// blue, varied across the tile so the march meets cloud and clear air.
+weather() -> *ShaderImage {
+    img = image_new(16, 16)
+    y = 0
+    while y < 16 {
+        x = 0
+        while x < 16 {
+            image_set(img, x, y, 0.55 + 0.4 * (((x * 5 + y * 3) % 7) / 6.0), ((x + y * 2) % 4) / 3.0,
+                      0.3 + 0.6 * ((x % 3) / 2.0), 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return img
+}
+
+// A tileable cube of noise, `n` a side: Perlin-Worley-like red over three
+// Worley-like octaves, enough structure for a density with edges.
+noise3d(n: int, seed: int) -> *ShaderImage3D {
+    img = image3d_new(n, n, n)
+    z = 0
+    while z < n {
+        y = 0
+        while y < n {
+            x = 0
+            while x < n {
+                h = (x * 73 + y * 151 + z * 197 + seed * 31) % 101
+                image3d_set(img, x, y, z, 0.35 + 0.6 * (h / 100.0), 0.3 + 0.5 * (((h * 3) % 101) / 100.0),
+                            0.2 + 0.6 * (((h * 7) % 101) / 100.0), 0.25 + 0.5 * (((h * 11) % 101) / 100.0))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        z = z + 1
+    }
+    return img
+}
+
+// ── The shaders written as plain Aether: what the CPU is held to ──────
+
+sky_reference(f_tex: vec3, clip_now: vec4, clip_prev: vec4, skybox: Texture, cloud_buffer: Texture, kind: int,
+              sky_sun: vec3, cloud_sun: vec3, cloud_sun_colour: vec3, turbidity: float, flat_colour: vec3,
+              overcast: float, overcast_colour: vec3, cloud_cover: float, screen_size: vec2, fc: vec2) -> SkyOut {
+    dir = shaderlib.normalize(f_tex)
+    sky_colour = skydome.sky_at(dir, skybox, kind, sky_sun, cloud_sun, cloud_sun_colour, turbidity, flat_colour, overcast,
+                                overcast_colour, true)
+    clouds = splat4(0.0)
+    if cloud_cover > 0.0 { clouds = shaderlib.texture(cloud_buffer, fc / screen_size) }
+    c = clouds as f32x4
+    return SkyOut { colour: vec4(skydome.display_radiance(sky_colour) * (1.0 - c.w) + rgb(clouds), 1.0),
+                    velocity: skydome.velocity(clip_now, clip_prev, splat2(0.0)) }
+}
+
+capture_reference(fc: vec2, skybox: Texture, cloud_weather: Texture, cloud_shape: Texture3D, cloud_detail: Texture3D,
+                  kind: int, sky_sun: vec3, cloud_sun: vec3, cloud_sun_colour: vec3, turbidity: float,
+                  flat_colour: vec3, overcast: float, overcast_colour: vec3, cloud_cover: float, cloud_time: float,
+                  eye: vec3) -> vec4 {
+    dir = skydome.texel_direction(fc / 256.0, 256.0)
+    sky_colour = skydome.sky_at(dir, skybox, kind, sky_sun, cloud_sun, cloud_sun_colour, turbidity, flat_colour, overcast,
+                                overcast_colour, false)
+    clouds = skydome.clouds_along(dir, sky_colour, cloud_cover, cloud_time, skydome.cloud_dither(fc), 32.0, 64.0, eye,
+                                  cloud_sun, cloud_sun_colour, cloud_weather, cloud_shape, cloud_detail)
+    c = clouds as f32x4
+    return vec4(skydome.display_radiance(sky_colour) * (1.0 - c.w) + rgb(clouds), 1.0)
+}
+
+cloud_reference(fc: vec2, skybox: Texture, history: Texture, cloud_weather: Texture, cloud_shape: Texture3D,
+                cloud_detail: Texture3D, kind: int, sky_sun: vec3, cloud_sun: vec3, cloud_sun_colour: vec3,
+                turbidity: float, flat_colour: vec3, overcast: float, overcast_colour: vec3, cloud_cover: float,
+                cloud_time: float, eye: vec3, size: vec2, projection: mat4, view: mat4, prev_view_projection: mat4,
+                frame: int, history_on: int) -> vec4 {
+    ndc = fc / size * 2.0 - splat2(1.0)
+    n = ndc as f32x4
+    toward = vec3((n.x + m4_at(projection, 2, 0)) / m4_at(projection, 0, 0),
+                  (n.y + m4_at(projection, 2, 1)) / m4_at(projection, 1, 1), -1.0)
+    dir = shaderlib.normalize(mul_transpose3(view, toward))
+    sky_colour = skydome.sky_at(dir, skybox, kind, sky_sun, cloud_sun, cloud_sun_colour, turbidity, flat_colour, overcast,
+                                overcast_colour, false)
+    grain = fc + splat2(5.588238 * float_of(frame % 64))
+    clouds = skydome.clouds_along(dir, sky_colour, cloud_cover, cloud_time, skydome.cloud_dither(grain), 16.0, 32.0, eye,
+                                  cloud_sun, cloud_sun_colour, cloud_weather, cloud_shape, cloud_detail)
+    if history_on == 1 {
+        was = mul(prev_view_projection, vec4(dir, 0.0)) as f32x4
+        at = xy(was as vec4) / maxf(was.w, 0.00001) * 0.5 + splat2(0.5)
+        a = at as f32x4
+        if was.w > 0.0 && a.x >= 0.0 && a.x <= 1.0 && a.y >= 0.0 && a.y <= 1.0 {
+            clouds = mix_v4(shaderlib.texture(history, at), clouds, 0.125)
+        }
+    }
+    return clouds
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────
+
+// A camera's matrices, as the renderer gives them: a perspective whose
+// offset terms are a jitter, and a view's turn (its translation stripped).
+perspective(jx: float, jy: float) -> mat4 {
+    c = calloc(16, 8)
+    d = c as float[]
+    d[0] = 1.2
+    d[5] = 1.9
+    d[8] = jx
+    d[9] = jy
+    d[10] = 0.0 - 1.0002
+    d[11] = 0.0 - 1.0
+    d[14] = 0.0 - 0.20002
+    m = shaderlib.mat4_of(c)
+    free(c)
+    return m
+}
+
+// A turn about y by `a` radians, then a tilt about x by `t`.
+turn(a: float, t: float) -> mat4 {
+    c = calloc(16, 8)
+    d = c as float[]
+    ca = shaderlib.cos(a)
+    sa = shaderlib.sin(a)
+    ct = shaderlib.cos(t)
+    st = shaderlib.sin(t)
+    // Columns of R_x(t) * R_y(a).
+    d[0] = ca
+    d[1] = sa * st
+    d[2] = 0.0 - sa * ct
+    d[5] = ct
+    d[6] = st
+    d[8] = sa
+    d[9] = 0.0 - ca * st
+    d[10] = ca * ct
+    d[15] = 1.0
+    m = shaderlib.mat4_of(c)
+    free(c)
+    return m
+}
+
+v3_of(v: vec3) -> *GpuVal {
+    p = v as f32x4
+    return gpu.v3(p.x, p.y, p.z)
+}
+v4_of(v: vec4) -> *GpuVal {
+    p = v as f32x4
+    return gpu.v4(p.x, p.y, p.z, p.w)
+}
+
+// How far `got` (four lanes) is from `want`, relative where it is large: the
+// worst lane.
+apart(got: *GpuVal, want: vec4) -> float {
+    w = want as f32x4
+    worst = rel(gpu.val_x(got), w.x)
+    worst = maxf(worst, rel(gpu.val_y(got), w.y))
+    worst = maxf(worst, rel(gpu.val_z(got), w.z))
+    return maxf(worst, rel(gpu.val_w(got), w.w))
+}
+rel(a: float, b: float) -> float { return absf(a - b) / maxf(1.0, absf(b)) }
+
+// The sky's values: a day sky (kind 1), a painted one (0), a flat one (2),
+// a night with the moon up, an overcast over the painting.
+struct SkyCase {
+    kind: int
+    sky_sun: vec3
+    cloud_sun: vec3
+    overcast: float
+}
+
+sky_case(k: int) -> SkyCase {
+    if k == 0 { return SkyCase { kind: 1, sky_sun: vec3(0.3, 0.6, 0.5), cloud_sun: vec3(0.3, 0.6, 0.5), overcast: 0.0 } }
+    if k == 1 { return SkyCase { kind: 0, sky_sun: vec3(0.3, 0.6, 0.5), cloud_sun: vec3(0.3, 0.6, 0.5), overcast: 0.0 } }
+    if k == 2 { return SkyCase { kind: 2, sky_sun: vec3(0.3, 0.6, 0.5), cloud_sun: vec3(0.3, 0.6, 0.5), overcast: 0.0 } }
+    if k == 3 { return SkyCase { kind: 1, sky_sun: vec3(0.2, -0.5, 0.4), cloud_sun: vec3(-0.4, 0.7, 0.2), overcast: 0.0 } }
+    if k == 4 { return SkyCase { kind: 0, sky_sun: vec3(0.3, 0.6, 0.5), cloud_sun: vec3(0.3, 0.6, 0.5), overcast: 0.6 } }
+    return SkyCase { kind: 1, sky_sun: vec3(0.6, 0.1, -0.3), cloud_sun: vec3(0.6, 0.1, -0.3), overcast: 0.3 }
+}
+const SKY_CASES = 6
+
+main() {
+    println("ae3d.shaders.skydome: the sky, its capture and its clouds")
+    sun_colour = vec3(1.6, 1.45, 1.2)
+    overcast_colour = vec3(0.55, 0.57, 0.6)
+    flat_colour = vec3(0.2, 0.3, 0.45)
+
+    // ── The GLSL ──
+    proj = perspective(0.0013, -0.0021)
+    view = turn(0.7, 0.25)
+    prev = mul_m4(perspective(0.0, 0.0), turn(0.69, 0.251))
+    vs = skydome.sky_vertex(proj, view, prev)
+    written("skydome", gpu.emit_vertex_glsl(vs, gpu.VULKAN, "", ""), gpu.emit_vertex_glsl(vs, gpu.GL, "", ""), "vert")
+    vk_vert = gpu.emit_vertex_glsl(vs, gpu.VULKAN, "", "")
+    check("the cube at the far plane, its turn and last frame's in VertexParams, the three varyings at 0, 1 and 2",
+          string.contains(vk_vert, "gl_Position = vec4(vec3(pos.x, pos.y, pos.w), pos.w);") != 0 &&
+          string.contains(vk_vert, "vec4 pos = ((projection * view) * vec4(inPosition, 1.0));") != 0 &&
+          string.contains(vk_vert, "layout(location = 0) out vec3 tex_coords;") != 0 &&
+          string.contains(vk_vert, "layout(location = 1) out vec4 clip_now;") != 0 &&
+          string.contains(vk_vert, "layout(location = 2) out vec4 clip_prev;") != 0 &&
+          string.contains(vk_vert, "layout(std140, set = 1, binding = 0) uniform VertexParams {") != 0)
+
+    sky_img = painted()
+    buf_img = cloudy(40, 24, 0.0)
+    skybox = texture_of(sky_img)
+    cloud_buffer = texture_of(buf_img)
+    ps = skydome.sky(skybox, cloud_buffer, 1, vec3(0.3, 0.6, 0.5), vec3(0.3, 0.6, 0.5), sun_colour, 2.5, flat_colour,
+                     0.0, overcast_colour, 0.5, vec2(40.0, 24.0))
+    unlinked = gpu.emit_glsl(ps, gpu.VULKAN)
+    check("the sky is not written before it is linked", unlinked == "")
+    check("gpu.link pairs the sky with its vertex shader", gpu.link(vs, ps))
+    check("the sky reads its varyings where the hand-written one did (TexCoords 0, ClipNow 1, ClipPrev 2)",
+          gpu.varying_location(ps, "tex_coords") == 0 && gpu.varying_location(ps, "clip_now") == 1 &&
+          gpu.varying_location(ps, "clip_prev") == 2)
+    check("and writes two outputs", gpu.outputs_count(ps) == 2)
+    vk_sky = gpu.emit_glsl(ps, gpu.VULKAN)
+    written("skydome_sky", vk_sky, gpu.emit_glsl(ps, gpu.GL), "frag")
+    check("its colour at 0 and its motion at 1, the outVelocity of the hand-written sky",
+          string.contains(vk_sky, "layout(location = 0) out vec4 out_colour;") != 0 &&
+          string.contains(vk_sky, "layout(location = 1) out vec2 out_velocity;") != 0 &&
+          string.contains(vk_sky, "FragColor") == 0)
+
+    weather_img = weather()
+    shape_img = noise3d(8, 1)
+    detail_img = noise3d(8, 2)
+    weather_t = texture_of(weather_img)
+    shape_t = texture3d_of(shape_img)
+    detail_t = texture3d_of(detail_img)
+    eye = vec3(130.0, 2.0, -250.0)
+    cs = skydome.sky_capture(skybox, weather_t, shape_t, detail_t, 1, vec3(0.3, 0.6, 0.5), vec3(0.3, 0.6, 0.5),
+                             sun_colour, 2.5, flat_colour, 0.0, overcast_colour, 0.7, 340.0, eye)
+    check("the capture reads no varyings: it links to the screen's vertex shader", gpu.link(gpu.screen_vertex(), cs))
+    vk_cap = gpu.emit_glsl(cs, gpu.VULKAN)
+    written("skydome_capture", vk_cap, gpu.emit_glsl(cs, gpu.GL), "frag")
+    check("cloudDensity's out parameter a CloudSample its helper returns, two 3D textures sampled",
+          string.contains(vk_cap, "struct CloudSample {\n    float density;\n    float height;\n};") != 0 &&
+          string.contains(vk_cap, "CloudSample ae3d_shaders_skydome_cloud_density(") != 0 &&
+          string.contains(vk_cap, "uniform sampler3D cloud_shape;") != 0 &&
+          string.contains(vk_cap, "uniform sampler3D cloud_detail;") != 0 &&
+          string.contains(vk_cap, "\nlayout(location = 0) out vec4 FragColor;\n") != 0 &&
+          string.contains(vk_cap, " in ") == 0)
+    check("and is drawn with the screen's vertex shader",
+          gpu.emit_screen_vertex(cs, gpu.VULKAN) == gpu.emit_vertex_glsl(gpu.screen_vertex(), gpu.VULKAN, "", ""))
+
+    hist_img = cloudy(40, 24, 1.0)
+    history = texture_of(hist_img)
+    cl = skydome.cloud(skybox, history, weather_t, shape_t, detail_t, 1, vec3(0.3, 0.6, 0.5), vec3(0.3, 0.6, 0.5),
+                       sun_colour, 2.5, flat_colour, 0.0, overcast_colour, 0.7, 340.0, eye, vec2(40.0, 24.0), proj, view,
+                       prev, 77, 1)
+    check("the cloud pass links to the screen's vertex shader", gpu.link(gpu.screen_vertex(), cl))
+    vk_cl = gpu.emit_glsl(cl, gpu.VULKAN)
+    written("skydome_cloud", vk_cl, gpu.emit_glsl(cl, gpu.GL), "frag")
+    check("the cloud pass's direction through the projection's terms and the view's turn",
+          string.contains(vk_cl, "(ndc.x + projection[2][0]) / projection[0][0]") != 0 &&
+          string.contains(vk_cl, "normalize((transpose(mat3(view)) * toward))") != 0 &&
+          string.contains(vk_cl, "float((frame % 64))") != 0)
+
+    // ── The vertex shader on the CPU ──
+    // A run a corner: a run's attributes are bound for its life.
+    right = 0
+    k = 0
+    while k < 8 {
+        cv = gpu.cpu_new(vs)
+        corner = vec3(if (k % 2 == 0) { -1.0 } else { 1.0 }, if ((k / 2) % 2 == 0) { -1.0 } else { 1.0 },
+                      if (k / 4 == 0) { -1.0 } else { 1.0 })
+        cg = v3_of(corner)
+        gpu.cpu_vertex_attr(cv, "position", cg)
+        ran = gpu.cpu_run_vertex(cv)
+        if !ran { println("  cpu_run_vertex: ${gpu.last_error()}") }
+        want_now = mul(mul_m4(proj, view), vec4(corner, 1.0))
+        want_prev = mul(prev, vec4(corner, 0.0))
+        wn = want_now as f32x4
+        pos = gpu.cpu_varying(cv, "position")
+        now = gpu.cpu_varying(cv, "clip_now")
+        pv = gpu.cpu_varying(cv, "clip_prev")
+        tc = gpu.cpu_varying(cv, "tex_coords")
+        c4 = corner as f32x4
+        if ran && pos != null && now != null && pv != null && tc != null &&
+           apart(now, want_now) < 1e-5 && apart(pv, want_prev) < 1e-5 &&
+           absf(gpu.val_x(pos) - wn.x) < 1e-5 && absf(gpu.val_y(pos) - wn.y) < 1e-5 &&
+           gpu.val_z(pos) == gpu.val_w(now) && gpu.val_w(pos) == gpu.val_w(now) &&
+           gpu.val_x(tc) == c4.x && gpu.val_y(tc) == c4.y && gpu.val_z(tc) == c4.z {
+            right = right + 1
+        }
+        gpu.cpu_free(cv)
+        heap.free(cg)
+        k = k + 1
+    }
+    check("the CPU puts each corner of the cube at the far plane, as the product written as Aether does (${right} of 8)",
+          right == 8)
+
+    // ── The sky on the CPU, every kind ──
+    cases_right = 0
+    worst = 0.0
+    vel_right = 0
+    runs = 0
+    c = 0
+    while c < SKY_CASES {
+        sc = sky_case(c)
+        skyc = skydome.sky(skybox, cloud_buffer, sc.kind, sc.sky_sun, sc.cloud_sun, sun_colour, 2.5, flat_colour,
+                           sc.overcast, overcast_colour, 0.5, vec2(40.0, 24.0))
+        _l = gpu.link(vs, skyc)
+        cx = gpu.cpu_new(skyc)
+        good = 0
+        k = 0
+        while k < 24 {
+            // Directions all round, some under the horizon, toward the sun
+            // and the moon now and then.
+            a = k * 0.53
+            dir = vec3(shaderlib.cos(a), (k % 7) * 0.3 - 0.6, shaderlib.sin(a))
+            if k == 5 { dir = sc.sky_sun }
+            if k == 11 { dir = sc.cloud_sun }
+            now4 = mul(mul_m4(proj, view), vec4(dir, 1.0))
+            prev4 = mul(prev, vec4(dir, 0.0))
+            fc = vec2(3.5 + k * 1.5, 2.5 + (k % 9) * 2.0)
+            f4 = fc as f32x4
+            gpu.cpu_set_frag_coord(cx, f4.x, f4.y)
+            vary = gpu.vstruct()
+            gpu.val_set(vary, "tex_coords", v3_of(dir))
+            gpu.val_set(vary, "clip_now", v4_of(now4))
+            gpu.val_set(vary, "clip_prev", v4_of(prev4))
+            out = gpu.cpu_run(cx, vary)
+            if out == null { println("  cpu_run sky: ${gpu.last_error()}") }
+            want = sky_reference(dir, now4, prev4, skybox, cloud_buffer, sc.kind, sc.sky_sun, sc.cloud_sun, sun_colour, 2.5,
+                                 flat_colour, sc.overcast, overcast_colour, 0.5, vec2(40.0, 24.0), fc)
+            if out != null && gpu.val_is_struct(out) {
+                colour = gpu.val_field(out, "colour")
+                vel = gpu.val_field(out, "velocity")
+                if colour != null && vel != null {
+                    d = apart(colour, want.colour)
+                    worst = maxf(worst, d)
+                    if d < 0.0005 { good = good + 1 }
+                    wv = want.velocity as f32x4
+                    if absf(gpu.val_x(vel) - wv.x) < 1e-5 && absf(gpu.val_y(vel) - wv.y) < 1e-5 { vel_right = vel_right + 1 }
+                }
+            }
+            runs = runs + 1
+            gpu.val_free(out)
+            gpu.val_free(vary)
+            k = k + 1
+        }
+        if good == 24 { cases_right = cases_right + 1 } else { println("  case ${c}: ${good} of 24") }
+        gpu.cpu_free(cx)
+        gpu.shader_free(skyc)
+        c = c + 1
+    }
+    check("the CPU draws the sky as the shader written as Aether does: painted, by day, by night, flat, overcast (${cases_right} of ${SKY_CASES}, worst ${worst})",
+          cases_right == SKY_CASES)
+    check("and its motion vector (${vel_right} of ${runs})", vel_right == runs)
+
+    // ── The capture on the CPU, its clouds marched ──
+    ccx = gpu.cpu_new(cs)
+    good = 0
+    clouded = 0
+    worst = 0.0
+    y = 0
+    while y < 256 {
+        x = 3
+        while x < 256 {
+            fc = vec2(x + 0.5, y + 0.5)
+            gpu.cpu_set_frag_coord(ccx, x + 0.5, y + 0.5)
+            pa = gpu.v2(0.0, 0.0)
+            got = gpu.cpu_run(ccx, pa)
+            heap.free(pa)
+            if got == null { println("  cpu_run capture: ${gpu.last_error()}") }
+            want_c = capture_reference(fc, skybox, weather_t, shape_t, detail_t, 1, vec3(0.3, 0.6, 0.5), vec3(0.3, 0.6, 0.5),
+                                     sun_colour, 2.5, flat_colour, 0.0, overcast_colour, 0.7, 340.0, eye)
+            sky_only = capture_reference(fc, skybox, weather_t, shape_t, detail_t, 1, vec3(0.3, 0.6, 0.5),
+                                         vec3(0.3, 0.6, 0.5), sun_colour, 2.5, flat_colour, 0.0, overcast_colour, 0.0,
+                                         340.0, eye)
+            if got != null {
+                d = apart(got, want_c)
+                worst = maxf(worst, d)
+                if d < 0.001 { good = good + 1 }
+                gpu.val_free(got)
+            }
+            w4 = want_c as f32x4
+            s4 = sky_only as f32x4
+            if absf(w4.x - s4.x) > 0.01 { clouded = clouded + 1 }
+            x = x + 23
+        }
+        y = y + 19
+    }
+    check("the capture marches clouds over a good share of its texels (${clouded} of 154)", clouded >= 15)
+    check("the CPU captures the sky and its clouds as the shader written as Aether does (${good} of 154, worst ${worst})",
+          good == 154)
+    gpu.cpu_free(ccx)
+
+    // ── The cloud pass on the CPU, its history folded in ──
+    clx = gpu.cpu_new(cl)
+    good = 0
+    folded = 0
+    worst = 0.0
+    y = 0
+    while y < 24 {
+        x = 0
+        while x < 40 {
+            fc = vec2(x + 0.5, y + 0.5)
+            gpu.cpu_set_frag_coord(clx, x + 0.5, y + 0.5)
+            pa = gpu.v2(0.0, 0.0)
+            got = gpu.cpu_run(clx, pa)
+            heap.free(pa)
+            if got == null { println("  cpu_run cloud: ${gpu.last_error()}") }
+            want_l = cloud_reference(fc, skybox, history, weather_t, shape_t, detail_t, 1, vec3(0.3, 0.6, 0.5),
+                                   vec3(0.3, 0.6, 0.5), sun_colour, 2.5, flat_colour, 0.0, overcast_colour, 0.7, 340.0,
+                                   eye, vec2(40.0, 24.0), proj, view, prev, 77, 1)
+            fresh = cloud_reference(fc, skybox, history, weather_t, shape_t, detail_t, 1, vec3(0.3, 0.6, 0.5),
+                                    vec3(0.3, 0.6, 0.5), sun_colour, 2.5, flat_colour, 0.0, overcast_colour, 0.7, 340.0,
+                                    eye, vec2(40.0, 24.0), proj, view, prev, 77, 0)
+            if got != null {
+                d = apart(got, want_l)
+                worst = maxf(worst, d)
+                if d < 0.001 { good = good + 1 }
+                gpu.val_free(got)
+            }
+            w4 = want_l as f32x4
+            f4 = fresh as f32x4
+            if absf(w4.w - f4.w) > 0.01 { folded = folded + 1 }
+            x = x + 3
+        }
+        y = y + 2
+    }
+    check("the cloud pass folds its history into most texels (${folded} of 168)", folded >= 80)
+    check("the CPU marches the cloud pass as the shader written as Aether does (${good} of 168, worst ${worst})",
+          good == 168)
+    gpu.cpu_free(clx)
+
+    gpu.shader_free(cl)
+    gpu.shader_free(cs)
+    gpu.shader_free(ps)
+    gpu.shader_free(vs)
+    image_free(hist_img)
+    image3d_free(detail_img)
+    image3d_free(shape_img)
+    image_free(weather_img)
+    image_free(buf_img)
+    image_free(sky_img)
+    if g_failures > 0 {
+        println("skydome: ${g_failures} of ${g_checks} checks failed")
+        exit(1)
+    }
+    println("skydome: all checks passed (${g_checks})")
+}

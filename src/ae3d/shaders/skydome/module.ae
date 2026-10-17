@@ -1,0 +1,622 @@
+// ae3d.shaders.skydome: the sky, its capture and its clouds, written with
+// `quote` (step 6, docs/aether_quote_design.md section 11). The module is
+// skydome, not sky: ae3d.sky is the engine's, and two modules of one last
+// name in a program name a quote's helpers by what else it imports.
+//
+// One vertex shader and three pixel shaders over its varyings:
+//
+//   - sky_vertex: the sky's cube about the eye, pushed to the far plane
+//     (pos.xyww), handing on the direction it looks along and this frame's
+//     and last frame's clip positions (a direction: the eye's move drops
+//     out, its turn stays). It was VERTEX_SKYBOX and sky_vk.vert.
+//   - sky: the sky drawn behind the scene, the painted or the hour's, the
+//     overcast over it and what the cloud pass left composited on, and its
+//     motion vector: two outputs, its colour at 0 and its motion at 1.
+//   - sky_capture: the sky into the octahedral map the scene is lit from
+//     (#655), every texel the sky in its direction with its clouds marched,
+//     without the sun's and the moon's discs (the key light is them).
+//   - cloud: the clouds alone at half the frame's size (#317), folded into
+//     the frames before.
+//
+// The capture and the cloud pass are screen passes: they read none of the
+// varyings and work from the pixel (frag_coord), so gpu.link takes them to
+// the screen's vertex shader. All three were FRAGMENT_SKYBOX, one source of
+// three #ifdef variants (sky_vk.frag, sky_capture_vk.frag, cloud_vk.frag);
+// here they are three quotes sharing the @quotable helpers, the variants'
+// differences arguments (`discs`, the march's steps).
+//
+// Each helper is the hand-written one in the same shape -- the same
+// operations in the same order, the constants written as they were -- since
+// a GPU that fuses and reorders what it may (MoltenVK's fast math) rounds by
+// the shape, not by the value. What GLSL read from uniforms a helper takes
+// as arguments; cloudDensity's `out float heightFraction` is a CloudSample.
+
+import std.quote
+import ae3d.gpu (GpuShader, fragment, vertex)
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, Texture3D, texture, texture_lod, texture_3d, frag_coord, rgb, xy,
+                       xz, zx, abs_v2, dot, dot_v2, normalize, normalize_v2, length_v3, sqrt, sin, cos, tan, acos, asin, atan2, exp,
+                       pow, abs, min, max, clamp, clamp_v3, smoothstep, mix, mix_v3, mix_v4, max_v3, fract, floor_v3, splat2,
+                       splat3, splat4, mul, mul_m4, m4_at, mul_transpose3, float_of)
+
+exports (
+    SkyVertex, SkyVaryings, SkyOut, CloudSample,
+    sky_vertex, sky, sky_capture, cloud,
+    cloud_weather_uv, cloud_coverage_from, remap, cloud_density, cloud_dither, cloud_phase, cloud_sun_shade,
+    clouds_along, perez, daylight, shown_channel, shown_of, procedural_sky, dusk_sky, night_sky, srgb_decode,
+    aces_inverse, display_radiance, velocity, sky_at, texel_decode, texel_direction
+)
+
+// The sky's cube, a vertex its position about the eye.
+struct SkyVertex {
+    position: vec3
+}
+
+// What the vertex shader hands on: `position` is gl_Position, the far plane
+// whatever the distance; the direction it looks along; the clip positions,
+// this frame's and last frame's, for the motion vector.
+struct SkyVaryings {
+    position: vec4
+    tex_coords: vec3
+    clip_now: vec4
+    clip_prev: vec4
+}
+
+// The sky's two outputs: its colour, and its motion vector (the scene
+// pass's second attachment).
+struct SkyOut {
+    colour: vec4
+    velocity: vec2
+}
+
+// A sample of the clouds' density, and how far up the layer the point is
+// (cloudDensity's `out float heightFraction`).
+struct CloudSample {
+    density: float
+    height: float
+}
+
+// Clouds, shared by the sky that draws them and the ground they shadow. A
+// layer between CLOUD_BASE and CLOUD_TOP metres up; the weather over a tile
+// of CLOUD_TILE metres that repeats without a seam, baked by the engine
+// (ae3d.cloudnoise) into the weather texture.
+const CLOUD_BASE = 1400.0
+const CLOUD_TOP = 2600.0
+const CLOUD_TILE = 24000.0
+// The cloud's extinction, per metre at full density: the one constant the
+// sun's shade and the eye's alpha both use.
+const CLOUD_SIGMA = 0.12
+
+// Where on the weather tile a point of the world is, with the wind's drift.
+@quotable
+cloud_weather_uv(p: vec2, t: float) -> vec2 {
+    return p / CLOUD_TILE + vec2(t * 0.00012, t * 0.00004)
+}
+
+// The cover threshold over the field and the banks: 0.3 is a few
+// fair-weather clouds, 0.8 an overcast with holes. A soft ramp that stops
+// short of one: at full coverage the cloud still has its cells.
+@quotable
+cloud_coverage_from(weather: vec2, cover: float) -> float {
+    threshold = 1.0 - cover * (0.45 + 1.1 * weather.y)
+    return smoothstep(threshold, threshold + 0.5, weather.x) * 0.9
+}
+
+@quotable
+remap(v: float, lo: float, hi: float, new_lo: float, new_hi: float) -> float {
+    return new_lo + (clamp(v, lo, hi) - lo) / max(hi - lo, 0.00001) * (new_hi - new_lo)
+}
+
+// The cloud's density at a point in the layer, and how far up the layer it
+// is: the weather says where cloud is and what kind; the height profile
+// gives the kind its shape; the Perlin-Worley shape carves the body, the
+// Worley fractal erodes its edges. `detailed` reads the detail texture as
+// well, which the eye's march wants and the far steps toward the sun do not.
+@quotable
+cloud_density(p: vec3, cover: float, t: float, detailed: bool, cloud_weather: Texture, cloud_shape: Texture3D,
+              cloud_detail: Texture3D) -> CloudSample {
+    weather = rgb(texture(cloud_weather, cloud_weather_uv(xz(p), t)))
+    cov = cloud_coverage_from(vec2(weather.x, weather.z), cover)
+    height = clamp((p.y - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE), 0.0, 1.0)
+    if cov <= 0.0 {
+        return CloudSample { density: 0.0, height: height }
+    }
+    kind = smoothstep(0.25, 0.75, weather.y)
+    top = mix(0.30, 1.0, kind) * (0.75 + 0.25 * cov)
+    profile = smoothstep(0.0, 0.04, height) * (1.0 - smoothstep(top * 0.4, top, height))
+    if profile <= 0.0 {
+        return CloudSample { density: 0.0, height: height }
+    }
+    sp = p * (1.0 / 1500.0) + vec3(t * 0.004, 0.0, t * 0.0015)
+    shape = texture_3d(cloud_shape, sp)
+    fbm = shape.y * 0.625 + shape.z * 0.25 + shape.w * 0.125
+    base = remap(shape.x, fbm - 1.0, 1.0, 0.0, 1.0) * profile
+    d = remap(base, 1.0 - cov, 1.0, 0.0, 1.0) * cov
+    if d <= 0.0 {
+        return CloudSample { density: 0.0, height: height }
+    }
+    fine = texture_3d(cloud_shape, sp * 6.0 + vec3(0.37, 0.21, 0.63) + vec3(t * 0.01, 0.0, 0.0))
+    puffs = fine.y * 0.625 + fine.z * 0.25 + fine.w * 0.125
+    detail = puffs
+    if detailed {
+        dp = p * (1.0 / 240.0) + vec3(t * 0.012, 0.0, t * 0.005)
+        curl = rgb(texture_3d(cloud_detail, dp * 0.25)) * 2.0 - splat3(1.0)
+        dp = dp + curl * (0.25 * (1.0 - height))
+        detail = mix(puffs, texture_3d(cloud_detail, dp).w, 0.6)
+    }
+    erosion = mix(detail, 1.0 - detail, clamp(height * 6.0, 0.0, 1.0))
+    d = remap(d, erosion * 0.45, 1.0, 0.0, 1.0)
+    return CloudSample { density: clamp(d, 0.0, 1.0), height: height }
+}
+
+// A screen-space dither: each pixel starts its march a different fraction
+// of a step into the layer. Interleaved gradient noise.
+@quotable
+cloud_dither(pixel: vec2) -> float {
+    return fract(52.9829189 * fract(dot_v2(pixel, vec2(0.06711056, 0.00583715))))
+}
+
+// Henyey-Greenstein: how much light a cloud throws toward the eye by the
+// angle between the sun and the view.
+@quotable
+cloud_phase(cos_angle: float, g: float) -> float {
+    gg = g * g
+    return (1.0 - gg) / (4.0 * 3.14159265 * pow(1.0 + gg - 2.0 * g * cos_angle, 1.5))
+}
+
+// How much cloud stands between a point and the sun: a short march toward
+// it, six samples spaced wider as they go.
+@quotable
+cloud_sun_shade(p: vec3, sun: vec3, cover: float, t: float, cloud_weather: Texture, cloud_shape: Texture3D,
+                cloud_detail: Texture3D) -> float {
+    shade = 0.0
+    stride = (CLOUD_TOP - CLOUD_BASE) * 0.02
+    at = p
+    for (k = 0; k < 6; k++) {
+        at = at + sun * stride
+        shade = shade + cloud_density(at, cover, t, k < 2, cloud_weather, cloud_shape, cloud_detail).density * stride
+        stride = stride * 1.6
+    }
+    return shade
+}
+
+// Clouds along a view ray from the ground: the layer marched front to back
+// until the sky behind is hidden, striding through empty air and stepping
+// finely inside a cloud. Each sample lit by the sun through the cloud above
+// it (three octaves of Beer's law), the powder term and the phase, and an
+// ambient from the sky; the far clouds sit in the haze. `near_steps` and
+// `far_steps` are the fine steps along a ray straight up and the more a ray
+// along the horizon takes: 32 and 64 in the capture, half in the cloud pass,
+// whose history folds a dozen frames' dithered marches into each texel.
+// `eye` is where the layer's march starts from, `sun` and `sun_colour` the
+// key light that lights it.
+@quotable
+clouds_along(dir: vec3, sky_colour: vec3, cover: float, t: float, dither: float, near_steps: float, far_steps: float, eye: vec3,
+             cloud_sun: vec3, cloud_sun_colour: vec3, cloud_weather: Texture, cloud_shape: Texture3D,
+             cloud_detail: Texture3D) -> vec4 {
+    if cover <= 0.0 || dir.y <= 0.03 {
+        return splat4(0.0)
+    }
+    t0 = CLOUD_BASE / dir.y
+    // The march ends twelve kilometres into the layer.
+    t1 = min(CLOUD_TOP / dir.y, t0 + 12000.0)
+    slant = 1.0 - clamp(dir.y, 0.0, 1.0)
+    fine = (t1 - t0) / (near_steps + far_steps * slant * slant)
+    coarse = fine * 3.0
+    sun = normalize(cloud_sun)
+    // A thick cloud gives back the sun about as a white surface of albedo
+    // 0.9 does: the key light's irradiance times 0.9 over pi.
+    sun_light = cloud_sun_colour * (0.9 / 3.14159265)
+    // The sky behind the ray, as light, lifted toward a neutral of its own
+    // brightness by day.
+    sky_radiance = display_radiance(sky_colour)
+    sky_shown = dot(sky_colour, vec3(0.299, 0.587, 0.114))
+    sky_bright = dot(sky_radiance, vec3(0.299, 0.587, 0.114))
+    sky_light = mix_v3(sky_radiance, splat3(sky_bright * 1.6), 0.35 * clamp(sky_shown * 2.5, 0.0, 1.0))
+    // Forward and back scattering, one lobe pair an octave of Beer's law
+    // below, flatter each time (Wrenninge's multiple scattering).
+    cos_angle = dot(dir, sun)
+    phase0 = mix(cloud_phase(cos_angle, 0.5), cloud_phase(cos_angle, -0.25), 0.30) * 12.566
+    phase1 = mix(cloud_phase(cos_angle, 0.25), cloud_phase(cos_angle, -0.125), 0.30) * 12.566
+    phase2 = mix(cloud_phase(cos_angle, 0.125), cloud_phase(cos_angle, -0.0625), 0.30) * 12.566
+    colour = splat3(0.0)
+    alpha = 0.0
+    ray = t0 + fine * dither
+    dt = coarse
+    empties = 0
+    for (i = 0; i < 160; i++) {
+        if ray > t1 {
+            break
+        }
+        p = vec3(eye.x, 0.0, eye.z) + dir * ray
+        s = cloud_density(p, cover, t, true, cloud_weather, cloud_shape, cloud_detail)
+        d = s.density
+        if d > 0.002 {
+            if dt > fine {
+                // Struck cloud on a coarse stride: back up to where the
+                // stride began and walk it finely.
+                ray = ray - (dt - fine)
+                dt = fine
+                empties = 0
+                continue
+            }
+            empties = 0
+            shade = cloud_sun_shade(p, sun, cover, t, cloud_weather, cloud_shape, cloud_detail)
+            tau = shade * CLOUD_SIGMA
+            scattered = exp(-tau) * phase0 + 0.5 * exp(-tau * 0.25) * phase1 + 0.25 * exp(-tau * 0.0625) * phase2
+            // The powder effect: darker where the cloud is thin against the
+            // light.
+            powder = 1.0 - 0.5 * exp(-d * 12.0)
+            // The sky's light, dimmed down the layer and inside the cloud.
+            ambient = sky_light * mix(0.62, 1.0, s.height) * (0.7 + 0.3 * exp(-tau * 0.25))
+            c = sun_light * scattered * powder + ambient
+            haze = 1.0 - exp(-ray * 0.00005)
+            c = mix_v3(c, sky_radiance, haze)
+            a = (1.0 - exp(-d * dt * CLOUD_SIGMA)) * (1.0 - 0.8 * haze)
+            colour = colour + c * a * (1.0 - alpha)
+            alpha = alpha + a * (1.0 - alpha)
+            if alpha > 0.98 {
+                break
+            }
+        } else {
+            empties = empties + 1
+            if empties > 3 {
+                dt = coarse
+            }
+        }
+        ray = ray + dt
+    }
+    // Gone at the horizon. The colour is premultiplied, so it fades with the
+    // alpha.
+    horizon = smoothstep(0.04, 0.32, dir.y)
+    return vec4(colour * horizon, alpha * horizon)
+}
+
+// The daylight sky as light (#655): Preetham, Shirley and Smits' analytic
+// model, the sky's luminance and colour in every direction from the sun's
+// height and the air's turbidity, in cd/m2 and then in the engine's units
+// (SKY_PHOTOMETRIC, 2.0e-5, radiance a candela a square metre). Below the
+// horizon, the horizon's light through the haze.
+@quotable
+perez(cos_theta: float, gamma: float, a: float, b: float, c: float, d: float, e: float) -> float {
+    return (1.0 + a * exp(b / max(cos_theta, 0.01))) * (1.0 + c * exp(d * gamma) + e * cos(gamma) * cos(gamma))
+}
+
+@quotable
+daylight(dir_in: vec3, sun: vec3, turbidity: float) -> vec3 {
+    dir = dir_in
+    tt = turbidity
+    theta_s = acos(clamp(sun.y, 0.0, 1.0))
+    below = 1.0
+    if dir.y < 0.0 {
+        below = mix(1.0, 0.6, clamp(-dir.y * 4.0, 0.0, 1.0))
+        dir = normalize(vec3(dir.x, 0.0, dir.z))
+    }
+    cos_theta = dir.y
+    gamma = acos(clamp(dot(dir, sun), -1.0, 1.0))
+    chi = (4.0 / 9.0 - tt / 120.0) * (3.14159265 - 2.0 * theta_s)
+    yz_lum = ((4.0453 * tt - 4.9710) * tan(chi) - 0.2155 * tt + 2.4192) * 1000.0
+    t1 = theta_s
+    t2 = theta_s * theta_s
+    t3 = t2 * theta_s
+    xz_c = tt * tt * (0.00166 * t3 - 0.00375 * t2 + 0.00209 * t1) +
+           tt * (-0.02903 * t3 + 0.06377 * t2 - 0.03202 * t1 + 0.00394) +
+           (0.11693 * t3 - 0.21196 * t2 + 0.06052 * t1 + 0.25886)
+    yz_c = tt * tt * (0.00275 * t3 - 0.00610 * t2 + 0.00317 * t1) +
+           tt * (-0.04214 * t3 + 0.08970 * t2 - 0.04153 * t1 + 0.00516) +
+           (0.15346 * t3 - 0.26756 * t2 + 0.06670 * t1 + 0.26688)
+    lum = yz_lum * perez(cos_theta, gamma, 0.1787 * tt - 1.4630, -0.3554 * tt + 0.4275, -0.0227 * tt + 5.3251, 0.1206 * tt - 2.5771, -0.0670 * tt + 0.3703) /
+                   perez(1.0, theta_s, 0.1787 * tt - 1.4630, -0.3554 * tt + 0.4275, -0.0227 * tt + 5.3251, 0.1206 * tt - 2.5771, -0.0670 * tt + 0.3703)
+    cx = xz_c * perez(cos_theta, gamma, -0.0193 * tt - 0.2592, -0.0665 * tt + 0.0008, -0.0004 * tt + 0.2125, -0.0641 * tt - 0.8989, -0.0033 * tt + 0.0452) /
+                perez(1.0, theta_s, -0.0193 * tt - 0.2592, -0.0665 * tt + 0.0008, -0.0004 * tt + 0.2125, -0.0641 * tt - 0.8989, -0.0033 * tt + 0.0452)
+    cy = yz_c * perez(cos_theta, gamma, -0.0167 * tt - 0.2608, -0.0950 * tt + 0.0092, -0.0079 * tt + 0.2102, -0.0441 * tt - 1.6537, -0.0109 * tt + 0.0529) /
+                perez(1.0, theta_s, -0.0167 * tt - 0.2608, -0.0950 * tt + 0.0092, -0.0079 * tt + 0.2102, -0.0441 * tt - 1.6537, -0.0109 * tt + 0.0529)
+    xyz_c = vec3(cx / cy * lum, lum, (1.0 - cx - cy) / cy * lum)
+    lin = vec3(3.2406 * xyz_c.x - 1.5372 * xyz_c.y - 0.4986 * xyz_c.z,
+               -0.9689 * xyz_c.x + 1.8758 * xyz_c.y + 0.0415 * xyz_c.z,
+               0.0557 * xyz_c.x - 0.2040 * xyz_c.y + 1.0570 * xyz_c.z)
+    return max_v3(lin, splat3(0.0)) * (2.0e-5 * below)
+}
+
+// Light as it shows at an exposure of one: the frame's tone curve (ACES,
+// then the sRGB encoding), which display_radiance takes back.
+@quotable
+shown_channel(x: float) -> float {
+    t = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0)
+    return if (t <= 0.0031308) { t * 12.92 } else { 1.055 * pow(t, 1.0 / 2.4) - 0.055 }
+}
+
+@quotable
+shown_of(c: vec3) -> vec3 { return vec3(shown_channel(c.x), shown_channel(c.y), shown_channel(c.z)) }
+
+// The dusk and night sky, as it shows: a gradient from the sun's position,
+// the horizon gold and then red as the sun nears it, most on the sun's side,
+// a glow around the sun.
+@quotable
+dusk_sky(dir: vec3, sun: vec3, sun_colour: vec3) -> vec3 {
+    elevation = sun.y
+    day = smoothstep(-0.14, 0.06, elevation)
+    low = 1.0 - smoothstep(-0.05, 0.35, elevation)
+    zenith_day = vec3(0.20, 0.42, 0.85)
+    zenith_dusk = vec3(0.16, 0.20, 0.45)
+    zenith_night = vec3(0.02, 0.03, 0.08)
+    horizon_day = vec3(0.72, 0.82, 0.93)
+    horizon_dusk = vec3(1.0, 0.52, 0.22)
+    horizon_night = vec3(0.06, 0.07, 0.13)
+    toward = 0.5 + 0.5 * dot_v2(normalize_v2(vec2(dir.x, dir.z) + splat2(0.00001)),
+                                normalize_v2(vec2(sun.x, sun.z) + splat2(0.00001)))
+    horizon = mix_v3(horizon_day, horizon_dusk, low * (0.25 + 0.75 * toward * toward))
+    horizon = mix_v3(horizon_night, horizon, day)
+    zenith = mix_v3(zenith_night, mix_v3(zenith_day, zenith_dusk, low), day)
+    up = clamp(dir.y, 0.0, 1.0)
+    sky_colour = mix_v3(horizon, zenith, pow(up, 0.55))
+    // Below the horizon: the haze the ground would be seen through.
+    if dir.y < 0.0 {
+        sky_colour = mix_v3(horizon, horizon * 0.6, clamp(-dir.y * 4.0, 0.0, 1.0))
+    }
+    cos_angle = dot(dir, sun)
+    glow = pow(max(cos_angle, 0.0), 4.0) * 0.16 + pow(max(cos_angle, 0.0), 40.0) * 0.5
+    sky_colour = sky_colour + sun_colour * glow * (0.3 + 0.7 * day) * (1.0 + low * 1.6)
+    return sky_colour
+}
+
+// A clear sky from the sun's position: by day the daylight model, as it
+// shows; through the dusk and the night the dusk sky, which the daylight
+// hands over to as the sun goes low. The sun's disc over both where `discs`
+// (the sky drawn, not the capture, whose key light is the disc).
+@quotable
+procedural_sky(dir: vec3, sun: vec3, sun_colour: vec3, turbidity: float, discs: bool) -> vec3 {
+    dusk = dusk_sky(dir, sun, sun_colour)
+    day_share = smoothstep(0.0, 0.25, sun.y)
+    sky_colour = dusk
+    if day_share > 0.0 {
+        sky_colour = mix_v3(dusk, shown_of(daylight(dir, sun, turbidity)), day_share)
+    }
+    if discs {
+        cos_angle = dot(dir, sun)
+        day = smoothstep(-0.14, 0.06, sun.y)
+        disc = smoothstep(0.9993, 0.9997, cos_angle)
+        sky_colour = sky_colour + sun_colour * disc * (0.6 + 1.4 * day)
+    }
+    return sky_colour
+}
+
+// The night over the sky: the stars, fixed in the sky as the camera turns,
+// and the moon's glow -- and its disc where `discs` -- where the key light is
+// when the key light is the moon. `night` is 0 by day and 1 once the sun is
+// well under.
+@quotable
+night_sky(dir: vec3, moon: vec3, night: float, discs: bool) -> vec3 {
+    if night <= 0.0 || dir.y <= 0.0 {
+        return splat3(0.0)
+    }
+    add = splat3(0.0)
+    // A star in one cell of a fine grid over the sphere in a hundred and
+    // fifty: hashed from the cell, so it stays where it is.
+    cell = floor_v3(dir * 420.0)
+    h = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719))) * 43758.5453)
+    if h > 0.9935 {
+        bright = (h - 0.9935) / 0.0065
+        centre = (cell + splat3(0.5)) / 420.0
+        near = 1.0 - smoothstep(0.0, 1.2 / 420.0, length_v3(dir - centre))
+        add = add + vec3(0.85, 0.9, 1.0) * near * (0.25 + 0.75 * bright) * smoothstep(0.0, 0.15, dir.y)
+    }
+    if moon.y > 0.0 {
+        c = dot(dir, moon)
+        if discs {
+            add = add + vec3(0.82, 0.86, 0.95) * smoothstep(0.99955, 0.99975, c) * 1.4
+        }
+        add = add + vec3(0.30, 0.34, 0.45) * pow(max(c, 0.0), 60.0) * 0.18
+    }
+    return add * night
+}
+
+// The sky is given as it shows and drawn as the radiance that shows as it:
+// the frame's tone curve (ACES, then the sRGB encoding) taken back. See
+// core.display_radiance.
+@quotable
+srgb_decode(c: float) -> float {
+    return if (c <= 0.04045) { c / 12.92 } else { pow((c + 0.055) / 1.055, 2.4) }
+}
+
+@quotable
+aces_inverse(y_in: float) -> float {
+    y = clamp(y_in, 0.0, 0.9999)
+    a = 2.51 - 2.43 * y
+    b = 0.03 - 0.59 * y
+    return (-b + sqrt(b * b + 4.0 * a * 0.14 * y)) / (2.0 * a)
+}
+
+@quotable
+display_radiance(shown: vec3) -> vec3 {
+    c = clamp_v3(shown, splat3(0.0), splat3(1.0))
+    return vec3(aces_inverse(srgb_decode(c.x)), aces_inverse(srgb_decode(c.y)), aces_inverse(srgb_decode(c.z)))
+}
+
+// Where this pixel's surface was last frame, for the temporal passes: this
+// frame's clip position (the jitter taken back out, `nudge`) less last
+// frame's, in texture space. See docs/rendering.md, "Motion vectors".
+@quotable
+velocity(now: vec4, prev: vec4, nudge: vec2) -> vec2 {
+    if now.w <= 0.0 || prev.w <= 0.0 {
+        return splat2(0.0)
+    }
+    uv_now = xy(now) / now.w * 0.5 + splat2(0.5) - nudge
+    uv_prev = xy(prev) / prev.w * 0.5 + splat2(0.5)
+    return uv_now - uv_prev
+}
+
+// The sky in direction `dir`, before its clouds: the painted one (`kind` 0),
+// the hour's (1, its sun's disc where `discs`) or the clear colour (2), the
+// overcast pulled over it. u wraps from 1 to 0 along one longitude, where
+// texture() would choose the smallest mip for that column: level 0 is right
+// everywhere and seamless.
+@quotable
+sky_at(dir: vec3, skybox: Texture, kind: int, sky_sun: vec3, cloud_sun: vec3, cloud_sun_colour: vec3, turbidity: float,
+       flat_colour: vec3, overcast: float, overcast_colour: vec3, discs: bool) -> vec3 {
+    theta = atan2(dir.z, dir.x)
+    phi = asin(dir.y)
+    u = (theta + 3.14159265) / 6.28318531
+    v = (phi + 1.57079633) / 3.14159265
+    sky_colour = rgb(texture_lod(skybox, vec2(u, v), 0.0))
+    if kind == 1 {
+        hour_sun = normalize(sky_sun)
+        sky_colour = procedural_sky(dir, hour_sun, cloud_sun_colour, turbidity, discs)
+        night = 1.0 - smoothstep(-0.14, -0.02, hour_sun.y)
+        sky_colour = sky_colour + night_sky(dir, normalize(cloud_sun), night, discs)
+    }
+    if kind == 2 {
+        sky_colour = flat_colour
+    }
+    if overcast > 0.0 {
+        // The cast's brightness follows the sky's broad brightness, read
+        // from a coarse level of the painting, so a star goes under the
+        // cloud with the rest of the sky.
+        broad = sky_colour
+        if kind != 1 {
+            broad = rgb(texture_lod(skybox, vec2(u, v), 4.0))
+        }
+        luma = dot(broad, vec3(0.299, 0.587, 0.114))
+        sky_colour = mix_v3(sky_colour, overcast_colour * (0.35 + 0.65 * luma), clamp(overcast, 0.0, 1.0))
+    }
+    return sky_colour
+}
+
+// The octahedral sky map (ae3d.skylight, whose arithmetic this must match):
+// the upper hemisphere in the square's inner diamond, the lower folded into
+// its corners, one texel of gutter around each level. The direction a point
+// of the square stands for, and a texel's at texture coordinate uv of a
+// level `size` a side, a gutter texel's folded back across the edge it lies
+// past. In the hand-written capture's shape, a vector at a time:
+// ae3d.shaders.skyprobe's, a lane at a time, gave a few directions a
+// rounding apart on MoltenVK.
+@quotable
+texel_decode(p: vec2) -> vec3 {
+    d = vec3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y)
+    if d.y < 0.0 {
+        folded = (splat2(1.0) - abs_v2(zx(d))) * vec2(if (d.x >= 0.0) { 1.0 } else { -1.0 },
+                                                     if (d.z >= 0.0) { 1.0 } else { -1.0 })
+        d = vec3(folded.x, d.y, folded.y)
+    }
+    return normalize(d)
+}
+
+@quotable
+texel_direction(uv: vec2, size: float) -> vec3 {
+    p = ((uv * size - splat2(1.0)) / (size - 2.0)) * 2.0 - splat2(1.0)
+    px = p.x
+    py = p.y
+    if px > 1.0 {
+        px = 2.0 - px
+        py = -py
+    }
+    if px < -1.0 {
+        px = -2.0 - px
+        py = -py
+    }
+    if py > 1.0 {
+        py = 2.0 - py
+        px = -px
+    }
+    if py < -1.0 {
+        py = -2.0 - py
+        px = -px
+    }
+    return texel_decode(vec2(px, py))
+}
+
+// ── The shaders ───────────────────────────────────────────────────────
+//
+//   view, projection          the camera's turn (its translation stripped)
+//                             and its projection
+//   prev_view_projection      last frame's view-projection, the jitter out
+//   skybox                    the painted sky (the default texture for the
+//                             hour's or a flat one)
+//   kind                      0 painted, 1 the hour's, 2 flat
+//   sky_sun                   where the sun is for the hour, pointing at it
+//   cloud_sun, cloud_sun_colour  the key light: the sun, or the moon at
+//                             night, and its irradiance
+//   turbidity                 how hazy the air is (Preetham's: 2 clear, 6 hazy)
+//   flat_colour               the clear colour, for a flat sky
+//   overcast, overcast_colour how far the sky is pulled toward a flat cast,
+//                             and its colour
+//   cloud_cover, cloud_time   how much the clouds cover and the time they
+//                             drift by (no clouds at 0)
+//   eye                       where the eye is: the layer's march starts there
+
+// The sky's vertex shader: its cube's direction, the cube at the far plane.
+sky_vertex(projection: mat4, view: mat4, prev_view_projection: mat4) -> *GpuShader {
+    return vertex("sky_vertex") quote | v: SkyVertex | {
+        pos = mul(mul_m4(projection, view), vec4(v.position, 1.0))
+        // pos.xyww: the sky at the far plane, whatever its distance.
+        return SkyVaryings { position: vec4(vec3(pos.x, pos.y, pos.w), pos.w), tex_coords: v.position, clip_now: pos,
+                             clip_prev: mul(prev_view_projection, vec4(v.position, 0.0)) }
+    }
+}
+
+// The sky drawn behind the scene: what the cloud pass left (`cloud_buffer`,
+// read at the pixel's place on a screen `screen_size` pixels) composited
+// over it, the clouds being radiance, premultiplied; and its motion vector.
+sky(skybox: Texture, cloud_buffer: Texture, kind: int, sky_sun: vec3, cloud_sun: vec3, cloud_sun_colour: vec3,
+    turbidity: float, flat_colour: vec3, overcast: float, overcast_colour: vec3, cloud_cover: float,
+    screen_size: vec2) -> *GpuShader {
+    return fragment("sky") quote | f: SkyVaryings | {
+        dir = normalize(f.tex_coords)
+        sky_colour = sky_at(dir, skybox, kind, sky_sun, cloud_sun, cloud_sun_colour, turbidity, flat_colour, overcast,
+                     overcast_colour, true)
+        clouds = splat4(0.0)
+        if cloud_cover > 0.0 {
+            clouds = texture(cloud_buffer, frag_coord() / screen_size)
+        }
+        return SkyOut { colour: vec4(display_radiance(sky_colour) * (1.0 - clouds.w) + rgb(clouds), 1.0),
+                        velocity: velocity(f.clip_now, f.clip_prev, splat2(0.0)) }
+    }
+}
+
+// The sky into the octahedral map the scene is lit from (#655), 256 texels
+// a side (ae3d.skylight's SIZE): every texel the sky in its direction, its
+// clouds marched over it, the dither still (no history to fold it).
+sky_capture(skybox: Texture, cloud_weather: Texture, cloud_shape: Texture3D, cloud_detail: Texture3D, kind: int,
+            sky_sun: vec3, cloud_sun: vec3, cloud_sun_colour: vec3, turbidity: float, flat_colour: vec3,
+            overcast: float, overcast_colour: vec3, cloud_cover: float, cloud_time: float, eye: vec3) -> *GpuShader {
+    return fragment("sky_capture") quote | f: SkyVaryings | {
+        dir = texel_direction(frag_coord() / 256.0, 256.0)
+        sky_colour = sky_at(dir, skybox, kind, sky_sun, cloud_sun, cloud_sun_colour, turbidity, flat_colour, overcast,
+                     overcast_colour, false)
+        clouds = clouds_along(dir, sky_colour, cloud_cover, cloud_time, cloud_dither(frag_coord()), 32.0, 64.0, eye, cloud_sun,
+                              cloud_sun_colour, cloud_weather, cloud_shape, cloud_detail)
+        return vec4(display_radiance(sky_colour) * (1.0 - clouds.w) + rgb(clouds), 1.0)
+    }
+}
+
+// The clouds alone over the screen at half the frame's size (#317), `size`
+// texels: each texel looks along the direction the view and projection give
+// it, and last frame's view-projection finds where that direction was then.
+// The march's dither turns with `frame`; with a history (`history_on` 1) an
+// eighth of this frame's march is folded into what the frames before left.
+cloud(skybox: Texture, history: Texture, cloud_weather: Texture, cloud_shape: Texture3D, cloud_detail: Texture3D,
+      kind: int, sky_sun: vec3, cloud_sun: vec3, cloud_sun_colour: vec3, turbidity: float, flat_colour: vec3,
+      overcast: float, overcast_colour: vec3, cloud_cover: float, cloud_time: float, eye: vec3, size: vec2,
+      projection: mat4, view: mat4, prev_view_projection: mat4, frame: int, history_on: int) -> *GpuShader {
+    return fragment("cloud") quote | f: SkyVaryings | {
+        // The texel's direction through the projection (its offset terms are
+        // a jitter or an off-centre frustum) and the view's turn.
+        ndc = frag_coord() / size * 2.0 - splat2(1.0)
+        toward = vec3((ndc.x + m4_at(projection, 2, 0)) / m4_at(projection, 0, 0),
+                      (ndc.y + m4_at(projection, 2, 1)) / m4_at(projection, 1, 1), -1.0)
+        dir = normalize(mul_transpose3(view, toward))
+        sky_colour = sky_at(dir, skybox, kind, sky_sun, cloud_sun, cloud_sun_colour, turbidity, flat_colour, overcast,
+                     overcast_colour, false)
+        grain = frag_coord() + splat2(5.588238 * float_of(frame % 64))
+        clouds = clouds_along(dir, sky_colour, cloud_cover, cloud_time, cloud_dither(grain), 16.0, 32.0, eye, cloud_sun,
+                              cloud_sun_colour, cloud_weather, cloud_shape, cloud_detail)
+        // Where this direction was last frame, and what was drawn there.
+        if history_on == 1 {
+            was = mul(prev_view_projection, vec4(dir, 0.0))
+            at = xy(was) / max(was.w, 0.00001) * 0.5 + splat2(0.5)
+            if was.w > 0.0 && at.x >= 0.0 && at.x <= 1.0 && at.y >= 0.0 && at.y <= 1.0 {
+                clouds = mix_v4(texture(history, at), clouds, 0.125)
+            }
+        }
+        return clouds
+    }
+}
