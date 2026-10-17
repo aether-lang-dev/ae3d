@@ -54,5 +54,21 @@
   evaluator and the doubles land a 256th of a sampler's weight apart). A
   `texture_lod` that reads only the top level fails it; so does an
   irradiance without its cosine.
-- `FRAGMENT_SKY_IRRADIANCE`, its `_vk` file and `vkpipes`' irradiance
-  pipeline stay, unused, until they are cleaned up with the filter's.
+- **`FRAGMENT_SKY_FILTER`, `FRAGMENT_SKY_IRRADIANCE`, their `_vk` files and
+  `vkpipes`' two pipelines are gone**, and with them `skyLevelSize`,
+  `skyRoughness`, `groundAlbedo` and `groundSun` in the scene block (193
+  uniforms, 16160 bytes): the renderer hands the ground to `vksky` itself
+  (`vksky.set_ground`), which watches it for a new capture in the same
+  words it watched in the block. On an Apple M6 at 4x and one sample, 27
+  of 28 `test_backend_parity` frames are byte-identical to main's on both
+  renderers (the clouds within main's own spread, #793), every one of the
+  16 Vulkan frames the filter used to move among them, and zombie_city and
+  street_drive are main's but for Vulkan at one sample (#794). No
+  validation errors.
+- **One printed figure moves**: `test_water_sky`'s Vulkan mean reads
+  40.324, 129, 55.6744 where main's reads 40.3241, 129, 55.6745, the same
+  on every run: one channel a step, from the quoted filter (the
+  hand-written pipeline in its place gives main's). Its loop counts in
+  floats where the hand-written one counted in ints, the likeliest
+  difference left. No frame the parity test or the scenes compare shows
+  it.
