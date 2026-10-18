@@ -18,8 +18,11 @@
 //     the value returned its colour. params_* give the uniforms' names,
 //     types and std140 layout, and params_write fills a block from the
 //     captures' cells, which are the variables themselves: what the program
-//     last set is what the next frame reads. emit_screen_vertex writes the
-//     vertex shader a full-screen pass draws it with.
+//     last set is what the next frame reads. A capture may be a struct
+//     of values and arrays of them, its fields placed in its cell by
+//     capture_field (offsetof); uniforms_* name each value OpenGL sets.
+//     emit_screen_vertex writes the vertex shader a full-screen pass draws
+//     it with.
 //   - cpu_run runs the tree for one pixel over vec values (doubles,
 //     rounded to f32 as each is made, as a GPU holds them), the captures
 //     read from their cells, texture() reading a Texture's ShaderImage.
@@ -28,7 +31,7 @@
 // WHILE, FOR, BREAK, CONTINUE, EXPR, LIT, LOCAL, CAPTURE, UNARY, BINARY,
 // CHOOSE, CALL, FIELD, MAKE (a struct literal) and HELPER_CALL (a @quotable
 // function, written out as a GLSL function, quote version 2); INDEX is
-// written as GLSL but not run. A shader owns its tree: shader_free gives it
+// written as GLSL, and run for an element of a captured struct's array. A shader owns its tree: shader_free gives it
 // back.
 //
 // Structs (step 6, docs/aether_quote_design.md section 11):
@@ -75,6 +78,7 @@ exports (
     cpu_vertex_attr, cpu_run_vertex, cpu_varying, ScreenVertex, ScreenVaryings, VERTEX_STAGE, FRAGMENT_STAGE, writes_depth, shader_free, shader_name, shader_tree, shader_hash,
     emit_glsl, emit_screen_vertex, outputs_count,
     params_count, params_name, params_type, params_offset, params_size, params_write,
+    capture_field, capture_struct, uniforms_count, uniforms_name, uniforms_type, uniforms_offset,
     set_float, set_int, set_vec2, set_vec3, set_mat4, set_mat4_f32, set_float_f32, set_vec2_f32, set_vec3_f32, set_vec4_f32,
     call_glsl, call_glsl_for, call_args, cpu_set_dialect,
     samplers_count, samplers_name, samplers_type,
@@ -91,6 +95,8 @@ struct GpuShader {
     depth: bool
     stage: int       // FRAGMENT_STAGE, or VERTEX_STAGE (vertex)
     links: ptr       // a pixel shader of a struct of varyings, once linked: list of *GpuField, located
+    members: ptr     // its captured structs' fields, where each is in its cell: list of *GpuMember, by place
+    leaves: ptr      // its uniforms one value at a time (uniforms_*), made when first asked: list of *GpuUniform
 }
 
 // A struct's field, or a linked pixel shader's varying: its name, its type
@@ -149,6 +155,8 @@ fragment(name: string, t: quote.Tree) -> *GpuShader {
     s.depth = false
     s.stage = FRAGMENT_STAGE
     s.links = null
+    s.members = null
+    s.leaves = null
     return s
 }
 
@@ -184,6 +192,10 @@ shader_free(s: *GpuShader) {
     quote.free(s.tree)
     fields_free(s.links)
     s.links = null
+    members_free(s.members)
+    s.members = null
+    leaves_free(s.leaves)
+    s.leaves = null
     s.name = ""
     heap.free(s)
 }
@@ -703,7 +715,25 @@ fn param_capture(s: *GpuShader, k: int) -> quote.Capture {
 }
 
 params_name(s: *GpuShader, k: int) -> string { return glsl_name(quote.capture_name(param_capture(s, k))) }
-params_type(s: *GpuShader, k: int) -> string { return glsl_type(quote.capture_type(param_capture(s, k))) }
+params_type(s: *GpuShader, k: int) -> string {
+    c = param_capture(s, k)
+    // A captured struct: the GLSL struct of its type, declared before the block.
+    if is_struct_capture(s, quote.capture_name(c)) { return quote.capture_type(c) }
+    return glsl_type(quote.capture_type(c))
+}
+
+// The k-th uniform's std140 alignment and size: a captured struct's
+// sixteen, and its members' extent rounded up to sixteen.
+fn param_align(s: *GpuShader, k: int) -> int {
+    c = param_capture(s, k)
+    if is_struct_capture(s, quote.capture_name(c)) { return 16 }
+    return std140_align(quote.capture_type(c))
+}
+fn param_size(s: *GpuShader, k: int) -> int {
+    c = param_capture(s, k)
+    if is_struct_capture(s, quote.capture_name(c)) { return struct_layout(s, quote.capture_name(c)) }
+    return std140_size(quote.capture_type(c))
+}
 
 fn round_up(v: int, to: int) -> int { return (v + to - 1) / to * to }
 
@@ -711,9 +741,8 @@ params_offset(s: *GpuShader, k: int) -> int {
     at = 0
     j = 0
     while j <= k {
-        t = quote.capture_type(param_capture(s, j))
-        at = round_up(at, std140_align(t))
-        if j < k { at = at + std140_size(t) }
+        at = round_up(at, param_align(s, j))
+        if j < k { at = at + param_size(s, j) }
         j = j + 1
     }
     return at
@@ -724,8 +753,7 @@ params_offset(s: *GpuShader, k: int) -> int {
 params_size(s: *GpuShader) -> int {
     n = params_count(s)
     if n == 0 { return 0 }
-    last = quote.capture_type(param_capture(s, n - 1))
-    return round_up(params_offset(s, n - 1) + std140_size(last), 16)
+    return round_up(params_offset(s, n - 1) + param_size(s, n - 1), 16)
 }
 
 // Each uniform's current value, read through its capture's cell, written
@@ -738,7 +766,9 @@ params_write(s: *GpuShader, dst: ptr) {
         c = param_capture(s, k)
         t = quote.capture_type(c)
         at = params_offset(s, k)
-        if t == "float" {
+        if is_struct_capture(s, quote.capture_name(c)) {
+            struct_write(s, c, dst + at)
+        } else if t == "float" {
             ((dst + at) as f32[])[0] = quote.get_float(c) as f32
         } else if t == "f32" {
             ((dst + at) as f32[])[0] = quote.get_f32(c)
@@ -889,6 +919,354 @@ fn typed_cell(s: *GpuShader, name: string, t: string) -> ptr {
         i = i + 1
     }
     return null
+}
+
+// ── Captured structs ───────────────────────────────────────────────────
+//
+// A capture may be a struct of values and fixed-size arrays of them (the
+// composite's Haze: a count, four columns, four shapes). The tree says
+// which fields the body reads and as what (`FIELD column :vec4[4]`), not
+// where they are in the struct's cell, so the shader's module says that,
+// with the compiler's own offsets, once the shader is made:
+//
+//   s = fragment("composite") quote | uv: vec2 | { ... haze.column[k] ... }
+//   _c = gpu.capture_field(s, "haze", "column", offsetof(Haze, column))
+//
+// Each field it reads is then a member of a GLSL struct of the capture's
+// type, in the order of the cell, at std140's places (an array's stride
+// rounded up to sixteen: a vec4[4] is 64 bytes, a float[4] 64 too, not 16),
+// and params_write repacks the cell's values into them an element at a
+// time. A field it reads that no capture_field placed is refused when the
+// shader is written or run.
+
+// A captured struct's field: its capture, its name, its element's type and
+// its length (0 for one value), where it is in the cell, and where it is in
+// the struct as std140 lays it out.
+struct GpuMember {
+    capture: string
+    name: string
+    type: string
+    count: int
+    at: int
+    placed: int
+}
+
+fn members_free(l: ptr) {
+    if l == null { return }
+    k = 0
+    while k < list.size(l) {
+        m = list.get_raw(l, k) as *GpuMember
+        m.capture = ""
+        m.name = ""
+        m.type = ""
+        heap.free(m)
+        k = k + 1
+    }
+    list.free(l)
+}
+
+// The type a FIELD of the capture `capture` named `field` has in `n`, the
+// first one found; "" when `n` reads no such field.
+fn field_read_type(n: quote.Node, capture: string, field: string) -> string {
+    if quote.kind(n) == quote.FIELD && quote.name(n) == field {
+        o = quote.child(n, 0)
+        if quote.kind(o) == quote.CAPTURE && quote.name(o) == capture { return quote.type_of(n) }
+    }
+    j = 0
+    while j < quote.child_count(n) {
+        t = field_read_type(quote.child(n, j), capture, field)
+        if t != "" { return t }
+        j = j + 1
+    }
+    return ""
+}
+
+// The length of an array type ("vec4[4]" is 4), 0 for one that is not.
+fn array_count(t: string) -> int {
+    b = string.index_of(t, "[")
+    if b < 0 || string.ends_with(t, "]") == 0 { return 0 }
+    n, err = string.to_int(string.substring(t, b + 1, string.length(t) - 1))
+    if err != "" { return 0 }
+    return n
+}
+
+// An array type's element ("vec4" of "vec4[4]"); a type that is not one, itself.
+fn array_element(t: string) -> string {
+    b = string.index_of(t, "[")
+    if b < 0 { return t }
+    return string.substring(t, 0, b)
+}
+
+// How far apart two of `t` are in a cell: a vector is Aether's f32x4,
+// sixteen bytes whatever its lanes; a float a double; an f32 or int four.
+fn cell_stride(t: string) -> int {
+    if t == "vec2" || t == "vec3" || t == "vec4" { return 16 }
+    if t == "float" { return 8 }
+    return 4
+}
+
+// Where the field `field` of the captured struct `capture` is in its cell:
+// `at`, which is offsetof(the struct, field). False when the shader has no
+// capture `capture`, or it is a texture or a value rather than a struct, or
+// the field the body reads is of a type a uniform block cannot hold here (a
+// float, f32, int, vec2, vec3 or vec4, or a fixed-size array of one). A
+// field the body does not read is placed all the same, and not written.
+capture_field(s: *GpuShader, capture: string, field: string, at: int) -> bool {
+    c = quote.capture_named(s.tree, capture)
+    if (c as ptr) == null { return false }
+    ct = quote.capture_type(c)
+    if is_texture(ct) || glsl_type(ct) != "" { return false }
+    t = field_read_type(quote.body(s.tree), capture, field)
+    el = array_element(t)
+    if t != "" && el != "float" && el != "f32" && el != "int" && el != "vec2" && el != "vec3" && el != "vec4" {
+        return false
+    }
+    if s.members == null { s.members = list.new() }
+    m = heap.new(GpuMember)
+    m.capture = capture
+    m.name = field
+    m.type = el     // f32 stays f32: four bytes in the cell, where a float is eight
+    m.count = array_count(t)
+    m.at = at
+    m.placed = 0
+    if t == "" { m.type = "" }
+    // In the cell's order, which is the struct's: added last, then moved
+    // down past every member placed after it.
+    list.add_raw(s.members, m as ptr)
+    k = list.size(s.members) - 1
+    while k > 0 && (list.get_raw(s.members, k - 1) as *GpuMember).at > at {
+        list.set(s.members, k, list.get_raw(s.members, k - 1))
+        list.set(s.members, k - 1, m as ptr)
+        k = k - 1
+    }
+    leaves_free(s.leaves)
+    s.leaves = null
+    return true
+}
+
+// The member `field` of the captured struct `capture`, or null.
+fn member_named(s: *GpuShader, capture: string, field: string) -> *GpuMember {
+    if s.members == null { return null }
+    k = 0
+    while k < list.size(s.members) {
+        m = list.get_raw(s.members, k) as *GpuMember
+        if m.capture == capture && m.name == field { return m }
+        k = k + 1
+    }
+    return null
+}
+
+// Whether the capture `capture` is a struct whose fields were placed.
+fn is_struct_capture(s: *GpuShader, capture: string) -> bool {
+    if s.members == null { return false }
+    k = 0
+    while k < list.size(s.members) {
+        if (list.get_raw(s.members, k) as *GpuMember).capture == capture { return true }
+        k = k + 1
+    }
+    return false
+}
+
+// A captured struct's members as std140 lays them out: each read one's
+// place in the struct (`placed`); the struct's size, rounded up to sixteen.
+fn struct_layout(s: *GpuShader, capture: string) -> int {
+    at = 0
+    k = 0
+    while k < list.size(s.members) {
+        m = list.get_raw(s.members, k) as *GpuMember
+        if m.capture == capture && m.type != "" {
+            if m.count > 0 {
+                at = round_up(at, 16)
+                m.placed = at
+                at = at + round_up(std140_size(m.type), 16) * m.count
+            } else {
+                at = round_up(at, std140_align(m.type))
+                m.placed = at
+                at = at + std140_size(m.type)
+            }
+        }
+        k = k + 1
+    }
+    return round_up(at, 16)
+}
+
+// Why the body cannot be written or run for its captured structs: a field
+// it reads that nothing placed, or a struct read whole; "" when it can.
+fn members_refused(s: *GpuShader, n: quote.Node) -> string {
+    k = quote.kind(n)
+    if k == quote.FIELD {
+        o = quote.child(n, 0)
+        if quote.kind(o) == quote.CAPTURE && is_struct_capture(s, quote.name(o)) {
+            m = member_named(s, quote.name(o), quote.name(n))
+            if m == null || m.type == "" {
+                return "line ${quote.line(n)}: ${quote.name(o)}.${quote.name(n)} is read, but gpu.capture_field placed no ${quote.name(n)} in ${quote.name(o)}'s cell"
+            }
+            return ""
+        }
+    }
+    if k == quote.CAPTURE && is_struct_capture(s, quote.name(n)) {
+        return "line ${quote.line(n)}: the captured struct ${quote.name(n)} is read a field at a time in a shader, not whole"
+    }
+    j = 0
+    while j < quote.child_count(n) {
+        why = members_refused(s, quote.child(n, j))
+        if why != "" { return why }
+        j = j + 1
+    }
+    return ""
+}
+
+// The GLSL declarations of the captured structs, each before the block that
+// holds it: the members read, in the cell's order.
+fn emit_capture_structs(s: *GpuShader, sb: ptr) {
+    i = 0
+    while i < quote.capture_count(s.tree) {
+        c = quote.capture(s.tree, i)
+        name = quote.capture_name(c)
+        if is_struct_capture(s, name) {
+            strbuilder.append(sb, "struct ${quote.capture_type(c)} {\n")
+            k = 0
+            while k < list.size(s.members) {
+                m = list.get_raw(s.members, k) as *GpuMember
+                if m.capture == name && m.type != "" {
+                    if m.count > 0 {
+                        strbuilder.append(sb, "    ${glsl_type(m.type)} ${glsl_name(m.name)}[${m.count}];\n")
+                    } else {
+                        strbuilder.append(sb, "    ${glsl_type(m.type)} ${glsl_name(m.name)};\n")
+                    }
+                }
+                k = k + 1
+            }
+            strbuilder.append(sb, "};\n")
+        }
+        i = i + 1
+    }
+}
+
+// One value of the member `m` of a struct whose cell is `cell`, its
+// element `i` (0 for one value), as f32s at `to`, as a uniform block holds it.
+fn member_write(m: *GpuMember, cell: ptr, i: int, to: ptr) {
+    from = cell + m.at + i * cell_stride(m.type)
+    if m.type == "float" {
+        (to as f32[])[0] = (from as float[])[0] as f32
+    } else if m.type == "int" {
+        (to as int[])[0] = (from as int[])[0]
+    } else {
+        lanes = 1
+        if m.type == "vec2" { lanes = 2 }
+        if m.type == "vec3" { lanes = 3 }
+        if m.type == "vec4" { lanes = 4 }
+        j = 0
+        while j < lanes {
+            (to as f32[])[j] = (from as f32[])[j]
+            j = j + 1
+        }
+    }
+}
+
+// The captured struct `c`'s members from its cell into `dst`, the struct's
+// place in the block.
+fn struct_write(s: *GpuShader, c: quote.Capture, dst: ptr) {
+    name = quote.capture_name(c)
+    _size = struct_layout(s, name)
+    cell = quote.cell(c)
+    k = 0
+    while k < list.size(s.members) {
+        m = list.get_raw(s.members, k) as *GpuMember
+        if m.capture == name && m.type != "" {
+            if m.count > 0 {
+                stride = round_up(std140_size(m.type), 16)
+                e = 0
+                while e < m.count {
+                    member_write(m, cell, e, dst + m.placed + e * stride)
+                    e = e + 1
+                }
+            } else {
+                member_write(m, cell, 0, dst + m.placed)
+            }
+        }
+        k = k + 1
+    }
+}
+
+// The uniforms one value at a time: each capture that is a value, and each
+// element of each member of a captured struct ("haze.column[2]"), with its
+// GLSL type and its offset in the block. OpenGL sets them by these names.
+struct GpuUniform {
+    name: string
+    type: string
+    at: int
+}
+
+fn leaves_free(l: ptr) {
+    if l == null { return }
+    k = 0
+    while k < list.size(l) {
+        u = list.get_raw(l, k) as *GpuUniform
+        u.name = ""
+        u.type = ""
+        heap.free(u)
+        k = k + 1
+    }
+    list.free(l)
+}
+
+fn leaf_add(l: ptr, name: string, t: string, at: int) {
+    u = heap.new(GpuUniform)
+    u.name = name
+    u.type = t
+    u.at = at
+    list.add_raw(l, u as ptr)
+}
+
+fn leaves_of(s: *GpuShader) -> ptr {
+    if s.leaves != null { return s.leaves }
+    l = list.new()
+    k = 0
+    while k < params_count(s) {
+        c = param_capture(s, k)
+        name = params_name(s, k)
+        at = params_offset(s, k)
+        if is_struct_capture(s, quote.capture_name(c)) {
+            _size = struct_layout(s, quote.capture_name(c))
+            j = 0
+            while j < list.size(s.members) {
+                m = list.get_raw(s.members, j) as *GpuMember
+                if m.capture == quote.capture_name(c) && m.type != "" {
+                    if m.count > 0 {
+                        stride = round_up(std140_size(m.type), 16)
+                        e = 0
+                        while e < m.count {
+                            leaf_add(l, "${name}.${glsl_name(m.name)}[${e}]", glsl_type(m.type), at + m.placed + e * stride)
+                            e = e + 1
+                        }
+                    } else {
+                        leaf_add(l, "${name}.${glsl_name(m.name)}", glsl_type(m.type), at + m.placed)
+                    }
+                }
+                j = j + 1
+            }
+        } else {
+            leaf_add(l, name, params_type(s, k), at)
+        }
+        k = k + 1
+    }
+    s.leaves = l
+    return l
+}
+
+uniforms_count(s: *GpuShader) -> int { return list.size(leaves_of(s)) }
+uniforms_name(s: *GpuShader, k: int) -> string { return (list.get_raw(leaves_of(s), k) as *GpuUniform).name }
+uniforms_type(s: *GpuShader, k: int) -> string { return (list.get_raw(leaves_of(s), k) as *GpuUniform).type }
+uniforms_offset(s: *GpuShader, k: int) -> int { return (list.get_raw(leaves_of(s), k) as *GpuUniform).at }
+
+// A captured struct's cell, for the program to set its fields through
+// (`gpu.capture_struct(s, "haze", "Haze") as *Haze`); null when the shader
+// has no capture `name` of the struct type `t`.
+capture_struct(s: *GpuShader, name: string, t: string) -> ptr {
+    c = quote.capture_named(s.tree, name)
+    if (c as ptr) == null || quote.capture_type(c) != t || !is_struct_capture(s, name) { return null }
+    return quote.cell(c)
 }
 
 // The textures, in order: the samplers at bindings 1, 2, ... (0 when the
@@ -1261,11 +1639,16 @@ fn emit_ready(s: *GpuShader) -> bool {
     i = 0
     while i < quote.capture_count(t) {
         c = quote.capture(t, i)
-        if glsl_type(quote.capture_type(c)) == "" {
+        if glsl_type(quote.capture_type(c)) == "" && !is_struct_capture(s, quote.capture_name(c)) {
             g_error = "${quote.source(t)}: ${quote.capture_name(c)} is a ${quote.capture_type(c)}, which a shader cannot read"
             return false
         }
         i = i + 1
+    }
+    why = members_refused(s, quote.body(t))
+    if why != "" {
+        g_error = "${quote.source(t)}: ${why}"
+        return false
     }
     return true
 }
@@ -1455,6 +1838,7 @@ emit_vertex_glsl(s: *GpuShader, dialect: int, from: string, to: string) -> strin
 fn emit_vertex_params(s: *GpuShader, sb: ptr, dialect: int) {
     np = params_count(s)
     if np == 0 { return }
+    emit_capture_structs(s, sb)
     if dialect == GL {
         k = 0
         while k < np {
@@ -1485,6 +1869,7 @@ emit_glsl(s: *GpuShader, dialect: int) -> string {
     strbuilder.append(sb, "// ${s.name}: written by ae3d.gpu from its quote.\n\n")
     binding = 0
     np = params_count(s)
+    emit_capture_structs(s, sb)
     if np > 0 && dialect == GL {
         k = 0
         while k < np {
@@ -1907,7 +2292,10 @@ fn read_captures(cx: *GpuRun) {
         c = quote.capture(t, i)
         ty = quote.capture_type(c)
         name = quote.capture_name(c)
-        if ty == "Texture" {
+        if is_struct_capture(cx.s, name) {
+            // A captured struct: its fields are read from its cell where they are.
+            bind(cx.caps, name, null, quote.cell(c))
+        } else if ty == "Texture" {
             tex = quote.cell(c) as *Texture
             bind(cx.caps, name, null, tex.image)
         } else if ty == "mat4" {
@@ -2202,9 +2590,28 @@ fn cpu_expr(cx: *GpuRun, n: quote.Node) -> *GpuVal {
         if bd == null || bd.val == null { return fail(cx, n, "no value for the capture ${quote.name(n)}") }
         return bd.val
     }
+    if k == quote.INDEX {
+        // An element of a captured struct's array, from its cell.
+        o = quote.child(n, 0)
+        m = captured_member(cx, o)
+        if m == null { return fail(cx, n, "an index of anything but a captured struct's array is not run on the CPU") }
+        if m.count < 1 { return fail(cx, n, "${quote.name(o)} is not an array") }
+        i = floori(cpu_expr(cx, quote.child(n, 1)).x)
+        if i < 0 || i >= m.count { return fail(cx, n, "${quote.name(o)}[${i}] is past its ${m.count}") }
+        return member_value(cx, m, find(cx.caps, m.capture).img, i)
+    }
     if k == quote.FIELD {
         // A vertex run's attribute: the value it was given.
         o = quote.child(n, 0)
+        // A captured struct's field, from its cell.
+        m = captured_member(cx, n)
+        if m != null {
+            if m.count > 0 { return fail(cx, n, "the array ${quote.name(n)} is read an element at a time") }
+            return member_value(cx, m, find(cx.caps, m.capture).img, 0)
+        }
+        if quote.kind(o) == quote.CAPTURE && is_struct_capture(cx.s, quote.name(o)) {
+            return fail(cx, n, "gpu.capture_field placed no ${quote.name(n)} in ${quote.name(o)}'s cell")
+        }
         if cx.attrs != null && quote.kind(o) == quote.LOCAL && quote.name(o) == quote.param_name(cx.s.tree, 0) {
             a = find(cx.attrs, quote.name(n))
             if a == null { return fail(cx, n, "no value given for the attribute ${quote.name(n)}") }
@@ -2307,6 +2714,32 @@ fn cpu_helper_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
     if cx.flow != FLOW_RETURN || result == null { return fail(cx, n, "${quote.name(n)} ended without a return") }
     cx.flow = FLOW_ON
     return result
+}
+
+// The member a FIELD node reads of a captured struct, placed and read; null
+// for any other node.
+fn captured_member(cx: *GpuRun, n: quote.Node) -> *GpuMember {
+    if quote.kind(n) != quote.FIELD { return null }
+    o = quote.child(n, 0)
+    if quote.kind(o) != quote.CAPTURE { return null }
+    m = member_named(cx.s, quote.name(o), quote.name(n))
+    if m == null || m.type == "" { return null }
+    return m
+}
+
+// Element `i` of the member `m` in the struct cell `cell`, as a value (made
+// as every value is, rounded to the f32 the GPU holds).
+fn member_value(cx: *GpuRun, m: *GpuMember, cell: ptr, i: int) -> *GpuVal {
+    from = cell + m.at + i * cell_stride(m.type)
+    if m.type == "float" { return keep(cx, v1((from as float[])[0])) }
+    if m.type == "int" { return keep(cx, v1((from as int[])[0] * 1.0)) }
+    lanes = from as f32[]
+    if m.type == "vec2" { return keep(cx, mkval(2, lanes[0] as float, lanes[1] as float, 0.0, 0.0)) }
+    if m.type == "vec3" { return keep(cx, mkval(3, lanes[0] as float, lanes[1] as float, lanes[2] as float, 0.0)) }
+    if m.type == "vec4" {
+        return keep(cx, mkval(4, lanes[0] as float, lanes[1] as float, lanes[2] as float, lanes[3] as float))
+    }
+    return keep(cx, v1(lanes[0] as float))
 }
 
 fn cpu_field(cx: *GpuRun, n: quote.Node, v: *GpuVal, name: string) -> *GpuVal {

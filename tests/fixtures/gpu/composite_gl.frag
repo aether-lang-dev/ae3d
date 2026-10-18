@@ -1,16 +1,13 @@
 #version 410 core
 // composite: written by ae3d.gpu from its quote.
 
-uniform int haze_count;
+struct Haze {
+    int count;
+    vec4 column[4];
+    vec4 shape[4];
+};
+uniform Haze haze;
 uniform int capture_channel;
-uniform vec4 haze_column0;
-uniform vec4 haze_column1;
-uniform vec4 haze_column2;
-uniform vec4 haze_column3;
-uniform vec4 haze_shape0;
-uniform vec4 haze_shape1;
-uniform vec4 haze_shape2;
-uniform vec4 haze_shape3;
 uniform mat4 view_projection;
 uniform int bloom_on;
 uniform float bloom_intensity;
@@ -22,10 +19,6 @@ struct HazePoint {
     vec2 at;
     float w;
 };
-
-vec4 ae3d_shaders_composite_haze_column(int k, vec4 c0, vec4 c1, vec4 c2, vec4 c3) {
-    return k == 0 ? c0 : (k == 1 ? c1 : (k == 2 ? c2 : c3));
-}
 
 HazePoint ae3d_shaders_composite_haze_screen(mat4 view_projection, vec3 p) {
     vec4 c = (view_projection * vec4(p, 1.0));
@@ -56,17 +49,17 @@ out vec4 FragColor;
 
 void main() {
     vec2 at = uv;
-    if (haze_count > 0 && capture_channel == 0) {
+    if (haze.count > 0 && capture_channel == 0) {
         vec2 offset = vec2(0.0, 0.0);
         int k = 0;
         while (k < 4) {
             int kk = k;
             k = k + 1;
-            if (kk >= haze_count) {
+            if (kk >= haze.count) {
                 break;
             }
-            vec4 column = ae3d_shaders_composite_haze_column(kk, haze_column0, haze_column1, haze_column2, haze_column3);
-            vec4 shape = ae3d_shaders_composite_haze_column(kk, haze_shape0, haze_shape1, haze_shape2, haze_shape3);
+            vec4 column = haze.column[kk];
+            vec4 shape = haze.shape[kk];
             HazePoint hb = ae3d_shaders_composite_haze_screen(view_projection, column.xyz);
             HazePoint ht = ae3d_shaders_composite_haze_screen(view_projection, column.xyz + vec3(0.0, shape.x, 0.0));
             if (hb.w <= 0.0 || ht.w <= 0.0) {
