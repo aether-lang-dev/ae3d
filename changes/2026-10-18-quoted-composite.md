@@ -38,5 +38,14 @@ renderers. The frames are main's.
   - Scaling the exposure by 1.01 in the quote fails 6 of the checks. On the
     GPU it makes all 56 of test_backend_parity's frames differ, on both
     renderers.
-- **Still hand-written:** `FRAGMENT_COMPOSITE` and `composite_vk.frag` stay
-  until a follow-up deletes them.
+- **The hand-written composite is gone,** with `VERTEX_SCREEN` /
+  `screen_vk.vert`. The composite was the last pass that drew with them.
+  - `vkpipes`' post pipelines go, and so do `vkframe`'s hand-written
+    screen draw (`draw_screen`, `draw_screen_with`) and the sets it kept.
+  - Six scene-block uniforms only the composite read go too:
+    `frameExposure`, `enableBloom`, `bloomIntensity`, `hazeCount`,
+    `hazeColumn` and `hazeShape`. The block now has 177 uniforms and 15808
+    bytes, in 53 shaders.
+  - The renderer writes the same 32-bit words into the composite's own
+    words instead (`vkframe.set_composite_haze`, `setup_post_uniforms`), and
+    the quoted composite copies from there.

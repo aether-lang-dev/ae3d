@@ -391,7 +391,8 @@ From mapping the compiler; nothing here is built yet.
    - **the passthrough**, `screen_vk.vert` / `VERTEX_SCREEN`, which every
      post pass draws with: `gpu.emit_screen_vertex` already writes it for
      each quoted pass, and the hand-written one goes when the last pass
-     reading it has moved.
+     reading it has moved. *Gone (2026-10-18) with the hand-written
+     composite, the last pass that read it.*
 
    **The composite** (two textures, `hazeColumn[4]`, `hazeShape[4]` and a
    `mat4`) and **the sky, its capture and its clouds** (varyings from their
@@ -568,8 +569,13 @@ sky(...) -> *GpuShader {
    `type_to_string`, which has no name for a distinct vector type. Second,
    a back end cannot read a captured struct's cell without its layout,
    which a tree does not carry. `haze_screen`'s `out float w` is a
-   `HazePoint` it returns. The hand-written composite stays until its
-   cleanup.
+   `HazePoint` it returns. Its cleanup removed four things. The first two
+   are the hand-written composite and `VERTEX_SCREEN` / `screen_vk.vert`,
+   the composite being the last pass that drew with them. The third is
+   `vkpipes`' post pipelines. The last is the six scene-block uniforms only
+   the composite read: frameExposure, enableBloom, bloomIntensity,
+   hazeCount, hazeColumn and hazeShape. The block now has 177 uniforms and
+   15808 bytes. Those values are now `vkframe`'s composite words.
 4. **Water**, then **the crowd**, then **the scene**: the mesh shaders, and
    with them the scene block.
 
