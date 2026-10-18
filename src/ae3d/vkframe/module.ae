@@ -68,7 +68,8 @@ exports (
     ssao_intensity, occlusion_pass, mark_sky_done, mark_opaque_done, set_capture_bypass, default_texture,
     max_texture_size, texture_destroy, dlss_available, set_dlss, dlss, dlss_failed, dlss_camera, clip_correct,
     SKY_PROJECTION, SKY_VIEW, SKY_CLOUD_SUN_COLOUR, SKY_SUN, SKY_CLOUD_FRAME, SKY_KIND, SKY_FLAT, SKY_TURBIDITY,
-    SKY_CLOUD_SIZE, SKY_CLOUD_HISTORY, sky_words, set_sky_int, set_sky_float, set_sky_vec3, set_sky_mat4, set_sky_clip_mat4
+    SKY_CLOUD_SIZE, SKY_CLOUD_HISTORY, sky_words, set_sky_int, set_sky_float, set_sky_vec3, set_sky_mat4, set_sky_clip_mat4,
+    set_composite_haze
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -215,6 +216,17 @@ var g_cloud_pass: ptr = null
 // The frame's tone curve (ae3d.shaders.composite), into the frame or the
 // display-format texture FXAA reads.
 var g_composite_pass: ptr = null
+// The values only it reads, which the scene block held while the
+// hand-written composite did (frameExposure, bloomIntensity, hazeCount,
+// hazeColumn, hazeShape): set here in the same 32-bit words, at these byte
+// offsets (enableBloom is the draw's own).
+const COMPOSITE_EXPOSURE = 0         // float
+const COMPOSITE_BLOOM_INTENSITY = 4  // float
+const COMPOSITE_HAZE_COUNT = 8       // int
+const COMPOSITE_HAZE_COLUMN = 16     // vec4[4]
+const COMPOSITE_HAZE_SHAPE = 80      // vec4[4]
+const COMPOSITE_BYTES = 144
+var g_composite_words: ptr = null
 // The values only those three read, which the scene block held while the
 // hand-written sky did (projection, view, cloudSunColor, skySun,
 // cloudFrame, skyProcedural, skyFlat, skyTurbidity, cloudPassSize,
@@ -257,10 +269,6 @@ var g_ssao_intensity = 0.0
 var g_taa_enabled = false
 var g_scene_depth_wanted = false
 
-// The post chain's own sets, per frame slot, written every draw, dropped
-// when the camera depth they bind is remade (vktargets.camdepth_serial).
-var g_show_sets: ptr = null
-var g_sets_serial = 0 - 1
 
 // DLSS: loaded for the device, whether the device runs it, the mode in
 // force, the camera the frame was drawn with and whether it was given,
@@ -318,7 +326,6 @@ scratch() {
     g_pass_ms = calloc(STAGES, 8)
     g_ticks = calloc(STAMPS, 8)
     g_scene_clear = calloc(4, 4)
-    g_show_sets = calloc(FRAMES, 8)
     g_dlss_camera = calloc(1, DLSS_CAMERA_BYTES)
     g_dlss_images = calloc(4, DLSS_IMAGE_BYTES)
     g_hooks = calloc(MAX_HOOKS, sizeof(FrameHook))
@@ -644,7 +651,6 @@ start(width: int, height: int) -> bool {
     g_screen_quad = 0
     g_blend = false
     g_cull = 0
-    g_sets_serial = 0 - 1
     g_dlss_loaded = vkdevice.dlss_loaded()
     g_dlss_supported = false
     g_dlss_mode = 0
@@ -842,13 +848,6 @@ shutdown() {
 // What was uploaded since the last flush, run: before a frame is begun and
 // before one is submitted (the frame reads what the batch wrote).
 flush_uploads() { vkhost.flush() }
-
-// The post chain's sets dropped when the camera depth they bind was remade.
-post_sets_current() {
-    serial = vktargets.camdepth_serial()
-    if serial == g_sets_serial { return }
-    g_sets_serial = serial
-}
 
 // The camera depth made at the scene's size where something reads it and
 // it is not; remade the device idle first.
@@ -1839,94 +1838,6 @@ scene_depth_ready() -> bool {
     return g_depth_split && vktargets.camdepth_framebuffer() != null && vktargets.camdepth_view() != null
 }
 
-// A full-screen draw with `view` at binding 1 -- the colour source of a
-// composite, or the frame's depth for the resolve -- the camera depth at 2,
-// at 3 `third` (the temporal pass's history) or the default texture, and
-// the frame's motion vectors at 4; through its own set at `slot`, written
-// every draw because both images are remade on resize.
-draw_screen_with(pipeline: @keep ptr, sets: ptr, slot: int, view: @keep ptr, sampler: @keep ptr, layout: int, third: @keep ptr, third_sampler: @keep ptr) {
-    if pipeline == null || !vkmesh.drawable(g_screen_quad) { return }
-    if view == null || sampler == null { return }
-    if vkmesh.index_count(g_screen_quad) == 0 { return }
-    post_sets_current()
-    set = (sets as ptr[])[slot]
-    if set == null {
-        set = vkdesc.allocate()
-        if set == null { return }
-        (sets as ptr[])[slot] = set
-    }
-    at = vkdesc.ring_push(g_frame, vkdesc.PROGRAM_SCENE, false)
-    if at < 0 { return }
-    buffer = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
-    buffer.buffer = vkdesc.ring_buffer(g_frame)
-    buffer.offset = 0
-    buffer.range = vkscene.SCENE_SIZE
-    images = calloc(4, sizeof(VkDescriptorImageInfo))
-    writes = calloc(5, sizeof(VkWriteDescriptorSet))
-    read = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-    screen_image(images, 0, view, sampler, layout)
-    // The camera depth at 2 where the frame has one; the colour resolve runs
-    // whether or not anything made it, and reads nothing there.
-    if vktargets.camdepth_view() != null {
-        screen_image(images, 1, vktargets.camdepth_view(), vktargets.camdepth_sampler(), read)
-    } else {
-        screen_image(images, 1, vktexture.view(g_default_texture), vktexture.sampler_of(g_default_texture), read)
-    }
-    if third != null {
-        screen_image(images, 2, third, third_sampler, read)
-    } else {
-        screen_image(images, 2, vktexture.view(g_default_texture), vktexture.sampler_of(g_default_texture), read)
-    }
-    // Binding 4 is the frame's motion vectors, for the temporal pass.
-    velocity = vktargets.velocity_texture()
-    if velocity == 0 { velocity = g_default_texture }
-    screen_image(images, 3, vktexture.view(velocity), vktexture.sampler_of(velocity), read)
-    w0 = writes as *VkWriteDescriptorSet
-    w0.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
-    w0.dstSet = set
-    w0.dstBinding = 0
-    w0.descriptorCount = 1
-    w0.descriptorType = vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
-    w0.pBufferInfo = buffer as ptr
-    k = 1
-    while k < 5 {
-        w = (writes + k * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
-        w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
-        w.dstSet = set
-        w.dstBinding = k
-        w.descriptorCount = 1
-        w.descriptorType = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-        w.pImageInfo = images + (k - 1) * sizeof(VkDescriptorImageInfo)
-        k = k + 1
-    }
-    vk.vkUpdateDescriptorSets(vkdevice.device(), 5, writes, 0, null)
-    free(writes)
-    free(images)
-    free(buffer as ptr)
-    bind_pipeline(pipeline)
-    bind_set(set, at)
-    bind_vertices(0, vkmesh.vertex_buffer(g_screen_quad))
-    bind_vertices(1, identity_buffer())
-    bind_vertices(2, empty_skin_buffer())
-    vk.vkCmdBindIndexBuffer(commands_now(), vkmesh.index_buffer(g_screen_quad), 0, vk.INDEX_TYPE_UINT32)
-    vk.vkCmdDrawIndexed(commands_now(), vkmesh.index_count(g_screen_quad), 1, 0, 0, 0)
-    g_draw_calls = g_draw_calls + 1
-}
-
-screen_image(images: ptr, index: int, view: @keep ptr, sampler: @keep ptr, layout: int) {
-    info = (images + index * sizeof(VkDescriptorImageInfo)) as *VkDescriptorImageInfo
-    info.imageLayout = layout
-    info.imageView = view
-    info.sampler = sampler
-}
-
-// A full-screen draw of a texture.
-draw_screen(pipeline: @keep ptr, sets: ptr, slot: int, colour: int) {
-    if !vktexture.valid(colour) { return }
-    draw_screen_with(pipeline, sets, slot, vktexture.view(colour), vktexture.sampler_of(colour),
-                     vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, null, null)
-}
-
 // The scene's depth, as the opaque draws left it, resolved into the
 // camera-depth image the occlusion, the reflection and the water read.
 // Called by the renderer between its opaque and its transparent draws: the
@@ -2094,15 +2005,34 @@ block_int(offset: int, value: int) {
     ((vkdesc.block(vkdesc.PROGRAM_SCENE) + offset) as int[])[0] = value
 }
 
-// The post uniforms live in the shared scene block, so every screen pass
-// reads them; set once before the first draws.
+// The composite's own words (COMPOSITE_*), zero until set.
+composite_words() -> ptr {
+    if g_composite_words == null { g_composite_words = calloc(COMPOSITE_BYTES, 1) }
+    return g_composite_words
+}
+
+// The post values the composite reads, set once before the first draws.
 setup_post_uniforms() {
-    block_float(vkscene.OFF_FRAMEEXPOSURE, g_frame_exposure)
-    bloom = 0
-    if g_bloom && !g_capture_bypass { bloom = 1 }
-    block_int(vkscene.OFF_ENABLEBLOOM, bloom)
-    block_float(vkscene.OFF_BLOOMINTENSITY, g_bloom_intensity)
+    w = composite_words()
+    ((w + COMPOSITE_EXPOSURE) as f32[])[0] = g_frame_exposure as f32
+    ((w + COMPOSITE_BLOOM_INTENSITY) as f32[])[0] = g_bloom_intensity as f32
     vkdesc.set_program(vkdesc.PROGRAM_SCENE)
+}
+
+// The heat haze (#738): `count` columns, and `haze` (f32[32]) their bases and
+// radii then their shapes, copied only when there are any, as the scene
+// block was.
+set_composite_haze(count: int, haze: ptr) {
+    w = composite_words()
+    ((w + COMPOSITE_HAZE_COUNT) as int[])[0] = count
+    if count <= 0 || haze == null { return }
+    from = haze as f32[]
+    to = (w + COMPOSITE_HAZE_COLUMN) as f32[]
+    i = 0
+    while i < 32 {
+        to[i] = from[i]
+        i = i + 1
+    }
 }
 
 // The composite with nothing set: what a frame's values are copied into
@@ -2113,26 +2043,27 @@ composite_shader() -> *GpuShader {
                                z, zero_mat4())
 }
 
-// What the composite is drawn from, copied into `s`'s captures from the
-// scene program's block word for word, as the hand-written shader read
-// them: the exposure, the capture channel, the bloom's strength, the haze's
-// count, columns and shapes and the camera they are projected by; and
-// whether the bloom is added, `bloom_on`.
+// What the composite is drawn from, copied into `s`'s captures word for
+// word: the exposure, the bloom's strength and the haze's count, columns and
+// shapes from its own words; the capture channel and the camera the columns
+// are projected by from the scene program's block, which the scene shader
+// reads too; and whether the bloom is added, `bloom_on`.
 composite_values(s: *GpuShader, bloom_on: int) {
     block = vkdesc.block(vkdesc.PROGRAM_SCENE)
-    _e = gpu.set_float_f32(s, "frame_exposure", block + vkscene.OFF_FRAMEEXPOSURE)
+    w = composite_words()
+    _e = gpu.set_float_f32(s, "frame_exposure", w + COMPOSITE_EXPOSURE)
     _c = gpu.set_int(s, "capture_channel", ((block + vkscene.OFF_CAPTURECHANNEL) as int[])[0])
     _b = gpu.set_int(s, "bloom_on", bloom_on)
-    _i = gpu.set_float_f32(s, "bloom_intensity", block + vkscene.OFF_BLOOMINTENSITY)
-    _h = gpu.set_int(s, "haze_count", ((block + vkscene.OFF_HAZECOUNT) as int[])[0])
-    _c0 = gpu.set_vec4_f32(s, "haze_column0", block + vkscene.OFF_HAZECOLUMN)
-    _c1 = gpu.set_vec4_f32(s, "haze_column1", block + vkscene.OFF_HAZECOLUMN + 16)
-    _c2 = gpu.set_vec4_f32(s, "haze_column2", block + vkscene.OFF_HAZECOLUMN + 32)
-    _c3 = gpu.set_vec4_f32(s, "haze_column3", block + vkscene.OFF_HAZECOLUMN + 48)
-    _s0 = gpu.set_vec4_f32(s, "haze_shape0", block + vkscene.OFF_HAZESHAPE)
-    _s1 = gpu.set_vec4_f32(s, "haze_shape1", block + vkscene.OFF_HAZESHAPE + 16)
-    _s2 = gpu.set_vec4_f32(s, "haze_shape2", block + vkscene.OFF_HAZESHAPE + 32)
-    _s3 = gpu.set_vec4_f32(s, "haze_shape3", block + vkscene.OFF_HAZESHAPE + 48)
+    _i = gpu.set_float_f32(s, "bloom_intensity", w + COMPOSITE_BLOOM_INTENSITY)
+    _h = gpu.set_int(s, "haze_count", ((w + COMPOSITE_HAZE_COUNT) as int[])[0])
+    _c0 = gpu.set_vec4_f32(s, "haze_column0", w + COMPOSITE_HAZE_COLUMN)
+    _c1 = gpu.set_vec4_f32(s, "haze_column1", w + COMPOSITE_HAZE_COLUMN + 16)
+    _c2 = gpu.set_vec4_f32(s, "haze_column2", w + COMPOSITE_HAZE_COLUMN + 32)
+    _c3 = gpu.set_vec4_f32(s, "haze_column3", w + COMPOSITE_HAZE_COLUMN + 48)
+    _s0 = gpu.set_vec4_f32(s, "haze_shape0", w + COMPOSITE_HAZE_SHAPE)
+    _s1 = gpu.set_vec4_f32(s, "haze_shape1", w + COMPOSITE_HAZE_SHAPE + 16)
+    _s2 = gpu.set_vec4_f32(s, "haze_shape2", w + COMPOSITE_HAZE_SHAPE + 32)
+    _s3 = gpu.set_vec4_f32(s, "haze_shape3", w + COMPOSITE_HAZE_SHAPE + 48)
     _vp = gpu.set_mat4_f32(s, "view_projection", block + vkscene.OFF_VIEWPROJECTION)
 }
 
@@ -2173,7 +2104,6 @@ draw_composite(source: int, bloom: int) {
     viewport(fw, fh)
     enabled = 0
     if bloom > 0 { enabled = 1 }
-    block_int(vkscene.OFF_ENABLEBLOOM, enabled)
     p = g_composite_pass as *QuotedPass
     if p != null {
         composite_values(vkquote.shader(p), enabled)
@@ -2400,7 +2330,6 @@ frame_end() -> bool {
     stamp_through(8)
 
     if g_post_active {
-        post_sets_current()
         rw = vktargets.render_width()
         rh = vktargets.render_height()
         setup_post_uniforms()
