@@ -557,6 +557,19 @@ sky(...) -> *GpuShader {
    directions otherwise on MoltenVK.
 3. **The composite**: two textures, `mat4`, and `hazeColumn[4]` /
    `hazeShape[4]` as a captured struct with array fields.
+   *Done (2026-10-18, on Aether 0.824.0), without the struct:*
+   `ae3d.shaders.composite`, drawn on both renderers with frames
+   byte-identical to the hand-written one's. The columns are eight `vec4`
+   captures, and the haze's loop picks its column with a `@quotable`
+   `haze_column(k, c0, c1, c2, c3)`, keeping the hand-written loop's break,
+   continues and `float(k)`. A captured struct with array fields hit two
+   gaps. First, quote 0.824.0 types a captured struct's `vec4[4]` field as
+   `UNKNOWN[4]`: `quote_type_name` spells an array through
+   `type_to_string`, which has no name for a distinct vector type. Second,
+   a back end cannot read a captured struct's cell without its layout,
+   which a tree does not carry. `haze_screen`'s `out float w` is a
+   `HazePoint` it returns. The hand-written composite stays until its
+   cleanup.
 4. **Water**, then **the crowd**, then **the scene**: the mesh shaders, and
    with them the scene block.
 

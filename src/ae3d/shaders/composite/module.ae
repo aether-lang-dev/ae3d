@@ -1,0 +1,135 @@
+// ae3d.shaders.composite: the frame's tone curve, written with `quote`.
+//
+// The scene is light, and the composite is where it becomes the frame: the
+// light, rippled where hot air rises over a fire, the bloom added, scaled by
+// the eye's exposure, through the ACES curve and the sRGB encoding, and half
+// a step of grain added so a gradient in the dark is a grain and not bands.
+// A capture (`capture_channel` past zero) is data, not light: passed through
+// as it is. It was shaders/module.ae's FRAGMENT_COMPOSITE and
+// composite_vk.frag (step 6, docs/aether_quote_design.md section 11).
+//
+//   screen            the light: the scene, or what the reflection, the
+//                     temporal pass or DLSS made of it
+//   bloom             the bloom pyramid's widest blur (ae3d.shaders.bloom)
+//   frame_exposure    the eye's exposure, what the light is scaled by
+//   capture_channel   past zero, the light is data, passed through
+//   bloom_on, bloom_intensity
+//                     whether the bloom is added (not 0), and how much of it
+//   haze_count        how many of the four columns of hot air are there
+//   haze_column0..3   each column's base (xyz) and radius (w)
+//   haze_shape0..3    each column's height (x), strength (y) and the phase
+//                     its shimmer has risen to (z)
+//   view_projection   the frame's camera, which the columns are projected by
+//
+// Heat haze (#738): what is seen through a column ripples, most just over
+// the fire, rising. The hand-written shader read the columns as two vec4[4]
+// arrays; here they are eight vec4 captures, and the loop over them picks
+// its column by its index, as a quote can capture no array of vectors yet
+// (aether names a captured struct's vec4[4] field UNKNOWN[4]) and a back end
+// cannot read a captured struct's cell without its layout. The loop keeps
+// the hand-written one's shape -- its break, its continues, float(k) -- so
+// the rounding is the same.
+
+import std.quote
+import ae3d.gpu (GpuShader, fragment)
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, texture, rgb, xy, xyz, dot_v2, mul, m4_at, abs, max, clamp,
+                       clamp_v3, splat2, splat3, smoothstep, mix, fract, floor_v2, fract_v2, sin, pow, float_of,
+                       frag_coord)
+
+exports (composite, HazePoint, haze_screen, haze_hash, haze_noise, haze_column, aces, srgb_encode)
+
+// A point of a column on the screen, and its clip w: what haze_screen's
+// `out float w` was.
+struct HazePoint {
+    at: vec2
+    w: float
+}
+
+@quotable
+haze_screen(view_projection: mat4, p: vec3) -> HazePoint {
+    c = mul(view_projection, vec4(p, 1.0))
+    return HazePoint { at: xy(c) / max(c.w, 0.0001) * 0.5 + splat2(0.5), w: c.w }
+}
+
+@quotable
+haze_hash(p: vec2) -> float {
+    return fract(sin(dot_v2(p, vec2(127.1, 311.7))) * 43758.5453)
+}
+
+@quotable
+haze_noise(p: vec2) -> float {
+    i = floor_v2(p)
+    f0 = fract_v2(p)
+    f = f0 * f0 * (splat2(3.0) - f0 * 2.0)
+    return mix(mix(haze_hash(i), haze_hash(i + vec2(1.0, 0.0)), f.x),
+               mix(haze_hash(i + vec2(0.0, 1.0)), haze_hash(i + vec2(1.0, 1.0)), f.x), f.y)
+}
+
+// The k-th of four vectors: a quote's stand-in for an array indexed by `k`.
+@quotable
+haze_column(k: int, c0: vec4, c1: vec4, c2: vec4, c3: vec4) -> vec4 {
+    return if (k == 0) { c0 } else { if (k == 1) { c1 } else { if (k == 2) { c2 } else { c3 } } }
+}
+
+@quotable
+aces(x: vec3) -> vec3 {
+    return clamp_v3((x * (x * 2.51 + splat3(0.03))) / (x * (x * 2.43 + splat3(0.59)) + splat3(0.14)), splat3(0.0),
+                    splat3(1.0))
+}
+
+@quotable
+srgb_encode(c: float) -> float {
+    return if (c <= 0.0031308) { c * 12.92 } else { 1.055 * pow(c, 1.0 / 2.4) - 0.055 }
+}
+
+composite(screen: Texture, bloom: Texture, frame_exposure: float, capture_channel: int, bloom_on: int,
+          bloom_intensity: float, haze_count: int, haze_column0: vec4, haze_column1: vec4, haze_column2: vec4,
+          haze_column3: vec4, haze_shape0: vec4, haze_shape1: vec4, haze_shape2: vec4, haze_shape3: vec4,
+          view_projection: mat4) -> *GpuShader {
+    return fragment("composite") quote | uv: vec2 | {
+        at = uv
+        if haze_count > 0 && capture_channel == 0 {
+            // How far the image is pulled at `uv` by the hot air over it.
+            offset = vec2(0.0, 0.0)
+            k = 0
+            while k < 4 {
+                kk = k
+                k = k + 1
+                if kk >= haze_count { break }
+                column = haze_column(kk, haze_column0, haze_column1, haze_column2, haze_column3)
+                shape = haze_column(kk, haze_shape0, haze_shape1, haze_shape2, haze_shape3)
+                hb = haze_screen(view_projection, xyz(column))
+                ht = haze_screen(view_projection, xyz(column) + vec3(0.0, shape.x, 0.0))
+                if hb.w <= 0.0 || ht.w <= 0.0 { continue }
+                b = hb.at
+                axis = ht.at - b
+                len2 = dot_v2(axis, axis)
+                if len2 < 1e-10 { continue }
+                along = dot_v2(uv - b, axis) / len2
+                // Wider as it rises, as a plume spreads.
+                width = column.w * abs(m4_at(view_projection, 0, 0)) / hb.w * 0.5 * (1.0 + 0.6 * along)
+                across = abs(uv.x - (b.x + axis.x * along)) / max(width, 1e-6)
+                if along < 0.0 || along > 1.0 || across > 1.0 { continue }
+                amount = shape.y * smoothstep(0.0, 0.08, along) * (1.0 - along) * (1.0 - across * across)
+                q = vec2(across * 3.0 + float_of(kk) * 7.1, along * 7.0 - shape.z)
+                n = vec2(haze_noise(q * 2.3), haze_noise(q * 2.3 + vec2(17.3, 5.9))) - splat2(0.5)
+                offset = offset + n * amount * width * 0.18
+            }
+            at = at + offset
+        }
+        radiance = rgb(texture(screen, at))
+        if capture_channel != 0 {
+            return vec4(radiance, 1.0)
+        }
+        if bloom_on != 0 {
+            radiance = radiance + rgb(texture(bloom, at)) * bloom_intensity
+        }
+        shown = aces(radiance * frame_exposure)
+        shown = vec3(srgb_encode(shown.x), srgb_encode(shown.y), srgb_encode(shown.z))
+        // Half a step of an 8-bit target, in a pattern that does not repeat
+        // across the screen, so a gradient in the dark is a grain and not
+        // bands.
+        noise = fract(sin(dot_v2(frag_coord(), vec2(12.9898, 78.233))) * 43758.5453) - 0.5
+        return vec4(shown + splat3(noise / 255.0), 1.0)
+    }
+}
