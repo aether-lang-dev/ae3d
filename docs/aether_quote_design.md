@@ -523,7 +523,8 @@ sky(...) -> *GpuShader {
    not rasterise: a test feeds the pixel stage the varyings it chooses, and
    holds each stage to the same stage written as plain Aether, as step 4's
    tests do.
-2. **Captured arrays and structs in the block.** std140 as glslang has it:
+2. **Captured arrays and structs in the block** (built with the
+   composite's haze, 2026-10-18). std140 as glslang has it:
    an array's stride rounded up to 16 (`float waveAmplitudes[4]` is 64
    bytes, not 16), a struct aligned to 16 and its size rounded to 16. The
    cell's layout is Aether's (`float[4]` is four packed f32s), so
@@ -576,6 +577,19 @@ sky(...) -> *GpuShader {
    the composite read: frameExposure, enableBloom, bloomIntensity,
    hazeCount, hazeColumn and hazeShape. The block now has 177 uniforms and
    15808 bytes. Those values are now `vkframe`'s composite words.
+   *With the struct (2026-10-18, on Aether 0.829.0):* the haze is one
+   captured `Haze { count: int, column: vec4[4], shape: vec4[4] }`, and the
+   loop reads `haze.column[kk]` and `haze.shape[kk]`; `haze_column` is
+   gone. aether#2972 (0.829.0) types the field `vec4[4]`. The layout the
+   tree does not carry comes from the shader's module, with the compiler's
+   own offsets: `gpu.capture_field(s, "haze", "column", offsetof(Haze,
+   column))`. ae3d.gpu declares the GLSL struct with the fields the body
+   reads, in the cell's order. `params_write` repacks each element from
+   the cell to std140's 16-byte stride. A `float[4]` is doubles 8 bytes
+   apart in the cell, and 16 apart in the block. The CPU reads an element
+   from the cell. OpenGL sets the struct a value at a time
+   (`gpu.uniforms_*`: `haze.column[2]`). A field read but not placed is
+   refused. The frames are byte-identical to the eight captures'.
 4. **Water**, then **the crowd**, then **the scene**: the mesh shaders, and
    with them the scene block.
 
