@@ -51,6 +51,9 @@ import ae3d.shaders.ssr
 import ae3d.shaders.skydome
 import ae3d.shaders.composite
 import ae3d.shaders.composite (Haze)
+import ae3d.shaders.sea
+import ae3d.shaders.sea (Water)
+import ae3d.shaders.frame (Eye, KeyLight, Weather)
 import ae3d.shaderlib (vec2, vec3, Texture, TextureMS, Texture3D, zero_mat4)
 import std.io
 
@@ -245,6 +248,18 @@ const SKY_CLOUD_SIZE = 192     // vec2
 const SKY_CLOUD_HISTORY = 200  // int
 const SKY_BYTES = 208
 var g_sky_words: ptr = null
+// The water's surface (ae3d.shaders.sea): a pair over the model's mesh, its
+// captures copied before each draw from the water program's block, word for
+// word, where the hand-written shader read them. Up to WATER_DRAWS draws a
+// frame, counted from frame_begin.
+var g_water_pass: ptr = null
+var g_water_draw = 0
+const WATER_DRAWS = 64
+// Each captured field's offset in the block, by capture (WATER_CAPTURES) and
+// field, looked up once.
+var g_water_offsets: ptr = null
+const WATER_CAPTURES = 4
+const WATER_FIELDS_MOST = 32
 // A quoted draw's textures, in its shader's order, at most QUOTED_TEXTURES.
 const QUOTED_TEXTURES = 5
 var g_quoted_views: ptr = null
@@ -742,6 +757,12 @@ start(width: int, height: int) -> bool {
                                     vkspirv.CLOUD_QUOTED_HASH, vktargets.hdr_pass(), 1) as ptr
     g_composite_pass = vkquote.pass_new(composite_shader(), vkspirv.COMPOSITE_QUOTED_VERT, vkspirv.COMPOSITE_QUOTED_FRAG,
                                         vkspirv.COMPOSITE_QUOTED_HASH, vktargets.post_pass(), 1) as ptr
+    // The water's: its pair drawn in the scene pass, as the scene's
+    // pipelines draw a mesh.
+    g_water_pass = vkquote.mesh_pair_new(sea_vertex_shader(), sea_shader(), vkspirv.SEA_QUOTED_VERT,
+                                         vkspirv.SEA_QUOTED_FRAG, vkspirv.SEA_QUOTED_VERTEX_HASH, vkspirv.SEA_QUOTED_HASH,
+                                         vktargets.scene_pass(), WATER_DRAWS) as ptr
+    water_offsets()
     if g_dlss_loaded {
         g_dlss_supported = ae3d_dlss_supported(vkdevice.physical()) == 1
         if !g_dlss_supported { io.stderr_write("ae3d: DLSS: ${ae3d_dlss_last_error()}\n") }
@@ -812,6 +833,10 @@ shutdown() {
     g_cloud_pass = null
     vkquote.pass_free(g_composite_pass as *QuotedPass)
     g_composite_pass = null
+    vkquote.pass_free(g_water_pass as *QuotedPass)
+    g_water_pass = null
+    free(g_water_offsets)
+    g_water_offsets = null
     free(g_quoted_views)
     free(g_quoted_samplers)
     g_quoted_views = null
@@ -1113,6 +1138,7 @@ frame_begin(r: float, g: float, b: float, a: float) -> bool {
     }
     vkdesc.ring_begin(g_frame)
     g_draw_calls = 0
+    g_water_draw = 0
     vkhost.set_recording(true)
     return true
 }
@@ -1205,6 +1231,12 @@ draw_pipeline_range(pipeline: @keep ptr, handle: int, texture: int, instances: i
     if first < 0 || indices == 0 || first + indices > vkmesh.index_count(handle) { return }
     tex = texture
     if !vktexture.valid(tex) { tex = g_default_texture }
+    // A water surface is the sea's pair; added over the frame it is the
+    // scene's added pipeline, as it was.
+    if vkdesc.program() == vkdesc.PROGRAM_WATER && g_water_pass != null && !(g_blend && g_additive) {
+        draw_water(handle, tex, instances, instance_count, first, indices)
+        return
+    }
     offset = vkdesc.ring_push(g_frame, vkdesc.program(), posed(handle))
     if offset < 0 { return }
     set = set_now(tex)
@@ -1390,6 +1422,118 @@ draw_pulled(texture: int, pulled: @keep ptr, indices: ptr, draws: ptr, command: 
     vk.vkCmdBindIndexBuffer(commands_now(), indices, 0, vk.INDEX_TYPE_UINT32)
     vk.vkCmdDrawIndexedIndirect(commands_now(), draws, (command * 20) as long, 1, 20)
     g_draw_calls = g_draw_calls + 1
+}
+
+// The water's shaders with nothing set: what a draw's values are copied
+// into (water_values).
+sea_vertex_shader() -> *GpuShader { return sea.sea_vertex(Water { time: 0.0 }, Eye { far: 0.0 }) }
+sea_shader() -> *GpuShader {
+    return sea.sea(Water { time: 0.0 }, Eye { far: 0.0 }, KeyLight { intensity: 0.0 }, Weather { fog: 0 },
+                   Texture { image: null }, Texture { image: null }, Texture { image: null }, Texture { image: null },
+                   Texture { image: null })
+}
+
+// The structs the water reads, and the names each shader captures them as
+// ("" for one it does not).
+const WATER_CAPTURE_NAMES[] = ["water", "eye", "key", "weather"]
+const WATER_VERTEX_NAMES[] = ["surface", "viewer", "", ""]
+
+// Where each of the water's captured fields was in the scene block.
+water_offsets() {
+    if g_water_offsets == null { g_water_offsets = calloc(WATER_CAPTURES * WATER_FIELDS_MOST, 4) }
+    c = 0
+    while c < WATER_CAPTURES {
+        name = WATER_CAPTURE_NAMES[c]
+        k = 0
+        while k < sea.fields(name) && k < WATER_FIELDS_MOST {
+            (g_water_offsets as int[])[c * WATER_FIELDS_MOST + k] = vkscene.offset_of(sea.uniform_of(name, k))
+            k = k + 1
+        }
+        c = c + 1
+    }
+}
+
+// The water program's block into `s`'s captured structs, word for word: the
+// draw's water, the frame's eye, key light and weather, each where the
+// shader captures it (the vertex shader's `vertex`: surface and viewer). A
+// capture the shader does not have is passed over.
+water_values(s: *GpuShader, vertex: bool) {
+    block = vkdesc.block(vkdesc.PROGRAM_WATER)
+    c = 0
+    while c < WATER_CAPTURES {
+        kind = WATER_CAPTURE_NAMES[c]
+        name = kind
+        if vertex { name = WATER_VERTEX_NAMES[c] }
+        k = 0
+        while name != "" && k < sea.fields(kind) && k < WATER_FIELDS_MOST {
+            at = (g_water_offsets as int[])[c * WATER_FIELDS_MOST + k]
+            if at >= 0 { _w = gpu.set_field_words(s, name, sea.field_of(kind, k), block + at) }
+            k = k + 1
+        }
+        c = c + 1
+    }
+}
+
+// A view and its sampler where the shader of `p` samples `name`.
+quoted_view(p: *QuotedPass, name: string, view: @keep ptr, sampler: @keep ptr) {
+    quoted_cells()
+    s = vkquote.shader(p)
+    k = 0
+    while k < gpu.samplers_count(s) && k < QUOTED_TEXTURES {
+        if gpu.samplers_name(s, k) == name {
+            (g_quoted_views as ptr[])[k] = view
+            (g_quoted_samplers as ptr[])[k] = sampler
+        }
+        k = k + 1
+    }
+}
+
+// A water surface's draw of `indices` indices from `first` of mesh `handle`,
+// with `instances` (or the one identity): the sea's pair, its values the
+// water program's block's, its images those the scene's set binds -- the
+// sky's image at 1 (`texture`), the camera's depth at 4 where the draw asked
+// for it (the default texture otherwise), its ripples' mask at 9 and the
+// sky's light at 10 and 12 -- through the pipeline the draw's blend and
+// culling choose.
+draw_water(handle: int, texture: int, instances: int, instance_count: int, first: int, indices: int) {
+    p = g_water_pass as *QuotedPass
+    water_values(vkquote.vertex_shader(p), true)
+    water_values(vkquote.shader(p), false)
+    quoted_texture(p, "sky_image", texture)
+    if g_pose_bank == vkdesc.AUX_SCENE_DEPTH && vktargets.camdepth_view() != null && vktargets.camdepth_sampler() != null {
+        quoted_view(p, "scene_depth", vktargets.camdepth_view(), vktargets.camdepth_sampler())
+    } else {
+        quoted_texture(p, "scene_depth", g_default_texture)
+    }
+    quoted_texture(p, "ripple_mask", g_damage_mask)
+    quoted_view(p, "sky_light_map", vkdesc.sky_view(0), vkdesc.sky_sampler(0))
+    quoted_view(p, "sky_irradiance", vkdesc.sky_view(2), vkdesc.sky_sampler(2))
+    draw = g_water_draw
+    g_water_draw = g_water_draw + 1
+    set = vkquote.prepare(p, g_frame, draw, g_quoted_views, g_quoted_samplers)
+    vset = vkquote.vertex_set(p, g_frame, draw)
+    if set == null || vset == null { return }
+    bind_pipeline(vkquote.mesh_pipeline(p, g_blend, g_cull == 1))
+    (g_set_cell as ptr[])[0] = set
+    vk.vkCmdBindDescriptorSets(commands_now(), vk.PIPELINE_BIND_POINT_GRAPHICS, vkquote.layout(p), 0, 1, g_set_cell, 0, null)
+    (g_set_cell as ptr[])[0] = vset
+    vk.vkCmdBindDescriptorSets(commands_now(), vk.PIPELINE_BIND_POINT_GRAPHICS, vkquote.layout(p), 1, 1, g_set_cell, 0, null)
+    bind_vertices(0, vkmesh.vertex_buffer(handle))
+    count = instance_count
+    if vkmesh.in_range(instances) && instance_count > 0 {
+        if vkmesh.drawable(instances) { bind_vertices(1, vkmesh.vertex_buffer(instances)) }
+    } else {
+        bind_vertices(1, identity_buffer())
+        count = 1
+    }
+    skin = vkmesh.skin_buffer(handle)
+    if skin != null { bind_vertices(2, skin) } else { bind_vertices(2, empty_skin_buffer()) }
+    vk.vkCmdBindIndexBuffer(commands_now(), vkmesh.index_buffer(handle), 0, vk.INDEX_TYPE_UINT32)
+    vk.vkCmdDrawIndexed(commands_now(), indices, count, first, 0, 0)
+    g_draw_calls = g_draw_calls + 1
+    // The next scene draw binds the scene's set on the scene's layout.
+    g_bound_texture = 0 - 1
+    g_bound_normal = 0 - 1
 }
 
 // The sky's shaders, each with nothing set: what a frame's values are

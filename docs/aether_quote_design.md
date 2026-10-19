@@ -401,9 +401,11 @@ From mapping the compiler; nothing here is built yet.
    shaders (scene, water, crowd): their vertex stage is a quote too, and
    their uniforms are the scene block.
 5. **MSL**, after step 6 (the vertex shaders) (Nic, 2026-10-16; the FXAA-only MSL
-   spike is dropped), then a SPIR-V writer of our own (after reading Chris's
-   `spirv.inc` for ideas, then writing ours from the SPIR-V spec), with
-   glslang and `spirv-val` kept in CI as the checkers.
+   spike is dropped). A SPIR-V writer of our own is on hold until something
+   needs it (Nic, 2026-10-19): glslang stays the precompiler, turning the
+   GLSL ae3d.gpu writes into the SPIR-V ae3d.vkspirv holds, and with
+   `spirv-val` it stays CI's checker (`generate_shaders --check`). Chris's
+   `spirv.inc` and the SPIR-V spec are where that writer would start.
 6. **Vertex shaders.** ChrysaLisp's split is worth taking as an idea: a
    vertex shader's inputs and outputs are declared, and one vertex shader
    serves any pixel shader whose inputs it provides. For us the vertex
@@ -592,6 +594,37 @@ sky(...) -> *GpuShader {
    refused. The frames are byte-identical to the eight captures'.
 4. **Water**, then **the crowd**, then **the scene**: the mesh shaders, and
    with them the scene block.
+   *Water done (2026-10-19, on Aether 0.829.0):* `ae3d.shaders.sea`, a
+   vertex and a pixel quote drawn on both renderers with frames
+   byte-identical to the hand-written ones. `Light[16]` was probed first:
+   quote 0.829.0 types it `Light[16]`, its element `Light` and a field of
+   one `vec4` (and `mat4[96]` likewise), so the scene's lights need nothing
+   of aether. What the water reads is four captured structs: the frame's
+   `Eye`, `KeyLight` and `Weather` (`ae3d.shaders.frame`; the camera's is
+   `Eye` because `Camera` is `ae3d.core`'s, and an engine module importing
+   both could no longer name its own unqualified), and the draw's `Water`.
+   A `mat4` is a field of a captured struct now. Each field is the scene
+   block uniform it was, and both renderers fill the structs from what
+   filled those uniforms: Vulkan copies the water program's block word for
+   word (`gpu.set_field_words`), OpenGL from the renderer's state and the
+   model's uniforms by name. On Vulkan the pair is drawn per draw through
+   `vkquote`'s ring (`mesh_pair_new`: opaque, culled and blended pipelines
+   on its layout), every struct in each draw's block for now; the scene
+   shader's draws are where the frame's structs want a binding of their
+   own. Three things the hand-written shape decided:
+   - a vertex shader's captures are named apart from its pixel shader's
+     (`surface`, `viewer`; `water`, `eye`): on OpenGL a uniform of one name
+     is one uniform across the program, and the two read other fields
+     (`gpu.link` refuses a struct both capture under one name);
+   - the vertex shader still hands on the uv and the trains' normal, which
+     no pixel shader reads, at the hand-written places;
+   - a helper the hand-written shader wrote reading its uniforms is written
+     where it is used when a helper given them as arguments rounds
+     otherwise: `water_below`, given the inverse view-projection as an
+     argument, put the shore's sums a step out in 117 channels on MoltenVK,
+     whose fast math orders a sum by where its values were loaded. waveField
+     is written into the pixel shader's body (a shader cannot hand a helper
+     the wave table), and its `out` parameters with it.
 
 ### The scene block
 
@@ -617,6 +650,10 @@ before the scene shader moves. The block goes when the last shader reading
 it does, and with it `vkscene` and `vkdesc`'s single scene program.
 
 ### What it buys MSL (step 5, after this)
+
+MSL comes after the mesh shaders (Nic, 2026-10-19). Our own SPIR-V writer
+is on hold until something needs it; glslang stays the precompiler and,
+with `spirv-val`, CI's checker (section 9, item 5).
 
 Metal's stage-in and stage-out are structs (`[[stage_in]]`, a returned
 struct with `[[position]]`), so varyings designed as structs map across as
