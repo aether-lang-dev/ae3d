@@ -401,9 +401,11 @@ From mapping the compiler; nothing here is built yet.
    shaders (scene, water, crowd): their vertex stage is a quote too, and
    their uniforms are the scene block.
 5. **MSL**, after step 6 (the vertex shaders) (Nic, 2026-10-16; the FXAA-only MSL
-   spike is dropped), then a SPIR-V writer of our own (after reading Chris's
-   `spirv.inc` for ideas, then writing ours from the SPIR-V spec), with
-   glslang and `spirv-val` kept in CI as the checkers.
+   spike is dropped). A SPIR-V writer of our own is on hold until something
+   needs it (Nic, 2026-10-19): glslang stays the precompiler, turning the
+   GLSL ae3d.gpu writes into the SPIR-V ae3d.vkspirv holds, and with
+   `spirv-val` it stays CI's checker (`generate_shaders --check`). Chris's
+   `spirv.inc` and the SPIR-V spec are where that writer would start.
 6. **Vertex shaders.** ChrysaLisp's split is worth taking as an idea: a
    vertex shader's inputs and outputs are declared, and one vertex shader
    serves any pixel shader whose inputs it provides. For us the vertex
@@ -617,6 +619,10 @@ before the scene shader moves. The block goes when the last shader reading
 it does, and with it `vkscene` and `vkdesc`'s single scene program.
 
 ### What it buys MSL (step 5, after this)
+
+MSL comes after the mesh shaders (Nic, 2026-10-19). Our own SPIR-V writer
+is on hold until something needs it; glslang stays the precompiler and,
+with `spirv-val`, CI's checker (section 9, item 5).
 
 Metal's stage-in and stage-out are structs (`[[stage_in]]`, a returned
 struct with `[[position]]`), so varyings designed as structs map across as
