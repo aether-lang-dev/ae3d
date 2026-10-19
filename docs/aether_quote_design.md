@@ -649,6 +649,11 @@ sky(...) -> *GpuShader {
    (`mul_fm4`, `add_m4`, `mul_m4f`), in the hand-written order; the
    optimised SPIR-V's arithmetic is the hand-written one's op for op, but
    for where a component is extracted.
+   Its cleanup removed `VERTEX_CROWD`, `VERTEX_CROWD_DEPTH`, `crowd_vk.vert`,
+   `crowd_pull_vk.vert`, `crowd_depth_vk.vert` and `vkpipes`' crowd
+   pipelines, and with them the nine scene-block uniforms only they read
+   (134 uniforms, 15168 bytes): Vulkan keeps their words in the crowd's own
+   (`vkframe.set_crowd_*`), where the rings copy them from.
 
 ### The scene block
 

@@ -55,3 +55,13 @@ shaders go in a cleanup pull request after this.
   the figures' stride, the reach's comparison, vertex_set, the impostor's
   row).
 - `test_quoted_hashes` holds the three shaders.
+- **`VERTEX_CROWD`, `VERTEX_CROWD_DEPTH`, `crowd_vk.vert`, `crowd_pull_vk.vert`,
+  `crowd_depth_vk.vert` and `vkpipes`' crowd pipelines are gone** (the
+  cleanup after the frames above). With them go the nine scene-block
+  uniforms only they read (134 uniforms, 15168 bytes; 53 shaders):
+  poseBankFrames, the impostor's grid and size, crowdTravel,
+  crowdPhaseStep, pullVertexBits and shadowReach. Vulkan keeps them in the
+  crowd's own words (`vkframe.set_crowd_*`), which the rings copy from as
+  they copy the rest from the scene's block. A crowd whose rings would not
+  make draws through the skinned pipelines; `vkpipes` still makes the
+  cluster cut's pulled set layout, which the cut's ring reads through.

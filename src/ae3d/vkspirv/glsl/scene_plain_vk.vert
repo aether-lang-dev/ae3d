@@ -149,15 +149,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 ddgiBase[2];
     vec4 ddgiSpacing;
     vec4 ddgiAtlas;
-    int pullVertexBits;
-    int poseBankFrames;
-    int impostorCols;
-    int impostorRows;
-    float impostorWidth;
-    float impostorHeight;
-    float crowdTravel;
-    float crowdPhaseStep;
-    vec4 shadowReach;
     mat4 bones[96];
     vec4 prevBoneRows[288];
 };

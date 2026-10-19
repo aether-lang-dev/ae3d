@@ -152,15 +152,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 ddgiBase[2];
     vec4 ddgiSpacing;
     vec4 ddgiAtlas;
-    int pullVertexBits;
-    int poseBankFrames;
-    int impostorCols;
-    int impostorRows;
-    float impostorWidth;
-    float impostorHeight;
-    float crowdTravel;
-    float crowdPhaseStep;
-    vec4 shadowReach;
     mat4 bones[96];
     vec4 prevBoneRows[288];
 };
@@ -274,7 +265,7 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
     shadowSlot = int(floor(e.z + 0.5));
     return L;
 }
-// The crowd's far tier as pictures (see VERTEX_CROWD): a picture is cut out
+// The crowd's far tier as pictures (see ae3d.shaders.throng): a picture is cut out
 // by its alpha, and its colour is the figure's albedo and its normal map
 // the figure's own normals, so it is lit below by the scene's lights the
 // way the mesh beside it is.
