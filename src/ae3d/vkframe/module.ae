@@ -53,8 +53,11 @@ import ae3d.shaders.composite
 import ae3d.shaders.composite (Haze)
 import ae3d.shaders.sea
 import ae3d.shaders.sea (Water)
-import ae3d.shaders.frame (Eye, KeyLight, Weather)
-import ae3d.shaderlib (vec2, vec3, Texture, TextureMS, Texture3D, zero_mat4)
+import ae3d.shaders.frame (Eye, KeyLight, Weather, Shadow)
+import ae3d.shaders.throng
+import ae3d.shaders.throng (Throng)
+import ae3d.vkquote (VertexRing)
+import ae3d.shaderlib (vec2, vec3, Texture, TextureMS, Texture3D, Floats, Vec4s, zero_mat4, splat4)
 import std.io
 
 exports (
@@ -74,7 +77,7 @@ exports (
     SKY_PROJECTION, SKY_VIEW, SKY_CLOUD_SUN_COLOUR, SKY_SUN, SKY_CLOUD_FRAME, SKY_KIND, SKY_FLAT, SKY_TURBIDITY,
     SKY_CLOUD_SIZE, SKY_CLOUD_HISTORY, SKY_OVERCAST, SKY_OVERCAST_COLOUR, sky_words, set_sky_int, set_sky_float, set_sky_vec3,
     set_sky_mat4, set_sky_clip_mat4, set_composite_haze, water_word, set_water_int, set_water_float, set_water_vec3,
-    set_water_array
+    set_water_array, crowd_pull_pipeline
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -278,6 +281,26 @@ const WATER_FROM_SKY = 2
 // look, the time) and the key light's four flat names; zero until set.
 var g_water_words: ptr = null
 const WATER_SLOT = 64
+// The crowd's vertex shaders (ae3d.shaders.throng), each a ring of blocks
+// drawn with the scene's or the depth pass's hand-written pixel shader: the
+// lit crowd (its opaque pipelines, culled or not, and its blended one), the
+// one drawn by its cluster cut, and the one cast into a shadow map. A
+// draw's values are copied, word for word, from the block the scene's ring
+// takes for it (every one is still a scene block uniform), its pose bank
+// bound in the ring's own set. Null where its ring or pipelines would not
+// make: the hand-written crowd's pipelines (vkpipes) draw it then.
+var g_crowd_ring: ptr = null
+var g_crowd_pull_ring: ptr = null
+var g_crowd_depth_ring: ptr = null
+var g_crowd_pipes: ptr = null      // VkPipeline[2], by culling
+var g_crowd_blend_pipe: ptr = null
+var g_crowd_pull_pipes: ptr = null // VkPipeline[2]
+var g_crowd_shadow_pipe: ptr = null
+const CROWD_DRAWS = 1024
+// The captures the crowd's shaders read, by the names they capture them as.
+const CROWD_CAPTURES[] = ["throng", "eye", "shadow"]
+var g_crowd_views: ptr = null
+var g_crowd_samplers: ptr = null
 // A quoted draw's textures, in its shader's order, at most QUOTED_TEXTURES.
 const QUOTED_TEXTURES = 5
 var g_quoted_views: ptr = null
@@ -781,6 +804,7 @@ start(width: int, height: int) -> bool {
                                          vkspirv.SEA_QUOTED_FRAG, vkspirv.SEA_QUOTED_VERTEX_HASH, vkspirv.SEA_QUOTED_HASH,
                                          vktargets.scene_pass(), WATER_DRAWS) as ptr
     water_offsets()
+    crowd_rings()
     if g_dlss_loaded {
         g_dlss_supported = ae3d_dlss_supported(vkdevice.physical()) == 1
         if !g_dlss_supported { io.stderr_write("ae3d: DLSS: ${ae3d_dlss_last_error()}\n") }
@@ -853,6 +877,7 @@ shutdown() {
     g_composite_pass = null
     vkquote.pass_free(g_water_pass as *QuotedPass)
     g_water_pass = null
+    crowd_rings_free()
     free(g_water_offsets)
     g_water_offsets = null
     free(g_water_sources)
@@ -1161,6 +1186,9 @@ frame_begin(r: float, g: float, b: float, a: float) -> bool {
     vkdesc.ring_begin(g_frame)
     g_draw_calls = 0
     g_water_draw = 0
+    vkquote.ring_frame(g_crowd_ring as *VertexRing, g_frame)
+    vkquote.ring_frame(g_crowd_pull_ring as *VertexRing, g_frame)
+    vkquote.ring_frame(g_crowd_depth_ring as *VertexRing, g_frame)
     vkhost.set_recording(true)
     return true
 }
@@ -1273,6 +1301,7 @@ draw_pipeline_range(pipeline: @keep ptr, handle: int, texture: int, instances: i
         g_set_binds = g_set_binds + 1
     }
     bind_set(set, offset)
+    if !crowd_bound(pipeline) { return }
     bind_vertices(0, vkmesh.vertex_buffer(handle))
     count = instance_count
     if vkmesh.in_range(instances) && instance_count > 0 {
@@ -1297,9 +1326,9 @@ pipeline_for(handle: int, points: bool) -> ptr {
     if points && vkpipes.points(g_cull) != null && vkpipes.points_blend() != null {
         opaque = vkpipes.points(g_cull)
         blended = vkpipes.points_blend()
-    } else if skinned && g_pose_bank > 0 && vkpipes.crowd(g_cull) != null && vkpipes.crowd_blend() != null {
-        opaque = vkpipes.crowd(g_cull)
-        blended = vkpipes.crowd_blend()
+    } else if skinned && g_pose_bank > 0 && crowd_pipeline(g_cull) != null && crowd_blend_pipeline() != null {
+        opaque = crowd_pipeline(g_cull)
+        blended = crowd_blend_pipeline()
     } else if skinned && vkpipes.skinned(g_cull) != null && vkpipes.skinned_blend() != null {
         opaque = vkpipes.skinned(g_cull)
         blended = vkpipes.skinned_blend()
@@ -1346,7 +1375,7 @@ draw_indirect(handle: int, texture: int, instances: @keep ptr, draws: ptr, offse
     if shadow {
         pipeline = vkpipes.shadow()
         if vkmesh.skinned(handle) && vkpipes.skinned_shadow() != null { pipeline = vkpipes.skinned_shadow() }
-        if g_pose_bank > 0 && vkpipes.crowd_shadow() != null { pipeline = vkpipes.crowd_shadow() }
+        if g_pose_bank > 0 && crowd_shadow_pipeline() != null { pipeline = crowd_shadow_pipeline() }
         vkdesc.set_program(vkdesc.PROGRAM_SCENE)
     } else {
         pipeline = pipeline_for(handle, false)
@@ -1360,6 +1389,7 @@ draw_indirect(handle: int, texture: int, instances: @keep ptr, draws: ptr, offse
     if set == null { return }
     bind_pipeline(pipeline)
     bind_set(set, at)
+    if !crowd_bound(pipeline) { return }
     bind_vertices(0, vkmesh.vertex_buffer(handle))
     bind_vertices(1, instances)
     skin = vkmesh.skin_buffer(handle)
@@ -1385,13 +1415,15 @@ draw_cut(handle: int, texture: int, instances: int, indices: ptr, draws: ptr, fi
     if offset < 0 { return }
     set = set_now(tex)
     if set == null { return }
-    bind_pipeline(pipeline_for(handle, false))
+    cut_pipeline = pipeline_for(handle, false)
+    bind_pipeline(cut_pipeline)
     if tex != g_bound_texture || g_normal_map != g_bound_normal {
         g_bound_texture = tex
         g_bound_normal = g_normal_map
         g_set_binds = g_set_binds + 1
     }
     bind_set(set, offset)
+    if !crowd_bound(cut_pipeline) { return }
     bind_vertices(0, vkmesh.vertex_buffer(handle))
     if vkmesh.in_range(instances) && vkmesh.drawable(instances) {
         bind_vertices(1, vkmesh.vertex_buffer(instances))
@@ -1419,7 +1451,7 @@ draw_cut(handle: int, texture: int, instances: int, indices: ptr, draws: ptr, fi
 // pipeline. The block's pullVertexBits is the caller's to have set.
 draw_pulled(texture: int, pulled: @keep ptr, indices: ptr, draws: ptr, command: int) {
     if !vkhost.recording() || pulled == null { return }
-    pipeline = vkpipes.crowd_pull(g_cull)
+    pipeline = crowd_pull_pipeline(g_cull)
     if pipeline == null { return }
     open_scene_pass()
     tex = texture
@@ -1438,6 +1470,7 @@ draw_pulled(texture: int, pulled: @keep ptr, indices: ptr, draws: ptr, command: 
     bind_set(set, offset)
     (g_set_cell as ptr[])[0] = pulled
     vk.vkCmdBindDescriptorSets(commands_now(), vk.PIPELINE_BIND_POINT_GRAPHICS, vkpipes.pull_layout(), 1, 1, g_set_cell, 0, null)
+    if !crowd_bound(pipeline) { return }
     vk.vkCmdBindIndexBuffer(commands_now(), indices, 0, vk.INDEX_TYPE_UINT32)
     vk.vkCmdDrawIndexedIndirect(commands_now(), draws, (command * 20) as long, 1, 20)
     g_draw_calls = g_draw_calls + 1
@@ -1899,7 +1932,7 @@ shadow_draw(handle: int, instances: int, instance_count: int) {
         pipeline = vkpipes.point_shadow()
     } else if vkmesh.skinned(handle) && vkpipes.skinned_shadow() != null {
         pipeline = vkpipes.skinned_shadow()
-        if g_pose_bank > 0 && vkpipes.crowd_shadow() != null { pipeline = vkpipes.crowd_shadow() }
+        if g_pose_bank > 0 && crowd_shadow_pipeline() != null { pipeline = crowd_shadow_pipeline() }
     }
     vkdesc.set_program(vkdesc.PROGRAM_SCENE)
     draw_pipeline(pipeline, handle, g_default_texture, instances, instance_count)
@@ -2962,4 +2995,182 @@ run_dlss(source: int) -> int {
     g_bound_texture = 0
     g_bound_normal = 0
     return output
+}
+
+// ── The crowd's quoted vertex shaders ───────────────────────────────────
+
+// The crowd's shaders with nothing set: what a draw's values are copied
+// into (crowd_values).
+crowd_vertex_shader() -> *GpuShader {
+    return throng.crowd_vertex(Throng { frames: 0 }, Eye { far: 0.0 }, Shadow { reach: splat4(0.0) },
+                               Texture { image: null })
+}
+crowd_pull_vertex_shader() -> *GpuShader {
+    return throng.crowd_pull_vertex(Throng { frames: 0 }, Eye { far: 0.0 }, Shadow { reach: splat4(0.0) },
+                                    Texture { image: null }, Floats { data: null }, Vec4s { data: null },
+                                    Floats { data: null })
+}
+crowd_depth_vertex_shader() -> *GpuShader {
+    return throng.crowd_depth_vertex(Throng { frames: 0 }, Shadow { reach: splat4(0.0) }, Texture { image: null })
+}
+
+// The three rings and their pipelines, as vkpipes builds the hand-written
+// crowd's: into the scene pass after the scene's pixel shader (the one
+// that traces its shadow rays where the device traces), opaque culled or
+// not and blended; the cluster cut's after the pulled set; and into the
+// shadow pass after the depth one. A ring whose pipelines would not all
+// build is let go, and the hand-written crowd draws in its place.
+crowd_rings() {
+    if g_crowd_pipes == null {
+        g_crowd_pipes = calloc(2, 8)
+        g_crowd_pull_pipes = calloc(2, 8)
+    }
+    if g_crowd_views == null {
+        g_crowd_views = calloc(1, 8)
+        g_crowd_samplers = calloc(1, 8)
+    }
+    fragment = vkspirv.SCENE_FRAG
+    if vkdevice.ray_query() { fragment = vkspirv.SCENE_RQ_FRAG }
+    render = vktargets.scene_pass()
+    lit = vkquote.vertex_ring_new(crowd_vertex_shader(), vkspirv.CROWD_QUOTED_HASH, CROWD_DRAWS)
+    if lit != null {
+        ok = true
+        cull = 0
+        while cull < 2 {
+            p = vkquote.ring_pipeline(lit, vkspirv.CROWD_QUOTED_VERT, fragment, 1, true, true, render, cull == 1, true, false)
+            (g_crowd_pipes as ptr[])[cull] = p
+            if p == null { ok = false }
+            cull = cull + 1
+        }
+        g_crowd_blend_pipe = vkquote.ring_pipeline(lit, vkspirv.CROWD_QUOTED_VERT, fragment, 1, true, false, render, false,
+                                                   true, false)
+        if ok && g_crowd_blend_pipe != null {
+            g_crowd_ring = lit as ptr
+        } else {
+            vkquote.vertex_ring_free(lit)
+            crowd_lit_forget()
+        }
+    }
+    if vkpipes.pull_set_layout() != null {
+        pull = vkquote.vertex_ring_new(crowd_pull_vertex_shader(), vkspirv.CROWD_PULL_QUOTED_HASH, CROWD_DRAWS)
+        if pull != null {
+            ok = true
+            cull = 0
+            while cull < 2 {
+                p = vkquote.ring_pipeline(pull, vkspirv.CROWD_PULL_QUOTED_VERT, fragment, 1, true, true, render, cull == 1,
+                                          true, true)
+                (g_crowd_pull_pipes as ptr[])[cull] = p
+                if p == null { ok = false }
+                cull = cull + 1
+            }
+            if ok {
+                g_crowd_pull_ring = pull as ptr
+            } else {
+                vkquote.vertex_ring_free(pull)
+                memset(g_crowd_pull_pipes, 0, 16 as long)
+            }
+        }
+    }
+    depth = vkquote.vertex_ring_new(crowd_depth_vertex_shader(), vkspirv.CROWD_DEPTH_QUOTED_HASH, CROWD_DRAWS)
+    if depth != null {
+        g_crowd_shadow_pipe = vkquote.ring_pipeline(depth, vkspirv.CROWD_DEPTH_QUOTED_VERT, vkspirv.DEPTH_FRAG, 0, true,
+                                                    true, vktargets.shadow_pass(), false, true, false)
+        if g_crowd_shadow_pipe != null {
+            g_crowd_depth_ring = depth as ptr
+        } else {
+            vkquote.vertex_ring_free(depth)
+        }
+    }
+}
+
+fn crowd_lit_forget() {
+    memset(g_crowd_pipes, 0, 16 as long)
+    g_crowd_blend_pipe = null
+}
+
+crowd_rings_free() {
+    vkquote.vertex_ring_free(g_crowd_ring as *VertexRing)
+    vkquote.vertex_ring_free(g_crowd_pull_ring as *VertexRing)
+    vkquote.vertex_ring_free(g_crowd_depth_ring as *VertexRing)
+    g_crowd_ring = null
+    g_crowd_pull_ring = null
+    g_crowd_depth_ring = null
+    if g_crowd_pipes != null {
+        crowd_lit_forget()
+        memset(g_crowd_pull_pipes, 0, 16 as long)
+    }
+    g_crowd_shadow_pipe = null
+}
+
+// The crowd's pipelines: the quoted shaders', or the hand-written ones'
+// where those would not make.
+crowd_pipeline(cull: int) -> ptr {
+    if g_crowd_ring != null { return (g_crowd_pipes as ptr[])[cull] }
+    return vkpipes.crowd(cull)
+}
+crowd_blend_pipeline() -> ptr {
+    if g_crowd_ring != null { return g_crowd_blend_pipe }
+    return vkpipes.crowd_blend()
+}
+crowd_pull_pipeline(cull: int) -> ptr {
+    if g_crowd_pull_ring != null { return (g_crowd_pull_pipes as ptr[])[cull] }
+    return vkpipes.crowd_pull(cull)
+}
+crowd_shadow_pipeline() -> ptr {
+    if g_crowd_depth_ring != null { return g_crowd_shadow_pipe }
+    return vkpipes.crowd_shadow()
+}
+
+// The ring a pipeline draws through, or null for a pipeline that is none
+// of the quoted crowd's.
+fn crowd_ring_of(pipeline: ptr) -> ptr {
+    if pipeline == null { return null }
+    if g_crowd_ring != null {
+        if pipeline == (g_crowd_pipes as ptr[])[0] || pipeline == (g_crowd_pipes as ptr[])[1] ||
+           pipeline == g_crowd_blend_pipe {
+            return g_crowd_ring
+        }
+    }
+    if g_crowd_pull_ring != null {
+        if pipeline == (g_crowd_pull_pipes as ptr[])[0] || pipeline == (g_crowd_pull_pipes as ptr[])[1] {
+            return g_crowd_pull_ring
+        }
+    }
+    if g_crowd_depth_ring != null && pipeline == g_crowd_shadow_pipe { return g_crowd_depth_ring }
+    return null
+}
+
+// Where the draw just bound to `pipeline` is one of the quoted crowd's: its
+// values, from the block the scene's ring took for it, into the next block
+// of its ring, and its set bound with the pose bank. False when that ring
+// refuses the draw, which is then not made; true for any other pipeline.
+crowd_bound(pipeline: ptr) -> bool {
+    ring = crowd_ring_of(pipeline)
+    if ring == null { return true }
+    r = ring as *VertexRing
+    crowd_values(vkquote.ring_shader(r))
+    bank = g_pose_bank
+    if !vktexture.valid(bank) { bank = g_default_texture }
+    (g_crowd_views as ptr[])[0] = vktexture.view(bank)
+    (g_crowd_samplers as ptr[])[0] = vktexture.sampler_of(bank)
+    return vkquote.ring_bind(r, commands_now(), g_frame, g_crowd_views, g_crowd_samplers)
+}
+
+// What a crowd is drawn from into `s`'s captured structs, word for word:
+// each field the scene block uniform it was, from the block the scene's
+// ring took for the draw (the current program's). A field the shader does
+// not read, or the block no longer has, is passed over.
+crowd_values(s: *GpuShader) {
+    block = vkdesc.block(vkdesc.program())
+    c = 0
+    while c < 3 {
+        name = CROWD_CAPTURES[c]
+        k = 0
+        while k < throng.fields(name) {
+            at = vkscene.offset_of(throng.uniform_of(name, k))
+            if at >= 0 { _w = gpu.set_field_words(s, name, throng.field_of(name, k), block + at) }
+            k = k + 1
+        }
+        c = c + 1
+    }
 }

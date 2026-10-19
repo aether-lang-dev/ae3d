@@ -631,6 +631,24 @@ sky(...) -> *GpuShader {
    15216 bytes): Vulkan keeps their words where the pair copies them from,
    the overcast in `vkframe`'s sky words, the rest in the water's own
    (`vkframe.water_word`).
+   *The crowd done (2026-10-19, on Aether 0.830.0):* `ae3d.shaders.throng`,
+   its three vertex shaders (`crowd_vertex`, `crowd_pull_vertex`,
+   `crowd_depth_vertex`) drawn with the scene's and the depth pass's
+   hand-written pixel shaders, which move with the scene. The frames are
+   byte-identical to the hand-written crowd's on both renderers (zombie_city
+   within #794). What they read is the draw's `Throng` and the frame's `Eye`
+   and `Shadow` (the map's light space, a lamp's reach); their varyings are
+   named as FRAGMENT_DEFAULT's and FRAGMENT_DEPTH's inputs, at their places.
+   A vertex shader now samples textures (the pose bank) and reads storage
+   buffers (`Floats`, `Vec4s`: the cluster cut's vertices, skin and
+   figures, at set 1, the shader's own set then 2). On Vulkan a quoted
+   vertex shader with a hand-written pixel shader is a vertex ring
+   (`vkquote.vertex_ring_new`): the scene's set, then its own, a dynamic
+   uniform buffer of each draw's values copied word for word from the block
+   the scene's ring took for it. The skinning is written a matrix at a time
+   (`mul_fm4`, `add_m4`, `mul_m4f`), in the hand-written order; the
+   optimised SPIR-V's arithmetic is the hand-written one's op for op, but
+   for where a component is extracted.
 
 ### The scene block
 
