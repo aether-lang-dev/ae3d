@@ -2,7 +2,7 @@
 
 Step 6's mesh shaders begin (docs/aether_quote_design.md section 11): the
 water, as a vertex and a pixel quote, drawn on both renderers. The
-hand-written water shaders stay for a cleanup pull request after this one.
+hand-written water shaders went in a cleanup pull request after it.
 
 - **`Light[16]` probed first:** Aether 0.829.0's quote types a captured
   struct's `Light[16]` field as `Light[16]`, an element as `Light` and its
@@ -61,3 +61,18 @@ hand-written water shaders stay for a cleanup pull request after this one.
   40.324, 129, 55.6744 on Vulkan). Khronos validation with sync, nothing
   excluded: 0 errors, parity, both scenes, the water suites and the flood,
   floating and caustics examples.
+- **`VERTEX_WATER`, `FRAGMENT_WATER`, `water_vk.vert`/`.frag` and `vkpipes`'
+  water pipelines are gone** (the cleanup after the frames above). The
+  water's shader is a kind with no source (`shaders.water_shader()`):
+  `core.shader_valid` holds a named kind valid on its own, OpenGL compiles a
+  model's own GLSL only for a custom shader, and a Vulkan water draw whose
+  pair would not make draws nothing. With them go 34 scene-block uniforms
+  only they read (143 uniforms, 15216 bytes; 53 shaders): the wave table and
+  the surface's settings, the key light's four flat names, and the overcast.
+  Vulkan keeps them, in the same 32-bit words, where the water's pair copies
+  them from: the overcast in the sky's words (`SKY_OVERCAST`,
+  `SKY_OVERCAST_COLOUR`, which the quoted sky and `vksky` read too), every
+  other in the water's own (`vkframe.water_word`), which a water draw's model
+  uniforms the block has no member for are written to, and the key light
+  each frame. `frames_against.sh`: 59 frames, none differ but the clouds
+  (#793); parity at 1x main's but the clouds.

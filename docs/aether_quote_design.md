@@ -625,6 +625,12 @@ sky(...) -> *GpuShader {
      whose fast math orders a sum by where its values were loaded. waveField
      is written into the pixel shader's body (a shader cannot hand a helper
      the wave table), and its `out` parameters with it.
+   Its cleanup removed `VERTEX_WATER`, `FRAGMENT_WATER`, `water_vk.*` and
+   `vkpipes`' water pipelines; the water's shader is a kind with no source.
+   With them went the 34 scene-block uniforms only they read (143 uniforms,
+   15216 bytes): Vulkan keeps their words where the pair copies them from,
+   the overcast in `vkframe`'s sky words, the rest in the water's own
+   (`vkframe.water_word`).
 
 ### The scene block
 
