@@ -1,0 +1,739 @@
+// ae3d.shaders.sea: the water's surface, written with `quote` (step 6,
+// docs/aether_quote_design.md section 11). It was VERTEX_WATER and
+// FRAGMENT_WATER (water_vk.vert, water_vk.frag). The module is sea, not
+// water: ae3d.water is the engine's, and two modules of one last name in a
+// program name a quote's helpers by what else it imports.
+//
+//   - sea_vertex: the mesh's flat sheet raised by the four trains of the wave
+//     table (Gerstner waves, sharpened a little at the crests, their heights
+//     varied by a slow noise where the water asks for randomness), handing on
+//     where the point is in the world, this frame's and last frame's clip
+//     positions (the waves are not motion the eye follows: its vector is the
+//     camera's) and how far under the surface the eye is, the trains summed
+//     where it stands.
+//   - sea: the surface lit. Its normal is the water's, summed per pixel from
+//     the trains and the wind waves under them, not the mesh's; the sky it
+//     mirrors (the captured sky, the sky's image or its two colours), the
+//     sun's glitter, the body lit from above and through the crests, foam
+//     where a crest breaks and along the shore, the caustic web, the fog, and
+//     from below Snell's window; and its motion vector. Two outputs, its
+//     colour at 0 and its motion at 1.
+//
+// What it reads is captured structs (the scene block split by what changes
+// together): the frame's Eye, KeyLight and Weather (ae3d.shaders.frame),
+// and the draw's Water: the model's place and every setting the water module
+// gives it, each the uniform it was (uniform_of).
+//
+// Each helper is the hand-written one in the same shape -- the same
+// operations in the same order, the constants written as they were -- since
+// a GPU that fuses and reorders what it may (MoltenVK's fast math) rounds by
+// the shape, not by the value. waveField's `out` parameters are its body
+// written into the pixel shader's, which reads the wave table a shader
+// cannot hand a helper; the sky's helpers are skydome's.
+
+import std.quote
+import ae3d.gpu
+import ae3d.gpu (GpuShader, fragment, vertex)
+import ae3d.shaders.frame
+import ae3d.shaders.frame (Eye, KeyLight, Weather)
+import ae3d.shaders.skydome (display_radiance, velocity)
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, mat2, Texture, texture, texture_lod, frag_coord, rgb, xy, xz, xyz, yx,
+                       abs_v2, dot, dot_v2, normalize, normalize_v2, length_v2, length_v3, distance, reflect, sqrt, sin,
+                       cos, asin, atan2, exp, pow, abs, min, max, clamp, smoothstep, mix, mix_v3, fract, fract_v2, fract_v3,
+                       floor_v2, splat2, splat3, mul, m4_at, mat2_of, mul_m2, float_of, depth_clip, vec3_xv)
+
+exports (
+    Water, SeaVertex, SeaVaryings, SeaOut,
+    sea_vertex, sea, place, fields, field_of, uniform_of,
+    swell_hash, swell_noise, gerstner, gerstner_normal, sea_hash, sea_noise, sea_noised, sea_perlin, sea_fbm, sea_ridged,
+    sea_caustics, sea_oct_uv, overcast_sky, reflected_sky
+)
+
+// One water surface's draw: where the model is, the time its waves have
+// run, the wave table (four trains: direction, height, wavenumber, speed,
+// phase and steepness) and how the table is scaled, and how the surface
+// looks -- its colour and opacity, foam, caustics, the mirror and how far
+// ripples bend it, the shore, the sky it mirrors when there is no capture,
+// whether it has the sky's image or the sky's capture to mirror, and the
+// ripples bodies make (#637): their mask's square of the sea.
+struct Water {
+    model: mat4
+    time: float
+    speed: float
+    height: float
+    randomness: float
+    directions: vec3[4]
+    amplitudes: float[4]
+    frequencies: float[4]
+    speeds: float[4]
+    phases: float[4]
+    steepness: float[4]
+    colour: vec3
+    opacity: float
+    foam: int
+    foam_intensity: float
+    caustics: int
+    caustics_intensity: float
+    caustics_scale: float
+    reflection: int
+    reflection_intensity: float
+    distortion: int
+    distortion_intensity: float
+    normal_mapping: int
+    normal_intensity: float
+    depth_fade: float
+    shore_foam: float
+    sky_colour: vec3
+    horizon_colour: vec3
+    sky_texture: int
+    sky_capture: int
+    ripples: int
+    ripple_area: vec3
+}
+
+// The surface's mesh, a vertex its position in the model and its texture
+// coordinate.
+struct SeaVertex {
+    position: vec3
+    uv: vec2
+}
+
+// What the vertex shader hands on: `position` is gl_Position (the clip
+// position); the texture coordinate and the trains' normal, at the
+// hand-written shader's places (no pixel shader reads them now: the
+// surface's normal is summed per pixel); where the point is in the world,
+// waves and all; the clip positions this frame and last, for the motion
+// vector; and how far under the surface over it the eye is (negative
+// above).
+struct SeaVaryings {
+    position: vec4
+    uv: vec2
+    normal: vec3
+    world: vec3
+    clip_now: vec4
+    clip_prev: vec4
+    eye_below: float
+}
+
+// The surface's two outputs: its colour, and its motion vector.
+struct SeaOut {
+    colour: vec4
+    velocity: vec2
+}
+
+// The ripples' slopes are stored in the mask over this range.
+const RIPPLE_SLOPE_RANGE = 0.6
+
+// Each field of Water and the uniform it was in the scene block.
+const WATER_FIELDS[] = ["model", "time", "speed", "height", "randomness", "directions", "amplitudes", "frequencies",
+                        "speeds", "phases", "steepness", "colour", "opacity", "foam", "foam_intensity", "caustics",
+                        "caustics_intensity", "caustics_scale", "reflection", "reflection_intensity", "distortion",
+                        "distortion_intensity", "normal_mapping", "normal_intensity", "depth_fade", "shore_foam",
+                        "sky_colour", "horizon_colour", "sky_texture", "sky_capture", "ripples", "ripple_area"]
+const WATER_UNIFORMS[] = ["model", "time", "waveSpeedMultiplier", "waveHeightMultiplier", "waveRandomness",
+                          "waveDirections", "waveAmplitudes", "waveFrequencies", "waveSpeeds", "wavePhases",
+                          "waveSteepness", "waterBaseColor", "waterOpacity", "enableFoam", "foamIntensity",
+                          "enableCaustics", "causticsIntensity", "causticsScale", "enableWaterReflection",
+                          "waterReflectionIntensity", "enableWaterDistortion", "waterDistortionIntensity",
+                          "enableWaterNormalMapping", "waterNormalIntensity", "waterDepthFade", "waterShoreFoam",
+                          "skyColor", "horizonColor", "hasSkyTexture", "waterSkyCapture", "damageOn", "rippleArea"]
+const WATER_FIELD_COUNT = 32
+
+// The fields of the struct `capture` (water, or the frame's eye, key and
+// weather), each with the scene block uniform it was.
+fields(capture: string) -> int {
+    if capture == "water" { return WATER_FIELD_COUNT }
+    return frame.fields(capture)
+}
+field_of(capture: string, k: int) -> string {
+    if capture == "water" { return WATER_FIELDS[k] }
+    return frame.field_of(capture, k)
+}
+uniform_of(capture: string, k: int) -> string {
+    if capture == "water" { return WATER_UNIFORMS[k] }
+    return frame.uniform_of(capture, k)
+}
+
+// Where each field of the captured structs is in its cell, for a shader
+// capturing them as `water`, `eye`, `key` and `weather` ("" for one it does
+// not capture).
+place(s: *GpuShader, water: string, eye: string, key: string, weather: string) {
+    frame.place(s, eye, key, weather)
+    _a = gpu.capture_field(s, water, "model", offsetof(Water, model))
+    _b = gpu.capture_field(s, water, "time", offsetof(Water, time))
+    _c = gpu.capture_field(s, water, "speed", offsetof(Water, speed))
+    _d = gpu.capture_field(s, water, "height", offsetof(Water, height))
+    _e = gpu.capture_field(s, water, "randomness", offsetof(Water, randomness))
+    _f = gpu.capture_field(s, water, "directions", offsetof(Water, directions))
+    _g = gpu.capture_field(s, water, "amplitudes", offsetof(Water, amplitudes))
+    _h = gpu.capture_field(s, water, "frequencies", offsetof(Water, frequencies))
+    _i = gpu.capture_field(s, water, "speeds", offsetof(Water, speeds))
+    _j = gpu.capture_field(s, water, "phases", offsetof(Water, phases))
+    _k = gpu.capture_field(s, water, "steepness", offsetof(Water, steepness))
+    _l = gpu.capture_field(s, water, "colour", offsetof(Water, colour))
+    _m = gpu.capture_field(s, water, "opacity", offsetof(Water, opacity))
+    _n = gpu.capture_field(s, water, "foam", offsetof(Water, foam))
+    _o = gpu.capture_field(s, water, "foam_intensity", offsetof(Water, foam_intensity))
+    _p = gpu.capture_field(s, water, "caustics", offsetof(Water, caustics))
+    _q = gpu.capture_field(s, water, "caustics_intensity", offsetof(Water, caustics_intensity))
+    _r = gpu.capture_field(s, water, "caustics_scale", offsetof(Water, caustics_scale))
+    _t = gpu.capture_field(s, water, "reflection", offsetof(Water, reflection))
+    _u = gpu.capture_field(s, water, "reflection_intensity", offsetof(Water, reflection_intensity))
+    _v = gpu.capture_field(s, water, "distortion", offsetof(Water, distortion))
+    _w = gpu.capture_field(s, water, "distortion_intensity", offsetof(Water, distortion_intensity))
+    _x = gpu.capture_field(s, water, "normal_mapping", offsetof(Water, normal_mapping))
+    _y = gpu.capture_field(s, water, "normal_intensity", offsetof(Water, normal_intensity))
+    _z = gpu.capture_field(s, water, "depth_fade", offsetof(Water, depth_fade))
+    _aa = gpu.capture_field(s, water, "shore_foam", offsetof(Water, shore_foam))
+    _ab = gpu.capture_field(s, water, "sky_colour", offsetof(Water, sky_colour))
+    _ac = gpu.capture_field(s, water, "horizon_colour", offsetof(Water, horizon_colour))
+    _ad = gpu.capture_field(s, water, "sky_texture", offsetof(Water, sky_texture))
+    _ae = gpu.capture_field(s, water, "sky_capture", offsetof(Water, sky_capture))
+    _af = gpu.capture_field(s, water, "ripples", offsetof(Water, ripples))
+    _ag = gpu.capture_field(s, water, "ripple_area", offsetof(Water, ripple_area))
+}
+
+// ── The vertex shader's helpers ─────────────────────────────────────────
+
+// A hash of a point (GPU Gems chapter 5).
+@quotable
+swell_hash(p: vec2) -> float {
+    return fract(sin(dot_v2(p, vec2(127.1, 311.7))) * 43758.5453)
+}
+
+// Value noise over `octaves` octaves, each half the last's height and twice
+// its frequency: what varies a train's height when the water asks for
+// randomness.
+@quotable
+swell_noise(p_in: vec2, octaves: int) -> float {
+    p = p_in
+    value = 0.0
+    amplitude = 0.5
+    for (i = 0; i < octaves; i++) {
+        i_p = floor_v2(p)
+        f_p0 = fract_v2(p)
+        f_p = f_p0 * f_p0 * (splat2(3.0) - f_p0 * 2.0)
+        a = swell_hash(i_p)
+        b = swell_hash(i_p + vec2(1.0, 0.0))
+        c = swell_hash(i_p + vec2(0.0, 1.0))
+        d = swell_hash(i_p + vec2(1.0, 1.0))
+        value = value + amplitude * mix(mix(a, b, f_p.x), mix(c, d, f_p.x), f_p.y)
+        amplitude = amplitude * 0.5
+        p = p * 2.0
+    }
+    return value
+}
+
+// One train's displacement of the point `position` (GPU Gems' Gerstner wave,
+// its sine sharpened a little so the peaks are narrower than the troughs):
+// the horizontal pull toward the crest by the steepness Q, and the height.
+// The speed is the multiplier's, as the normal's is, or the train's own
+// where none is set.
+@quotable
+gerstner(position: vec3, direction: vec3, amplitude: float, frequency: float, speed: float, phase: float,
+         steepness: float, time: float, speed_multiplier: float) -> vec3 {
+    d = normalize_v2(xz(direction))
+    effective_speed = speed * speed_multiplier
+    if speed_multiplier <= 0.001 {
+        effective_speed = speed
+    }
+    wave = dot_v2(d, xz(position)) * frequency + time * effective_speed + phase
+    c = cos(wave)
+    s = sin(wave)
+    k = 1.2
+    sharpened_s = pow((s + 1.0) * 0.5, k) * 2.0 - 1.0
+    q = steepness / (frequency * amplitude * 6.0 + 0.01)
+    return vec3(q * amplitude * d.x * c, amplitude * sharpened_s, q * amplitude * d.y * c)
+}
+
+// The same train's contribution to the normal, from the sharpened sine's
+// derivative.
+@quotable
+gerstner_normal(position: vec3, direction: vec3, amplitude: float, frequency: float, speed: float, phase: float,
+                steepness: float, time: float, speed_multiplier: float) -> vec3 {
+    d = normalize_v2(xz(direction))
+    effective_speed = speed * speed_multiplier
+    if speed_multiplier <= 0.001 {
+        effective_speed = speed
+    }
+    wave = dot_v2(d, xz(position)) * frequency + time * effective_speed + phase
+    c = cos(wave)
+    s = sin(wave)
+    k = 1.2
+    sharpened_derivative = k * pow((s + 1.0) * 0.5, k - 1.0)
+    q = steepness / (frequency * amplitude * 6.0 + 0.01)
+    wa = frequency * amplitude
+    return vec3(-d.x * wa * c * sharpened_derivative, 1.0 - q * wa * s, -d.y * wa * c * sharpened_derivative)
+}
+
+// ── The pixel shader's helpers ──────────────────────────────────────────
+
+@quotable
+sea_hash(p: vec2) -> float {
+    p3_0 = fract_v3(vec3(p.x, p.y, p.x) * 0.1031)
+    p3 = p3_0 + splat3(dot(p3_0, vec3(p3_0.y, p3_0.z, p3_0.x) + splat3(33.33)))
+    return fract((p3.x + p3.y) * p3.z)
+}
+
+// Value noise with a quintic fade.
+@quotable
+sea_noise(st: vec2) -> float {
+    i = floor_v2(st)
+    f = fract_v2(st)
+    a = sea_hash(i)
+    b = sea_hash(i + vec2(1.0, 0.0))
+    c = sea_hash(i + vec2(0.0, 1.0))
+    d = sea_hash(i + vec2(1.0, 1.0))
+    u = f * f * f * (f * (f * 6.0 - splat2(15.0)) + splat2(10.0))
+    return mix(a, b, u.x) + (c - a) * u.y * (1.0 - u.x) + (d - b) * u.x * u.y
+}
+
+// The same noise with its slope: the value in x, its derivative along each
+// axis in y and z, from the fade's own polynomial.
+@quotable
+sea_noised(st: vec2) -> vec3 {
+    i = floor_v2(st)
+    f = fract_v2(st)
+    a = sea_hash(i)
+    b = sea_hash(i + vec2(1.0, 0.0))
+    c = sea_hash(i + vec2(0.0, 1.0))
+    d = sea_hash(i + vec2(1.0, 1.0))
+    u = f * f * f * (f * (f * 6.0 - splat2(15.0)) + splat2(10.0))
+    du = f * 30.0 * f * (f * (f - splat2(2.0)) + splat2(1.0))
+    k1 = b - a
+    k2 = c - a
+    k3 = a - b - c + d
+    // One constructor, its value first: the order the hand-written one
+    // made them in, which MoltenVK's fast math rounds by.
+    return vec3_xv(a + k1 * u.x + k2 * u.y + k3 * u.x * u.y, du * vec2(k1 + k3 * u.y, k2 + k3 * u.x))
+}
+
+// The noise over `octaves` octaves (GPU Gems chapter 5).
+@quotable
+sea_perlin(p: vec2, octaves: int) -> float {
+    value = 0.0
+    amplitude = 0.5
+    frequency = 1.0
+    for (i = 0; i < octaves; i++) {
+        value = value + amplitude * sea_noise(p * frequency)
+        amplitude = amplitude * 0.5
+        frequency = frequency * 2.0
+    }
+    return value
+}
+
+// Six octaves, each turned and scaled by an odd amount so no two line up.
+@quotable
+sea_fbm(st_in: vec2) -> float {
+    st = st_in
+    value = 0.0
+    amplitude = 0.5
+    rotation = mat2_of(cos(0.5), sin(0.5), -sin(0.5), cos(0.5))
+    for (i = 0; i < 6; i++) {
+        value = value + amplitude * sea_noise(st)
+        st = mul_m2(rotation, st) * 2.31
+        amplitude = amplitude * 0.53
+    }
+    return value
+}
+
+// Ridges of the octaves: what tears the foam into patches.
+@quotable
+sea_ridged(st: vec2) -> float {
+    n = sea_fbm(st)
+    return 1.0 - abs(n * 2.0 - 1.0)
+}
+
+// The caustic web (GPU Gems chapter 2), for a scene that lights its surface
+// with it: three layers of noise warped by noise, sharpened into bright
+// spots, fading slowly with the distance from the eye.
+@quotable
+sea_caustics(world: vec3, time: float, on: int, scale: float, intensity: float, eye: vec3) -> float {
+    if on == 0 {
+        return 0.0
+    }
+    coord = xz(world) * scale
+    warp1 = vec2(sea_perlin(coord * 0.5 + splat2(time * 0.02), 2),
+                 sea_perlin(coord * 0.5 + splat2(time * 0.025) + vec2(5.2, 1.3), 2))
+    caustic1 = sea_perlin(coord + warp1 * 0.3 + splat2(time * 0.015), 3)
+    warp2 = vec2(sea_perlin(coord * 0.8 - splat2(time * 0.018), 2),
+                 sea_perlin(coord * 0.8 - splat2(time * 0.022) + vec2(3.7, 2.1), 2))
+    caustic2 = sea_perlin(coord * 1.3 + warp2 * 0.25 - splat2(time * 0.012), 3)
+    caustic3 = sea_perlin(coord * 2.0 + splat2(time * 0.03), 2)
+    combined = caustic1 * 0.5 + caustic2 * 0.3 + caustic3 * 0.2
+    combined = pow(abs(combined), 2.5) * 1.3
+    combined = smoothstep(0.2, 0.8, combined)
+    attenuation = 1.0 / (1.0 + length_v2(xz(world) - xz(eye)) * 0.00005)
+    return combined * intensity * attenuation
+}
+
+// The octahedral sky map's texel coordinate for a direction, `size` texels a
+// side with a texel of gutter round it (ae3d.skylight's).
+@quotable
+sea_oct_uv(d_in: vec3, size: float) -> vec2 {
+    d = d_in / (abs(d_in.x) + abs(d_in.y) + abs(d_in.z))
+    p = xz(d)
+    if d.y < 0.0 {
+        p = (splat2(1.0) - abs_v2(yx(p))) * vec2(if (p.x >= 0.0) { 1.0 } else { -1.0 },
+                                                 if (p.y >= 0.0) { 1.0 } else { -1.0 })
+    }
+    return ((p * 0.5 + splat2(0.5)) * (size - 2.0) + splat2(1.0)) / size
+}
+
+// The overcast over a sky colour, as the sky shader pulls it: toward a flat
+// cast at the sky's own brightness. In display space, as the sky is given.
+@quotable
+overcast_sky(shown: vec3, overcast: float, overcast_colour: vec3) -> vec3 {
+    if overcast <= 0.0 {
+        return shown
+    }
+    luma = dot(shown, vec3(0.299, 0.587, 0.114))
+    return mix_v3(shown, overcast_colour * (0.35 + 0.65 * luma), clamp(overcast, 0.0, 1.0))
+}
+
+// What the surface reflects along `ray`, turned up into the sky: the
+// captured sky at its sharpest level but one (ripples finer than the mesh
+// soften it a little); else the sky's image, read as the equirect the sky
+// reads it as; else the two sky colours graded from horizon to zenith. The
+// image and the colours under the overcast, as light.
+@quotable
+reflected_sky(ray_in: vec3, sky_capture: int, sky_light: Texture, sky_texture: int, sky_image: Texture,
+              sky_colour: vec3, horizon_colour: vec3, overcast: float, overcast_colour: vec3) -> vec3 {
+    ray = vec3(ray_in.x, abs(ray_in.y), ray_in.z)
+    if sky_capture == 1 {
+        return rgb(texture_lod(sky_light, sea_oct_uv(normalize(ray), 256.0), 0.5))
+    }
+    if sky_texture == 1 {
+        theta = atan2(ray.z, ray.x)
+        phi = asin(clamp(ray.y, -1.0, 1.0))
+        shown = rgb(texture_lod(sky_image, vec2((theta + 3.14159265) / 6.28318531, (phi + 1.57079633) / 3.14159265),
+                                0.0))
+        return display_radiance(overcast_sky(shown, overcast, overcast_colour))
+    }
+    zenith = display_radiance(overcast_sky(sky_colour, overcast, overcast_colour))
+    rim = display_radiance(overcast_sky(horizon_colour, overcast, overcast_colour))
+    return mix_v3(rim, zenith, smoothstep(0.0, 0.35, ray.y))
+}
+
+// ── The shaders ───────────────────────────────────────────────────────
+
+// The surface's vertex shader: the sheet displaced by the four trains, and
+// the trains summed under the eye. Its captures are named apart from the
+// pixel shader's (surface, viewer; water, eye): on OpenGL a uniform of one
+// name is one uniform across the program, and the two read other fields.
+sea_vertex(surface: Water, viewer: Eye) -> *GpuShader {
+    s = vertex("sea_vertex") quote | v: SeaVertex | {
+        world0 = xyz(mul(surface.model, vec4(v.position, 1.0)))
+        total = splat3(0.0)
+        total_normal = vec3(0.0, 1.0, 0.0)
+        for (i = 0; i < 4; i++) {
+            random_factor = 1.0
+            if surface.randomness > 0.001 {
+                random_noise = swell_noise(xz(world0) * 0.01 + splat2(surface.time * 0.1) + splat2(float_of(i)), 2)
+                random_factor = mix(1.0, 0.5 + random_noise, surface.randomness)
+            }
+            adjusted = surface.amplitudes[i] * surface.height * random_factor
+            wave_disp = gerstner(world0, surface.directions[i], adjusted, surface.frequencies[i], surface.speeds[i],
+                                 surface.phases[i], surface.steepness[i], surface.time, surface.speed)
+            wave_normal = gerstner_normal(world0, surface.directions[i], adjusted, surface.frequencies[i],
+                                          surface.speeds[i], surface.phases[i], surface.steepness[i], surface.time,
+                                          surface.speed)
+            total = total + wave_disp
+            total_normal = total_normal + wave_normal
+        }
+        // A gentle vertical displacement, half again.
+        lifted = vec3(total.x, total.y * 1.5, total.z)
+        displaced = world0 + lifted
+        normal_out = normalize(total_normal)
+        now = mul(viewer.view_projection, vec4(displaced, 1.0))
+        prev = mul(viewer.prev_view_projection, vec4(displaced, 1.0))
+        // The surface over the eye: the trains summed where the eye stands,
+        // as they are at every vertex. A camera a few metres up is above the
+        // swell, where a fixed level took it for under.
+        eye_at = vec3(viewer.position.x, 0.0, viewer.position.z)
+        over = 0.0
+        for (j = 0; j < 4; j++) {
+            eye_factor = 1.0
+            if surface.randomness > 0.001 {
+                eye_noise = swell_noise(xz(eye_at) * 0.01 + splat2(surface.time * 0.1) + splat2(float_of(j)), 2)
+                eye_factor = mix(1.0, 0.5 + eye_noise, surface.randomness)
+            }
+            over = over + gerstner(eye_at, surface.directions[j], surface.amplitudes[j] * surface.height * eye_factor,
+                                   surface.frequencies[j], surface.speeds[j], surface.phases[j], surface.steepness[j],
+                                   surface.time, surface.speed).y
+        }
+        return SeaVaryings { position: now, uv: v.uv, normal: normal_out, world: displaced, clip_now: now, clip_prev: prev,
+                             eye_below: m4_at(surface.model, 3, 1) + over * 1.5 - viewer.position.y }
+    }
+    place(s, "surface", "viewer", "", "")
+    return s
+}
+
+// The surface lit, over the vertex shader's varyings: its colour (and the
+// alpha it is blended by) at 0, its motion vector at 1.
+//
+//   sky_image        the sky's image, the model's texture (hasSkyTexture)
+//   scene_depth      the camera's depth, what the shore reads
+//   ripple_mask      the ripples' slopes (the model's mask)
+//   sky_light_map    the sky's light, prefiltered (the scene's binding 10)
+//   sky_irradiance   its irradiance onto every normal (binding 12)
+sea(water: Water, eye: Eye, key: KeyLight, weather: Weather, sky_image: Texture, scene_depth: Texture,
+    ripple_mask: Texture, sky_light_map: Texture, sky_irradiance: Texture) -> *GpuShader {
+    s = fragment("sea") quote | f: SeaVaryings | {
+        // Toward the light: a sun's direction, else the lamp's position.
+        light_dir = splat3(0.0)
+        if key.direction.x != 0.0 || key.direction.y != 0.0 || key.direction.z != 0.0 {
+            light_dir = normalize(key.direction)
+        } else {
+            light_dir = normalize(key.position - f.world)
+        }
+        view_dir = normalize(eye.position - f.world)
+        distance_from_camera = length_v3(eye.position - f.world)
+        // How far across the view the fragment is: ripples, foam and the
+        // mirror's sharpness fall off with it.
+        far = smoothstep(0.0, eye.far * 0.35, distance_from_camera)
+
+        // The sea's surface here (waveField), summed per pixel: the four
+        // trains, then four octaves of wind waves fanned about the wind and
+        // bent by a slow noise, coming and going in sets, then three of
+        // chop from the noise's own slope. Each octave fades out before its
+        // wavelength can alias. `swell` is the trains' alone, for the mirror.
+        p = xz(f.world)
+        t = water.time
+        dhx = 0.0
+        dhz = 0.0
+        sx = 0.0
+        sz = 0.0
+        slope_max = 0.0
+        speed_mul = max(water.speed, 0.001)
+        field_height = 0.0
+        for (i = 0; i < 4; i++) {
+            td = normalize_v2(xz(water.directions[i]))
+            tk = water.frequencies[i]
+            ta = water.amplitudes[i] * water.height * 1.5
+            t_lambda = 6.28318531 / max(tk, 0.000001)
+            t_fade = 1.0 - smoothstep(t_lambda * 40.0, t_lambda * 160.0, distance_from_camera)
+            t_phase = dot_v2(td, p) * tk + t * water.speeds[i] * speed_mul + water.phases[i] +
+                      sea_noise(p * tk * 0.2 + vec2(float_of(i) * 4.1, 0.0)) * 1.2
+            tc = cos(t_phase) * ta * tk * t_fade
+            field_height = field_height + ta * sin(t_phase) * t_fade
+            sx = sx + td.x * tc
+            sz = sz + td.y * tc
+            slope_max = slope_max + ta * tk * t_fade
+        }
+        dhx = sx
+        dhz = sz
+        wind = normalize_v2(xz(water.directions[0]))
+        k0 = water.frequencies[3]
+        sets = 0.55 + 0.9 * sea_noise(p * k0 * 0.03 + vec2(t * 0.004, 0.0))
+        warp = vec2(sea_noise(p * k0 * 0.12 + vec2(3.1, 7.7)), sea_noise(p * k0 * 0.12 + vec2(9.2, 1.3))) * 2.0 -
+               splat2(1.0)
+        for (j = 1; j <= 4; j++) {
+            wk = k0 * pow(1.65, float_of(j))
+            turn = sin(float_of(j) * 2.3 + float_of(j * j) * 0.61) * 0.5
+            wd = vec2(wind.x * cos(turn) - wind.y * sin(turn), wind.x * sin(turn) + wind.y * cos(turn))
+            wa = 0.028 / wk
+            w_lambda = 6.28318531 / wk
+            w_fade = (1.0 - smoothstep(w_lambda * 40.0, w_lambda * 160.0, distance_from_camera)) * sets
+            w_bend = (warp.x * wd.y - warp.y * wd.x) * 2.4
+            w_phase = dot_v2(wd, p) * wk + t * sqrt(9.81 * wk) * speed_mul + float_of(j) * 1.7 + w_bend
+            wc = cos(w_phase) * wa * wk * w_fade
+            field_height = field_height + wa * sin(w_phase) * w_fade
+            dhx = dhx + wd.x * wc
+            dhz = dhz + wd.y * wc
+            slope_max = slope_max + wa * wk * w_fade
+        }
+        kc = k0 * pow(1.65, 5.0)
+        for (m = 0; m < 3; m++) {
+            ck = kc * pow(2.1, float_of(m))
+            c_lambda = 6.28318531 / ck
+            c_fade = (1.0 - smoothstep(c_lambda * 40.0, c_lambda * 160.0, distance_from_camera)) * sets
+            if c_fade <= 0.0 {
+                continue
+            }
+            ca = 0.16 / ck
+            st = p * (ck / 6.28318531) - wind * (t * sqrt(9.81 * ck) * speed_mul / 6.28318531) +
+                 vec2(float_of(m) * 17.3, float_of(m) * 5.9)
+            cn = sea_noised(st)
+            field_height = field_height + ca * (cn.x - 0.5) * c_fade
+            c_slope = ca * ck / 6.28318531 * c_fade
+            dhx = dhx + cn.y * c_slope
+            dhz = dhz + cn.z * c_slope
+            slope_max = slope_max + c_slope * 1.5
+        }
+        norm = normalize(vec3(-dhx, 1.0, -dhz))
+        swell = normalize(vec3(-sx, 1.0, -sz))
+        steep = clamp(length_v2(vec2(dhx, dhz)) / max(slope_max * 0.5, 0.0001), 0.0, 1.0)
+
+        // Flattened as asked.
+        if water.normal_mapping != 0 {
+            norm = normalize(mix_v3(vec3(0.0, 1.0, 0.0), norm, water.normal_intensity))
+            swell = normalize(mix_v3(vec3(0.0, 1.0, 0.0), swell, water.normal_intensity))
+        }
+        // The ripples over the swell: a wake, a ring round a bobbing crate.
+        if water.ripples == 1 {
+            ruv = (p - vec2(water.ripple_area.x, water.ripple_area.y)) * water.ripple_area.z
+            if ruv.x > 0.0 && ruv.y > 0.0 && ruv.x < 1.0 && ruv.y < 1.0 {
+                slope = (xy(texture(ripple_mask, ruv)) * 2.0 - splat2(1.0)) * RIPPLE_SLOPE_RANGE
+                tilt = vec3(-slope.x, 0.0, -slope.y)
+                norm = normalize(norm + tilt)
+                swell = normalize(swell + tilt)
+            }
+        }
+        ripple_freq = water.frequencies[3] * 9.0 / 6.28318531
+        ripple_time = water.time * water.speeds[3] * max(water.speed, 0.001) * 0.35
+        // How far the ripples bend the mirror, less far off: from a distance
+        // a sea is a mirror of the swell.
+        bend = if (water.distortion != 0) { clamp(water.distortion_intensity, 0.0, 1.0) * 0.6 } else { 0.12 }
+        bend = bend * (1.0 - 0.7 * far)
+        mirror_norm = normalize(mix_v3(swell, norm, bend))
+
+        half_dir = normalize(light_dir + view_dir)
+        n_dot_v = max(dot(norm, view_dir), 0.001)
+        n_dot_l = max(dot(norm, light_dir), 0.0)
+        n_dot_h = max(dot(norm, half_dir), 0.0)
+        v_dot_h = max(dot(view_dir, half_dir), 0.0)
+
+        // Two percent looking straight down, nearly all of the sky at a
+        // grazing look.
+        fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(mirror_norm, view_dir), 0.001), 5.0)
+        mirror = if (water.reflection != 0) { clamp(water.reflection_intensity, 0.0, 1.0) } else { 0.0 }
+
+        // Radiance in the scene shader's units: the sun's colour times its
+        // intensity, the sky's light as the sky is drawn, or the captured
+        // sky's from above (its irradiance over pi).
+        sun = key.colour * key.intensity
+        sky_lit = display_radiance(overcast_sky(water.sky_colour, weather.overcast, weather.overcast_colour))
+        if water.sky_capture == 1 {
+            sky_lit = rgb(texture(sky_irradiance, sea_oct_uv(vec3(0.0, 1.0, 0.0), 16.0))) / 3.14159265
+        }
+
+        // The sun's glitter: GGX, a little rougher far off so the highlight
+        // there is a path of light and not aliased points.
+        roughness = mix(0.07, 0.22, far)
+        alpha_r = roughness * roughness
+        alpha2 = alpha_r * alpha_r
+        denom = n_dot_h * n_dot_h * (alpha2 - 1.0) + 1.0
+        ggx_d = alpha2 / (3.14159265 * denom * denom)
+        ggx_k = (roughness + 1.0) * (roughness + 1.0) / 8.0
+        ggx_g = (n_dot_v / (n_dot_v * (1.0 - ggx_k) + ggx_k)) * (n_dot_l / (n_dot_l * (1.0 - ggx_k) + ggx_k))
+        ggx_fs = 0.02 + 0.98 * pow(1.0 - v_dot_h, 5.0)
+        glitter = sun * (ggx_d * ggx_g * ggx_fs) / (4.0 * n_dot_l * n_dot_v + 0.0001) * n_dot_l
+
+        // The body: its own colour lit by the sky from above and the sun
+        // where the swell faces it.
+        base = water.colour
+        if base.x == 0.0 && base.y == 0.0 && base.z == 0.0 {
+            base = vec3(0.02, 0.08, 0.14)
+        }
+        body = base * (sky_lit * 0.7 + sun * (0.12 + 0.30 * n_dot_l))
+
+        // Light through the crests, against the table's sum.
+        tallest = (water.amplitudes[0] + water.amplitudes[1] + water.amplitudes[2] + water.amplitudes[3]) * water.height
+        crest = clamp(field_height / max(tallest, 0.001), 0.0, 1.0)
+        through = pow(clamp(dot(view_dir, -light_dir), 0.0, 1.0), 3.0) * (0.3 + 0.7 * crest) + crest * 0.25 * n_dot_l
+        scatter = (base * 2.5 + vec3(0.0, 0.06, 0.04)) * sun * 0.30 * through
+
+        // Foam where a crest's steep face breaks, torn into patches and
+        // eaten into lace by the noise.
+        foam = 0.0
+        if water.foam != 0 && tallest > 0.0 {
+            torn = sea_ridged(p * ripple_freq * 0.08 + splat2(water.time * 0.02))
+            breaking = smoothstep(0.45, 0.9, steep) * (0.4 + 0.6 * crest)
+            foam = breaking * (0.35 + 0.65 * smoothstep(0.35, 0.8, torn))
+            foam = foam * (0.55 + 0.45 * sea_noise(p * ripple_freq * 1.5 + splat2(ripple_time * 0.5)))
+            foam = foam * (clamp(water.foam_intensity, 0.0, 2.0) * (1.0 - 0.7 * far))
+            foam = clamp(foam, 0.0, 1.0)
+        }
+
+        sky_hit = reflected_sky(reflect(-view_dir, mirror_norm), water.sky_capture, sky_light_map, water.sky_texture,
+                                sky_image, water.sky_colour, water.horizon_colour, weather.overcast,
+                                weather.overcast_colour)
+        final_colour = mix_v3(body + scatter, sky_hit, fresnel * mirror) + glitter * (1.0 - 0.6 * foam)
+        foam_lit = splat3(0.85) * (sun * 0.5 * max(light_dir.y, 0.0) + sky_lit * 0.6)
+        final_colour = mix_v3(final_colour, foam_lit, foam)
+
+        // The caustic web, for a scene that lights its surface with it.
+        caustic = sea_caustics(f.world, water.time, water.caustics, water.caustics_scale, water.caustics_intensity,
+                               eye.position)
+        final_colour = final_colour + sun * caustic * 0.1
+
+        // The air between the eye and the surface, as the scene shader's.
+        if weather.fog != 0 {
+            haze = smoothstep(weather.fog_start, weather.fog_end, distance_from_camera) * weather.fog_intensity
+            final_colour = mix_v3(final_colour, weather.fog_radiance, clamp(haze, 0.0, 1.0))
+        }
+
+        // The shore: clear and pale over close ground, and a line of foam
+        // along the waterline. How much water lies along the view ray
+        // between the surface and what the scene drew behind it, in metres:
+        // the camera's depth turned back into a world position, a thousand
+        // without one. Written here and not as a helper given the matrix:
+        // read where it is used, as the hand-written water_below read its
+        // uniforms, its sums come out as that one's did on MoltenVK, whose
+        // fast math orders them by where their values were loaded.
+        below = 1000.0
+        if eye.depth_on == 1 {
+            suv = frag_coord() / eye.screen_size
+            dd = texture(scene_depth, suv).x
+            if dd < 0.99999 {
+                ndc = suv * 2.0 - splat2(1.0)
+                clip = vec4(vec3(ndc.x, ndc.y, depth_clip(dd)), 1.0)
+                at = mul(eye.inv_view_projection, clip)
+                ground = xyz(at) / at.w
+                below = max(distance(eye.position, ground) - distance(eye.position, f.world), 0.0)
+            }
+        }
+        clear = 1.0 - exp(-below / max(water.depth_fade, 0.01))
+        if eye.depth_on == 1 && below < 999.0 {
+            wash = 1.0 - smoothstep(0.0, max(water.shore_foam, 0.01), below)
+            lace = 0.5 + 0.5 * sea_noise(p * ripple_freq * 0.8 + splat2(ripple_time * 0.3))
+            shore_foam = wash * wash * lace * 0.9
+            shore_lit = splat3(0.9) * (sun * 0.5 * max(light_dir.y, 0.0) + sky_lit * 0.6)
+            final_colour = mix_v3(final_colour, shore_lit, clamp(shore_foam, 0.0, 1.0))
+            foam = max(foam, shore_foam)
+        }
+
+        // Opaque where it mirrors and under foam, seen through over close
+        // ground.
+        alpha = water.opacity
+        if alpha <= 0.01 {
+            alpha = 0.85
+        }
+        alpha = mix(alpha, 1.0, fresnel * mirror)
+        alpha = alpha * clear
+        alpha = mix(alpha, 1.0, foam)
+
+        // From under the surface: the sky through Snell's window overhead,
+        // the water's own colour toward the horizon, deepening with the
+        // diver's depth; the sun's glint and the caustic web; the murk.
+        underwater_depth = max(0.0, f.eye_below)
+        if underwater_depth > 0.0 {
+            sky_through = display_radiance(overcast_sky(water.sky_colour, weather.overcast, weather.overcast_colour))
+            through_sky = mix_v3(sky_through, water.colour * sky_through, 0.35)
+            under = normalize(mix_v3(vec3(0.0, 1.0, 0.0), norm, 0.35))
+            overhead = clamp(dot(under, -view_dir), 0.0, 1.0)
+            window = smoothstep(0.15, 0.75, overhead)
+            underside = mix_v3(water.colour * sky_through * 0.55, through_sky, window)
+            deep = clamp(underwater_depth * 0.0025, 0.0, 0.5)
+            final_colour = mix_v3(underside, water.colour * sky_through * 0.5, deep)
+            refracted = normalize(reflect(-view_dir, under))
+            glint = pow(max(0.0, dot(refracted, light_dir)), 48.0)
+            final_colour = final_colour + key.colour * glint * 0.8 * window
+            final_colour = final_colour + splat3(caustic * 0.35) * window
+            underwater_fog = clamp(distance_from_camera * 0.0002, 0.0, 0.85)
+            murk = water.colour * sky_through * 0.4
+            if weather.fog != 0 {
+                underwater_fog = smoothstep(weather.fog_start, weather.fog_end, distance_from_camera) *
+                                 weather.fog_intensity
+                murk = weather.fog_radiance
+            }
+            final_colour = mix_v3(final_colour, murk, underwater_fog)
+        }
+
+        alpha = clamp(alpha, 0.001, 0.98)
+        return SeaOut { colour: vec4(final_colour, alpha), velocity: velocity(f.clip_now, f.clip_prev, eye.jitter) }
+    }
+    place(s, "water", "eye", "key", "weather")
+    return s
+}

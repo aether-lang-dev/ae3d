@@ -594,6 +594,37 @@ sky(...) -> *GpuShader {
    refused. The frames are byte-identical to the eight captures'.
 4. **Water**, then **the crowd**, then **the scene**: the mesh shaders, and
    with them the scene block.
+   *Water done (2026-10-19, on Aether 0.829.0):* `ae3d.shaders.sea`, a
+   vertex and a pixel quote drawn on both renderers with frames
+   byte-identical to the hand-written ones. `Light[16]` was probed first:
+   quote 0.829.0 types it `Light[16]`, its element `Light` and a field of
+   one `vec4` (and `mat4[96]` likewise), so the scene's lights need nothing
+   of aether. What the water reads is four captured structs: the frame's
+   `Eye`, `KeyLight` and `Weather` (`ae3d.shaders.frame`; the camera's is
+   `Eye` because `Camera` is `ae3d.core`'s, and an engine module importing
+   both could no longer name its own unqualified), and the draw's `Water`.
+   A `mat4` is a field of a captured struct now. Each field is the scene
+   block uniform it was, and both renderers fill the structs from what
+   filled those uniforms: Vulkan copies the water program's block word for
+   word (`gpu.set_field_words`), OpenGL from the renderer's state and the
+   model's uniforms by name. On Vulkan the pair is drawn per draw through
+   `vkquote`'s ring (`mesh_pair_new`: opaque, culled and blended pipelines
+   on its layout), every struct in each draw's block for now; the scene
+   shader's draws are where the frame's structs want a binding of their
+   own. Three things the hand-written shape decided:
+   - a vertex shader's captures are named apart from its pixel shader's
+     (`surface`, `viewer`; `water`, `eye`): on OpenGL a uniform of one name
+     is one uniform across the program, and the two read other fields
+     (`gpu.link` refuses a struct both capture under one name);
+   - the vertex shader still hands on the uv and the trains' normal, which
+     no pixel shader reads, at the hand-written places;
+   - a helper the hand-written shader wrote reading its uniforms is written
+     where it is used when a helper given them as arguments rounds
+     otherwise: `water_below`, given the inverse view-projection as an
+     argument, put the shore's sums a step out in 117 channels on MoltenVK,
+     whose fast math orders a sum by where its values were loaded. waveField
+     is written into the pixel shader's body (a shader cannot hand a helper
+     the wave table), and its `out` parameters with it.
 
 ### The scene block
 
