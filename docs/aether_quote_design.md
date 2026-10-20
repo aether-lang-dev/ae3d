@@ -691,6 +691,15 @@ sky(...) -> *GpuShader {
    was loaded. The ray-query pixel shader (`scene_rq_vk.frag`) is still
    the hand-written one: no device here traces rays, so only CI's lavapipe
    could hold a quoted one to it.
+   Its cleanup removed `VERTEX_DEFAULT`, `VERTEX_DEPTH`, `FRAGMENT_DEPTH`,
+   `shaders.default_shader` (a model without a shader is drawn by the
+   scene's), `scene_vk.vert`, `scene_plain_vk.vert`, `scene_vk.frag` and
+   the three `depth_*vk.*`. `FRAGMENT_DEFAULT` stays as the ray-query
+   shader's source alone, and the generator lays the three blocks out from
+   their tables, no longer from the hand-written declarations. No scene
+   block uniform went with them: each of the 134 is read by a quoted
+   shader, by the ray-query one (the rays, the probes) or copied by the
+   water's (`viewDistance`), so the blocks are the size they were.
 
 ### The scene block
 

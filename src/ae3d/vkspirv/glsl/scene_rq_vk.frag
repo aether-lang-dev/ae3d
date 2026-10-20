@@ -22,14 +22,14 @@ layout(std140, set = 0, binding = 0) uniform DrawBlock {
     mat4 model;
     mat4 prevModel;
     mat4 lightSpaceMatrix;
-    bool isInstanced;
-    bool useInstanceColor;
-    bool instancePoints;
+    int isInstanced;
+    int useInstanceColor;
+    int instancePoints;
     int instanceBillboard;
     int pointFlipbookColumns;
     int pointFlipbookRows;
     float pointLift;
-    bool isSkinned;
+    int isSkinned;
     bool impostor;
     vec3 diffuseColor;
     vec3 specularColor;
