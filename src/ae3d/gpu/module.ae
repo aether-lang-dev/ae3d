@@ -48,6 +48,19 @@
 //     local) is a GLSL struct, declared once from its literals, every literal
 //     setting every field: so a helper returns a struct where GLSL's would
 //     have had an `out` parameter.
+//
+// The scene's shaders (ae3d.shaders.lit) add:
+//
+//   - layouts: a uniform block's structs, typed and placed, shared by every
+//     shader drawn with it (use_layout); capture_binding puts a texture or a
+//     storage buffer at a set and binding of its own, a pixel shader's
+//     buffer a texture of rows on OpenGL;
+//   - read_in_place: a helper reads in place what every call hands it alike,
+//     as the hand-written helper read its uniforms (hand_on keeps one a
+//     parameter);
+//   - discard() and cut_fragment (a pixel shader that writes nothing), the
+//     derivatives, textureGrad, the int and uint arithmetic of a hash, held
+//     exactly on the CPU.
 
 import std.heap
 import std.list
@@ -75,17 +88,19 @@ extern free(p: ptr)
 exports (
     GpuShader, GpuVal, GpuRun,
     VULKAN, GL,
-    fragment, vertex, depth_fragment, emit_vertex_glsl, screen_vertex, link, linked, varying_location,
+    fragment, vertex, depth_fragment, cut_fragment, emit_vertex_glsl, screen_vertex, link, linked, varying_location,
     cpu_vertex_attr, cpu_run_vertex, cpu_varying, ScreenVertex, ScreenVaryings, VERTEX_STAGE, FRAGMENT_STAGE, writes_depth, shader_free, shader_name, shader_tree, shader_hash,
     emit_glsl, emit_screen_vertex, outputs_count,
     params_count, params_name, params_type, params_offset, params_size, params_write,
     capture_field, capture_element_field, capture_struct, set_field_words, uniforms_count, uniforms_name, uniforms_type, uniforms_offset,
+    uniforms_set, read_in_place, hand_on, GpuLayout, layout_new, layout_free, layout_struct, layout_field, layout_element_field, layout_size,
+    layout_offset, layout_stride, layout_part_offset, use_layout, capture_binding, block_size, block_write,
     set_float, set_int, set_vec2, set_vec3, set_mat4, set_mat4_f32, set_float_f32, set_vec2_f32, set_vec3_f32, set_vec4_f32,
     call_glsl, call_glsl_for, call_args, cpu_set_dialect,
-    samplers_count, samplers_name, samplers_type, buffers_count, buffers_name, buffers_type, vertex_set,
+    samplers_count, samplers_name, samplers_type, buffers_count, buffers_name, buffers_type, vertex_set, buffers_set, set_base,
     cpu_set_vertex_index, vmat4,
     v1, v2, v3, v4, vstruct, val_set, val_field, val_free, val_is_struct, val_n, val_x, val_y, val_z, val_w, val_bool,
-    cpu_new, cpu_run, cpu_free, cpu_set_viewport, cpu_set_frag_coord, last_error
+    cpu_new, cpu_run, cpu_free, cpu_set_viewport, cpu_set_frag_coord, cpu_discarded, last_error
 )
 
 // A shader: its name and the tree its quote made, which it owns, and
@@ -99,6 +114,13 @@ struct GpuShader {
     links: ptr       // a pixel shader of a struct of varyings, once linked: list of *GpuField, located
     members: ptr     // its captured structs' fields, where each is in its cell: list of *GpuMember, by place
     leaves: ptr      // its uniforms one value at a time (uniforms_*), made when first asked: list of *GpuUniform
+    base: int        // a vertex shader's: the sets before its own on Vulkan (set_base)
+    blocks: ptr      // the layouts it declares its captured structs in: list of *GpuBlockUse, by set
+    bindings: ptr    // its textures' and buffers' places on Vulkan where given: list of *GpuPlace
+    refused: string  // why a layout it was given disagrees with its tree ("" when none does)
+    in_place: bool   // its helpers read in place what every call hands them alike (read_in_place)
+    cut: bool        // a pixel shader that writes nothing, only discards (cut_fragment)
+    handed: ptr      // the helpers' parameters handed on even so (hand_on): list of *GpuSub
 }
 
 // A struct's field, or a linked pixel shader's varying: its name, its type
@@ -159,6 +181,13 @@ fragment(name: string, t: quote.Tree) -> *GpuShader {
     s.links = null
     s.members = null
     s.leaves = null
+    s.base = 1
+    s.blocks = null
+    s.bindings = null
+    s.refused = ""
+    s.in_place = false
+    s.cut = false
+    s.handed = null
     return s
 }
 
@@ -171,6 +200,15 @@ fragment(name: string, t: quote.Tree) -> *GpuShader {
 vertex(name: string, t: quote.Tree) -> *GpuShader {
     s = fragment(name, t)
     s.stage = VERTEX_STAGE
+    return s
+}
+// The fragment shader `name` that writes nothing: its pixel is kept or
+// discarded, and its depth is the rasteriser's (a shadow map's casters,
+// cut by a model's cut and wounds). Its quote returns any float, which is
+// not written.
+cut_fragment(name: string, t: quote.Tree) -> *GpuShader {
+    s = fragment(name, t)
+    s.cut = true
     return s
 }
 depth_fragment(name: string, t: quote.Tree) -> *GpuShader {
@@ -198,8 +236,400 @@ shader_free(s: *GpuShader) {
     s.members = null
     leaves_free(s.leaves)
     s.leaves = null
+    places_free(s.blocks)
+    s.blocks = null
+    places_free(s.bindings)
+    s.bindings = null
+    handed_free(s.handed)
+    s.handed = null
+    s.refused = ""
     s.name = ""
     heap.free(s)
+}
+
+// ── Layouts: uniform blocks shared by shaders ─────────────────────────
+//
+// Shaders drawn together read one buffer each block is bound to, so they
+// lay it out alike whatever each reads (the scene's: ae3d.shaders.frame).
+// A layout is a block's structs in order, each field given its type and its
+// place in the struct's cell (offsetof); std140 places them as glslang does
+// (each struct aligned to sixteen and its size rounded up to sixteen). A
+// shader given a layout for a set (use_layout) declares that set's block
+// with each struct it captures by the entry's name as that struct, whole
+// (every field, read or not), and each it does not as padding of its size,
+// up to the last it captures; OpenGL declares each captured struct a uniform
+// of its name, the same in every program's stages. A field read as another
+// type than the layout gives is refused.
+
+struct GpuLayout {
+    block: string    // the block's name in GLSL (DrawBlock)
+    entries: ptr     // list of *GpuEntry, in the block's order
+}
+
+struct GpuEntry {
+    name: string     // the capture's
+    type: string     // its struct's
+    members: ptr     // list of *GpuMember: every field, typed, in the cell's order
+    size: int        // its std140 size
+    placed: int      // its offset in the block
+}
+
+// Where a layout is declared (a *GpuBlockUse), or a capture bound (a *GpuPlace).
+struct GpuBlockUse {
+    set: int
+    layout: ptr      // *GpuLayout, the caller's, which outlives the shader
+}
+
+struct GpuPlace {
+    name: string
+    set: int
+    binding: int
+}
+
+fn places_free(l: ptr) {
+    if l == null { return }
+    k = 0
+    while k < list.size(l) {
+        heap.free(list.get_raw(l, k))
+        k = k + 1
+    }
+    list.free(l)
+}
+
+// An empty layout of the block `block`.
+layout_new(block: string) -> *GpuLayout {
+    l = heap.new(GpuLayout)
+    l.block = block
+    l.entries = list.new()
+    return l
+}
+
+layout_free(l: *GpuLayout) {
+    if l == null { return }
+    k = 0
+    while k < list.size(l.entries) {
+        e = list.get_raw(l.entries, k) as *GpuEntry
+        members_free(e.members)
+        e.name = ""
+        e.type = ""
+        heap.free(e)
+        k = k + 1
+    }
+    list.free(l.entries)
+    l.block = ""
+    heap.free(l)
+}
+
+fn entry_named(l: *GpuLayout, name: string) -> *GpuEntry {
+    k = 0
+    while k < list.size(l.entries) {
+        e = list.get_raw(l.entries, k) as *GpuEntry
+        if e.name == name { return e }
+        k = k + 1
+    }
+    return null
+}
+
+// The struct `type` next in the block, captured as `name`.
+layout_struct(l: *GpuLayout, name: string, type: string) -> bool {
+    if entry_named(l, name) != null { return false }
+    e = heap.new(GpuEntry)
+    e.name = name
+    e.type = type
+    e.members = list.new()
+    e.size = 0
+    e.placed = 0
+    list.add_raw(l.entries, e as ptr)
+    return true
+}
+
+// The field `field` of `name`'s struct, at `at` in its cell (offsetof), of
+// the type `type`: a value (float, f32, int, vec2, vec3, vec4, mat4), an
+// array of one ("vec4[4]"), or an array of structs ("Light[16]", whose
+// element's fields layout_element_field gives). False for any other, or a
+// field given twice.
+layout_field(l: *GpuLayout, name: string, field: string, at: int, type: string) -> bool {
+    e = entry_named(l, name)
+    if e == null || member_in(e.members, field) != null { return false }
+    el = array_element(type)
+    count = array_count(type)
+    if !is_value_type(el) && count < 1 { return false }
+    m = member_new(name, field, el, count, at)
+    if !is_value_type(el) { m.parts = list.new() }
+    member_insert(e.members, m)
+    return true
+}
+
+// The field `part` of each element of the array of structs `field`, at
+// `at` in the element's cell, the elements `stride` bytes apart (sizeof).
+layout_element_field(l: *GpuLayout, name: string, field: string, stride: int, part: string, at: int, type: string) -> bool {
+    e = entry_named(l, name)
+    if e == null { return false }
+    m = member_in(e.members, field)
+    if m == null || m.parts == null || !is_value_type(type) || member_in(m.parts, part) != null { return false }
+    if m.stride != 0 && m.stride != stride { return false }
+    m.stride = stride
+    member_insert(m.parts, member_new(name, part, type, 0, at))
+    return true
+}
+
+fn member_new(capture: string, name: string, type: string, count: int, at: int) -> *GpuMember {
+    m = heap.new(GpuMember)
+    m.capture = capture
+    m.name = name
+    m.type = type
+    m.count = count
+    m.at = at
+    m.placed = 0
+    m.stride = 0
+    m.size = 0
+    m.parts = null
+    return m
+}
+
+// `m` into the list of members `l`, in the cell's order.
+fn member_insert(l: ptr, m: *GpuMember) {
+    list.add_raw(l, m as ptr)
+    k = list.size(l) - 1
+    while k > 0 && (list.get_raw(l, k - 1) as *GpuMember).at > m.at {
+        list.set(l, k, list.get_raw(l, k - 1))
+        list.set(l, k - 1, m as ptr)
+        k = k - 1
+    }
+}
+
+// Every entry's place and size, and the block's size, as std140 has them.
+layout_size(l: *GpuLayout) -> int {
+    at = 0
+    k = 0
+    while k < list.size(l.entries) {
+        e = list.get_raw(l.entries, k) as *GpuEntry
+        e.size = members_layout(e.members, e.name)
+        at = round_up(at, 16)
+        e.placed = at
+        at = at + e.size
+        k = k + 1
+    }
+    return round_up(at, 16)
+}
+
+// Where in the block the field `field` of `name` is (its element 0 for an
+// array); -1 for one the layout has none of.
+layout_offset(l: *GpuLayout, name: string, field: string) -> int {
+    _size = layout_size(l)
+    e = entry_named(l, name)
+    if e == null { return 0 - 1 }
+    m = member_in(e.members, field)
+    if m == null { return 0 - 1 }
+    return e.placed + m.placed
+}
+
+// An array's elements apart in the block: sixteen for values, an element's
+// size for structs, sixty-four for a mat4; 0 for a field that is not one.
+layout_stride(l: *GpuLayout, name: string, field: string) -> int {
+    _size = layout_size(l)
+    e = entry_named(l, name)
+    if e == null { return 0 }
+    m = member_in(e.members, field)
+    if m == null || m.count < 1 { return 0 }
+    if m.parts != null { return m.size }
+    return round_up(std140_size(m.type), 16)
+}
+
+// Where the part `part` is in an element of the array of structs `field`.
+layout_part_offset(l: *GpuLayout, name: string, field: string, part: string) -> int {
+    _size = layout_size(l)
+    e = entry_named(l, name)
+    if e == null { return 0 - 1 }
+    m = member_in(e.members, field)
+    if m == null || m.parts == null { return 0 - 1 }
+    p = member_in(m.parts, part)
+    if p == null { return 0 - 1 }
+    return p.placed
+}
+
+// A deep copy of the members `l`, each its capture's `capture`.
+fn members_copy(l: ptr, capture: string) -> ptr {
+    out = list.new()
+    k = 0
+    while k < list.size(l) {
+        m = list.get_raw(l, k) as *GpuMember
+        c = member_new(capture, m.name, m.type, m.count, m.at)
+        c.stride = m.stride
+        if m.parts != null { c.parts = members_copy(m.parts, capture) }
+        list.add_raw(out, c as ptr)
+        k = k + 1
+    }
+    return out
+}
+
+// The shader `s` declares the block of set `set` as the layout `l` (which
+// it does not own): each struct it captures by an entry's name, whole,
+// typed as the layout types it. False when a capture of an entry's name is
+// not of the entry's struct, or the set is given twice. A field the tree
+// reads as another type is refused when the shader is written or run.
+use_layout(s: *GpuShader, set: int, l: *GpuLayout) -> bool {
+    if s.blocks == null { s.blocks = list.new() }
+    k = 0
+    while k < list.size(s.blocks) {
+        if (list.get_raw(s.blocks, k) as *GpuBlockUse).set == set { return false }
+        k = k + 1
+    }
+    _size = layout_size(l)
+    k = 0
+    while k < list.size(l.entries) {
+        e = list.get_raw(l.entries, k) as *GpuEntry
+        c = quote.capture_named(s.tree, e.name)
+        if (c as ptr) != null {
+            if quote.capture_type(c) != e.type || is_struct_capture(s, e.name) { return false }
+            if s.members == null { s.members = list.new() }
+            copied = members_copy(e.members, e.name)
+            j = 0
+            while j < list.size(copied) {
+                m = list.get_raw(copied, j) as *GpuMember
+                list.add_raw(s.members, m as ptr)
+                read = field_read_type(quote.body(s.tree), e.name, m.name)
+                want = m.type
+                if m.count > 0 { want = "${m.type}[${m.count}]" }
+                if read != "" && read != want && s.refused == "" {
+                    s.refused = "${e.name}.${m.name} is read as a ${read}; the layout of ${l.block} has it a ${want}"
+                }
+                j = j + 1
+            }
+            list.free(copied)
+        }
+        k = k + 1
+    }
+    u = heap.new(GpuBlockUse)
+    u.set = set
+    u.layout = l as ptr
+    list.add_raw(s.blocks, u as ptr)
+    leaves_free(s.leaves)
+    s.leaves = null
+    return true
+}
+
+// The set a struct capture's block is in, -1 for one in no layout.
+fn layout_set_of(s: *GpuShader, name: string) -> int {
+    if s.blocks == null { return 0 - 1 }
+    k = 0
+    while k < list.size(s.blocks) {
+        u = list.get_raw(s.blocks, k) as *GpuBlockUse
+        if entry_named(u.layout as *GpuLayout, name) != null && (quote.capture_named(s.tree, name) as ptr) != null {
+            return u.set
+        }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+// The texture or buffer `capture` at `binding` of `set` on Vulkan, in place
+// of the next free binding of the shader's own set.
+capture_binding(s: *GpuShader, capture: string, set: int, binding: int) -> bool {
+    c = quote.capture_named(s.tree, capture)
+    if (c as ptr) == null || !is_bound(quote.capture_type(c)) { return false }
+    if s.bindings == null { s.bindings = list.new() }
+    p = heap.new(GpuPlace)
+    p.name = capture
+    p.set = set
+    p.binding = binding
+    list.add_raw(s.bindings, p as ptr)
+    return true
+}
+
+fn place_of(s: *GpuShader, name: string) -> *GpuPlace {
+    if s.bindings == null { return null }
+    k = 0
+    while k < list.size(s.bindings) {
+        p = list.get_raw(s.bindings, k) as *GpuPlace
+        if p.name == name { return p }
+        k = k + 1
+    }
+    return null
+}
+
+// The block of `set` in `s`'s layouts, or null.
+fn block_use(s: *GpuShader, set: int) -> *GpuBlockUse {
+    if s.blocks == null { return null }
+    k = 0
+    while k < list.size(s.blocks) {
+        u = list.get_raw(s.blocks, k) as *GpuBlockUse
+        if u.set == set { return u }
+        k = k + 1
+    }
+    return null
+}
+
+// The size of the block of `set`, its layout's whole (0 for a set it has no
+// layout for).
+block_size(s: *GpuShader, set: int) -> int {
+    u = block_use(s, set)
+    if u == null { return 0 }
+    return layout_size(u.layout as *GpuLayout)
+}
+
+// The block of `set` filled from the cells of the structs `s` captures in
+// it, at their places: what a CPU-side check holds a block to. Padding and
+// structs it does not capture are left as they are.
+block_write(s: *GpuShader, set: int, dst: ptr) {
+    u = block_use(s, set)
+    if u == null { return }
+    l = u.layout as *GpuLayout
+    _size = layout_size(l)
+    k = 0
+    while k < list.size(l.entries) {
+        e = list.get_raw(l.entries, k) as *GpuEntry
+        c = quote.capture_named(s.tree, e.name)
+        if (c as ptr) != null { struct_write(s, c, dst + e.placed) }
+        k = k + 1
+    }
+}
+
+// The declarations of the blocks `s` has layouts for, in `dialect`: on
+// Vulkan each set's block, each captured struct whole and each other entry
+// before the last captured one padding of its size; on OpenGL each captured
+// struct a uniform of its name.
+fn emit_layout_blocks(s: *GpuShader, sb: ptr, dialect: int) {
+    if s.blocks == null { return }
+    set = 0
+    while set < 8 {
+        u = block_use(s, set)
+        if u != null {
+            l = u.layout as *GpuLayout
+            _size = layout_size(l)
+            last = 0 - 1
+            k = 0
+            while k < list.size(l.entries) {
+                e = list.get_raw(l.entries, k) as *GpuEntry
+                if (quote.capture_named(s.tree, e.name) as ptr) != null { last = k }
+                k = k + 1
+            }
+            if last >= 0 && dialect == GL {
+                k = 0
+                while k <= last {
+                    e = list.get_raw(l.entries, k) as *GpuEntry
+                    if (quote.capture_named(s.tree, e.name) as ptr) != null {
+                        strbuilder.append(sb, "uniform ${e.type} ${glsl_name(e.name)};\n")
+                    }
+                    k = k + 1
+                }
+            } else if last >= 0 {
+                strbuilder.append(sb, "layout(std140, set = ${set}, binding = 0) uniform ${l.block} {\n")
+                k = 0
+                while k <= last {
+                    e = list.get_raw(l.entries, k) as *GpuEntry
+                    if (quote.capture_named(s.tree, e.name) as ptr) != null {
+                        strbuilder.append(sb, "    ${e.type} ${glsl_name(e.name)};\n")
+                    } else if e.size > 0 {
+                        strbuilder.append(sb, "    vec4 ${glsl_name(e.name)}_unread[${e.size / 16}];\n")
+                    }
+                    k = k + 1
+                }
+                strbuilder.append(sb, "};\n")
+            }
+        }
+        set = set + 1
+    }
 }
 
 // ── Linking a vertex shader to a pixel shader ──────────────────────────
@@ -235,7 +665,8 @@ link(vs: *GpuShader, ps: *GpuShader) -> bool {
     i = 0
     while i < quote.capture_count(vs.tree) {
         name = quote.capture_name(quote.capture(vs.tree, i))
-        if is_struct_capture(vs, name) && is_struct_capture(ps, name) {
+        if is_struct_capture(vs, name) && is_struct_capture(ps, name) &&
+           (layout_set_of(vs, name) < 0 || layout_set_of(vs, name) != layout_set_of(ps, name)) {
             g_error = "${quote.source(pt)}: ${vs.name} and ${ps.name} both capture the struct ${name}; name one of them apart"
             return false
         }
@@ -612,7 +1043,16 @@ const CALL_AETHER[] = ["vec2", "vec3", "vec4", "texture", "rgb",
                        "texture_3d", "xz", "mat2_of", "mul_m2", "fract_v3",
                        "vec3_xv", "mul_fm4", "mul_m4f", "add_m4", "mat4_cols",
                        "mat4_floats", "m4_col", "mul_m3", "texel_fetch_at", "int_of",
-                       "vertex_index", "floats_at", "vec4s_at"]
+                       "vertex_index", "floats_at", "vec4s_at",
+                       "discard", "dfdx", "dfdy", "dfdx_v2", "dfdy_v2",
+                       "dfdx_v3", "dfdy_v3", "fwidth_v3", "texture_grad", "abs_int",
+                       "uint_of_int", "sin_v2", "sin_v3", "pow_v3", "abs_v3",
+                       "step", "mod", "mod_v2", "ceil", "exp2",
+                       "log", "inversesqrt", "mul_cols3", "mat4_rows", "mul_transpose_m2",
+                       "vec4s_at_i", "floats_at_i", "clamp_int", "min_int", "max_int",
+                       "lane_at", "lane_at_v3", "clip_depth",
+                       "yzx", "zy", "zyx", "xzy", "xy_v3",
+                       "vec3_of_v2"]
 const CALL_GLSL[] = ["vec2", "vec3", "vec4", "texture", "$0.rgb",
                      "dot", "min", "max", "abs", "sign",
                      "clamp", "smoothstep", "mix", "fract", "floor",
@@ -629,7 +1069,16 @@ const CALL_GLSL[] = ["vec2", "vec3", "vec4", "texture", "$0.rgb",
                      "texture", "$0.xz", "mat2", "($0 * $1)", "fract",
                      "vec3", "($0 * $1)", "($0 * $1)", "($0 + $1)", "mat4",
                      "mat4", "$0[$1]", "(mat3($0) * $1)", "texelFetch($0, ivec2($1, $2), 0)", "int($0)",
-                     "int(gl_VertexIndex)", "$0[$1]", "$0[$1]"]
+                     "int(gl_VertexIndex)", "$0[$1]", "$0[$1]",
+                     "discard", "dFdx", "dFdy", "dFdx", "dFdy",
+                     "dFdx", "dFdy", "fwidth", "textureGrad", "abs",
+                     "uint($0)", "sin", "sin", "pow", "abs",
+                     "step", "mod", "mod", "ceil", "exp2",
+                     "log", "inversesqrt", "(mat3($0, $1, $2) * $3)", "transpose(mat4($0, $1, $2, $3))", "(transpose($0) * $1)",
+                     "$0[$1]", "$0[$1]", "clamp", "min", "max",
+                     "$0[$1]", "$0[$1]", "$0",
+                     "$0.yzx", "$0.zy", "$0.zyx", "$0.xzy", "$0.xy",
+                     "vec3"]
 const CALL_GL[] = ["", "", "", "", "",
                    "", "", "", "", "",
                    "", "", "", "", "",
@@ -646,7 +1095,16 @@ const CALL_GL[] = ["", "", "", "", "",
                    "", "", "", "", "",
                    "", "", "", "", "",
                    "", "", "", "", "",
-                   "int(gl_VertexID)", "", ""]
+                   "int(gl_VertexID)", "", "",
+                   "", "", "", "", "",
+                   "", "", "", "", "",
+                   "", "", "", "", "",
+                   "", "", "", "", "",
+                   "", "", "", "", "",
+                   "texelFetch($0, ivec2($1 % 1024, $1 / 1024), 0)", "texelFetch($0, ivec2($1 % 4096, $1 / 4096), 0).r", "", "", "",
+                   "", "", "($0 * 0.5 + 0.5)",
+                   "", "", "", "", "",
+                   ""]
 const CALL_ARGS: int[] = [-1, -1, -1, 2, 1,
                           2, 2, 2, 1, 1,
                           3, 3, 3, 1, 1,
@@ -663,8 +1121,17 @@ const CALL_ARGS: int[] = [-1, -1, -1, 2, 1,
                           2, 1, 4, 2, 1,
                           2, 2, 2, 2, 4,
                           16, 2, 2, 3, 1,
-                          0, 2, 2]
-const CALL_COUNT = 83
+                          0, 2, 2,
+                          0, 1, 1, 1, 1,
+                          1, 1, 1, 4, 1,
+                          1, 1, 1, 2, 1,
+                          2, 2, 2, 1, 1,
+                          1, 1, 4, 4, 2,
+                          2, 2, 3, 2, 2,
+                          2, 2, 1,
+                          1, 1, 1, 1, 1,
+                          2]
+const CALL_COUNT = 122
 
 fn call_index(name: string) -> int {
     i = 0
@@ -759,7 +1226,8 @@ params_count(s: *GpuShader) -> int {
     n = 0
     i = 0
     while i < quote.capture_count(s.tree) {
-        if !is_bound(quote.capture_type(quote.capture(s.tree, i))) { n = n + 1 }
+        c = quote.capture(s.tree, i)
+        if !is_bound(quote.capture_type(c)) && layout_set_of(s, quote.capture_name(c)) < 0 { n = n + 1 }
         i = i + 1
     }
     return n
@@ -771,7 +1239,7 @@ fn param_capture(s: *GpuShader, k: int) -> quote.Capture {
     i = 0
     while i < quote.capture_count(s.tree) {
         c = quote.capture(s.tree, i)
-        if !is_bound(quote.capture_type(c)) {
+        if !is_bound(quote.capture_type(c)) && layout_set_of(s, quote.capture_name(c)) < 0 {
             if n == k { return c }
             n = n + 1
         }
@@ -1263,11 +1731,14 @@ fn is_struct_capture(s: *GpuShader, capture: string) -> bool {
 
 // A captured struct's members as std140 lays them out: each read one's
 // place in the struct (`placed`); the struct's size, rounded up to sixteen.
-fn struct_layout(s: *GpuShader, capture: string) -> int {
+fn struct_layout(s: *GpuShader, capture: string) -> int { return members_layout(s.members, capture) }
+
+// The members of `capture` among `members` as std140 lays them out.
+fn members_layout(members: ptr, capture: string) -> int {
     at = 0
     k = 0
-    while k < list.size(s.members) {
-        m = list.get_raw(s.members, k) as *GpuMember
+    while k < list.size(members) {
+        m = list.get_raw(members, k) as *GpuMember
         if m.capture == capture && m.type != "" {
             if m.parts != null {
                 // An array of structs: each element a struct, aligned to
@@ -1493,6 +1964,7 @@ struct GpuUniform {
     name: string
     type: string
     at: int
+    set: int
 }
 
 fn leaves_free(l: ptr) {
@@ -1508,11 +1980,12 @@ fn leaves_free(l: ptr) {
     list.free(l)
 }
 
-fn leaf_add(l: ptr, name: string, t: string, at: int) {
+fn leaf_add(l: ptr, name: string, t: string, at: int, set: int) {
     u = heap.new(GpuUniform)
     u.name = name
     u.type = t
     u.at = at
+    u.set = set
     list.add_raw(l, u as ptr)
 }
 
@@ -1526,50 +1999,78 @@ fn leaves_of(s: *GpuShader) -> ptr {
         at = params_offset(s, k)
         if is_struct_capture(s, quote.capture_name(c)) {
             _size = struct_layout(s, quote.capture_name(c))
-            j = 0
-            while j < list.size(s.members) {
-                m = list.get_raw(s.members, j) as *GpuMember
-                if m.capture == quote.capture_name(c) && m.type != "" {
-                    if m.parts != null {
-                        e = 0
-                        while e < m.count {
-                            q = 0
-                            while q < list.size(m.parts) {
-                                p = list.get_raw(m.parts, q) as *GpuMember
-                                if p.type != "" {
-                                    leaf_add(l, "${name}.${glsl_name(m.name)}[${e}].${glsl_name(p.name)}", glsl_type(p.type),
-                                             at + m.placed + e * m.size + p.placed)
-                                }
-                                q = q + 1
-                            }
-                            e = e + 1
-                        }
-                    } else if m.count > 0 {
-                        stride = round_up(std140_size(m.type), 16)
-                        e = 0
-                        while e < m.count {
-                            leaf_add(l, "${name}.${glsl_name(m.name)}[${e}]", glsl_type(m.type), at + m.placed + e * stride)
-                            e = e + 1
-                        }
-                    } else {
-                        leaf_add(l, "${name}.${glsl_name(m.name)}", glsl_type(m.type), at + m.placed)
-                    }
-                }
-                j = j + 1
-            }
+            struct_leaves(s, l, quote.capture_name(c), name, at, 0)
         } else {
-            leaf_add(l, name, params_type(s, k), at)
+            leaf_add(l, name, params_type(s, k), at, 0)
         }
         k = k + 1
     }
+    // The structs of its layouts, each at its place in its set's block.
+    set = 0
+    while s.blocks != null && set < 8 {
+        u = block_use(s, set)
+        if u != null {
+            lay = u.layout as *GpuLayout
+            _lsize = layout_size(lay)
+            j = 0
+            while j < list.size(lay.entries) {
+                e = list.get_raw(lay.entries, j) as *GpuEntry
+                if (quote.capture_named(s.tree, e.name) as ptr) != null {
+                    _ssize = struct_layout(s, e.name)
+                    struct_leaves(s, l, e.name, glsl_name(e.name), e.placed, set)
+                }
+                j = j + 1
+            }
+        }
+        set = set + 1
+    }
     s.leaves = l
     return l
+}
+
+// The captured struct `capture`'s values into `l`, a value at a time, each
+// named under `name` and placed from `at` in the block of `set`.
+fn struct_leaves(s: *GpuShader, l: ptr, capture: string, name: string, at: int, set: int) {
+    j = 0
+    while j < list.size(s.members) {
+        m = list.get_raw(s.members, j) as *GpuMember
+        if m.capture == capture && m.type != "" {
+            if m.parts != null {
+                e = 0
+                while e < m.count {
+                    q = 0
+                    while q < list.size(m.parts) {
+                        p = list.get_raw(m.parts, q) as *GpuMember
+                        if p.type != "" {
+                            leaf_add(l, "${name}.${glsl_name(m.name)}[${e}].${glsl_name(p.name)}", glsl_type(p.type),
+                                     at + m.placed + e * m.size + p.placed, set)
+                        }
+                        q = q + 1
+                    }
+                    e = e + 1
+                }
+            } else if m.count > 0 {
+                stride = round_up(std140_size(m.type), 16)
+                e = 0
+                while e < m.count {
+                    leaf_add(l, "${name}.${glsl_name(m.name)}[${e}]", glsl_type(m.type), at + m.placed + e * stride, set)
+                    e = e + 1
+                }
+            } else {
+                leaf_add(l, "${name}.${glsl_name(m.name)}", glsl_type(m.type), at + m.placed, set)
+            }
+        }
+        j = j + 1
+    }
 }
 
 uniforms_count(s: *GpuShader) -> int { return list.size(leaves_of(s)) }
 uniforms_name(s: *GpuShader, k: int) -> string { return (list.get_raw(leaves_of(s), k) as *GpuUniform).name }
 uniforms_type(s: *GpuShader, k: int) -> string { return (list.get_raw(leaves_of(s), k) as *GpuUniform).type }
 uniforms_offset(s: *GpuShader, k: int) -> int { return (list.get_raw(leaves_of(s), k) as *GpuUniform).at }
+// The set whose block the k-th value is in on Vulkan: 0 for a shader's own
+// block, its layout's set for a struct of a layout.
+uniforms_set(s: *GpuShader, k: int) -> int { return (list.get_raw(leaves_of(s), k) as *GpuUniform).set }
 
 // A captured struct's cell, for the program to set its fields through
 // (`gpu.capture_struct(s, "haze", "Haze") as *Haze`); null when the shader
@@ -1681,8 +2182,9 @@ samplers_type(s: *GpuShader, k: int) -> string {
 }
 
 // The storage buffers a vertex shader reads, in the order it captures them:
-// on Vulkan at set 1, binding k (the cluster cut's pulled vertices, skin and
-// figures), its own block and textures then at set 2 (vertex_set).
+// on Vulkan at buffers_set(), binding k (the cluster cut's pulled vertices,
+// skin and figures), its own block and textures then at the set after
+// (vertex_set).
 buffers_count(s: *GpuShader) -> int {
     n = 0
     i = 0
@@ -1713,11 +2215,22 @@ buffers_type(s: *GpuShader, k: int) -> string {
 }
 
 // The set a vertex shader's own block (VertexParams) and textures are at
-// on Vulkan: 1, or 2 when it reads storage buffers, which are at 1.
+// on Vulkan: after the sets before it (set_base: its pixel shader's one, by
+// default), and after its storage buffers' set when it reads any, which is
+// the first after those.
 vertex_set(s: *GpuShader) -> int {
-    if buffers_count(s) > 0 { return 2 }
-    return 1
+    if buffers_count(s) > 0 { return s.base + 1 }
+    return s.base
 }
+
+// The set a vertex shader's storage buffers are at on Vulkan: the first
+// after the sets before it.
+buffers_set(s: *GpuShader) -> int { return s.base }
+
+// How many sets come before the vertex shader `s`'s own on Vulkan: 1 (its
+// pixel shader's) by default; 3 for one drawn beside the scene's draw,
+// camera and world sets with a hand-written pixel shader (the crowd's).
+set_base(s: *GpuShader, sets: int) { s.base = sets }
 
 // ── GLSL ───────────────────────────────────────────────────────────────
 
@@ -1752,6 +2265,24 @@ fn glsl_expr(t: quote.Tree, n: quote.Node, outer: int, right: int) -> string {
         if quote.type_of(n) == "uint32" && !string.ends_with(quote.lit(n), "u") { return "${quote.lit(n)}u" }
         return quote.lit(n)
     }
+    if k == quote.LOCAL && g_in_helper && g_helper != null {
+        // A parameter read in place (subs_find): the value itself, unless
+        // the helper has a parameter or a local of the name it begins with,
+        // which would hide the uniform it names.
+        pi = param_index(g_helper as quote.Tree, quote.name(n))
+        if pi >= 0 {
+            u = sub_of(quote.function_name(g_helper as quote.Tree), pi)
+            if u != null {
+                root = sub_root(u.text)
+                ri = param_index(g_helper as quote.Tree, root)
+                kept = ri >= 0 && sub_of(quote.function_name(g_helper as quote.Tree), ri) == null
+                if kept || (local_named(quote.body(g_helper as quote.Tree), root) as ptr) != null {
+                    refuse(t, n, "${quote.function_name(g_helper as quote.Tree)} reads ${u.text} in place, but its own ${root} hides it; name one of them apart")
+                }
+                return u.text
+            }
+        }
+    }
     if k == quote.LOCAL || k == quote.CAPTURE { return glsl_name(quote.name(n)) }
     if k == quote.FIELD {
         // A vertex shader's attribute: the name the table gives it.
@@ -1781,6 +2312,8 @@ fn glsl_expr(t: quote.Tree, n: quote.Node, outer: int, right: int) -> string {
             return ""
         }
         g = call_glsl_for(bare_call(quote.name(n)), g_dialect)
+        // GLSL's discard is a statement, not a call.
+        if g == "discard" { return g }
         if !is_identifier(g) { return glsl_template(t, n, g) }
         sb = strbuilder.new(32)
         strbuilder.append(sb, g)
@@ -1799,10 +2332,15 @@ fn glsl_expr(t: quote.Tree, n: quote.Node, outer: int, right: int) -> string {
         sb = strbuilder.new(32)
         strbuilder.append(sb, glsl_name(quote.name(n)))
         strbuilder.append(sb, "(")
+        first = true
         j = 0
         while j < quote.child_count(n) {
-            if j > 0 { strbuilder.append(sb, ", ") }
-            strbuilder.append(sb, glsl_expr(t, quote.child(n, j), 0, 0))
+            // An argument read in place is the helper's to read, not passed.
+            if sub_of(quote.name(n), j) == null {
+                if !first { strbuilder.append(sb, ", ") }
+                first = false
+                strbuilder.append(sb, glsl_expr(t, quote.child(n, j), 0, 0))
+            }
             j = j + 1
         }
         strbuilder.append(sb, ")")
@@ -1943,6 +2481,15 @@ fn glsl_stmt(t: quote.Tree, sb: ptr, s: quote.Node, depth: int, last: bool) {
             }
             return
         }
+        if g_cut {
+            // Nothing to write: the pixel kept.
+            if !last {
+                strbuilder.append(sb, "return;\n")
+            } else {
+                strbuilder.append(sb, "// kept\n")
+            }
+            return
+        }
         if g_depth {
             rt = quote.type_of(quote.child(s, 0))
             if rt != "float" && rt != "f32" {
@@ -1991,6 +2538,8 @@ var g_in_helper = false
 var g_dialect = 0
 // Whether the shader being written returns its depth (depth_fragment).
 var g_depth = false
+// Whether it writes nothing (cut_fragment).
+var g_cut = false
 // Whether the pixel shader being written returns a struct of outputs.
 var g_outputs = false
 // The linked pixel shader's parameter, a struct of varyings, while it is
@@ -2002,26 +2551,273 @@ var g_pixel_param = ""
 // before its use. The same text for both dialects. Errors name the shader's
 // quote, which is where the call that reached the helper is.
 fn emit_helpers(t: quote.Tree, sb: ptr) {
+    subs_free()
+    if g_emitting != null && (g_emitting as *GpuShader).in_place { subs_find(t) }
     i = 0
     while i < quote.helper_count(t) {
         h = quote.helper(t, i)
         ret = glsl_type(quote.return_type(h))
         if ret == "" { refuse(t, quote.body(h), "${quote.function_name(h)} returns a ${quote.return_type(h)}, which GLSL has no type for") }
         strbuilder.append(sb, "\n${ret} ${glsl_name(quote.function_name(h))}(")
+        first = true
         k = 0
         while k < quote.param_count(h) {
-            if k > 0 { strbuilder.append(sb, ", ") }
-            pt = glsl_type(quote.param_type(h, k))
-            if pt == "" { refuse(t, quote.body(h), "${quote.function_name(h)}'s ${quote.param_name(h, k)} is a ${quote.param_type(h, k)}, which GLSL has no type for") }
-            strbuilder.append(sb, "${pt} ${glsl_name(quote.param_name(h, k))}")
+            if sub_of(quote.function_name(h), k) == null {
+                if !first { strbuilder.append(sb, ", ") }
+                first = false
+                pt = glsl_type(quote.param_type(h, k))
+                if pt == "" { refuse(t, quote.body(h), "${quote.function_name(h)}'s ${quote.param_name(h, k)} is a ${quote.param_type(h, k)}, which GLSL has no type for") }
+                strbuilder.append(sb, "${pt} ${glsl_name(quote.param_name(h, k))}")
+            }
             k = k + 1
         }
         strbuilder.append(sb, ") {\n")
         g_in_helper = true
+        g_helper = h as ptr
         glsl_block(t, sb, quote.body(h), 1, false)
         g_in_helper = false
+        g_helper = null
         strbuilder.append(sb, "}\n")
         i = i + 1
+    }
+}
+
+// ── A helper's argument read in place ──────────────────────────────────
+//
+// read_in_place(s): the shader's helpers read where they use them the
+// values every call hands them alike (below). The scene's shaders, which
+// match hand-written ones that read their uniforms in their helpers; the
+// shaders quoted before them were matched with their helpers handed theirs.
+read_in_place(s: *GpuShader) { s.in_place = true }
+
+// The parameter `param` of the helper `helper` (its Aether name) handed on,
+// read in place or not: the hand-written helper took it as a parameter.
+hand_on(s: *GpuShader, helper: string, param: string) {
+    if s.handed == null { s.handed = list.new() }
+    u = heap.new(GpuSub)
+    u.helper = helper
+    u.param = 0
+    u.key = param
+    u.text = ""
+    list.add_raw(s.handed, u as ptr)
+}
+
+fn handed_free(l: ptr) {
+    if l == null { return }
+    k = 0
+    while k < list.size(l) {
+        u = list.get_raw(l, k) as *GpuSub
+        u.helper = ""
+        u.key = ""
+        heap.free(u)
+        k = k + 1
+    }
+    list.free(l)
+}
+
+// Whether the shader being written hands on the parameter `param` of the
+// helper whose tree name is `function` (its module's prefix before the
+// Aether name: ae3d_shaders_lit_velocity is velocity).
+fn is_handed(function: string, param: string) -> bool {
+    if g_emitting == null { return false }
+    l = (g_emitting as *GpuShader).handed
+    if l == null { return false }
+    k = 0
+    while k < list.size(l) {
+        u = list.get_raw(l, k) as *GpuSub
+        if u.key == param && (function == u.helper || string.ends_with(function, "_${u.helper}") == 1) { return true }
+        k = k + 1
+    }
+    return false
+}
+//
+// A hand-written helper reads the uniforms and varyings it needs where it
+// uses them; a @quotable one is handed them, since only the quote's body
+// sees its captures. The two round apart where a GPU orders a sum by where
+// its values were loaded (MoltenVK's fast math): loaded at the call, before
+// the helper's own work, they enter its sums first. So a parameter every
+// call hands the same capture, field of one, varying or attribute (or a
+// parameter of its caller that is one of those) is not a parameter in the
+// GLSL: the helper reads the value where it uses it, as the hand-written one
+// does. A parameter the helper assigns to stays one.
+
+struct GpuSub {
+    helper: string
+    param: int
+    key: string      // what the argument is, the same at every call
+    text: string     // and as GLSL, where the helper reads it
+}
+
+var g_subs: ptr = null              // list of *GpuSub while a shader is written
+var g_main_param = ""               // a linked pixel shader's parameter, while subs_find reads its body
+var g_helper: ptr = null             // the helper being written (a quote.Tree)
+
+fn subs_free() {
+    if g_subs == null { return }
+    k = 0
+    while k < list.size(g_subs) {
+        u = list.get_raw(g_subs, k) as *GpuSub
+        u.helper = ""
+        u.key = ""
+        u.text = ""
+        heap.free(u)
+        k = k + 1
+    }
+    list.free(g_subs)
+    g_subs = null
+}
+
+fn sub_of(helper: string, k: int) -> *GpuSub {
+    if g_subs == null { return null }
+    j = 0
+    while j < list.size(g_subs) {
+        u = list.get_raw(g_subs, j) as *GpuSub
+        if u.helper == helper && u.param == k { return u }
+        j = j + 1
+    }
+    return null
+}
+
+// The name a value read in place begins with (`surface` of
+// surface.shadow_softness, `cascades` of cascades.matrices[c]).
+fn sub_root(text: string) -> string {
+    i = 0
+    while i < string.length(text) {
+        c = string.char_at(text, i)
+        if c == 46 || c == 91 { return string.substring(text, 0, i) }
+        i = i + 1
+    }
+    return text
+}
+
+fn param_index(h: quote.Tree, name: string) -> int {
+    k = 0
+    while k < quote.param_count(h) {
+        if quote.param_name(h, k) == name { return k }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+// What the argument `n` is, read in a body (`h` the helper it is in, or
+// null for the quote's own) -- a capture, a field of one, a varying, an
+// attribute, or a parameter of `h` read in place -- and as GLSL; "" for
+// anything else.
+fn arg_key(t: quote.Tree, n: quote.Node, h: quote.Tree) -> (string, string) {
+    k = quote.kind(n)
+    if k == quote.CAPTURE { return "c:${quote.name(n)}", glsl_name(quote.name(n)) }
+    if k == quote.FIELD {
+        o = quote.child(n, 0)
+        if (h as ptr) == null && quote.kind(o) == quote.LOCAL {
+            if g_main_param != "" && quote.name(o) == g_main_param { return "v:${quote.name(n)}", glsl_name(quote.name(n)) }
+            if is_attr_read(n) {
+                i = attr_index(quote.name(n))
+                if i >= 0 { return "a:${quote.name(n)}", ATTR_GLSL[i] }
+            }
+            return "", ""
+        }
+        bk, bt = arg_key(t, o, h)
+        if string.starts_with(bk, "c:") == 1 { return "${bk}.${quote.name(n)}", "${bt}.${glsl_name(quote.name(n))}" }
+        return "", ""
+    }
+    if k == quote.INDEX && quote.kind(quote.child(n, 1)) == quote.LIT {
+        bk, bt = arg_key(t, quote.child(n, 0), h)
+        if string.starts_with(bk, "c:") == 1 { return "${bk}[${quote.lit(quote.child(n, 1))}]", "${bt}[${quote.lit(quote.child(n, 1))}]" }
+        return "", ""
+    }
+    if k == quote.LOCAL && (h as ptr) != null {
+        i = param_index(h, quote.name(n))
+        if i >= 0 {
+            u = sub_of(quote.function_name(h), i)
+            if u != null { return u.key, u.text }
+        }
+    }
+    return "", ""
+}
+
+// Whether `n` assigns to the local `name`.
+fn assigns(n: quote.Node, name: string) -> bool {
+    if quote.kind(n) == quote.ASSIGN {
+        target = quote.child(n, 0)
+        if quote.kind(target) == quote.LOCAL && quote.name(target) == name { return true }
+    }
+    j = 0
+    while j < quote.child_count(n) {
+        if assigns(quote.child(n, j), name) { return true }
+        j = j + 1
+    }
+    return false
+}
+
+// The arguments the calls of `helper` in `n` hand its parameter `k`, held to
+// one another: the first's key and text through `seen` (*GpuSub), false at
+// the first that is not the same or not one that can be read in place.
+fn calls_agree(t: quote.Tree, n: quote.Node, enclosing: quote.Tree, helper: string, k: int, seen: *GpuSub) -> bool {
+    if quote.kind(n) == quote.HELPER_CALL && quote.name(n) == helper && k < quote.child_count(n) {
+        key, text = arg_key(t, quote.child(n, k), enclosing)
+        if key == "" { return false }
+        if seen.key == "" {
+            seen.key = key
+            seen.text = text
+        } else if seen.key != key {
+            return false
+        }
+    }
+    j = 0
+    while j < quote.child_count(n) {
+        if !calls_agree(t, quote.child(n, j), enclosing, helper, k, seen) { return false }
+        j = j + 1
+    }
+    return true
+}
+
+// Every helper parameter the tree's calls all hand the same value that can
+// be read in place, found until no more are (a caller's parameter read in
+// place makes its callee's argument one).
+fn subs_find(t: quote.Tree) {
+    subs_free()
+    g_subs = list.new()
+    // A linked pixel shader's parameter is its varyings, each read by name.
+    g_main_param = ""
+    if g_emitting != null && (g_emitting as *GpuShader).stage == FRAGMENT_STAGE && (g_emitting as *GpuShader).links != null {
+        g_main_param = quote.param_name(t, 0)
+    }
+    changed = true
+    while changed {
+        changed = false
+        i = 0
+        while i < quote.helper_count(t) {
+            h = quote.helper(t, i)
+            name = quote.function_name(h)
+            k = 0
+            while k < quote.param_count(h) {
+                if sub_of(name, k) == null && !assigns(quote.body(h), quote.param_name(h, k)) &&
+                   !is_handed(name, quote.param_name(h, k)) {
+                    seen = heap.new(GpuSub)
+                    seen.helper = name
+                    seen.param = k
+                    seen.key = ""
+                    seen.text = ""
+                    agree = calls_agree(t, quote.body(t), null as quote.Tree, name, k, seen)
+                    j = 0
+                    while agree && j < quote.helper_count(t) {
+                        agree = calls_agree(t, quote.body(quote.helper(t, j)), quote.helper(t, j), name, k, seen)
+                        j = j + 1
+                    }
+                    if agree && seen.key != "" {
+                        list.add_raw(g_subs, seen as ptr)
+                        changed = true
+                    } else {
+                        seen.helper = ""
+                        seen.key = ""
+                        seen.text = ""
+                        heap.free(seen)
+                    }
+                }
+                k = k + 1
+            }
+            i = i + 1
+        }
     }
 }
 
@@ -2058,6 +2854,7 @@ fn emit_ready(s: *GpuShader) -> bool {
         i = i + 1
     }
     why = members_refused(s, quote.body(t))
+    if why == "" { why = s.refused }
     if why != "" {
         g_error = "${quote.source(t)}: ${why}"
         return false
@@ -2270,17 +3067,18 @@ fn emit_vertex_text(s: *GpuShader, dialect: int, from: string, to: string) -> st
 }
 
 // A vertex shader's captures: a std140 block of their own, VertexParams, at
-// binding 0 of vertex_set() on Vulkan (set 0 is the pixel shader's, its
-// Params and its textures), its textures at the bindings after it, and its
-// storage buffers at set 1 (std430, read only); each a uniform by name on
-// OpenGL, which has no storage buffers here (the cluster cut is Vulkan's).
-// None, nothing written.
+// binding 0 of vertex_set() on Vulkan (after its pixel shader's set, or the
+// scene's three for a crowd's: set_base), its textures at the bindings after
+// it, and its storage buffers at buffers_set() (std430, read only); each a
+// uniform by name on OpenGL, which has no storage buffers here (the cluster
+// cut is Vulkan's). None, nothing written.
 fn emit_vertex_params(s: *GpuShader, sb: ptr, dialect: int) {
     np = params_count(s)
     vs = vertex_set(s)
     binding = 0
+    if np > 0 || s.blocks != null { emit_capture_structs(s, sb) }
+    emit_layout_blocks(s, sb, dialect)
     if np > 0 {
-        emit_capture_structs(s, sb)
         if dialect == GL {
             k = 0
             while k < np {
@@ -2298,26 +3096,75 @@ fn emit_vertex_params(s: *GpuShader, sb: ptr, dialect: int) {
             binding = 1
         }
     }
-    k = 0
-    while k < samplers_count(s) {
-        if dialect == GL {
-            strbuilder.append(sb, "uniform ${samplers_type(s, k)} ${samplers_name(s, k)};\n")
-        } else {
-            strbuilder.append(sb, "layout(set = ${vs}, binding = ${binding}) uniform ${samplers_type(s, k)} ${samplers_name(s, k)};\n")
-        }
-        binding = binding + 1
-        k = k + 1
-    }
-    if dialect == GL && buffers_count(s) > 0 {
-        refuse(s.tree, quote.body(s.tree), "a vertex shader reads storage buffers on Vulkan alone")
-        return
-    }
+    emit_samplers(s, sb, dialect, vs, binding)
+    emit_placed_buffers(s, sb, dialect)
     k = 0
     while k < buffers_count(s) {
         name = buffers_name(s, k)
-        strbuilder.append(sb, "layout(std430, set = 1, binding = ${k}) readonly buffer ${name}_buffer { ${buffers_type(s, k)} ${name}[]; };\n")
+        if place_of(s, quote.capture_name(buffer_capture(s, k))) == null {
+            if dialect == GL {
+                refuse(s.tree, quote.body(s.tree), "a vertex shader reads storage buffers on Vulkan alone")
+                return
+            }
+            strbuilder.append(sb, "layout(std430, set = ${buffers_set(s)}, binding = ${k}) readonly buffer ${name}_buffer { ${buffers_type(s, k)} ${name}[]; };\n")
+        }
         k = k + 1
     }
+}
+
+// The textures: on Vulkan each at its place where capture_binding gave one,
+// the rest at `set` from `binding` on, in order; on OpenGL each a uniform
+// by its name.
+fn emit_samplers(s: *GpuShader, sb: ptr, dialect: int, set: int, first: int) {
+    binding = first
+    k = 0
+    while k < samplers_count(s) {
+        name = samplers_name(s, k)
+        p = place_of(s, sampler_capture_name(s, k))
+        if dialect == GL {
+            strbuilder.append(sb, "uniform ${samplers_type(s, k)} ${name};\n")
+        } else if p != null {
+            strbuilder.append(sb, "layout(set = ${p.set}, binding = ${p.binding}) uniform ${samplers_type(s, k)} ${name};\n")
+        } else {
+            strbuilder.append(sb, "layout(set = ${set}, binding = ${binding}) uniform ${samplers_type(s, k)} ${name};\n")
+            binding = binding + 1
+        }
+        k = k + 1
+    }
+}
+
+// The storage buffers capture_binding placed: on Vulkan each at its place,
+// std430, read only; on OpenGL 4.1, which has no storage buffers, each a
+// texture of its values in rows (vec4s_at_i, floats_at_i read it).
+fn emit_placed_buffers(s: *GpuShader, sb: ptr, dialect: int) {
+    k = 0
+    while k < buffers_count(s) {
+        name = buffers_name(s, k)
+        p = place_of(s, quote.capture_name(buffer_capture(s, k)))
+        if p != null {
+            if dialect == GL {
+                strbuilder.append(sb, "uniform sampler2D ${name};\n")
+            } else {
+                strbuilder.append(sb, "layout(std430, set = ${p.set}, binding = ${p.binding}) readonly buffer ${name}_buffer { ${buffers_type(s, k)} ${name}[]; };\n")
+            }
+        }
+        k = k + 1
+    }
+}
+
+// The k-th texture's capture's own name (samplers_name is GLSL's).
+fn sampler_capture_name(s: *GpuShader, k: int) -> string {
+    n = 0
+    i = 0
+    while i < quote.capture_count(s.tree) {
+        c = quote.capture(s.tree, i)
+        if is_texture(quote.capture_type(c)) {
+            if n == k { return quote.capture_name(c) }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return ""
 }
 
 emit_glsl(s: *GpuShader, dialect: int) -> string {
@@ -2330,9 +3177,13 @@ emit_glsl(s: *GpuShader, dialect: int) -> string {
 
 fn emit_pixel_text(s: *GpuShader, dialect: int) -> string {
     t = s.tree
-    if buffers_count(s) > 0 {
-        g_error = "${quote.source(t)}: ${s.name}: a pixel shader reads no storage buffer"
-        return ""
+    k = 0
+    while k < buffers_count(s) {
+        if place_of(s, quote.capture_name(buffer_capture(s, k))) == null {
+            g_error = "${quote.source(t)}: ${s.name}: a pixel shader reads a storage buffer only where capture_binding places it"
+            return ""
+        }
+        k = k + 1
     }
     g_dialect = dialect
     sb = strbuilder.new(4096)
@@ -2345,6 +3196,7 @@ fn emit_pixel_text(s: *GpuShader, dialect: int) -> string {
     binding = 0
     np = params_count(s)
     emit_capture_structs(s, sb)
+    emit_layout_blocks(s, sb, dialect)
     if np > 0 && dialect == GL {
         k = 0
         while k < np {
@@ -2361,43 +3213,25 @@ fn emit_pixel_text(s: *GpuShader, dialect: int) -> string {
         strbuilder.append(sb, "};\n")
         binding = 1
     }
-    k = 0
-    while k < samplers_count(s) {
-        if dialect == GL {
-            strbuilder.append(sb, "uniform ${samplers_type(s, k)} ${samplers_name(s, k)};\n")
-        } else {
-            strbuilder.append(sb, "layout(set = 0, binding = ${binding}) uniform ${samplers_type(s, k)} ${samplers_name(s, k)};\n")
-        }
-        binding = binding + 1
-        k = k + 1
-    }
+    emit_samplers(s, sb, dialect, 0, binding)
+    emit_placed_buffers(s, sb, dialect)
     // A struct of outputs, returned as a literal: its fields, each to its out.
     outs = returned_make(quote.body(t))
     out_type = ""
     if (outs as ptr) != null && !s.depth { out_type = quote.type_of(outs) }
     structs_of(t, out_type)
     emit_structs(t, sb)
+    // A shader whose helpers read its varyings in place declares them before
+    // the helpers, as a hand-written one does.
+    if s.links != null && s.in_place { emit_varying_inputs(s, t, sb, dialect) }
     emit_helpers(t, sb)
     // A depth shader has no colour output: what it returns is gl_FragDepth.
     colour = "out vec4 FragColor;\n"
     if dialect != GL { colour = "layout(location = 0) ${colour}" }
-    if s.depth { colour = "" }
+    if s.depth || s.cut { colour = "" }
     if out_type != "" { colour = output_decls(outs) }
     if s.links != null {
-        // The varyings it reads, at the vertex shader's locations: each an
-        // input of its own name, which a local of that name would hide.
-        strbuilder.append(sb, "\n")
-        k = 0
-        while k < list.size(s.links) {
-            f = list.get_raw(s.links, k) as *GpuField
-            clash = local_named(quote.body(t), glsl_name(f.name))
-            if (clash as ptr) != null { refuse(t, clash, "a local named ${quote.name(clash)} hides the varying of that name") }
-            decl = "in ${glsl_type(f.type)} ${glsl_name(f.name)};\n"
-            if f.type == "int" { decl = "flat ${decl}" }
-            if dialect != GL { decl = "layout(location = ${f.location}) ${decl}" }
-            strbuilder.append(sb, decl)
-            k = k + 1
-        }
+        if !s.in_place { emit_varying_inputs(s, t, sb, dialect) }
         strbuilder.append(sb, "${colour}\nvoid main() {\n")
         g_pixel_param = quote.param_name(t, 0)
     } else {
@@ -2409,9 +3243,11 @@ fn emit_pixel_text(s: *GpuShader, dialect: int) -> string {
         }
     }
     g_depth = s.depth
+    g_cut = s.cut
     g_outputs = out_type != ""
     glsl_block(t, sb, quote.body(t), 1, true)
     g_depth = false
+    g_cut = false
     g_outputs = false
     g_pixel_param = ""
     structs_free()
@@ -2419,6 +3255,24 @@ fn emit_pixel_text(s: *GpuShader, dialect: int) -> string {
     text = strbuilder.finish(sb)
     if g_error != "" { return "" }
     return text
+}
+
+// The varyings a linked pixel shader reads, at the vertex shader's
+// locations: each an input of its own name, which a local of that name
+// would hide.
+fn emit_varying_inputs(s: *GpuShader, t: quote.Tree, sb: ptr, dialect: int) {
+    strbuilder.append(sb, "\n")
+    k = 0
+    while k < list.size(s.links) {
+        f = list.get_raw(s.links, k) as *GpuField
+        clash = local_named(quote.body(t), glsl_name(f.name))
+        if (clash as ptr) != null { refuse(t, clash, "a local named ${quote.name(clash)} hides the varying of that name") }
+        decl = "in ${glsl_type(f.type)} ${glsl_name(f.name)};\n"
+        if f.type == "int" { decl = "flat ${decl}" }
+        if dialect != GL { decl = "layout(location = ${f.location}) ${decl}" }
+        strbuilder.append(sb, decl)
+        k = k + 1
+    }
 }
 
 // A pixel shader's outs, one for each field of the struct literal it
@@ -2438,7 +3292,7 @@ fn output_decls(mk: quote.Node) -> string {
 // How many outputs the pixel shader writes: its struct's fields, or 1 (its
 // colour), or 0 (a depth shader).
 outputs_count(s: *GpuShader) -> int {
-    if s.depth { return 0 }
+    if s.depth || s.cut { return 0 }
     mk = returned_make(quote.body(s.tree))
     if (mk as ptr) == null { return 1 }
     return quote.child_count(mk)
@@ -2658,7 +3512,8 @@ fn clampi(v: int, lo: int, hi: int) -> int {
 struct GpuBinding {
     name: string
     val: *GpuVal
-    img: ptr         // a texture's *shaderlib.ShaderImage
+    img: ptr         // a texture's *shaderlib.ShaderImage; a buffer's cell; an array's struct cell
+    arr: ptr         // a helper's parameter given a captured struct's array: its *GpuMember (img the cell)
 }
 
 // A run of a shader: the captures' values as the run began, the locals as
@@ -2681,6 +3536,7 @@ struct GpuRun {
     frag_x: float
     frag_y: float
     vertex_index: int // a vertex run's gl_VertexIndex (cpu_set_vertex_index)
+    discarded: bool  // the last run's pixel discarded (cpu_discarded)
 }
 
 const FLOW_ON = 0
@@ -2733,6 +3589,7 @@ fn bind(lst: ptr, name: string, v: *GpuVal, img: @keep ptr) {
     bd.name = name
     bd.val = v
     bd.img = img
+    bd.arr = null
     list.add_raw(lst, bd as ptr)
 }
 
@@ -2819,14 +3676,17 @@ cpu_run(cx: *GpuRun, param: *GpuVal) -> *GpuVal {
     cx.flow = FLOW_ON
     cx.out = null
     cx.failed = 0
+    cx.discarded = false
     t = cx.s.tree
     read_captures(cx)
     cx.param = param
     bind(cx.locals, quote.param_name(t, 0), param, null)
     cpu_block(cx, quote.body(t))
-    ok = cx.out != null && cx.failed == 0
+    ok = cx.out != null && cx.failed == 0 && !cx.discarded
     result = null as *GpuVal
-    if ok {
+    if cx.discarded {
+        // Nothing to give: the pixel was dropped (cpu_discarded).
+    } else if ok {
         // Its own copy, past the arena: a struct's fields with it.
         result = val_copy(cx.out)
     } else if cx.failed == 0 {
@@ -2853,6 +3713,10 @@ cpu_run(cx: *GpuRun, param: *GpuVal) -> *GpuVal {
     list.clear(cx.arena)
     return result
 }
+
+// Whether the last cpu_run's pixel was discarded: its result is then null
+// with no error.
+cpu_discarded(cx: *GpuRun) -> bool { return cx.discarded }
 
 // A vertex run's outputs let go.
 fn drop_outs(cx: *GpuRun) {
@@ -3068,6 +3932,38 @@ fn cpu_stmt(cx: *GpuRun, s: quote.Node) {
     }
 }
 
+// A whole number's literal, decimal or hex (0x...), with a u or a sign:
+// its value, and whether it was one.
+fn parse_whole(text: string) -> (long, bool) {
+    t = text
+    if string.ends_with(t, "u") == 1 || string.ends_with(t, "U") == 1 { t = string.substring(t, 0, string.length(t) - 1) }
+    negative = false
+    if string.starts_with(t, "-") == 1 {
+        negative = true
+        t = string.substring(t, 1, string.length(t))
+    }
+    base = 10 as long
+    if string.starts_with(t, "0x") == 1 || string.starts_with(t, "0X") == 1 {
+        base = 16
+        t = string.substring(t, 2, string.length(t))
+    }
+    if string.length(t) == 0 { return 0 as long, false }
+    v = 0 as long
+    i = 0
+    while i < string.length(t) {
+        c = string.char_at(t, i)
+        d = 0 - 1
+        if c >= 48 && c <= 57 { d = c - 48 }
+        if base == 16 && c >= 97 && c <= 102 { d = c - 87 }
+        if base == 16 && c >= 65 && c <= 70 { d = c - 55 }
+        if d < 0 { return 0 as long, false }
+        v = v * base + d
+        i = i + 1
+    }
+    if negative { v = 0 - v }
+    return v, true
+}
+
 fn cpu_lit(cx: *GpuRun, n: quote.Node) -> *GpuVal {
     ty = quote.type_of(n)
     text = quote.lit(n)
@@ -3076,7 +3972,13 @@ fn cpu_lit(cx: *GpuRun, n: quote.Node) -> *GpuVal {
         if text == "true" { on = 1.0 }
         return keep(cx, mkval(0, on, 0.0, 0.0, 0.0))
     }
-    if ty == "float" || ty == "f32" || ty == "int" {
+    if ty == "int" {
+        // Held exactly: an int past 2^24 is no f32 (the scene's hash).
+        iv, iok = parse_whole(text)
+        if !iok { return fail(cx, n, "the literal ${text} is not a number") }
+        return keep(cx, int_val(iv))
+    }
+    if ty == "float" || ty == "f32" {
         v, err = string.to_float(text)
         if err != "" { return fail(cx, n, "the literal ${text} is not a number") }
         return keep(cx, v1(v))
@@ -3084,9 +3986,9 @@ fn cpu_lit(cx: *GpuRun, n: quote.Node) -> *GpuVal {
     if ty == "uint32" {
         // Held exactly: a double holds every 32-bit whole number, and an f32
         // would lose the low bits of a mask like 0xAAAAAAAA.
-        v, err = string.to_float(text)
-        if err != "" { return fail(cx, n, "the literal ${text} is not a number") }
-        return keep(cx, whole32(v))
+        uv, uok = parse_whole(text)
+        if !uok { return fail(cx, n, "the literal ${text} is not a number") }
+        return keep(cx, whole32(uv * 1.0))
     }
     return fail(cx, n, "a ${ty} literal is not run on the CPU")
 }
@@ -3105,16 +4007,18 @@ fn cpu_expr(cx: *GpuRun, n: quote.Node) -> *GpuVal {
         return bd.val
     }
     if k == quote.INDEX {
-        // An element of a captured struct's array, from its cell.
+        // An element of a captured struct's array, from its cell (or of a
+        // helper's parameter given one).
         o = quote.child(n, 0)
-        m = captured_member(cx, o)
+        m = array_arg(cx, o)
         if m == null { return fail(cx, n, "an index of anything but a captured struct's array is not run on the CPU") }
+        acell = array_cell(cx, o)
         if m.count < 1 { return fail(cx, n, "${quote.name(o)} is not an array") }
         i = floori(cpu_expr(cx, quote.child(n, 1)).x)
         if i < 0 || i >= m.count { return fail(cx, n, "${quote.name(o)}[${i}] is past its ${m.count}") }
         if m.parts != null {
             // An element of an array of structs: a struct value of its parts.
-            element = find(cx.caps, m.capture).img + m.at + i * m.stride
+            element = acell + m.at + i * m.stride
             v = keep(cx, vstruct())
             j = 0
             while j < list.size(m.parts) {
@@ -3124,7 +4028,7 @@ fn cpu_expr(cx: *GpuRun, n: quote.Node) -> *GpuVal {
             }
             return v
         }
-        return member_value(cx, m, find(cx.caps, m.capture).img, i)
+        return member_value(cx, m, acell, i)
     }
     if k == quote.FIELD {
         // A vertex run's attribute: the value it was given.
@@ -3156,6 +4060,8 @@ fn cpu_expr(cx: *GpuRun, n: quote.Node) -> *GpuVal {
             return keep(cx, mkval(0, 1.0, 0.0, 0.0, 0.0))
         }
         if quote.op(n) != "-" { return fail(cx, n, "the operator ${quote.op(n)} is not run on the CPU") }
+        // An int negated exactly: one past 2^24 is no f32.
+        if quote.type_of(n) == "int" { return keep(cx, int_val(0 - (a.x as long))) }
         return keep(cx, mkval(a.n, 0.0 - a.x, 0.0 - a.y, 0.0 - a.z, 0.0 - a.w))
     }
     if k == quote.BINARY {
@@ -3200,18 +4106,34 @@ fn cpu_helper_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
     // A texture argument passes its image; any other its value.
     args = list.new()
     imgs = list.new()
+    arrs = list.new()
     j = 0
     while j < quote.child_count(n) {
         a = quote.child(n, j)
-        if is_texture(quote.param_type(h, j)) || quote.param_type(h, j) == "mat4" {
+        am = array_arg(cx, a)
+        if am != null {
+            // A captured struct's array, read an element at a time in the
+            // helper: the array and its struct's cell.
+            list.add_raw(args, null)
+            list.add_raw(imgs, array_cell(cx, a))
+            list.add_raw(arrs, am as ptr)
+        } else if is_buffer(quote.param_type(h, j)) {
             img = texture_image(cx, a)
-            if img == null && quote.param_type(h, j) == "mat4" { img = matrix_of(cx, a) }
-            if img == null { list.free(args); list.free(imgs); return fail(cx, n, "${quote.name(n)} is given a texture with no image") }
+            if img == null { list.free(args); list.free(imgs); list.free(arrs); return fail(cx, n, "${quote.name(n)} is given a buffer that is no capture") }
             list.add_raw(args, null)
             list.add_raw(imgs, img)
+            list.add_raw(arrs, null)
+        } else if is_texture(quote.param_type(h, j)) || quote.param_type(h, j) == "mat4" {
+            img = texture_image(cx, a)
+            if img == null && quote.param_type(h, j) == "mat4" { img = matrix_of(cx, a) }
+            if img == null { list.free(args); list.free(imgs); list.free(arrs); return fail(cx, n, "${quote.name(n)} is given a texture with no image") }
+            list.add_raw(args, null)
+            list.add_raw(imgs, img)
+            list.add_raw(arrs, null)
         } else {
             list.add_raw(args, cpu_expr(cx, a) as ptr)
             list.add_raw(imgs, null)
+            list.add_raw(arrs, null)
         }
         j = j + 1
     }
@@ -3221,10 +4143,12 @@ fn cpu_helper_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
     j = 0
     while j < quote.param_count(h) {
         bind(cx.locals, quote.param_name(h, j), list.get_raw(args, j) as *GpuVal, list.get_raw(imgs, j))
+        (list.get_raw(cx.locals, list.size(cx.locals) - 1) as *GpuBinding).arr = list.get_raw(arrs, j)
         j = j + 1
     }
     list.free(args)
     list.free(imgs)
+    list.free(arrs)
     cx.out = null
     cpu_block(cx, quote.body(h))
     result = cx.out
@@ -3237,9 +4161,36 @@ fn cpu_helper_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
     cx.locals = saved_locals
     cx.out = saved_out
     if cx.failed != 0 { return keep(cx, v1(0.0)) }
+    // Discarded inside the helper: the run stops there, the flow a return's.
+    if cx.discarded { return keep(cx, v1(0.0)) }
     if cx.flow != FLOW_RETURN || result == null { return fail(cx, n, "${quote.name(n)} ended without a return") }
     cx.flow = FLOW_ON
     return result
+}
+
+// The array `a` names, when it is a captured struct's array of values or
+// structs (or a helper's parameter given one): its member; null otherwise.
+fn array_arg(cx: *GpuRun, a: quote.Node) -> *GpuMember {
+    m = captured_member(cx, a)
+    if m != null && m.count > 0 { return m }
+    if quote.kind(a) == quote.LOCAL {
+        bd = find(cx.locals, quote.name(a))
+        if bd != null && bd.arr != null { return bd.arr as *GpuMember }
+    }
+    return null
+}
+
+// The struct cell the array `a` is in (array_arg's).
+fn array_cell(cx: *GpuRun, a: quote.Node) -> ptr {
+    if quote.kind(a) == quote.FIELD {
+        m = captured_member(cx, a)
+        if m != null { return find(cx.caps, m.capture).img }
+    }
+    if quote.kind(a) == quote.LOCAL {
+        bd = find(cx.locals, quote.name(a))
+        if bd != null { return bd.img }
+    }
+    return null
 }
 
 // The member a FIELD node reads of a captured struct, placed and read; null
@@ -3309,6 +4260,14 @@ fn cpu_field(cx: *GpuRun, n: quote.Node, v: *GpuVal, name: string) -> *GpuVal {
 // remainder are whole.
 // A uint32 value, held exactly (mkval rounds to an f32; a whole number
 // past 2^24 is not one), wrapped to 32 bits as GLSL's uint is.
+// An int value, held exactly and wrapped to 32 bits as GLSL's int is.
+fn int_val(w: long) -> *GpuVal {
+    v = heap.new(GpuVal)
+    v.n = 1
+    v.x = ((w as int) as long) * 1.0
+    return v
+}
+
 fn whole32(x: float) -> *GpuVal {
     w = x as long
     w = w % 4294967296
@@ -3322,13 +4281,21 @@ fn whole32(x: float) -> *GpuVal {
 // a op c on uint32s: wrapped to 32 bits; a shift by 32 or more is
 // undefined in GLSL and gives 0 here.
 fn cpu_uint(cx: *GpuRun, n: quote.Node, op: string, a: *GpuVal, c: *GpuVal) -> *GpuVal {
-    x = (a.x as long) % 4294967296
-    y = (c.x as long) % 4294967296
+    // As 32-bit words: an int's bits (a negative one wraps), as GLSL's
+    // uint(i) takes them.
+    x = (((a.x as long) % 4294967296) + 4294967296) % 4294967296
+    y = (((c.x as long) % 4294967296) + 4294967296) % 4294967296
     r = 0 as long
     match op {
         "+" -> { r = x + y }
         "-" -> { r = x - y }
-        "*" -> { r = (x * y) % 4294967296 }
+        "*" -> {
+            // Wrapped to 32 bits a half of y at a time: the whole product of
+            // two 32-bit words is past a long.
+            low = (x * (y % 65536)) % 4294967296
+            high = ((x * (y / 65536)) % 65536) * 65536
+            r = (low + high) % 4294967296
+        }
         "/" -> { if y != 0 { r = x / y } }
         "%" -> { if y != 0 { r = x % y } }
         "&" -> { r = x & y }
@@ -3356,10 +4323,46 @@ fn cpu_binary(cx: *GpuRun, n: quote.Node, op: string, ty: string, a: *GpuVal, c:
         if on { r = 1.0 }
         return keep(cx, mkval(0, r, 0.0, 0.0, 0.0))
     }
+    if ty == "int" && (op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
+        // On 32-bit ints, as GLSL's are: a shift by 32 or more is undefined
+        // there and gives 0 here; >> keeps the sign.
+        // Each as the 32-bit int its value wraps to (a double past an int's
+        // range is no int to cast).
+        xi = ((a.x as long) as int) as long
+        yi = ((c.x as long) as int) as long
+        ri = 0 as long
+        match op {
+            "&" -> { ri = xi & yi }
+            "|" -> { ri = xi | yi }
+            "^" -> { ri = xi ^ yi }
+            "<<" -> { if yi >= 0 && yi < 32 { ri = xi << yi } }
+            ">>" -> { if yi >= 0 && yi < 32 { ri = xi >> yi } }
+            _ -> { ri = 0 }
+        }
+        return keep(cx, int_val(ri))
+    }
     if op != "+" && op != "-" && op != "*" && op != "/" && op != "%" {
         return fail(cx, n, "the operator ${op} is not run on the CPU")
     }
     whole = ty == "int"
+    if whole && a.n == 1 && c.n == 1 && (op == "+" || op == "-" || op == "*") {
+        // On 32-bit ints, wrapped as GLSL's are: the scene's hash
+        // multiplies past them.
+        xa = (a.x as long) % 4294967296
+        xb = (c.x as long) % 4294967296
+        wr = 0 as long
+        if op == "+" { wr = xa + xb }
+        if op == "-" { wr = xa - xb }
+        if op == "*" { wr = (xa * xb) % 4294967296 }
+        return keep(cx, int_val(wr))
+    }
+    if whole && a.n == 1 && c.n == 1 && (op == "/" || op == "%") {
+        xd = (a.x as long) as int
+        yd = (c.x as long) as int
+        if yd == 0 { return keep(cx, int_val(0)) }
+        if op == "/" { return keep(cx, int_val((xd / yd) as long)) }
+        return keep(cx, int_val((xd % yd) as long))
+    }
     m = a.n
     if c.n > m { m = c.n }
     out = keep(cx, mkval(m, 0.0, 0.0, 0.0, 0.0))
@@ -3481,6 +4484,20 @@ fn cpu_lanes(cx: *GpuRun, n: quote.Node, fname: string, a: *GpuVal, c: *GpuVal, 
             r = asin(x)
         } else if fname == "acos" {
             r = acos(x)
+        } else if fname == "step" {
+            // step(edge = x, value = y)
+            r = 1.0
+            if y < x { r = 0.0 }
+        } else if fname == "mod" {
+            r = x - y * (floori(x / y) * 1.0)
+        } else if fname == "ceil" {
+            r = 0.0 - (floori(0.0 - x) * 1.0)
+        } else if fname == "exp2" {
+            r = pow(2.0, x)
+        } else if fname == "log" {
+            r = log2(x) * 0.6931471805599453
+        } else if fname == "inversesqrt" {
+            r = 1.0 / sqrt(x)
         } else {
             return fail(cx, n, "${fname}() is not run on the CPU")
         }
@@ -3595,6 +4612,84 @@ fn cpu_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
     why = call_refused(n)
     if why != "" { return fail(cx, n, why) }
     name = bare_call(quote.name(n))
+    argc0 = quote.child_count(n)
+    // The pixel dropped: the run stops, as at a return, giving nothing.
+    if name == "discard" {
+        cx.discarded = true
+        cx.flow = FLOW_RETURN
+        return keep(cx, v1(0.0))
+    }
+    // How a value changes to the next pixel: there is none on the CPU.
+    if name == "dfdx" || name == "dfdy" || name == "dfdx_v2" || name == "dfdy_v2" || name == "dfdx_v3" ||
+       name == "dfdy_v3" || name == "fwidth_v3" {
+        a = cpu_expr(cx, quote.child(n, 0))
+        return keep(cx, mkval(a.n, 0.0, 0.0, 0.0, 0.0))
+    }
+    if name == "texture_grad" && argc0 == 4 {
+        tex = quote.child(n, 0)
+        img = texture_image(cx, tex)
+        if img == null { return fail(cx, n, "texture_grad() of ${quote.name(tex)}, which has no image") }
+        uv = cpu_expr(cx, quote.child(n, 1))
+        return sample(cx, img as *ShaderImage, uv.x, uv.y)
+    }
+    if name == "uint_of_int" && argc0 == 1 { return keep(cx, whole32(cpu_expr(cx, quote.child(n, 0)).x)) }
+    if name == "mul_cols3" && argc0 == 4 {
+        a = cpu_expr(cx, quote.child(n, 0))
+        b = cpu_expr(cx, quote.child(n, 1))
+        c = cpu_expr(cx, quote.child(n, 2))
+        v = cpu_expr(cx, quote.child(n, 3))
+        return keep(cx, mkval(3, a.x * v.x + b.x * v.y + c.x * v.z, a.y * v.x + b.y * v.y + c.y * v.z,
+                              a.z * v.x + b.z * v.y + c.z * v.z, 0.0))
+    }
+    if name == "mat4_rows" && argc0 == 4 {
+        p = matrix_new(cx)
+        r = 0
+        while r < 4 {
+            row = cpu_expr(cx, quote.child(n, r))
+            c = 0
+            while c < 4 {
+                (p.mat as f32[])[c * 4 + r] = lane(row, c) as f32
+                c = c + 1
+            }
+            r = r + 1
+        }
+        return p
+    }
+    if name == "mul_transpose_m2" && argc0 == 2 {
+        m = cpu_expr(cx, quote.child(n, 0))
+        v = cpu_expr(cx, quote.child(n, 1))
+        return keep(cx, mkval(2, m.x * v.x + m.y * v.y, m.z * v.x + m.w * v.y, 0.0, 0.0))
+    }
+    if (name == "lane_at" || name == "lane_at_v3") && argc0 == 2 {
+        v = cpu_expr(cx, quote.child(n, 0))
+        k = floori(cpu_expr(cx, quote.child(n, 1)).x)
+        if k < 0 || k >= v.n { return fail(cx, n, "${name}() of lane ${k}, past the value's ${v.n}") }
+        return keep(cx, v1(lane(v, k)))
+    }
+    if (name == "floats_at_i" || name == "vec4s_at_i") && argc0 == 2 {
+        bn = quote.child(n, 0)
+        cell = texture_image(cx, bn)
+        if cell == null { return fail(cx, n, "${name}() of ${quote.name(bn)}, which is not a captured buffer") }
+        i = cpu_expr(cx, quote.child(n, 1)).x as long
+        if name == "floats_at_i" {
+            fb = cell as *Floats
+            if fb.data == null || i < 0 || i >= fb.count { return keep(cx, v1(0.0)) }
+            return keep(cx, v1(((fb.data as f32[])[i]) as float))
+        }
+        vb = cell as *Vec4s
+        if vb.data == null || i < 0 || i >= vb.count { return keep(cx, mkval(4, 0.0, 0.0, 0.0, 0.0)) }
+        d = vb.data as f32[]
+        return keep(cx, mkval(4, d[i * 4] as float, d[i * 4 + 1] as float, d[i * 4 + 2] as float, d[i * 4 + 3] as float))
+    }
+    if name == "vec3_of_v2" { name = "vec3" }
+    if name == "abs_int" && argc0 == 1 {
+        ai = (cpu_expr(cx, quote.child(n, 0)).x as long) as int
+        if ai < 0 { ai = 0 - ai }
+        return keep(cx, int_val(ai as long))
+    }
+    if name == "clamp_int" || name == "min_int" || name == "max_int" {
+        name = string.substring(name, 0, string.length(name) - 4)
+    }
     // A further signature's name runs as GLSL's one name (min_v3 as min):
     // the lanes are as many as its values have.
     if string.ends_with(name, "_v2") != 0 || string.ends_with(name, "_v3") != 0 || string.ends_with(name, "_v4") != 0 {
@@ -3811,7 +4906,11 @@ fn cpu_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
         return keep(cx, whole32(((x as long) * 1.0)))
     }
     if name == "float_of_uint" && argc == 1 { return keep(cx, v1(cpu_expr(cx, quote.child(n, 0)).x)) }
-    if (name == "zx" || name == "yx") && argc == 1 { return cpu_field(cx, n, cpu_expr(cx, quote.child(n, 0)), name) }
+    if (name == "zx" || name == "yx" || name == "yzx" || name == "zy" || name == "zyx" || name == "xzy") && argc == 1 {
+        return cpu_field(cx, n, cpu_expr(cx, quote.child(n, 0)), name)
+    }
+    if name == "xy_v3" && argc == 1 { return cpu_field(cx, n, cpu_expr(cx, quote.child(n, 0)), "xy") }
+
     if name == "xyz" && argc == 1 { return cpu_field(cx, n, cpu_expr(cx, quote.child(n, 0)), "xyz") }
     if name == "length" && argc == 1 { return keep(cx, v1(sqrt(dot_of(cpu_expr(cx, quote.child(n, 0)))))) }
     if name == "normalize" && argc == 1 {
@@ -3908,6 +5007,13 @@ fn cpu_call(cx: *GpuRun, n: quote.Node) -> *GpuVal {
         d = cpu_expr(cx, quote.child(n, 0))
         if cx.dialect == GL { return keep(cx, v1(d.x * 2.0 - 1.0)) }
         return keep(cx, v1(d.x))
+    }
+    // A clip-space z as a depth map stores it: OpenGL's -1..1 halved into
+    // 0..1, Vulkan's 0..1 as it is.
+    if name == "clip_depth" && argc == 1 {
+        z = cpu_expr(cx, quote.child(n, 0))
+        if cx.dialect == GL { return keep(cx, v1(z.x * 0.5 + 0.5)) }
+        return keep(cx, v1(z.x))
     }
     if name == "screen_y_sign" && argc == 0 {
         if cx.dialect == GL { return keep(cx, v1(1.0)) }
