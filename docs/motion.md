@@ -25,6 +25,7 @@ motion.hit(body, human.BONE_SPINE_03, point, impulse)
 | `POWERED` | Muscles. Every joint's motor drives it toward the pose the animation gives it, within a torque budget. Nothing holds the figure up but its own feet and a balance the pelvis keeps within a budget of its own. The figure is drawn as its bodies are. |
 | `LIMP` | A ragdoll. The animation follows the bodies. |
 | `GETTING_UP` | Not set but got to: `get_up(body)` from the ground. A way up keyed on the rig, the bodies following it as an `ANIMATED` figure's do. |
+| `ACTING` | Not set but got to: `sit`, `stand_up`, `lie_down` (#825). An action keyed on its contacts, followed as a way up is; sat or lain, it holds there. |
 
 **Going with its object.** `engine.destroy(e, o)` on a figure's object takes the figure with it (#714): its meshes out of the renderer, the figure out of the engine's list, and its file's models freed at the end of the frame. An active ragdoll from `motion.on_figure` or `on_skeleton` goes too: its twelve bones' objects are destroyed, its bodies taken out of the world, and the motion released and freed, so a program drops its `*Motion` with the object. A ragdoll built by hand is taken out with `physics.ragdoll_destroy(r)`. When the whole scene goes at once, at the engine's end, figures and motions are freed after the engine (`figures_free`, `motions_free`), as before.
 
@@ -472,6 +473,37 @@ A figure that was `POWERED` is `POWERED` again once up; any other ends `ANIMATED
 | facing, against where its feet (head) lay | 16° | 12° | |
 
 The blended figure takes 15 steps, a quarter second, and no drawn bone turns more than 1.3° in a step. The limits the test holds are 6° a step, 40 mm a step for the hips, 1° and 5 mm at the hand-over, 3 cm into the ground, 10° of lean afterwards and 30° of facing.
+
+## Sitting and lying down
+
+A figure can sit on a seat and lie down on the ground, and get up from either (#825). These are actions at an interaction point, as GTA V's scenario points and Unreal's Smart Objects are: a seat, or a bedroll, and the way the figure faces there. The way down and back up is keyed and planned on its contacts, as the way up from the ground is. The feet stay on the spots they stood on, solved to them every step and pinned there, and the bodies follow the keys through the anchors, so a seat holds them. A game with a clip for the action can give the clip instead, warped to the same point (to come).
+
+- **Sitting.** `sit(body, seat, facing)` sits it on `seat` (where its hips' middle comes to rest, on the seat's top), facing `facing`, from POWERED or ANIMATED. The keys follow a person's sit-to-stand (Schenkman et al. 1990) run down and back up: the trunk leans 35° over the feet as the hips go back and down, then sits upright, the hands on the thighs, set down by its own pelvis and thigh capsules on the seat. `sit_spot(body, seat, facing)` says where to stand so the shins come out upright: a thigh's length ahead of the seat. `sitting(body)` says it is sitting or sat, `seated(body)` that it has come to sit.
+- **Standing up.** `stand_up(body)` leans it forward 42° on the seat, lifts the hips over the feet, and ends in the animation's pose where the feet stand, handed back to the mode it sat down from, as a get-up is.
+- **Lying down.** `lie_down(body, head)` lays it on its back with its head toward `head`, from where it stands: it squats over its feet, sits back on the ground leaning on its hands behind its hips, and lies back flat, its legs out, its hands by its hips and its elbows on the ground. That is the face-up way up run the other way. `lie_spot(body, middle, head)` says where to stand to lie with the hips at a bedroll's middle. It lies until `get_up(body)`, which rises from its back and ends in the mode it lay down from. `lying_down(body)` says it is lying down or lain.
+
+While a figure acts it is in `ACTING` (`acting(body)`), got to as `GETTING_UP` is; `set_mode` ends the action.
+
+Three things about the way's stages came out of measuring the feet and the turns, and apply to every keyed way:
+
+- A stage into the animation's pose eases each limb onto its turns by what its solve at that key is short of it, in the bone's own frame: 3° of swing and up to 3° of twist on the box man, because a near-straight knee or elbow has no bend to read its pole from. Eased onto the key's turns in the world instead, while the trunk was still on its way, a figure standing up from a seat drew its ankles 65 mm off their spots in the middle of the stage. A last key planned on its contacts (sat, lying) is not eased at all: its limbs are its solves.
+- A planted foot keeps the turn it stands with. Set flat to face the way, as a way up sets a foot it brings under it, a sitter's feet lost their toes' splay going down and turned it back coming up, the foot's middle sweeping 40 mm round its ankle.
+- The planted feet's anchors are held at 30 Hz (`physics.ragdoll_plant`), PuppetMaster's pin weight on a planted foot. At the anchors' 5 Hz, a figure standing up from a seat pushed its feet 5.3 mm along the ground as its weight came onto them.
+
+And a key's limbs must be ones its body can take. Lying, the elbows bent toward the sky were drawn 69° past their hinges and the feet 90° up at an ankle that bends 35. The bodies stayed where they could, and as the way up began from where the bodies lay, the arms jumped 9° in a step.
+
+`tests/test_sit.ae` and `tests/test_lie.ae` hold them to the numbers a game judges them by, on the box man with feet of its own:
+
+| | measured | held to |
+|---|---|---|
+| sat, the pelvis and thighs over the log's top | 0.04 cm | under 3 cm, no more than 1 cm into it |
+| the toes sliding along the ground, sitting down / standing up | 2.8 / 3.5 mm | 5 mm |
+| the worst turn of any body in a step, sitting and standing | 2.9° | 6° |
+| lying, past the bedroll's edge / under its top | 0 / 0.6 cm | 0 / 1 cm |
+| up from lying | 3.6 s | 4 s |
+| the worst turn of any body in a step, lying down and getting up | 5.5° | 6° |
+
+Stood or risen, it is upright (under 0.1 rad) and in its mode a second on.
 
 ## What it costs
 
