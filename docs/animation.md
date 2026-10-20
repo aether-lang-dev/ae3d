@@ -267,6 +267,30 @@ it is the lowest, as it lands and lifts, played on the spot as much as
 under a body. Pacing cannot take that out; locking the feet (`ae3d.feet`)
 does, on a figure with legs to solve.
 
+## Going to a spot
+
+`locomotion.go_to(l, at, facing, running)` (#825) sends a figure to a spot and stops it there, facing a given way: the spot a game sends someone to, to sit, to work, to stand guard. It sets the input each step; `arrived(l)` says it is within 5 cm and 0.1 rad, standing, and `set_input` or `stop_going` ends it.
+
+- **Arriving.** Toward the spot at the speed it can still stop from in the distance left, braking at half its `DECELERATION` (Reynolds' arrive, 1999), so its own momentum brings it to rest there. Once there it stays, until it is moved more than 0.3 m off: a person does not walk a 5 cm correction, and steered again for every drift, the box man turned to face each one and ended 104 degrees off.
+- **Coming in along the facing.** Over its last metre it comes along the way it is to face, as a GTA scenario point's or an Unreal Smart Object slot's entry has a character come in: it heads for a point a metre back along the facing, then walks the line. Turned on the spot at the end instead, its body was walked round its planted foot, 0.26 m off the spot. From nearer than a metre and a half when sent, it goes straight there and turns on the spot.
+- **Stopping on a footfall (#828).** The walk is paced to the body, so its cycle and the ground go together. At attach the walk's footfalls are read from the clip (the moments its lowest foot changes to the other), and the stop is planned onto the footfall nearest the spot that it can still brake to: Distance Matching's aim (Paragon, GDC 2016), a move ending on its mark with its feet where they land. It stops with both feet down. Cut wherever the speed ran out, the walk ended mid-stride and the lifted foot was carried 8 cm low over the ground to the idle's place. A run brakes into the walk before the stop is planned, since a run's footfall nearest the spot can be 0.38 m off it.
+- **Keeping its gait.** It runs once past the middle of the walk's and the run's speeds by `GAIT_BAND` (0.15 m/s), and walks again only below it by as much: switched at the middle itself, a figure braking from a run changed clip every frame, each change a new blend, and a foot was flung up to its hips.
+- **Turning on the spot by steps (#827).** `set_turn_steps(l, true)`, for a figure on `ae3d.feet`: turning on the spot it plays its idle, turns at `TURN_SPOT_RATE` (2.5 rad/s, about a second and a quarter for a turn round), and the feet stay planted and step themselves round, about every 45 degrees, as `ae3d.feet` steps a standing figure's feet. That is procedural legs' planting and stepping. Off, as before, the walk is played at a slow pace and held on its planted foot, which carries the body round it.
+
+For the feet's own steps, `ae3d.feet` now asks the body to be still where it stands: the clip's ankle still in the figure's own frame, and the root not going over the ground. Turning where it stands is still. Measured in the world, the turning body moved every ankle and no foot stepped until the turn was over; measured in the clip alone, a body carried over a held foot stepped it by itself. And a step is over its place by 80% of its way before it is set down, as a foot reaches its place before it lands: carried the whole way, a turning figure's foot came down still going 13 mm a frame.
+
+`tests/test_go_to.ae` sends the box man on `ae3d.feet` to a spot 10 m off five ways:
+
+| | arrived in | off the spot | toe slid in a plant, at the most |
+|---|---|---|---|
+| straight ahead | 10.7 s | 6.0 cm | 4.1 mm |
+| ahead, then turned a quarter | 11.7 s | 16.3 cm | 5.0 mm |
+| to its side | 11.8 s | 19.8 cm | 7.7 mm |
+| behind it | 11.3 s | 10.3 cm | 8.4 mm |
+| ahead at a run | 5.6 s | 7.8 cm | 15.6 mm |
+
+Each faces the way asked to the degree, no bone goes faster than 7 m/s in the figure's frame, and its toes move under 5 mm in the 1.5 s after it arrives. #825's bar is 5 mm a plant: setting off and turning while walking (#827) and braking a run (#828) still slide a toe further, and the test holds them to what they slide now until those are fixed.
+
 ## Motion matching
 
 `ae3d.matching` (#586, part of #509) moves a figure the way motion matching
