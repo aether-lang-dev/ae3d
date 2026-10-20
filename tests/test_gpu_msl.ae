@@ -1,0 +1,252 @@
+// ae3d.gpu's MSL (the METAL dialect: emit_msl, emit_vertex_msl,
+// emit_screen_vertex_msl), on a pair of its own; no GPU. What is checked here
+// is what the MSL is made of, where it departs from the GLSL; that it
+// compiles is scripts/msl_check.sh's (Metal's compiler, every warning an
+// error), over this pair too when AE3D_MSL_OUT names a directory to write it
+// to, and over every quoted shader the renderers draw (src/ae3d/metal, held
+// current by tools/generate_shaders.ae --check).
+//
+//   - a captured struct in the shader's own block is laid out as std140 has
+//     it: a vec3 a packed_float3, an array of floats one of float4s read
+//     through .x, an array of structs (its element a struct of its own with a
+//     maker for its literals); each member's offset a static_assert, at the
+//     offsets the GLSL's block has (uniforms_offset);
+//   - a helper that reads a capture in place is handed it by name, and so is
+//     a helper calling it; a texture handed to a helper goes with its
+//     sampler; a helper whose own name would hide what it is handed is
+//     refused (MSL only: GLSL reads the capture as a global);
+//   - the vertex shader: its attributes at the table's [[attribute(n)]] (a
+//     mat4 four float4s), its varyings at [[user(locnK)]], its position's y
+//     negated as it returns it; the pixel shader reads an int varying
+//     [[flat]], writes each output four lanes wide at [[color(k)]];
+//   - names MSL keeps (constant, level) given an underscore, in MSL alone;
+//   - writing MSL leaves the GLSL and OpenGL's uniform names as they were.
+import std.os
+import std.file
+import std.string
+import std.quote
+import ae3d.gpu
+import ae3d.gpu (GpuShader, vertex)
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, texture, rgb, mul, splat3, xyz, float_of)
+
+extern exit(code: int)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+has(text: string, part: string) -> bool { return string.contains(text, part) != 0 }
+
+// ── The captures ──────────────────────────────────────────────────────
+
+struct Bulb {
+    position: vec3
+    power: float
+}
+
+struct Lamp {
+    colour: vec3
+    gain: float
+    level: float
+    taps: float[4]
+    bulbs: Bulb[2]
+}
+
+struct MslVertex {
+    position: vec3
+    uv: vec2
+    instance_model: mat4
+}
+
+struct MslVaryings {
+    position: vec4
+    Coord: vec2
+    Level: int
+}
+
+struct MslOut {
+    colour: vec4
+    motion: vec2
+}
+
+// ── The helpers ───────────────────────────────────────────────────────
+
+// Read in place: every call hands it the lamp's colour and gain.
+@quotable
+lamp_tint(c: vec3, gain: float) -> vec3 { return c * gain }
+
+// Calls one that reads in place: handed the lamp too.
+@quotable
+lamp_twice(c: vec3, gain: float) -> vec3 { return lamp_tint(c, gain) * 2.0 }
+
+// Handed two textures, so its own parameter: with its sampler.
+@quotable
+tap(t: Texture, uv: vec2) -> vec4 { return texture(t, uv) }
+
+// A bulb, whole: an element of the captured array.
+@quotable
+bulb_power(b: Bulb) -> float { return b.power }
+
+// Its own `lamp` would hide the lamp its callee reads in place.
+@quotable
+shadowed(lamp: float, gain: float) -> float { return lamp + lamp_tint(splat3(1.0), gain).x }
+
+place(s: *GpuShader) {
+    _c = gpu.capture_field(s, "lamp", "colour", offsetof(Lamp, colour))
+    _g = gpu.capture_field(s, "lamp", "gain", offsetof(Lamp, gain))
+    _l = gpu.capture_field(s, "lamp", "level", offsetof(Lamp, level))
+    _t = gpu.capture_field(s, "lamp", "taps", offsetof(Lamp, taps))
+    _b = gpu.capture_field(s, "lamp", "bulbs", offsetof(Lamp, bulbs))
+    _p = gpu.capture_element_field(s, "lamp", "bulbs", sizeof(Bulb), "position", offsetof(Bulb, position))
+    _w = gpu.capture_element_field(s, "lamp", "bulbs", sizeof(Bulb), "power", offsetof(Bulb, power))
+}
+
+msl_vertex(lift: float) -> *GpuShader {
+    return vertex("msl_vertex") quote | v: MslVertex | {
+        p = mul(v.instance_model, vec4(v.position, 1.0))
+        return MslVaryings { position: vec4(xyz(p), p.w + lift), Coord: v.uv, Level: 2 }
+    }
+}
+
+msl_pixel(lamp: Lamp, screen: Texture, glow: Texture, device: float) -> *GpuShader {
+    s = gpu.fragment("msl_pixel") quote | f: MslVaryings | {
+        constant = lamp.taps[1]
+        level = float_of(f.Level) + lamp.level * device
+        lit = lamp_twice(lamp.colour, lamp.gain) + lamp_tint(lamp.colour, lamp.gain)
+        made = Bulb { position: lamp.bulbs[0].position, power: constant }
+        c = rgb(tap(screen, f.Coord)) + rgb(tap(glow, f.Coord)) + lit * (level + bulb_power(made) + bulb_power(lamp.bulbs[1]))
+        return MslOut { colour: vec4(c, constant), motion: f.Coord }
+    }
+    place(s)
+    gpu.read_in_place(s)
+    return s
+}
+
+hidden_pixel(lamp: Lamp) -> *GpuShader {
+    s = gpu.fragment("msl_hidden") quote | uv: vec2 | {
+        return vec4(splat3(shadowed(uv.x, lamp.gain) + shadowed(uv.y, lamp.gain)), 1.0)
+    }
+    place(s)
+    gpu.read_in_place(s)
+    return s
+}
+
+// The offset of OpenGL's value `name` in the shader's block, -1 for none.
+leaf(s: *GpuShader, name: string) -> int {
+    k = 0
+    while k < gpu.uniforms_count(s) {
+        if gpu.uniforms_name(s, k) == name { return gpu.uniforms_offset(s, k) }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+uniform_names(s: *GpuShader) -> string {
+    out = ""
+    k = 0
+    while k < gpu.uniforms_count(s) {
+        out = "${out}${gpu.uniforms_name(s, k)}@${gpu.uniforms_offset(s, k)} "
+        k = k + 1
+    }
+    return out
+}
+
+write_out(name: string, text: string) {
+    dir = os.getenv("AE3D_MSL_OUT")
+    if dir == null { return }
+    _w = file.write("${dir}/${name}", text)
+}
+
+main() {
+    lamp = Lamp { gain: 1.0 }
+    screen = Texture { image: null }
+    glow = Texture { image: null }
+    vs = msl_vertex(0.0)
+    ps = msl_pixel(lamp, screen, glow, 0.5)
+    check("the pair links", gpu.link(vs, ps))
+
+    // What the GLSL is before any MSL is written, to hold it to after.
+    vk_before = gpu.emit_glsl(ps, gpu.VULKAN)
+    gl_before = gpu.emit_glsl(ps, gpu.GL)
+    vert_before = gpu.emit_vertex_glsl(vs, gpu.VULKAN, "", "")
+    names_before = uniform_names(msl_pixel(lamp, screen, glow, 0.5))
+    check("the GLSL is written", vk_before != "" && gl_before != "" && vert_before != "")
+
+    frag = gpu.emit_msl(ps)
+    vert = gpu.emit_vertex_msl(vs, "", "")
+    // A shader made straight after the MSL was written, its names made then.
+    names_after = uniform_names(msl_pixel(lamp, screen, glow, 0.5))
+    if frag == "" || vert == "" { println("    ${gpu.last_error()}") }
+    check("the MSL is written", frag != "" && vert != "")
+    write_out("msl_pixel.frag.metal", frag)
+    write_out("msl_vertex.vert.metal", vert)
+
+    println("std140 in MSL")
+    check("a vec3 in a block is a packed_float3", has(frag, "    packed_float3 colour;\n"))
+    check("an array of floats is one of float4s", has(frag, "    float4 taps[4];\n"))
+    check("and is read through its first lane", has(frag, "float constant_ = lamp.taps[1].x;"))
+    check("an array of structs is one of its element's struct", has(frag, "    Bulb bulbs[2];\n") && has(frag, "\nstruct Bulb {\n    packed_float3 position;\n"))
+    check("a literal of the element is its maker's", has(frag, "ae_make_Bulb(lamp.bulbs[0].position, constant_)"))
+    check("the struct is the shader's own block's, by reference", has(frag, "constant Lamp& lamp = ae_params.lamp;") &&
+          has(frag, "constant ae_Params& ae_params [[buffer(0)]]"))
+    // Every offset the GLSL's block has is the MSL's, asserted.
+    base = leaf(ps, "lamp.colour")
+    check("lamp sits at the block's start", base == 0 && has(frag, "__builtin_offsetof(ae_Params, lamp) == 0,"))
+    check("gain where the GLSL has it", has(frag, "__builtin_offsetof(Lamp, gain) == ${leaf(ps, "lamp.gain") - base},"))
+    check("taps where the GLSL has them", has(frag, "__builtin_offsetof(Lamp, taps) == ${leaf(ps, "lamp.taps[0]") - base},"))
+    bulbs = leaf(ps, "lamp.bulbs[0].position")
+    check("bulbs where the GLSL has them", has(frag, "__builtin_offsetof(Lamp, bulbs) == ${bulbs - base},"))
+    check("a bulb's power where the GLSL has it", has(frag, "__builtin_offsetof(Bulb, power) == ${leaf(ps, "lamp.bulbs[0].power") - bulbs},"))
+    check("a bulb's size the GLSL's stride", has(frag, "sizeof(Bulb) == ${leaf(ps, "lamp.bulbs[1].position") - bulbs},"))
+
+    println("helpers")
+    check("one reading in place is handed the lamp by name",
+          has(frag, "lamp_tint(constant Lamp& lamp)") && has(frag, "lamp_tint(lamp)"))
+    check("and so is one calling it", has(frag, "lamp_twice(constant Lamp& lamp)") && has(frag, "lamp_twice(lamp)"))
+    // (Its uv is the varying every call hands it, read in place: handed
+    // on by name too.)
+    check("a texture goes with its sampler", has(frag, "tap(texture2d<float> t, sampler ae_smp_t, float2 Coord)") &&
+          has(frag, "tap(screen, ae_smp_screen, Coord)") && has(frag, "t.sample(ae_smp_t, Coord)"))
+    check("and the entry is handed each at its index",
+          has(frag, "texture2d<float> screen [[texture(0)]], sampler ae_smp_screen [[sampler(0)]]") &&
+          has(frag, "texture2d<float> glow [[texture(1)]], sampler ae_smp_glow [[sampler(1)]]"))
+    check("helpers are the file's own", has(frag, "\nstatic float3 "))
+    hidden = gpu.emit_msl(hidden_pixel(lamp))
+    check("a helper's own name hiding what it is handed is refused", hidden == "" && has(gpu.last_error(), "would hide it"))
+    check("which the GLSL is not", gpu.emit_glsl(hidden_pixel(lamp), gpu.VULKAN) != "")
+
+    println("the stages")
+    check("a mat4 attribute is four float4s at its locations",
+          has(vert, "float4 instanceModel_0 [[attribute(3)]];") && has(vert, "float4 instanceModel_3 [[attribute(6)]];") &&
+          has(vert, "float4x4 instanceModel = float4x4(ae_in.instanceModel_0, ae_in.instanceModel_1, ae_in.instanceModel_2, ae_in.instanceModel_3);"))
+    check("the others at the table's", has(vert, "float3 inPosition [[attribute(0)]];") && has(vert, "float2 inTexCoord [[attribute(1)]];"))
+    check("the varyings at their locations", has(vert, "float2 Coord [[user(locn0)]];") && has(vert, "int Level [[user(locn1)]];"))
+    check("the position's y negated as it is returned",
+          has(vert, "    ae_out.ae_position.y = -ae_out.ae_position.y;\n    return ae_out;\n"))
+    check("the pixel shader reads an int flat", has(frag, "int Level [[user(locn1)]] [[flat]];"))
+    check("its outputs four lanes wide", has(frag, "float4 out_motion [[color(1)]];") && has(frag, "ae_out.out_motion = float4(Coord, 0.0, 0.0);"))
+    check("names MSL keeps given an underscore", has(frag, "float level_ = float(Level) + lamp.level_ * device_;") &&
+          has(frag, "constant float& device_ = ae_params.device_;"))
+
+    println("the GLSL as it was")
+    check("Vulkan's", gpu.emit_glsl(ps, gpu.VULKAN) == vk_before)
+    check("OpenGL's", gpu.emit_glsl(ps, gpu.GL) == gl_before)
+    check("the vertex shader's", gpu.emit_vertex_glsl(vs, gpu.VULKAN, "", "") == vert_before)
+    // device, a word MSL keeps, still OpenGL's device.
+    check("OpenGL's uniform names", names_after == names_before && has(names_before, " device@"))
+
+    if g_failures > 0 {
+        println("gpu_msl: ${g_failures} of ${g_checks} checks failed")
+        exit(1)
+    }
+    println("gpu_msl: all checks passed (${g_checks})")
+}
