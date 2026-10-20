@@ -331,6 +331,14 @@ fi
 # passes' times on the card that recorded them. Twice: the default near band,
 # and the 28 m one, where the shadow stage once took 9.6 ms of a 7.6 fps
 # frame. On Vulkan, the renderer the engine is taken forward on.
+#
+# A device that traces rays shadows the city by ray, and one that does not
+# draws its shadow map: every cascade's and every lamp face's casters, 410
+# draws more of the frame on an Apple M6 (696 against the 285 of the RTX
+# 4070 Ti's) and six pipelines (11 against 5). The frame is a different one,
+# so it has a budget of its own, recorded where the shadow map stands
+# (*.shadowmap.budget.json), and the bench takes it when frame.stats says
+# the frame was not traced.
 city_cost() {   # city_cost <name> <port> <baseline> [VAR=value ...]
     city_name="zombie_city at 20,000 ($1, vulkan)"
     city_port="$2"
@@ -348,7 +356,8 @@ city_cost() {   # city_cost <name> <port> <baseline> [VAR=value ...]
     attempt=0
     while [ "$attempt" -lt 300 ]; do
         kill -0 "$city_scene" 2>/dev/null || break
-        bounded "$RUN_LIMIT" ./build/ae3d_bench "$city_port" --hold 90 --baseline "$city_baseline" >"$city_log" 2>&1
+        bounded "$RUN_LIMIT" ./build/ae3d_bench "$city_port" --hold 90 --baseline "$city_baseline" \
+            --shadow-map-baseline "${city_baseline%.budget.json}.shadowmap.budget.json" >"$city_log" 2>&1
         costed=$?
         grep -q 'nothing answering' "$city_log" || break
         attempt=$((attempt + 1))
