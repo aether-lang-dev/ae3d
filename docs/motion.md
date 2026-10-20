@@ -478,7 +478,7 @@ The blended figure takes 15 steps, a quarter second, and no drawn bone turns mor
 
 A figure can sit on a seat and lie down on the ground, and get up from either (#825). These are actions at an interaction point, as GTA V's scenario points and Unreal's Smart Objects are: a seat, or a bedroll, and the way the figure faces there. The way down and back up is keyed and planned on its contacts, as the way up from the ground is. The feet stay on the spots they stood on, solved to them every step and pinned there, and the bodies follow the keys through the anchors, so a seat holds them. A game with a clip for the action can give the clip instead, warped to the same point (to come).
 
-- **Sitting.** `sit(body, seat, facing)` sits it on `seat` (where its hips' middle comes to rest, on the seat's top), facing `facing`, from POWERED or ANIMATED. The keys follow a person's sit-to-stand (Schenkman et al. 1990) run down and back up: the trunk leans 35° over the feet as the hips go back and down, then sits upright, the hands on the thighs, set down by its own pelvis and thigh capsules on the seat. `sit_spot(body, seat, facing)` says where to stand so the shins come out upright: a thigh's length ahead of the seat. `sitting(body)` says it is sitting or sat, `seated(body)` that it has come to sit.
+- **Sitting.** `sit(body, seat, facing)` sits it on `seat` (where its hips' middle comes to rest, on the seat's top), facing `facing`, from POWERED or ANIMATED. The keys follow a person's sit-to-stand (Schenkman et al. 1990) run down and back up: the trunk leans 35° over the feet as the hips go back and down, then sits upright, the hands on the thighs. It is set down by its drawn pelvis and thighs against the seat's own surface under each point of them, sampled once a sit, so a round log holds it as a flat seat does (#833). Each hand rests where its arm reaches with the elbow bent 30° at least, further up the thigh on a high seat (#834). `sit_spot(body, seat, facing)` says where to stand so the shins come out upright: a thigh's length ahead of the seat. `sitting(body)` says it is sitting or sat, `seated(body)` that it has come to sit.
 - **Standing up.** `stand_up(body)` leans it forward 42° on the seat, lifts the hips over the feet, and ends in the animation's pose where the feet stand, handed back to the mode it sat down from, as a get-up is.
 - **Lying down.** `lie_down(body, head)` lays it on its back with its head toward `head`, from where it stands: it squats over its feet, sits back on the ground leaning on its hands behind its hips, and lies back flat, its legs out, its hands by its hips and its elbows on the ground. That is the face-up way up run the other way. `lie_spot(body, middle, head)` says where to stand to lie with the hips at a bedroll's middle. It lies until `get_up(body)`, which rises from its back and ends in the mode it lay down from. `lying_down(body)` says it is lying down or lain.
 
@@ -496,14 +496,41 @@ And a key's limbs must be ones its body can take. Lying, the elbows bent toward 
 
 | | measured | held to |
 |---|---|---|
-| sat, the pelvis and thighs over the log's top | 0.04 cm | under 3 cm, no more than 1 cm into it |
-| the toes sliding along the ground, sitting down / standing up | 2.8 / 3.5 mm | 5 mm |
-| the worst turn of any body in a step, sitting and standing | 2.9° | 6° |
+| sat, the pelvis and thighs over a squared log's top / a round one's, 0.6 m up | 0.00 / 0.03 cm into it | under 1 mm over it, no more than 1 mm into it |
+| the toes sliding along the ground, sitting down / standing up | 3.1 / 3.8 mm | 5 mm |
+| the worst turn of any body in a step, sitting and standing, the 0.4 m log / the 0.6 m one | 3.0° / 2.7° | 6° |
 | lying, past the bedroll's edge / under its top | 0 / 0.6 cm | 0 / 1 cm |
 | up from lying | 3.6 s | 4 s |
 | the worst turn of any body in a step, lying down and getting up | 5.5° | 6° |
 
 Stood or risen, it is upright (under 0.1 rad) and in its mode a second on.
+
+### Holding and eating
+
+Sat, a figure can take something in both hands and eat from it (#825's 3). What it holds is an interaction point of its own, as a GTA V scenario's prop and an Unreal Smart Object's hand slots are: the places on it the hands grip, in its own frame.
+
+- `hold(body, item, left, right)` takes `item`, sat. The grips `left` and `right` are in the item's frame, and each goes to the hand on the side nearer it. The item rests over the thighs, `LAP_AHEAD` ahead of the hips' middle.
+- Each step the item is placed, and the hands are solved onto its grips with the arms' two-bone solve, elbows down and out.
+- The hands go from the thighs to the grips over `TAKE` (half a second), eased, and back on `let_go(body)`. Set onto the grips at once, the arms were solved there in a step and turned 22.7°.
+- `eat(body)` takes a bite: the item comes up in front of the mouth over `BITE_RAISE`, stays `BITE_STAY` and goes back down over `BITE_LOWER`. `eating(body)` says a bite is on, `holding(body)` that it holds something.
+- `mouth(body)` is the figure's own: part way up its neck's body, ahead by that body's thickness. Any rig's head serves, with nothing set per clip.
+- Standing up puts the item down first.
+- `hold_cup(body, cup, grip, right)` takes a cup in one hand. The cup rests over that side's thigh, and the other hand stays on its own thigh.
+- `drink(body)` takes a sip: the cup's rim comes to the lips, `CUP_AHEAD` ahead of the mouth and `CUP_UNDER` under it, tipped toward the face by `CUP_TILT` (60°) at the top, as a cup is tipped to drink from it.
+
+The hands are measured at the palm, where a grip is held: the forearm's line on past the drawn wrist, as far as the forearm's body reaches past it (4.5 cm on the box man, which has no fingers). `tests/test_eat.ae` holds it, on a 0.4 m log with three bites:
+
+| | measured | held to |
+|---|---|---|
+| each palm off its grip, bites and all | 0.05 cm | 3 cm |
+| the bowl from the mouth at a bite's top | 11 cm | 13 cm (it is held 10 cm ahead of the mouth, 5 under) |
+| the toes sliding along the ground | 3.8 mm | 5 mm |
+| the worst turn of any body in a step | 5.0° | 6° |
+| a cup: the right palm off its grip / the left hand off its thigh's middle | 0.03 / 2.0 cm | 3 / 12 cm |
+| a cup: its rim from the mouth / tipped toward the face, a sip's top | 0.6 cm / 60° | 6 cm / 40° or more |
+| a cup: the toes sliding / the worst turn in a step | 3.8 mm / 4.6° | 5 mm / 6° |
+
+Let go, the hands are back on the thighs, and it stands up as from any sitting.
 
 ## What it costs
 
