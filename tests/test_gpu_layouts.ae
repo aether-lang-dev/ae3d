@@ -1,0 +1,529 @@
+// What ae3d.gpu gives the scene's shaders (step 6, ae3d.shaders.lit), on a
+// small pair of its own:
+//
+//   - a layout (gpu.layout_*): a block's structs in order, each field typed
+//     and placed in its struct's cell; a shader given it for a set declares
+//     that set's block with each struct it captures whole (every field,
+//     read or not) and each it does not as padding of its size, so two
+//     shaders reading other fields lay one buffer out alike; OpenGL
+//     declares each captured struct a uniform; its values are named with
+//     their set (uniforms_set), held to glslang's offsets; block_write puts a
+//     capture's cell at its place; a field read as another type than the
+//     layout gives is refused;
+//   - capture_binding: a texture or a storage buffer at a set and binding of
+//     its own; a pixel shader's storage buffer is a texture of rows on
+//     OpenGL (vec4s_at_i), and one that is not placed is refused;
+//   - read_in_place: a helper's parameter every call hands the same capture
+//     or varying is read in the helper, as a hand-written helper reads its
+//     uniforms, and the varyings are declared before the helpers; hand_on
+//     keeps one a parameter; a value read in place that a helper's own local
+//     would hide is refused;
+//   - discard() is GLSL's statement, and on the CPU the pixel dropped;
+//     cut_fragment writes nothing;
+//   - a captured array handed to a helper is read there an element at a
+//     time on the CPU; ints shift, and, or and xor as GLSL's do;
+//   - the scene's calls (lane_at, mul_cols3, mat4_rows, mod, step, ...) run
+//     on the CPU as the plain Aether does.
+import std.os
+import std.list
+import std.file
+import std.string
+import std.heap
+import std.quote
+import ae3d.gpu
+import ae3d.gpu (GpuShader, GpuLayout, vertex)
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, Vec4s, ShaderImage, splat2, splat3, splat4, xyz, rgb, xy, dot, max,
+                       min, clamp, mix, fract, floor, sqrt, normalize, texture, texture_of, image_new, image_set, image_free,
+                       vec4s_of, vec4s_at_i, discard, discarded, clear_discarded, lane_at, mul_cols3, mat4_rows, mod, step,
+                       mul, abs_int, int_of, float_of, xy_v3, zy, yzx, vec3_of_v2, clamp_int, m4_col, clip_depth)
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+absf(a: float) -> float { if a < 0.0 { return 0.0 - a } return a }
+
+// ── The structs, two blocks of them ───────────────────────────────────
+
+// Set 0: a Pad the pixel shader does not read, then a Tint it does.
+struct Pad {
+    a: vec4
+    b: float
+}
+struct Tint {
+    colour: vec3
+    rows: vec4[4]
+    gain: float
+    flags: int
+}
+// Set 1: a Spot, then an Other no shader here reads.
+struct Spot {
+    gain: float
+    unread: vec3
+    shift: int
+}
+struct Other {
+    x: vec4
+}
+
+var g_draw_layout: ptr = null
+var g_spot_layout: ptr = null
+
+draw_layout() -> *GpuLayout {
+    if g_draw_layout != null { return g_draw_layout as *GpuLayout }
+    l = gpu.layout_new("TestDrawBlock")
+    _p = gpu.layout_struct(l, "pad", "Pad")
+    _t = gpu.layout_struct(l, "tint", "Tint")
+    _a = gpu.layout_field(l, "pad", "a", offsetof(Pad, a), "vec4")
+    _b = gpu.layout_field(l, "pad", "b", offsetof(Pad, b), "float")
+    _c = gpu.layout_field(l, "tint", "colour", offsetof(Tint, colour), "vec3")
+    _r = gpu.layout_field(l, "tint", "rows", offsetof(Tint, rows), "vec4[4]")
+    _g = gpu.layout_field(l, "tint", "gain", offsetof(Tint, gain), "float")
+    _f = gpu.layout_field(l, "tint", "flags", offsetof(Tint, flags), "int")
+    g_draw_layout = l as ptr
+    return l
+}
+
+spot_layout() -> *GpuLayout {
+    if g_spot_layout != null { return g_spot_layout as *GpuLayout }
+    l = gpu.layout_new("TestSpotBlock")
+    _s = gpu.layout_struct(l, "spot", "Spot")
+    _o = gpu.layout_struct(l, "other", "Other")
+    _g = gpu.layout_field(l, "spot", "gain", offsetof(Spot, gain), "float")
+    _u = gpu.layout_field(l, "spot", "unread", offsetof(Spot, unread), "vec3")
+    _h = gpu.layout_field(l, "spot", "shift", offsetof(Spot, shift), "int")
+    _x = gpu.layout_field(l, "other", "x", offsetof(Other, x), "vec4")
+    g_spot_layout = l as ptr
+    return l
+}
+
+struct PairVertex {
+    position: vec3
+    uv: vec2
+}
+
+struct PairVaryings {
+    position: vec4
+    Coord: vec2
+    Shade: float
+}
+
+// ── The helpers ───────────────────────────────────────────────────────
+
+// A colour scaled by a gain every call hands alike (read in place) and a
+// weight every call hands alike too, but handed on (hand_on), through a
+// frame of three columns.
+@quotable
+shaded(c: vec3, gain: float, weight: float) -> vec3 {
+    framed = mul_cols3(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0), c)
+    return framed * (gain * weight)
+}
+
+// The rows of an array handed whole, read an element at a time.
+@quotable
+row_sum(rows: vec4[4], k: int) -> float {
+    sum = 0.0
+    for (i = 0; i < 4; i++) {
+        sum = sum + lane_at(rows[i], k)
+    }
+    return sum
+}
+
+// The scene's integer hash, shifts and all.
+@quotable
+hashed(x: int, y: int) -> int {
+    n0 = x + y * 57
+    n = (n0 << 13) ^ n0
+    return abs_int((n * (n * n * 15731 + 789221) + 1376312589)) & 255
+}
+
+// A helper whose own local hides the capture it would read in place.
+@quotable
+hidden(gain: float) -> float {
+    spot = 2.0
+    return gain * spot
+}
+
+// ── The shaders ───────────────────────────────────────────────────────
+
+pair_vertex(tint: Tint) -> *GpuShader {
+    s = vertex("layout_vertex") quote | v: PairVertex | {
+        return PairVaryings { position: vec4(v.position, 1.0), Coord: v.uv, Shade: tint.gain }
+    }
+    _d = gpu.use_layout(s, 0, draw_layout())
+    gpu.read_in_place(s)
+    return s
+}
+
+pair_pixel(tint: Tint, spot: Spot, tex: Texture, lamps: Vec4s) -> *GpuShader {
+    s = gpu.fragment("layout_pixel") quote | f: PairVaryings | {
+        if f.Coord.x < 0.1 {
+            discard()
+        }
+        lamp = vec4s_at_i(lamps, int_of(f.Coord.y * 3.0))
+        base = rgb(texture(tex, f.Coord)) + xyz(lamp) * 0.5
+        lit = shaded(base, spot.gain, f.Shade) + shaded(tint.colour, spot.gain, f.Shade)
+        h = hashed(int_of(f.Coord.x * 64.0), spot.shift)
+        extra = row_sum(tint.rows, 1) * 0.125 + float_of(h) / 255.0 * 0.01
+        m = mat4_rows(vec4(vec3(1.0, 0.0, 0.0), mod(f.Coord.x * 7.0, 1.0)), vec4(vec3(0.0, 1.0, 0.0), step(0.5, f.Coord.y)),
+                      vec4(vec3(0.0, 0.0, 1.0), 0.0), vec4(vec3(0.0, 0.0, 0.0), 1.0))
+        moved = mul(m, vec4(lit, 1.0))
+        return vec4(xyz(moved) * tint.gain + splat3(extra), clamp_int(tint.flags, 0, 3) * 1.0 / 3.0 + 0.25)
+    }
+    place(s)
+    return s
+}
+
+place(s: *GpuShader) {
+    _d = gpu.use_layout(s, 0, draw_layout())
+    _s = gpu.use_layout(s, 1, spot_layout())
+    _t = gpu.capture_binding(s, "tex", 0, 3)
+    _l = gpu.capture_binding(s, "lamps", 1, 2)
+    gpu.read_in_place(s)
+    gpu.hand_on(s, "shaded", "weight")
+}
+
+// The same shader's arithmetic as plain Aether: what the CPU is held to.
+reference(tint: Tint, spot: Spot, tex: Texture, lamps: Vec4s, coord: vec2, shade: float) -> vec4 {
+    c = coord as f32x4
+    lamp = vec4s_at_i(lamps, int_of(c.y * 3.0))
+    base = rgb(texture(tex, coord)) + xyz(lamp) * 0.5
+    lit = shaded(base, spot.gain, shade) + shaded(tint.colour, spot.gain, shade)
+    h = hashed(int_of(c.x * 64.0), spot.shift)
+    extra = row_sum(tint.rows, 1) * 0.125 + float_of(h) / 255.0 * 0.01
+    m = mat4_rows(vec4(vec3(1.0, 0.0, 0.0), mod(c.x * 7.0, 1.0)), vec4(vec3(0.0, 1.0, 0.0), step(0.5, c.y)),
+                  vec4(vec3(0.0, 0.0, 1.0), 0.0), vec4(vec3(0.0, 0.0, 0.0), 1.0))
+    moved = mul(m, vec4(lit, 1.0))
+    return vec4(xyz(moved) * tint.gain + splat3(extra), clamp_int(tint.flags, 0, 3) * 1.0 / 3.0 + 0.25)
+}
+
+// Read as a vec4 where the layout has a vec3: refused.
+mistyped_pixel(tint: Tint) -> *GpuShader {
+    s = gpu.fragment("mistyped") quote | uv: vec2 | {
+        return vec4(tint.colour, uv.x)
+    }
+    _d = gpu.use_layout(s, 0, wrong_layout())
+    return s
+}
+
+var g_wrong_layout: ptr = null
+wrong_layout() -> *GpuLayout {
+    if g_wrong_layout != null { return g_wrong_layout as *GpuLayout }
+    l = gpu.layout_new("WrongBlock")
+    _t = gpu.layout_struct(l, "tint", "Tint")
+    _c = gpu.layout_field(l, "tint", "colour", offsetof(Tint, colour), "vec4")
+    g_wrong_layout = l as ptr
+    return l
+}
+
+// A storage buffer no capture_binding placed: refused in a pixel shader.
+unplaced_buffer(lamps: Vec4s) -> *GpuShader {
+    return gpu.fragment("unplaced_buffer") quote | uv: vec2 | {
+        return vec4s_at_i(lamps, int_of(uv.x))
+    }
+}
+
+// A capture read in place that the helper's own local hides: refused.
+hiding_pixel(spot: Spot) -> *GpuShader {
+    s = gpu.fragment("hiding") quote | uv: vec2 | {
+        return vec4(splat3(hidden(spot.gain)), uv.x)
+    }
+    _s = gpu.use_layout(s, 1, spot_layout())
+    gpu.read_in_place(s)
+    return s
+}
+
+// A pixel shader that writes nothing, only discards.
+cut_pixel(spot: Spot) -> *GpuShader {
+    s = gpu.cut_fragment("cut") quote | f: PairVaryings | {
+        if f.Shade > spot.gain {
+            discard()
+        }
+        return 0.0
+    }
+    _s = gpu.use_layout(s, 1, spot_layout())
+    return s
+}
+
+// ── glslang ────────────────────────────────────────────────────────────
+
+compiles(label: string, text: string, stage: string, opengl: bool) -> string {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return ""
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-q")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+    } else {
+        check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    }
+    if status != 0 { println(out) }
+    if !opengl && string.length(os.which("spirv-val")) > 0 {
+        vargv = list.new()
+        list.add(vargv, spv)
+        vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+        check("spirv-val passes ${label}.${stage}", vstatus == 0)
+        if vstatus != 0 { println(vout) }
+        list.free(vargv)
+    }
+    return out
+}
+
+// Our offset of the value `name` and its set, (-1, -1) when there is none.
+leaf(s: *GpuShader, name: string) -> (int, int) {
+    k = 0
+    while k < gpu.uniforms_count(s) {
+        if gpu.uniforms_name(s, k) == name { return gpu.uniforms_offset(s, k), gpu.uniforms_set(s, k) }
+        k = k + 1
+    }
+    return 0 - 1, 0 - 1
+}
+
+// Each `name: offset N` glslang reports in `out` against ours; how many were
+// held, negative for how many disagreed.
+held_to(s: *GpuShader, out: string) -> int {
+    held = 0
+    bad = 0
+    lines = string.split(out, "\n")
+    k = 0
+    while k < string.array_size(lines) {
+        line = string.concat(string.string_array_get(lines, k), "")
+        at = string.index_of(line, ": offset ")
+        if at > 0 && (string.starts_with(line, "tint.") != 0 || string.starts_with(line, "spot.") != 0) {
+            name = string.substring(line, 0, at)
+            rest = string.substring(line, at + 9, string.length(line))
+            off, _e = string.to_int(string.substring(rest, 0, string.index_of(rest, ",")))
+            ours, _set = leaf(s, name)
+            if ours < 0 {
+                // An array, reported once (tint.rows), each element ours.
+                zero, _zs = leaf(s, "${name}[0]")
+                ours = zero
+            }
+            held = held + 1
+            if ours != off {
+                println("    ${name} at ${ours}, glslang says ${off}")
+                bad = bad + 1
+            }
+        }
+        k = k + 1
+    }
+    string.array_free(lines)
+    if bad > 0 { return 0 - bad }
+    return held
+}
+
+some_tint() -> Tint {
+    t = Tint { colour: vec3(0.25, 0.5, 0.75), gain: 1.5, flags: 2 }
+    t.rows[0] = vec4(vec3(1.0, 2.0, 3.0), 4.0)
+    t.rows[1] = vec4(vec3(0.5, 0.25, 0.125), 1.0)
+    t.rows[2] = vec4(vec3(-1.0, 3.0, 0.0), 2.0)
+    t.rows[3] = vec4(vec3(0.0, 0.75, 1.0), 0.5)
+    return t
+}
+
+main() {
+    println("layouts: the scene's blocks, places, discards and helpers, on a small pair")
+    tint = some_tint()
+    spot = Spot { gain: 0.8, unread: vec3(9.0, 9.0, 9.0), shift: 5 }
+    img = image_new(4, 4)
+    y = 0
+    while y < 4 {
+        x = 0
+        while x < 4 {
+            image_set(img, x, y, x * 0.25, y * 0.25, 0.5, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    tex = texture_of(img)
+    lamp_data = calloc(16, 4) as f32[]
+    q = 0
+    while q < 16 {
+        lamp_data[q] = (q * 0.0625) as f32
+        q = q + 1
+    }
+    lamps = vec4s_of(lamp_data as ptr, 4)
+
+    vs = pair_vertex(tint)
+    ps = pair_pixel(tint, spot, tex, lamps)
+    check("the pair links: the struct both capture is the same layout's", gpu.link(vs, ps))
+    vk = gpu.emit_glsl(ps, gpu.VULKAN)
+    gl = gpu.emit_glsl(ps, gpu.GL)
+    vv = gpu.emit_vertex_glsl(vs, gpu.VULKAN, "", "")
+    if vk == "" || gl == "" || vv == "" { println("  emit: ${gpu.last_error()}") }
+
+    // The blocks.
+    check("set 0's block: the Pad it does not read as its size of padding, then the Tint whole",
+          string.contains(vk, "layout(std140, set = 0, binding = 0) uniform TestDrawBlock {\n    vec4 pad_unread[2];\n    Tint tint;\n};") != 0)
+    check("set 1's block: the Spot whole, its unread field too, and no Other after the last captured",
+          string.contains(vk, "struct Spot {\n    float gain;\n    vec3 unread;\n    int shift;\n};") != 0 &&
+          string.contains(vk, "layout(std140, set = 1, binding = 0) uniform TestSpotBlock {\n    Spot spot;\n};") != 0)
+    check("the vertex shader declares set 0's block alike, the Tint whole though it reads only its gain",
+          string.contains(vv, "struct Tint {\n    vec3 colour;\n    vec4 rows[4];\n    float gain;\n    int flags;\n};") != 0 &&
+          string.contains(vv, "uniform TestDrawBlock {\n    vec4 pad_unread[2];\n    Tint tint;\n};") != 0)
+    check("OpenGL: each captured struct a uniform of its name, no padding",
+          string.contains(gl, "uniform Tint tint;\n") != 0 && string.contains(gl, "uniform Spot spot;\n") != 0 &&
+          string.contains(gl, "pad_unread") == 0)
+    // The places.
+    check("the texture at set 0, binding 3, and the buffer at set 1, binding 2, as capture_binding put them",
+          string.contains(vk, "layout(set = 0, binding = 3) uniform sampler2D tex;") != 0 &&
+          string.contains(vk, "layout(std430, set = 1, binding = 2) readonly buffer lamps_buffer { vec4 lamps[]; };") != 0)
+    check("on OpenGL the buffer is a texture of rows, read by texelFetch",
+          string.contains(gl, "uniform sampler2D lamps;") != 0 &&
+          string.contains(gl, "texelFetch(lamps, ivec2(int((Coord.y * 3.0)) % 1024, int((Coord.y * 3.0)) / 1024), 0)") != 0)
+    // Read in place, handed on, discarded.
+    check("a gain every call hands alike is read in place; a weight handed on stays a parameter",
+          string.contains(vk, "vec3 shaded(vec3 c, float weight) {") != 0 &&
+          string.contains(vk, "return framed * (spot.gain * weight);") != 0 &&
+          string.contains(vk, "vec3 lit = shaded(base, Shade) + shaded(tint.colour, Shade);") != 0)
+    check("an array handed whole is read in place: row_sum takes the index alone",
+          string.contains(vk, "float row_sum(int k) {") != 0 && string.contains(vk, "tint.rows[i][k]") != 0)
+    first_in = string.index_of(vk, "layout(location = 0) in vec2 Coord;")
+    first_helper = string.index_of(vk, "vec3 shaded(")
+    check("the varyings are declared before the helpers that read them in place", first_in >= 0 && first_in < first_helper)
+    check("discard() is GLSL's statement", string.contains(vk, "        discard;\n") != 0)
+    out = compiles("layout_pixel", vk, "frag", false)
+    _gv = compiles("layout_vertex", vv, "vert", false)
+    _gg = compiles("layout_pixel_gl", gl, "frag", true)
+    if out != "" {
+        held = held_to(ps, out)
+        check("every offset glslang reports of both blocks is ours (${held} held)", held == 6)
+    }
+    // The values, with their sets.
+    gain_at, gain_set = leaf(ps, "spot.gain")
+    shift_at, shift_set = leaf(ps, "spot.shift")
+    colour_at, colour_set = leaf(ps, "tint.colour")
+    row2_at, _row2_set = leaf(ps, "tint.rows[2]")
+    flags_at, _fs = leaf(ps, "tint.flags")
+    check("each value named with its set: the tint's at set 0 after the Pad's 32 bytes, the spot's at set 1",
+          colour_at == 32 && colour_set == 0 && row2_at == 80 && flags_at == 116 && gain_at == 0 && gain_set == 1 &&
+          shift_at == 28 && shift_set == 1)
+    check("each block's size its layout's: 128 and 48 (${gpu.block_size(ps, 0)}, ${gpu.block_size(ps, 1)})",
+          gpu.block_size(ps, 0) == 128 && gpu.block_size(ps, 1) == 48 && gpu.params_count(ps) == 0)
+    block = calloc(1, 128)
+    gpu.block_write(ps, 0, block)
+    bf = block as f32[]
+    bi = block as int[]
+    check("block_write puts the tint at its place: its colour at 32, row 2 at 80, its gain at 112, its flags at 116",
+          bf[8] == 0.25 && bf[10] == 0.75 && bf[20] == -1.0 && bf[23] == 2.0 && bf[28] == 1.5 && bi[29] == 2)
+    free(block)
+
+    // On the CPU.
+    cx = gpu.cpu_new(ps)
+    right = 0
+    dropped = 0
+    runs = 0
+    j = 0
+    while j < 8 {
+        i = 0
+        while i < 8 {
+            cu = (i * 1.0 + 0.5) / 8.0
+            cv = (j * 1.0 + 0.5) / 8.0
+            vals = gpu.vstruct()
+            gpu.val_set(vals, "Coord", gpu.v2(cu, cv))
+            gpu.val_set(vals, "Shade", gpu.v1(0.3 + cu))
+            got = gpu.cpu_run(cx, vals)
+            runs = runs + 1
+            if cu < 0.1 {
+                if got == null && gpu.cpu_discarded(cx) { dropped = dropped + 1 }
+            } else if got == null {
+                if right == 0 { println("    cpu_run: ${gpu.last_error()}") }
+            } else {
+                want = reference(tint, spot, tex, lamps, vec2(cu, cv), 0.3 + cu) as f32x4
+                if absf(gpu.val_x(got) - want.x) < 0.00001 && absf(gpu.val_y(got) - want.y) < 0.00001 &&
+                   absf(gpu.val_z(got) - want.z) < 0.00001 && absf(gpu.val_w(got) - want.w) < 0.00001 {
+                    right = right + 1
+                } else if right == 0 {
+                    println("    (${cu}, ${cv}): got ${gpu.val_x(got)} ${gpu.val_y(got)} ${gpu.val_z(got)} ${gpu.val_w(got)}, want ${want.x} ${want.y} ${want.z} ${want.w}")
+                }
+                gpu.val_free(got)
+            }
+            gpu.val_free(vals)
+            i = i + 1
+        }
+        j = j + 1
+    }
+    gpu.cpu_free(cx)
+    check("the CPU drops the pixels the shader discards (${dropped} of 8)", dropped == 8)
+    check("and draws every other as the plain Aether does (${right} of 56)", right == 56)
+
+    // The cut shader.
+    cs = cut_pixel(spot)
+    _cl = gpu.link(vs, cs)
+    cut = gpu.emit_glsl(cs, gpu.VULKAN)
+    if cut == "" { println("  emit cut: ${gpu.last_error()}") }
+    check("a cut shader writes no colour, and its last return writes nothing",
+          cut != "" && string.contains(cut, "FragColor") == 0 && string.contains(cut, " out ") == 0 &&
+          string.contains(cut, "discard;") != 0)
+    _gc = compiles("layout_cut", cut, "frag", false)
+    ccx = gpu.cpu_new(cs)
+    kv = gpu.vstruct()
+    gpu.val_set(kv, "Coord", gpu.v2(0.5, 0.5))
+    gpu.val_set(kv, "Shade", gpu.v1(0.9))
+    kept = gpu.cpu_run(ccx, kv)
+    cut_dropped = kept == null && gpu.cpu_discarded(ccx)
+    gpu.val_free(kv)
+    kv2 = gpu.vstruct()
+    gpu.val_set(kv2, "Coord", gpu.v2(0.5, 0.5))
+    gpu.val_set(kv2, "Shade", gpu.v1(0.1))
+    kept2 = gpu.cpu_run(ccx, kv2)
+    check("on the CPU it drops a pixel past the gain and keeps one under it", cut_dropped && kept2 != null)
+    if kept2 != null { gpu.val_free(kept2) }
+    gpu.val_free(kv2)
+    gpu.cpu_free(ccx)
+    gpu.shader_free(cs)
+
+    // Refusals.
+    ms = mistyped_pixel(tint)
+    _me = gpu.emit_glsl(ms, gpu.VULKAN)
+    check("a field read as another type than its layout's is refused (${gpu.last_error()})",
+          _me == "" && string.contains(gpu.last_error(), "the layout of WrongBlock has it a vec4") != 0)
+    gpu.shader_free(ms)
+    us = unplaced_buffer(lamps)
+    _ue = gpu.emit_glsl(us, gpu.VULKAN)
+    check("a pixel shader's storage buffer no capture_binding placed is refused",
+          _ue == "" && string.contains(gpu.last_error(), "only where capture_binding places it") != 0)
+    check("capture_binding of a capture that is no texture or buffer is refused", !gpu.capture_binding(us, "uv", 0, 1))
+    gpu.shader_free(us)
+    hs = hiding_pixel(spot)
+    _he = gpu.emit_glsl(hs, gpu.VULKAN)
+    check("a value read in place that the helper's own local hides is refused (${gpu.last_error()})",
+          _he == "" && string.contains(gpu.last_error(), "its own spot hides it") != 0)
+    gpu.shader_free(hs)
+    check("a set given a second layout is refused", !gpu.use_layout(ps, 0, spot_layout()))
+
+    gpu.shader_free(ps)
+    gpu.shader_free(vs)
+    free(lamp_data as ptr)
+    image_free(img)
+    println("${g_checks - g_failures} of ${g_checks} checks passed")
+    if g_failures > 0 { exit(1) }
+    println("all checks passed")
+}

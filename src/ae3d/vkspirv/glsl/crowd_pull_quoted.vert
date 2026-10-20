@@ -21,15 +21,15 @@ struct Eye {
 struct Shadow {
     mat4 light_space;
 };
-layout(std140, set = 2, binding = 0) uniform VertexParams {
+layout(std140, set = 4, binding = 0) uniform VertexParams {
     Throng throng;
-    Eye eye;
+    Eye viewer;
     Shadow shadow;
 };
-layout(set = 2, binding = 1) uniform sampler2D pose_bank;
-layout(std430, set = 1, binding = 0) readonly buffer pulled_vertex_buffer { float pulled_vertex[]; };
-layout(std430, set = 1, binding = 1) readonly buffer pulled_skin_buffer { vec4 pulled_skin[]; };
-layout(std430, set = 1, binding = 2) readonly buffer pulled_figure_buffer { float pulled_figure[]; };
+layout(set = 4, binding = 1) uniform sampler2D pose_bank;
+layout(std430, set = 3, binding = 0) readonly buffer pulled_vertex_buffer { float pulled_vertex[]; };
+layout(std430, set = 3, binding = 1) readonly buffer pulled_skin_buffer { vec4 pulled_skin[]; };
+layout(std430, set = 3, binding = 2) readonly buffer pulled_figure_buffer { float pulled_figure[]; };
 
 layout(location = 0) out vec2 fragTexCoord;
 layout(location = 1) out vec3 Normal;
@@ -92,7 +92,7 @@ void main() {
     if (throng.impostor != 0) {
         vec3 origin = model_matrix[3].xyz;
         vec3 facing = normalize(vec3(model_matrix[0][0], 0.0, model_matrix[0][2]));
-        vec3 to_eye = eye.position - origin;
+        vec3 to_eye = viewer.position - origin;
         vec3 level = normalize(vec3(to_eye.x, 0.0, to_eye.z));
         float angle = atan(dot(level, vec3(-facing.z, 0.0, facing.x)), dot(level, facing));
         float turn = fract(angle / 6.28318530718 + 1.0);
@@ -102,8 +102,8 @@ void main() {
         vec3 world = origin + right * (position.x * throng.width) + vec3(0.0, position.y * throng.height, 0.0);
         vec2 cell = vec2((float(column) + uv.x) / float(throng.columns), 1.0 - (float(row) + (1.0 - uv.y)) / float(throng.rows));
         vec4 quad_light = (shadow.light_space * vec4(world, 1.0));
-        vec4 quad_now = (eye.view_projection * vec4(world, 1.0));
-        vec4 quad_prev = (eye.prev_view_projection * vec4(world - walking * throng.travel, 1.0));
+        vec4 quad_now = (viewer.view_projection * vec4(world, 1.0));
+        vec4 quad_prev = (viewer.prev_view_projection * vec4(world - walking * throng.travel, 1.0));
         gl_Position = quad_now;
         fragTexCoord = cell;
         Normal = facing;
@@ -126,11 +126,11 @@ void main() {
     vec3 frag_pos = (model_matrix * posed).xyz;
     vec3 normal_out = normalize((mat3(model_matrix) * posed_normal));
     vec4 light = (shadow.light_space * vec4(frag_pos, 1.0));
-    vec4 now = ((eye.view_projection * model_matrix) * posed);
+    vec4 now = ((viewer.view_projection * model_matrix) * posed);
     vec4 posed_prev = (ae3d_shaders_throng_skin_at_phase(pose_bank, joints, weights, instance_phase - throng.phase_step, throng.frames) * vec4(position, 1.0));
     vec4 world_prev = (model_matrix * posed_prev);
     vec4 stepped = vec4(world_prev.xyz - walking * throng.travel, world_prev.w);
-    vec4 prev = (eye.prev_view_projection * stepped);
+    vec4 prev = (viewer.prev_view_projection * stepped);
     gl_Position = now;
     fragTexCoord = uv;
     Normal = normal_out;

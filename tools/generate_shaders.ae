@@ -45,6 +45,7 @@ import std.strbuilder
 import std.mem
 import ae3d.blob
 import ae3d.gpu
+import ae3d.gpu (GpuLayout)
 import ae3d.shaders.fxaa
 import ae3d.shaders.bloom
 import ae3d.shaders.depth
@@ -60,7 +61,10 @@ import ae3d.shaders.sea
 import ae3d.shaders.sea (Water)
 import ae3d.shaders.throng
 import ae3d.shaders.throng (Throng)
-import ae3d.shaders.frame (Eye, KeyLight, Weather, Shadow)
+import ae3d.shaders.frame
+import ae3d.shaders.frame (Eye, KeyLight, Weather, Shadow, ShadowCascades, Grid, WorldState)
+import ae3d.shaders.lit
+import ae3d.shaders.lit (Draw, DrawMaterial, Surface, Cut, Wounds, Damage, Skin)
 import ae3d.shaderlib (vec2, vec3, Texture, TextureMS, Texture3D, Floats, Vec4s, zero_mat4, splat4)
 
 const SHADERS = "src/ae3d/shaders/module.ae"
@@ -361,7 +365,6 @@ line_at(parts: ptr, i: int) -> string { return string.string_array_get(parts, i)
 string_at(l: ptr, i: int) -> string { return list.get_raw(l, i) }
 member_ptr(m: *Member) -> ptr { return m }
 placed_ptr(p: *Placed) -> ptr { return p }
-derived_ptr(d: *Derived) -> ptr { return d }
 output_ptr(o: *Output) -> ptr { return o }
 free_member(m: *Member) { free(member_ptr(m)) }
 free_ints(a: int[]) { free(ints_ptr(a)) }
@@ -403,6 +406,238 @@ light_struct(source: string) -> ptr {
     }
     string.free(body)
     return members
+}
+
+// --- the three blocks ------------------------------------------------------------------------------------------
+//
+// The scene's uniforms are three blocks of captured structs (Nic,
+// 2026-10-20: the scene block split per-camera from per-world, still one
+// camera), as ae3d.shaders.lit and ae3d.shaders.frame lay them out:
+//
+//   - the draw's (set 0, binding 0, a dynamic uniform buffer, lit.draw_layout):
+//     the model, its instances, pose, cut, wounds and damage, its material
+//     and every value a model carries by name (ae3d.rendering's Config, the
+//     water's), and the light space a shadow draw is drawn into: copied into
+//     the frame's ring for each draw, as the one block was, its bone
+//     palettes last;
+//   - the camera's (set 1, binding 0, frame.view_layout): what is seen from
+//     where, through what and how -- the eye and its matrices, the jitter
+//     and the history, the frame's size, the shadow cascades fitted to the
+//     view, the light grid cut from it, the lamps given shadows by their
+//     distance from it, the probes placed round it, the ray reach and frame
+//     -- written once a frame and bound beside every draw's set, with the
+//     images and buffers made for that view. A second camera is a second of
+//     these sets; nothing else changes;
+//   - the world's (set 2, binding 0, frame.world_layout): the lights, the
+//     sky and the weather, the clouds and the time, and the renderer's
+//     settings that hold for every view, with the sky's light and the
+//     scene's structure.
+//
+// Each hand-written uniform is one field of one of their structs (the
+// modules' tables give which): the generator lays a block's members out
+// where the layout lays the field out, a float of padding wherever std140
+// starts the next struct on a sixteen-byte boundary or rounds one up, and
+// glslang is asked whether it put them there. A shader reading the structs
+// and one reading the members read the same words. A uniform in no table,
+// or a table's in no source, stops the generator.
+
+const BLOCK_DRAW = 0
+const BLOCK_VIEW = 1
+const BLOCK_WORLD = 2
+
+// The block the uniform `name` is in, -1 for none.
+block_of(name: string) -> int {
+    k = 0
+    while k < lit.draw_count() {
+        if lit.draw_uniform(k) == name { return BLOCK_DRAW }
+        k = k + 1
+    }
+    k = 0
+    while k < frame.view_count() {
+        if frame.view_uniform(k) == name { return BLOCK_VIEW }
+        k = k + 1
+    }
+    k = 0
+    while k < frame.world_count() {
+        if frame.world_uniform(k) == name { return BLOCK_WORLD }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+layout_of(block: int) -> *GpuLayout {
+    if block == BLOCK_VIEW { return frame.view_layout() }
+    if block == BLOCK_WORLD { return frame.world_layout() }
+    return lit.draw_layout()
+}
+
+// Where the uniform `name` is in its block, as its layout places the field
+// it is; -1 for one in no table.
+layout_place(block: int, name: string) -> int {
+    l = layout_of(block)
+    if block == BLOCK_VIEW {
+        k = 0
+        while k < frame.view_count() {
+            if frame.view_uniform(k) == name { return gpu.layout_offset(l, frame.view_capture(k), frame.view_field(k)) }
+            k = k + 1
+        }
+    } else if block == BLOCK_WORLD {
+        k = 0
+        while k < frame.world_count() {
+            if frame.world_uniform(k) == name { return gpu.layout_offset(l, frame.world_capture(k), frame.world_field(k)) }
+            k = k + 1
+        }
+    } else {
+        k = 0
+        while k < lit.draw_count() {
+            if lit.draw_uniform(k) == name { return gpu.layout_offset(l, lit.draw_capture(k), lit.draw_field(k)) }
+            k = k + 1
+        }
+    }
+    return 0 - 1
+}
+
+// Where the hand-written Light's member `name` is in an element of the
+// world's lights.
+light_place(name: string) -> int {
+    k = 0
+    while k < frame.light_count() {
+        if frame.light_uniform(k) == name { return gpu.layout_part_offset(frame.world_layout(), "world", "lights", frame.light_field(k)) }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+// The three blocks' members, each in its layout's order.
+struct Blocks {
+    draw: ptr
+    view: ptr
+    world: ptr
+}
+
+// The members of `block` (a block's, in any order) as its layout places
+// them, sorted by their offsets into `placed`; the block's size, its
+// layout's. The generator stops at a member the layout has no place for.
+layout_block(block: int, members: ptr, placed: ptr) -> int {
+    k = 0
+    while k < list.size(members) {
+        m = list.get_raw(members, k) as *Member
+        at = layout_place(block, m.name)
+        if at < 0 {
+            println("generate: ${m.name} is in no block's table (ae3d.shaders.lit, ae3d.shaders.frame)")
+            os.exit(1)
+        }
+        p = calloc(1, sizeof(Placed)) as *Placed
+        p.name = m.name
+        p.kind = m.kind
+        p.offset = at
+        // In the order of their offsets: added last, moved down past every
+        // one placed after it.
+        list.add_raw(placed, placed_ptr(p))
+        j = list.size(placed) - 1
+        while j > 0 && (list.get_raw(placed, j - 1) as *Placed).offset > at {
+            list.set(placed, j, list.get_raw(placed, j - 1))
+            list.set(placed, j - 1, placed_ptr(p))
+            j = j - 1
+        }
+        k = k + 1
+    }
+    return gpu.layout_size(layout_of(block))
+}
+
+// The member of `members` named `name`.
+// The scene's uniforms, its blocks' fields in their tables' order (the
+// draw's, the camera's, the world's; the lights apart, light_struct's): each
+// as `declared` (the ray-query pixel shader's) has it where it has it, as its
+// table types it where it does not.
+table_members(declared: ptr) -> ptr {
+    out = list.new()
+    k = 0
+    while k < lit.draw_count() {
+        list.add_raw(out, member_ptr(table_member(declared, lit.draw_uniform(k), lit.draw_type(k))))
+        k = k + 1
+    }
+    k = 0
+    while k < frame.view_count() {
+        list.add_raw(out, member_ptr(table_member(declared, frame.view_uniform(k), frame.view_type(k))))
+        k = k + 1
+    }
+    k = 0
+    while k < frame.world_count() {
+        if frame.world_uniform(k) != "lights" {
+            list.add_raw(out, member_ptr(table_member(declared, frame.world_uniform(k), frame.world_type(k))))
+        }
+        k = k + 1
+    }
+    return out
+}
+
+fn table_member(declared: ptr, name: string, t: string) -> *Member {
+    m = member_named(declared, name)
+    if m != null { return m }
+    open_at = string.index_of(t, "[")
+    if open_at < 0 { return member(t, name, 0) }
+    kind = string.substring(t, 0, open_at)
+    digits = string.substring(t, open_at + 1, string.length(t) - 1)
+    made = member(kind, name, string.get_int(digits))
+    string.free(kind)
+    string.free(digits)
+    return made
+}
+
+member_named(members: ptr, name: string) -> *Member {
+    k = 0
+    while k < list.size(members) {
+        m = list.get_raw(members, k) as *Member
+        if m.name == name { return m }
+        k = k + 1
+    }
+    return null
+}
+
+// Every uniform the tables name is one the sources declare, and the
+// world's lights are the hand-written Light's members at the layout's
+// places, an element the layout's size apart; the generator stops at the
+// first that is not.
+tables_declared(ordered: ptr, light_members: ptr) {
+    k = 0
+    while k < lit.draw_count() {
+        if member_named(ordered, lit.draw_uniform(k)) == null { no_source(lit.draw_uniform(k)) }
+        k = k + 1
+    }
+    k = 0
+    while k < frame.view_count() {
+        if member_named(ordered, frame.view_uniform(k)) == null { no_source(frame.view_uniform(k)) }
+        k = k + 1
+    }
+    k = 0
+    while k < frame.world_count() {
+        if frame.world_uniform(k) != "lights" && member_named(ordered, frame.world_uniform(k)) == null { no_source(frame.world_uniform(k)) }
+        k = k + 1
+    }
+    if light_members == null { return }
+    scratch = list.new()
+    stride = light_layout(light_members, scratch)
+    if stride != gpu.layout_stride(frame.world_layout(), "world", "lights") ||
+       gpu.layout_offset(frame.world_layout(), "world", "lights") != 0 {
+        println("generate: the lights are ${stride} bytes apart at the head of the world's block; its layout has them otherwise")
+        os.exit(1)
+    }
+    k = 0
+    while k < list.size(scratch) {
+        p = list.get_raw(scratch, k) as *Placed
+        if light_place(p.name) != p.offset {
+            println("generate: a Light's ${p.name} at ${p.offset}; the world's layout has it at ${light_place(p.name)}")
+            os.exit(1)
+        }
+        k = k + 1
+    }
+    free_placed(scratch)
+}
+
+no_source(name: string) {
+    println("generate: the tables name ${name}, which no scene shader declares")
+    os.exit(1)
 }
 
 // --- std140 ----------------------------------------------------------------------------------------------------
@@ -564,6 +799,11 @@ index_of_member(members: ptr, kind: string, name: string) -> int {
     return 0 - 1
 }
 
+// The three blocks' members as their layouts place them (main's).
+var g_draw_placed: ptr = null
+var g_view_placed: ptr = null
+var g_world_placed: ptr = null
+
 // Rewrite an OpenGL shader for Vulkan.
 //
 // The uniforms move into an UNNAMED block, so its members keep their
@@ -574,8 +814,8 @@ index_of_member(members: ptr, kind: string, name: string) -> int {
 //
 // `placed` receives the block's members with their offsets; the return
 // is the rewritten source and, through `size_out`, the block's size.
-to_vulkan(source: string, stage: string, members: ptr, samplers: ptr, varyings_in: ptr, varyings_out: ptr,
-          light_members: ptr, placed: ptr, size_out: int[]) -> string {
+to_vulkan(source: string, stage: string, blocks: *Blocks, samplers: ptr, varyings_in: ptr, varyings_out: ptr,
+          light_members: ptr) -> string {
     // The version line, the light declarations, the count.
     parts = split_lines(source)
     n = string.array_size(parts)
@@ -658,14 +898,13 @@ to_vulkan(source: string, stage: string, members: ptr, samplers: ptr, varyings_i
     string.free(text)
     text = strbuilder.finish(b)
 
-    // The block, after the first `#version 450`.
-    size = std140(members, light_bytes(light_members), placed)
-    size_out[0] = size
+    // The blocks, after the first `#version 450`.
     b = strbuilder.new(8192)
     strbuilder.append(b, "#version 450\n\n")
     if light_members != null {
-        // The array leads the block, so its offset is zero and the C side
-        // steps through it with a stride rather than a table of offsets.
+        // The array leads the world's block, so its offset there is zero and
+        // the C side steps through it with a stride rather than a table of
+        // offsets.
         strbuilder.append(b, "struct Light {\n")
         k = list.size(light_members)
         i = 0
@@ -676,37 +915,33 @@ to_vulkan(source: string, stage: string, members: ptr, samplers: ptr, varyings_i
         }
         strbuilder.append(b, "};\n\n")
     }
-    strbuilder.append(b, "layout(std140, set = 0, binding = 0) uniform SceneBlock {\n")
-    if light_members != null { strbuilder.append(b, "    Light lights[${MAX_LIGHTS}];\n") }
-    k = list.size(members)
-    i = 0
-    while i < k {
-        m = list.get_raw(members, i) as *Member
-        if m.count > 0 {
-            strbuilder.append(b, "    ${m.kind} ${m.name}[${m.count}];\n")
-        } else {
-            strbuilder.append(b, "    ${m.kind} ${m.name};\n")
-        }
-        i = i + 1
-    }
-    strbuilder.append(b, "};")
-    // Every shader shares one descriptor set layout, so whichever sampler
-    // a shader names sits at binding 1 and the renderer binds the right
-    // texture. A sampler is 2D unless named "name:3D" or "name:2DMS"
-    // (none of the hand-written shaders left needs either).
+    block_declaration(b, "layout(std140, set = 0, binding = 0) uniform DrawBlock {\n", blocks.draw, g_draw_placed, false, 0, "draw_pad")
+    block_declaration(b, "\nlayout(std140, set = 1, binding = 0) uniform CameraBlock {\n", blocks.view, g_view_placed, false, 0, "camera_pad")
+    block_declaration(b, "\nlayout(std140, set = 2, binding = 0) uniform WorldBlock {\n", blocks.world, g_world_placed,
+                      light_members != null, light_bytes(light_members), "world_pad")
+    // Every scene pipeline shares the three set layouts, so whichever
+    // sampler a shader names sits where the renderer binds it: `name@S.B`
+    // at set S, binding B. A sampler is 2D unless named "name:3D" or
+    // "name:2DMS" (none of the hand-written shaders left needs either).
     k = list.size(samplers)
     i = 0
     while i < k {
         sampler = string_at(samplers, i)
-        colon = string.string_index_of(sampler, ":")
-        name = sampler
+        at_sign = string.string_index_of(sampler, "@")
+        dot_at = string.string_index_of(sampler, ".")
+        place = string.substring(sampler, at_sign + 1, string.length(sampler))
+        set_text = string.substring(sampler, at_sign + 1, dot_at)
+        binding_text = string.substring(sampler, dot_at + 1, string.length(sampler))
+        named = string.substring(sampler, 0, at_sign)
+        colon = string.string_index_of(named, ":")
+        name = named
         kind = "2D"
         if colon >= 0 {
-            name = string.substring(sampler, 0, colon)
-            kind = string.substring(sampler, colon + 1, string.length(sampler))
+            name = string.substring(named, 0, colon)
+            kind = string.substring(named, colon + 1, string.length(named))
         }
-        strbuilder.append(b, "\nlayout(set = 0, binding = ${i + 1}) uniform sampler${kind} ${name};")
-        if colon >= 0 { string.free(name); string.free(kind) }
+        strbuilder.append(b, "\nlayout(set = ${set_text}, binding = ${binding_text}) uniform sampler${kind} ${name};")
+        string.free(place)
         i = i + 1
     }
     header = strbuilder.finish(b)
@@ -727,20 +962,46 @@ to_vulkan(source: string, stage: string, members: ptr, samplers: ptr, varyings_i
     return out
 }
 
-// The skybox and the fullscreen passes name their attributes differently
-// from the scene shader. Renaming them onto the scene's names lets every
-// pipeline share one vertex input description and one descriptor set
-// layout, so the renderer has a single binding path instead of one per
-// pass.
-rename_attributes(text: string) -> string {
-    out = replace_declaration(text, "in vec2 aPos", "in vec3 inPosition;")
-    out = replaced(out, "vec4(aPos, 0.0, 1.0)", "vec4(inPosition.xy, 0.0, 1.0)")
-    out = replace_word(out, "aTexCoords", "inTexCoord")
-    out = replace_word(out, "aTexCoord", "inTexCoord")
-    out = replace_word(out, "aNormal", "inNormal")
-    out = replace_word(out, "aPos", "inPosition")
-    return out
+// One block's declaration: `head`, the light array where `lights` (from 0,
+// `from` bytes long), its members at their places in `placed`'s order, a
+// float of padding before each where std140 would put it earlier (named
+// from `pads`: the blocks are nameless, their members global), `};`.
+block_declaration(b: ptr, head: string, members: ptr, placed: ptr, lights: bool, from: int, pads: string) {
+    strbuilder.append(b, head)
+    at = 0
+    if lights {
+        strbuilder.append(b, "    Light lights[${MAX_LIGHTS}];\n")
+        at = from
+    }
+    pad = 0
+    k = 0
+    while k < list.size(placed) {
+        p = list.get_raw(placed, k) as *Placed
+        m = member_named(members, p.name)
+        align = alignment_of(m.kind)
+        size = size_of(m.kind)
+        if m.count > 0 {
+            align = ARRAY_STRIDE
+            element = round16(size)
+            if element < ARRAY_STRIDE { element = ARRAY_STRIDE }
+            size = element * m.count
+        }
+        while (at + align - 1) / align * align < p.offset {
+            strbuilder.append(b, "    float ${pads}${pad};\n")
+            pad = pad + 1
+            at = at + 4
+        }
+        if m.count > 0 {
+            strbuilder.append(b, "    ${m.kind} ${m.name}[${m.count}];\n")
+        } else {
+            strbuilder.append(b, "    ${m.kind} ${m.name};\n")
+        }
+        at = p.offset + size
+        k = k + 1
+    }
+    strbuilder.append(b, "};")
 }
+
 
 // `prefix`, any spacing, `;` -> replacement, wherever it occurs.
 replace_declaration(text: string, prefix: string, replacement: string) -> string {
@@ -817,17 +1078,36 @@ sorted_indices(placed: ptr) -> int[] {
     return order
 }
 
+// Each of `from` (a block's placed members) at `base` further on, appended
+// to `to`: its offset in the words.
+shifted(from: ptr, base: int, to: ptr) {
+    k = 0
+    while k < list.size(from) {
+        q = list.get_raw(from, k) as *Placed
+        p = calloc(1, sizeof(Placed)) as *Placed
+        p.name = q.name
+        p.kind = q.kind
+        p.offset = q.offset + base
+        list.add_raw(to, placed_ptr(p))
+        k = k + 1
+    }
+}
+
 // The same offsets as an Aether module, so the renderer names uniforms.
-aether_offsets(placed: ptr, size: int, light_placed: ptr, light_stride: int) -> string {
+aether_offsets(placed: ptr, size: int, light_placed: ptr, light_stride: int, view_from: int, world_from: int) -> string {
     n = list.size(placed)
     has_lights = light_placed != null && list.size(light_placed) > 0
     b = strbuilder.new(8192)
     strbuilder.append(b, "// Generated by ${GENERATOR} - do not edit.\n//\n")
-    strbuilder.append(b, "// Byte offsets into the scene uniform block, from the same declarations\n")
-    strbuilder.append(b, "// that generate the shader's block, and a uniform's offset by its name.\n\n")
+    strbuilder.append(b, "// Byte offsets into the scene's uniform words, from the same declarations\n")
+    strbuilder.append(b, "// that generate the shaders' blocks, and a uniform's offset by its name.\n")
+    strbuilder.append(b, "// The words are the three blocks end to end: the draw's (0 to DRAW_SIZE,\n")
+    strbuilder.append(b, "// copied into the ring for each draw), the camera's (VIEW_FROM, VIEW_SIZE\n")
+    strbuilder.append(b, "// bytes) and the world's (WORLD_FROM, WORLD_SIZE bytes, its lights first at\n")
+    strbuilder.append(b, "// OFF_LIGHTS), each written to its set's buffer once a frame.\n\n")
     strbuilder.append(b, "import std.string\n\nexports (\n")
     // The names in rows of at most 92 columns, as the module's own style has them.
-    rows = Rows { out: b, row: strbuilder.new(128), index: 0, count: n + 3 }
+    rows = Rows { out: b, row: strbuilder.new(128), index: 0, count: n + 9 }
     if has_lights { rows.count = rows.count + 2 + list.size(light_placed) }
     strbuilder.append(rows.row, "   ")
     i = 0
@@ -853,6 +1133,12 @@ aether_offsets(placed: ptr, size: int, light_placed: ptr, light_stride: int) -> 
     }
     row_name(&rows, "", "SCENE_SIZE")
     row_name(&rows, "", "SCENE_SKIN_FROM")
+    row_name(&rows, "", "DRAW_SIZE")
+    row_name(&rows, "", "VIEW_FROM")
+    row_name(&rows, "", "VIEW_SIZE")
+    row_name(&rows, "", "WORLD_FROM")
+    row_name(&rows, "", "WORLD_SIZE")
+    row_name(&rows, "", "OFF_LIGHTS")
     row_name(&rows, "", "offset_of")
     line = strbuilder.finish(rows.row)
     strbuilder.append(b, line)
@@ -879,9 +1165,9 @@ aether_offsets(placed: ptr, size: int, light_placed: ptr, light_stride: int) -> 
         }
     }
     strbuilder.append(b, "const SCENE_SIZE = ${size}\n")
-    // Where the bone palettes start: the block's last members, so a draw
-    // that is not skinned copies the block only up to here (#726).
-    skin_from = size
+    // Where the bone palettes start: the draw block's last members, so a
+    // draw that is not skinned copies the block only up to here (#726).
+    skin_from = view_from
     i = 0
     while i < n {
         p = list.get_raw(placed, i) as *Placed
@@ -889,6 +1175,12 @@ aether_offsets(placed: ptr, size: int, light_placed: ptr, light_stride: int) -> 
         i = i + 1
     }
     strbuilder.append(b, "const SCENE_SKIN_FROM = ${skin_from}\n")
+    strbuilder.append(b, "const DRAW_SIZE = ${view_from}\n")
+    strbuilder.append(b, "const VIEW_FROM = ${view_from}\n")
+    strbuilder.append(b, "const VIEW_SIZE = ${world_from - view_from}\n")
+    strbuilder.append(b, "const WORLD_FROM = ${world_from}\n")
+    strbuilder.append(b, "const WORLD_SIZE = ${size - world_from}\n")
+    strbuilder.append(b, "const OFF_LIGHTS = ${world_from}\n")
     // A model carries uniforms by name, so the renderer needs the reverse
     // of the table above: the names in byte order, for a binary search.
     strbuilder.append(b, "\n// A uniform's offset by its name, -1 for one the block has none of.\n")
@@ -989,6 +1281,7 @@ var g_matched = 0
 
 verify_offsets(name: string, placed: ptr) -> int {
     g_matched = 0
+    g_unmatched = 0
     path = string.concat("${OUT_DIR}/", name)
     reflect = string.concat("${WORK_DIR}/", "${name}.reflect")
     argv = list.new()
@@ -1004,14 +1297,16 @@ verify_offsets(name: string, placed: ptr) -> int {
         println("generate: glslangValidator could not be run (${err}); is the Vulkan SDK on PATH?")
         os.exit(1)
     }
-    // `name: offset N, type X, size N, index 0,` per reported uniform.
+    // `name: offset N, type X, size N, index N,` per reported uniform.
     reported = 0
     mismatched = 0
     parts = split_lines(out)
     n = string.array_size(parts)
     i = 0
+    in_uniforms = true
     while i < n {
         line = line_at(parts, i)
+        if string.ends_with(line, " reflection:") != 0 { in_uniforms = line == "Uniform reflection:" }
         c = cursor(line)
         e = member_end(&c, 0)
         if e > 0 && word_at(&c, e, ": offset ") {
@@ -1023,12 +1318,18 @@ verify_offsets(name: string, placed: ptr) -> int {
                 t = word_end(&c, d + 7)
                 if t > d + 7 && word_at(&c, t, ", size ") {
                     s = digits_end(&c, t + 7)
-                    if s > t + 7 && word_at(&c, s, ", index 0,") && neg == false {
+                    // Any block's (the draw's, the camera's, the world's:
+                    // `index` is the block's): each member's name is one
+                    // block's alone, and its offset is in that block. A
+                    // storage buffer's runtime array (size 0) is no block's.
+                    sized = !(s == t + 8 && at(&c, t + 7) == 48)
+                    if s > t + 7 && word_at(&c, s, ", index ") && neg == false && sized {
                         uniform_name = slice(&c, 0, e)
                         digits = slice(&c, j, d)
                         offset = string.get_int(digits)
                         string.free(digits)
                         reported = reported + 1
+                        before = g_matched
                         ours = offset_of(placed, uniform_name)
                         if ours >= 0 { g_matched = g_matched + 1 }
                         if ours >= 0 && ours != offset {
@@ -1039,6 +1340,15 @@ verify_offsets(name: string, placed: ptr) -> int {
                         // once, with its stride; ae3d.gpu places each
                         // element (haze.column[0], [1], ...).
                         mismatched = mismatched + elements_mismatched(placed, uniform_name, offset, line)
+                        // An array of structs (world.lights) is reported a
+                        // field at a time, with the array's stride
+                        // (world.lights.colour, topLevelArrayStride);
+                        // ae3d.gpu places each element's (world.lights[2].colour).
+                        mismatched = mismatched + struct_elements_mismatched(placed, uniform_name, offset, line)
+                        if g_matched == before && in_uniforms {
+                            g_unmatched = g_unmatched + 1
+                            if g_unmatched == 1 { g_first_unmatched = string.copy(uniform_name) }
+                        }
                         string.free(uniform_name)
                     }
                 }
@@ -1073,6 +1383,46 @@ elements_mismatched(placed: ptr, name: string, offset: int, line: string) -> int
         g_matched = g_matched + 1
         if ours != offset + k * stride {
             println("generate: ${name}[${k}] at ${ours}, glslang says ${offset + k * stride}")
+            bad = bad + 1
+        }
+        k = k + 1
+    }
+    return bad
+}
+
+// The fields of an array of structs glslang reports at `offset` for the
+// first element, `name` with the array's name in it ("world.lights.colour"),
+// that `placed` puts anywhere but its topLevelArrayStride apart: each
+// element's ("world.lights[k].colour"), named; the elements matched are
+// counted in g_matched.
+struct_elements_mismatched(placed: ptr, name: string, offset: int, line: string) -> int {
+    at = string.index_of(line, ", topLevelArrayStride ")
+    if at < 0 { return 0 }
+    rest = string.substring(line, at + 22, string.length(line))
+    end = 0
+    while end < string.length(rest) && string.char_at(rest, end) >= 48 && string.char_at(rest, end) <= 57 { end = end + 1 }
+    stride = string.get_int(string.substring(rest, 0, end))
+    // Which of its names is the array's: the one whose element 0 is placed.
+    cut = 0 - 1
+    i = 0
+    while i < string.length(name) && cut < 0 {
+        if string.char_at(name, i) == 46 && i > 0 {
+            head = string.substring(name, 0, i)
+            tail = string.substring(name, i, string.length(name))
+            if offset_of(placed, "${head}[0]${tail}") >= 0 { cut = i }
+        }
+        i = i + 1
+    }
+    if cut < 0 { return 0 }
+    head = string.substring(name, 0, cut)
+    tail = string.substring(name, cut, string.length(name))
+    bad = 0
+    k = 0
+    while offset_of(placed, "${head}[${k}]${tail}") >= 0 {
+        ours = offset_of(placed, "${head}[${k}]${tail}")
+        g_matched = g_matched + 1
+        if ours != offset + k * stride {
+            println("generate: ${head}[${k}]${tail} at ${ours}, glslang says ${offset + k * stride}")
             bad = bad + 1
         }
         k = k + 1
@@ -1181,17 +1531,6 @@ read_text(path: string) -> string {
 
 // --- the tables ------------------------------------------------------------------------------------------------
 
-// One derived shader: its file, the block it comes from, its stage, its
-// samplers in binding order, and its varyings in and out.
-struct Derived {
-    name: string
-    source: string
-    stage: string
-    samplers: ptr
-    varyings_in: ptr
-    varyings_out: ptr
-    define: string               // a variant of its source: defined, "" for none
-}
 
 strings(count: int, a: string, b: string, c: string, d: string) -> ptr {
     l = list.new()
@@ -1222,48 +1561,9 @@ scene_out() -> ptr {
     return l
 }
 
-// The depth passes' varyings: the vertex before it was skinned, where a
-// model's cut is measured (#545), and how much of it is on the joints the
-// cut is kept to (#556).
-depth_out() -> ptr {
-    l = list.new()
-    varying(l, "vec3", "BindPos")
-    varying(l, "float", "ClipLimb")
-    return l
-}
-
-derived(l: ptr, name: string, source: string, stage: string, samplers: @keep ptr, varyings_in: @keep ptr, varyings_out: @keep ptr) {
-    d = calloc(1, sizeof(Derived)) as *Derived
-    d.name = name
-    d.source = source
-    d.stage = stage
-    d.samplers = samplers
-    d.varyings_in = varyings_in
-    d.varyings_out = varyings_out
-    d.define = ""
-    list.add_raw(l, derived_ptr(d))
-}
-
-// The same, of a variant of the source: `define` defined over it.
-derived_variant(l: ptr, name: string, source: string, stage: string, samplers: @keep ptr, varyings_in: @keep ptr,
-                varyings_out: @keep ptr, define: string) {
-    derived(l, name, source, stage, samplers, varyings_in, varyings_out)
-    d = list.get_raw(l, list.size(l) - 1) as *Derived
-    d.define = define
-}
 
 empty_list() -> ptr { return list.new() }
 
-// The auxiliary pipelines, in the order their SPIR-V lands in the header.
-auxiliary() -> ptr {
-    l = list.new()
-    derived(l, "depth_vk.vert", "VERTEX_DEPTH", "vert", empty_list(), empty_list(), depth_out())
-    // And without the skin stream, for the plain shadow pipelines: the
-    // portability subset refuses the zero stride they named it at.
-    derived_variant(l, "depth_plain_vk.vert", "VERTEX_DEPTH", "vert", empty_list(), empty_list(), depth_out(), "AE3D_UNSKINNED")
-    derived(l, "depth_vk.frag", "FRAGMENT_DEPTH", "frag", empty_list(), depth_out(), empty_list())
-    return l
-}
 
 // The shaders written with `quote`, each with the name its files take
 // (NAME.frag, NAME.vert) and its words' constants in ae3d.vkspirv
@@ -1381,7 +1681,43 @@ quoted_shaders() -> ptr {
     cd.shader = throng.crowd_depth_vertex(Throng { frames: 0 }, Shadow { reach: splat4(0.0) }, Texture { image: null })
     cd.vertex_only = true
     list.add_raw(l, quoted_ptr(cd))
+    // The scene's: its vertex and pixel shaders, the plain pipelines' vertex
+    // shader (no skin stream) drawn with the same pixel shader, and the depth
+    // pass's likewise.
+    li = calloc(1, sizeof(Quoted)) as *Quoted
+    li.name = string.copy("lit_quoted")
+    li.vertex = lit.lit_vertex(Draw { lift: 0.0 }, Cut { on: 0 }, Skin {}, Eye { far: 0.0 })
+    li.shader = lit_pixel_blank()
+    linked(li.vertex, li.shader)
+    list.add_raw(l, quoted_ptr(li))
+    lp = calloc(1, sizeof(Quoted)) as *Quoted
+    lp.name = string.copy("lit_plain_quoted")
+    lp.shader = lit.lit_plain_vertex(Draw { lift: 0.0 }, Cut { on: 0 }, Skin {}, Eye { far: 0.0 })
+    lp.vertex_only = true
+    list.add_raw(l, quoted_ptr(lp))
+    ld = calloc(1, sizeof(Quoted)) as *Quoted
+    ld.name = string.copy("lit_depth_quoted")
+    ld.vertex = lit.lit_depth_vertex(Draw { lift: 0.0 }, Cut { on: 0 }, Skin {}, Eye { far: 0.0 })
+    ld.shader = lit.lit_depth_pixel(Cut { on: 0 }, Wounds { count: 0 })
+    linked(ld.vertex, ld.shader)
+    list.add_raw(l, quoted_ptr(ld))
+    lq = calloc(1, sizeof(Quoted)) as *Quoted
+    lq.name = string.copy("lit_depth_plain_quoted")
+    lq.shader = lit.lit_depth_plain_vertex(Draw { lift: 0.0 }, Cut { on: 0 }, Skin {}, Eye { far: 0.0 })
+    lq.vertex_only = true
+    list.add_raw(l, quoted_ptr(lq))
     return l
+}
+
+// The scene's pixel shader with nothing set: its tree's shape is the same
+// for any.
+lit_pixel_blank() -> *GpuShader {
+    return lit.lit_pixel(Draw { lift: 0.0 }, DrawMaterial { alpha: 0.0 }, Surface { shadows: 0 }, Cut { on: 0 },
+                         Wounds { count: 0 }, Damage { on: 0 }, Eye { far: 0.0 }, ShadowCascades { on: 0 },
+                         Grid { lamp_base: 0 }, WorldState { light_count: 0 }, Weather { fog: 0 }, Texture { image: null },
+                         Texture { image: null }, Texture { image: null }, Texture { image: null }, Texture { image: null },
+                         Vec4s { data: null }, Floats { data: null }, Texture { image: null }, Texture { image: null },
+                         Texture { image: null }, Texture { image: null }, Texture { image: null })
 }
 
 // The composite with nothing set: its tree's shape is the same for any.
@@ -1472,92 +1808,77 @@ main() {
         println("generate: cannot read ${SHADERS}; run from the repository root")
         os.exit(1)
     }
-    vertex = block(source, "VERTEX_DEFAULT")
     fragment = block(source, "FRAGMENT_DEFAULT")
     light_members = light_struct(fragment)
 
-    // One block serves every pipeline, so a name declared twice has to
-    // mean the same thing in both. Two shaders disagreeing about a type
-    // would lay the block out for one of them and corrupt what the other
-    // reads.
-    all = list.new()
-    collect_uniforms(vertex, all)
-    collect_uniforms(fragment, all)
-    aux = auxiliary()
-    aux_count = list.size(aux)
+    // The scene's uniforms are its three blocks' tables (ae3d.shaders.lit,
+    // ae3d.shaders.frame), each typed as the ray-query pixel shader, the one
+    // hand-written shader left reading them, declares it where it does (a
+    // bool in an int's four bytes), as its table does where it does not.
+    declared = list.new()
+    collect_uniforms(fragment, declared)
+    ordered = table_members(declared)
+    // The three blocks: each uniform in the block its table puts it in.
+    blocks = Blocks { draw: list.new(), view: list.new(), world: list.new() }
     i = 0
-    while i < aux_count {
-        d = list.get_raw(aux, i) as *Derived
-        text = block(source, d.source)
-        collect_uniforms(text, all)
-        string.free(text)
-        i = i + 1
-    }
-    ordered = list.new()
-    n = list.size(all)
-    i = 0
-    while i < n {
-        m = list.get_raw(all, i) as *Member
-        seen = first_named(ordered, m.name)
-        if seen == null {
-            list.add_raw(ordered, member_ptr(m))
-        } else if seen.kind != m.kind || seen.count != m.count {
-            println("generate: ${m.name} declared as ${seen.kind}[${seen.count}] and ${m.kind}[${m.count}]")
+    while i < list.size(ordered) {
+        m = list.get_raw(ordered, i) as *Member
+        where = block_of(m.name)
+        if where == BLOCK_VIEW {
+            list.add_raw(blocks.view, member_ptr(m))
+        } else if where == BLOCK_WORLD {
+            list.add_raw(blocks.world, member_ptr(m))
+        } else if where == BLOCK_DRAW {
+            list.add_raw(blocks.draw, member_ptr(m))
+        } else {
+            println("generate: ${m.name} is in no block's table (ae3d.shaders.lit, ae3d.shaders.frame)")
             os.exit(1)
         }
         i = i + 1
     }
-    // The bone palettes last (#726): ten of the block's sixteen kilobytes,
-    // read only by a skinned draw, so every other draw copies the block up
-    // to where they start and no further.
-    i = 0
-    n = list.size(ordered)
-    moved = list.new()
-    kept = list.new()
-    while i < n {
-        m = list.get_raw(ordered, i) as *Member
-        if m.name == "bones" || m.name == "prevBoneRows" {
-            list.add_raw(moved, member_ptr(m))
-        } else {
-            list.add_raw(kept, member_ptr(m))
-        }
-        i = i + 1
-    }
-    i = 0
-    while i < list.size(moved) {
-        list.add_raw(kept, list.get_raw(moved, i))
-        i = i + 1
-    }
-    ordered = kept
-
-    // The vertex inputs already carry explicit locations in the OpenGL
-    // source, so they pass through untouched; only the varyings need
-    // numbering.
-    vertex_out = scene_out()
-    size_slot = calloc(1, 4) as int[]
+    tables_declared(ordered, light_members)
+    // Each block's offsets as glslang reports them, from its own start
+    // (`placed`, held to glslang), and the words' (`words`: the three end to
+    // end, what ae3d.vkscene names).
     placed = list.new()
-    vk_vertex = to_vulkan(vertex, "vert", ordered, empty_list(), empty_list(), vertex_out, light_members, placed, size_slot)
-    size = size_slot[0]
-    scratch = list.new()
-    // The scene's depth at 4, where a soft particle reads it (#738).
-    vk_fragment = to_vulkan(fragment, "frag", ordered, strings(4, "textureSampler", "shadowMap", "normalMap", "sceneDepth"), vertex_out, empty_list(), light_members, scratch, size_slot)
-    free_placed(scratch)
+    draw_size = layout_block(BLOCK_DRAW, blocks.draw, placed)
+    g_draw_placed = placed
+    view_from = draw_size
+    view_placed = list.new()
+    view_size = layout_block(BLOCK_VIEW, blocks.view, view_placed)
+    g_view_placed = view_placed
+    world_from = view_from + view_size
+    world_placed = list.new()
+    world_size = layout_block(BLOCK_WORLD, blocks.world, world_placed)
+    g_world_placed = world_placed
+    size = world_from + world_size
+    words_placed = list.new()
+    shifted(placed, 0, words_placed)
+    shifted(view_placed, view_from, words_placed)
+    shifted(world_placed, world_from, words_placed)
+    all_placed = list.new()
+    shifted(placed, 0, all_placed)
+    shifted(view_placed, 0, all_placed)
+    shifted(world_placed, 0, all_placed)
 
-    // The scene fragment twice: as it is, and tracing rays through the
-    // scene's acceleration structure at binding 5 where the device has
-    // VK_KHR_ray_query -- the same source, with its ray-query block
-    // compiled in (AE3D_RAY_QUERY) and the extension it needs.
+    // The pixel shader's varyings are where the quoted vertex shaders hand
+    // them on (ae3d.shaders.lit); its colour, normal map and auxiliary image
+    // in the draw's set, the cascades' atlas in the camera's.
+    vertex_out = scene_out()
+    vk_fragment = to_vulkan(fragment, "frag", &blocks,
+                            strings(4, "textureSampler@0.1", "shadowMap@1.1", "normalMap@0.3", "sceneDepth@0.4"),
+                            vertex_out, list.new(), light_members)
+
+    // The scene fragment tracing rays through the scene's acceleration
+    // structure (the world's set, binding 4) where the device has
+    // VK_KHR_ray_query: its ray-query block compiled in (AE3D_RAY_QUERY) and
+    // the extension it needs. Everywhere else the scene's pixel shader is
+    // the quoted one.
     vk_fragment_rq = string.replace(vk_fragment, "#version 450",
-        "#version 460\n#extension GL_EXT_ray_query : require\n#define AE3D_RAY_QUERY 1\nlayout(set = 0, binding = 5) uniform accelerationStructureEXT sceneAS;")
+        "#version 460\n#extension GL_EXT_ray_query : require\n#define AE3D_RAY_QUERY 1\nlayout(set = 2, binding = 4) uniform accelerationStructureEXT sceneAS;")
 
     written = list.new()                 // *Output, the shaders in header order
-    output(written, "scene_vk.vert", vk_vertex)
-    output(written, "scene_vk.frag", vk_fragment)
     output(written, "scene_rq_vk.frag", vk_fragment_rq)
-    // The scene's vertex shader for the plain pipelines, which name no skin
-    // stream (ae3d.vkpipes): what an unskinned vertex reads from it held as
-    // constants.
-    output(written, "scene_plain_vk.vert", string.replace(vk_vertex, "#version 450", "#version 450\n#define AE3D_UNSKINNED 1"))
     // Compute shaders carry their own layout -- storage buffers and push
     // constants, nothing from the scene block -- so they are compiled as
     // they are written, not rewritten around the block.
@@ -1576,23 +1897,6 @@ main() {
     output(written, "cluster_cull_vk.comp", block(source, "COMPUTE_CLUSTER_CULL"))
     output(written, "cluster_scan_vk.comp", block(source, "COMPUTE_CLUSTER_SCAN"))
     output(written, "cluster_emit_vk.comp", block(source, "COMPUTE_CLUSTER_EMIT"))
-    i = 0
-    while i < aux_count {
-        d = list.get_raw(aux, i) as *Derived
-        // These pipelines reuse the scene's vertex input, so their
-        // attributes are renamed onto it rather than described a second
-        // time.
-        text = block(source, d.source)
-        renamed = rename_attributes(text)
-        string.free(text)
-        scratch = list.new()
-        code = to_vulkan(renamed, d.stage, ordered, d.samplers, d.varyings_in, d.varyings_out, light_members, scratch, size_slot)
-        free_placed(scratch)
-        string.free(renamed)
-        if d.define != "" { code = string.replace(code, "#version 450", "#version 450\n#define ${d.define} 1") }
-        output(written, d.name, code)
-        i = i + 1
-    }
     // The overlay carries its own layout as well -- two vec4s of push
     // constants and its atlas at binding 0, nothing from the scene block --
     // and its one source is written for both renderers: the same text at
@@ -1642,7 +1946,7 @@ main() {
         output(outputs, shader_path, w.text)
         i = i + 1
     }
-    offsets_module = aether_offsets(placed, size, light_placed, light_stride)
+    offsets_module = aether_offsets(words_placed, size, light_placed, light_stride, view_from, world_from)
     output(outputs, VKSCENE, offsets_module)
 
     // --check: is what is checked in what the shader source produces? An
@@ -1728,14 +2032,23 @@ main() {
             // Its own block, every member of it reported where ae3d.gpu put it.
             own = quoted_placed(q, name)
             _reported = verify_offsets(name, own)
-            if (string.ends_with(name, ".frag") != 0 || q.vertex != null || q.vertex_only) && g_matched != list.size(own) {
+            // A shader of the scene's layouts is handed every field of each
+            // struct it captures of one, and glslang reports the ones it
+            // reads: each of those must be one ae3d.gpu placed.
+            layouts = gpu.uses_layouts(q.shader)
+            if q.vertex != null && string.ends_with(name, ".vert") != 0 { layouts = gpu.uses_layouts(q.vertex) }
+            if layouts && (g_unmatched > 0 || g_matched == 0) {
+                println("generate: glslang reported ${g_unmatched} of ${name}'s uniforms that ae3d.gpu did not place (${g_first_unmatched})")
+                os.exit(1)
+            }
+            if !layouts && (string.ends_with(name, ".frag") != 0 || q.vertex != null || q.vertex_only) && g_matched != list.size(own) {
                 println("generate: glslang reported ${g_matched} of ${name}'s ${list.size(own)} uniforms")
                 os.exit(1)
             }
             checked = checked + g_matched
             free_placed(own)
         } else if string.ends_with(name, ".comp") == 0 {
-            checked = checked + verify_offsets(name, placed)
+            checked = checked + verify_offsets(name, all_placed)
         }
         i = i + 1
     }
@@ -1744,8 +2057,13 @@ main() {
     module_text = vkspirv_text(written, quoted, OUT_DIR, bodies)
     write_text(VKSPIRV, module_text)
 
-    println("generate: ${list.size(ordered)} uniforms, block ${size} bytes, ${checked} offsets verified against glslang, ${shader_count} shaders, ${g_spirv_total}B of SPIR-V")
+    println("generate: ${list.size(ordered)} uniforms, blocks of ${draw_size}, ${view_size} and ${world_size} bytes, ${checked} offsets verified against glslang, ${shader_count} shaders, ${g_spirv_total}B of SPIR-V")
 }
+
+// What the last verify_offsets found glslang report that it was not given,
+// and the first of them.
+var g_unmatched = 0
+var g_first_unmatched = ""
 
 // The SPIR-V's bytes in all, from the last vkspirv_text.
 var g_spirv_total = 0

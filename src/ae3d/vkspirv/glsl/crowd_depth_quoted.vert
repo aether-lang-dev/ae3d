@@ -9,11 +9,11 @@ struct Shadow {
     mat4 light_space;
     vec4 reach;
 };
-layout(std140, set = 1, binding = 0) uniform VertexParams {
+layout(std140, set = 3, binding = 0) uniform VertexParams {
     Throng throng;
     Shadow shadow;
 };
-layout(set = 1, binding = 1) uniform sampler2D pose_bank;
+layout(set = 3, binding = 1) uniform sampler2D pose_bank;
 layout(location = 0) in vec3 inPosition;
 layout(location = 3) in mat4 instanceModel;
 layout(location = 8) in vec4 inJoints;
