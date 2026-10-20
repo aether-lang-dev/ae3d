@@ -152,49 +152,6 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     vec4 ddgiBase[2];
     vec4 ddgiSpacing;
     vec4 ddgiAtlas;
-    float time;
-    float waveSpeedMultiplier;
-    float waveHeightMultiplier;
-    float waveRandomness;
-    vec3 waveDirections[4];
-    float waveAmplitudes[4];
-    float waveFrequencies[4];
-    float waveSpeeds[4];
-    float wavePhases[4];
-    float waveSteepness[4];
-    vec3 lightPos;
-    vec3 lightDirection;
-    vec3 lightColor;
-    float lightIntensity;
-    vec3 waterBaseColor;
-    float waterOpacity;
-    bool enableFoam;
-    float foamIntensity;
-    float waterLevel;
-    vec3 skyColor;
-    vec3 horizonColor;
-    float skyOvercast;
-    vec3 skyOvercastColor;
-    bool enableWaterReflection;
-    float waterReflectionIntensity;
-    int hasSkyTexture;
-    int waterSkyCapture;
-    vec3 rippleArea;
-    float waterDepthFade;
-    float waterShoreFoam;
-    bool enableWaterDistortion;
-    float waterDistortionIntensity;
-    bool enableWaterNormalMapping;
-    float waterNormalIntensity;
-    int pullVertexBits;
-    int poseBankFrames;
-    int impostorCols;
-    int impostorRows;
-    float impostorWidth;
-    float impostorHeight;
-    float crowdTravel;
-    float crowdPhaseStep;
-    vec4 shadowReach;
     mat4 bones[96];
     vec4 prevBoneRows[288];
 };
@@ -308,7 +265,7 @@ Light clustered_light(int i, out float reach, out int shadowSlot) {
     shadowSlot = int(floor(e.z + 0.5));
     return L;
 }
-// The crowd's far tier as pictures (see VERTEX_CROWD): a picture is cut out
+// The crowd's far tier as pictures (see ae3d.shaders.throng): a picture is cut out
 // by its alpha, and its colour is the figure's albedo and its normal map
 // the figure's own normals, so it is lit below by the scene's lights the
 // way the mesh beside it is.

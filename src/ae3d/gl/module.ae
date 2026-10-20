@@ -35,7 +35,8 @@ import ae3d.shaders.composite
 import ae3d.shaders.composite (Haze)
 import ae3d.shaders.sea
 import ae3d.shaders.frame
-import ae3d.shaderlib (vec2, vec3, Texture, TextureMS, Texture3D, zero_mat4)
+import ae3d.shaders.throng
+import ae3d.shaderlib (vec2, vec3, Texture, TextureMS, Texture3D, zero_mat4, splat4)
 import ae3d.skylight
 import ae3d.skin
 import ae3d.posing
@@ -1180,7 +1181,8 @@ matrix_columns() {
 }
 
 // The crowd's extra instance attribute: one float an instance at location
-// 11, the animation phase VERTEX_CROWD reads to pick a pose-bank frame.
+// 11, the animation phase the crowd's vertex shader (ae3d.shaders.throng)
+// reads to pick a pose-bank frame.
 // Called after the shared setup, so a crowd draw carries matrices, colours
 // and phases and an ordinary instanced draw carries only the first two.
 // Set up with no instances too: the attribute is the vertex array's, and
@@ -1731,10 +1733,15 @@ struct GLRenderer {
     sky_shader: ptr                // *GpuShader
     // The water's surface (ae3d.shaders.sea): a pair, its captures set
     // before each draw (sea_values); 0 when it would not compile, and the
-    // hand-written water program drawn instead.
+    // surface drawn by the default program instead.
     sea_program: int
     sea_vertex_shader: ptr         // *GpuShader
     sea_shader: ptr                // *GpuShader
+    // The crowd's vertex shaders (ae3d.shaders.throng), the crowd program's
+    // and the crowd's depth program's, their captures set before each draw
+    // (crowd_values) from what the hand-written ones were sent.
+    crowd_vertex_shader: ptr       // *GpuShader
+    crowd_depth_shader: ptr        // *GpuShader
     sky_capture_program: int
     sky_capture_shader: ptr        // *GpuShader
     // The cloud pass (#317): its program, its two targets (one drawn while
@@ -2638,9 +2645,9 @@ apply_skeleton(r: *GLRenderer, slots: *ProgramSlots, m: *Model) {
 }
 
 // A crowd is posed from its pose bank -- a float texture of baked frames -- on
-// texture unit 3, uploaded the first time this model is drawn. VERTEX_CROWD
-// reads it by (bone, frame); poseBankFrames lets it turn an instance's phase
-// into a frame.
+// texture unit 3, uploaded the first time this model is drawn. The crowd's
+// vertex shader (ae3d.shaders.throng) reads it by (bone, frame); its frames
+// let it turn an instance's phase into a frame.
 bind_pose_bank(r: *GLRenderer, slots: *ProgramSlots, m: *Model) {
     if m.pose_bank_texture == 0 {
         m.pose_bank_texture = gl_posebank_texture(posing.posebank_data(m.pose_bank), posing.posebank_frames(m.pose_bank), posing.posebank_bones(m.pose_bank))
@@ -2670,6 +2677,53 @@ bind_pose_bank(r: *GLRenderer, slots: *ProgramSlots, m: *Model) {
     }
 }
 
+// The frame's values the crowd's vertex shader reads, as set_frame_uniforms
+// sends them to the crowd program, once a frame: the view-projection, last
+// frame's unjittered one, and where the eye is.
+crowd_eye(r: *GLRenderer, view_projection: *Mat4, cam: *Camera) {
+    s = r.crowd_vertex_shader as *GpuShader
+    sea_mat4(s, "eye", "view_projection", view_projection as ptr)
+    previous = core.camera_view_projection(cam)
+    if r.prev_vp_valid { previous = r.prev_vp }
+    sea_mat4(s, "eye", "prev_view_projection", (&previous) as ptr)
+    sea_vec(s, "eye", "position", cam.position.x, cam.position.y, cam.position.z)
+}
+
+// A crowd's draw: the rest of what its vertex shader reads, as the
+// hand-written program was sent it -- the model's place (set_model_matrix),
+// the shadow's light space (bind_shadow_map, where there is a map), the
+// bank's frames, the walk's step and the impostor's grid (bind_pose_bank)
+// -- each uniform then set on the crowd program, its bank on unit 3.
+crowd_values(r: *GLRenderer, m: *Model) {
+    s = r.crowd_vertex_shader as *GpuShader
+    sent = m.model_matrix
+    if m.is_instanced && core.model_instance_count(m) > 0 {
+        if geometry.inst_is_points(m.instances) == 1 { sent = point_frame(m) } else { sent = core.mat4_ident() }
+    }
+    sea_mat4(s, "throng", "model", (&sent) as ptr)
+    if r.shadow_enabled && r.shadow_map != 0 { sea_mat4(s, "shadow", "light_space", (&r.shadow_space) as ptr) }
+    sea_int(s, "throng", "frames", m.pose_bank_frames)
+    travel = 0.0
+    step = 0.0
+    if m.crowd_walk > 0.0 {
+        step = r.frame_seconds / m.crowd_walk
+        travel = posing.posebank_travel(m.pose_bank, m.pose_bank_frames) * step
+    }
+    sea_float(s, "throng", "travel", travel)
+    sea_float(s, "throng", "phase_step", step)
+    on = 0
+    if core.model_is_impostor(m) { on = 1 }
+    sea_int(s, "throng", "impostor", on)
+    if on == 1 {
+        sea_int(s, "throng", "columns", m.impostor_cols)
+        sea_int(s, "throng", "rows", m.impostor_rows)
+        sea_float(s, "throng", "width", m.impostor_width)
+        sea_float(s, "throng", "height", m.impostor_height)
+    }
+    quoted_uniforms(r.crowd_program, s)
+    gl_uniform_int(gl_uniform_location(r.crowd_program, "pose_bank"), 3)
+}
+
 renderer_init(r: *GLRenderer, window: ptr, width: int, height: int) -> int {
     missing = gl_load()
     if missing != 0 {
@@ -2692,14 +2746,22 @@ renderer_init(r: *GLRenderer, window: ptr, width: int, height: int) -> int {
 
     // The crowd's instanced-skinned program: same lighting as the default, but a
     // vertex stage that poses each instance from the pose bank at its own phase.
-    r.crowd_program = compile_program(shaders.VERTEX_CROWD, shaders.FRAGMENT_DEFAULT, "crowd")
+    // Its vertex shader is the quoted one's, written as OpenGL's GLSL.
+    cv = throng.crowd_vertex(throng.Throng { frames: 0 }, frame.Eye { far: 0.0 }, frame.Shadow { reach: splat4(0.0) },
+                             Texture { image: null })
+    r.crowd_vertex_shader = cv as ptr
+    r.crowd_program = compile_program(gpu.emit_vertex_glsl(cv, gpu.GL, "", ""), shaders.FRAGMENT_DEFAULT, "crowd")
     if r.crowd_program == 0 { return 0 }
     slots_for(r, r.crowd_program)
 
     r.shadow_program = compile_program(shaders.VERTEX_DEPTH, shaders.FRAGMENT_DEPTH, "depth")
     // The crowd's depth pass poses from the pose bank by phase, so it casts a
     // walking shadow, not a bind-pose one. Same fragment (depth only).
-    r.crowd_shadow_program = compile_program(shaders.VERTEX_CROWD_DEPTH, shaders.FRAGMENT_DEPTH, "crowd_depth")
+    cd = throng.crowd_depth_vertex(throng.Throng { frames: 0 }, frame.Shadow { reach: splat4(0.0) },
+                                   Texture { image: null })
+    r.crowd_depth_shader = cd as ptr
+    r.crowd_shadow_program = compile_program(gpu.emit_vertex_glsl(cd, gpu.GL, "", ""), shaders.FRAGMENT_DEPTH,
+                                             "crowd_depth")
     // FXAA's program is its quoted shader's tree written as OpenGL's GLSL,
     // the same tree the Vulkan backend's SPIR-V was made from.
     r.fxaa_w = width
@@ -3855,10 +3917,6 @@ face_contents(r: *GLRenderer, ls: *LampShadows, slot: int, f: int) -> (long, boo
 render_crowd_shadows(r: *GLRenderer, space: *Mat4, mode: int, a: int, b: int) {
     if r.crowd_shadow_program == 0 { return }
     bound = 0
-    space_loc = 0
-    model_loc = 0
-    bank_loc = 0
-    frames_loc = 0
     count = list.size(r.models)
     i = 0
     while i < count {
@@ -3875,11 +3933,7 @@ render_crowd_shadows(r: *GLRenderer, space: *Mat4, mode: int, a: int, b: int) {
         }
         if bound == 0 {
             use_program(r, r.crowd_shadow_program)
-            space_loc = gl_uniform_location(r.crowd_shadow_program, "lightSpaceMatrix")
-            model_loc = gl_uniform_location(r.crowd_shadow_program, "model")
-            bank_loc = gl_uniform_location(r.crowd_shadow_program, "poseBank")
-            frames_loc = gl_uniform_location(r.crowd_shadow_program, "poseBankFrames")
-            gl_uniform_mat4(space_loc, space)
+            sea_mat4(r.crowd_depth_shader as *GpuShader, "shadow", "light_space", space as ptr)
             bound = 1
         }
         core.model_sync_transform(m)
@@ -3890,13 +3944,15 @@ render_crowd_shadows(r: *GLRenderer, space: *Mat4, mode: int, a: int, b: int) {
             m.pose_bank_texture = gl_posebank_texture(posing.posebank_data(m.pose_bank), posing.posebank_frames(m.pose_bank), posing.posebank_bones(m.pose_bank))
         }
         gl_texture_bind(3, m.pose_bank_texture)
-        gl_uniform_int(bank_loc, 3)
-        gl_uniform_int(frames_loc, m.pose_bank_frames)
         // The identity, as the lit crowd draw sends: each figure's placement
         // is its instance matrix, built from the model's own scale, and a
         // shadow cast through the model matrix as well was scaled twice.
+        ds = r.crowd_depth_shader as *GpuShader
         crowd_identity = core.mat4_ident()
-        gl_uniform_mat4(model_loc, &crowd_identity)
+        sea_mat4(ds, "throng", "model", (&crowd_identity) as ptr)
+        sea_int(ds, "throng", "frames", m.pose_bank_frames)
+        quoted_uniforms(r.crowd_shadow_program, ds)
+        gl_uniform_int(gl_uniform_location(r.crowd_shadow_program, "pose_bank"), 3)
         // Through the proxy's mesh where the model has one: the near tier
         // casts from the far tier's hundred and sixty-eight triangles.
         gl_vao_bind(depth_vao(m))
@@ -4705,7 +4761,7 @@ init_sky_light(r: *GLRenderer) -> bool {
 }
 
 // The water's pair, compiled from its trees' GLSL. Left at 0, said once,
-// when it would not compile: the hand-written water program is drawn then.
+// when it would not compile: the default program draws the surface then.
 init_sea(r: *GLRenderer) {
     vs = sea.sea_vertex(sea.Water { time: 0.0 }, frame.Eye { far: 0.0 })
     ps = sea.sea(sea.Water { time: 0.0 }, frame.Eye { far: 0.0 }, frame.KeyLight { intensity: 0.0 }, frame.Weather { fog: 0 },
@@ -5529,7 +5585,7 @@ render_model(r: *GLRenderer, m: *Model, view_projection: *Mat4,
         program = r.crowd_program
     } else if is_sea {
         program = r.sea_program
-    } else if core.shader_valid(&m.shader) {
+    } else if core.shader_valid(&m.shader) && m.shader.kind == core.SHADER_CUSTOM {
         if !m.shader.compiled {
             m.shader.program = compile_program(m.shader.vertex_source,
                                                m.shader.fragment_source, "model")
@@ -5542,6 +5598,7 @@ render_model(r: *GLRenderer, m: *Model, view_projection: *Mat4,
     use_program(r, program)
     if slots.frame_stamp != r.frame_stamp {
         set_frame_uniforms(r, slots, view_projection, light, r.lights, cam)
+        if is_crowd { crowd_eye(r, view_projection, cam) }
         slots.frame_stamp = r.frame_stamp
     }
     bind_shadow_map(r, slots)
@@ -5552,7 +5609,10 @@ render_model(r: *GLRenderer, m: *Model, view_projection: *Mat4,
     send_wounds(slots.wound_count, slots.wound_data, slots.wound_layers, slots.wound_core, m)
     send_damage(r, slots, m)
     apply_shading(r, slots, m, program)
-    if is_crowd { bind_pose_bank(r, slots, m) }
+    if is_crowd {
+        bind_pose_bank(r, slots, m)
+        crowd_values(r, m)
+    }
     if is_sea { sea_values(r, m, view_projection, light, cam) }
 
     gl_vao_bind(m.vao)
@@ -6856,6 +6916,8 @@ renderer_cleanup(r: *GLRenderer) {
     if r.default_program != 0 { gl_program_delete(r.default_program) ; r.default_program = 0 }
     if r.shadow_program != 0 { gl_program_delete(r.shadow_program) ; r.shadow_program = 0 }
     if r.crowd_shadow_program != 0 { gl_program_delete(r.crowd_shadow_program) ; r.crowd_shadow_program = 0 }
+    if r.crowd_vertex_shader != null { gpu.shader_free(r.crowd_vertex_shader as *GpuShader) ; r.crowd_vertex_shader = null }
+    if r.crowd_depth_shader != null { gpu.shader_free(r.crowd_depth_shader as *GpuShader) ; r.crowd_depth_shader = null }
     if r.fxaa_program != 0 { gl_program_delete(r.fxaa_program) ; r.fxaa_program = 0 }
     if r.fxaa_shader != null { gpu.shader_free(r.fxaa_shader as *GpuShader) ; r.fxaa_shader = null }
     if r.composite_program != 0 { gl_program_delete(r.composite_program) ; r.composite_program = 0 }

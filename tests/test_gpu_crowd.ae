@@ -1,0 +1,755 @@
+// ae3d.shaders.throng through ae3d.gpu: the crowd's vertex shaders, written
+// with `quote` (step 6), drawn with the scene's and the depth pass's
+// hand-written pixel shaders.
+//
+//   - crowd_vertex, crowd_pull_vertex and crowd_depth_vertex come out as the
+//     GLSL in tests/fixtures/gpu/crowd*.vert (and the _gl twins of the two
+//     OpenGL draws; the cluster cut is Vulkan's alone, and its OpenGL GLSL
+//     is refused), and glslang and spirv-val pass them;
+//   - they hand on what FRAGMENT_DEFAULT and FRAGMENT_DEPTH read, by their
+//     names, at the hand-written shaders' places; their own block and the
+//     pose bank are at set 1, or set 2 for the cluster cut, whose three
+//     storage buffers are at set 1 where vkclusterlod binds them;
+//   - their captures are structs, the draw's Throng and the frame's Eye and
+//     Shadow: each field the scene block's words copied in comes back out of
+//     the shader's block the same 32 bits, which the Vulkan renderer's copy
+//     from the block the scene's ring takes relies on;
+//   - on the CPU, crowd_vertex poses figures from a pose bank at their own
+//     phases, and turns impostors to the eye, as the same shader written as
+//     plain Aether over ae3d.shaderlib does; crowd_pull_vertex, given the
+//     same vertices, skin and figures in storage, hands on what crowd_vertex
+//     does, to the bit; crowd_depth_vertex poses them into a map and drops
+//     a figure past a lamp's reach;
+//   - shaderlib's matrix weighing and summing, its columns, mat3(m) * v and
+//     int(x) are GLSL's; a pixel shader reading a storage buffer is refused.
+//
+// On a GPU the crowd is drawn by test_backend_parity, test_device_crowd,
+// test_impostor and zombie_city. AE3D_GPU_WRITE_GOLDEN=1 writes the
+// fixtures.
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.lanes
+import std.quote
+import ae3d.core
+import ae3d.gpu
+import ae3d.gpu (GpuShader, GpuVal, GpuRun, fragment)
+import ae3d.shaders.throng
+import ae3d.shaders.throng (Throng, CrowdVertex)
+import ae3d.shaders.frame
+import ae3d.shaders.frame (Eye, Shadow)
+import ae3d.shaderlib
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, ShaderImage, Floats, Vec4s, xyz, splat3, splat4, mul, mul_m4,
+                       m4_at, m4_col, mul_m3, mul_fm4, mul_m4f, add_m4, mat4_cols, mat4_floats, int_of, float_of,
+                       normalize, cross, dot, distance, fract, floor, atan2, image_new, image_set, image_free, texture_of,
+                       mat4_of, floats_of, vec4s_of, floats_at)
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+absf(a: float) -> float { if a < 0.0 { return 0.0 - a } return a }
+maxf(a: float, b: float) -> float { if a > b { return a } return b }
+
+// glslang -V over `text` (as `stage`), then spirv-val; or, for desktop
+// OpenGL's GLSL (`opengl`), glslang's check of it. Skipped where they are
+// not on PATH.
+compiles(label: string, text: string, stage: string, opengl: bool) {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+        if status != 0 { println(out) }
+        return
+    }
+    check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    if status != 0 { println(out) }
+    if string.length(os.which("spirv-val")) == 0 {
+        println("  skip spirv-val (not on PATH)")
+        return
+    }
+    vargv = list.new()
+    list.add(vargv, spv)
+    vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+    check("spirv-val passes ${label}.${stage}", vstatus == 0)
+    if vstatus != 0 { println(vout) }
+    list.free(vargv)
+}
+
+// `text` is the fixture at `path`; AE3D_GPU_WRITE_GOLDEN=1 writes it.
+golden_is(text: string, path: string) {
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(path, text)
+        check("${path} written", werr == "")
+    }
+    golden, gerr = file.read(path)
+    check("${path} is there", gerr == "")
+    check("the GLSL written is ${path}", text == golden)
+    if text != golden {
+        println("--- emitted ---")
+        println(text)
+    }
+}
+
+// ── The pose bank ─────────────────────────────────────────────────────
+
+const BONES = 3
+const FRAMES = 4
+
+// Bone `b` at frame `f`: a turn about the vertical and a lift, each its own,
+// so every bone, frame and blend between them poses otherwise.
+bone_matrix(b: int, f: int) -> mat4 {
+    a = b * 0.31 + f * 0.17 + 0.05
+    c = shaderlib.cos(a)
+    s = shaderlib.sin(a)
+    return mat4_cols(vec4(vec3(c, 0.0, 0.0 - s), 0.0), vec4(vec3(0.0, 1.0, 0.0), 0.0), vec4(vec3(s, 0.0, c), 0.0),
+                     vec4(vec3(b * 0.11, f * 0.05 + b * 0.02, 0.0 - b * 0.03), 1.0))
+}
+
+// The bank: four texels a bone (its columns), a row a frame.
+bank_picture() -> *ShaderImage {
+    img = image_new(BONES * 4, FRAMES)
+    f = 0
+    while f < FRAMES {
+        b = 0
+        while b < BONES {
+            m = bone_matrix(b, f)
+            col = 0
+            while col < 4 {
+                v = m4_col(m, col) as f32x4
+                image_set(img, b * 4 + col, f, v.x, v.y, v.z, v.w)
+                col = col + 1
+            }
+            b = b + 1
+        }
+        f = f + 1
+    }
+    return img
+}
+
+// ── The values ────────────────────────────────────────────────────────
+
+camera_matrix(eye: vec3, jx: float) -> Mat4 {
+    e = eye as f32x4
+    proj = core.mat4_perspective(1.0, 16.0 / 9.0, 0.2, 2000.0)
+    proj.m8 = jx
+    look = core.mat4_look_at(core.vec3(e.x, e.y, e.z), core.vec3(e.x, e.y - 1.5, e.z - 20.0), core.vec3(0.0, 1.0, 0.0))
+    return core.mat4_mul(proj, look)
+}
+
+// Figure `k`'s placement: turned its own way, scaled, standing on the
+// street somewhere ahead.
+figure_matrix(k: int) -> mat4 {
+    yaw = k * 0.73 - 1.1
+    sc = 0.9 + (k % 3) * 0.1
+    c = shaderlib.cos(yaw) * sc
+    s = shaderlib.sin(yaw) * sc
+    return mat4_cols(vec4(vec3(c, 0.0, 0.0 - s), 0.0), vec4(vec3(0.0, sc, 0.0), 0.0), vec4(vec3(s, 0.0, c), 0.0),
+                     vec4(vec3(k * 1.7 - 6.0, 0.0, 0.0 - 9.0 - (k % 4) * 3.5), 1.0))
+}
+
+// Vertex `j` of a figure: somewhere on its body, hanging off two or three
+// of the bones.
+vertex_of(j: int, k: int) -> CrowdVertex {
+    w0 = 0.5 + (j % 3) * 0.1
+    w1 = 0.3 - (j % 2) * 0.1
+    return CrowdVertex { position: vec3((j % 4) * 0.13 - 0.2, j * 0.21, (j % 3) * 0.07 - 0.05),
+                         uv: vec2(j * 0.11, 1.0 - j * 0.07),
+                         normal: normalize(vec3(0.3 + j * 0.1, 0.5, 0.7 - j * 0.05)),
+                         instance_model: figure_matrix(k),
+                         instance_color: vec3(0.4 + k * 0.05, 0.6, 0.3 + j * 0.02),
+                         joints: vec4(vec3((j % BONES) * 1.0, ((j + 1) % BONES) * 1.0, ((j + 2) % BONES) * 1.0), 0.0),
+                         weights: vec4(vec3(w0, w1, 1.0 - w0 - w1), 0.0), occlusion: 0.6 + j * 0.03,
+                         instance_phase: k * 0.137 + 0.02 }
+}
+
+v2_of(v: vec2) -> *GpuVal {
+    p = v as f32x4
+    return gpu.v2(p.x, p.y)
+}
+v3_of(v: vec3) -> *GpuVal {
+    p = v as f32x4
+    return gpu.v3(p.x, p.y, p.z)
+}
+v4_of(v: vec4) -> *GpuVal {
+    p = v as f32x4
+    return gpu.v4(p.x, p.y, p.z, p.w)
+}
+
+// A vertex's attributes into a run, each a value the caller frees.
+give(run: *GpuRun, a: CrowdVertex, made: ptr) {
+
+    vals = [v3_of(a.position), v2_of(a.uv), v3_of(a.normal), gpu.vmat4(a.instance_model), v3_of(a.instance_color),
+            v4_of(a.joints), v4_of(a.weights), gpu.v1(a.occlusion), gpu.v1(a.instance_phase)]
+    names = ["position", "uv", "normal", "instance_model", "instance_color", "joints", "weights", "occlusion",
+             "instance_phase"]
+    k = 0
+    while k < 9 {
+        gpu.cpu_vertex_attr(run, names[k], vals[k])
+        list.add_raw(made, vals[k] as ptr)
+        k = k + 1
+    }
+}
+
+made_free(made: ptr) {
+    k = 0
+    while k < list.size(made) {
+        gpu.val_free(list.get_raw(made, k) as *GpuVal)
+        k = k + 1
+    }
+    list.free(made)
+}
+
+// ── The shader written as plain Aether ───────────────────────────────
+//
+// Posed from the bones themselves (bone_matrix), not through the module's
+// helpers and the bank, so a helper written wrong is not held to itself.
+
+// The four-bone skin at one frame: each bone weighed, summed in order.
+ref_skin(joints: vec4, weights: vec4, frame: int) -> mat4 {
+    j = joints as f32x4
+    w = weights as f32x4
+    return add_m4(add_m4(add_m4(mul_fm4(w.x, bone_matrix(j.x as int, frame)), mul_fm4(w.y, bone_matrix(j.y as int, frame))),
+                         mul_fm4(w.z, bone_matrix(j.z as int, frame))),
+                  mul_fm4(w.w, bone_matrix(j.w as int, frame)))
+}
+
+// The skin at a phase of the walk: the two frames about it blended, the
+// clip looping.
+ref_skin_at(joints: vec4, weights: vec4, phase: float, frames: int) -> mat4 {
+    fpos = fract(phase) * float_of(frames)
+    frame0 = floor(fpos) as int
+    blend = fpos - float_of(frame0)
+    frame1 = frame0 + 1
+    if frame1 >= frames { frame1 = 0 }
+    return add_m4(mul_m4f(ref_skin(joints, weights, frame0), 1.0 - blend), mul_m4f(ref_skin(joints, weights, frame1), blend))
+}
+
+struct CrowdOut {
+    position: vec4
+    uv: vec2
+    normal: vec3
+    frag_pos: vec3
+    colour: vec3
+    light: vec4
+    occlusion: float
+    now: vec4
+    prev: vec4
+}
+
+crowd_reference(t: Throng, eye: Eye, shadow: Shadow, bank: Texture, v: CrowdVertex) -> CrowdOut {
+    model_matrix = mul_m4(t.model, v.instance_model)
+    walking = normalize(vec3(m4_at(model_matrix, 0, 0), 0.0, m4_at(model_matrix, 0, 2)))
+    if t.impostor != 0 {
+        origin = xyz(m4_col(model_matrix, 3))
+        facing = normalize(vec3(m4_at(model_matrix, 0, 0), 0.0, m4_at(model_matrix, 0, 2)))
+        to_eye = eye.position - origin
+        level = normalize(vec3(to_eye.x, 0.0, to_eye.z))
+        angle = atan2(dot(level, vec3(-facing.z, 0.0, facing.x)), dot(level, facing))
+        turn = fract(angle / 6.28318530718 + 1.0)
+        column = int_of(floor(turn * float_of(t.columns) + 0.5)) % t.columns
+        row = int_of(floor(fract(v.instance_phase) * float_of(t.rows))) % t.rows
+        right = normalize(cross(vec3(0.0, 1.0, 0.0), level))
+        world = origin + right * (v.position.x * t.width) + vec3(0.0, v.position.y * t.height, 0.0)
+        cell = vec2((float_of(column) + v.uv.x) / float_of(t.columns),
+                    1.0 - (float_of(row) + (1.0 - v.uv.y)) / float_of(t.rows))
+        quad_now = mul(eye.view_projection, vec4(world, 1.0))
+        return CrowdOut { position: quad_now, uv: cell, normal: facing, frag_pos: world, colour: v.instance_color,
+                          light: mul(shadow.light_space, vec4(world, 1.0)), occlusion: v.occlusion, now: quad_now,
+                          prev: mul(eye.prev_view_projection, vec4(world - walking * t.travel, 1.0)) }
+    }
+    skin = ref_skin_at(v.joints, v.weights, v.instance_phase, t.frames)
+    posed = mul(skin, vec4(v.position, 1.0))
+    posed_normal = mul_m3(skin, v.normal)
+    frag_pos = xyz(mul(model_matrix, posed))
+    now = mul(mul_m4(eye.view_projection, model_matrix), posed)
+    posed_prev = mul(ref_skin_at(v.joints, v.weights, v.instance_phase - t.phase_step, t.frames), vec4(v.position, 1.0))
+    world_prev = mul(model_matrix, posed_prev)
+    stepped = vec4(xyz(world_prev) - walking * t.travel, world_prev.w)
+    return CrowdOut { position: now, uv: v.uv, normal: normalize(mul_m3(model_matrix, posed_normal)), frag_pos: frag_pos,
+                      colour: v.instance_color, light: mul(shadow.light_space, vec4(frag_pos, 1.0)),
+                      occlusion: v.occlusion, now: now, prev: mul(eye.prev_view_projection, stepped) }
+}
+
+depth_reference(t: Throng, shadow: Shadow, bank: Texture, v: CrowdVertex) -> vec4 {
+    model_matrix = mul_m4(t.model, v.instance_model)
+    r = shadow.reach as f32x4
+    if r.w > 0.0 && distance(xyz(m4_col(model_matrix, 3)), xyz(shadow.reach)) > r.w {
+        return vec4(vec3(2.0, 2.0, 2.0), 1.0)
+    }
+    fpos = v.instance_phase * float_of(t.frames)
+    frame0 = int_of(floor(fpos))
+    blend = fpos - float_of(frame0)
+    if frame0 < 0 {
+        frame0 = 0
+        blend = 0.0
+    }
+    if frame0 >= t.frames {
+        frame0 = t.frames - 1
+        blend = 0.0
+    }
+    frame1 = frame0 + 1
+    if frame1 >= t.frames { frame1 = 0 }
+    skin = add_m4(mul_m4f(ref_skin(v.joints, v.weights, frame0), 1.0 - blend),
+                  mul_m4f(ref_skin(v.joints, v.weights, frame1), blend))
+    return mul(mul_m4(shadow.light_space, model_matrix), mul(skin, vec4(v.position, 1.0)))
+}
+
+rel(a: float, b: float) -> float { return absf(a - b) / maxf(1.0, absf(b)) }
+
+// How far `got` is from `want`, lane by lane, relative where it is large.
+apart4(got: *GpuVal, want: vec4) -> float {
+    if got == null { return 1.0 }
+    w = want as f32x4
+    worst = rel(gpu.val_x(got), w.x)
+    worst = maxf(worst, rel(gpu.val_y(got), w.y))
+    worst = maxf(worst, rel(gpu.val_z(got), w.z))
+    return maxf(worst, rel(gpu.val_w(got), w.w))
+}
+apart3(got: *GpuVal, want: vec3) -> float {
+    if got == null { return 1.0 }
+    w = want as f32x4
+    worst = rel(gpu.val_x(got), w.x)
+    worst = maxf(worst, rel(gpu.val_y(got), w.y))
+    return maxf(worst, rel(gpu.val_z(got), w.z))
+}
+apart2(got: *GpuVal, want: vec2) -> float {
+    if got == null { return 1.0 }
+    w = want as f32x4
+    return maxf(rel(gpu.val_x(got), w.x), rel(gpu.val_y(got), w.y))
+}
+
+// Whether two runs handed on the same value of `name`, to the bit.
+same_out(a: *GpuRun, b: *GpuRun, name: string) -> bool {
+    x = gpu.cpu_varying(a, name)
+    y = gpu.cpu_varying(b, name)
+    if x == null || y == null { return false }
+    return gpu.val_n(x) == gpu.val_n(y) && gpu.val_x(x) == gpu.val_x(y) && gpu.val_y(x) == gpu.val_y(y) &&
+           gpu.val_z(x) == gpu.val_z(y) && gpu.val_w(x) == gpu.val_w(y)
+}
+
+// ── Shaders that must be refused ──────────────────────────────────────
+
+// A pixel shader reading a storage buffer.
+buffer_pixel(b: Floats) -> *GpuShader {
+    return fragment("buffer_pixel") quote | uv: vec2 | {
+        return vec4(splat3(floats_at(b, shaderlib.uint_of(uv.x))), 1.0)
+    }
+}
+
+const VARYINGS[] = ["position", "fragTexCoord", "Normal", "FragPos", "InstanceColor", "FragPosLightSpace", "Occlusion",
+                    "ClipNow", "ClipPrev", "BindPos", "ClipLimb", "MaskUV", "ParticleAlpha", "FlipNext"]
+
+main() {
+    println("ae3d.shaders.throng: the crowd's vertex shaders")
+    eye_at = vec3(0.0, 2.0, 4.0)
+    vpm = camera_matrix(eye_at, 0.0011)
+    prevm = camera_matrix(vec3(0.05, 2.0, 4.0), 0.0)
+    lightm = camera_matrix(vec3(30.0, 60.0, 20.0), 0.0)
+    vp = mat4_of((&vpm) as ptr)
+    prev_vp = mat4_of((&prevm) as ptr)
+    light_vp = mat4_of((&lightm) as ptr)
+    ident = core.mat4_ident()
+    eye = Eye { view_projection: vp, prev_view_projection: prev_vp, inv_view_projection: vp, position: eye_at,
+                far: 1500.0, jitter: vec2(0.0004, -0.0007), screen_size: vec2(64.0, 36.0), depth_on: 0 }
+    shadow = Shadow { light_space: light_vp, reach: splat4(0.0) }
+    walk = Throng { model: mat4_of((&ident) as ptr), frames: FRAMES, impostor: 0, columns: 8, rows: 4, width: 1.2,
+                    height: 2.0, travel: 0.31, phase_step: 0.047, pull_bits: 4 }
+    bank_img = bank_picture()
+    bank = texture_of(bank_img)
+
+    // ── The GLSL ──
+    cv = throng.crowd_vertex(walk, eye, shadow, bank)
+    vk_vert = gpu.emit_vertex_glsl(cv, gpu.VULKAN, "", "")
+    gl_vert = gpu.emit_vertex_glsl(cv, gpu.GL, "", "")
+    if vk_vert == "" || gl_vert == "" { println("  emit crowd: ${gpu.last_error()}") }
+    golden_is(vk_vert, "tests/fixtures/gpu/crowd.vert")
+    compiles("crowd", vk_vert, "vert", false)
+    golden_is(gl_vert, "tests/fixtures/gpu/crowd_gl.vert")
+    compiles("crowd_gl", gl_vert, "vert", true)
+    check("the lit crowd's block and pose bank at set 1, and what the scene's pixel shader reads at its places",
+          string.contains(vk_vert, "layout(std140, set = 1, binding = 0) uniform VertexParams {\n    Throng throng;\n    Eye eye;\n    Shadow shadow;\n};") != 0 &&
+          string.contains(vk_vert, "layout(set = 1, binding = 1) uniform sampler2D pose_bank;") != 0 &&
+          string.contains(vk_vert, "layout(location = 3) in mat4 instanceModel;") != 0 &&
+          string.contains(vk_vert, "layout(location = 11) in float instancePhase;") != 0 &&
+          string.contains(vk_vert, "layout(location = 0) out vec2 fragTexCoord;") != 0 &&
+          string.contains(vk_vert, "layout(location = 4) out vec4 FragPosLightSpace;") != 0 &&
+          string.contains(vk_vert, "layout(location = 7) out vec4 ClipPrev;") != 0 &&
+          string.contains(vk_vert, "layout(location = 12) out vec3 FlipNext;") != 0)
+    check("its skinning the hand-written one's: weighed a matrix at a time, summed in order, two poses blended",
+          string.contains(vk_vert, "return ((((weights.x * ae3d_shaders_throng_bone_at(bank, int(joints.x), frame)) + (weights.y * ae3d_shaders_throng_bone_at(bank, int(joints.y), frame))) + (weights.z * ae3d_shaders_throng_bone_at(bank, int(joints.z), frame))) + (weights.w * ae3d_shaders_throng_bone_at(bank, int(joints.w), frame)));") != 0 &&
+          string.contains(vk_vert, "return ((ae3d_shaders_throng_skin_at(bank, joints, weights, frame0) * (1.0 - blend)) + (ae3d_shaders_throng_skin_at(bank, joints, weights, frame1) * blend));") != 0 &&
+          string.contains(vk_vert, "vec4 now = ((eye.view_projection * model_matrix) * posed);") != 0 &&
+          string.contains(vk_vert, "vec3 posed_normal = (mat3(skin) * inNormal);") != 0)
+
+    pv = throng.crowd_pull_vertex(walk, eye, shadow, bank, Floats { data: null }, Vec4s { data: null }, Floats { data: null })
+    vk_pull = gpu.emit_vertex_glsl(pv, gpu.VULKAN, "", "")
+    if vk_pull == "" { println("  emit crowd_pull: ${gpu.last_error()}") }
+    golden_is(vk_pull, "tests/fixtures/gpu/crowd_pull.vert")
+    compiles("crowd_pull", vk_pull, "vert", false)
+    check("the cluster cut's storage buffers at set 1, as vkclusterlod binds them, its block and bank at set 2, and no vertex input",
+          string.contains(vk_pull, "layout(std430, set = 1, binding = 0) readonly buffer pulled_vertex_buffer { float pulled_vertex[]; };") != 0 &&
+          string.contains(vk_pull, "layout(std430, set = 1, binding = 1) readonly buffer pulled_skin_buffer { vec4 pulled_skin[]; };") != 0 &&
+          string.contains(vk_pull, "layout(std430, set = 1, binding = 2) readonly buffer pulled_figure_buffer { float pulled_figure[]; };") != 0 &&
+          string.contains(vk_pull, "layout(std140, set = 2, binding = 0) uniform VertexParams {") != 0 &&
+          string.contains(vk_pull, "layout(set = 2, binding = 1) uniform sampler2D pose_bank;") != 0 &&
+          string.contains(vk_pull, ") in ") == 0 &&
+          string.contains(vk_pull, "uint f = (uint(int(gl_VertexIndex)) >> bits) * uint(20);") != 0)
+    check("the cluster cut's OpenGL GLSL is refused: OpenGL draws no cut", gpu.emit_vertex_glsl(pv, gpu.GL, "", "") == "" &&
+          string.contains(gpu.last_error(), "storage buffers on Vulkan alone") != 0)
+    check("gpu.vertex_set: 1 for a vertex shader, 2 for one reading storage buffers",
+          gpu.vertex_set(cv) == 1 && gpu.vertex_set(pv) == 2 && gpu.buffers_count(pv) == 3 &&
+          gpu.buffers_name(pv, 1) == "pulled_skin" && gpu.buffers_type(pv, 1) == "vec4" && gpu.buffers_type(pv, 2) == "float")
+
+    dv = throng.crowd_depth_vertex(walk, shadow, bank)
+    vk_depth = gpu.emit_vertex_glsl(dv, gpu.VULKAN, "", "")
+    gl_depth = gpu.emit_vertex_glsl(dv, gpu.GL, "", "")
+    if vk_depth == "" || gl_depth == "" { println("  emit crowd_depth: ${gpu.last_error()}") }
+    golden_is(vk_depth, "tests/fixtures/gpu/crowd_depth.vert")
+    compiles("crowd_depth", vk_depth, "vert", false)
+    golden_is(gl_depth, "tests/fixtures/gpu/crowd_depth_gl.vert")
+    compiles("crowd_depth_gl", gl_depth, "vert", true)
+    check("the depth pass's: the bind position and the cut's limb at 0 and 1, a figure past the reach dropped",
+          string.contains(vk_depth, "layout(location = 0) out vec3 BindPos;") != 0 &&
+          string.contains(vk_depth, "layout(location = 1) out float ClipLimb;") != 0 &&
+          string.contains(vk_depth, "if (shadow.reach.w > 0.0 && distance(model_matrix[3].xyz, shadow.reach.xyz) > shadow.reach.w) {") != 0 &&
+          string.contains(vk_depth, "gl_Position = ((shadow.light_space * model_matrix) * posed);") != 0)
+
+    // ── The block's words through the structs and back ──
+    words = calloc(64, 4)
+    fields = 0
+    same = 0
+    placed = 0
+    kinds = ["throng", "eye", "shadow"]
+    c = 0
+    while c < 3 {
+        k = 0
+        while k < throng.fields(kinds[c]) {
+            field = throng.field_of(kinds[c], k)
+            j = 0
+            while j < 64 {
+                (words as int[])[j] = 1065353216 + c * 4096 + k * 64 + j
+                j = j + 1
+            }
+            if gpu.set_field_words(cv, kinds[c], field, words) { placed = placed + 1 }
+            k = k + 1
+        }
+        c = c + 1
+    }
+    block = calloc(gpu.params_size(cv) + 16, 1)
+    gpu.params_write(cv, block)
+    u = 0
+    while u < gpu.uniforms_count(cv) {
+        name = gpu.uniforms_name(cv, u)
+        dot_at = string.index_of(name, ".")
+        cap = string.substring(name, 0, dot_at)
+        rest = string.substring(name, dot_at + 1, string.length(name))
+        c = 0
+        kk = 0 - 1
+        while c < 3 && kk < 0 {
+            if kinds[c] == cap {
+                k = 0
+                while k < throng.fields(cap) {
+                    if throng.field_of(cap, k) == rest { kk = k }
+                    k = k + 1
+                }
+            }
+            if kk < 0 { c = c + 1 }
+        }
+        lanes = 1
+        t = gpu.uniforms_type(cv, u)
+        if t == "vec2" { lanes = 2 }
+        if t == "vec3" { lanes = 3 }
+        if t == "vec4" { lanes = 4 }
+        if t == "mat4" { lanes = 16 }
+        ok = kk >= 0
+        j = 0
+        while j < lanes && ok {
+            if ((block + gpu.uniforms_offset(cv, u)) as int[])[j] != 1065353216 + c * 4096 + kk * 64 + j { ok = false }
+            j = j + 1
+        }
+        fields = fields + 1
+        if ok { same = same + 1 } else { println("  ${name}: not the words it was given") }
+        u = u + 1
+    }
+    check("every field the crowd's shaders read is placed (${placed} of 20)", placed == 20)
+    check("each value of each field it reads comes back out of its block the 32 bits the scene block's words gave it (${same} of ${fields})",
+          same == fields && fields == 13)
+    free(block)
+    free(words)
+    gpu.shader_free(cv)
+    gpu.shader_free(pv)
+    gpu.shader_free(dv)
+
+    // ── shaderlib's matrices ──
+    ma = bone_matrix(1, 2)
+    mb = bone_matrix(2, 3)
+    sum = add_m4(mul_fm4(0.25, ma), mul_m4f(mb, 0.75))
+    e = m4_at(sum, 3, 0)
+    want_e = 0.25 * m4_at(ma, 3, 0) + 0.75 * m4_at(mb, 3, 0)
+    tw = mul_m3(ma, vec3(1.0, 2.0, 3.0)) as f32x4
+    whole = xyz(mul(ma, vec4(vec3(1.0, 2.0, 3.0), 0.0))) as f32x4
+    fl = mat4_floats(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0)
+    check("mul_fm4, mul_m4f and add_m4 weigh and sum a matrix element by element; mul_m3 turns by mat3(m); mat4_floats fills column by column; int_of truncates",
+          absf(e - want_e) < 1e-6 && absf(tw.x - whole.x) < 1e-6 && absf(tw.z - whole.z) < 1e-6 &&
+          m4_at(fl, 1, 2) == 7.0 && m4_at(fl, 3, 0) == 13.0 && int_of(2.9) == 2 && int_of(-2.9) == -2)
+
+    // ── The lit crowd on the CPU ──
+    right = 0
+    runs = 0
+    worst = 0.0
+    im = 0
+    while im < 2 {
+        drawn = walk
+        drawn.impostor = im
+        if im == 1 {
+            // A model that is not the identity, as impostors are drawn too.
+            moved = core.mat4_translate(0.5, 0.0, -1.0)
+            drawn.model = mat4_of((&moved) as ptr)
+        }
+        s = throng.crowd_vertex(drawn, eye, shadow, bank)
+        k = 0
+        while k < 6 {
+            j = 0
+            while j < 4 {
+                a = vertex_of(j, k)
+                cx = gpu.cpu_new(s)
+                made = list.new()
+                give(cx, a, made)
+                ran = gpu.cpu_run_vertex(cx)
+                if !ran { println("  cpu_run_vertex: ${gpu.last_error()}") }
+                want = crowd_reference(drawn, eye, shadow, bank, a)
+                d = apart4(gpu.cpu_varying(cx, "position"), want.position)
+                d = maxf(d, apart2(gpu.cpu_varying(cx, "fragTexCoord"), want.uv))
+                d = maxf(d, apart3(gpu.cpu_varying(cx, "Normal"), want.normal))
+                d = maxf(d, apart3(gpu.cpu_varying(cx, "FragPos"), want.frag_pos))
+                d = maxf(d, apart3(gpu.cpu_varying(cx, "InstanceColor"), want.colour))
+                d = maxf(d, apart4(gpu.cpu_varying(cx, "FragPosLightSpace"), want.light))
+                d = maxf(d, apart4(gpu.cpu_varying(cx, "ClipNow"), want.now))
+                d = maxf(d, apart4(gpu.cpu_varying(cx, "ClipPrev"), want.prev))
+                oc = gpu.cpu_varying(cx, "Occlusion")
+                if oc == null || absf(gpu.val_x(oc) - want.occlusion) > 1e-6 { d = 1.0 }
+                limb = gpu.cpu_varying(cx, "ClipLimb")
+                flip = gpu.cpu_varying(cx, "FlipNext")
+                if limb == null || gpu.val_x(limb) != 1.0 || flip == null || gpu.val_z(flip) != -1.0 { d = 1.0 }
+                worst = maxf(worst, d)
+                if ran && d < 1e-5 { right = right + 1 }
+                runs = runs + 1
+                gpu.cpu_free(cx)
+                made_free(made)
+                j = j + 1
+            }
+            k = k + 1
+        }
+        gpu.shader_free(s)
+        im = im + 1
+    }
+    check("the CPU poses the crowd from its bank at each figure's phase, and turns its impostors to the eye, as the shader written as Aether does (${right} of ${runs}, worst ${worst})",
+          right == runs && runs == 48)
+
+    // The walk is posed: two phases of one figure stand apart.
+    s0 = throng.crowd_vertex(walk, eye, shadow, bank)
+    a0 = vertex_of(2, 1)
+    a1 = vertex_of(2, 1)
+    a1.instance_phase = a0.instance_phase + 0.3
+    ca = gpu.cpu_new(s0)
+    cb = gpu.cpu_new(s0)
+    ma0 = list.new()
+    mb0 = list.new()
+    give(ca, a0, ma0)
+    give(cb, a1, mb0)
+    _ra = gpu.cpu_run_vertex(ca)
+    _rb = gpu.cpu_run_vertex(cb)
+    check("a figure's walk moves its vertex between phases", !same_out(ca, cb, "FragPos"))
+    gpu.cpu_free(ca)
+    gpu.cpu_free(cb)
+    made_free(ma0)
+    made_free(mb0)
+    gpu.shader_free(s0)
+
+    // ── The cluster cut on the CPU: the same figures, pulled ──
+    figures = 4
+    per = 4
+    vbuf = calloc(per * 9, 4) as f32[]
+    sbuf = calloc(per * 3 * 4, 4) as f32[]
+    fbuf = calloc(figures * 20, 4) as f32[]
+    j = 0
+    while j < per {
+        a = vertex_of(j, 0)
+        p3 = a.position as f32x4
+        uv2 = a.uv as f32x4
+        n3 = a.normal as f32x4
+        jt = a.joints as f32x4
+        wt = a.weights as f32x4
+        vbuf[j * 9] = p3.x
+        vbuf[j * 9 + 1] = p3.y
+        vbuf[j * 9 + 2] = p3.z
+        vbuf[j * 9 + 3] = uv2.x
+        vbuf[j * 9 + 4] = uv2.y
+        vbuf[j * 9 + 5] = n3.x
+        vbuf[j * 9 + 6] = n3.y
+        vbuf[j * 9 + 7] = n3.z
+        vbuf[j * 9 + 8] = a.occlusion as f32
+        sbuf[j * 12] = jt.x
+        sbuf[j * 12 + 1] = jt.y
+        sbuf[j * 12 + 2] = jt.z
+        sbuf[j * 12 + 3] = jt.w
+        sbuf[j * 12 + 4] = wt.x
+        sbuf[j * 12 + 5] = wt.y
+        sbuf[j * 12 + 6] = wt.z
+        sbuf[j * 12 + 7] = wt.w
+        j = j + 1
+    }
+    k = 0
+    while k < figures {
+        a = vertex_of(0, k)
+        col = 0
+        while col < 4 {
+            v = m4_col(a.instance_model, col) as f32x4
+            fbuf[k * 20 + col * 4] = v.x
+            fbuf[k * 20 + col * 4 + 1] = v.y
+            fbuf[k * 20 + col * 4 + 2] = v.z
+            fbuf[k * 20 + col * 4 + 3] = v.w
+            col = col + 1
+        }
+        tint = a.instance_color as f32x4
+        fbuf[k * 20 + 16] = tint.x
+        fbuf[k * 20 + 17] = tint.y
+        fbuf[k * 20 + 18] = tint.z
+        fbuf[k * 20 + 19] = a.instance_phase as f32
+        k = k + 1
+    }
+    pulled = 0
+    pulls = 0
+    im = 0
+    while im < 2 {
+        drawn = walk
+        drawn.impostor = im
+        sp = throng.crowd_pull_vertex(drawn, eye, shadow, bank, floats_of(vbuf as ptr, per * 9),
+                                      vec4s_of(sbuf as ptr, per * 3), floats_of(fbuf as ptr, figures * 20))
+        sv = throng.crowd_vertex(drawn, eye, shadow, bank)
+        k = 0
+        while k < figures {
+            j = 0
+            while j < per {
+                a = vertex_of(j, k)
+                a.instance_model = vertex_of(0, k).instance_model
+                a.instance_color = vertex_of(0, k).instance_color
+                a.instance_phase = vertex_of(0, k).instance_phase
+                cp = gpu.cpu_new(sp)
+                gpu.cpu_set_vertex_index(cp, k * 16 + j)
+                okp = gpu.cpu_run_vertex(cp)
+                if !okp { println("  cpu_run_vertex pulled: ${gpu.last_error()}") }
+                cw = gpu.cpu_new(sv)
+                made = list.new()
+                give(cw, a, made)
+                okw = gpu.cpu_run_vertex(cw)
+                all = okp && okw
+                q = 0
+                while q < 14 {
+                    if !same_out(cp, cw, VARYINGS[q]) { all = false }
+                    q = q + 1
+                }
+                if all { pulled = pulled + 1 }
+                pulls = pulls + 1
+                gpu.cpu_free(cp)
+                gpu.cpu_free(cw)
+                made_free(made)
+                j = j + 1
+            }
+            k = k + 1
+        }
+        gpu.shader_free(sp)
+        gpu.shader_free(sv)
+        im = im + 1
+    }
+    check("the cluster cut, its vertices, skin and figures pulled from storage by the index, hands on what the crowd's vertex input does, to the bit (${pulled} of ${pulls})",
+          pulled == pulls && pulls == 32)
+    free(vbuf as ptr)
+    free(sbuf as ptr)
+    free(fbuf as ptr)
+
+    // ── The crowd into a shadow map on the CPU ──
+    depth_right = 0
+    dropped = 0
+    depth_runs = 0
+    worst = 0.0
+    r = 0
+    while r < 2 {
+        caster = shadow
+        // A lamp's face: its reach takes in the figures nearest it alone.
+        if r == 1 { caster.reach = vec4(vec3(-6.0, 1.0, -10.0), 4.0) }
+        ds = throng.crowd_depth_vertex(walk, caster, bank)
+        k = 0
+        while k < 6 {
+            a = vertex_of(k % 4, k)
+            cx = gpu.cpu_new(ds)
+            made = list.new()
+            give(cx, a, made)
+            ran = gpu.cpu_run_vertex(cx)
+            if !ran { println("  cpu_run_vertex depth: ${gpu.last_error()}") }
+            want4 = depth_reference(walk, caster, bank, a)
+            got = gpu.cpu_varying(cx, "position")
+            d = apart4(got, want4)
+            bp = gpu.cpu_varying(cx, "BindPos")
+            d = maxf(d, apart3(bp, a.position))
+            worst = maxf(worst, d)
+            if ran && d < 1e-5 { depth_right = depth_right + 1 }
+            w4 = want4 as f32x4
+            if w4.x == 2.0 && w4.y == 2.0 && w4.w == 1.0 { dropped = dropped + 1 }
+            depth_runs = depth_runs + 1
+            gpu.cpu_free(cx)
+            made_free(made)
+            k = k + 1
+        }
+        gpu.shader_free(ds)
+        r = r + 1
+    }
+    check("the CPU poses the crowd into a map as the shader written as Aether does (${depth_right} of ${depth_runs}, worst ${worst}), and drops the figures past a lamp's reach (${dropped} of 6)",
+          depth_right == depth_runs && depth_runs == 12 && dropped >= 2 && dropped <= 5)
+
+    // ── Refused ──
+    bp_s = buffer_pixel(Floats { data: null })
+    check("a pixel shader reading a storage buffer is refused", gpu.emit_glsl(bp_s, gpu.VULKAN) == "" &&
+          string.contains(gpu.last_error(), "reads no storage buffer") != 0)
+    gpu.shader_free(bp_s)
+
+    image_free(bank_img)
+    if g_failures > 0 {
+        println("crowd: ${g_failures} of ${g_checks} checks failed")
+        exit(1)
+    }
+    println("crowd: all checks passed (${g_checks})")
+}

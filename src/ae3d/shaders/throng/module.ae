@@ -1,0 +1,390 @@
+// ae3d.shaders.throng: the crowd's vertex shaders, written with `quote`
+// (step 6, docs/aether_quote_design.md section 11). They were VERTEX_CROWD
+// (crowd_vk.vert, and crowd_pull_vk.vert, its AE3D_PULL variant) and
+// VERTEX_CROWD_DEPTH (crowd_depth_vk.vert). The module is throng, not crowd:
+// ae3d.crowd, ae3d.horde and ae3d.vkcrowd are the engine's, and two modules
+// of one last name in a program name a quote's helpers by what else it
+// imports.
+//
+// A crowd is one instanced skinned draw where every instance is at its own
+// point in the walk: the bone palette is not a uniform, which holds one
+// pose, but the pose bank, a float texture of `frames` poses baked from the
+// clip (four texels a bone, a row a frame), read by exact texel at the
+// instance's own phase and blended between the two poses about it.
+//
+//   - crowd_vertex: a figure posed and placed, or, for an impostor (the far
+//     tier as pictures), an upright quad turned to the eye showing the
+//     atlas cell for the angle the eye sees it from and the frame its phase
+//     is at. It hands on what the scene's pixel shader (FRAGMENT_DEFAULT,
+//     still hand-written) reads, by its names and at its places: the uv,
+//     the normal, where the point is, the tint, where it is in the light's
+//     space, the sky it sees, the two clip positions (where it was is worked
+//     out: it walked `travel` metres along its facing since last frame, and
+//     its walk was `phase_step` earlier in the cycle; the sort reorders the
+//     stream every frame), the bind position the cut reads, and the cut's,
+//     the mask's, the particle's and the flip's constants.
+//   - crowd_pull_vertex: the same, drawn by the cluster cut (Vulkan alone,
+//     ae3d.vkclusterlod) with no vertex input: each index is a figure's slot
+//     in its tier's stream above pull_bits bits of its mesh's vertex, and the
+//     vertex (nine floats), its skin (three vec4s) and the figure (twenty
+//     floats) are read from the three storage buffers at set 1.
+//   - crowd_depth_vertex: the figure posed into a shadow map, depth alone;
+//     a figure further from the lamp than its reach (a lamp's face) is not
+//     posed or drawn.
+//
+// What they read is captured structs: the draw's Throng (the model, the
+// bank's frames, the impostor's grid and size, the walk's step), the
+// frame's Eye and the map's Shadow (ae3d.shaders.frame), each field the
+// scene block uniform it was, and the pose bank.
+//
+// Each helper is the hand-written one in the same shape, the same
+// operations in the same order, since a GPU that fuses and reorders what it
+// may (MoltenVK's fast math) rounds by the shape, not by the value.
+
+import std.quote
+import ae3d.gpu
+import ae3d.gpu (GpuShader, vertex)
+import ae3d.shaders.frame
+import ae3d.shaders.frame (Eye, Shadow)
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, Floats, Vec4s, xyz, dot, normalize, cross, distance, fract,
+                       floor, atan2, mul, mul_m4, m4_at, m4_col, mul_m3, mul_fm4, mul_m4f, add_m4, mat4_cols,
+                       mat4_floats, texel_fetch_at, int_of, float_of, uint_of, vertex_index, floats_at, vec4s_at)
+
+exports (
+    Throng, CrowdVertex, CrowdVaryings, CrowdDepthVertex, CrowdDepthVaryings,
+    crowd_vertex, crowd_pull_vertex, crowd_depth_vertex, place, fields, field_of, uniform_of,
+    bone_at, skin_at, skin_at_phase
+)
+
+// A crowd's draw: where the model is (the identity for a crowd: each
+// figure's placement is its instance matrix), how many frames its pose
+// bank has, whether it is drawn as impostors and their atlas's grid and
+// size in metres, how far a figure walks and how far through its walk it
+// goes in a frame (for the motion vectors), and the cluster cut's vertex
+// bits.
+struct Throng {
+    model: mat4
+    frames: int
+    impostor: int
+    columns: int
+    rows: int
+    width: float
+    height: float
+    travel: float
+    phase_step: float
+    pull_bits: int
+}
+
+// A figure's vertex and its instance: the mesh's position, uv, normal, the
+// four bones it hangs off and how much of each, the sky it sees; the
+// figure's placement, tint and phase.
+struct CrowdVertex {
+    position: vec3
+    uv: vec2
+    normal: vec3
+    instance_model: mat4
+    instance_color: vec3
+    joints: vec4
+    weights: vec4
+    occlusion: float
+    instance_phase: float
+}
+
+// What the scene's pixel shader reads, by its names, at its places
+// (`position` is gl_Position).
+struct CrowdVaryings {
+    position: vec4
+    fragTexCoord: vec2
+    Normal: vec3
+    FragPos: vec3
+    InstanceColor: vec3
+    FragPosLightSpace: vec4
+    Occlusion: float
+    ClipNow: vec4
+    ClipPrev: vec4
+    BindPos: vec3
+    ClipLimb: float
+    MaskUV: vec2
+    ParticleAlpha: float
+    FlipNext: vec3
+}
+
+// The depth pass's vertex: its position and skin, the figure's placement
+// and phase.
+struct CrowdDepthVertex {
+    position: vec3
+    instance_model: mat4
+    joints: vec4
+    weights: vec4
+    instance_phase: float
+}
+
+// What the depth pixel shader (FRAGMENT_DEPTH) reads: the bind position the
+// cut is made in, and the cut's limb (a crowd's is the whole figure's).
+struct CrowdDepthVaryings {
+    position: vec4
+    BindPos: vec3
+    ClipLimb: float
+}
+
+// Each field of Throng and the scene block uniform it was.
+const THRONG_FIELDS[] = ["model", "frames", "impostor", "columns", "rows", "width", "height", "travel", "phase_step",
+                         "pull_bits"]
+const THRONG_UNIFORMS[] = ["model", "poseBankFrames", "impostor", "impostorCols", "impostorRows", "impostorWidth",
+                           "impostorHeight", "crowdTravel", "crowdPhaseStep", "pullVertexBits"]
+const THRONG_FIELD_COUNT = 10
+
+// The fields of the struct `capture` (throng, or the frame's eye and
+// shadow), each with the scene block uniform it was.
+fields(capture: string) -> int {
+    if capture == "throng" { return THRONG_FIELD_COUNT }
+    return frame.fields(capture)
+}
+field_of(capture: string, k: int) -> string {
+    if capture == "throng" { return THRONG_FIELDS[k] }
+    return frame.field_of(capture, k)
+}
+uniform_of(capture: string, k: int) -> string {
+    if capture == "throng" { return THRONG_UNIFORMS[k] }
+    return frame.uniform_of(capture, k)
+}
+
+// Where each field of the captured structs is in its cell, for a shader
+// capturing them as `throng`, `eye` and `shadow` ("" for one it does not
+// capture).
+place(s: *GpuShader, throng: string, eye: string, shadow: string) {
+    frame.place(s, eye, "", "")
+    frame.place_shadow(s, shadow)
+    _a = gpu.capture_field(s, throng, "model", offsetof(Throng, model))
+    _b = gpu.capture_field(s, throng, "frames", offsetof(Throng, frames))
+    _c = gpu.capture_field(s, throng, "impostor", offsetof(Throng, impostor))
+    _d = gpu.capture_field(s, throng, "columns", offsetof(Throng, columns))
+    _e = gpu.capture_field(s, throng, "rows", offsetof(Throng, rows))
+    _f = gpu.capture_field(s, throng, "width", offsetof(Throng, width))
+    _g = gpu.capture_field(s, throng, "height", offsetof(Throng, height))
+    _h = gpu.capture_field(s, throng, "travel", offsetof(Throng, travel))
+    _i = gpu.capture_field(s, throng, "phase_step", offsetof(Throng, phase_step))
+    _j = gpu.capture_field(s, throng, "pull_bits", offsetof(Throng, pull_bits))
+}
+
+// ── The helpers ─────────────────────────────────────────────────────────
+
+// The bone's matrix at a frame, read as its four columns from the bank.
+@quotable
+bone_at(bank: Texture, bone: int, frame: int) -> mat4 {
+    x = bone * 4
+    return mat4_cols(texel_fetch_at(bank, x + 0, frame), texel_fetch_at(bank, x + 1, frame),
+                     texel_fetch_at(bank, x + 2, frame), texel_fetch_at(bank, x + 3, frame))
+}
+
+// The vertex's four-bone skinning matrix at one baked frame.
+@quotable
+skin_at(bank: Texture, joints: vec4, weights: vec4, frame: int) -> mat4 {
+    return add_m4(add_m4(add_m4(mul_fm4(weights.x, bone_at(bank, int_of(joints.x), frame)),
+                                mul_fm4(weights.y, bone_at(bank, int_of(joints.y), frame))),
+                         mul_fm4(weights.z, bone_at(bank, int_of(joints.z), frame))),
+                  mul_fm4(weights.w, bone_at(bank, int_of(joints.w), frame)))
+}
+
+// The vertex's skinning matrix at a phase of the walk. The phase lands
+// between two baked poses; they are blended, so the walk is continuous
+// instead of snapping frame to frame. The clip loops, so the frame after
+// the last is the first.
+@quotable
+skin_at_phase(bank: Texture, joints: vec4, weights: vec4, phase: float, frames: int) -> mat4 {
+    fpos = fract(phase) * float_of(frames)
+    frame0 = int_of(floor(fpos))
+    blend = fpos - float_of(frame0)
+    if frame0 < 0 {
+        frame0 = 0
+        blend = 0.0
+    }
+    if frame0 >= frames {
+        frame0 = frames - 1
+        blend = 0.0
+    }
+    frame1 = frame0 + 1
+    if frame1 >= frames { frame1 = 0 }
+    return add_m4(mul_m4f(skin_at(bank, joints, weights, frame0), 1.0 - blend),
+                  mul_m4f(skin_at(bank, joints, weights, frame1), blend))
+}
+
+// ── The shaders ─────────────────────────────────────────────────────────
+
+// The crowd drawn lit, over its mesh's vertices and its instance stream.
+//
+//   pose_bank   the baked walk (the scene's binding 4 it was)
+crowd_vertex(throng: Throng, eye: Eye, shadow: Shadow, pose_bank: Texture) -> *GpuShader {
+    s = vertex("crowd_vertex") quote | v: CrowdVertex | {
+        model_matrix = mul_m4(throng.model, v.instance_model)
+        // The way the figure faces, which is the way it walks.
+        walking = normalize(vec3(m4_at(model_matrix, 0, 0), 0.0, m4_at(model_matrix, 0, 2)))
+        if throng.impostor != 0 {
+            // Where the figure stands and which way it faces: the instance
+            // matrix's origin and its local +X, on the ground plane -- the
+            // crowd's yaw is measured from +X, and a figure walking that way
+            // is at yaw zero, so the bake's first column is the figure seen
+            // from its own +X.
+            origin = xyz(m4_col(model_matrix, 3))
+            facing = normalize(vec3(m4_at(model_matrix, 0, 0), 0.0, m4_at(model_matrix, 0, 2)))
+            to_eye = eye.position - origin
+            level = normalize(vec3(to_eye.x, 0.0, to_eye.z))
+            // The angle the eye sees the figure from, measured around its
+            // facing: the cell column, with the bake's first view from the
+            // front.
+            angle = atan2(dot(level, vec3(-facing.z, 0.0, facing.x)), dot(level, facing))
+            turn = fract(angle / 6.28318530718 + 1.0)
+            column = int_of(floor(turn * float_of(throng.columns) + 0.5)) % throng.columns
+            row = int_of(floor(fract(v.instance_phase) * float_of(throng.rows))) % throng.rows
+            // An upright quad facing the eye: the mesh's x across it, y up it.
+            right = normalize(cross(vec3(0.0, 1.0, 0.0), level))
+            world = origin + right * (v.position.x * throng.width) + vec3(0.0, v.position.y * throng.height, 0.0)
+            // The cell in the atlas. The atlas is written with row 0 at its
+            // top and loaded flipped, as every texture is, so a row counts
+            // down from the top of texture space. The picture's normals were
+            // baked in the figure's own frame; the pixel shader turns them
+            // into the world by the facing, handed on as the normal.
+            cell = vec2((float_of(column) + v.uv.x) / float_of(throng.columns),
+                        1.0 - (float_of(row) + (1.0 - v.uv.y)) / float_of(throng.rows))
+            quad_light = mul(shadow.light_space, vec4(world, 1.0))
+            quad_now = mul(eye.view_projection, vec4(world, 1.0))
+            quad_prev = mul(eye.prev_view_projection, vec4(world - walking * throng.travel, 1.0))
+            return CrowdVaryings { position: quad_now, fragTexCoord: cell, Normal: facing, FragPos: world,
+                                   InstanceColor: v.instance_color, FragPosLightSpace: quad_light,
+                                   Occlusion: v.occlusion, ClipNow: quad_now, ClipPrev: quad_prev, BindPos: v.position,
+                                   ClipLimb: 1.0, MaskUV: v.uv, ParticleAlpha: 1.0, FlipNext: vec3(0.0, 0.0, -1.0) }
+        }
+        skin = skin_at_phase(pose_bank, v.joints, v.weights, v.instance_phase, throng.frames)
+        posed = mul(skin, vec4(v.position, 1.0))
+        posed_normal = mul_m3(skin, v.normal)
+        frag_pos = xyz(mul(model_matrix, posed))
+        normal_out = normalize(mul_m3(model_matrix, posed_normal))
+        light = mul(shadow.light_space, vec4(frag_pos, 1.0))
+        now = mul(mul_m4(eye.view_projection, model_matrix), posed)
+        // Last frame: the same vertex a step back in the walk, the figure a
+        // step back along its way.
+        posed_prev = mul(skin_at_phase(pose_bank, v.joints, v.weights, v.instance_phase - throng.phase_step,
+                                       throng.frames), vec4(v.position, 1.0))
+        world_prev = mul(model_matrix, posed_prev)
+        stepped = vec4(xyz(world_prev) - walking * throng.travel, world_prev.w)
+        prev = mul(eye.prev_view_projection, stepped)
+        return CrowdVaryings { position: now, fragTexCoord: v.uv, Normal: normal_out, FragPos: frag_pos,
+                               InstanceColor: v.instance_color, FragPosLightSpace: light, Occlusion: v.occlusion,
+                               ClipNow: now, ClipPrev: prev, BindPos: v.position, ClipLimb: 1.0, MaskUV: v.uv,
+                               ParticleAlpha: 1.0, FlipNext: vec3(0.0, 0.0, -1.0) }
+    }
+    place(s, "throng", "eye", "shadow")
+    return s
+}
+
+// The crowd drawn by its cluster cut: crowd_vertex's body over a vertex,
+// its skin and its figure pulled from storage by the index, which is the
+// figure's slot in its tier's stream above throng.pull_bits bits of the
+// mesh's vertex.
+//
+//   pulled_vertex   nine floats a vertex: position, uv, normal, occlusion
+//   pulled_skin     three vec4s a vertex: its joints, its weights, a spare
+//   pulled_figure   twenty floats a figure: its placement, tint and phase
+crowd_pull_vertex(throng: Throng, eye: Eye, shadow: Shadow, pose_bank: Texture, pulled_vertex: Floats,
+                  pulled_skin: Vec4s, pulled_figure: Floats) -> *GpuShader {
+    s = vertex("crowd_pull_vertex") quote | v: CrowdVertex | {
+        bits = uint_of(throng.pull_bits)
+        vi = uint_of(vertex_index()) & ((uint_of(1) << bits) - uint_of(1))
+        f = (uint_of(vertex_index()) >> bits) * uint_of(20)
+        at = vi * uint_of(9)
+        position = vec3(floats_at(pulled_vertex, at), floats_at(pulled_vertex, at + uint_of(1)),
+                        floats_at(pulled_vertex, at + uint_of(2)))
+        uv = vec2(floats_at(pulled_vertex, at + uint_of(3)), floats_at(pulled_vertex, at + uint_of(4)))
+        normal = vec3(floats_at(pulled_vertex, at + uint_of(5)), floats_at(pulled_vertex, at + uint_of(6)),
+                      floats_at(pulled_vertex, at + uint_of(7)))
+        occlusion = floats_at(pulled_vertex, at + uint_of(8))
+        joints = vec4s_at(pulled_skin, vi * uint_of(3))
+        weights = vec4s_at(pulled_skin, vi * uint_of(3) + uint_of(1))
+        instance_model = mat4_floats(floats_at(pulled_figure, f), floats_at(pulled_figure, f + uint_of(1)),
+                                     floats_at(pulled_figure, f + uint_of(2)), floats_at(pulled_figure, f + uint_of(3)),
+                                     floats_at(pulled_figure, f + uint_of(4)), floats_at(pulled_figure, f + uint_of(5)),
+                                     floats_at(pulled_figure, f + uint_of(6)), floats_at(pulled_figure, f + uint_of(7)),
+                                     floats_at(pulled_figure, f + uint_of(8)), floats_at(pulled_figure, f + uint_of(9)),
+                                     floats_at(pulled_figure, f + uint_of(10)), floats_at(pulled_figure, f + uint_of(11)),
+                                     floats_at(pulled_figure, f + uint_of(12)), floats_at(pulled_figure, f + uint_of(13)),
+                                     floats_at(pulled_figure, f + uint_of(14)), floats_at(pulled_figure, f + uint_of(15)))
+        instance_color = vec3(floats_at(pulled_figure, f + uint_of(16)), floats_at(pulled_figure, f + uint_of(17)),
+                              floats_at(pulled_figure, f + uint_of(18)))
+        instance_phase = floats_at(pulled_figure, f + uint_of(19))
+        model_matrix = mul_m4(throng.model, instance_model)
+        walking = normalize(vec3(m4_at(model_matrix, 0, 0), 0.0, m4_at(model_matrix, 0, 2)))
+        if throng.impostor != 0 {
+            origin = xyz(m4_col(model_matrix, 3))
+            facing = normalize(vec3(m4_at(model_matrix, 0, 0), 0.0, m4_at(model_matrix, 0, 2)))
+            to_eye = eye.position - origin
+            level = normalize(vec3(to_eye.x, 0.0, to_eye.z))
+            angle = atan2(dot(level, vec3(-facing.z, 0.0, facing.x)), dot(level, facing))
+            turn = fract(angle / 6.28318530718 + 1.0)
+            column = int_of(floor(turn * float_of(throng.columns) + 0.5)) % throng.columns
+            row = int_of(floor(fract(instance_phase) * float_of(throng.rows))) % throng.rows
+            right = normalize(cross(vec3(0.0, 1.0, 0.0), level))
+            world = origin + right * (position.x * throng.width) + vec3(0.0, position.y * throng.height, 0.0)
+            cell = vec2((float_of(column) + uv.x) / float_of(throng.columns),
+                        1.0 - (float_of(row) + (1.0 - uv.y)) / float_of(throng.rows))
+            quad_light = mul(shadow.light_space, vec4(world, 1.0))
+            quad_now = mul(eye.view_projection, vec4(world, 1.0))
+            quad_prev = mul(eye.prev_view_projection, vec4(world - walking * throng.travel, 1.0))
+            return CrowdVaryings { position: quad_now, fragTexCoord: cell, Normal: facing, FragPos: world,
+                                   InstanceColor: instance_color, FragPosLightSpace: quad_light, Occlusion: occlusion,
+                                   ClipNow: quad_now, ClipPrev: quad_prev, BindPos: position, ClipLimb: 1.0, MaskUV: uv,
+                                   ParticleAlpha: 1.0, FlipNext: vec3(0.0, 0.0, -1.0) }
+        }
+        skin = skin_at_phase(pose_bank, joints, weights, instance_phase, throng.frames)
+        posed = mul(skin, vec4(position, 1.0))
+        posed_normal = mul_m3(skin, normal)
+        frag_pos = xyz(mul(model_matrix, posed))
+        normal_out = normalize(mul_m3(model_matrix, posed_normal))
+        light = mul(shadow.light_space, vec4(frag_pos, 1.0))
+        now = mul(mul_m4(eye.view_projection, model_matrix), posed)
+        posed_prev = mul(skin_at_phase(pose_bank, joints, weights, instance_phase - throng.phase_step, throng.frames),
+                         vec4(position, 1.0))
+        world_prev = mul(model_matrix, posed_prev)
+        stepped = vec4(xyz(world_prev) - walking * throng.travel, world_prev.w)
+        prev = mul(eye.prev_view_projection, stepped)
+        return CrowdVaryings { position: now, fragTexCoord: uv, Normal: normal_out, FragPos: frag_pos,
+                               InstanceColor: instance_color, FragPosLightSpace: light, Occlusion: occlusion,
+                               ClipNow: now, ClipPrev: prev, BindPos: position, ClipLimb: 1.0, MaskUV: uv,
+                               ParticleAlpha: 1.0, FlipNext: vec3(0.0, 0.0, -1.0) }
+    }
+    place(s, "throng", "eye", "shadow")
+    return s
+}
+
+// The crowd into a shadow map: each figure posed by its phase, as the lit
+// pass poses it, and projected into the map's light space. Into a lamp's
+// face, a figure further from the lamp than shadow.reach.w lies on no line
+// from the lamp to a surface it lights: it is dropped outside every clip
+// volume, not posed.
+crowd_depth_vertex(throng: Throng, shadow: Shadow, pose_bank: Texture) -> *GpuShader {
+    s = vertex("crowd_depth_vertex") quote | v: CrowdDepthVertex | {
+        model_matrix = mul_m4(throng.model, v.instance_model)
+        if shadow.reach.w > 0.0 && distance(xyz(m4_col(model_matrix, 3)), xyz(shadow.reach)) > shadow.reach.w {
+            return CrowdDepthVaryings { position: vec4(vec3(2.0, 2.0, 2.0), 1.0), BindPos: v.position, ClipLimb: 1.0 }
+        }
+        fpos = v.instance_phase * float_of(throng.frames)
+        frame0 = int_of(floor(fpos))
+        blend = fpos - float_of(frame0)
+        if frame0 < 0 {
+            frame0 = 0
+            blend = 0.0
+        }
+        if frame0 >= throng.frames {
+            frame0 = throng.frames - 1
+            blend = 0.0
+        }
+        frame1 = frame0 + 1
+        if frame1 >= throng.frames { frame1 = 0 }
+        skin = add_m4(mul_m4f(skin_at(pose_bank, v.joints, v.weights, frame0), 1.0 - blend),
+                      mul_m4f(skin_at(pose_bank, v.joints, v.weights, frame1), blend))
+        posed = mul(skin, vec4(v.position, 1.0))
+        return CrowdDepthVaryings { position: mul(mul_m4(shadow.light_space, model_matrix), posed), BindPos: v.position,
+                                    ClipLimb: 1.0 }
+    }
+    place(s, "throng", "", "shadow")
+    return s
+}

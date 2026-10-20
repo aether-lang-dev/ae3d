@@ -36,11 +36,24 @@
 // scene's pipelines draw it, the water's surface: opaque (depth-tested and
 // written, back faces kept or culled) or blended over the frame (not
 // writing depth), the three pipelines on the pair's layout (mesh_pipeline).
+//
+// A vertex ring (vertex_ring_new) is a vertex shader written with quote
+// drawn with a hand-written pixel shader over the scene's set: the crowd's,
+// until the scene's own shader moves. Its layout is the scene's set, then,
+// for a shader reading storage buffers (the cluster cut's), the pulled set
+// vkpipes makes, then its own: its block at binding 0, a dynamic uniform
+// buffer -- each draw's values at their own offset in its frame slot's ring
+// of `draws` blocks, filled by ring_bind as the scene's ring is -- and its
+// textures at the bindings after it. A set is named, per frame slot, for
+// each set of images a frame draws it with (RING_SETS at most), once that
+// slot's fence has passed; a draw past the ring, or past the sets, is
+// refused and said once.
 
 import contrib.vulkan.vk
 import ae3d.vkhost
 import ae3d.vkhost (HostBuffer)
 import ae3d.vkdesc
+import ae3d.vkdevice
 import ae3d.vkpipes
 import ae3d.gpu
 import ae3d.gpu (GpuShader)
@@ -48,7 +61,8 @@ import std.io
 
 exports (
     QuotedPass, pass_new, pair_new, mesh_pair_new, mesh_pipeline, pass_free, set_shader, shader, vertex_shader, vertex_set, prepare, pipeline, layout,
-    textures, set_image_layout
+    textures, set_image_layout,
+    VertexRing, vertex_ring_new, ring_pipeline, ring_frame, ring_bind, ring_shader, ring_layout, vertex_ring_free
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -554,4 +568,357 @@ pass_free(p: *QuotedPass) {
     gpu.shader_free(p.shader as *GpuShader)
     gpu.shader_free(p.vshader as *GpuShader)
     free(p as ptr)
+}
+
+// ── Vertex rings ────────────────────────────────────────────────────────
+
+struct VertexRing {
+    shader: ptr          // *gpu.GpuShader, the vertex shader's
+    hash: long
+    set_layout: ptr      // its own set's
+    layout: ptr          // VkPipelineLayout: the scene's set, (the pulled set,) its own
+    index: int           // its own set's place in the layout: 1, or 2 after the pulled set
+    pool: ptr
+    rings: ptr           // *HostBuffer[FRAMES], `draws` blocks each
+    sets: ptr            // VkDescriptorSet[FRAMES * RING_SETS]
+    views: ptr           // ptr[FRAMES * RING_SETS * textures]: the images each set names now
+    samplers: ptr
+    named: ptr           // int[FRAMES]: the sets named in the slot's frame
+    used: ptr            // int[FRAMES]: the draws in the slot's frame
+    size: int            // its block's bytes
+    stride: int          // a block's place in the ring: the size, to the device's offset alignment
+    draws: int
+    textures: int
+    pipelines: ptr       // VkPipeline[RING_PIPELINES] built on its layout
+    built: int
+    overrun: bool
+}
+
+const RING_SETS = 16
+const RING_PIPELINES = 8
+
+// The ring of `vs` (which it then owns), its words made from a tree
+// hashing to `vhash`, up to `draws` draws a frame slot. Null, `vs` freed,
+// when the tree hashes otherwise, it has no block, or the device would not
+// make what it needs.
+vertex_ring_new(vs: *GpuShader, vhash: long, draws: int) -> *VertexRing {
+    why = ""
+    if gpu.shader_hash(vs) != vhash { why = "${gpu.shader_name(vs)}'s SPIR-V was made from another tree; run build/generate_shaders" }
+    if why == "" && gpu.params_size(vs) < 1 { why = "${gpu.shader_name(vs)}: a vertex ring's shader has captures" }
+    if why == "" && gpu.buffers_count(vs) > 0 && vkpipes.pull_set_layout() == null {
+        why = "${gpu.shader_name(vs)}: no pulled set layout to read its buffers through"
+    }
+    if why != "" {
+        io.stderr_write("ae3d: ${why}\n")
+        gpu.shader_free(vs)
+        return null
+    }
+    r = calloc(1, sizeof(VertexRing)) as *VertexRing
+    r.shader = vs as ptr
+    r.hash = vhash
+    r.size = gpu.params_size(vs)
+    align = vkdevice.uniform_alignment()
+    if align < 16 { align = 16 }
+    r.stride = (r.size + align - 1) / align * align
+    r.draws = draws
+    if r.draws < 1 { r.draws = 1 }
+    r.textures = gpu.samplers_count(vs)
+    r.index = gpu.vertex_set(vs)
+    r.rings = calloc(vkdesc.FRAMES, 8)
+    r.sets = calloc(vkdesc.FRAMES * RING_SETS, 8)
+    n = r.textures
+    if n < 1 { n = 1 }
+    r.views = calloc(vkdesc.FRAMES * RING_SETS * n, 8)
+    r.samplers = calloc(vkdesc.FRAMES * RING_SETS * n, 8)
+    r.named = calloc(vkdesc.FRAMES, 4)
+    r.used = calloc(vkdesc.FRAMES, 4)
+    r.pipelines = calloc(RING_PIPELINES, 8)
+    if !ring_layouts(r) || !ring_sets(r) {
+        vertex_ring_free(r)
+        return null
+    }
+    return r
+}
+
+// Its set layout -- the block at 0, the textures at 1.., read by the
+// vertex stage -- and the pipeline layout over the scene's set (and the
+// pulled one) and it.
+ring_layouts(r: *VertexRing) -> bool {
+    d = vkhost.device()
+    count = 1 + r.textures
+    bindings = calloc(count, sizeof(VkDescriptorSetLayoutBinding))
+    k = 0
+    while k < count {
+        b = (bindings + k * sizeof(VkDescriptorSetLayoutBinding)) as *VkDescriptorSetLayoutBinding
+        b.binding = k
+        b.descriptorType = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+        if k == 0 { b.descriptorType = vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC }
+        b.descriptorCount = 1
+        b.stageFlags = vk.SHADER_STAGE_VERTEX_BIT
+        k = k + 1
+    }
+    info = calloc(1, sizeof(VkDescriptorSetLayoutCreateInfo)) as *VkDescriptorSetLayoutCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    info.bindingCount = count
+    info.pBindings = bindings
+    cell = calloc(1, 8)
+    res = vk.vkCreateDescriptorSetLayout(d, info as ptr, null, cell)
+    r.set_layout = (cell as ptr[])[0]
+    free(cell)
+    free(info as ptr)
+    free(bindings)
+    if res != vk.SUCCESS {
+        r.set_layout = null
+        return false
+    }
+    layouts = calloc(r.index + 1, 8)
+    (layouts as ptr[])[0] = vkdesc.set_layout()
+    if r.index == 2 { (layouts as ptr[])[1] = vkpipes.pull_set_layout() }
+    (layouts as ptr[])[r.index] = r.set_layout
+    pl = calloc(1, sizeof(VkPipelineLayoutCreateInfo)) as *VkPipelineLayoutCreateInfo
+    pl.sType = vk.STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+    pl.setLayoutCount = r.index + 1
+    pl.pSetLayouts = layouts
+    out = calloc(1, 8)
+    res = vk.vkCreatePipelineLayout(d, pl as ptr, null, out)
+    r.layout = (out as ptr[])[0]
+    free(out)
+    free(pl as ptr)
+    free(layouts)
+    if res != vk.SUCCESS {
+        r.layout = null
+        return false
+    }
+    return true
+}
+
+// Each frame slot's ring of blocks, and its sets, each naming the slot's
+// ring at 0 for good (a draw's block at its dynamic offset).
+ring_sets(r: *VertexRing) -> bool {
+    d = vkhost.device()
+    count = vkdesc.FRAMES * RING_SETS
+    sizes = calloc(2, sizeof(VkDescriptorPoolSize))
+    s0 = sizes as *VkDescriptorPoolSize
+    s0.type = vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+    s0.descriptorCount = count
+    s1 = (sizes + sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
+    s1.type = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+    s1.descriptorCount = count * r.textures
+    info = calloc(1, sizeof(VkDescriptorPoolCreateInfo)) as *VkDescriptorPoolCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+    info.maxSets = count
+    info.poolSizeCount = 1
+    if r.textures > 0 { info.poolSizeCount = 2 }
+    info.pPoolSizes = sizes
+    cell = calloc(1, 8)
+    res = vk.vkCreateDescriptorPool(d, info as ptr, null, cell)
+    r.pool = (cell as ptr[])[0]
+    free(info as ptr)
+    free(sizes)
+    if res != vk.SUCCESS {
+        r.pool = null
+        free(cell)
+        return false
+    }
+    ok = true
+    slot = 0
+    while slot < vkdesc.FRAMES && ok {
+        ring = vkhost.mapped_buffer(r.stride * r.draws, vk.BUFFER_USAGE_UNIFORM_BUFFER_BIT)
+        if ring == null {
+            ok = false
+        } else {
+            (r.rings as ptr[])[slot] = ring as ptr
+            k = 0
+            while k < RING_SETS && ok {
+                (cell as ptr[])[0] = r.set_layout
+                alloc = calloc(1, sizeof(VkDescriptorSetAllocateInfo)) as *VkDescriptorSetAllocateInfo
+                alloc.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+                alloc.descriptorPool = r.pool
+                alloc.descriptorSetCount = 1
+                alloc.pSetLayouts = cell
+                out = calloc(1, 8)
+                res = vk.vkAllocateDescriptorSets(d, alloc as ptr, out)
+                set = (out as ptr[])[0]
+                free(out)
+                free(alloc as ptr)
+                if res != vk.SUCCESS {
+                    ok = false
+                } else {
+                    (r.sets as ptr[])[slot * RING_SETS + k] = set
+                    buffer = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+                    buffer.buffer = ring.buffer
+                    buffer.offset = 0
+                    buffer.range = r.size
+                    write = calloc(1, sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+                    write.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+                    write.dstSet = set
+                    write.dstBinding = 0
+                    write.descriptorCount = 1
+                    write.descriptorType = vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                    write.pBufferInfo = buffer as ptr
+                    vk.vkUpdateDescriptorSets(d, 1, write as ptr, 0, null)
+                    free(write as ptr)
+                    free(buffer as ptr)
+                }
+                k = k + 1
+            }
+        }
+        slot = slot + 1
+    }
+    free(cell)
+    return ok
+}
+
+// A pipeline over the ring's vertex shader (ae3d.vkspirv's words `vert`)
+// and the pixel shader `frag`, on the ring's layout, as vkpipes.build_on
+// makes one; kept with the ring, which destroys it. Null when it would not
+// build.
+ring_pipeline(r: *VertexRing, vert: int, frag: int, blend: int, depth_test: bool, depth_write: bool, pass: @keep ptr,
+              cull: bool, is_skinned: bool, pulled: bool) -> ptr {
+    if r == null || r.built >= RING_PIPELINES { return null }
+    v = vkpipes.shader(vert)
+    f = vkpipes.shader(frag)
+    p = null
+    if v != null && f != null {
+        p = vkpipes.build_on(v, f, blend, depth_test, depth_write, pass, cull, is_skinned, false, r.layout, pulled)
+    }
+    if v != null { vk.vkDestroyShaderModule(vkhost.device(), v, null) }
+    if f != null { vk.vkDestroyShaderModule(vkhost.device(), f, null) }
+    if p != null {
+        (r.pipelines as ptr[])[r.built] = p
+        r.built = r.built + 1
+    }
+    return p
+}
+
+// Frame slot `slot`'s draws begin: its blocks and its sets free to be named
+// again (its fence has passed).
+ring_frame(r: *VertexRing, slot: int) {
+    if r == null { return }
+    (r.used as int[])[slot] = 0
+    (r.named as int[])[slot] = 0
+}
+
+// A draw's values -- the shader's captures now -- into the next block of
+// frame slot `slot`'s ring, and its set bound at the ring's place in its
+// layout, at that block, naming `views[i]` through `samplers[i]` (one per
+// texture the shader names, in its order). False, said once, past the ring
+// or its sets: the draw is not to be made.
+ring_bind(r: *VertexRing, commands: ptr, slot: int, views: ptr, samplers: ptr) -> bool {
+    draw = (r.used as int[])[slot]
+    if draw >= r.draws {
+        if !r.overrun {
+            io.stderr_write("ae3d: ${gpu.shader_name(r.shader as *GpuShader)} drawn ${draw + 1} times in a frame; its ring has ${r.draws}\n")
+            r.overrun = true
+        }
+        return false
+    }
+    t = 0
+    while t < r.textures {
+        if (views as ptr[])[t] == null || (samplers as ptr[])[t] == null { return false }
+        t = t + 1
+    }
+    // The set already naming these images in this frame, or the next.
+    named = (r.named as int[])[slot]
+    found = 0 - 1
+    k = 0
+    while k < named && found < 0 {
+        same = true
+        t = 0
+        while t < r.textures {
+            at = (slot * RING_SETS + k) * r.textures + t
+            if (r.views as ptr[])[at] != (views as ptr[])[t] || (r.samplers as ptr[])[at] != (samplers as ptr[])[t] {
+                same = false
+            }
+            t = t + 1
+        }
+        if same { found = k }
+        k = k + 1
+    }
+    if found < 0 {
+        if named >= RING_SETS {
+            if !r.overrun {
+                io.stderr_write("ae3d: ${gpu.shader_name(r.shader as *GpuShader)} drawn with more than ${RING_SETS} sets of images in a frame\n")
+                r.overrun = true
+            }
+            return false
+        }
+        found = named
+        (r.named as int[])[slot] = named + 1
+        name_images(r, slot, found, views, samplers)
+    }
+    ring = (r.rings as ptr[])[slot] as *HostBuffer
+    gpu.params_write(r.shader as *GpuShader, ring.mapped + draw * r.stride)
+    (r.used as int[])[slot] = draw + 1
+    cell = calloc(1, 8)
+    (cell as ptr[])[0] = (r.sets as ptr[])[slot * RING_SETS + found]
+    dynamic = calloc(1, 4)
+    (dynamic as uint32[])[0] = (draw * r.stride) as uint32
+    vk.vkCmdBindDescriptorSets(commands, vk.PIPELINE_BIND_POINT_GRAPHICS, r.layout, r.index, 1, cell, 1, dynamic)
+    free(dynamic)
+    free(cell)
+    return true
+}
+
+// Set `k` of frame slot `slot` names the images, at 1.., from now on.
+fn name_images(r: *VertexRing, slot: int, k: int, views: ptr, samplers: ptr) {
+    n = r.textures
+    if n < 1 { return }
+    set = (r.sets as ptr[])[slot * RING_SETS + k]
+    images = calloc(n, sizeof(VkDescriptorImageInfo))
+    writes = calloc(n, sizeof(VkWriteDescriptorSet))
+    t = 0
+    while t < n {
+        at = (slot * RING_SETS + k) * n + t
+        (r.views as ptr[])[at] = (views as ptr[])[t]
+        (r.samplers as ptr[])[at] = (samplers as ptr[])[t]
+        image = (images + t * sizeof(VkDescriptorImageInfo)) as *VkDescriptorImageInfo
+        image.imageLayout = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        image.imageView = (views as ptr[])[t]
+        image.sampler = (samplers as ptr[])[t]
+        write = (writes + t * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+        write.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+        write.dstSet = set
+        write.dstBinding = 1 + t
+        write.descriptorCount = 1
+        write.descriptorType = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+        write.pImageInfo = image as ptr
+        t = t + 1
+    }
+    vk.vkUpdateDescriptorSets(vkhost.device(), n, writes, 0, null)
+    free(writes)
+    free(images)
+}
+
+ring_shader(r: *VertexRing) -> *GpuShader { return r.shader as *GpuShader }
+ring_layout(r: *VertexRing) -> ptr { return r.layout }
+
+// Everything the ring made, its pipelines and its shader, gone; the device
+// idle.
+vertex_ring_free(r: *VertexRing) {
+    if r == null { return }
+    d = vkhost.device()
+    k = 0
+    while k < r.built {
+        vk.vkDestroyPipeline(d, (r.pipelines as ptr[])[k], null)
+        k = k + 1
+    }
+    slot = 0
+    while slot < vkdesc.FRAMES {
+        ring = (r.rings as ptr[])[slot]
+        if ring != null { vkhost.host_buffer_free(ring as *HostBuffer) }
+        slot = slot + 1
+    }
+    if r.pool != null { vk.vkDestroyDescriptorPool(d, r.pool, null) }
+    if r.layout != null { vk.vkDestroyPipelineLayout(d, r.layout, null) }
+    if r.set_layout != null { vk.vkDestroyDescriptorSetLayout(d, r.set_layout, null) }
+    free(r.rings)
+    free(r.sets)
+    free(r.views)
+    free(r.samplers)
+    free(r.named)
+    free(r.used)
+    free(r.pipelines)
+    gpu.shader_free(r.shader as *GpuShader)
+    free(r as ptr)
 }
