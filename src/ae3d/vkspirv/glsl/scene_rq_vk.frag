@@ -2,7 +2,7 @@
 #version 460
 #extension GL_EXT_ray_query : require
 #define AE3D_RAY_QUERY 1
-layout(set = 0, binding = 5) uniform accelerationStructureEXT sceneAS;
+layout(set = 2, binding = 4) uniform accelerationStructureEXT sceneAS;
 
 struct Light {
     vec3 position;
@@ -18,8 +18,10 @@ struct Light {
     float spotCosInner;
 };
 
-layout(std140, set = 0, binding = 0) uniform SceneBlock {
-    Light lights[16];
+layout(std140, set = 0, binding = 0) uniform DrawBlock {
+    mat4 model;
+    mat4 prevModel;
+    mat4 lightSpaceMatrix;
     bool isInstanced;
     bool useInstanceColor;
     bool instancePoints;
@@ -27,34 +29,13 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     int pointFlipbookColumns;
     int pointFlipbookRows;
     float pointLift;
-    vec3 viewPos;
-    mat4 model;
-    mat4 viewProjection;
-    mat4 lightSpaceMatrix;
-    mat4 prevModel;
-    mat4 prevViewProjection;
     bool isSkinned;
-    int clipJoints0;
-    int clipJoints1;
-    int clipJoints2;
-    vec2 jitter;
-    vec2 screenSize;
-    int lightCount;
-    vec4 clusterDims;
-    vec4 clusterDepth;
-    mat4 clusterViewProjection;
-    vec4 viewDepth;
     bool impostor;
-    int captureChannel;
-    float viewDistance;
     vec3 diffuseColor;
     vec3 specularColor;
     float metallic;
     float roughness;
     float exposure;
-    float cloudCover;
-    float cloudTime;
-    vec3 cloudSun;
     float materialAlpha;
     float materialCutout;
     float materialNormalStrength;
@@ -74,14 +55,12 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float materialEmbers;
     float materialEmberCover;
     float materialEmberGlow;
-    int hasSceneDepth;
-    mat4 invViewProjection;
     int surfaceBlend;
     float reflectivity;
-    float wetness;
     bool hasNormalMap;
-    float normalStrength;
-    float occlusionStrength;
+    bool enableShadows;
+    float shadowIntensity;
+    float shadowSoftness;
     bool enableClearcoat;
     float clearcoatRoughness;
     float clearcoatIntensity;
@@ -94,32 +73,10 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     bool enableEnergyConservation;
     bool enableImageBasedLighting;
     float iblIntensity;
-    int giOff;
     bool enableVolumetricLighting;
     float volumetricIntensity;
     int volumetricSteps;
     float volumetricScattering;
-    bool enableFog;
-    float fogStart;
-    float fogEnd;
-    vec3 fogRadiance;
-    float fogIntensity;
-    bool enableShadows;
-    bool hasShadowMap;
-    float shadowIntensity;
-    float shadowSoftness;
-    vec3 shadowDirection;
-    mat4 cascadeMatrices[4];
-    vec4 cascadeSplits;
-    vec4 cascadeTexelWorld;
-    int cascadeCount;
-    int rayShadows;
-    float sunAngle;
-    float rayOcclusion;
-    float rayOcclusionStrength;
-    float rayLampRadius;
-    float rayReach;
-    int rayFrame;
     bool enablePerlinNoise;
     float noiseScale;
     int noiseOctaves;
@@ -130,33 +87,90 @@ layout(std140, set = 0, binding = 0) uniform SceneBlock {
     float causticsSpeed;
     float causticsWaterLevel;
     float causticsDepth;
-    float causticsTime;
-    int lampShadowBase;
-    int keyLampSlot;
     bool clipOn;
     vec4 clipPlane;
     bool clipDetached;
     float clipNoise;
     float clipNoiseScale;
+    int clipJoints0;
+    int clipJoints1;
+    int clipJoints2;
+    float draw_pad0;
+    float draw_pad1;
     int woundCount;
     vec4 woundData[96];
     vec4 woundLayers[4];
     float woundCore;
+    float draw_pad2;
+    float draw_pad3;
+    float draw_pad4;
     int damageOn;
     vec4 damageColours[4];
     vec4 damageRect;
     float damageClamp;
+    mat4 bones[96];
+    vec4 prevBoneRows[288];
+};
+layout(std140, set = 1, binding = 0) uniform CameraBlock {
+    mat4 viewProjection;
+    mat4 prevViewProjection;
+    mat4 invViewProjection;
+    vec3 viewPos;
+    float viewDistance;
+    vec2 jitter;
+    vec2 screenSize;
+    int hasSceneDepth;
+    vec4 viewDepth;
     int occlusionHistory;
+    int captureChannel;
+    float rayReach;
+    int rayFrame;
+    bool hasShadowMap;
+    mat4 cascadeMatrices[4];
+    vec4 cascadeSplits;
+    vec4 cascadeTexelWorld;
+    int cascadeCount;
+    vec4 clusterDims;
+    vec4 clusterDepth;
+    mat4 clusterViewProjection;
+    int lampShadowBase;
+    int keyLampSlot;
+    float camera_pad0;
+    float camera_pad1;
     int ddgiOn;
     vec4 ddgiDims;
     vec4 ddgiBase[2];
     vec4 ddgiSpacing;
     vec4 ddgiAtlas;
-    mat4 bones[96];
-    vec4 prevBoneRows[288];
+};
+layout(std140, set = 2, binding = 0) uniform WorldBlock {
+    Light lights[16];
+    int lightCount;
+    vec3 shadowDirection;
+    float cloudCover;
+    float cloudTime;
+    vec3 cloudSun;
+    float causticsTime;
+    float wetness;
+    float normalStrength;
+    float occlusionStrength;
+    int giOff;
+    int rayShadows;
+    float sunAngle;
+    float rayOcclusion;
+    float rayOcclusionStrength;
+    float rayLampRadius;
+    float world_pad0;
+    float world_pad1;
+    float world_pad2;
+    bool enableFog;
+    float fogStart;
+    float fogEnd;
+    vec3 fogRadiance;
+    float fogIntensity;
 };
 layout(set = 0, binding = 1) uniform sampler2D textureSampler;
-layout(set = 0, binding = 2) uniform sampler2D shadowMap;
+layout(set = 1, binding = 1) uniform sampler2D shadowMap;
 layout(set = 0, binding = 3) uniform sampler2D normalMap;
 layout(set = 0, binding = 4) uniform sampler2D sceneDepth;
 layout(location = 0) in vec2 fragTexCoord;
@@ -207,8 +221,8 @@ layout(location = 5) in float Occlusion;
 // .w. What the clusters and the shadow's cascades find a pixel by.
 
 #ifdef VULKAN
-layout(std430, set = 0, binding = 6) readonly buffer ClusterLightBlock { vec4 clusterLightData[]; };
-layout(std430, set = 0, binding = 7) readonly buffer ClusterWordBlock { float clusterWordData[]; };
+layout(std430, set = 1, binding = 2) readonly buffer ClusterLightBlock { vec4 clusterLightData[]; };
+layout(std430, set = 1, binding = 3) readonly buffer ClusterWordBlock { float clusterWordData[]; };
 vec4 cluster_light(int i) { return clusterLightData[i]; }
 float cluster_word(int i) { return clusterWordData[i]; }
 #else
@@ -613,7 +627,7 @@ float shadow_factor() {
 
 
 #ifdef VULKAN
-layout(set = 0, binding = 8) uniform sampler2D lampShadowMap;
+layout(set = 1, binding = 4) uniform sampler2D lampShadowMap;
 #else
 
 #endif
@@ -1722,10 +1736,10 @@ layout(set = 0, binding = 9) uniform sampler2D damageMask;
 // the split-sum table that scales them by F0 (ae3d.skylight), and its
 // irradiance onto every normal, an octahedral map of its own.
 #ifdef VULKAN
-layout(set = 0, binding = 10) uniform sampler2D skyLight;
-layout(set = 0, binding = 11) uniform sampler2D brdfLut;
-layout(set = 0, binding = 12) uniform sampler2D skyIrradiance;
-layout(set = 0, binding = 13) uniform sampler2D occlusionMap;
+layout(set = 2, binding = 1) uniform sampler2D skyLight;
+layout(set = 2, binding = 2) uniform sampler2D brdfLut;
+layout(set = 2, binding = 3) uniform sampler2D skyIrradiance;
+layout(set = 1, binding = 5) uniform sampler2D occlusionMap;
 #else
 
 
@@ -1793,9 +1807,9 @@ vec3 sky_irradiance(vec3 n) {
 // The probes' irradiance, where the device traces and the probes are on
 // (#537): what the sky's light and every bounce of it bring to this point,
 // in place of the sky's irradiance alone.
-layout(set = 0, binding = 14) uniform sampler2D ddgiIrradiance;
-layout(set = 0, binding = 15) uniform sampler2D ddgiDistance;
-layout(set = 0, binding = 16, std430) readonly buffer DdgiState { vec4 ddgiProbeState[]; };
+layout(set = 1, binding = 6) uniform sampler2D ddgiIrradiance;
+layout(set = 1, binding = 7) uniform sampler2D ddgiDistance;
+layout(set = 1, binding = 8, std430) readonly buffer DdgiState { vec4 ddgiProbeState[]; };
 
 
 

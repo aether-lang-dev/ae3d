@@ -21,15 +21,15 @@ struct Eye {
 struct Shadow {
     mat4 light_space;
 };
-layout(std140, set = 2, binding = 0) uniform VertexParams {
+layout(std140, set = 4, binding = 0) uniform VertexParams {
     Throng throng;
     Eye eye;
     Shadow shadow;
 };
-layout(set = 2, binding = 1) uniform sampler2D pose_bank;
-layout(std430, set = 1, binding = 0) readonly buffer pulled_vertex_buffer { float pulled_vertex[]; };
-layout(std430, set = 1, binding = 1) readonly buffer pulled_skin_buffer { vec4 pulled_skin[]; };
-layout(std430, set = 1, binding = 2) readonly buffer pulled_figure_buffer { float pulled_figure[]; };
+layout(set = 4, binding = 1) uniform sampler2D pose_bank;
+layout(std430, set = 3, binding = 0) readonly buffer pulled_vertex_buffer { float pulled_vertex[]; };
+layout(std430, set = 3, binding = 1) readonly buffer pulled_skin_buffer { vec4 pulled_skin[]; };
+layout(std430, set = 3, binding = 2) readonly buffer pulled_figure_buffer { float pulled_figure[]; };
 
 layout(location = 0) out vec2 fragTexCoord;
 layout(location = 1) out vec3 Normal;

@@ -670,26 +670,53 @@ sky(...) -> *GpuShader {
 
 ### The scene block
 
-Today 197 uniforms and 16208 bytes (step 4 took 17 out), every one shared
-by every hand-written shader. Each mesh shader's captures replace it as
-that shader moves, grouped into structs by what changes together, so one
-`gpu.set_*` or one block copy sets a group:
+Split (Nic, 2026-10-20: "option 1"): the scene's one block is three, each
+in a descriptor set of its own on Vulkan, and still one camera, so every
+frame is the one it was. The flat blocks keep their members in the order
+of the structs (`frame.view_layout`, `frame.world_layout`,
+`lit.draw_layout`; std140 places a flat block as it does the structs, which
+glslang's placement of each member checks), so the hand-written shaders and
+the quoted ones read one staging layout.
 
-- `Camera` (view, projection, view-projection, its inverse, last frame's,
-  the eye, jitter): set once a frame. On Vulkan from the same corrected
-  matrices `vkdesc.set_clip_mat4` writes now, as step 4's passes copy them.
-- `Lights` (`lights: Light[16]`, `count`, the cascades): once a frame.
-- `Material` (the ~40 material and surface fields): per draw, through the
-  pass's ring of blocks (`vkquote`'s `draws`), as the bloom's levels are.
-- `Skin` (`bones: mat4[96]`, last frame's rows): per draw, only in the
-  skinned variants.
-- `Wounds`, `Damage`, `Water` and `Crowd` likewise, each only in the shader
-  that reads it.
+| Set | Block (bytes) | Structs | What is in it |
+|---|---|---|---|
+| 0, the draw's | 13,056, a dynamic offset a draw | `Draw`, `DrawMaterial`, `Surface`, `Cut`, `Wounds`, `Damage`, `Skin` (`ae3d.shaders.lit`) | the model and last frame's, the key light's map space, instancing, the material and surface, the cut, wounds, damage, bones; the colour, normal, scene-depth and damage textures |
+| 1, the camera's | 800 | `Eye`, `ShadowCascades`, `Grid`, `Probes` (`ae3d.shaders.frame`) | everything that depends on the view; the shadow atlas, the cluster lights and words, the lamps' atlas, the occlusion map, the probes' atlases |
+| 2, the world's | 1,424 | `WorldState` (with `lights: WorldLight[16]`), `Weather` | what every view sees alike; the sky light, the BRDF table, the sky's irradiance, the rays' structure |
 
-A `Light[16]` array of structs is the one shape not probed yet; if quote
-types it as anything but `Light[16]`, that is an aether issue to file
-before the scene shader moves. The block goes when the last shader reading
-it does, and with it `vkscene` and `vkdesc`'s single scene program.
+Each uniform, by block (the hand-written name, then the field):
+
+| Camera (set 1) | |
+|---|---|
+| `viewProjection`, `prevViewProjection`, `invViewProjection` | `eye.view_projection`, `.prev_view_projection`, `.inv_view_projection` |
+| `viewPos`, `viewDistance`, `jitter`, `screenSize` | `eye.position`, `.far`, `.jitter`, `.screen_size` |
+| `hasSceneDepth`, `viewDepth`, `occlusionHistory` | `eye.depth_on`, `.depth_plane`, `.history` |
+| `captureChannel`, `rayReach`, `rayFrame` | `eye.capture`, `.ray_reach`, `.ray_frame` |
+| `hasShadowMap`, `cascadeMatrices`, `cascadeSplits`, `cascadeTexelWorld`, `cascadeCount` | `cascades.on`, `.matrices`, `.splits`, `.texel_world`, `.count` |
+| `clusterDims`, `clusterDepth`, `clusterViewProjection`, `lampShadowBase`, `keyLampSlot` | `grid.dims`, `.depth`, `.view_projection`, `.lamp_base`, `.key_lamp` |
+| `ddgiOn`, `ddgiDims`, `ddgiBase`, `ddgiSpacing`, `ddgiAtlas` | `probes.on`, `.dims`, `.base`, `.spacing`, `.atlas` |
+
+| World (set 2) | |
+|---|---|
+| `lights[16]`, `lightCount`, `shadowDirection` | `world.lights` (`WorldLight`: position, colour, intensity, temperature, kind, direction, constant, linear, quadratic, cos_outer, cos_inner), `.light_count`, `.shadow_direction` |
+| `cloudCover`, `cloudTime`, `cloudSun`, `causticsTime`, `wetness` | `world.cloud_cover`, `.cloud_time`, `.cloud_sun`, `.time`, `.wetness` |
+| `normalStrength`, `occlusionStrength`, `giOff`, `rayShadows`, `sunAngle`, `rayOcclusion`, `rayOcclusionStrength`, `rayLampRadius` | `world.normal_strength`, `.occlusion_strength`, `.gi_off`, `.rays`, `.sun_angle`, `.ray_occlusion`, `.ray_occlusion_strength`, `.ray_lamp_radius` |
+| `enableFog`, `fogStart`, `fogEnd`, `fogRadiance`, `fogIntensity` | `weather.fog`, `.fog_start`, `.fog_end`, `.fog_radiance`, `.fog_intensity` |
+
+The other 86 uniforms are the draw's: `lightSpaceMatrix` and the
+volumetric settings too, since models write them per draw.
+
+**A second camera is a second camera set.** `vkdesc.frame_sets` writes the
+frame's camera block and its images into set 1 and the world's into set 2,
+once a frame, before the first draw binds them (`vkframe.frame_sets_now`).
+Another camera needs only its own set 1 (a block filled the same way, from
+its own view) bound in the first one's place for its draws; the world's set
+and every draw's set stay as they are. Nothing else in a shader, a pipeline
+or a layout changes: the pipelines are made on the three set layouts
+(`vkpipes.scene_layouts`), and a shader drawn beside the scene takes its
+own sets after them (`frame.SCENE_SETS`, the crowd's rings at 3).
+No second camera is drawn yet (Nic: no multi-camera work before the
+scene).
 
 ### What it buys MSL (step 5, after this)
 

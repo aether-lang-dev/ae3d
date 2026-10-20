@@ -562,7 +562,7 @@ model from its palette as last frame drew it as well as its matrix
 (`skin.skeleton_frame_done`), and it goes to the shader as each bone's
 matrix's top three rows (`prevBoneRows`), so both palettes fit the vertex
 stage's uniform budget, which two whole ones were over; on Vulkan the
-scene block is 15,872 bytes, inside the 16,384 every device gives.
+draw's block is 13,056 bytes, inside the 16,384 every device gives.
 Without it, a limb that swung 20 cm in a frame read as still, and the
 temporal pass smeared it into a ghost of where it had been. Capture channel 3 (`engine_set_capture_channel(e, 3)`,
 `AE3D_CAPTURE=3`) draws the vector in pixels, a hundred either way across
@@ -596,7 +596,7 @@ models -- the ones that cast, drawn on their own or through a matrix
 stream -- with their matrices, and the top-level structure is built
 from them before any pass, in a ring of two. The scene fragment's
 ray-query variant (`scene_rq_vk.frag`, GLSL 4.60, SPIR-V 1.4, the
-structure at binding 5) traces one opaque ray, first hit, from a
+structure at binding 4 of the world's set) traces one opaque ray, first hit, from a
 little off the surface: lit, or the shadow's share of the light, exact
 at any distance and with no map's texel to fit the world into. What the
 structure does not hold -- a point stream, a crowd not in the rays, a
@@ -1228,7 +1228,7 @@ It works by clustered shading (`ae3d.lightgrid`, #468).
   in a gradient.
 - **The layout.** The lamps (five vec4s each) and the cells' lists are
   built once on the CPU in one layout. Vulkan reads them as storage buffers
-  at bindings 6 and 7. OpenGL 4.1, which has no storage buffers, reads the
+  at bindings 2 and 3 of the camera's set. OpenGL 4.1, which has no storage buffers, reads the
   same floats from two textures.
 - **The rest.** The key light and any directional light reach every pixel
   and stay in the shader's small uniform array.

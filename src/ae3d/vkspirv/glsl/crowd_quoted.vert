@@ -20,12 +20,12 @@ struct Eye {
 struct Shadow {
     mat4 light_space;
 };
-layout(std140, set = 1, binding = 0) uniform VertexParams {
+layout(std140, set = 3, binding = 0) uniform VertexParams {
     Throng throng;
     Eye eye;
     Shadow shadow;
 };
-layout(set = 1, binding = 1) uniform sampler2D pose_bank;
+layout(set = 3, binding = 1) uniform sampler2D pose_bank;
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec2 inTexCoord;
 layout(location = 2) in vec3 inNormal;
