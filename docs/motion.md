@@ -515,6 +515,8 @@ Sat, a figure can take something in both hands and eat from it (#825's 3). What 
 - `eat(body)` takes a bite: the item comes up in front of the mouth over `BITE_RAISE`, stays `BITE_STAY` and goes back down over `BITE_LOWER`. `eating(body)` says a bite is on, `holding(body)` that it holds something.
 - `mouth(body)` is the figure's own: part way up its neck's body, ahead by that body's thickness. Any rig's head serves, with nothing set per clip.
 - Standing up puts the item down first.
+- `hold_cup(body, cup, grip, right)` takes a cup in one hand. The cup rests over that side's thigh, and the other hand stays on its own thigh.
+- `drink(body)` takes a sip: the cup's rim comes to the lips, `CUP_AHEAD` ahead of the mouth and `CUP_UNDER` under it, tipped toward the face by `CUP_TILT` (60°) at the top, as a cup is tipped to drink from it.
 
 The hands are measured at the palm, where a grip is held: the forearm's line on past the drawn wrist, as far as the forearm's body reaches past it (4.5 cm on the box man, which has no fingers). `tests/test_eat.ae` holds it, on a 0.4 m log with three bites:
 
@@ -524,6 +526,9 @@ The hands are measured at the palm, where a grip is held: the forearm's line on 
 | the bowl from the mouth at a bite's top | 11 cm | 13 cm (it is held 10 cm ahead of the mouth, 5 under) |
 | the toes sliding along the ground | 3.8 mm | 5 mm |
 | the worst turn of any body in a step | 5.0° | 6° |
+| a cup: the right palm off its grip / the left hand off its thigh's middle | 0.03 / 2.0 cm | 3 / 12 cm |
+| a cup: its rim from the mouth / tipped toward the face, a sip's top | 0.6 cm / 60° | 6 cm / 40° or more |
+| a cup: the toes sliding / the worst turn in a step | 3.8 mm / 4.6° | 5 mm / 6° |
 
 Let go, the hands are back on the thighs, and it stands up as from any sitting.
 
