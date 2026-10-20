@@ -667,6 +667,30 @@ sky(...) -> *GpuShader {
    pipelines, and with them the nine scene-block uniforms only they read
    (134 uniforms, 15168 bytes): Vulkan keeps their words in the crowd's own
    (`vkframe.set_crowd_*`), where the rings copy them from.
+   *The scene done (2026-10-20, on Aether 0.834.0):* `ae3d.shaders.lit`,
+   the scene's vertex shaders (`lit_vertex`, and `lit_plain_vertex` for
+   the plain pipelines, which name no skin stream), its pixel shader
+   (`lit_pixel`, FRAGMENT_DEFAULT's) and the depth pass's
+   (`lit_depth_vertex`, `lit_depth_plain_vertex`, `lit_depth_pixel`,
+   FRAGMENT_DEPTH's), drawn on both renderers, the crowd's vertex shaders
+   with them. At one sample every parity frame is byte-identical to the
+   hand-written scene's on both renderers but the clouds (#793). What they
+   read is the scene's three blocks (below), each a `gpu.use_layout` of
+   whole structs, so one layout places a field for the hand-written
+   shaders, the quoted ones and the renderer's staging alike; the images
+   and buffers are at the hand-written bindings (`gpu.capture_binding`).
+   On OpenGL each struct is a uniform (`eye`, `world`, ...) and the
+   renderer still sets each value by its hand-written name: the scene's
+   programs find it by the name the quoted shaders give it (`lit.gl_name`:
+   viewPos is `eye.position`, `lights[2].color` `world.lights[2].colour`).
+   The crowd's vertex shaders capture the frame's Eye as `viewer` now: the
+   pixel shader they are drawn with captures the whole camera as `eye`,
+   and on OpenGL one name is one uniform across the program. Each helper is
+   the hand-written one's shape, and reads its uniforms in place
+   (`gpu.read_in_place`), MoltenVK's fast math rounding by where a value
+   was loaded. The ray-query pixel shader (`scene_rq_vk.frag`) is still
+   the hand-written one: no device here traces rays, so only CI's lavapipe
+   could hold a quoted one to it.
 
 ### The scene block
 
