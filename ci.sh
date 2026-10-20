@@ -493,10 +493,28 @@ if ! ./build.sh tools/generate_shaders.ae >/tmp/ae3d_shaders.log 2>&1; then
     fail "generate_shaders (build)"
     sed "s/^/        /" /tmp/ae3d_shaders.log | head -12
 elif ./build/generate_shaders --check >/tmp/ae3d_shaders.log 2>&1; then
-    pass "src/ae3d/vkspirv/glsl, vkscene and vkspirv's SPIR-V are what src/ae3d/shaders and the quoted shaders produce"
+    pass "src/ae3d/vkspirv/glsl, vkscene, vkspirv's SPIR-V and src/ae3d/metal are what src/ae3d/shaders and the quoted shaders produce"
 else
     fail "generated Vulkan shaders are out of date; run build/generate_shaders"
     sed "s/^/        /" /tmp/ae3d_shaders.log | head -12
+fi
+
+# The same trees' MSL (src/ae3d/metal), which the generator checks is
+# current beside the GLSL, compiled by Metal's own compiler with every
+# warning an error; each struct of a uniform block carries static_asserts of
+# its std140 offsets, so this holds the MSL's layout to the block's too.
+if [ "$(uname -s)" = "Darwin" ]; then
+    step "Metal shaders compile"
+    ./scripts/msl_check.sh >/tmp/ae3d_msl.log 2>&1
+    msl_status=$?
+    if [ "$msl_status" -eq 0 ]; then
+        pass "$(tail -1 /tmp/ae3d_msl.log | sed 's/^msl_check: //')"
+    elif [ "$msl_status" -eq 2 ]; then
+        skip "src/ae3d/metal" "$(tail -1 /tmp/ae3d_msl.log)"
+    else
+        fail "src/ae3d/metal does not compile clean"
+        sed "s/^/        /" /tmp/ae3d_msl.log | head -20
+    fi
 fi
 
 fi
