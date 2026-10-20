@@ -532,6 +532,19 @@ sky(...) -> *GpuShader {
    cell's layout is Aether's (`float[4]` is four packed f32s), so
    `params_write` repacks element by element; the generator already holds
    every offset to glslang's.
+   *An array of structs (2026-10-20, on Aether 0.834.0)*, the scene's
+   `lights: Light[16]`: `gpu.capture_field` places the array and
+   `gpu.capture_element_field(s, "world", "lights", sizeof(Light),
+   "colour", offsetof(Light, colour))` each field of its element. The
+   element is a GLSL struct of its own, declared once before the struct
+   holding the array, with every field the tree reads of a value of that
+   type or sets in a literal of it, in the cell's order: an element is
+   handed to a helper whole (`direct_light(world.lights[i], ...)`), and a
+   literal of the type (`clustered_light`'s) is the same struct. std140
+   aligns it to sixteen and rounds its size up to sixteen, its arrayStride;
+   OpenGL sets it a value at a time (`world.lights[3].colour`); the
+   generator holds each element to glslang's topLevelArrayStride
+   (tests/test_gpu_struct_arrays).
 3. **`Texture3D`** (`sampler3D`), read by `texture_3d(t, p)`; on the CPU a
    `ShaderImage3D`, trilinear across its slices.
 4. **`emit_glsl` of a vertex shader**, both dialects; `emit_screen_vertex`
