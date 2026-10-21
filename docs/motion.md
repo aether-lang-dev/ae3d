@@ -541,6 +541,7 @@ Sat, a figure can take something in both hands and eat from it (#825's 3). What 
 
 - `hold(body, item, left, right)` takes `item`, sat. The grips `left` and `right` are in the item's frame, and each goes to the hand on the side nearer it. The item rests over the thighs, `LAP_AHEAD` ahead of the hips' middle.
 - Each step the item is placed, and the hands are solved onto its grips with the arms' two-bone solve, elbows down and out.
+- While it holds something, the arms' anchors are pinned at 30 Hz (`physics.ragdoll_plant`), as a planted foot's are: PuppetMaster's pin weight raised on a hand gripping a prop. At the anchors' 5 Hz the forearms' bodies hung 3.5 cm off the grips the drawn hands were on, and fell 10.5 cm behind them in a bite (#843). Mid-bite they still trail by 4.9 cm, because the bodies chase the previous step's rig (#845).
 - The hands go from the thighs to the grips over `TAKE` (half a second), eased, and back on `let_go(body)`. Set onto the grips at once, the arms were solved there in a step and turned 22.7°.
 - `eat(body)` takes a bite: the item comes up in front of the mouth over `BITE_RAISE`, stays `BITE_STAY` and goes back down over `BITE_LOWER`. `eating(body)` says a bite is on, `holding(body)` that it holds something.
 - `mouth(body)` is the figure's own: part way up its neck's body, ahead by that body's thickness. Any rig's head serves, with nothing set per clip.
@@ -548,17 +549,18 @@ Sat, a figure can take something in both hands and eat from it (#825's 3). What 
 - `hold_cup(body, cup, grip, right)` takes a cup in one hand. The cup rests over that side's thigh, and the other hand stays on its own thigh.
 - `drink(body)` takes a sip: the cup's rim comes to the lips, `CUP_AHEAD` ahead of the mouth and `CUP_UNDER` under it, tipped toward the face by `CUP_TILT` (60°) at the top, as a cup is tipped to drink from it.
 
-The hands are measured at the palm, where a grip is held: the forearm's line on past the drawn wrist, as far as the forearm's body reaches past it (4.5 cm on the box man, which has no fingers). `tests/test_eat.ae` holds it, on a 0.4 m log with three bites:
+The hands are measured at the palm, where a grip is held: the forearm's line on past the drawn wrist, as far as the forearm's body reaches past it (4.5 cm on the box man, which has no fingers). `tests/test_eat.ae` holds it on a 0.38 m log, with an 11 cm bowl gripped at its sides near the rim as Siltreach's settlers hold theirs, and three bites:
 
 | | measured | held to |
 |---|---|---|
 | each palm off its grip, bites and all | 0.05 cm | 3 cm |
+| each forearm's body off its grip, between bites / mid-bite | 0.6 / 4.9 cm | 3 cm / not held (#845) |
 | the bowl from the mouth at a bite's top | 11 cm | 13 cm (it is held 10 cm ahead of the mouth, 5 under) |
 | the toes sliding along the ground | 3.8 mm | 5 mm |
-| the worst turn of any body in a step | 5.0° | 6° |
+| the worst turn of any body in a step | 5.5° | 6° |
 | a cup: the right palm off its grip / the left hand off its thigh's middle | 0.03 / 2.0 cm | 3 / 12 cm |
 | a cup: its rim from the mouth / tipped toward the face, a sip's top | 0.6 cm / 60° | 6 cm / 40° or more |
-| a cup: the toes sliding / the worst turn in a step | 3.8 mm / 4.6° | 5 mm / 6° |
+| a cup: the toes sliding / the worst turn in a step | 3.8 mm / 4.5° | 5 mm / 6° |
 
 Let go, the hands are back on the thighs, and it stands up as from any sitting.
 
