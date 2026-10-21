@@ -484,11 +484,20 @@ A figure can sit on a seat and lie down on the ground, and get up from either (#
 
 While a figure acts it is in `ACTING` (`acting(body)`), got to as `GETTING_UP` is; `set_mode` ends the action.
 
-Three things about the way's stages came out of measuring the feet and the turns, and apply to every keyed way:
+These things about the way's stages came out of measuring the feet and the turns, and apply to every keyed way:
 
 - A stage into the animation's pose eases each limb onto its turns by what its solve at that key is short of it, in the bone's own frame: 3° of swing and up to 3° of twist on the box man, because a near-straight knee or elbow has no bend to read its pole from. Eased onto the key's turns in the world instead, while the trunk was still on its way, a figure standing up from a seat drew its ankles 65 mm off their spots in the middle of the stage. A last key planned on its contacts (sat, lying) is not eased at all: its limbs are its solves.
+- Eased, a leg's end is then put back where its solve had it, on its spot or on its way through the air: the knee bent and the leg swung about the hip by the least turn, then turned about the hip-to-ankle line so its knee's hinge lies as it did. Eased bone by bone, a back leg swinging forward from kneeling drew its ankle 2.7 cm over the ground, under both keys, and its foot 8.3 cm into it (#841).
+- A way begun while the figure holds another's last key (seated, lying, kneeling) starts from the pose it is drawn in, not its bodies', which follow it from behind. From the bodies, a figure standing up from kneeling drew its neck 58° round in its first step and its arms 29°.
+- Every limb's solve keeps its middle joint within its range: a knee bends 130° at the most, an elbow its own, `LIMIT_MARGIN` short. A foot is kept within its ankle's cone of its shin (35° up, 50° down, 15° to the side). An end nearer the hip than the folded leg lets it come is put as near as it does. Folded past it, a knee bent 153° for a foot brought forward from kneeling; its body stopped at its limit, and dragged its foot 26 cm along the ground under the foot drawn 13 cm over it.
 - A planted foot keeps the turn it stands with. Set flat to face the way, as a way up sets a foot it brings under it, a sitter's feet lost their toes' splay going down and turned it back coming up, the foot's middle sweeping 40 mm round its ankle.
 - The planted feet's anchors are held at 30 Hz (`physics.ragdoll_plant`), PuppetMaster's pin weight on a planted foot. At the anchors' 5 Hz, a figure standing up from a seat pushed its feet 5.3 mm along the ground as its weight came onto them.
+
+A foot stepped from one key to the next (its ankle moving more than 2 cm) goes the way a stepping foot goes:
+
+- It lifts, is carried level at an even pace, and is set down: its level way runs between `SET_DOWN` and `1 - SET_DOWN` of the stage's time, coming on and going off over `SET_RAMP`, at 1.33 times the stage's even pace at its quickest. Carried and lowered on the one ease, a foot came down still going 6.5 mm a step and slid as its toes came to bear. Not in the stage eased onto the animation's pose, whose limbs go the ease's way.
+- Off the ground it is carried by its shin, each key's foot turned by the least turn from that key's shin to the shin now, so its ankle bends from the one key's bend to the other's. Turned in the world from key to key instead, getting up its feet went 36° past the ankle's cone.
+- While it is carried it is kept `FOOT_CLEAR` (3 cm) over the ground: its ankle raised, and where its leg folded as far as it goes can't lift it, its toes turned up toward its shin, as a person's are swung through under them, and its foot swung out to the side round the folded knee, as a stiff knee steps through wide. The turn up and the swing out are planned over the stage from samples of its way (`plan_level`), on a bump that comes on and goes off at rest, so neither snaps. Reacting step by step, a foot turned 23° in one step as its need came on.
 
 And a key's limbs must be ones its body can take. Lying, the elbows bent toward the sky were drawn 69° past their hinges and the feet 90° up at an ankle that bends 35. The bodies stayed where they could, and as the way up began from where the bodies lay, the arms jumped 9° in a step.
 
@@ -504,6 +513,27 @@ And a key's limbs must be ones its body can take. Lying, the elbows bent toward 
 | the worst turn of any body in a step, lying down and getting up | 5.5° | 6° |
 
 Stood or risen, it is upright (under 0.1 rad) and in its mode a second on.
+
+### Kneeling
+
+`kneel(body, at, facing)` kneels a figure by a point on the ground to work over it with both hands: a wound treated, a fire lit, a trap set (#825's 5). It is an interaction point as a seat is: the point worked at and the way the kneeler faces. `kneel_spot(body, at, facing)` says where to stand for it.
+
+- **Down.** It kneels as a person does stepping back: the left knee goes down a thigh's length behind where it stood (`KNEEL_BACK`), the right foot still planted ahead of it, its shin upright over it. Then the right knee comes down beside the left, the trunk upright and the hands hanging. Only then does the trunk lean over the work, as far as the arms need (`KNEEL_REACH` of their length, 70° at the most), and the hands go to it. Down over its feet where they stood, the right shin tipped past the ankle's 35° and its knee past 130°. Brought down while the hands went to the work, the right knee came into the right forearm's way, held its body 41° back from the arm drawn, and let it go 6.5° a step.
+- **Working.** Knelt, the hands move over the work as hands do treating: `WORK_RADIUS` round it at `WORK_HZ`, `KNEEL_HANDS` either side of it. `work_at(body)` says where. `kneeling(body)` says it is kneeling or knelt, `knelt(body)` that it has come to kneel.
+- **Up.** `stand_up(body)` rises the way the get-up's half kneel does: the right foot brought forward and planted, up over it, and the animation's pose where the feet stand. The two stages that swing a foot from behind the knee to ahead of it, down and up, take `SWING_STAGE` times as long.
+
+`tests/test_kneel.ae` holds it, on the box man with feet of its own:
+
+| | measured | held to |
+|---|---|---|
+| comes to kneel | 2.95 s | |
+| knelt, the left knee's flesh over the ground | 1.9 cm | under 2 cm, no more than 1 cm into it |
+| working, the hands' middle from the work | 3.0 cm | 5 cm |
+| the toes sliding along the ground, down, working and up | 4.0 mm | 5 mm |
+| the lowest drawn flesh, all the way | 0.7 cm into the ground (a standing foot) | 1 cm |
+| the worst turn of any body in a step | 5.4° | 6° |
+
+Stood up, it is `POWERED` and upright (under 0.1 rad) a second on. Settling onto its feet after a way up, the stance is brought onto them at `OVER_SPEED`, 0.24 m/s, 4 mm a step: at 0.3 m/s its drawn feet slid 5 mm a step, the most a planted foot may.
 
 ### Holding and eating
 
