@@ -406,6 +406,17 @@ From mapping the compiler; nothing here is built yet.
    GLSL ae3d.gpu writes into the SPIR-V ae3d.vkspirv holds, and with
    `spirv-val` it stays CI's checker (`generate_shaders --check`). Chris's
    `spirv.inc` and the SPIR-V spec are where that writer would start.
+   *The MSL written (2026-10-20, on Aether 0.834.0); no Metal renderer yet:*
+   ae3d.gpu has a third dialect, `gpu.METAL` (`emit_msl`, `emit_vertex_msl`,
+   `emit_screen_vertex_msl`), written from the same trees as the GLSL, and
+   the generator writes every quoted shader's MSL into `src/ae3d/metal`
+   (41 files), which `--check` holds current byte for byte as it holds the
+   GLSL. `scripts/msl_check.sh` (in `./ci.sh` on macOS) compiles them with
+   Metal's compiler with every warning an error; each block struct's std140
+   offsets are `static_assert`s in the text, so the compiler holds the MSL's
+   layout to the block the renderer fills. Section 11, "What it buys MSL",
+   has the rules and the choices left for a Metal path. No aether change
+   was needed: quote's trees carry everything the dialect reads.
 6. **Vertex shaders.** ChrysaLisp's split is worth taking as an idea: a
    vertex shader's inputs and outputs are declared, and one vertex shader
    serves any pixel shader whose inputs it provides. For us the vertex
@@ -761,4 +772,83 @@ Metal's stage-in and stage-out are structs (`[[stage_in]]`, a returned
 struct with `[[position]]`), so varyings designed as structs map across as
 they are. The attribute table becomes `[[attribute(n)]]`, and the block's
 structs Metal's argument buffers.
+
+*Written (2026-10-20, on Aether 0.834.0):* `gpu.METAL`, the expressions and
+statements the GLSL emitter's, in a third column of the call table
+(`CALL_MSL`: `t.sample(ae_smp_t, uv)` for `texture`, `.read()` for the
+fetches, `rsqrt`, `atan2`, the prelude's `ae_mod` and `ae_mat3`), struct
+literals as aggregates. Around them:
+
+- **Conventions are Vulkan's.** A stored depth is clip z as it is, the
+  screen's y runs down (`screen_y_sign` is -1), and each vertex shader
+  negates its position's y as it returns it, an exact step, so a Metal
+  renderer draws with the Vulkan renderer's matrices and viewports and the
+  frame comes out the same way up. `[[position]]` in a pixel shader is the
+  pixel's centre from the top left, as `gl_FragCoord` is on Vulkan.
+- **Nothing is global.** Each block is a struct handed to the entry in a
+  buffer, each texture with a sampler beside it, each storage buffer a
+  pointer. The entry's first lines name each capture as a reference into
+  its block (`constant Eye& eye = ae_set1.eye;`), so the body reads them by
+  their GLSL names where it uses them, as the GLSL does (the load order
+  MoltenVK's fast math rounds by). A helper reading in place is handed what
+  it reads by name, after its own parameters, and so is each helper calling
+  it; a helper whose own parameter or local would hide such a name is
+  refused, in MSL only.
+- **std140 by hand.** MSL's own layout is not std140 (a `float3` takes
+  sixteen bytes), so each block struct is written member by member at the
+  offsets ae3d.gpu gives it, padded between: a vec3 a `packed_float3`, an
+  array of floats, vec2s or vec3s one of `float4`s read through `.x`,
+  `.xy`, `.xyz`, an array's element struct of its own with a maker for its
+  literals (an aggregate would fill the padding). Each offset and size is a
+  `static_assert` in the text.
+- **Outputs.** Varyings at `[[user(locnK)]]`, K the location the GLSL gives
+  them (an int `[[flat]]` in the pixel shader), attributes at the table's
+  `[[attribute(n)]]` (a mat4 four `float4`s), colour outputs four lanes wide
+  at `[[color(k)]]` (Metal holds an output to its attachment's channels;
+  MoltenVK widens them alike), the depth `[[depth(any)]]`.
+- **Bindings**, one rule for a Metal renderer to follow: Vulkan set N's
+  block at `[[buffer(N)]]`, the storage buffers at `[[buffer(8 + k)]]`, the
+  textures and their samplers at `[[texture(k)]]` and `[[sampler(k)]]` in
+  capture order, vertex buffers from `[[buffer(16)]]`. Discrete arguments,
+  not argument buffers: the simplest thing that compiles, and a renderer's
+  choice to change.
+
+How it is held:
+
+- `generate_shaders --check`: the 41 files are what the trees write.
+- `scripts/msl_check.sh`: Metal's compiler, through the device
+  (`tools/mslc.m`), with every warning clang has an error but four groups
+  (C++98 compatibility, padding, Metal 4's deprecated `vertex`/`fragment`
+  keywords, unused parameters). `xcrun metal` needs Xcode's Metal Toolchain
+  component, a download, and the script runs it too where it is installed.
+- `tests/test_gpu_msl`, no GPU: what each rule writes, the offsets the
+  GLSL's block has, and the GLSL and OpenGL's names unchanged by writing MSL.
+- Against MoltenVK's own MSL of the same shaders' SPIR-V (its SPIRV-Cross,
+  logged with `MVK_CONFIG_DEBUG=1`): every one of the 41 paired, the stage
+  interfaces the same (attributes, varying locations, outputs), and 506 of
+  ae3d.gpu's offsets asserted on MoltenVK's own block structs compile. That
+  is a check of the interfaces and layouts, not of the arithmetic: nothing
+  here draws with the MSL yet.
+
+**What is left, for Nic: the Metal path (#312).** Three ways, smallest first:
+
+1. **Our MSL through MoltenVK.** MoltenVK takes MSL source in place of
+   SPIR-V (`vkCreateShaderModule`, its MSL magic number), so the Vulkan
+   renderer could draw the quoted shaders from `src/ae3d/metal` on macOS
+   with nothing else changed, and every frame be held to the SPIR-V path's
+   on the M6 (frames_against, parity). It needs the MSL's bindings to be
+   the ones MoltenVK assigns (its argument buffers, or its discrete indices
+   with `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0`): a binding rule in the
+   dialect, not a backend. It tests the arithmetic, which nothing does now.
+2. **A Metal harness for the screen passes.** Draw each quoted full-screen
+   pass through Metal itself from a small Objective-C tool, its inputs
+   fixed, and hold it to MoltenVK's drawing of the same pass, or to the CPU
+   evaluator. No renderer; it proves the MSL, not a Metal path.
+3. **The Metal backend** behind the `Backend` vtable, as #312 has it: a
+   third renderer, its parity test and the editor's viewport on it. #312
+   puts it after the Vulkan performance pass, so the structures it shares
+   are the settled ones.
+
+The recommendation is 1: the least new code, and the first time the MSL's
+arithmetic is held to frames; 3 after #312's groundwork.
 
