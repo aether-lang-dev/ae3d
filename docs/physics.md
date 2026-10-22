@@ -225,6 +225,8 @@ The capsule rides a step height (0.35 m) above the feet, so a kerb or a stair lo
 
 **In the scene file.** A model's physics record with body `"character"` (the editor's Character kind) is a character: `apply_spec` makes it from the mesh -- a capsule as wide as the mesh's widest half and as tall as it -- with the object's origin `lift` above the feet, the mesh's lowest point, so a model centred on its origin stands with its bottom on the ground. `spec_of` and the scene's attachments write it back the same way. The world keeps a list of its characters; one that nothing has moved yet (no `character_move` from a script) is stood each fixed step, under gravity and on the ground. `character_of(object)` finds an object's character. `tests/test_character.ae`: a 1.8 m box centred on its origin, dropped from 2 m with a character record, stands with its middle at 0.90 m.
 
+**Its own ragdoll.** A character walks through the bodies of its own figure's ragdoll: `motion.on_figure` tells the ragdoll which object it stands for (`ragdoll_set_object`), and a character on that object ignores those bodies, whichever was made first. `character_ignore(controller, ragdoll)` pairs a character with a ragdoll made some other way. Unpaired, the capsule was pushed out of its own figure's bodies: the box man on its Walk, its bodies following the clip, was carried 6 m backwards in 2 s against its input (#851). `tests/test_character_bodies.ae` walks it 2 s: 1.58 m ahead, the capsule made before or after the ragdoll.
+
 ## The scenes
 
 **`examples/physics.ae`** runs four of the reference's own scenes rather
