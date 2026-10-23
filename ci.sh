@@ -144,7 +144,7 @@ GPU_SUITES="test_gpu_fxaa test_agent test_agent_attached test_agent_components t
     test_render test_render_scale test_scene_hold test_shading_isolation
     test_shading_knobs test_shadow_batches test_shadow_cascades test_sky_light
     test_shadows test_skinned_render test_ssr test_taa test_texture_swap
-    test_trace test_velocity test_vk_mesh test_weather"
+    test_trace test_velocity test_vk_fence_wait test_vk_mesh test_weather"
 suite_sources() {   # the suites this tier, and this shard of it, builds and runs
     turn=0
     for suite in tests/test_*.ae; do
