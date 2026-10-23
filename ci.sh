@@ -1192,7 +1192,12 @@ else
                 # stops answering fails this step with its log, rather than
                 # holding the runner until the job's limit cancels it and
                 # takes every result after it along.
-                if timeout 900 ./build/drive_editor --backend "$driver_backend" \
+                # Line-buffered where coreutils' stdbuf is: the driver's
+                # output to a file is block-buffered, so a drive the timeout
+                # killed left no line saying how far it got.
+                line_buffered=""
+                command -v stdbuf >/dev/null 2>&1 && line_buffered="stdbuf -oL -eL"
+                if timeout 900 $line_buffered ./build/drive_editor --backend "$driver_backend" \
                         --port 8797 >"$driver_log" 2>&1; then
                     pass "ae3d_editor (driver, $driver_backend)"
                     grep '^slowest' "$driver_log" | sed 's/^/        /'
@@ -1213,6 +1218,12 @@ else
                     # the line they skipped.
                     grep -E 'never answered|could not find|no editor at|driver:' "$driver_log" \
                         | sed 's/^/        /' | head -6
+                    # And the last checks it reached, which say where a drive
+                    # that never finished stopped (the editor's ALSA and
+                    # toolkit chatter left out).
+                    echo "        --- the drive's last lines ---"
+                    grep -vE '^ALSA lib|Gtk-WARNING|libEGL warning' "$driver_log" \
+                        | tail -8 | sed 's/^/        /'
                     tail -3 "$driver_log" | sed 's/^/        /'
                     # On a runner the whole log is the only way to read what
                     # led up to a failure -- which checks passed before the
