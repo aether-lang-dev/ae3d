@@ -65,7 +65,7 @@ import std.io
 exports (
     STAGE_MEASURE, STAGE_DRAW, STAGE_READ, FRAMES, STAGES, mark_sorted, mark_rays_built,
     start, shutdown, ready, resize, frame_begin, frame_end, flush_uploads,
-    add_hooks, frame_wait, frame_bgr, frame_commands, frame_slot, frame_image, frame_view, frame_format,
+    add_hooks, frame_wait, set_fence_wait_ms, hold_fence, frame_bgr, frame_commands, frame_slot, frame_image, frame_view, frame_format,
     frame_offscreen, frame_copyable, frame_width, frame_height, render_width, render_height, recording, pass_open,
     offscreen_width, offscreen_height, draw, draw_range, set_additive, draw_indirect, draw_cut, draw_pulled, draw_sky, cloud_pass, sky_capture_pass, set_screen_quad, set_blend, set_normal_map, set_pose_bank, set_damage_mask,
     set_face_culling, set_shadows, shadows, shadow_begin, shadow_draw, shadow_end, shadow_viewport, shadow_done,
@@ -147,6 +147,13 @@ var g_timestamps: ptr = null
 var g_timestamp_ms = 0.0
 var g_timestamps_usable = false
 var g_stamped: ptr = null          // bool[FRAMES] as int
+// How many times each slot's frame was begun (its fence reset) and handed to
+// the queue with that fence: a wait that never ends says in these which of the
+// two it was, a fence reset and then never submitted or one submitted and
+// never signalled.
+var g_begun: ptr = null            // int[FRAMES]
+var g_sent: ptr = null             // int[FRAMES]
+var g_fence_stuck = false          // a fence wait ran out: no more are tried
 var g_stamp_next = 0
 var g_pass_ms: ptr = null          // float[STAGES]
 var g_ticks: ptr = null            // long[STAMPS]
@@ -400,6 +407,8 @@ scratch() {
     g_render_finished = calloc(PRESENT_IMAGES, 8)
     g_in_flight = calloc(FRAMES, 8)
     g_stamped = calloc(FRAMES, 4)
+    g_begun = calloc(FRAMES, 4)
+    g_sent = calloc(FRAMES, 4)
     g_pass_ms = calloc(STAGES, 8)
     g_ticks = calloc(STAMPS, 8)
     g_scene_clear = calloc(4, 4)
@@ -469,10 +478,46 @@ run_hooks(which: int) {
 // Whether the backend is up, and a frame slot's last submission waited
 // for: what a module that reads a frame back waits on before it reads.
 ready() -> bool { return g_ready }
-frame_wait(slot: int) {
+frame_wait(slot: int) -> bool {
+    if !g_ready || slot < 0 || slot >= FRAMES { return true }
+    return wait_fence(slot, "a read of the frame")
+}
+
+// The longest a frame's fence is waited on. A frame is milliseconds on a GPU
+// and seconds under a software rasteriser; a fence still unsignalled after
+// this is not coming, and a process that waits for it forever is a hung
+// editor, a hung test and a runner held to its limit with nothing in the log.
+const FENCE_WAIT_NS = 30000000000
+var g_fence_wait_ns = FENCE_WAIT_NS
+
+// For a test: the wait shortened (0 puts it back), and a slot's fence made
+// unsignalled with nothing submitted to signal it, which is what a frame
+// whose work never finishes looks like from here.
+set_fence_wait_ms(ms: int) {
+    g_fence_wait_ns = FENCE_WAIT_NS
+    if ms > 0 { g_fence_wait_ns = ms * 1000000 }
+}
+hold_fence(slot: int) {
     if !g_ready || slot < 0 || slot >= FRAMES { return }
-    fences = g_in_flight + slot * 8
-    vk.vkWaitForFences(vkdevice.device(), 1, fences, 1, 0 - 1)
+    vk.vkResetFences(vkdevice.device(), 1, g_in_flight + slot * 8)
+}
+
+// A slot's fence, waited on for at most FENCE_WAIT_NS. False when it did not
+// signal, after saying which frame, which fence and what that fence had been
+// through; once one has not, the rest are not waited for (each would cost the
+// same wait again) and the device error says so.
+wait_fence(slot: int, who: string) -> bool {
+    if g_fence_stuck { return false }
+    d = vkdevice.device()
+    res = vk.vkWaitForFences(d, 1, g_in_flight + slot * 8, 1, g_fence_wait_ns)
+    if res == vk.SUCCESS { return true }
+    g_fence_stuck = true
+    s0 = vk.vkGetFenceStatus(d, (g_in_flight as ptr[])[0])
+    s1 = vk.vkGetFenceStatus(d, (g_in_flight as ptr[])[1])
+    msg = "frame ${slot}'s fence (${who}) did not signal in ${g_fence_wait_ns / 1000000} ms (VkResult ${res}): on frame ${g_frame}, recording ${vkhost.recording()}, fence statuses ${s0}/${s1} (0 signalled, 1 not), begun ${(g_begun as int[])[0]}/${(g_begun as int[])[1]}, submitted ${(g_sent as int[])[0]}/${(g_sent as int[])[1]}"
+    println("ae3d: vkframe: ${msg}")
+    vkdevice.fail(msg)
+    return false
 }
 // Whether the frame's image holds blue before red (a BGRA swapchain).
 frame_bgr() -> bool {
@@ -715,6 +760,7 @@ start(width: int, height: int) -> bool {
         return false
     }
     g_frame = 0
+    g_fence_stuck = false
     publish_slot()
     g_image_index = 0
     vkhost.set_recording(false)
@@ -1139,7 +1185,7 @@ frame_begin(r: float, g: float, b: float, a: float) -> bool {
         if !rebuild(g_pending_width, g_pending_height) { return false }
     }
     fence = g_in_flight + g_frame * 8
-    vk.vkWaitForFences(d, 1, fence, 1, 0 - 1)
+    if !wait_fence(g_frame, "begin of the frame") { return false }
     collect_stamps()
     run_hooks(1)
     if vktargets.offscreen() {
@@ -1158,6 +1204,7 @@ frame_begin(r: float, g: float, b: float, a: float) -> bool {
         if !present_semaphore(g_image_index) { return false }
     }
     vk.vkResetFences(d, 1, fence)
+    (g_begun as int[])[g_frame] = (g_begun as int[])[g_frame] + 1
     commands = commands_now()
     publish_slot()
     vk.vkResetCommandBuffer(commands, 0)
@@ -2756,6 +2803,7 @@ frame_end() -> bool {
     submit.commandBufferCount = 1
     submit.pCommandBuffers = g_commands + g_frame * 8
     res = vk.vkQueueSubmit(vkdevice.graphics_queue(), 1, submit as ptr, (g_in_flight as ptr[])[g_frame])
+    (g_sent as int[])[g_frame] = (g_sent as int[])[g_frame] + 1
     free(wait_stage)
     free(submit as ptr)
     if res != vk.SUCCESS {

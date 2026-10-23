@@ -144,7 +144,7 @@ GPU_SUITES="test_gpu_fxaa test_agent test_agent_attached test_agent_components t
     test_render test_render_scale test_scene_hold test_shading_isolation
     test_shading_knobs test_shadow_batches test_shadow_cascades test_sky_light
     test_shadows test_skinned_render test_ssr test_taa test_texture_swap
-    test_trace test_velocity test_vk_mesh test_weather"
+    test_trace test_velocity test_vk_fence_wait test_vk_mesh test_weather"
 suite_sources() {   # the suites this tier, and this shard of it, builds and runs
     turn=0
     for suite in tests/test_*.ae; do
@@ -1192,8 +1192,35 @@ else
                 # stops answering fails this step with its log, rather than
                 # holding the runner until the job's limit cancels it and
                 # takes every result after it along.
-                if timeout 900 ./build/drive_editor --backend "$driver_backend" \
-                        --port 8797 >"$driver_log" 2>&1; then
+                # Line-buffered where coreutils' stdbuf is: the driver's
+                # output to a file is block-buffered, so a drive the timeout
+                # killed left no line saying how far it got.
+                line_buffered=""
+                command -v stdbuf >/dev/null 2>&1 && line_buffered="stdbuf -oL -eL"
+                timeout 900 $line_buffered ./build/drive_editor --backend "$driver_backend" \
+                        --port 8797 >"$driver_log" 2>&1
+                driver_status=$?
+                # A drive the backstop stopped leaves its editor running, cut
+                # off from the driver that would have stopped it: where its
+                # threads are is the reason it stopped answering. Read with
+                # gdb where there is one (Linux; macOS's driver samples the
+                # editor itself), then stopped.
+                if [ "$driver_status" -eq 124 ]; then
+                    for editor_pid in $(pgrep -x ae3d_editor 2>/dev/null); do
+                        if command -v gdb >/dev/null 2>&1; then
+                            # Attaching to a process that is not gdb's child
+                            # takes privilege under Yama (a runner's default):
+                            # sudo where it asks for no password.
+                            as_root=""
+                            sudo -n true 2>/dev/null && as_root="sudo -n"
+                            echo "        --- the editor's threads, after the drive's timeout (gdb) ---"
+                            $as_root gdb -batch -nx -p "$editor_pid" -ex "thread apply all bt 30" 2>&1 \
+                                | grep -E '^Thread|^#' | head -150 | sed 's/^/        /'
+                        fi
+                        kill "$editor_pid" 2>/dev/null
+                    done
+                fi
+                if [ "$driver_status" -eq 0 ]; then
                     pass "ae3d_editor (driver, $driver_backend)"
                     grep '^slowest' "$driver_log" | sed 's/^/        /'
                 else
@@ -1213,6 +1240,12 @@ else
                     # the line they skipped.
                     grep -E 'never answered|could not find|no editor at|driver:' "$driver_log" \
                         | sed 's/^/        /' | head -6
+                    # And the last checks it reached, which say where a drive
+                    # that never finished stopped (the editor's ALSA and
+                    # toolkit chatter left out).
+                    echo "        --- the drive's last lines ---"
+                    grep -vE '^ALSA lib|Gtk-WARNING|libEGL warning' "$driver_log" \
+                        | tail -8 | sed 's/^/        /'
                     tail -3 "$driver_log" | sed 's/^/        /'
                     # On a runner the whole log is the only way to read what
                     # led up to a failure -- which checks passed before the
