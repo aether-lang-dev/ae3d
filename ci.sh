@@ -1197,8 +1197,30 @@ else
                 # killed left no line saying how far it got.
                 line_buffered=""
                 command -v stdbuf >/dev/null 2>&1 && line_buffered="stdbuf -oL -eL"
-                if timeout 900 $line_buffered ./build/drive_editor --backend "$driver_backend" \
-                        --port 8797 >"$driver_log" 2>&1; then
+                timeout 900 $line_buffered ./build/drive_editor --backend "$driver_backend" \
+                        --port 8797 >"$driver_log" 2>&1
+                driver_status=$?
+                # A drive the backstop stopped leaves its editor running, cut
+                # off from the driver that would have stopped it: where its
+                # threads are is the reason it stopped answering. Read with
+                # gdb where there is one (Linux; macOS's driver samples the
+                # editor itself), then stopped.
+                if [ "$driver_status" -eq 124 ]; then
+                    for editor_pid in $(pgrep -x ae3d_editor 2>/dev/null); do
+                        if command -v gdb >/dev/null 2>&1; then
+                            # Attaching to a process that is not gdb's child
+                            # takes privilege under Yama (a runner's default):
+                            # sudo where it asks for no password.
+                            as_root=""
+                            sudo -n true 2>/dev/null && as_root="sudo -n"
+                            echo "        --- the editor's threads, after the drive's timeout (gdb) ---"
+                            $as_root gdb -batch -nx -p "$editor_pid" -ex "thread apply all bt 30" 2>&1 \
+                                | grep -E '^Thread|^#' | head -150 | sed 's/^/        /'
+                        fi
+                        kill "$editor_pid" 2>/dev/null
+                    done
+                fi
+                if [ "$driver_status" -eq 0 ]; then
                     pass "ae3d_editor (driver, $driver_backend)"
                     grep '^slowest' "$driver_log" | sed 's/^/        /'
                 else
