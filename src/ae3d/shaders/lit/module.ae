@@ -60,13 +60,13 @@ import ae3d.shaderlib (vec2, vec3, vec4, mat2, mat4, Texture, Floats, Vec4s, rgb
                        abs_v3, step, mod, mod_v2, ceil, exp2, log, inversesqrt, mul_cols3, mat4_rows, mul_transpose_m2,
                        vec4s_at_i, floats_at_i, clamp_int, min_int, lane_at, lane_at_v3, vec3_xv, texel_fetch_at,
                        yzx, zy, zyx, xzy, xy_v3, vec3_of_v2, yx, AccelerationStructure, ray_query, ray_query_initialize,
-                       ray_query_proceed, ray_query_committed_hit, ray_flag_opaque, ray_flag_terminate_on_first_hit)
+                       ray_query_proceed, ray_query_committed_hit, ray_flag_opaque, ray_flag_terminate_on_first_hit, instance_index)
 
 exports (
     Draw, DrawMaterial, Surface, Cut, Wounds, Damage, Skin, LitVertex, LitPlainVertex, LitVaryings, LitOut,
-    LitDepthVertex, LitDepthPlainVertex, LitDepthVaryings,
+    LitDepthVertex, LitDepthPlainVertex, LitDepthVaryings, PickVertex, PickPlainVertex, PickVaryings,
     draw_layout, draw_count, draw_uniform, draw_capture, draw_field, draw_type, place, gl_name,
-    lit_vertex, lit_plain_vertex, lit_pixel, lit_rq_pixel, lit_depth_vertex, lit_depth_plain_vertex, lit_depth_pixel, cloud_hash
+    lit_vertex, lit_plain_vertex, lit_pixel, lit_rq_pixel, lit_depth_vertex, lit_depth_plain_vertex, lit_depth_pixel, pick_vertex, pick_plain_vertex, pick_pixel, cloud_hash
 )
 
 // ── The draw's block ───────────────────────────────────────────────────
@@ -89,6 +89,8 @@ struct Draw {
     lift: float
     skinned: int
     impostor: int
+    // What the pick pass writes for this draw: its model's id (0: none).
+    pick: int
 }
 
 // Its material (ae3d.core's Material, as the renderer writes it).
@@ -198,7 +200,7 @@ struct Skin {
 
 const DRAW_UNIFORMS[] = ["model", "prevModel", "lightSpaceMatrix", "isInstanced", "useInstanceColor", "instancePoints",
                          "instanceBillboard", "pointFlipbookColumns", "pointFlipbookRows", "pointLift", "isSkinned",
-                         "impostor",
+                         "impostor", "pickId",
                          "diffuseColor", "specularColor", "metallic", "roughness", "exposure", "materialAlpha",
                          "materialCutout", "materialNormalStrength", "materialTileBreakup", "materialTileRotation",
                          "materialVariation", "materialVariationScale", "materialDetailScale", "materialDetailStrength",
@@ -219,7 +221,7 @@ const DRAW_UNIFORMS[] = ["model", "prevModel", "lightSpaceMatrix", "isInstanced"
                          "bones", "prevBoneRows"]
 const DRAW_CAPTURES[] = ["draw", "draw", "draw", "draw", "draw", "draw",
                          "draw", "draw", "draw", "draw", "draw",
-                         "draw",
+                         "draw", "draw",
                          "material", "material", "material", "material", "material", "material",
                          "material", "material", "material", "material",
                          "material", "material", "material", "material",
@@ -240,7 +242,7 @@ const DRAW_CAPTURES[] = ["draw", "draw", "draw", "draw", "draw", "draw",
                          "skin", "skin"]
 const DRAW_FIELDS[] = ["model", "prev_model", "light_space", "instanced", "instance_colour", "points",
                        "billboard", "flip_columns", "flip_rows", "lift", "skinned",
-                       "impostor",
+                       "impostor", "pick",
                        "diffuse", "specular", "metallic", "roughness", "exposure", "alpha",
                        "cutout", "normal_strength", "tile_breakup", "tile_rotation",
                        "variation", "variation_scale", "detail_scale", "detail_strength",
@@ -261,7 +263,7 @@ const DRAW_FIELDS[] = ["model", "prev_model", "light_space", "instanced", "insta
                        "bones", "prev_rows"]
 const DRAW_TYPES[] = ["mat4", "mat4", "mat4", "int", "int", "int",
                       "int", "int", "int", "float", "int",
-                      "int",
+                      "int", "int",
                       "vec3", "vec3", "float", "float", "float", "float",
                       "float", "float", "float", "float",
                       "float", "float", "float", "float",
@@ -280,7 +282,7 @@ const DRAW_TYPES[] = ["mat4", "mat4", "mat4", "int", "int", "int",
                       "int", "vec4[96]", "vec4[4]", "float",
                       "int", "vec4[4]", "vec4", "float",
                       "mat4[96]", "vec4[288]"]
-const DRAW_COUNT = 86
+const DRAW_COUNT = 87
 
 draw_count() -> int { return DRAW_COUNT }
 draw_type(k: int) -> string { return DRAW_TYPES[k] }
@@ -327,6 +329,7 @@ fn draw_offset(k: int) -> int {
         if f == "flip_rows" { return offsetof(Draw, flip_rows) }
         if f == "lift" { return offsetof(Draw, lift) }
         if f == "skinned" { return offsetof(Draw, skinned) }
+        if f == "pick" { return offsetof(Draw, pick) }
         return offsetof(Draw, impostor)
     }
     if c == "material" { return material_offset(f) }
@@ -2967,6 +2970,152 @@ lit_depth_pixel(cut: Cut, wounds: Wounds) -> *GpuShader {
         return 0.0
     }
     place(s)
+    gpu.hand_on(s, "wound_depth", "p")
+    gpu.hand_on(s, "clipped_away", "bind_pos")
+    return s
+}
+
+// ── The pick pass's shaders (#865) ───────────────────────────────────────
+//
+// What is at a pixel, asked of the GPU: the scene's surfaces drawn again
+// from the camera into a target that holds, in place of colour, which model
+// each pixel is, which of its instances, and how deep. A model is placed and
+// posed as the lit pass places and poses it (the draw's block is the same),
+// and a pixel the lit pass would not draw -- a cut model's far side, a
+// wound's core, a cutout's hole -- is not written either, so a skinned,
+// instanced or alpha-tested surface answers for what is seen and not for its
+// bind-pose bounds, which is all a ray on the CPU has.
+//
+// The target's four channels: the model's id (Draw.pick), the instance's
+// index (0 for a model that is not instanced), the depth the rasteriser
+// gives the pixel (0..1, as the scene's own) and 1 for covered: a pixel
+// nothing wrote is all zeros. Floats hold whole numbers exactly to 2^24.
+
+struct PickVertex {
+    position: vec3
+    uv: vec2
+    normal: vec3
+    instance_model: mat4
+    joints: vec4
+    weights: vec4
+}
+
+struct PickPlainVertex {
+    position: vec3
+    uv: vec2
+    normal: vec3
+    instance_model: mat4
+}
+
+// What the pick pixel shader reads: the surface's place and uv for its
+// cutout, the bind position its cut is made in, and the instance.
+struct PickVaryings {
+    position: vec4
+    fragTexCoord: vec2
+    Normal: vec3
+    FragPos: vec3
+    BindPos: vec3
+    ClipLimb: float
+    Instance: float
+}
+
+pick_vertex(draw: Draw, cut: Cut, skin: Skin, eye: Eye) -> *GpuShader {
+    s = vertex("pick_vertex") quote | v: PickVertex | {
+        clip_limb = clip_limb_of(v.joints, v.weights, draw.skinned, cut.joints0, cut.joints1, cut.joints2)
+        model_matrix = if (draw.instanced != 0) { mul_m4(draw.model, v.instance_model) } else { draw.model }
+        posed0 = vec4(v.position, 1.0)
+        posed = posed0
+        posed_normal = v.normal
+        if draw.skinned != 0 {
+            skin_now = add_m4(add_m4(add_m4(mul_fm4(v.weights.x, skin.bones[int_of(v.joints.x)]),
+                                            mul_fm4(v.weights.y, skin.bones[int_of(v.joints.y)])),
+                                     mul_fm4(v.weights.z, skin.bones[int_of(v.joints.z)])),
+                              mul_fm4(v.weights.w, skin.bones[int_of(v.joints.w)]))
+            posed = mul(skin_now, posed0)
+            posed_normal = mul_m3(skin_now, v.normal)
+        }
+        frag_pos = xyz(mul(model_matrix, posed))
+        normal_out = normalize(mul_m3(model_matrix, posed_normal))
+        clip_now = mul(mul_m4(eye.view_projection, model_matrix), posed)
+        return PickVaryings { position: clip_now, fragTexCoord: v.uv, Normal: normal_out, FragPos: frag_pos,
+                              BindPos: v.position, ClipLimb: clip_limb, Instance: float_of(instance_index()) }
+    }
+    place(s)
+    vertex_hand_on(s)
+    return s
+}
+
+// The plain pipelines' (no skin stream): its joints and weights none.
+pick_plain_vertex(draw: Draw, cut: Cut, skin: Skin, eye: Eye) -> *GpuShader {
+    s = vertex("pick_plain_vertex") quote | v: PickPlainVertex | {
+        clip_limb = clip_limb_of(splat4(0.0), splat4(0.0), draw.skinned, cut.joints0, cut.joints1, cut.joints2)
+        model_matrix = if (draw.instanced != 0) { mul_m4(draw.model, v.instance_model) } else { draw.model }
+        posed0 = vec4(v.position, 1.0)
+        posed = posed0
+        posed_normal = v.normal
+        if draw.skinned != 0 {
+            weights = splat4(0.0)
+            joints = splat4(0.0)
+            skin_now = add_m4(add_m4(add_m4(mul_fm4(weights.x, skin.bones[int_of(joints.x)]),
+                                            mul_fm4(weights.y, skin.bones[int_of(joints.y)])),
+                                     mul_fm4(weights.z, skin.bones[int_of(joints.z)])),
+                              mul_fm4(weights.w, skin.bones[int_of(joints.w)]))
+            posed = mul(skin_now, posed0)
+            posed_normal = mul_m3(skin_now, v.normal)
+        }
+        frag_pos = xyz(mul(model_matrix, posed))
+        normal_out = normalize(mul_m3(model_matrix, posed_normal))
+        clip_now = mul(mul_m4(eye.view_projection, model_matrix), posed)
+        return PickVaryings { position: clip_now, fragTexCoord: v.uv, Normal: normal_out, FragPos: frag_pos,
+                              BindPos: v.position, ClipLimb: clip_limb, Instance: float_of(instance_index()) }
+    }
+    place(s)
+    vertex_hand_on(s)
+    return s
+}
+
+// The pick pixel: lit_pixel's discards (the cut, the wounds, the texture's
+// cutout) and nothing of its shading, then the id. A blended surface counts
+// where it is at least half opaque.
+pick_pixel(draw: Draw, material: DrawMaterial, cut: Cut, wounds: Wounds, eye: Eye, colour_map: Texture) -> *GpuShader {
+    s = gpu.fragment("pick") quote | f: PickVaryings | {
+        if clipped_away(f.BindPos, cut.on, f.ClipLimb, cut.detached, cut.plane, cut.noise, cut.noise_scale) {
+            discard()
+        }
+        wound_at = if (wounds.count > 0) { wound_depth(f.BindPos, wounds.count, wounds.data) } else { 2.0 }
+        if wound_at < wounds.core {
+            discard()
+        }
+        tri = Tri { weights: vec3(0.0, 1.0, 0.0), x: splat2(0.0), y: splat2(0.0), z: splat2(0.0) }
+        hx = Hex { uv0: splat2(0.0), uv1: splat2(0.0), uv2: splat2(0.0), turn0: mat2_of(1.0, 0.0, 0.0, 1.0),
+                   turn1: mat2_of(1.0, 0.0, 0.0, 1.0), turn2: mat2_of(1.0, 0.0, 0.0, 1.0), dx: splat2(0.0),
+                   dy: splat2(0.0), weights: vec3(1.0, 0.0, 0.0) }
+        tex_colour = splat4(0.0)
+        if material.triplanar > 0.0 {
+            tri = tri_setup(normalize(f.Normal), f.FragPos, material.triplanar)
+            tex_colour = tri_texture(colour_map, tri)
+        } else if material.tile_breakup > 0.0 {
+            hx = hex_setup(f.fragTexCoord, material.tile_rotation)
+            tex_colour = hex_texture(colour_map, hx).colour
+        } else {
+            tex_colour = texture(colour_map, f.fragTexCoord)
+        }
+        if tex_colour.w < material.cutout {
+            discard()
+        }
+        if material.blend != 0 && tex_colour.w * material.alpha < 0.5 {
+            discard()
+        }
+        ndc = mul(eye.view_projection, vec4(f.FragPos, 1.0))
+        return vec4(vec3(float_of(draw.pick), f.Instance, clip_depth(ndc.z / ndc.w)), 1.0)
+    }
+    place(s)
+    gpu.hand_on(s, "tri_setup", "position")
+    gpu.hand_on(s, "tri_setup", "metres")
+    gpu.hand_on(s, "hex_setup", "uv")
+    gpu.hand_on(s, "hex_setup", "rotation")
+    gpu.hand_on(s, "tri_texture", "tex")
+    gpu.hand_on(s, "hex_texture", "tex")
     gpu.hand_on(s, "wound_depth", "p")
     gpu.hand_on(s, "clipped_away", "bind_pos")
     return s

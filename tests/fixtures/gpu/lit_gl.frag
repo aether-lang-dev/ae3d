@@ -87,6 +87,7 @@ struct Draw {
     float lift;
     int skinned;
     int impostor;
+    int pick;
 };
 struct WorldState {
     WorldLight lights[16];
