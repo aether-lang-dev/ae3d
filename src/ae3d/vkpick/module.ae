@@ -1,0 +1,410 @@
+// ae3d.vkpick -- what is at a pixel, on the Vulkan backend (#865), on
+// contrib.vulkan.vk: the pick pass's targets, its pipelines and the read of
+// the one pixel asked about.
+//
+// The pass is the scene's surfaces drawn again from the camera
+// (ae3d.shaders.lit's pick_vertex and pick_pixel) into an RGBA32F target,
+// each pixel the id of the model drawn there, its instance, the depth and
+// 1; a pixel nothing wrote is zero. It runs only in a frame something asked
+// about (`ask`), before the scene pass, in the same command buffer, so a
+// frame that asks nothing is the frame it was: no target, no pipeline and no
+// draw exists until the first ask. The pixel is copied into a buffer of the
+// frame slot's as the pass ends, and read once that slot's fence has passed
+// (the renderer waits, as a capture does).
+//
+// The pass draws at the scene's own size, one sample: the id of a pixel is
+// not an average of its samples'.
+
+import contrib.vulkan.vk
+import ae3d.vkhost
+import ae3d.vkdevice
+import ae3d.vkpipes
+import ae3d.vkspirv
+import ae3d.vktargets
+
+exports (
+    SLOTS, MOST, ask, asked, forget, ready, prepare, begin, finish, pass, pipeline, answer_slot, read, destroy
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memset(p: ptr, value: int, n: long) -> ptr
+
+// At least ae3d.vkframe's FRAMES, as ae3d.vkreadback's buffers are.
+const SLOTS = 4
+// What a pixel of the target holds: four floats.
+const PIXEL_BYTES = 16
+// The pixels one frame answers for.
+const MOST = 16
+
+struct Pick {
+    color: vkhost.VKImage
+    depth: vkhost.VKImage
+    pass: ptr
+    framebuffer: ptr
+    width: int
+    height: int
+    // The pipelines: plain, then skinned, each unculled then culled.
+    pipes: ptr
+    buffers: ptr                     // *HostBuffer[SLOTS]
+    asked: int                       // the pixels asked about this frame
+    xs: ptr                          // int[MOST], the frame's pixels until the pass maps them to the target's
+    ys: ptr
+    answered: int                    // how many the last frame answered
+    slot: int                        // the slot holding the last answers, or -1
+}
+
+var g_pick: ptr = null
+
+held() -> *Pick {
+    if g_pick == null {
+        p = calloc(1, sizeof(Pick)) as *Pick
+        p.pipes = calloc(4, 8)
+        p.buffers = calloc(SLOTS, 8)
+        p.slot = 0 - 1
+        p.xs = calloc(MOST, 4)
+        p.ys = calloc(MOST, 4)
+        g_pick = p as ptr
+    }
+    return g_pick as *Pick
+}
+
+// Ask that the next frame answer for pixel (x, y) of the frame:
+// the index its answer is read by, or -1 when the frame is asked about as
+// many as it will answer. The first ask after a frame answered starts a new
+// batch.
+ask(x: int, y: int) -> int {
+    p = held()
+    if p.asked == 0 {
+        p.answered = 0
+        p.slot = 0 - 1
+    }
+    if p.asked >= MOST { return 0 - 1 }
+    (p.xs as int[])[p.asked] = x
+    (p.ys as int[])[p.asked] = y
+    p.asked = p.asked + 1
+    return p.asked - 1
+}
+
+// Whether a frame is to answer. Taken by `begin`.
+asked() -> bool { return g_pick != null && held().asked > 0 }
+
+// What was asked of a frame that was not drawn.
+forget() {
+    if g_pick == null { return }
+    held().asked = 0
+}
+
+pass() -> ptr { return held().pass }
+
+// The pipeline a pick draw takes: by the mesh (skinned or not) and whether
+// back faces are culled. Null before `prepare`, or where it would not build.
+pipeline(skinned: bool, cull: int) -> ptr {
+    p = held()
+    at = cull
+    if skinned { at = 2 + cull }
+    return (p.pipes as ptr[])[at]
+}
+
+ready() -> bool {
+    p = held()
+    return p.pass != null && (p.pipes as ptr[])[0] != null && (p.pipes as ptr[])[1] != null &&
+           (p.pipes as ptr[])[2] != null && (p.pipes as ptr[])[3] != null
+}
+
+fn attachment(at: ptr, format: int, load: int, store: int, final_layout: int) {
+    a = at as *VkAttachmentDescription
+    a.format = format
+    a.samples = vk.SAMPLE_COUNT_1_BIT
+    a.loadOp = load
+    a.storeOp = store
+    a.stencilLoadOp = vk.ATTACHMENT_LOAD_OP_DONT_CARE
+    a.stencilStoreOp = vk.ATTACHMENT_STORE_OP_DONT_CARE
+    a.initialLayout = vk.IMAGE_LAYOUT_UNDEFINED
+    a.finalLayout = final_layout
+}
+
+fn dependency(at: ptr, src: uint32, dst: uint32, src_stage: int, dst_stage: int, src_access: int, dst_access: int) {
+    d = at as *VkSubpassDependency
+    d.srcSubpass = src
+    d.dstSubpass = dst
+    d.srcStageMask = src_stage
+    d.dstStageMask = dst_stage
+    d.srcAccessMask = src_access
+    d.dstAccessMask = dst_access
+}
+
+// The render pass: the colour cleared to nothing and left to be copied from,
+// the depth cleared and let go. What the last pick's copy read is done with
+// before this one's writes; what this one writes is the copy's.
+fn make_pass() -> ptr {
+    a = calloc(2, sizeof(VkAttachmentDescription))
+    attachment(a, vk.FORMAT_R32G32B32A32_SFLOAT, vk.ATTACHMENT_LOAD_OP_CLEAR, vk.ATTACHMENT_STORE_OP_STORE,
+               vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+    attachment(a + sizeof(VkAttachmentDescription), vktargets.depth_format(), vk.ATTACHMENT_LOAD_OP_CLEAR,
+               vk.ATTACHMENT_STORE_OP_DONT_CARE, vk.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+    colour_ref = calloc(1, sizeof(VkAttachmentReference)) as *VkAttachmentReference
+    colour_ref.attachment = 0
+    colour_ref.layout = vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+    depth_ref = calloc(1, sizeof(VkAttachmentReference)) as *VkAttachmentReference
+    depth_ref.attachment = 1
+    depth_ref.layout = vk.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+    subpass = calloc(1, sizeof(VkSubpassDescription)) as *VkSubpassDescription
+    subpass.pipelineBindPoint = vk.PIPELINE_BIND_POINT_GRAPHICS
+    subpass.colorAttachmentCount = 1
+    subpass.pColorAttachments = colour_ref as ptr
+    subpass.pDepthStencilAttachment = depth_ref as ptr
+    deps = calloc(2, sizeof(VkSubpassDependency))
+    writes = vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | vk.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+             vk.PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+    dependency(deps, vk.SUBPASS_EXTERNAL, 0, vk.PIPELINE_STAGE_TRANSFER_BIT, writes, vk.ACCESS_TRANSFER_READ_BIT,
+               vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT | vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+    dependency(deps + sizeof(VkSubpassDependency), 0, vk.SUBPASS_EXTERNAL, vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+               vk.PIPELINE_STAGE_TRANSFER_BIT, vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, vk.ACCESS_TRANSFER_READ_BIT)
+    info = calloc(1, sizeof(VkRenderPassCreateInfo)) as *VkRenderPassCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+    info.attachmentCount = 2
+    info.pAttachments = a
+    info.subpassCount = 1
+    info.pSubpasses = subpass as ptr
+    info.dependencyCount = 2
+    info.pDependencies = deps
+    cell = calloc(1, 8)
+    r = vk.vkCreateRenderPass(vkhost.device(), info as ptr, null, cell)
+    made = (cell as ptr[])[0]
+    free(cell)
+    free(info as ptr)
+    free(deps)
+    free(subpass as ptr)
+    free(depth_ref as ptr)
+    free(colour_ref as ptr)
+    free(a)
+    if r != vk.SUCCESS { return null }
+    return made
+}
+
+fn make_framebuffer(p: *Pick) -> ptr {
+    views = calloc(2, 8)
+    (views as ptr[])[0] = p.color.view
+    (views as ptr[])[1] = p.depth.view
+    info = calloc(1, sizeof(VkFramebufferCreateInfo)) as *VkFramebufferCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+    info.renderPass = p.pass
+    info.attachmentCount = 2
+    info.pAttachments = views
+    info.width = p.width
+    info.height = p.height
+    info.layers = 1
+    cell = calloc(1, 8)
+    r = vk.vkCreateFramebuffer(vkhost.device(), info as ptr, null, cell)
+    made = (cell as ptr[])[0]
+    free(cell)
+    free(info as ptr)
+    free(views)
+    if r != vk.SUCCESS { return null }
+    return made
+}
+
+// One pipeline over the pick pass: the pick shaders, never blended, the
+// depth tested and written.
+fn pipe(vert: int, skinned: bool, cull: bool) -> ptr {
+    v = vkpipes.shader(vert)
+    f = vkpipes.shader(vkspirv.PICK_QUOTED_FRAG)
+    if v == null || f == null {
+        if v != null { vk.vkDestroyShaderModule(vkhost.device(), v, null) }
+        if f != null { vk.vkDestroyShaderModule(vkhost.device(), f, null) }
+        return null
+    }
+    made = vkpipes.build_on(v, f, 0, true, true, held().pass, cull, skinned, false, vkpipes.layout(), false)
+    vk.vkDestroyShaderModule(vkhost.device(), v, null)
+    vk.vkDestroyShaderModule(vkhost.device(), f, null)
+    return made
+}
+
+// The target at `w` by `h`, the pass over it and its four pipelines, made
+// the first time a pick is asked and again when the scene's size moves.
+// False, with the reason in the backend's last error, when they would not
+// make.
+prepare(w: int, h: int) -> bool {
+    p = held()
+    if p.pass != null && p.width == w && p.height == h && ready() { return true }
+    destroy()
+    p.width = w
+    p.height = h
+    p.color = vkhost.image(w, h, 1, vk.FORMAT_R32G32B32A32_SFLOAT, vk.SAMPLE_COUNT_1_BIT,
+                           vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_TRANSFER_SRC_BIT, vk.IMAGE_ASPECT_COLOR_BIT)
+    if p.color.image == null { return false }
+    p.depth = vkhost.image(w, h, 1, vktargets.depth_format(), vk.SAMPLE_COUNT_1_BIT,
+                           vk.IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, vk.IMAGE_ASPECT_DEPTH_BIT)
+    if p.depth.image == null { return false }
+    p.pass = make_pass()
+    if p.pass == null {
+        vkdevice.fail("pick vkCreateRenderPass failed")
+        return false
+    }
+    p.framebuffer = make_framebuffer(p)
+    if p.framebuffer == null {
+        vkdevice.fail("pick vkCreateFramebuffer failed")
+        return false
+    }
+    // A pass the pipelines are built over is not one of the scene's, so
+    // they draw a sample, not the scene's four.
+    vkpipes.single_sample(p.pass)
+    cull = 0
+    while cull < 2 {
+        (p.pipes as ptr[])[cull] = pipe(vkspirv.PICK_PLAIN_QUOTED_VERT, false, cull == 1)
+        (p.pipes as ptr[])[2 + cull] = pipe(vkspirv.PICK_QUOTED_VERT, true, cull == 1)
+        cull = cull + 1
+    }
+    if !ready() {
+        vkdevice.fail("pick vkCreateGraphicsPipelines failed")
+        return false
+    }
+    f = 0
+    while f < SLOTS {
+        if (p.buffers as ptr[])[f] == null { (p.buffers as ptr[])[f] = vkhost.host_buffer(PIXEL_BYTES * MOST) as ptr }
+        if (p.buffers as ptr[])[f] == null { return false }
+        f = f + 1
+    }
+    return true
+}
+
+// The pass begun in `commands`, and the answer's pixel taken: clears set
+// for nothing, the viewport the target's. False, the ask let go, when the
+// pass is not made.
+begin(commands: @keep ptr, w: int, h: int, frame_w: int, frame_h: int) -> bool {
+    p = held()
+    if p.asked == 0 { return false }
+    if !prepare(w, h) {
+        p.asked = 0
+        return false
+    }
+    // The scene may be drawn smaller than the frame (the render scale), and
+    // at this size now though it was another when the pixel was asked: the
+    // pixel is the one the same spot of the scene is drawn at.
+    if frame_w > 0 && frame_h > 0 {
+        k = 0
+        while k < p.asked {
+            (p.xs as int[])[k] = (p.xs as int[])[k] * w / frame_w
+            (p.ys as int[])[k] = (p.ys as int[])[k] * h / frame_h
+            k = k + 1
+        }
+    }
+    clears = calloc(2, 16)
+    memset(clears, 0, 32 as long)
+    (clears as f32[])[4] = 1.0
+    b = calloc(1, sizeof(VkRenderPassBeginInfo)) as *VkRenderPassBeginInfo
+    b.sType = vk.STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+    b.renderPass = p.pass
+    b.framebuffer = p.framebuffer
+    b.renderArea.extent.width = w
+    b.renderArea.extent.height = h
+    b.clearValueCount = 2
+    b.pClearValues = clears
+    vk.vkCmdBeginRenderPass(commands, b as ptr, vk.SUBPASS_CONTENTS_INLINE)
+    free(b as ptr)
+    free(clears)
+    v = calloc(1, sizeof(VkViewport)) as *VkViewport
+    v.width = w as f32
+    v.height = h as f32
+    v.maxDepth = 1.0
+    vk.vkCmdSetViewport(commands, 0, 1, v as ptr)
+    free(v as ptr)
+    s = calloc(1, sizeof(VkRect2D)) as *VkRect2D
+    s.extent.width = w
+    s.extent.height = h
+    vk.vkCmdSetScissor(commands, 0, 1, s as ptr)
+    free(s as ptr)
+    return true
+}
+
+// The pass ended in `commands`, and the pixels asked about copied into the
+// frame slot's buffer, one after another.
+finish(commands: @keep ptr, slot: int) {
+    p = held()
+    vk.vkCmdEndRenderPass(commands)
+    n = p.asked
+    p.asked = 0
+    if slot < 0 || slot >= SLOTS { return }
+    region = calloc(1, sizeof(VkBufferImageCopy)) as *VkBufferImageCopy
+    region.imageSubresource.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    region.imageSubresource.layerCount = 1
+    region.imageExtent.width = 1
+    region.imageExtent.height = 1
+    region.imageExtent.depth = 1
+    k = 0
+    while k < n {
+        x = (p.xs as int[])[k]
+        y = (p.ys as int[])[k]
+        if x < 0 { x = 0 }
+        if y < 0 { y = 0 }
+        if x >= p.width { x = p.width - 1 }
+        if y >= p.height { y = p.height - 1 }
+        region.bufferOffset = k * PIXEL_BYTES
+        region.imageOffset.x = x
+        region.imageOffset.y = y
+        vk.vkCmdCopyImageToBuffer(commands, p.color.image, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                  ((p.buffers as ptr[])[slot] as *HostBuffer).buffer, 1, region as ptr)
+        k = k + 1
+    }
+    free(region as ptr)
+    p.answered = n
+    p.slot = slot
+}
+
+// The slot holding the answers, or -1.
+answer_slot() -> int {
+    if g_pick == null { return 0 - 1 }
+    return held().slot
+}
+
+// The four floats of answer `k` in `slot` into `out` (f32[4]): the model's
+// id, the instance, the depth, covered. The slot's fence has passed.
+read(slot: int, k: int, out: ptr) -> bool {
+    p = held()
+    if slot < 0 || slot >= SLOTS || k < 0 || k >= p.answered { return false }
+    b = (p.buffers as ptr[])[slot] as *HostBuffer
+    if b == null { return false }
+    src = b.mapped as f32[]
+    dst = out as f32[]
+    i = 0
+    while i < 4 {
+        dst[i] = src[k * 4 + i]
+        i = i + 1
+    }
+    return true
+}
+
+// The target, the pass and the pipelines gone, the device idle.
+destroy() {
+    if g_pick == null { return }
+    p = held()
+    d = vkhost.device()
+    if d != null {
+        vk.vkDeviceWaitIdle(d)
+        i = 0
+        while i < 4 {
+            q = (p.pipes as ptr[])[i]
+            if q != null { vk.vkDestroyPipeline(d, q, null) }
+            (p.pipes as ptr[])[i] = null
+            i = i + 1
+        }
+        if p.framebuffer != null { vk.vkDestroyFramebuffer(d, p.framebuffer, null) }
+        if p.pass != null { vk.vkDestroyRenderPass(d, p.pass, null) }
+        vkhost.image_free(p.color)
+        vkhost.image_free(p.depth)
+    }
+    f = 0
+    while f < SLOTS {
+        if (p.buffers as ptr[])[f] != null { vkhost.host_buffer_free((p.buffers as ptr[])[f] as *HostBuffer) }
+        (p.buffers as ptr[])[f] = null
+        f = f + 1
+    }
+    p.slot = 0 - 1
+    p.framebuffer = null
+    p.pass = null
+    p.color = vkhost.VKImage { image: null, memory: null, view: null }
+    p.depth = vkhost.VKImage { image: null, memory: null, view: null }
+    p.width = 0
+    p.height = 0
+}

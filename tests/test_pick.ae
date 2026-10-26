@@ -1,0 +1,469 @@
+// What is at a pixel (#865), asked of the GPU.
+//
+// The frame's pixel (x, y) is answered with the model drawn there, which of
+// its instances, how deep and where, by drawing the scene's surfaces again
+// into a target of ids (ae3d.shaders.lit's pick_pixel). The cases are the
+// ones a ray against a model's bind-pose bounds gets wrong:
+//
+//   - a skinned figure, bent: the pixel on its bent top is the figure, and a
+//     ray at the bounds it was bound in goes by;
+//   - an instanced model: the pixel on its second copy answers 1;
+//   - an alpha-tested quad: the pixel on its cut-out corner is what is
+//     behind it, and with no cutout it is the quad;
+//   - the ordinary: a sphere, another, nothing, the depth and the point.
+//
+// Each has a control that must fail the other way, and the frame a pick is
+// asked of is the frame it would have been.
+
+import std.list
+import std.mem
+import ae3d.core
+import ae3d.gl
+import ae3d.vulkan
+import ae3d.offscreen
+import ae3d.loader
+import ae3d.skin
+import ae3d.raycast
+import ae3d.picture
+import ae3d.png
+import ae3d.rendering
+
+const WIDTH = 192
+const HEIGHT = 144
+const QUARTER_TURN = 1.5707963
+const SEGMENTS = 8
+const RADIUS = 0.35
+const HEIGHT_EACH = 0.5
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memcpy(to: ptr, from: ptr, bytes: int) -> ptr
+extern sqrt(x: float) -> float
+extern exit(code: int)
+
+var g_failures = 0
+
+check(name: string, condition: bool) {
+    if condition {
+        println("  ok   ${name}")
+    } else {
+        println("  FAIL ${name}")
+        g_failures = g_failures + 1
+    }
+}
+
+// --- the figure: a column weighted to a chain of bones, as test_skinned_render's
+
+build_column(bones: ptr) -> ptr {
+    mesh = core.mesh_create()
+    ring = 0
+    while ring <= SEGMENTS {
+        y = ring * HEIGHT_EACH
+        side = 0
+        while side < 4 {
+            angle = side * QUARTER_TURN
+            x = RADIUS * core.cos_of(angle)
+            z = RADIUS * core.sin_of(angle)
+            core.mesh_push_vertex(mesh, core.vec3(x, y, z), (side * 1.0) / 4.0, (ring * 1.0) / SEGMENTS,
+                                  core.v3_normalize(core.vec3(x, 0.0, z)))
+            side = side + 1
+        }
+        ring = ring + 1
+    }
+    ring = 0
+    while ring < SEGMENTS {
+        side = 0
+        while side < 4 {
+            next = (side + 1) % 4
+            a = ring * 4 + side
+            b = ring * 4 + next
+            c = (ring + 1) * 4 + next
+            d = (ring + 1) * 4 + side
+            core.mesh_push_index(mesh, a)
+            core.mesh_push_index(mesh, b)
+            core.mesh_push_index(mesh, c)
+            core.mesh_push_index(mesh, a)
+            core.mesh_push_index(mesh, c)
+            core.mesh_push_index(mesh, d)
+            side = side + 1
+        }
+        ring = ring + 1
+    }
+    count = list.size(bones)
+    ring = 0
+    while ring <= SEGMENTS {
+        along = (ring * 1.0) / SEGMENTS * ((count - 1) * 1.0)
+        lower = along as int
+        if lower > count - 2 { lower = count - 2 }
+        if lower < 0 { lower = 0 }
+        blend = along - (lower * 1.0)
+        side = 0
+        while side < 4 {
+            core.mesh_set_skin(mesh, ring * 4 + side, lower, lower + 1, 0, 0, 1.0 - blend, blend, 0.0, 0.0)
+            side = side + 1
+        }
+        ring = ring + 1
+    }
+    return mesh
+}
+
+build_bones() -> ptr {
+    bones = list.new()
+    i = 0
+    while i < SEGMENTS + 1 {
+        bone = loader.cube(0.02)
+        if i == 0 {
+            core.model_set_position(bone, 0.0, 0.0, 0.0)
+        } else {
+            core.model_set_position(bone, 0.0, HEIGHT_EACH, 0.0)
+            core.model_set_parent(bone, list.get_raw(bones, i - 1) as *Model)
+        }
+        list.add_raw(bones, bone as ptr)
+        i = i + 1
+    }
+    return bones
+}
+
+free_bones(bones: ptr) {
+    i = list.size(bones) - 1
+    while i >= 0 {
+        bone = list.get_raw(bones, i) as *Model
+        core.model_set_parent(bone, null)
+        core.model_free(bone)
+        i = i - 1
+    }
+    list.free(bones)
+}
+
+// Everything above the waist turned, so the column curls up and away.
+bend(bones: ptr, angle: float) {
+    i = list.size(bones) / 2
+    while i < list.size(bones) {
+        core.model_set_rotation(list.get_raw(bones, i) as *Model, core.quat_rotate(angle, core.vec3(0.0, 0.0, 1.0)))
+        i = i + 1
+    }
+}
+
+// --- the alpha-tested quad's texture: opaque at its middle, clear at its corners
+
+disc_texture(name: string) -> bool {
+    side = 32
+    pixels = calloc(side * side, 4)
+    y = 0
+    while y < side {
+        x = 0
+        while x < side {
+            dx = ((x as float) + 0.5) / (side as float) - 0.5
+            dy = ((y as float) + 0.5) / (side as float) - 0.5
+            r = sqrt(dx * dx + dy * dy) * 2.0
+            a = 1.0
+            if r > 0.9 { a = 0.0 }
+            png.rgba_set(pixels, y * side + x, 1.0, 1.0, 1.0, a)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    ok = picture.register_rgba(name, pixels, side, side) == 1
+    free(pixels)
+    return ok
+}
+
+// A quad a metre across facing +z, centred at (x, y, z).
+disc_quad(x: float, y: float, z: float) -> *Model {
+    m = core.model_new()
+    facing = core.vec3(0.0, 0.0, 1.0)
+    core.mesh_reserve(m.mesh, 4, 6)
+    core.mesh_push_vertex(m.mesh, core.vec3(0.0 - 0.5, 0.0 - 0.5, 0.0), 0.0, 0.0, facing)
+    core.mesh_push_vertex(m.mesh, core.vec3(0.5, 0.0 - 0.5, 0.0), 1.0, 0.0, facing)
+    core.mesh_push_vertex(m.mesh, core.vec3(0.5, 0.5, 0.0), 1.0, 1.0, facing)
+    core.mesh_push_vertex(m.mesh, core.vec3(0.0 - 0.5, 0.5, 0.0), 0.0, 1.0, facing)
+    core.mesh_push_triangle(m.mesh, 0, 1, 2)
+    core.mesh_push_triangle(m.mesh, 0, 2, 3)
+    core.model_set_position(m, x, y, z)
+    core.model_update_matrix(m)
+    core.model_recalculate_bounds(m)
+    core.model_set_texture(m, "test://pick/disc")
+    core.model_set_cutout(m, 0.5)
+    core.model_set_diffuse(m, 1.0, 0.6, 0.2)
+    return m
+}
+
+// --- the picks
+
+// The pixel a world point shows at.
+screen_x(cam: *Camera, x: float, y: float, z: float) -> int {
+    return core.camera_world_to_screen(cam, core.vec3(x, y, z), WIDTH, HEIGHT).x as int
+}
+
+screen_y(cam: *Camera, x: float, y: float, z: float) -> int {
+    return core.camera_world_to_screen(cam, core.vec3(x, y, z), WIDTH, HEIGHT).y as int
+}
+
+pick_at(pass: *Backend, cam: *Camera, light: *Light, x: int, y: int) -> Pick {
+    return core.backend_pick(pass, cam, light, x, y, WIDTH, HEIGHT)
+}
+
+distance_to(p: Vec3, x: float, y: float, z: float) -> float {
+    dx = p.x - x
+    dy = p.y - y
+    dz = p.z - z
+    return sqrt(dx * dx + dy * dy + dz * dz)
+}
+
+differing(a: ptr, b: ptr) -> int {
+    count = 0
+    i = 0
+    while i < WIDTH * HEIGHT * 4 {
+        if mem.get_byte(a, i) != mem.get_byte(b, i) { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+struct Scene {
+    a: *Model
+    b: *Model
+    column: *Model
+    copies: *Model
+    quad: *Model
+    bones: ptr
+    skeleton: *Skeleton
+    cam: *Camera
+    light: *Light
+}
+
+build_scene(pass: *Backend) -> Scene {
+    core.backend_set_clear_color(pass, 0.0, 0.0, 0.0)
+    cam = core.camera_new(WIDTH, HEIGHT)
+    core.camera_set_position(cam, core.vec3(0.0, 2.0, 7.0))
+    core.camera_look_at(cam, core.vec3(0.0, 2.0, 0.0))
+    core.camera_set_aspect(cam, (WIDTH * 1.0) / (HEIGHT * 1.0))
+    light = core.light_directional(core.vec3(0.2, 0.4, 1.0), core.vec3(1.0, 1.0, 1.0), 1.0)
+
+    a = loader.sphere(1.0, 24, 18)
+    core.model_set_position(a, 0.0 - 3.0, 2.0, 0.0)
+    core.model_set_diffuse(a, 0.9, 0.2, 0.2)
+    core.backend_add_model(pass, a)
+    b = loader.sphere(1.0, 24, 18)
+    core.model_set_position(b, 3.0, 2.0, 0.0)
+    core.model_set_diffuse(b, 0.2, 0.3, 0.9)
+    core.backend_add_model(pass, b)
+
+    bones = build_bones()
+    skeleton = skin.skeleton_new()
+    i = 0
+    while i < list.size(bones) {
+        skin.skeleton_add(skeleton, list.get_raw(bones, i) as *Model)
+        i = i + 1
+    }
+    skin.skeleton_bind(skeleton)
+    column = core.model_new()
+    core.model_set_mesh(column, build_column(bones))
+    core.model_set_skeleton(column, skeleton as ptr)
+    core.model_set_diffuse(column, 0.3, 0.8, 0.3)
+    core.backend_add_model(pass, column)
+
+    // Three small spheres in front, one model.
+    copies = loader.sphere(0.5, 16, 12)
+    core.model_enable_instancing(copies, 3)
+    core.model_set_instance_position(copies, 0, core.vec3(0.0 - 1.5, 0.7, 3.0))
+    core.model_set_instance_position(copies, 1, core.vec3(0.0, 0.7, 3.0))
+    core.model_set_instance_position(copies, 2, core.vec3(1.5, 0.7, 3.0))
+    core.model_set_diffuse(copies, 0.9, 0.8, 0.1)
+    core.backend_add_model(pass, copies)
+
+    quad = disc_quad(0.0 - 3.0, 2.0, 2.0)
+    core.backend_add_model(pass, quad)
+    return Scene { a: a, b: b, column: column, copies: copies, quad: quad, bones: bones,
+                   skeleton: skeleton, cam: cam, light: light }
+}
+
+free_scene(pass: *Backend, s: *Scene) {
+    core.backend_remove_model(pass, s.a)
+    core.backend_remove_model(pass, s.b)
+    core.backend_remove_model(pass, s.column)
+    core.backend_remove_model(pass, s.copies)
+    core.backend_remove_model(pass, s.quad)
+    core.model_free(s.a)
+    core.model_free(s.b)
+    core.model_free(s.column)
+    core.model_free(s.copies)
+    core.model_free(s.quad)
+    skin.skeleton_free(s.skeleton)
+    free_bones(s.bones)
+    core.camera_free(s.cam)
+    core.light_free(s.light)
+}
+
+run_checks(pass: *Backend, name: string, frame: fn() -> ptr) {
+    s = build_scene(pass)
+    cam = s.cam
+    light = s.light
+
+    // The ordinary cases.
+    miss = pick_at(pass, cam, light, 4, 4)
+    check("${name}: the corner of the frame is nothing", !miss.hit && miss.model_id == 0)
+
+    ax = screen_x(cam, 0.0 - 2.15, 2.0, 0.0)
+    ay = screen_y(cam, 0.0 - 2.15, 2.0, 0.0)
+    on_a = pick_at(pass, cam, light, ax, ay)
+    check("${name}: a sphere's side is the sphere (id ${on_a.model_id} of ${s.a.id})", on_a.hit && on_a.model_id == s.a.id)
+    check("${name}: it is not instanced, its instance is 0", on_a.instance == 0)
+    check("${name}: its depth is in the view (${on_a.depth})", on_a.depth > 0.0 && on_a.depth < 1.0)
+    surface = distance_to(on_a.position, 0.0 - 3.0, 2.0, 0.0)
+    check("${name}: its point is on the sphere's surface, a metre from its middle (${surface})", surface > 0.93 && surface < 1.07)
+
+    bx = screen_x(cam, 3.0, 2.0, 0.0)
+    by = screen_y(cam, 3.0, 2.0, 0.0)
+    on_b = pick_at(pass, cam, light, bx, by)
+    check("${name}: the other sphere is the other sphere", on_b.hit && on_b.model_id == s.b.id)
+    // The ray through its middle meets it a metre short of the middle, on the camera's side.
+    near = distance_to(on_b.position, 3.0, 2.0, 0.0)
+    check("${name}: its middle's point is a metre from the middle (${near}), on the camera's side (${on_b.position.z})",
+          near > 0.93 && near < 1.07 && on_b.position.z > 0.8 && on_b.position.x < 3.0)
+    check("${name}: the same pixel asked twice answers alike", pick_at(pass, cam, light, bx, by).model_id == on_b.model_id)
+
+    // One frame answers for several pixels, each by the index its ask gave.
+    k_a = core.backend_pick_ask(pass, ax, ay)
+    k_b = core.backend_pick_ask(pass, bx, by)
+    k_none = core.backend_pick_ask(pass, 4, 4)
+    core.backend_render(pass, cam, light)
+    got_a = core.backend_pick_read(pass, k_a, cam, ax, ay, WIDTH, HEIGHT)
+    got_b = core.backend_pick_read(pass, k_b, cam, bx, by, WIDTH, HEIGHT)
+    got_none = core.backend_pick_read(pass, k_none, cam, 4, 4, WIDTH, HEIGHT)
+    check("${name}: a frame answers for three pixels at once, each its own (${got_a.model_id}, ${got_b.model_id}, ${got_none.model_id})",
+          k_a == 0 && k_b == 1 && k_none == 2 && got_a.model_id == s.a.id && got_b.model_id == s.b.id && !got_none.hit)
+    check("${name}: control: an answer that was not asked for is a miss", !core.backend_pick_read(pass, 3, cam, 0, 0, WIDTH, HEIGHT).hit)
+
+    // The scene drawn at half the frame's size: the pixel is the one the same
+    // spot of the scene is drawn at.
+    adopted = core.backend_set_render_scale(pass, 0.5)
+    if adopted < 1.0 {
+        small_a = pick_at(pass, cam, light, ax, ay)
+        small_b = pick_at(pass, cam, light, bx, by)
+        small_none = pick_at(pass, cam, light, 4, 4)
+        check("${name}: drawn at ${adopted} of the frame, the same pixels name the same models (${small_a.model_id}, ${small_b.model_id}, ${small_none.model_id})",
+              small_a.hit && small_a.model_id == s.a.id && small_b.hit && small_b.model_id == s.b.id && !small_none.hit)
+        check("${name}: and the point is still the surface's, within a pixel's reach (${distance_to(small_a.position, 0.0 - 3.0, 2.0, 0.0)})",
+              distance_to(small_a.position, 0.0 - 3.0, 2.0, 0.0) > 0.9 && distance_to(small_a.position, 0.0 - 3.0, 2.0, 0.0) < 1.1)
+        core.backend_set_render_scale(pass, 1.0)
+    }
+
+    // A frame that was asked about is the frame it would have been.
+    core.backend_render(pass, cam, light)
+    quiet = calloc(WIDTH * HEIGHT, 4)
+    memcpy(quiet, frame(), WIDTH * HEIGHT * 4)
+    _again = pick_at(pass, cam, light, bx, by)
+    core.backend_render(pass, cam, light)
+    check("${name}: a pick leaves the next frame as it was", differing(quiet, frame()) == 0)
+    free(quiet)
+
+    // Alpha-tested: the quad's middle is the quad, its clear corner is what is behind it.
+    qx = screen_x(cam, 0.0 - 3.0, 2.0, 2.0)
+    qy = screen_y(cam, 0.0 - 3.0, 2.0, 2.0)
+    on_q = pick_at(pass, cam, light, qx, qy)
+    check("${name}: a cutout's opaque middle is the quad", on_q.hit && on_q.model_id == s.quad.id)
+    cx = screen_x(cam, 0.0 - 3.0 - 0.46, 2.0 + 0.46, 2.0)
+    cy = screen_y(cam, 0.0 - 3.0 - 0.46, 2.0 + 0.46, 2.0)
+    through = pick_at(pass, cam, light, cx, cy)
+    check("${name}: its clear corner is the sphere behind it (id ${through.model_id})", through.hit && through.model_id == s.a.id)
+    check("${name}: and is deeper than the quad", through.depth > on_q.depth)
+    core.model_set_cutout(s.quad, 0.0)
+    solid = pick_at(pass, cam, light, cx, cy)
+    check("${name}: control: with no cutout the corner is the quad", solid.hit && solid.model_id == s.quad.id)
+    core.model_set_cutout(s.quad, 0.5)
+
+    // Instanced: each copy answers for itself.
+    i = 0
+    while i < 3 {
+        px = screen_x(cam, 0.0 - 1.5 + i * 1.5, 0.7, 3.0)
+        py = screen_y(cam, 0.0 - 1.5 + i * 1.5, 0.7, 3.0)
+        got = pick_at(pass, cam, light, px, py)
+        check("${name}: instance ${i} of the copies is that copy (id ${got.model_id}, instance ${got.instance})",
+              got.hit && got.model_id == s.copies.id && got.instance == i)
+        i = i + 1
+    }
+    gap_x = screen_x(cam, 0.0 - 0.75, 0.7, 3.0)
+    gap_y = screen_y(cam, 0.0 - 0.75, 0.7, 3.0)
+    gap = pick_at(pass, cam, light, gap_x, gap_y)
+    check("${name}: control: between two copies is neither", gap.model_id != s.copies.id)
+
+    // Skinned: bent, the figure's top is where its bones carried it.
+    straight_x = screen_x(cam, 0.0, 3.0, 0.0)
+    straight_y = screen_y(cam, 0.0, 3.0, 0.0)
+    on_column = pick_at(pass, cam, light, straight_x, straight_y)
+    check("${name}: the straight column is the column", on_column.hit && on_column.model_id == s.column.id)
+    bend(s.bones, QUARTER_TURN / 5.0)
+    top = list.get_raw(s.bones, 7) as *Model
+    core.model_sync_transform(top)
+    tx = top.world_position.x
+    ty = top.world_position.y
+    tz = top.world_position.z
+    check("${name}: bent, a bone near the top has left the column's bind-pose width (${tx})", tx > 0.7 || tx < 0.0 - 0.7)
+    px = screen_x(cam, tx, ty, tz)
+    py = screen_y(cam, tx, ty, tz)
+    on_bent = pick_at(pass, cam, light, px, py)
+    check("${name}: the pixel on the bent column's top is the column (id ${on_bent.model_id})", on_bent.hit && on_bent.model_id == s.column.id)
+    direction = raycast.screen_direction(cam, px * 1.0, py * 1.0, WIDTH, HEIGHT)
+    bind = raycast.model_mesh(cam.position, direction, s.column)
+    check("${name}: control: a ray at the bind pose's mesh misses it", !raycast.hit(bind))
+    bend(s.bones, 0.0)
+    straight = pick_at(pass, cam, light, px, py)
+    check("${name}: control: straightened, that pixel is not the column", straight.model_id != s.column.id)
+
+    free_scene(pass, &s)
+}
+
+main() {
+    context = offscreen.context_create(WIDTH, HEIGHT)
+    if context == null {
+        println("pick: SKIP no OpenGL context")
+    }
+    if !disc_texture("test://pick/disc") {
+        println("pick: the disc texture would not register")
+        exit(1)
+    }
+
+    if context != null {
+        renderer = gl.renderer_new()
+        gl_pass = gl.backend(renderer)
+        if !core.backend_init(&gl_pass, context, WIDTH, HEIGHT) {
+            println("pick: SKIP the OpenGL backend would not initialise")
+        } else {
+            target = offscreen.target_create(WIDTH, HEIGHT)
+            gl.renderer_set_target(renderer, target)
+            g_gl_target = target as ptr
+            run_checks(&gl_pass, "opengl", gl_frame)
+            core.backend_cleanup(&gl_pass)
+            offscreen.target_destroy(target)
+        }
+        gl.renderer_free(renderer)
+        offscreen.context_destroy(context)
+    }
+
+    if !vulkan.available() {
+        println("pick: no Vulkan driver (${vulkan.last_error()}), checked OpenGL only")
+    } else {
+        vk_renderer = vulkan.renderer_new()
+        vk_pass = vulkan.backend(vk_renderer)
+        if !core.backend_init(&vk_pass, null, WIDTH, HEIGHT) {
+            println("pick: SKIP Vulkan would not start (${vulkan.last_error()})")
+        } else {
+            run_checks(&vk_pass, "vulkan", vk_frame)
+            core.backend_cleanup(&vk_pass)
+        }
+        vulkan.renderer_free(vk_renderer)
+    }
+
+    if g_failures == 0 {
+        println("pick: all checks passed")
+    } else {
+        println("pick: ${g_failures} failure(s)")
+        exit(1)
+    }
+}
+
+var g_gl_target: ptr = null
+
+gl_frame() -> ptr { return offscreen.target_pixels(g_gl_target as *Target) }
+vk_frame() -> ptr { return vulkan.offscreen_pixels() }

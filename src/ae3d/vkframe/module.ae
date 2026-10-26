@@ -32,6 +32,7 @@ import ae3d.vkdesc
 import ae3d.vktargets
 import ae3d.cascades
 import ae3d.vkpipes
+import ae3d.vkpick
 import ae3d.vktexture
 import ae3d.vkmesh
 import ae3d.vkrays
@@ -63,7 +64,7 @@ import ae3d.shaderlib (vec2, vec3, Texture, TextureMS, Texture3D, Floats, Vec4s,
 import std.io
 
 exports (
-    STAGE_MEASURE, STAGE_DRAW, STAGE_READ, FRAMES, STAGES, mark_sorted, mark_rays_built,
+    STAGE_MEASURE, STAGE_DRAW, STAGE_READ, FRAMES, STAGES, mark_sorted, mark_rays_built, pick_begin, pick_end, pick_on,
     start, shutdown, ready, resize, frame_begin, frame_end, flush_uploads,
     add_hooks, frame_wait, set_fence_wait_ms, hold_fence, frame_bgr, frame_commands, frame_slot, frame_image, frame_view, frame_format,
     frame_offscreen, frame_copyable, frame_width, frame_height, render_width, render_height, recording, pass_open,
@@ -308,6 +309,10 @@ var g_crowd_pipes: ptr = null      // VkPipeline[2], by culling
 var g_crowd_blend_pipe: ptr = null
 var g_crowd_pull_pipes: ptr = null // VkPipeline[2]
 var g_crowd_shadow_pipe: ptr = null
+// The pick pass's (#865): its ring and its pipelines, unculled then culled,
+// made the first time a pick is drawn.
+var g_crowd_pick_ring: ptr = null
+var g_crowd_pick_pipes: ptr = null
 const CROWD_DRAWS = 1024
 // The crowd's own words: what only its shaders read, set by the renderer
 // (set_crowd_*) at these byte offsets, in the 32-bit words the scene block
@@ -1240,6 +1245,7 @@ frame_begin(r: float, g: float, b: float, a: float) -> bool {
     g_composited = 0
     vkhost.set_pass_open(false)
     g_in_shadow_pass = false
+    g_pick_on = false
     // Two halves when something reads the scene's depth this frame: the
     // renderer says what wants it before the frame (set_scene_depth, the
     // occlusion, the reflection), and the target is made at the size of the
@@ -1260,6 +1266,7 @@ frame_begin(r: float, g: float, b: float, a: float) -> bool {
     vkquote.ring_frame(g_crowd_ring as *VertexRing, g_frame)
     vkquote.ring_frame(g_crowd_pull_ring as *VertexRing, g_frame)
     vkquote.ring_frame(g_crowd_depth_ring as *VertexRing, g_frame)
+    vkquote.ring_frame(g_crowd_pick_ring as *VertexRing, g_frame)
     vkhost.set_recording(true)
     return true
 }
@@ -1352,6 +1359,9 @@ draw_pipeline(pipeline: @keep ptr, handle: int, texture: int, instances: int, in
 draw_pipeline_range(pipeline: @keep ptr, handle: int, texture: int, instances: int, instance_count: int,
                     first_index: int, index_count: int) {
     if !vkhost.recording() || !vkmesh.in_range(handle) { return }
+    // A draw the pick pass has no pipeline for (a particle, a flame, a
+    // crowd's figure) is not made.
+    if pipeline == null { return }
     open_scene_pass()
     if !vkmesh.drawable(handle) || vkmesh.index_count(handle) == 0 { return }
     first = first_index
@@ -1368,6 +1378,7 @@ draw_pipeline_range(pipeline: @keep ptr, handle: int, texture: int, instances: i
     // A water surface is the sea's pair (nothing, when its pipelines would
     // not make); added over the frame it is the scene's added pipeline, as
     // it was.
+    if g_pick_on && vkdesc.program() == vkdesc.PROGRAM_WATER { return }
     if vkdesc.program() == vkdesc.PROGRAM_WATER && !(g_blend && g_additive) {
         if g_water_pass != null { draw_water(handle, tex, instances, instance_count, first, indices) }
         return
@@ -1404,6 +1415,7 @@ draw_pipeline_range(pipeline: @keep ptr, handle: int, texture: int, instances: i
 // The pipeline a lit draw of `handle` takes: by the mesh (skinned or not),
 // the pose bank (a crowd), the instances (points) and the blend state.
 pipeline_for(handle: int, points: bool) -> ptr {
+    if g_pick_on { return pick_pipeline_for(handle, points) }
     opaque = vkpipes.scene(g_cull)
     blended = vkpipes.scene_blend()
     skinned = vkmesh.skinned(handle)
@@ -1426,9 +1438,77 @@ pipeline_for(handle: int, points: bool) -> ptr {
     return opaque
 }
 
+// The pick pass's pipeline for a mesh (#865): the surface, never blended,
+// culled as the scene culls an opaque one. None for a particle's points, a
+// surface added over the frame and a crowd's figure, which are not what a
+// click means.
+pick_pipeline_for(handle: int, points: bool) -> ptr {
+    if points { return null }
+    if g_blend && g_additive { return null }
+    skinned = vkmesh.skinned(handle)
+    cull = g_cull
+    if g_blend { cull = 0 }
+    if skinned && g_pose_bank > 0 { return crowd_pick_pipeline(cull) }
+    return vkpick.pipeline(skinned, cull)
+}
+
 instances_are_points(instances: int, count: int) -> bool {
     if count <= 0 || instances <= 0 { return false }
     return vkmesh.drawable(instances) && vkmesh.points(instances)
+}
+
+// --- the pick pass (#865) ---------------------------------------------------------------------------------------
+
+// Whether the pass is recording: every lit draw's pipeline is then the pick
+// pipeline of its mesh (pick_pipeline_for).
+var g_pick_on = false
+// The frame's counts as the pass found them, which it hands back: a frame
+// that is asked about reports the draws, pipelines and sets it drew
+// without the pass.
+var g_pick_draws = 0
+var g_pick_pipelines = 0
+var g_pick_sets = 0
+
+pick_on() -> bool { return g_pick_on }
+
+// The pass begun, when the frame was asked what is at a pixel
+// (vkpick.ask): into its own target, ahead of the scene pass, which has not
+// opened. False when nothing was asked or the pass would not begin; the
+// draws between pick_begin and pick_end are the scene's, as the pick
+// pipelines draw them.
+pick_begin() -> bool {
+    if !vkhost.recording() || vkhost.pass_open() || !vkpick.asked() { return false }
+    if !frame_sets_now() {
+        vkpick.forget()
+        return false
+    }
+    if !vkpick.begin(commands_now(), vktargets.render_width(), vktargets.render_height(), vktargets.width(), vktargets.height()) {
+        return false
+    }
+    crowd_pick_ring()
+    vkhost.set_pass_open(true)
+    g_pick_on = true
+    g_pick_draws = g_draw_calls
+    g_pick_pipelines = g_pipeline_binds
+    g_pick_sets = g_set_binds
+    g_bound_pipeline = null
+    g_bound_texture = 0 - 1
+    g_bound_normal = 0 - 1
+    return true
+}
+
+// The pass ended and the pixel asked about copied out.
+pick_end() {
+    if !g_pick_on { return }
+    vkpick.finish(commands_now(), g_frame)
+    vkhost.set_pass_open(false)
+    g_pick_on = false
+    g_draw_calls = g_pick_draws
+    g_pipeline_binds = g_pick_pipelines
+    g_set_binds = g_pick_sets
+    g_bound_pipeline = null
+    g_bound_texture = 0 - 1
+    g_bound_normal = 0 - 1
 }
 
 // A model's draw: its mesh, its texture, its instance stream and how many
@@ -1500,6 +1580,7 @@ draw_cut(handle: int, texture: int, instances: int, indices: ptr, draws: ptr, fi
     set = set_now(tex)
     if set == null { return }
     cut_pipeline = pipeline_for(handle, false)
+    if cut_pipeline == null { return }
     bind_pipeline(cut_pipeline)
     if tex != g_bound_texture || g_normal_map != g_bound_normal {
         g_bound_texture = tex
@@ -1534,6 +1615,7 @@ draw_cut(handle: int, texture: int, instances: int, indices: ptr, draws: ptr, fi
 // read through `pulled` (vkpipes.pull_set_layout's) by the crowd's pulling
 // pipeline. The block's pullVertexBits is the caller's to have set.
 draw_pulled(texture: int, pulled: @keep ptr, indices: ptr, draws: ptr, command: int) {
+    if g_pick_on { return }
     if !vkhost.recording() || pulled == null { return }
     pipeline = crowd_pull_pipeline(g_cull)
     if pipeline == null { return }
@@ -3119,6 +3201,16 @@ lit_fresh() {
     dpv = lit.lit_depth_plain_vertex(Draw { lift: 0.0 }, Cut { on: 0 }, Skin {}, Eye { far: 0.0 })
     vkquote.fresh(dpv, vkspirv.LIT_DEPTH_PLAIN_QUOTED_HASH)
     gpu.shader_free(dpv)
+    kv = lit.pick_vertex(Draw { lift: 0.0 }, Cut { on: 0 }, Skin {}, Eye { far: 0.0 })
+    vkquote.fresh(kv, vkspirv.PICK_QUOTED_VERTEX_HASH)
+    gpu.shader_free(kv)
+    kp = lit.pick_pixel(Draw { lift: 0.0 }, DrawMaterial { alpha: 0.0 }, Cut { on: 0 }, Wounds { count: 0 }, Eye { far: 0.0 },
+                        Texture { image: null })
+    vkquote.fresh(kp, vkspirv.PICK_QUOTED_HASH)
+    gpu.shader_free(kp)
+    kpv = lit.pick_plain_vertex(Draw { lift: 0.0 }, Cut { on: 0 }, Skin {}, Eye { far: 0.0 })
+    vkquote.fresh(kpv, vkspirv.PICK_PLAIN_QUOTED_HASH)
+    gpu.shader_free(kpv)
 }
 
 crowd_vertex_shader() -> *GpuShader {
@@ -3212,6 +3304,9 @@ crowd_rings_free() {
     vkquote.vertex_ring_free(g_crowd_ring as *VertexRing)
     vkquote.vertex_ring_free(g_crowd_pull_ring as *VertexRing)
     vkquote.vertex_ring_free(g_crowd_depth_ring as *VertexRing)
+    vkquote.vertex_ring_free(g_crowd_pick_ring as *VertexRing)
+    g_crowd_pick_ring = null
+    if g_crowd_pick_pipes != null { memset(g_crowd_pick_pipes, 0, 16 as long) }
     g_crowd_ring = null
     g_crowd_pull_ring = null
     g_crowd_depth_ring = null
@@ -3220,6 +3315,41 @@ crowd_rings_free() {
         memset(g_crowd_pull_pipes, 0, 16 as long)
     }
     g_crowd_shadow_pipe = null
+}
+
+crowd_pick_vertex_shader() -> *GpuShader {
+    return throng.crowd_pick_vertex(Throng { frames: 0 }, Eye { far: 0.0 }, Texture { image: null })
+}
+
+// The crowd's ring and pipelines in the pick pass (#865), made the first
+// time one is drawn, over the pass vkpick made: the pose bank poses each
+// figure, lit's pick pixel names the model. A ring whose pipelines would not
+// build is let go, and a crowd is not picked.
+crowd_pick_ring() {
+    if g_crowd_pick_ring != null || vkpick.pass() == null { return }
+    if g_crowd_pick_pipes == null { g_crowd_pick_pipes = calloc(2, 8) }
+    ring = vkquote.vertex_ring_new(crowd_pick_vertex_shader(), vkspirv.CROWD_PICK_QUOTED_HASH, CROWD_DRAWS)
+    if ring == null { return }
+    ok = true
+    cull = 0
+    while cull < 2 {
+        p = vkquote.ring_pipeline(ring, vkspirv.CROWD_PICK_QUOTED_VERT, vkspirv.PICK_QUOTED_FRAG, 0, true, true, vkpick.pass(),
+                                  cull == 1, true, false)
+        (g_crowd_pick_pipes as ptr[])[cull] = p
+        if p == null { ok = false }
+        cull = cull + 1
+    }
+    if ok {
+        g_crowd_pick_ring = ring as ptr
+    } else {
+        vkquote.vertex_ring_free(ring)
+        memset(g_crowd_pick_pipes, 0, 16 as long)
+    }
+}
+
+crowd_pick_pipeline(cull: int) -> ptr {
+    if g_crowd_pick_ring == null { return null }
+    return (g_crowd_pick_pipes as ptr[])[cull]
 }
 
 // The crowd's pipelines, its quoted shaders'; null where they would not
@@ -3292,6 +3422,9 @@ fn crowd_ring_of(pipeline: ptr) -> ptr {
         }
     }
     if g_crowd_depth_ring != null && pipeline == g_crowd_shadow_pipe { return g_crowd_depth_ring }
+    if g_crowd_pick_ring != null {
+        if pipeline == (g_crowd_pick_pipes as ptr[])[0] || pipeline == (g_crowd_pick_pipes as ptr[])[1] { return g_crowd_pick_ring }
+    }
     return null
 }
 

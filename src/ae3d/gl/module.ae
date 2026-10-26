@@ -67,7 +67,8 @@ exports (
     renderer_shadow_ms, renderer_scene_ms, renderer_post_ms, renderer_post_active, device_name,
     renderer_program_binds, renderer_material_binds, renderer_texture_binds,
     renderer_set_occlusion_strength, renderer_set_capture_channel, renderer_set_wetness, renderer_set_frame_exposure, renderer_meter,
-    renderer_frame_pixels, read_pixel, snapshot, renderer_add_model, renderer_remove_model
+    renderer_frame_pixels, read_pixel, snapshot, renderer_add_model, renderer_remove_model,
+    renderer_pick_ask, renderer_pick_read
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -797,7 +798,7 @@ gl_uniform_location(program: int, name: string) -> int {
 // (viewPos, lights[2].color, shadowMap), and gl_uniform_location finds each
 // by the name the quoted shader gives it (eye.position,
 // world.lights[2].colour, shadow_map; lit.gl_name).
-const LIT_PROGRAMS = 4
+const LIT_PROGRAMS = 6
 var g_lit_programs: ptr = null
 
 lit_program(program: int) {
@@ -1654,6 +1655,7 @@ struct ProgramSlots {
     pose_bank: int
     pose_bank_frames: int
     impostor: int
+    pick_id: int
     clip: ClipSlots                // a model's cut (#545, #556)
     wound_count: int               // a model's wounds (#543)
     wound_data: int
@@ -1732,6 +1734,12 @@ struct GLRenderer {
     cluster_light_rows: int
     cluster_word_texture: int
     cluster_word_rows: int
+    // What is at a pixel (#865): the pick pass's program, and its targets
+    // and answer (a *GLPick), made the first frame something asks.
+    pick: ptr
+    pick_program: int
+    pick_crowd_program: int
+    pick_crowd_shader: ptr         // *GpuShader, ae3d.shaders.throng's crowd_pick_vertex
     models: ptr
     lights: ptr
     programs: ptr
@@ -2131,6 +2139,322 @@ renderer_free(r: *GLRenderer) {
     heap.free(r)
 }
 
+// --- what is at a pixel (#865) --------------------------------------------------------------------------------
+
+// The pick pass's targets and answer: an RGBA32F texture and a depth
+// renderbuffer the size of the scene, the pixel asked about and the four
+// floats read back from it (the model's id, the instance, the depth, 1 for
+// a hit), or all zero.
+struct GLPick {
+    framebuffer: int
+    texture: int
+    depth: int
+    width: int
+    height: int
+    asked: int                         // the pixels asked about this frame
+    xs: ptr                            // int[MOST], the frame's
+    ys: ptr
+    answered: int
+    cells: ptr                         // f32[4 * MOST]
+}
+
+// The pixels one frame answers for.
+const PICK_MOST = 16
+
+the_pick(r: *GLRenderer) -> *GLPick {
+    if r.pick == null {
+        p = calloc(1, sizeof(GLPick)) as *GLPick
+        p.cells = calloc(4 * PICK_MOST, 4)
+        p.xs = calloc(PICK_MOST, 4)
+        p.ys = calloc(PICK_MOST, 4)
+        r.pick = p as ptr
+    }
+    return r.pick as *GLPick
+}
+
+// Ask that the next frame answer for the frame's pixel (x, y), the top row
+// first: the index its answer is read by, or -1 when the frame is asked
+// about as many as it will answer.
+renderer_pick_ask(r: *GLRenderer, x: int, y: int) -> int {
+    if !r.initialized { return 0 - 1 }
+    p = the_pick(r)
+    if p.asked == 0 { p.answered = 0 }
+    if p.asked >= PICK_MOST { return 0 - 1 }
+    (p.xs as int[])[p.asked] = x
+    (p.ys as int[])[p.asked] = y
+    p.asked = p.asked + 1
+    return p.asked - 1
+}
+
+// Answer `k` to the last asks: four floats into `out`. False when there is
+// none to give.
+renderer_pick_read(r: *GLRenderer, k: int, out: ptr) -> bool {
+    if r.pick == null { return false }
+    p = r.pick as *GLPick
+    if k < 0 || k >= p.answered { return false }
+    src = p.cells as f32[]
+    dst = out as f32[]
+    i = 0
+    while i < 4 {
+        dst[i] = src[k * 4 + i]
+        i = i + 1
+    }
+    return true
+}
+
+// The pick pass's program: lit's pick vertex and pixel shaders written as
+// OpenGL's GLSL, as the scene's are; 0 when it would not compile.
+pick_program_of(r: *GLRenderer) -> int {
+    if r.pick_program != 0 { return r.pick_program }
+    pv = lit.pick_vertex(lit.Draw { lift: 0.0 }, lit.Cut { on: 0 }, lit.Skin {}, frame.Eye { far: 0.0 })
+    pp = lit.pick_pixel(lit.Draw { lift: 0.0 }, lit.DrawMaterial { alpha: 0.0 }, lit.Cut { on: 0 },
+                        lit.Wounds { count: 0 }, frame.Eye { far: 0.0 }, Texture { image: null })
+    if !gpu.link(pv, pp) {
+        println("ae3d: pick program failed: ${gpu.last_error()}")
+        return 0
+    }
+    r.pick_program = compile_program(gpu.emit_vertex_glsl(pv, gpu.GL, "", ""), gpu.emit_glsl(pp, gpu.GL), "pick")
+    gpu.shader_free(pv)
+    gpu.shader_free(pp)
+    if r.pick_program != 0 { lit_program(r.pick_program) }
+    return r.pick_program
+}
+
+// The crowd's pick program: throng's pick vertex shader over lit's pick
+// pixel, its captures set before each draw (pick_crowd_values). 0 when it
+// would not compile, and a crowd is not picked.
+pick_crowd_program_of(r: *GLRenderer) -> int {
+    if r.pick_crowd_program != 0 { return r.pick_crowd_program }
+    cv = throng.crowd_pick_vertex(throng.Throng { frames: 0 }, frame.Eye { far: 0.0 }, Texture { image: null })
+    pp = lit.pick_pixel(lit.Draw { lift: 0.0 }, lit.DrawMaterial { alpha: 0.0 }, lit.Cut { on: 0 },
+                        lit.Wounds { count: 0 }, frame.Eye { far: 0.0 }, Texture { image: null })
+    if !gpu.link(cv, pp) {
+        println("ae3d: crowd pick program failed: ${gpu.last_error()}")
+        return 0
+    }
+    r.pick_crowd_program = compile_program(gpu.emit_vertex_glsl(cv, gpu.GL, "", ""), gpu.emit_glsl(pp, gpu.GL), "crowd pick")
+    gpu.shader_free(pp)
+    if r.pick_crowd_program != 0 {
+        r.pick_crowd_shader = cv as ptr
+        lit_program(r.pick_crowd_program)
+    } else {
+        gpu.shader_free(cv)
+    }
+    return r.pick_crowd_program
+}
+
+// A crowd's draw in the pick pass: the camera's, the model's place, the
+// bank's frames and the impostor's grid into the pick vertex shader's
+// captures, then onto the program, the bank on unit 3.
+pick_crowd_values(r: *GLRenderer, m: *Model, view_projection: *Mat4, cam: *Camera) {
+    s = r.pick_crowd_shader as *GpuShader
+    sea_mat4(s, "viewer", "view_projection", view_projection as ptr)
+    sea_vec(s, "viewer", "position", cam.position.x, cam.position.y, cam.position.z)
+    sent = m.model_matrix
+    if m.is_instanced && core.model_instance_count(m) > 0 {
+        if geometry.inst_is_points(m.instances) == 1 { sent = point_frame(m) } else { sent = core.mat4_ident() }
+    }
+    sea_mat4(s, "throng", "model", (&sent) as ptr)
+    sea_int(s, "throng", "frames", m.pose_bank_frames)
+    on = 0
+    if core.model_is_impostor(m) { on = 1 }
+    sea_int(s, "throng", "impostor", on)
+    if on == 1 {
+        sea_int(s, "throng", "columns", m.impostor_cols)
+        sea_int(s, "throng", "rows", m.impostor_rows)
+        sea_float(s, "throng", "width", m.impostor_width)
+        sea_float(s, "throng", "height", m.impostor_height)
+    }
+    if m.pose_bank_texture == 0 {
+        m.pose_bank_texture = gl_posebank_texture(posing.posebank_data(m.pose_bank), posing.posebank_frames(m.pose_bank),
+                                                  posing.posebank_bones(m.pose_bank))
+    }
+    gl_texture_bind(3, m.pose_bank_texture)
+    quoted_uniforms(r.pick_crowd_program, s)
+    gl_uniform_int(gl_uniform_location(r.pick_crowd_program, "pose_bank"), 3)
+}
+
+// The targets at `w` by `h`, remade when the scene's size moves.
+pick_targets(r: *GLRenderer, p: *GLPick, w: int, h: int) -> bool {
+    if p.framebuffer != 0 && p.width == w && p.height == h { return true }
+    if p.framebuffer != 0 {
+        gl_drop(NAME_TEXTURE, p.texture)
+        gl_renderbuffer_delete(p.depth)
+        gl_fbo_delete(p.framebuffer)
+    }
+    p.width = w
+    p.height = h
+    p.framebuffer = gl_fbo_create()
+    p.texture = target_texture(w, h, glapi.RGBA32F, glapi.RGBA, glapi.FLOAT, glapi.NEAREST)
+    attach_texture(p.framebuffer, glapi.COLOR_ATTACHMENT0, p.texture, 0)
+    p.depth = attach_renderbuffer(p.framebuffer, glapi.DEPTH_ATTACHMENT, w, h, 0, glapi.DEPTH_COMPONENT32F)
+    ok = gl_fbo_complete() == 1
+    if !ok {
+        println("ae3d: the pick framebuffer is incomplete")
+        p.framebuffer = 0
+    }
+    return ok
+}
+
+// The pass, when this frame was asked: the scene's surfaces through the
+// pick program into the pick targets, the pixel read back, and the
+// framebuffer, viewport and state the scene was about to be drawn in put
+// back. Drawn at the scene's size (the post buffers').
+render_pick_pass(r: *GLRenderer, view_projection: *Mat4, light: *Light, cam: *Camera) {
+    if r.pick == null { return }
+    p = r.pick as *GLPick
+    if p.asked == 0 { return }
+    n = p.asked
+    p.asked = 0
+    w = r.post_width
+    h = r.post_height
+    if w < 1 || h < 1 { return }
+    program = pick_program_of(r)
+    if program == 0 || !pick_targets(r, p, w, h) { return }
+    crowd_program = pick_crowd_program_of(r)
+
+    was_framebuffer = gl_integer(glapi.DRAW_FRAMEBUFFER_BINDING, 0, 1)
+    vx = gl_integer(glapi.VIEWPORT, 0, 4)
+    vy = gl_integer(glapi.VIEWPORT, 1, 4)
+    vw = gl_integer(glapi.VIEWPORT, 2, 4)
+    vh = gl_integer(glapi.VIEWPORT, 3, 4)
+    draws = r.last_draw_calls
+    programs = r.last_programs
+    gl_fbo_bind(p.framebuffer)
+    gl_viewport(0, 0, w, h)
+    gl_set_depth_mask(1)
+    gl_clear_color(0.0, 0.0, 0.0, 0.0)
+    gl_clear(1, 1)
+    set_depth_test(r, true)
+    set_blend(r, false)
+    // The programs have not had this frame's uniforms.
+    slots_for(r, program).frame_stamp = 0 - 1
+    if crowd_program != 0 { slots_for(r, crowd_program).frame_stamp = 0 - 1 }
+
+    count = list.size(r.models)
+    pass = 0
+    while pass < 2 {
+        i = 0
+        while i < count {
+            m = list.get_raw(r.models, i) as *Model
+            render_pick_model(r, m, view_projection, light, cam, program, crowd_program, pass == 1)
+            i = i + 1
+        }
+        pass = pass + 1
+    }
+
+    // The frame's top row first; GL's rows are bottom-up. The scene may be
+    // drawn smaller than the frame.
+    glapi.glPixelStorei(glapi.PACK_ALIGNMENT as uint32, 1)
+    k = 0
+    while k < n {
+        x = (p.xs as int[])[k]
+        y = (p.ys as int[])[k]
+        if r.screen_width > 0 && r.screen_height > 0 {
+            x = x * w / r.screen_width
+            y = y * h / r.screen_height
+        }
+        if x < 0 { x = 0 }
+        if x >= w { x = w - 1 }
+        if y < 0 { y = 0 }
+        if y >= h { y = h - 1 }
+        glapi.glReadPixels(x, h - 1 - y, 1, 1, glapi.RGBA as uint32, glapi.FLOAT as uint32, p.cells + k * 16)
+        k = k + 1
+    }
+    p.answered = n
+
+    // Back as it was, and as the scene's draws expect to find it.
+    gl_fbo_bind(was_framebuffer)
+    gl_viewport(vx, vy, vw, vh)
+    set_blend(r, true)
+    set_depth_test(r, core.depth_test())
+    set_face_culling(r, core.face_culling())
+    gl_set_depth_mask(1)
+    r.last_draw_calls = draws
+    r.last_programs = programs
+    use_program(r, r.default_program)
+    r.bound_material = null
+    r.bound_material_set = false
+    r.bound_texture = 0 - 1
+    r.bound_normal = 0 - 1
+    glapi.glActiveTexture(glapi.TEXTURE0 as uint32)
+}
+
+// One model through the pick program, as render_model draws it but never
+// blended: nothing for a particle's points, a surface added over the frame,
+// a crowd's figure or the water.
+render_pick_model(r: *GLRenderer, m: *Model, view_projection: *Mat4, light: *Light, cam: *Camera, scene_program: int,
+                  crowd_program: int, transparent_pass: bool) {
+    if m == null || !m.visible { return }
+    if !model_in_pass(m, transparent_pass) { return }
+    is_crowd = core.model_pose_bank(m) != null
+    program = scene_program
+    if is_crowd {
+        if crowd_program == 0 { return }
+        program = crowd_program
+    }
+    if core.shader_valid(&m.shader) && m.shader.kind == core.SHADER_WATER { return }
+    if m.is_instanced && core.model_instance_points(m) { return }
+
+    core.model_sync_transform(m)
+    if m.skeleton != null && !is_crowd { skin.skeleton_fit(m.skeleton as *Skeleton, m) }
+    spread = m.is_instanced && core.model_instance_count(m) > 0
+    if core.frustum_culling() && !spread &&
+       !core.frustum_sphere_visible(r.frustum, m.bounding_center, m.bounding_radius) {
+        return
+    }
+
+    slots = slots_for(r, program)
+    use_program(r, program)
+    if slots.frame_stamp != r.frame_stamp {
+        set_frame_uniforms(r, slots, view_projection, light, r.lights, cam)
+        slots.frame_stamp = r.frame_stamp
+    }
+    set_model_matrix(slots, m)
+    apply_skeleton(r, slots, m)
+    send_clip(slots.clip, m)
+    send_wounds(slots.wound_count, slots.wound_data, slots.wound_layers, slots.wound_core, m)
+    gl_uniform_int(slots.pick_id, m.id)
+    if is_crowd { pick_crowd_values(r, m, view_projection, cam) }
+    gl_vao_bind(m.vao)
+
+    groups = core.model_group_count(m)
+    if groups > 0 {
+        i = 0
+        while i < groups {
+            group = core.model_group(m, i)
+            material = group_material(m, group)
+            blend = core.surface_blend(m, material)
+            if (blend != core.BLEND_OPAQUE) == transparent_pass && blend != core.BLEND_ADD {
+                pick_surface(r, slots, material, blend)
+                draw(r, m, slots, group.index_count, group.index_start * 4)
+            }
+            i = i + 1
+        }
+    } else {
+        blend = core.surface_blend(m, m.material)
+        if (blend != core.BLEND_OPAQUE) == transparent_pass && blend != core.BLEND_ADD {
+            pick_surface(r, slots, m.material, blend)
+            draw(r, m, slots, core.mesh_index_count(m.mesh), 0)
+        }
+    }
+    gl_vao_bind(0)
+}
+
+// A surface's material and texture for the pick pass: opaque, depth written,
+// culled as the scene culls an opaque one and never a blended one.
+pick_surface(r: *GLRenderer, slots: *ProgramSlots, material: *Material, blend: int) {
+    apply_material(r, slots, material)
+    gl_uniform_int(slots.surface_blend, blend)
+    gl_set_depth_mask(1)
+    if blend != core.BLEND_OPAQUE {
+        set_face_culling(r, false)
+    } else {
+        set_face_culling(r, core.face_culling())
+    }
+    apply_texture(r, slots, texture_for(r, material))
+}
+
 backend(r: *GLRenderer) -> Backend {
     return Backend {
         state: r,
@@ -2153,6 +2477,8 @@ backend(r: *GLRenderer) -> Backend {
         remove_light: renderer_remove_light as fn(ptr, ptr),
         draw_calls: renderer_draw_calls as fn(ptr) -> int,
         frame_pixels: renderer_frame_pixels as fn(ptr) -> ptr,
+        pick_ask: renderer_pick_ask as fn(ptr, int, int) -> int,
+        pick_read: renderer_pick_read as fn(ptr, int, ptr) -> bool,
         set_overlay: renderer_set_overlay,
         cleanup: renderer_cleanup as fn(ptr)
     }
@@ -2283,6 +2609,7 @@ slots_for(r: *GLRenderer, program: int) -> *ProgramSlots {
     s.pose_bank = gl_uniform_location(program, "poseBank")
     s.pose_bank_frames = gl_uniform_location(program, "poseBankFrames")
     s.impostor = gl_uniform_location(program, "impostor")
+    s.pick_id = gl_uniform_location(program, "pickId")
     s.clip = clip_slots_of(program)
     s.wound_count = gl_uniform_location(program, "woundCount")
     s.wound_data = gl_uniform_location(program, "woundData")
@@ -5224,6 +5551,9 @@ renderer_render(r: *GLRenderer, cam: *Camera, light: *Light) {
     unjittered = core.camera_view_projection(cam)
     r.haze_view_projection = unjittered
     view_projection = frame_view_projection(r, cam, r.post_width, r.post_height)
+
+    // What is at a pixel, when this frame was asked (#865).
+    render_pick_pass(r, &view_projection, active_light, cam)
 
     draw_opaque(r, &view_projection, active_light, cam)
     // The sky after the opaque draws, at the far plane under the depth
