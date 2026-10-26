@@ -762,6 +762,51 @@ own sets after them (`frame.SCENE_SETS`, the crowd's rings at 3).
 No second camera is drawn yet (Nic: no multi-camera work before the
 scene).
 
+### Step 6b: the ray-query pixel shader (2026-10-26)
+
+The last hand-written scene shader, `scene_rq_vk.frag` (FRAGMENT_DEFAULT
+built with `AE3D_RAY_QUERY`), is `lit_rq_pixel` now, and both are gone.
+
+- **ae3d.gpu grew ray queries.** `AccelerationStructure` is
+  `accelerationStructureEXT`, captured and placed with `capture_binding`
+  (set 2, binding 4); `RayQuery` is `rayQueryEXT`, declared by
+  `q = ray_query()` and not given a value; `ray_query_initialize`,
+  `ray_query_proceed`, `ray_query_committed_hit` and the two flag constants
+  are the GLSL calls. A shader that traces is GLSL 4.60 with
+  `GL_EXT_ray_query`, and OpenGL's emission is refused. In MSL the structure
+  is an `instance_acceleration_structure` among the pixel shader's buffers
+  and a query an `intersection_query<triangle_data, instancing>` with the
+  flags as `intersection_params`. The CPU's evaluator has no scene: a ray finds
+  nothing. No aether change was needed.
+- **`lit_rq_pixel` is `lit_pixel`'s body with four additions**, in the order the
+  hand-written shader had them: the sun's shadow by four rays on a spiral
+  (`ray_shadow_factor`), a lamp's by one ray to a spot on its face
+  (`ray_lamp_factor`), the sky's occlusion by four rays over the hemisphere
+  (`ray_occlusion_factor`), and the probes' irradiance (`ddgi_irradiance`:
+  two cascades, trilinear over eight probes, each weighed by facing and by
+  Chebyshev visibility, a grid cell three ints for GLSL's `ivec3`, written
+  out an axis at a time). It is a copy of lit_pixel's body, not a
+  specialisation of it, so that `lit_pixel` and the 59 frames every device
+  without ray queries draws stay as they are (their GLSL, SPIR-V and
+  hashes are unchanged); `tests/test_gpu_lit_rq` is what keeps the copy
+  honest: on the CPU, where no ray finds anything and no probe is on, the two
+  shaders must shade 12 cases (rays and probes off and on, a key light, a lamp,
+  the sky) to the same lane, exactly. Four negative controls each fail it (the
+  body's exposure, the sun's factor, the lamps', the probes' fall-back).
+- **Where it is drawn.** `vkpipes` and `vkframe`'s crowd rings use
+  `LIT_RQ_QUOTED_FRAG` where the device traces, with the scene's vertex
+  shaders; its tree's hash is checked at start as the others'. Its bindings
+  are the hand-written one's (set 2 binding 4; set 1 bindings 6, 7 and 8).
+- **Held.** glslang for Vulkan 1.2 and `spirv-val` take its SPIR-V; its MSL
+  passes the device compiler and `xcrun metal` (MoltenVK takes no ray query,
+  so that is as far as the M6 goes: MSL ray queries are compile-checked
+  only). Only a device that traces draws it: CI's lavapipe (test_ray_shadows,
+  test_ray_occlusion, test_gi); the verification is recorded in
+  project_quote_shader_work.
+- **The cleanup** removed FRAGMENT_DEFAULT and, with it, 560 lines of
+  generator that read hand-written GLSL: the three blocks' uniforms are typed
+  by their tables alone, and `ae3d.vkscene` is byte for byte what it was.
+
 ### What it buys MSL (step 5, after this)
 
 MSL comes after the mesh shaders (Nic, 2026-10-19). Our own SPIR-V writer

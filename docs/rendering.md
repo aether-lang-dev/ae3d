@@ -595,7 +595,7 @@ index buffers the draws use; each frame the renderer adds the traced
 models -- the ones that cast, drawn on their own or through a matrix
 stream -- with their matrices, and the top-level structure is built
 from them before any pass, in a ring of two. The scene fragment's
-ray-query variant (`scene_rq_vk.frag`, GLSL 4.60, SPIR-V 1.4, the
+ray-query variant (`lit_rq_quoted.frag`, written with quote: `lit_rq_pixel`; GLSL 4.60, SPIR-V 1.4, the
 structure at binding 4 of the world's set) traces one opaque ray, first hit, from a
 little off the surface: lit, or the shadow's share of the light, exact
 at any distance and with no map's texel to fit the world into. What the
