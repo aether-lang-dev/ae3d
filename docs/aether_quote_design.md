@@ -699,14 +699,14 @@ sky(...) -> *GpuShader {
    and on OpenGL one name is one uniform across the program. Each helper is
    the hand-written one's shape, and reads its uniforms in place
    (`gpu.read_in_place`), MoltenVK's fast math rounding by where a value
-   was loaded. The ray-query pixel shader (`scene_rq_vk.frag`) is still
-   the hand-written one: no device here traces rays, so only CI's lavapipe
-   could hold a quoted one to it.
+   was loaded. The ray-query pixel shader (`scene_rq_vk.frag`) was the
+   hand-written one until step 6b (below): no device here traces rays, so
+   only CI's lavapipe could hold a quoted one to it.
    Its cleanup removed `VERTEX_DEFAULT`, `VERTEX_DEPTH`, `FRAGMENT_DEPTH`,
    `shaders.default_shader` (a model without a shader is drawn by the
    scene's), `scene_vk.vert`, `scene_plain_vk.vert`, `scene_vk.frag` and
-   the three `depth_*vk.*`. `FRAGMENT_DEFAULT` stays as the ray-query
-   shader's source alone, and the generator lays the three blocks out from
+   the three `depth_*vk.*`. `FRAGMENT_DEFAULT` stayed as the ray-query
+   shader's source alone (step 6b removed it), and the generator lays the three blocks out from
    their tables, no longer from the hand-written declarations. No scene
    block uniform went with them: each of the 134 is read by a quoted
    shader, by the ray-query one (the rays, the probes) or copied by the
