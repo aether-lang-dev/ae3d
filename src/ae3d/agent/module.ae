@@ -73,6 +73,10 @@ struct Deferred {
     rows: int
     // What the read is about, for the reads that are about something.
     subject: ptr
+    // A pixel read also asks the renderer what is drawn there (#865): the
+    // index its answer is read by, or -1 when the renderer would not take
+    // the ask.
+    pick: int
 }
 
 struct Context {
@@ -175,6 +179,90 @@ defer_read(c: *Context, kind: int, id: int, x: int, y: int, width: int, height: 
     return defer_grid(c, kind, id, x, y, width, height, background, tolerance, 0, 0)
 }
 
+// The renderer asked what it draws at (x, y) in its next frame: the index
+// its answer is read by, or -1.
+ask_pick(c: *Context, x: int, y: int) -> int {
+    if c.gl_renderer != null { return gl.renderer_pick_ask(c.gl_renderer, x, y) }
+    if c.vk_renderer != null { return vulkan.renderer_pick_ask(c.vk_renderer, x, y) }
+    return 0 - 1
+}
+
+// The renderer's answer `k` into four floats, or false.
+read_pick(c: *Context, k: int, cells: ptr) -> bool {
+    if k < 0 { return false }
+    if c.gl_renderer != null { return gl.renderer_pick_read(c.gl_renderer, k, cells) }
+    if c.vk_renderer != null { return vulkan.renderer_pick_read(c.vk_renderer, k, cells) }
+    return false
+}
+
+// The model the renderer holds under `id`, or null.
+model_by_id(c: *Context, id: int) -> *Model {
+    count = model_count(c)
+    i = 0
+    while i < count {
+        m = model_at(c, i)
+        if m != null && m.id == id { return m }
+        i = i + 1
+    }
+    return null
+}
+
+// What is at a pixel, as the frame.pixel answer carries it: whether
+// anything, which model (its id, its place in the renderer's list, its name
+// and where it came from), which of its instances, how deep and where in the
+// world. {"available": false} when the renderer gave no answer.
+pick_json(c: *Context, d: *Deferred) -> ptr {
+    out = json.obj()
+    cells = calloc(4, 4)
+    if !read_pick(c, d.pick, cells) {
+        free(cells)
+        json.object_set_raw(out, "available", json.boolean(false))
+        return out
+    }
+    f = cells as f32[]
+    json.object_set_raw(out, "available", json.boolean(true))
+    if f[3] < 0.5 || f[0] < 0.5 {
+        free(cells)
+        json.object_set_raw(out, "hit", json.boolean(false))
+        return out
+    }
+    json.object_set_raw(out, "hit", json.boolean(true))
+    id = (f[0] + 0.5) as int
+    m = model_by_id(c, id)
+    named = json.obj()
+    json.object_set_raw(named, "id", json.from_int(id))
+    if m != null {
+        json.object_set_raw(named, "name", json.str(core.text(m.name)))
+        index = 0
+        count = model_count(c)
+        while index < count && model_at(c, index) != m { index = index + 1 }
+        json.object_set_raw(named, "index", json.from_int(index))
+        p = assets.provenance_for(m)
+        if p != null {
+            json.object_set_raw(named, "asset", json.str(assets.provenance_id(p)))
+            json.object_set_raw(named, "object", json.str(assets.provenance_object(p)))
+        }
+    }
+    json.object_set_raw(out, "model", named)
+    json.object_set_raw(out, "instance", json.from_int((f[1] + 0.5) as int))
+    depth = f[2] as float
+    json.object_set_raw(out, "depth", json.num(depth))
+    if c.camera != null && c.width > 0 && c.height > 0 {
+        at = core.unproject_pixel(c.camera as *Camera, d.x, d.y, c.width, c.height, depth)
+        json.object_set_raw(out, "position", vec3_json(at.x, at.y, at.z))
+        // A crowd the device sorts: its instance is its place in a tier's
+        // stream, which the sort reorders every frame, so the figure is
+        // the one the crowd's columns hold nearest the point (the crowd's
+        // data read, not changed).
+        if m != null && m.device_crowd != null {
+            row = core.device_crowd_figure_at(m.device_crowd as *DeviceCrowd, at.x, at.z, 3.0)
+            json.object_set_raw(out, "figure", json.from_int(row))
+        }
+    }
+    free(cells)
+    return out
+}
+
 defer_skeleton(c: *Context, id: int, skeleton: @keep ptr) -> bool {
     d = heap.new(Deferred)
     d.kind = READ_SKELETON
@@ -215,14 +303,36 @@ clear_capture(c: *Context) { c.want_capture = false }
 // Called once the frame has been read back, in the order the requests arrived.
 answer_deferred(c: *Context) {
     count = list.size(c.deferred)
+    waiting = list.new()
     i = 0
     while i < count {
         d = list.get_raw(c.deferred, i) as *Deferred
-        answer_one_read(c, d)
-        heap.free(d)
+        // A pixel asked what is drawn there waits for the frame that draws
+        // it: the answer's colour is that frame's too.
+        if d.kind == READ_PIXEL && d.pick >= 0 && pick_pending(c) {
+            list.add_raw(waiting, d as ptr)
+        } else {
+            answer_one_read(c, d)
+            heap.free(d)
+        }
         i = i + 1
     }
     list.clear(c.deferred)
+    i = 0
+    while i < list.size(waiting) {
+        list.add_raw(c.deferred, list.get_raw(waiting, i))
+        c.want_capture = true
+        c.want_deferred = true
+        i = i + 1
+    }
+    list.free(waiting)
+}
+
+// Whether the renderer has pixels asked about that no frame has drawn yet.
+pick_pending(c: *Context) -> bool {
+    if c.gl_renderer != null { return gl.renderer_pick_pending(c.gl_renderer) }
+    if c.vk_renderer != null { return vulkan.renderer_pick_pending(c.vk_renderer) }
+    return false
 }
 
 answer_one_read(c: *Context, d: *Deferred) {
@@ -238,6 +348,7 @@ answer_one_read(c: *Context, d: *Deferred) {
         json.object_set_raw(out, "x", json.from_int(d.x))
         json.object_set_raw(out, "y", json.from_int(d.y))
         json.object_set_raw(out, "frame", json.from_int(c.frame_count))
+        json.object_set_raw(out, "pick", pick_json(c, d))
         answer(d.id, out)
         return
     }
@@ -650,7 +761,7 @@ help_result() -> ptr {
     json.array_add_raw(ops, describe("frame.capture", "",
         "Read the finished frame into the engine. Answers with its size once it is there."))
     json.array_add_raw(ops, describe("frame.pixel", "x, y",
-        "One pixel of the captured frame as r, g, b, a and hex."))
+        "One pixel of the captured frame as r, g, b, a and hex, and what is drawn there: the frame is drawn once more into a target of ids, so the answer's pick names the model at the pixel (its id, its index among the renderer's models, its name and, for an asset, where it came from), which of its instances, how deep and where in the world, however it is posed, instanced or cut out. A skinned figure's bent arm, one tree of a thousand and the visible part of an alpha-tested leaf are each the model that is seen there, which a ray against bind-pose bounds gets wrong. pick.hit is false for the sky and anything nothing is drawn at."))
     json.array_add_raw(ops, describe("frame.region", "x, y, width, height, [background], [tolerance]",
         "Mean colour, coverage, and the luminance spread over a rectangle. A flat surface has a stddev near zero; stipple and shadow acne do not."))
     json.array_add_raw(ops, describe("frame.grid", "[x], [y], [width], [height], [columns], [rows], [background], [tolerance]",
@@ -3106,10 +3217,14 @@ handle(c: *Context, op: string, id: int, request: ptr) -> bool {
     }
 
     if op == "frame.pixel" {
-        return defer_read(c, READ_PIXEL, id,
-                          json.get_int(json.object_get_raw(request, "x")),
-                          json.get_int(json.object_get_raw(request, "y")),
-                          0, 0, 0, 0)
+        x = json.get_int(json.object_get_raw(request, "x"))
+        y = json.get_int(json.object_get_raw(request, "y"))
+        queued = defer_read(c, READ_PIXEL, id, x, y, 0, 0, 0, 0)
+        // The frame is drawn once more into a target of ids, and what
+        // answers is the colour and what is there.
+        d = list.get_raw(c.deferred, list.size(c.deferred) - 1) as *Deferred
+        d.pick = ask_pick(c, x, y)
+        return queued
     }
 
     if op == "frame.region" {

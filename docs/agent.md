@@ -69,7 +69,7 @@ interleaved with the first.
 | `scene.save` | `path, [mesh_directory]` | Write the scene to JSON, with generated geometry beside it. |
 | `scene.load` | `path` | Replace the scene with one from a file, and reframe the camera as it was saved. |
 | `frame.capture` |  | Read the finished frame into the engine. Answers with its size once it is there. |
-| `frame.pixel` | `x, y` | One pixel of the captured frame as r, g, b, a and hex. |
+| `frame.pixel` | `x, y` | One pixel of the captured frame as r, g, b, a and hex, and what is drawn there: the frame is drawn once more into a target of ids, so the answer's pick names the model at the pixel (its id, its index among the renderer's models, its name and, for an asset, where it came from), which of its instances, how deep and where in the world, however it is posed, instanced or cut out. A skinned figure's bent arm, one tree of a thousand and the visible part of an alpha-tested leaf are each the model that is seen there, which a ray against bind-pose bounds gets wrong. pick.hit is false for the sky and anything nothing is drawn at. |
 | `frame.region` | `x, y, width, height, [background], [tolerance]` | Mean colour, coverage, and the luminance spread over a rectangle. A flat surface has a stddev near zero; stipple and shadow acne do not. |
 | `frame.grid` | `[x], [y], [width], [height], [columns], [rows], [background], [tolerance]` | A window of the frame as a grid of cells, each with its mean colour and how much of it is not the background; the whole frame by default. One answer instead of a round trip a pixel, which is what makes a picture something an agent can read. Given a window no larger than the grid is fine, every cell is one pixel. |
 | `frame.hold` |  | Keep the captured frame as the reference frame.diff compares against. |
@@ -114,9 +114,23 @@ pixels are, so a 1280x720 rectangle costs an answer of about twenty bytes
 rather than 3.7MB.
 
     frame.capture                          -> {"width": 1024, "height": 768}
-    frame.pixel x=512 y=384                -> {"r": 133, "g": 85, "b": 70}
+    frame.pixel x=512 y=384                -> {"r": 133, "g": 85, "b": 70, "pick": {...}}
     frame.region x=412 y=284 width=200 height=200
                                            -> {"coverage": 0.991, "mean": [...]}
+
+`frame.pixel` also says what is drawn at the pixel (#865): the frame is drawn
+once more into a target of ids, and `pick` names the model there --
+
+    frame.pixel x=512 y=384
+      -> {"pick": {"available": true, "hit": true,
+                   "model": {"id": 17, "index": 3, "name": "zombie"},
+                   "instance": 41, "depth": 0.9852, "position": [1.2, 0.9, -3.4]}}
+
+-- however it is posed, instanced or cut out: a skinned figure's bent arm, one
+tree of a thousand and the visible part of an alpha-tested leaf are each the
+model that is seen there, where a ray against bind-pose bounds gets them
+wrong. A crowd the device sorts adds `figure`, the row of its columns nearest
+the point. `hit` is false for the sky and anything nothing is drawn at.
 
 `frame.hold` keeps the current capture as a reference and `frame.diff` reports
 what changed against it, which turns "did that command do anything" into a
