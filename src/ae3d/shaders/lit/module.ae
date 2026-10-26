@@ -1,9 +1,9 @@
 // ae3d.shaders.lit: the scene's shaders, written with `quote` (step 6,
 // docs/aether_quote_design.md section 11). They were VERTEX_DEFAULT and
 // FRAGMENT_DEFAULT (scene_vk.vert, scene_plain_vk.vert, its AE3D_UNSKINNED
-// variant, and scene_vk.frag; FRAGMENT_DEFAULT is still the source of the
-// ray-query variant, scene_rq_vk.frag): every model's surface, its lights and shadows, the sky's light on it, its
-// fog and its motion vector. The module is lit, not scene: ae3d.scene is the
+// variant, scene_vk.frag and its ray-query variant, scene_rq_vk.frag, which
+// lit_rq_pixel replaced last): every model's surface, its lights and shadows,
+// the sky's light on it, its fog and its motion vector. The module is lit, not scene: ae3d.scene is the
 // engine's, and two modules of one last name in a program name a quote's
 // helpers by what else it imports.
 //
@@ -59,13 +59,14 @@ import ae3d.shaderlib (vec2, vec3, vec4, mat2, mat4, Texture, Floats, Vec4s, rgb
                        dfdx_v2, dfdy_v2, dfdx_v3, dfdy_v3, fwidth_v3, texture_grad, abs_int, sin_v2, sin_v3, pow_v3,
                        abs_v3, step, mod, mod_v2, ceil, exp2, log, inversesqrt, mul_cols3, mat4_rows, mul_transpose_m2,
                        vec4s_at_i, floats_at_i, clamp_int, min_int, lane_at, lane_at_v3, vec3_xv, texel_fetch_at,
-                       yzx, zy, zyx, xzy, xy_v3, vec3_of_v2, yx)
+                       yzx, zy, zyx, xzy, xy_v3, vec3_of_v2, yx, AccelerationStructure, ray_query, ray_query_initialize,
+                       ray_query_proceed, ray_query_committed_hit, ray_flag_opaque, ray_flag_terminate_on_first_hit)
 
 exports (
     Draw, DrawMaterial, Surface, Cut, Wounds, Damage, Skin, LitVertex, LitPlainVertex, LitVaryings, LitOut,
     LitDepthVertex, LitDepthPlainVertex, LitDepthVaryings,
     draw_layout, draw_count, draw_uniform, draw_capture, draw_field, draw_type, place, gl_name,
-    lit_vertex, lit_plain_vertex, lit_pixel, lit_depth_vertex, lit_depth_plain_vertex, lit_depth_pixel, cloud_hash
+    lit_vertex, lit_plain_vertex, lit_pixel, lit_rq_pixel, lit_depth_vertex, lit_depth_plain_vertex, lit_depth_pixel, cloud_hash
 )
 
 // ── The draw's block ───────────────────────────────────────────────────
@@ -1841,6 +1842,348 @@ lit_pixel(draw: Draw, material: DrawMaterial, shading: Surface, cut: Cut, wounds
     return s
 }
 
+// The pixel shader that traces rays: lit_pixel and the rays (see the section
+// above). It is lit_pixel's body and nothing else changes: where the rays are
+// off (world.rays 0, or past the eye's reach) and the probes are off
+// (probes.on 0) it shades as lit_pixel does, which tests/test_gpu_lit_rq holds
+// it to on the CPU, where no ray finds anything. What it reads beyond
+// lit_pixel's:
+//
+//   probes            the probes round the eye (the camera's block)
+//   scene             the scene's acceleration structure (the world's set, 4)
+//   ddgi_irradiance   the probes' irradiance atlas (the camera's set, 6)
+//   ddgi_distance     their distance moments (7)
+//   ddgi_state        their state, two vec4s a probe (8, a storage buffer)
+lit_rq_pixel(draw: Draw, material: DrawMaterial, shading: Surface, cut: Cut, wounds: Wounds, damage: Damage, eye: Eye,
+          cascades: ShadowCascades, grid: Grid, probes: Probes, world: WorldState, weather: Weather, colour_map: Texture, normal_map: Texture,
+          scene_depth: Texture, damage_mask: Texture, shadow_map: Texture, cluster_lights: Vec4s, cluster_words: Floats,
+          lamp_shadow_map: Texture, occlusion_map: Texture, sky_light: Texture, brdf_lut: Texture,
+          sky_irradiance: Texture, scene: AccelerationStructure, ddgi_irradiance: Texture, ddgi_distance: Texture,
+          ddgi_state: Vec4s) -> *GpuShader {
+    s = gpu.fragment("lit_rq") quote | f: LitVaryings | {
+        // A cut model's far side, not drawn (#545); a wound's core a hole (#543).
+        if clipped_away(f.BindPos, cut.on, f.ClipLimb, cut.detached, cut.plane, cut.noise, cut.noise_scale) {
+            discard()
+        }
+        wound_at = if (wounds.count > 0) { wound_depth(f.BindPos, wounds.count, wounds.data) } else { 2.0 }
+        if wound_at < wounds.core {
+            discard()
+        }
+        moved = velocity(f.ClipNow, f.ClipPrev, eye.jitter)
+
+        tri_on = 0
+        hex_on = 0
+        tri = Tri { weights: vec3(0.0, 1.0, 0.0), x: splat2(0.0), y: splat2(0.0), z: splat2(0.0) }
+        hx = Hex { uv0: splat2(0.0), uv1: splat2(0.0), uv2: splat2(0.0), turn0: mat2_of(1.0, 0.0, 0.0, 1.0),
+                   turn1: mat2_of(1.0, 0.0, 0.0, 1.0), turn2: mat2_of(1.0, 0.0, 0.0, 1.0), dx: splat2(0.0),
+                   dy: splat2(0.0), weights: vec3(1.0, 0.0, 0.0) }
+        hex_weights = vec3(1.0, 0.0, 0.0)
+        tex_colour = splat4(0.0)
+        if material.triplanar > 0.0 {
+            tri = tri_setup(normalize(f.Normal), f.FragPos, material.triplanar)
+            tri_on = 1
+            tex_colour = tri_texture(colour_map, tri)
+        } else if material.tile_breakup > 0.0 {
+            hx = hex_setup(f.fragTexCoord, material.tile_rotation)
+            hex_on = 1
+            hc = hex_texture(colour_map, hx)
+            tex_colour = hc.colour
+            hex_weights = hc.weights
+        } else {
+            tex_colour = texture(colour_map, f.fragTexCoord)
+            if f.FlipNext.z >= 0.0 {
+                tex_colour = mix_v4(tex_colour, texture(colour_map, xy_v3(f.FlipNext)), f.FlipNext.z)
+            }
+        }
+        if tex_colour.w < material.cutout {
+            discard()
+        }
+        detail_weight = 0.0
+        if material.detail_scale > 0.0 && tri_on == 0 {
+            away = length_v3(f.FragPos - eye.position)
+            detail_weight = material.detail_strength * (1.0 - smoothstep(material.detail_fade * 0.5, material.detail_fade, away))
+        }
+
+        // Fire (#738) and the emissive: their own light.
+        if material.fire > 0.0 {
+            heat = clamp(tex_colour.x * f.InstanceColor.x, 0.0, 1.0)
+            glowing = black_body(heat * material.fire) * (heat * heat * heat * heat) * max(material.exposure * 0.1, 1.0)
+            return LitOut { colour: vec4(glowing * material.diffuse,
+                                         tex_colour.w * material.alpha * f.ParticleAlpha *
+                                         soft_fade(material.soft, eye.depth_on, eye.screen_size, scene_depth,
+                                                   eye.inv_view_projection, eye.position, f.FragPos)),
+                            velocity: moved }
+        }
+        if material.exposure > 10.0 {
+            glow_alpha = if (material.blend != 0) {
+                tex_colour.w * material.alpha * f.ParticleAlpha *
+                soft_fade(material.soft, eye.depth_on, eye.screen_size, scene_depth, eye.inv_view_projection, eye.position,
+                          f.FragPos)
+            } else { 1.0 }
+            return LitOut { colour: vec4(material.diffuse * rgb(tex_colour) * f.InstanceColor * (material.exposure * 0.1),
+                                         glow_alpha),
+                            velocity: moved }
+        }
+
+        norm = normalize(f.Normal)
+        normal_variance = 0.0
+        if draw.impostor != 0 {
+            // The picture's normal, baked in the figure's frame, turned into
+            // the world by the facing the vertex carried.
+            if tex_colour.w < 0.5 {
+                discard()
+            }
+            facing = normalize(f.Normal)
+            baked = xyz(texture(normal_map, f.fragTexCoord)) * 2.0 - splat3(1.0)
+            norm = normalize(facing * baked.x + vec3(0.0, baked.y, 0.0) + vec3(-facing.z, 0.0, facing.x) * baked.z)
+        } else if material.normal_map != 0 {
+            mn = mapped_normal(norm, f.FragPos, f.fragTexCoord, world.normal_strength, material.normal_strength, tri_on, tri,
+                               hex_on, hx, hex_weights, detail_weight, material.detail_scale, normal_map)
+            norm = mn.normal
+            normal_variance = mn.variance
+        }
+        if eye.capture == 1 {
+            return LitOut { colour: vec4(material.diffuse * rgb(tex_colour) * f.InstanceColor, tex_colour.w), velocity: moved }
+        }
+        if eye.capture == 2 {
+            return LitOut { colour: vec4(norm * 0.5 + splat3(0.5), 1.0), velocity: moved }
+        }
+        if eye.capture == 3 {
+            shown = moved * eye.screen_size / 200.0 + splat2(0.5)
+            return LitOut { colour: vec4(vec3(shown.x, shown.y, 0.0), 1.0), velocity: moved }
+        }
+        view_dir = normalize(eye.position - f.FragPos)
+
+        albedo0 = material.diffuse * rgb(tex_colour) * f.InstanceColor
+        albedo1 = albedo0
+        // Blood splashed on the skin (#546), and the damage the mask kept (#544).
+        if wounds.count > 0 {
+            albedo1 = mix_v3(albedo0, rgb(wounds.layers[0]), splat_cover(f.BindPos, wounds.count, wounds.data))
+        }
+        mask_at = xy(damage.rect) + clamp_v2(f.MaskUV, splat2(damage.clamp), splat2(1.0 - damage.clamp)) * vec2(damage.rect.z, damage.rect.w)
+        damaged = texture(damage_mask, mask_at)
+        albedo2 = albedo1
+        if damage.on != 0 {
+            for (k = 0; k < 4; k++) {
+                albedo2 = mix_v3(albedo2, rgb(damage.colours[k]), clamp(lane_at(damaged, k) * damage.colours[k].w, 0.0, 1.0))
+            }
+        }
+        albedo3 = albedo2
+        if wound_at < 1.0 {
+            layer = rgb(wounds.layers[0])
+            for (j = 1; j < 4; j++) {
+                if wound_at < wounds.layers[j].w {
+                    layer = rgb(wounds.layers[j])
+                }
+            }
+            albedo3 = mix_v3(albedo2, layer, smoothstep(1.0, 0.94, wound_at))
+        }
+        // The detail layer's colour, as a ratio to the texture's own mean.
+        albedo4 = albedo3
+        if detail_weight > 0.0 {
+            fine = rgb(texture(colour_map, f.fragTexCoord * material.detail_scale))
+            mean = max_v3(rgb(texture_lod(colour_map, f.fragTexCoord, 16.0)), splat3(0.02))
+            albedo4 = albedo3 * mix_v3(splat3(1.0), clamp_v3(fine / mean, splat3(0.0), splat3(2.0)), detail_weight)
+        }
+        // Patches over the world.
+        albedo5 = albedo4
+        if material.variation > 0.0 {
+            cell = f.FragPos / max(material.variation_scale, 0.01)
+            v0 = clip_value_noise(cell) * 0.65 + clip_value_noise(cell * 2.7 + vec3(13.1, 7.3, 2.9)) * 0.35
+            v1 = smoothstep(0.25, 0.75, v0)
+            albedo5 = albedo4 * (1.0 + (v1 * 2.0 - 1.0) * material.variation)
+        }
+        // GPU Gems chapter 5's noise over the shading.
+        albedo6 = albedo5
+        if shading.perlin != 0 {
+            noise_coord = f.FragPos * shading.noise_scale
+            noise_value = turbulence(noise_coord, shading.noise_octaves)
+            albedo6 = mix_v3(albedo5, albedo5 * (1.0 + noise_value * 0.3), shading.noise_intensity)
+        }
+
+        f0a = splat3(0.04) * material.specular
+        f0 = f0a
+        if material.metallic > 0.5 {
+            metal_f0 = albedo6
+            if albedo6.x > albedo6.y && albedo6.x > albedo6.z {
+                metal_f0 = mix_v3(vec3(0.95, 0.64, 0.54), albedo6, 0.7)
+            } else if albedo6.y > albedo6.x && albedo6.y > albedo6.z {
+                metal_f0 = mix_v3(vec3(0.70, 0.78, 0.74), albedo6, 0.7)
+            } else if albedo6.z > albedo6.x && albedo6.z > albedo6.y {
+                metal_f0 = mix_v3(vec3(0.66, 0.73, 0.80), albedo6, 0.7)
+            } else {
+                metal_f0 = mix_v3(vec3(0.95, 0.93, 0.88), albedo6, 0.7)
+            }
+            f0 = mix_v3(f0a, metal_f0, material.metallic)
+        } else {
+            f0 = mix_v3(f0a, albedo6, material.metallic)
+        }
+
+        ndotv = clamp(dot(norm, view_dir), 0.001, 1.0)
+        adjusted0 = max(sqrt(material.roughness * material.roughness + normal_variance), 0.08)
+        adjusted = adjusted0
+        wet0 = world.wetness * clamp(norm.y, 0.0, 1.0)
+        wet = wet0 * wet0
+        wet_mirror = 0.0
+        albedo = albedo6
+        if wet > 0.001 {
+            albedo = albedo6 * (1.0 - 0.35 * wet)
+            adjusted = max(mix(adjusted0, 0.05, wet), 0.08)
+            wet_mirror = wet * 0.7
+        } else {
+            wet_mirror = 0.0
+        }
+
+        // The lights that reach everywhere, then the lamps of this cell.
+        shaded0 = 1.0
+        if cascades.on != 0 && shading.shadows != 0 {
+            shaded0 = shadow_factor(f.Normal, world.shadow_direction, eye.depth_plane, f.FragPos, cascades.count,
+                                    cascades.splits, shading.shadow_intensity, cascades.matrices, cascades.texel_world,
+                                    shadow_map, shading.shadow_softness)
+        }
+        shaded = shaded0
+        if grid.key_lamp >= 0 && grid.lamp_base >= 0 && shading.shadows != 0 {
+            shaded = lamp_shadow(grid.key_lamp, normalize(f.Normal), grid.lamp_base, cluster_lights, f.FragPos,
+                                 lamp_shadow_map, shading.shadow_softness, shading.shadow_intensity)
+        }
+        // Rays, where they reach: past `ray_reach` from the eye a pixel is not traced.
+        traced = world.rays == 1 && (eye.ray_reach <= 0.0 || distance(f.FragPos, eye.position) < eye.ray_reach)
+        if traced && shading.shadows != 0 {
+            shaded = min(shaded, ray_shadow_factor(scene, f.Normal, f.FragPos, world.shadow_direction, shading.shadow_intensity,
+                                                   world.sun_angle, eye.ray_frame))
+        }
+        sunlit = cloud_shadow(f.FragPos, world.cloud_cover, world.cloud_sun, world.cloud_time)
+        lo = splat3(0.0)
+        for (i = 0; i < 16; i++) {
+            if i >= world.light_count {
+                break
+            }
+            if world.lights[i].kind != 1 {
+                gap = world.lights[i].position - f.FragPos
+                if dot(gap, gap) * world.lights[i].quadratic > 64.0 {
+                    continue
+                }
+                if world.lights[i].kind == 2 &&
+                   dot(normalize(-gap), normalize(world.lights[i].direction)) < world.lights[i].cos_outer {
+                    continue
+                }
+            }
+            dl = direct_light(world.lights[i], norm, view_dir, albedo, f0, ndotv, adjusted, wet_mirror, f.FragPos,
+                              material.metallic, material.reflectivity, material.roughness, shading.clearcoat,
+                              shading.clearcoat_roughness, shading.clearcoat_intensity, shading.sheen,
+                              shading.sheen_roughness, shading.sheen_colour, shading.transmission,
+                              shading.transmission_factor, shading.multiple_scattering, shading.energy_conservation)
+            lo = lo + (if (i == 0) { dl.lit * sunlit * shaded } else { dl.lit }) + dl.back_fill
+        }
+        if material.glitter > 0.0 && world.light_count > 0 && world.lights[0].kind == 1 {
+            lo = lo + glitter(norm, view_dir, world.lights[0], f.FragPos, material.glitter_grains, material.glitter,
+                              material.glitter_strength) * sunlit * shaded
+        }
+        if grid.dims.w > 0.5 {
+            cell_at = cluster_of(f.FragPos, grid.view_projection, eye.depth_plane, grid.dims, grid.depth)
+            first = int_of(floats_at_i(cluster_words, cell_at * 2) + 0.5)
+            count = int_of(floats_at_i(cluster_words, cell_at * 2 + 1) + 0.5)
+            for (k2 = 0; k2 < count; k2++) {
+                cl = clustered_light(cluster_lights, int_of(floats_at_i(cluster_words, first + k2) + 0.5))
+                lamp = cl.light
+                lgap = lamp.position - f.FragPos
+                far2 = dot(lgap, lgap)
+                if far2 >= cl.reach * cl.reach {
+                    continue
+                }
+                if lamp.kind == 2 && dot(normalize(-lgap), normalize(lamp.direction)) < lamp.cos_outer {
+                    continue
+                }
+                fade_out = 1.0 - smoothstep(0.75 * cl.reach, cl.reach, sqrt(far2))
+                ldl = direct_light(lamp, norm, view_dir, albedo, f0, ndotv, adjusted, wet_mirror, f.FragPos,
+                                   material.metallic, material.reflectivity, material.roughness, shading.clearcoat,
+                                   shading.clearcoat_roughness, shading.clearcoat_intensity, shading.sheen,
+                                   shading.sheen_roughness, shading.sheen_colour, shading.transmission,
+                                   shading.transmission_factor, shading.multiple_scattering, shading.energy_conservation)
+                lit = ldl.lit * fade_out
+                lo = lo + ldl.back_fill * fade_out
+                shade = 1.0
+                if cl.slot >= 0 && grid.lamp_base >= 0 && shading.shadows != 0 && dot(lit, splat3(0.333)) > 0.002 {
+                    shade = lamp_shadow(cl.slot, normalize(f.Normal), grid.lamp_base, cluster_lights, f.FragPos,
+                                        lamp_shadow_map, shading.shadow_softness, shading.shadow_intensity)
+                }
+                // By ray a lamp throws its own shadow, where it reaches: past the
+                // lamp's fall-off there is no light to shadow and no ray is cast.
+                if traced && shading.shadows != 0 {
+                    if dot(lit, splat3(0.333)) > 0.002 {
+                        shade = ray_lamp_factor(scene, f.Normal, f.FragPos, lamp.position, world.ray_lamp_radius, eye.ray_frame,
+                                                shading.shadow_intensity)
+                    } else {
+                        shade = 1.0
+                    }
+                }
+                lo = lo + lit * shade
+            }
+        }
+
+        // The sky's light, scaled by what of the sky the point sees.
+        shut0 = mix(1.0, f.Occlusion, world.occlusion_strength) * screen_occlusion(eye.history, f.ClipPrev, occlusion_map)
+        shut = shut0
+        if traced && world.ray_occlusion > 0.0 {
+            shut = shut0 * ray_occlusion_factor(scene, f.Normal, f.FragPos, eye.ray_frame, world.ray_occlusion,
+                                                world.ray_occlusion_strength)
+        }
+        colour0 = sky_lit_probed(norm, view_dir, albedo, f0, adjusted, material.metallic, ndotv, world.gi_off, shading.ibl,
+                                 shading.ibl_intensity, sky_irradiance, sky_light, brdf_lut, f.FragPos, probes.on, probes.dims,
+                                 probes.base, probes.spacing, probes.atlas, ddgi_irradiance, ddgi_distance, ddgi_state) * shut + lo
+
+        distance_to_camera = length_v3(f.FragPos - eye.position)
+        volumetric = calculate_volumetric_lighting(f.FragPos, world.lights[0].position, eye.position, shading.volumetric,
+                                                   shading.volumetric_steps, world.lights[0].colour,
+                                                   world.lights[0].temperature, shading.volumetric_scattering,
+                                                   shading.volumetric_intensity)
+        colour1 = colour0 + volumetric
+        colour2 = colour1 + caustic_light(f.FragPos, norm, shading.caustics, shading.caustics_water_level, shading.caustics_scale,
+                                          world.time, shading.caustics_speed, shading.caustics_depth,
+                                          world.lights[0].colour, world.lights[0].temperature, world.lights[0].intensity,
+                                          shading.caustics_intensity) * albedo
+        colour3 = colour2 * material.exposure
+        colour4 = colour3
+        if material.embers > 0.0 {
+            colour4 = colour3 + ember_light(f.FragPos, world.time, material.ember_cover, material.embers, material.ember_glow)
+        }
+        // The air between the eye and the shading.
+        colour = colour4
+        if weather.fog != 0 {
+            haze = smoothstep(weather.fog_start, weather.fog_end, distance_to_camera) * weather.fog_intensity
+            colour = mix_v3(colour4, weather.fog_radiance, clamp(haze, 0.0, 1.0))
+        }
+
+        final0 = tex_colour.w * material.alpha
+        final1 = final0
+        if material.alpha >= 0.99 {
+            final1 = 1.0
+        }
+        final_alpha = final1
+        if material.blend != 0 {
+            final_alpha = tex_colour.w * material.alpha * f.ParticleAlpha *
+                          soft_fade(material.soft, eye.depth_on, eye.screen_size, scene_depth, eye.inv_view_projection,
+                                    eye.position, f.FragPos)
+        }
+        return LitOut { colour: vec4(colour, final_alpha), velocity: moved }
+    }
+    place_rays(s)
+    hand_on(s)
+    return s
+}
+
+
+
+// The scene's ray-query pixel shader's own bindings beside the others': the
+// structure and the probes' images and state.
+fn place_rays(s: *GpuShader) {
+    place(s)
+    _s = gpu.capture_binding(s, "scene", 2, 4)
+    _i = gpu.capture_binding(s, "ddgi_irradiance", 1, 6)
+    _d = gpu.capture_binding(s, "ddgi_distance", 1, 7)
+    _t = gpu.capture_binding(s, "ddgi_state", 1, 8)
+}
+
 // The parameters the hand-written helpers took as parameters, which stay
 // parameters though every call hands them alike: what the GLSL is written
 // as, which MoltenVK's fast math rounds by.
@@ -1871,6 +2214,382 @@ fn hand_on(s: *GpuShader) {
     gpu.hand_on(s, "glitter", "l_in")
     gpu.hand_on(s, "compensate_energy_loss", "rough")
     gpu.hand_on(s, "cluster_of", "p")
+}
+
+// ── The ray-query pixel shader (scene_rq_vk.frag, quoted) ───────────────
+//
+// Where the device traces (VK_KHR_ray_query), the scene's pixel shader is
+// lit_rq_pixel: lit_pixel's body with the rays the hand-written
+// FRAGMENT_DEFAULT cast under AE3D_RAY_QUERY, in the order it cast them:
+//
+//   - the key light's shadow by ray, the sun a disc of rays on a spiral
+//     (ray_shadow_factor), taken with the shadow map's, the nearer;
+//   - each lamp's by one ray to a spot on its face (ray_lamp_factor);
+//   - the sky's occlusion by rays over the hemisphere (ray_occlusion_factor);
+//   - and the probes' irradiance (#537, ae3d.vkddgi) in place of the sky's
+//     where the probes are on (ddgi_irradiance).
+//
+// The rays are ray_hit: a ray query from just off the surface, opaque
+// geometry only, stopped at the first hit, meeting what casts a shadow (mask
+// bit 1, ae3d.vkrays' RAY_SHADOW) and not what only the probes see. A
+// helper is handed the scene's acceleration structure (set 2, binding 4) and
+// reads it in place, as the hand-written one read its global; the probes'
+// atlases (set 1, bindings 6 and 7) and state (8) the same.
+//
+// The probe volume's layout is ae3d.vkddgi's, and these helpers are the
+// hand-written ones' arithmetic in their order: a grid cell is three ints
+// (GLSL's ivec3), written out an axis at a time.
+
+// Whether anything the ray meets, from `near` to `far` along `direction`
+// (a unit vector) out of `origin`.
+@quotable
+ray_hit(scene: AccelerationStructure, origin: vec3, near: float, direction: vec3, far: float) -> bool {
+    q = ray_query()
+    ray_query_initialize(q, scene, ray_flag_terminate_on_first_hit() | ray_flag_opaque(), 1, origin, near, direction, far)
+    ray_query_proceed(q)
+    return ray_query_committed_hit(q)
+}
+
+// One ray toward `direction` from just off the surface: the origin steps out
+// along the normal by a little more than the surface's own tessellation
+// error, so a face does not shadow itself.
+@quotable
+ray_blocked_to(scene: AccelerationStructure, origin: vec3, direction: vec3, far: float) -> bool {
+    return ray_hit(scene, origin, 0.01, direction, far)
+}
+
+@quotable
+ray_blocked(scene: AccelerationStructure, origin: vec3, direction: vec3) -> bool {
+    return ray_blocked_to(scene, origin, direction, 500.0)
+}
+
+// A sun with a size: four rays into the cone the sun's disc subtends, on a
+// spiral turned by a per-pixel noise and by the frame's jitter, so the
+// temporal pass folds successive frames' taps into a smooth penumbra and a
+// still frame reads as a fine grain rather than a band. What stands close to
+// its shadow blocks every tap; what stands far blocks some.
+@quotable
+ray_shadow_factor(scene: AccelerationStructure, normal: vec3, frag_pos: vec3, shadow_direction: vec3,
+                  shadow_intensity: float, sun_angle: float, ray_frame: int) -> float {
+    surface = normalize(normal)
+    to_light = normalize(-shadow_direction)
+    if dot(surface, to_light) <= 0.0 {
+        return shadow_intensity
+    }
+    origin = frag_pos + surface * 0.02
+    if sun_angle <= 0.0 {
+        if ray_blocked(scene, origin, to_light) {
+            return shadow_intensity
+        }
+        return 1.0
+    }
+    side = normalize(cross(to_light, if (abs(to_light.y) < 0.9) { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }))
+    up = cross(side, to_light)
+    spread = tan(sun_angle)
+    pixel = frag_coord()
+    grain = fract(52.9829189 * fract(0.06711056 * pixel.x + 0.00583715 * pixel.y))
+    turn = 6.2831853 * fract(grain + float_of(ray_frame) * 0.6180339887)
+    blocked = 0.0
+    for (i = 0; i < 4; i++) {
+        radius = spread * sqrt((float_of(i) + 0.5) / 4.0)
+        angle = float_of(i) * 2.3999632 + turn
+        direction = normalize(to_light + side * (radius * cos(angle)) + up * (radius * sin(angle)))
+        if ray_blocked(scene, origin, direction) {
+            blocked = blocked + 1.0
+        }
+    }
+    return mix(1.0, shadow_intensity, blocked / 4.0)
+}
+
+// Ambient occlusion by ray: four rays into the hemisphere over the surface,
+// cosine-weighted (a ray near the normal counts for the sky it stands for),
+// on a spiral turned by a per-pixel noise and the frame's jitter as the sun's
+// taps are, each stopped at the occlusion's reach. The share that hit is how
+// much of the sky the point does not see: the same number the screen-space
+// pass estimates from the depth, from the scene itself, with no screen edge
+// or hidden surface to miss. From a hand's breadth out: a figure is drawn from
+// its near mesh and traced against its far one, a few centimetres apart, so a
+// ray that started at the skin found the proxy and dotted every figure with
+// its own shadow.
+@quotable
+ray_occlusion_factor(scene: AccelerationStructure, normal: vec3, frag_pos: vec3, ray_frame: int, reach: float,
+                     strength: float) -> float {
+    surface = normalize(normal)
+    origin = frag_pos + surface * 0.02
+    side = normalize(cross(surface, if (abs(surface.y) < 0.9) { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }))
+    up = cross(side, surface)
+    pixel = frag_coord()
+    grain = fract(52.9829189 * fract(0.06711056 * pixel.x + 0.00583715 * pixel.y) + 0.37)
+    turn = 6.2831853 * fract(grain + float_of(ray_frame) * 0.6180339887)
+    blocked = 0.0
+    for (i = 0; i < 4; i++) {
+        u = (float_of(i) + 0.5) / 4.0
+        sin_theta = sqrt(u)
+        cos_theta = sqrt(1.0 - u)
+        angle = float_of(i) * 2.3999632 + turn
+        direction = side * (cos(angle) * sin_theta) + up * (sin(angle) * sin_theta) + surface * cos_theta
+        if ray_hit(scene, origin, 0.12, direction, reach) {
+            blocked = blocked + 1.0
+        }
+    }
+    return clamp(1.0 - strength * blocked / 4.0, 0.0, 1.0)
+}
+
+// A lamp's shadow: one ray from the surface to the lamp, stopped short of
+// it, on a spot of the lamp's face picked by the pixel's noise and the
+// frame's jitter -- a lamp has a size, and the temporal pass folds the frames
+// into its penumbra. A lamp has no shadow map, so on the map path the key
+// light's shadow stands in for every lamp's; by ray each lamp throws its own:
+// the figure under the street lamp is the one thing on a night street the eye
+// asks for, and it was missing.
+@quotable
+ray_lamp_factor(scene: AccelerationStructure, normal: vec3, frag_pos: vec3, lamp: vec3, radius: float, ray_frame: int,
+                shadow_intensity: float) -> float {
+    surface = normalize(normal)
+    to_lamp0 = lamp - frag_pos
+    span = length_v3(to_lamp0)
+    if span < 0.05 {
+        return 1.0
+    }
+    to_lamp = to_lamp0 / span
+    if dot(surface, to_lamp) <= 0.0 {
+        return 1.0
+    }
+    side = normalize(cross(to_lamp, if (abs(to_lamp.y) < 0.9) { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }))
+    up = cross(side, to_lamp)
+    pixel = frag_coord()
+    grain = fract(52.9829189 * fract(0.06711056 * pixel.x + 0.00583715 * pixel.y) + 0.71)
+    seed = fract(grain + float_of(ray_frame) * 0.6180339887)
+    turn = 6.2831853 * seed
+    reach = radius * sqrt(fract(seed * 7.0))
+    spot = lamp + side * (reach * cos(turn)) + up * (reach * sin(turn))
+    toward = spot - frag_pos
+    far = length_v3(toward)
+    direction = toward / far
+    origin = frag_pos + surface * 0.02
+    // Stopped well short of the lamp: the fitting the light hangs from -- its
+    // head, its arm -- stands right over it, and a ray run to the light itself
+    // found the head and shadowed half the street's walls with a grain.
+    if ray_blocked_to(scene, origin, direction, max(far - 0.6, 0.05)) {
+        return shadow_intensity
+    }
+    return 1.0
+}
+
+// The probe volume (#537, ae3d.vkddgi, whose layout this must match): two
+// cascades of probes round the camera, each `dims` probes (x y z, and probes
+// a cascade in w) `spacing` apart, addressed toroidally -- a probe's slot is
+// its world cell modulo the grid -- so the grid scrolls with the camera by
+// whole cells and what a probe knows stays where it was learned. Each probe
+// keeps its irradiance and its distance moments in octahedral texels in two
+// atlases (`atlas`: the irradiance atlas's size, then the distance atlas's),
+// a one-texel gutter round each, and its state -- the offset that moves it
+// out of a wall, whether it is on -- in the state buffer (`state`, two vec4s
+// a probe). `base` is the world cell of each cascade's first probe.
+
+// A cell's slot on a side of `d` probes: v wrapped into 0 to d-1 (GLSL's %
+// is undefined for a negative operand, and a grid west of the origin has
+// negative cells).
+@quotable
+ddgi_wrap(v: int, d: int) -> int {
+    return v - d * int_of(floor(float_of(v) / float_of(d)))
+}
+
+// Probe index of the grid cell (gx, gy, gz) of cascade c.
+@quotable
+ddgi_index(c: int, gx: int, gy: int, gz: int, dims: vec4, base: vec4[2]) -> int {
+    b = base[c]
+    sx = ddgi_wrap(int_of(b.x) + gx, int_of(dims.x))
+    sy = ddgi_wrap(int_of(b.y) + gy, int_of(dims.y))
+    sz = ddgi_wrap(int_of(b.z) + gz, int_of(dims.z))
+    return c * int_of(dims.w) + (sz * int_of(dims.y) + sy) * int_of(dims.x) + sx
+}
+
+// Whether probe `index`, at grid coordinate g of cascade c, is on: traced
+// since it came to its cell (its stamp's w 1, not 0, nor 2 for woken with its
+// texels not yet replaced), and neither inside anything (its state's w 0) nor
+// asleep, with nothing near it to light (w 2).
+@quotable
+ddgi_on(c: int, gx: int, gy: int, gz: int, index: int, base: vec4[2], state: Vec4s) -> bool {
+    stamp = vec4s_at_i(state, index * 2 + 1)
+    b = base[c]
+    return abs(vec4s_at_i(state, index * 2).w - 1.0) < 0.5 && abs(stamp.w - 1.0) < 0.5 &&
+           stamp.x == b.x + float_of(gx) && stamp.y == b.y + float_of(gy) && stamp.z == b.z + float_of(gz)
+}
+
+// Where the probe at grid coordinate g of cascade c belongs: its cell's
+// centre, not its corner, so a floor or a wall at a whole number of cells does
+// not run through a row of probes.
+@quotable
+ddgi_home(c: int, gx: int, gy: int, gz: int, base: vec4[2], spacing: vec4) -> vec3 {
+    b = base[c]
+    return (xyz(b) + vec3(float_of(gx), float_of(gy), float_of(gz)) + splat3(0.5)) * lane_at(spacing, c)
+}
+
+// Where probe `index` stands: its home and the offset its state keeps.
+@quotable
+ddgi_probe_position(c: int, gx: int, gy: int, gz: int, index: int, base: vec4[2], spacing: vec4, state: Vec4s) -> vec3 {
+    return ddgi_home(c, gx, gy, gz, base, spacing) + xyz(vec4s_at_i(state, index * 2))
+}
+
+// Point P in cascade c's grid coordinates, a probe at each whole number.
+@quotable
+ddgi_grid(c: int, p: vec3, base: vec4[2], spacing: vec4) -> vec3 {
+    return p / lane_at(spacing, c) - xyz(base[c]) - splat3(0.5)
+}
+
+// The atlas texel a probe's octahedron starts at (its gutter's corner).
+@quotable
+ddgi_corner(index: int, side: float, dims: vec4) -> vec2 {
+    c = index / int_of(dims.w)
+    within = index - c * int_of(dims.w)
+    dx = int_of(dims.x)
+    dy = int_of(dims.y)
+    dz = int_of(dims.z)
+    x = within % dx
+    y = (within / dx) % dy
+    z = within / (dx * dy)
+    return vec2(float_of(x + y * dx), float_of(z + c * dz)) * (side + 2.0)
+}
+
+// Where direction n is read in probe `index`'s octahedron of `side` texels.
+@quotable
+ddgi_uv(index: int, n: vec3, side: float, atlas: vec2, dims: vec4) -> vec2 {
+    o = oct_encode(n) * 0.5 + splat2(0.5)
+    return (ddgi_corner(index, side, dims) + splat2(1.0) + o * side) / atlas
+}
+
+// What a cascade gives a point: the irradiance and the weights' sum.
+struct Probed {
+    irradiance: vec3
+    total: float
+}
+
+// The irradiance onto a surface at P facing N, seen from V's side, from the
+// eight probes of cascade c's cell around it: trilinear, each weighed by
+// whether it faces the surface and by whether, by its distance moments, it can
+// see it (Chebyshev). The irradiance the probes keep is the cosine average of
+// the radiance, so pi times it is the irradiance; a weight sum of nothing is
+// for the caller to take what lies beyond.
+@quotable
+ddgi_cascade(c: int, p: vec3, n: vec3, v: vec3, dims: vec4, base: vec4[2], spacing: vec4, atlas: vec4,
+             irradiance_map: Texture, distance_map: Texture, state: Vec4s) -> Probed {
+    cell = lane_at(spacing, c)
+    biased = p + (n * 0.2 + v * 0.8) * (0.3 * cell)
+    grid_pos = ddgi_grid(c, biased, base, spacing)
+    g0x = int_of(floor(grid_pos.x))
+    g0y = int_of(floor(grid_pos.y))
+    g0z = int_of(floor(grid_pos.z))
+    alpha = clamp_v3(grid_pos - vec3(float_of(g0x), float_of(g0y), float_of(g0z)), splat3(0.0), splat3(1.0))
+    sum = splat3(0.0)
+    total = 0.0
+    for (i = 0; i < 8; i++) {
+        ox = i & 1
+        oy = (i >> 1) & 1
+        oz = (i >> 2) & 1
+        gx = clamp_int(g0x + ox, 0, int_of(dims.x) - 1)
+        gy = clamp_int(g0y + oy, 0, int_of(dims.y) - 1)
+        gz = clamp_int(g0z + oz, 0, int_of(dims.z) - 1)
+        index = ddgi_index(c, gx, gy, gz, dims, base)
+        if !ddgi_on(c, gx, gy, gz, index, base, state) {
+            continue
+        }
+        probe = ddgi_probe_position(c, gx, gy, gz, index, base, spacing, state)
+        tri = vec3(mix(1.0 - alpha.x, alpha.x, float_of(ox)), mix(1.0 - alpha.y, alpha.y, float_of(oy)),
+                   mix(1.0 - alpha.z, alpha.z, float_of(oz)))
+        weight = tri.x * tri.y * tri.z
+        to_probe = probe - p
+        dir_to_probe = normalize(to_probe)
+        facing = (dot(dir_to_probe, n) + 1.0) * 0.5
+        weight = weight * (facing * facing + 0.2)
+        from_probe = biased - probe
+        far = length_v3(from_probe)
+        moments = xy(texture_lod(distance_map, ddgi_uv(index, from_probe / max(far, 0.0001), 14.0,
+                                                       vec2(atlas.z, atlas.w), dims), 0.0))
+        variance = abs(moments.x * moments.x - moments.y)
+        visible = 1.0
+        if far > moments.x {
+            gap = far - moments.x
+            visible = variance / (variance + gap * gap)
+            visible = max(visible * visible * visible, 0.0)
+        }
+        weight = weight * max(visible, 0.05)
+        // Small weights crushed, so a probe that barely sees the point does
+        // not tint it (Majercik et al.'s threshold).
+        if weight < 0.2 {
+            weight = weight * (weight * weight / 0.04)
+        }
+        light = rgb(texture_lod(irradiance_map, ddgi_uv(index, n, 6.0, vec2(atlas.x, atlas.y), dims), 0.0))
+        sum = sum + light * weight
+        total = total + weight
+    }
+    if total <= 0.0 {
+        return Probed { irradiance: splat3(0.0), total: total }
+    }
+    return Probed { irradiance: sum / total * 3.14159265, total: total }
+}
+
+// How far inside cascade c point P is, in cells from its nearest face: past
+// one the cascade is whole; under it, the next one out takes over.
+@quotable
+ddgi_inside(c: int, p: vec3, dims: vec4, base: vec4[2], spacing: vec4) -> float {
+    grid_pos = ddgi_grid(c, p, base, spacing)
+    edge = min_v3(grid_pos, (xyz(dims) - splat3(1.0)) - grid_pos)
+    return min(edge.x, min(edge.y, edge.z))
+}
+
+// The probes' irradiance at P onto N, the nearest cascade that holds it
+// blending into the next over its last cell, and beyond the last the `beyond`
+// irradiance (the sky's) over the far cascade's last cell. From the near
+// cascade out, so a point the near one holds whole reads its eight probes and
+// no more.
+@quotable
+ddgi_irradiance(p: vec3, n: vec3, v: vec3, beyond: vec3, dims: vec4, base: vec4[2], spacing: vec4, atlas: vec4,
+                irradiance_map: Texture, distance_map: Texture, state: Vec4s) -> vec3 {
+    result = splat3(0.0)
+    left = 1.0
+    for (c = 0; c < 2; c++) {
+        inside = ddgi_inside(c, p, dims, base, spacing)
+        if inside <= 0.0 {
+            continue
+        }
+        found = ddgi_cascade(c, p, n, v, dims, base, spacing, atlas, irradiance_map, distance_map, state)
+        if found.total <= 0.0 {
+            continue
+        }
+        share = clamp(inside, 0.0, 1.0) * left
+        result = result + found.irradiance * share
+        left = left - share
+        if left <= 0.0 {
+            return result
+        }
+    }
+    return result + beyond * left
+}
+
+// What the sky gives a surface where the probes may add to it: sky_lit, with
+// the irradiance the probes' where they are on (#537).
+@quotable
+sky_lit_probed(n: vec3, v: vec3, albedo: vec3, f0: vec3, rough: float, metal: float, ndotv: float, gi_off: int, ibl: int,
+               ibl_intensity: float, sky_irradiance_map: Texture, sky_light_map: Texture, brdf_lut: Texture, frag_pos: vec3,
+               probes_on: int, dims: vec4, base: vec4[2], spacing: vec4, atlas: vec4, irradiance_map: Texture,
+               distance_map: Texture, state: Vec4s) -> vec3 {
+    if gi_off != 0 {
+        return splat3(0.0)
+    }
+    f = f0 + (max_v3(splat3(1.0 - rough), f0) - f0) * pow(1.0 - ndotv, 5.0)
+    kd = (splat3(1.0) - f) * (1.0 - metal)
+    irradiance = sky_irradiance(n, sky_irradiance_map)
+    if probes_on != 0 {
+        irradiance = ddgi_irradiance(frag_pos, n, v, irradiance, dims, base, spacing, atlas, irradiance_map, distance_map, state)
+    }
+    diffuse = kd * albedo * irradiance / 3.14159265
+    if ibl == 0 {
+        return diffuse
+    }
+    ab = xy(texture(brdf_lut, vec2(ndotv, rough)))
+    specular = sky_reflection(reflect(-v, n), rough, sky_light_map) * (f0 * ab.x + splat3(ab.y))
+    return diffuse + specular * ibl_intensity
 }
 
 // ── The vertex shaders ─────────────────────────────────────────────────

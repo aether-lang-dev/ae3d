@@ -699,14 +699,14 @@ sky(...) -> *GpuShader {
    and on OpenGL one name is one uniform across the program. Each helper is
    the hand-written one's shape, and reads its uniforms in place
    (`gpu.read_in_place`), MoltenVK's fast math rounding by where a value
-   was loaded. The ray-query pixel shader (`scene_rq_vk.frag`) is still
-   the hand-written one: no device here traces rays, so only CI's lavapipe
-   could hold a quoted one to it.
+   was loaded. The ray-query pixel shader (`scene_rq_vk.frag`) was the
+   hand-written one until step 6b (below): no device here traces rays, so
+   only CI's lavapipe could hold a quoted one to it.
    Its cleanup removed `VERTEX_DEFAULT`, `VERTEX_DEPTH`, `FRAGMENT_DEPTH`,
    `shaders.default_shader` (a model without a shader is drawn by the
    scene's), `scene_vk.vert`, `scene_plain_vk.vert`, `scene_vk.frag` and
-   the three `depth_*vk.*`. `FRAGMENT_DEFAULT` stays as the ray-query
-   shader's source alone, and the generator lays the three blocks out from
+   the three `depth_*vk.*`. `FRAGMENT_DEFAULT` stayed as the ray-query
+   shader's source alone (step 6b removed it), and the generator lays the three blocks out from
    their tables, no longer from the hand-written declarations. No scene
    block uniform went with them: each of the 134 is read by a quoted
    shader, by the ray-query one (the rays, the probes) or copied by the
@@ -762,6 +762,51 @@ own sets after them (`frame.SCENE_SETS`, the crowd's rings at 3).
 No second camera is drawn yet (Nic: no multi-camera work before the
 scene).
 
+### Step 6b: the ray-query pixel shader (2026-10-26)
+
+The last hand-written scene shader, `scene_rq_vk.frag` (FRAGMENT_DEFAULT
+built with `AE3D_RAY_QUERY`), is `lit_rq_pixel` now, and both are gone.
+
+- **ae3d.gpu grew ray queries.** `AccelerationStructure` is
+  `accelerationStructureEXT`, captured and placed with `capture_binding`
+  (set 2, binding 4); `RayQuery` is `rayQueryEXT`, declared by
+  `q = ray_query()` and not given a value; `ray_query_initialize`,
+  `ray_query_proceed`, `ray_query_committed_hit` and the two flag constants
+  are the GLSL calls. A shader that traces is GLSL 4.60 with
+  `GL_EXT_ray_query`, and OpenGL's emission is refused. In MSL the structure
+  is an `instance_acceleration_structure` among the pixel shader's buffers
+  and a query an `intersection_query<triangle_data, instancing>` with the
+  flags as `intersection_params`. The CPU's evaluator has no scene: a ray finds
+  nothing. No aether change was needed.
+- **`lit_rq_pixel` is `lit_pixel`'s body with four additions**, in the order the
+  hand-written shader had them: the sun's shadow by four rays on a spiral
+  (`ray_shadow_factor`), a lamp's by one ray to a spot on its face
+  (`ray_lamp_factor`), the sky's occlusion by four rays over the hemisphere
+  (`ray_occlusion_factor`), and the probes' irradiance (`ddgi_irradiance`:
+  two cascades, trilinear over eight probes, each weighed by facing and by
+  Chebyshev visibility, a grid cell three ints for GLSL's `ivec3`, written
+  out an axis at a time). It is a copy of lit_pixel's body, not a
+  specialisation of it, so that `lit_pixel` and the 59 frames every device
+  without ray queries draws stay as they are (their GLSL, SPIR-V and
+  hashes are unchanged); `tests/test_gpu_lit_rq` is what keeps the copy
+  honest: on the CPU, where no ray finds anything and no probe is on, the two
+  shaders must shade 12 cases (rays and probes off and on, a key light, a lamp,
+  the sky) to the same lane, exactly. Four negative controls each fail it (the
+  body's exposure, the sun's factor, the lamps', the probes' fall-back).
+- **Where it is drawn.** `vkpipes` and `vkframe`'s crowd rings use
+  `LIT_RQ_QUOTED_FRAG` where the device traces, with the scene's vertex
+  shaders; its tree's hash is checked at start as the others'. Its bindings
+  are the hand-written one's (set 2 binding 4; set 1 bindings 6, 7 and 8).
+- **Held.** glslang for Vulkan 1.2 and `spirv-val` take its SPIR-V; its MSL
+  passes the device compiler and `xcrun metal` (MoltenVK takes no ray query,
+  so that is as far as the M6 goes: MSL ray queries are compile-checked
+  only). Only a device that traces draws it: CI's lavapipe (test_ray_shadows,
+  test_ray_occlusion, test_gi); the verification is recorded in
+  project_quote_shader_work.
+- **The cleanup** removed FRAGMENT_DEFAULT and, with it, 560 lines of
+  generator that read hand-written GLSL: the three blocks' uniforms are typed
+  by their tables alone, and `ae3d.vkscene` is byte for byte what it was.
+
 ### What it buys MSL (step 5, after this)
 
 MSL comes after the mesh shaders (Nic, 2026-10-19). Our own SPIR-V writer
@@ -806,12 +851,26 @@ literals as aggregates. Around them:
   `[[attribute(n)]]` (a mat4 four `float4`s), colour outputs four lanes wide
   at `[[color(k)]]` (Metal holds an output to its attachment's channels;
   MoltenVK widens them alike), the depth `[[depth(any)]]`.
-- **Bindings**, one rule for a Metal renderer to follow: Vulkan set N's
-  block at `[[buffer(N)]]`, the storage buffers at `[[buffer(8 + k)]]`, the
-  textures and their samplers at `[[texture(k)]]` and `[[sampler(k)]]` in
-  capture order, vertex buffers from `[[buffer(16)]]`. Discrete arguments,
-  not argument buffers: the simplest thing that compiles, and a renderer's
-  choice to change.
+- **Bindings**, two rules (written 2026-10-26, when the MSL first drew):
+  a pixel shader's resources are numbered as MoltenVK numbers a pipeline
+  layout's with its argument buffers off: the blocks and the storage
+  buffers `[[buffer(i)]]`, the textures `[[texture(i)]]` and their samplers
+  `[[sampler(i)]]`, each kind counted from 0 over the shader's bindings in
+  set and binding order. A shader with a block and textures of its own (every
+  quoted pass) is `[[buffer(0)]]` and its textures `[[texture(0)]]`, ... in
+  capture order, as before. The scene's pixel shader has its draw, camera
+  and world blocks (sets 0, 1, 2 at binding 0), its storage buffers and
+  textures where `capture_binding` puts them: `lit_quoted` is buffers 0
+  (draw), 1 (camera), 2 and 3 (the lamps' storage), 4 (world), and textures
+  0 to 9 in binding order (set 0's colour, normal, depth, damage; set 1's
+  shadow, lamp shadow, occlusion; set 2's sky light, BRDF, sky irradiance),
+  not the order the shader names them in. The count is MoltenVK's where the
+  shader names every binding its layouts have, as the scene's do on a device
+  with no ray query (a binding the layout has and the shader does not name
+  would be a gap to count). A vertex shader's rule is a Metal renderer's to
+  choose and untested (below): Vulkan set N's block `[[buffer(N)]]`, the
+  storage buffers `[[buffer(8 + k)]]`, textures and samplers in capture
+  order, vertex buffers from `[[buffer(16)]]`.
 
 How it is held:
 
@@ -827,10 +886,82 @@ How it is held:
   logged with `MVK_CONFIG_DEBUG=1`): every one of the 41 paired, the stage
   interfaces the same (attributes, varying locations, outputs), and 506 of
   ae3d.gpu's offsets asserted on MoltenVK's own block structs compile. That
-  is a check of the interfaces and layouts, not of the arithmetic: nothing
-  here draws with the MSL yet.
+  is a check of the interfaces and layouts, not of the arithmetic. The
+  arithmetic is the next part.
 
-**What is left, for Nic: the Metal path (#312).** Three ways, smallest first:
+### MSL through MoltenVK (route 1, 2026-10-26)
+
+Nic chose route 1: the Vulkan renderer draws the quoted pixel shaders from
+their MSL, and the frames are held to the SPIR-V's. `AE3D_MSL=1` (macOS,
+MoltenVK) does it; the default stays SPIR-V.
+
+- **How.** `ae3d.vkmsl` (generated by `generate_shaders`, held by `--check`
+  like the rest) carries each fragment shader of `src/ae3d/metal` as the code
+  of a shader module: MoltenVK's magic word (`kMVKMagicNumberMSLSourceCode`,
+  0x19960412), the text, a NUL, zero padding. `vkpipes.shader` makes the
+  module from it for a quoted pixel shader, and `vkdevice.uses_msl` turns
+  MoltenVK's argument buffers off (`MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0`,
+  set before the first instance) so its resources are the discrete ones the
+  numbering above is. The entry function is renamed `main0` in the module's
+  text (the checked-in files keep their own names): that is the name
+  MoltenVK finds a direct-MSL module's function by, and the pipeline stage's
+  `pName` must be it too (`vkpipes.entry_of`; `main` or the shader's own name
+  made the pipeline fail with "function could not be compiled"). The dynamic
+  uniform buffer needs nothing: with argument buffers off MoltenVK applies the
+  dynamic offset when it binds the buffer.
+- **Pixel shaders only.** MoltenVK 1.4.2 refuses a pipeline whose vertex
+  module is MSL: "Failed to get vertex outputs: SPIRV file too small". It
+  reads the vertex stage's outputs from its SPIR-V to number the fragment
+  stage's inputs, for a pipeline of any fragment shader. Its header says
+  direct MSL is not officially supported, and for the vertex stage it does
+  not work. So the 27 pixel-shader modules a scene run makes are MSL
+  (`vkpipes.msl_made`), and the vertex shaders (lit, the sea's, the crowd's,
+  the full-screen vertex shader) stay SPIR-V; their MSL is compile-checked
+  and its structs and offsets paired with MoltenVK's, as before, and
+  evaluated on the CPU, and nothing more until a Metal renderer or route 2
+  draws it.
+- **Numerics.** MoltenVK compiles a SPIR-V shader with Metal's fast math
+  (`MathMode Fast`, fast math functions) and a direct-MSL module safe
+  (`MathMode Safe`, precise functions); its log says so
+  (`MVK_CONFIG_DEBUG=1 MVK_CONFIG_LOG_LEVEL=4`). Against the default SPIR-V
+  the MSL's 1x parity frames differ in 26 of 56 (most by a step in one to
+  thirty channels of 147,456), and the two screen-space ones, SSAO and SSR,
+  in 769 and 1,001 channels, worst 11 and 13 steps: the rounding of the
+  maths in a hash-sampled loop, not a different shader. `#pragma METAL fp
+  math_mode(fast)` brings most frames to a channel or two but not those two
+  (Metal's fast math functions are a compiler option, and asking for them in
+  the source did nothing), so the comparison is made at one mode: the SPIR-V
+  side with `MVK_CONFIG_FAST_MATH_ENABLED=0` too (and the MSL run's SPIR-V
+  vertex shaders alike). There the arithmetic is the same: **the MSL's frames
+  are the SPIR-V's byte for byte.** At 1x, 54 of 56 parity frames; the two
+  that differ are the clouds of #793, whose own runs differ by up to 2,649
+  channels on Vulkan and by some on OpenGL, which this does not touch. At 4x,
+  47 of 56, the clouds again, and seven frames that share the scene's sphere
+  at one channel by one step (`lit_quoted`'s MSL against its SPIR-V: the last
+  bit of one pixel). No tolerance is needed but #793's, which
+  `frames_against` already has, and one channel by one step in those seven
+  (the same pixel, 77,80, of the spheres: `lit_quoted`'s last bit).
+- **What holds it.** `frames_against.sh` takes `AE3D_HERE_ENV` and
+  `AE3D_THERE_ENV` (variables for this tree's draws and the ref's) and
+  `AE3D_WITHIN`, `AE3D_OVER` (a tolerance for every frame but the clouds and
+  the city), so `AE3D_WITHIN=1 AE3D_OVER=2 AE3D_HERE_ENV="AE3D_MSL=1
+  MVK_CONFIG_FAST_MATH_ENABLED=0" AE3D_THERE_ENV=MVK_CONFIG_FAST_MATH_ENABLED=0
+  ./scripts/frames_against.sh HEAD` draws the parity cases and zombie_city's
+  frames both ways: 59 of 59, 47 of the 56 parity frames byte for byte, the
+  clouds and the city within their own tolerances, and `fxaa_vk` and six
+  more at the one channel.
+  `tests/test_vk_msl` (macOS) draws a scene with the SPIR-V and then with the
+  MSL in one process, holds the frames equal byte for byte, and counts the
+  modules made from MSL (none for the first draw, at least 20 for the
+  second, 27 now): a run that quietly fell back to the SPIR-V would draw the
+  same frame, so the count is what shows the MSL was used. Negative controls
+  (2026-10-26): the switch ignored fails the count; every `max(` of the MSL
+  made `min(` fails the frame (5,415 of 24,576 channels, worst 213); the
+  scene's resources numbered by the old capture-order rule fails the frame.
+
+**Done, 2026-10-26: route 1, for the pixel shaders** (above). **What is left, for
+Nic: the Metal path (#312)**, after the Vulkan performance pass. Three ways,
+smallest first (the first is built, less the vertex shaders):
 
 1. **Our MSL through MoltenVK.** MoltenVK takes MSL source in place of
    SPIR-V (`vkCreateShaderModule`, its MSL magic number), so the Vulkan

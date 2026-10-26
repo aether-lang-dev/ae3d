@@ -1310,19 +1310,19 @@ fragment ae_lit_frag_out ae_lit_fragment(
     ae_lit_in ae_in [[stage_in]],
     constant DrawBlock& ae_set0 [[buffer(0)]],
     constant CameraBlock& ae_set1 [[buffer(1)]],
-    constant WorldBlock& ae_set2 [[buffer(2)]],
+    constant WorldBlock& ae_set2 [[buffer(4)]],
     texture2d<float> colour_map [[texture(0)]], sampler ae_smp_colour_map [[sampler(0)]],
-    texture2d<float> scene_depth [[texture(1)]], sampler ae_smp_scene_depth [[sampler(1)]],
-    texture2d<float> normal_map [[texture(2)]], sampler ae_smp_normal_map [[sampler(2)]],
+    texture2d<float> scene_depth [[texture(2)]], sampler ae_smp_scene_depth [[sampler(2)]],
+    texture2d<float> normal_map [[texture(1)]], sampler ae_smp_normal_map [[sampler(1)]],
     texture2d<float> damage_mask [[texture(3)]], sampler ae_smp_damage_mask [[sampler(3)]],
     texture2d<float> shadow_map [[texture(4)]], sampler ae_smp_shadow_map [[sampler(4)]],
     texture2d<float> lamp_shadow_map [[texture(5)]], sampler ae_smp_lamp_shadow_map [[sampler(5)]],
     texture2d<float> occlusion_map [[texture(6)]], sampler ae_smp_occlusion_map [[sampler(6)]],
-    texture2d<float> sky_irradiance [[texture(7)]], sampler ae_smp_sky_irradiance [[sampler(7)]],
-    texture2d<float> sky_light [[texture(8)]], sampler ae_smp_sky_light [[sampler(8)]],
-    texture2d<float> brdf_lut [[texture(9)]], sampler ae_smp_brdf_lut [[sampler(9)]],
-    const device float4* cluster_lights [[buffer(8)]],
-    const device float* cluster_words [[buffer(9)]]) {
+    texture2d<float> sky_irradiance [[texture(9)]], sampler ae_smp_sky_irradiance [[sampler(9)]],
+    texture2d<float> sky_light [[texture(7)]], sampler ae_smp_sky_light [[sampler(7)]],
+    texture2d<float> brdf_lut [[texture(8)]], sampler ae_smp_brdf_lut [[sampler(8)]],
+    const device float4* cluster_lights [[buffer(2)]],
+    const device float* cluster_words [[buffer(3)]]) {
     ae_lit_frag_out ae_out;
     float4 ae_frag_coord = ae_in.ae_frag_coord;
     float2 fragTexCoord = ae_in.fragTexCoord;

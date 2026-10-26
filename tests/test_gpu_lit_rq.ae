@@ -1,0 +1,257 @@
+// The scene's ray-query pixel shader (ae3d.shaders.lit's lit_rq_pixel), no
+// GPU: the shader the generator wrote (src/ae3d/vkspirv/glsl/lit_rq_quoted.frag,
+// src/ae3d/metal/lit_rq_quoted.frag.metal), held to lit_pixel on the CPU.
+//
+// The ray-query shader is lit_pixel's body with the rays and the probes added
+// (the hand-written FRAGMENT_DEFAULT's AE3D_RAY_QUERY blocks, quoted), so
+// where there is nothing to trace and no probe to read it must shade as
+// lit_pixel does. The CPU's evaluator has no scene, so every ray finds
+// nothing, and a state buffer with no data has every probe off. Each case is
+// run through both shaders at the same inputs and every lane of the colour and
+// of the motion held equal exactly:
+//
+//   - the rays and the probes off;
+//   - the rays on (the sun's disc, the lamps' faces, the occlusion's
+//     hemisphere), the probes off;
+//   - the probes on, with none of them on;
+//   - both.
+//
+// A change to one of the two bodies that the other did not get fails the case
+// whose shading it changed. The cases light the surface by a key light and the
+// sky, with a surface facing the sun (a surface turned from it is shadowed by
+// ray_shadow_factor at once, which lit_pixel's map-less path does not do).
+//
+// What a GPU makes of them is CI's (the ray-query suites on lavapipe:
+// test_ray_shadows, test_ray_occlusion, test_gi).
+import std.os
+import std.list
+import std.file
+import std.string
+import ae3d.gpu
+import ae3d.gpu (GpuShader, GpuVal)
+import ae3d.shaders.lit
+import ae3d.shaders.lit (Draw, DrawMaterial, Surface, Cut, Wounds, Damage)
+import ae3d.shaders.frame
+import ae3d.shaders.frame (Eye, ShadowCascades, Grid, Probes, WorldState, WorldLight, Weather)
+import ae3d.shaderlib
+import ae3d.shaderlib (vec2, vec3, vec4, Texture, Floats, Vec4s, AccelerationStructure, ShaderImage, image_new, image_set,
+                       image_free, texture_of, vec4s_of, floats_of)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern exit(code: int)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+has(text: string, part: string) -> bool { return string.contains(text, part) != 0 }
+
+flat_picture(r: float, g: float, b: float, a: float) -> *ShaderImage {
+    img = image_new(4, 4)
+    y = 0
+    while y < 4 {
+        x = 0
+        while x < 4 {
+            image_set(img, x, y, r, g, b, a)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return img
+}
+
+// The scene's varyings at one point.
+varyings(normal: vec3, at: vec3) -> *GpuVal {
+    v = gpu.vstruct()
+    gpu.val_set(v, "fragTexCoord", gpu.v2(0.5, 0.5))
+    gpu.val_set(v, "Normal", gpu.v3(normal.x, normal.y, normal.z))
+    gpu.val_set(v, "FragPos", gpu.v3(at.x, at.y, at.z))
+    gpu.val_set(v, "InstanceColor", gpu.v3(1.0, 1.0, 1.0))
+    gpu.val_set(v, "FragPosLightSpace", gpu.v4(0.0, 0.0, 0.0, 1.0))
+    gpu.val_set(v, "Occlusion", gpu.v1(0.8))
+    gpu.val_set(v, "ClipNow", gpu.v4(0.2, -0.1, 0.5, 2.0))
+    gpu.val_set(v, "ClipPrev", gpu.v4(0.1, 0.1, 0.5, 2.0))
+    gpu.val_set(v, "BindPos", gpu.v3(0.0, 0.0, 0.0))
+    gpu.val_set(v, "ClipLimb", gpu.v1(0.0))
+    gpu.val_set(v, "MaskUV", gpu.v2(0.0, 0.0))
+    gpu.val_set(v, "ParticleAlpha", gpu.v1(1.0))
+    gpu.val_set(v, "FlipNext", gpu.v3(0.0, 0.0, -1.0))
+    return v
+}
+
+run_pixel(s: *GpuShader, v: *GpuVal) -> *GpuVal {
+    cx = gpu.cpu_new(s)
+    gpu.cpu_set_frag_coord(cx, 10.5, 7.5)
+    out = gpu.cpu_run(cx, v)
+    if out == null { println("  cpu_run: ${gpu.last_error()}") }
+    gpu.cpu_free(cx)
+    return out
+}
+
+// Whether the two runs' colour and motion are the same, lane for lane.
+same_out(a: *GpuVal, b: *GpuVal) -> bool {
+    if a == null || b == null { return false }
+    ca = gpu.val_field(a, "colour")
+    cb = gpu.val_field(b, "colour")
+    ma = gpu.val_field(a, "velocity")
+    mb = gpu.val_field(b, "velocity")
+    return gpu.val_x(ca) == gpu.val_x(cb) && gpu.val_y(ca) == gpu.val_y(cb) && gpu.val_z(ca) == gpu.val_z(cb) &&
+           gpu.val_w(ca) == gpu.val_w(cb) && gpu.val_x(ma) == gpu.val_x(mb) && gpu.val_y(ma) == gpu.val_y(mb)
+}
+
+// The lamps' words (ae3d.lightgrid's, five vec4s a lamp: position and reach;
+// colour and intensity; direction and kind; the three attenuation terms and
+// the temperature; the spot's cone and the lamp's shadow slot, -1 for none)
+// for one point lamp, and the one cell's list of it.
+lamp_words() -> Vec4s {
+    w = calloc(20, 4) as f32[]
+    w[0] = 0.0
+    w[1] = 3.0
+    w[2] = 0.0
+    w[3] = 20.0
+    w[4] = 1.0
+    w[5] = 0.8
+    w[6] = 0.6
+    w[7] = 5.0
+    w[11] = 0.0
+    w[12] = 1.0
+    w[14] = 0.01
+    w[15] = 3000.0
+    w[18] = -1.0
+    return vec4s_of(w as ptr, 5)
+}
+
+cell_words() -> Floats {
+    w = calloc(3, 4) as f32[]
+    w[0] = 2.0
+    w[1] = 1.0
+    w[2] = 0.0
+    return floats_of(w as ptr, 3)
+}
+
+// The shading both shaders are run with: a key light and a sky, a material
+// with a normal, and a surface 1.2 m up.
+sun_light() -> WorldLight {
+    return WorldLight { position: vec3(0.0, 30.0, 0.0), colour: vec3(1.0, 0.95, 0.9), intensity: 3.0, temperature: 6500.0,
+                        kind: 1, direction: vec3(0.0, 1.0, 0.0), constant: 1.0, linear: 0.0, quadratic: 0.0,
+                        cos_outer: 0.0, cos_inner: 0.0 }
+}
+
+main() {
+    println("ae3d.shaders.lit: the ray-query pixel shader")
+    grey = flat_picture(0.5, 0.5, 0.5, 1.0)
+    colour = texture_of(grey)
+    flat = texture_of(grey)
+    draw = Draw { lift: 0.0 }
+    material = DrawMaterial { diffuse: vec3(0.5, 1.0, 0.25), specular: vec3(1.0, 1.0, 1.0), metallic: 0.0, roughness: 0.6,
+                              alpha: 1.0, exposure: 1.0 }
+    eye = Eye { far: 100.0, position: vec3(0.0, 2.0, 8.0), screen_size: vec2(64.0, 36.0), depth_plane: vec4(vec3(0.0, 0.0, 0.0), 0.5),
+                ray_frame: 3 }
+    shading = Surface { shadows: 1, shadow_intensity: 0.3, shadow_softness: 1.0, ibl: 1, ibl_intensity: 1.0 }
+    // One cell, one point lamp in it.
+    grid = Grid { dims: vec4(vec3(1.0, 1.0, 1.0), 1.0), depth: vec4(vec3(1.0, 0.0, 0.0), 0.0), lamp_base: 0 - 1, key_lamp: 0 - 1 }
+    lamps = lamp_words()
+    cells = cell_words()
+    off = Probes { on: 0, dims: vec4(vec3(4.0, 4.0, 4.0), 64.0), spacing: vec4(vec3(1.0, 2.0, 0.0), 0.0),
+                   atlas: vec4(vec3(64.0, 64.0, 32.0), 32.0) }
+    on = Probes { on: 1, dims: vec4(vec3(4.0, 4.0, 4.0), 64.0), spacing: vec4(vec3(1.0, 2.0, 0.0), 0.0),
+                  atlas: vec4(vec3(64.0, 64.0, 32.0), 32.0) }
+    world_off = WorldState { light_count: 1, shadow_direction: vec3(0.0, -1.0, 0.0), rays: 0, sun_angle: 0.0 }
+    world_off.lights[0] = sun_light()
+    world_on = WorldState { light_count: 1, shadow_direction: vec3(0.0, -1.0, 0.0), rays: 1, sun_angle: 0.02,
+                            ray_occlusion: 4.0, ray_occlusion_strength: 0.7, ray_lamp_radius: 0.15 }
+    world_on.lights[0] = sun_light()
+    weather = Weather { fog: 0 }
+    scene = AccelerationStructure { handle: null }
+    no_state = Vec4s { data: null }
+
+    rq0 = lit.lit_rq_pixel(draw, material, shading, Cut { on: 0 }, Wounds { count: 0 }, Damage { on: 0 }, eye,
+                           ShadowCascades { on: 0 }, grid, off, world_off, weather, colour, flat, flat, flat, flat,
+                           lamps, cells, flat, flat, flat, flat, flat, scene, flat, flat, no_state)
+    vs = lit.lit_vertex(draw, Cut { on: 0 }, lit.Skin {}, eye)
+    _l = gpu.link(vs, rq0)
+
+    println("what the generator wrote")
+    vk = gpu.emit_glsl(rq0, gpu.VULKAN)
+    if vk == "" { println("    ${gpu.last_error()}") }
+    held, gerr = file.read("src/ae3d/vkspirv/glsl/lit_rq_quoted.frag")
+    check("the GLSL is the generator's", gerr == "" && vk == held)
+    check("at 460 with the ray-query extension", has(vk, "#version 460\n#extension GL_EXT_ray_query : require\n"))
+    check("the structure at set 2, binding 4", has(vk, "layout(set = 2, binding = 4) uniform accelerationStructureEXT scene;"))
+    check("the probes' atlases at set 1, bindings 6 and 7 and their state at 8",
+          has(vk, "layout(set = 1, binding = 6) uniform sampler2D ddgi_irradiance;") &&
+          has(vk, "layout(set = 1, binding = 7) uniform sampler2D ddgi_distance;") &&
+          has(vk, "layout(std430, set = 1, binding = 8) readonly buffer ddgi_state_buffer { vec4 ddgi_state[]; };"))
+    check("the camera's block carries the probes", has(vk, "    Probes probes;\n"))
+    check("OpenGL's is refused", gpu.emit_glsl(rq0, gpu.GL) == "" && has(gpu.last_error(), "no ray queries"))
+    msl = gpu.emit_msl(rq0)
+    if msl == "" { println("    ${gpu.last_error()}") }
+    heldm, merr = file.read("src/ae3d/metal/lit_rq_quoted.frag.metal")
+    check("the MSL is the generator's", merr == "" && msl == heldm)
+    check("the pixel shader's buffers, MoltenVK's way: the structure after the world's block",
+          has(msl, "constant WorldBlock& ae_set2 [[buffer(5)]]") && has(msl, "instance_acceleration_structure scene [[buffer(6)]]"))
+
+    println("held to lit_pixel on the CPU, where no ray finds anything")
+    normals = [vec3(0.0, 1.0, 0.0), vec3(0.3, 0.9, 0.1), vec3(0.0, 0.8, 0.6)]
+    spots = [vec3(0.0, 1.2, 0.0), vec3(3.0, 0.2, -2.0), vec3(-4.0, 5.0, 1.0)]
+    cases = 0
+    agree = 0
+    r = 0
+    while r < 4 {
+        world = world_off
+        probes = off
+        if r == 1 || r == 3 { world = world_on }
+        if r == 2 || r == 3 { probes = on }
+        k = 0
+        while k < 3 {
+            a = lit.lit_pixel(draw, material, shading, Cut { on: 0 }, Wounds { count: 0 }, Damage { on: 0 }, eye,
+                              ShadowCascades { on: 0 }, grid, world, weather, colour, flat, flat, flat, flat,
+                              lamps, cells, flat, flat, flat, flat, flat)
+            b = lit.lit_rq_pixel(draw, material, shading, Cut { on: 0 }, Wounds { count: 0 }, Damage { on: 0 }, eye,
+                                 ShadowCascades { on: 0 }, grid, probes, world, weather, colour, flat, flat, flat, flat,
+                                 lamps, cells, flat, flat, flat, flat, flat, scene, flat, flat,
+                                 no_state)
+            va = varyings(normals[k], spots[k])
+            vb = varyings(normals[k], spots[k])
+            oa = run_pixel(a, va)
+            ob = run_pixel(b, vb)
+            cases = cases + 1
+            if same_out(oa, ob) { agree = agree + 1 } else if oa != null && ob != null {
+                ca = gpu.val_field(oa, "colour")
+                cb = gpu.val_field(ob, "colour")
+                println("    case ${r}.${k}: ${gpu.val_x(ca)} ${gpu.val_y(ca)} ${gpu.val_z(ca)} against ${gpu.val_x(cb)} ${gpu.val_y(cb)} ${gpu.val_z(cb)}")
+            }
+            gpu.val_free(oa)
+            gpu.val_free(ob)
+            gpu.val_free(va)
+            gpu.val_free(vb)
+            gpu.shader_free(a)
+            gpu.shader_free(b)
+            k = k + 1
+        }
+        r = r + 1
+    }
+    check("the same colour and motion as lit_pixel's, with the rays and the probes off, the rays on, the probes on and both (${agree} of ${cases})",
+          agree == cases && cases == 12)
+
+    gpu.shader_free(rq0)
+    gpu.shader_free(vs)
+    free(lamps.data)
+    free(cells.data)
+    image_free(grey)
+    if g_failures > 0 {
+        println("test_gpu_lit_rq: ${g_failures} of ${g_checks} checks failed")
+        exit(1)
+    }
+    println("test_gpu_lit_rq: all checks passed (${g_checks})")
+}

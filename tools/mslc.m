@@ -5,11 +5,13 @@
 //
 // The runtime compiler reports diagnostics only when a source fails, so each
 // source is compiled behind pragmas that make every warning clang knows an
-// error (-Weverything), less four groups that say nothing about a shader:
+// error (-Weverything), less five groups that say nothing about a shader:
 // C++98 compatibility, padding a struct (the std140 blocks are padded on
 // purpose), the `vertex`/`fragment` keywords Metal 4 deprecates in favour of
 // attributes older Metal does not take, and an unused parameter (a helper's
-// own, from its quote, or a sampler handed beside a texture only read).
+// own, from its quote, or a sampler handed beside a texture only read), and a
+// float compared for equality (the quote said ==: the probes' stamps are
+// whole numbers a probe is matched to its cell by).
 // That is stricter than `xcrun metal`'s default set, which needs the Metal
 // Toolchain component (scripts/msl_check.sh runs it too where it is there).
 // Built and run by scripts/msl_check.sh.
@@ -22,7 +24,8 @@ static NSString *const STRICT =
     @"#pragma clang diagnostic ignored \"-Wc++98-compat-pedantic\"\n"
     @"#pragma clang diagnostic ignored \"-Wpadded\"\n"
     @"#pragma clang diagnostic ignored \"-Wdeprecated\"\n"
-    @"#pragma clang diagnostic ignored \"-Wunused-parameter\"\n";
+    @"#pragma clang diagnostic ignored \"-Wunused-parameter\"\n"
+    @"#pragma clang diagnostic ignored \"-Wfloat-equal\"\n";
 
 int main(int argc, char **argv) {
     @autoreleasepool {
@@ -51,7 +54,7 @@ int main(int argc, char **argv) {
                                                           options:options
                                                             error:&error];
             if (!library || error) {
-                // Line numbers are the source's plus the pragmas' six.
+                // Line numbers are the source's plus the pragmas' seven.
                 fprintf(stderr, "%s: %s\n", argv[i], error ? [[error localizedDescription] UTF8String] : "refused");
                 refused++;
             } else {

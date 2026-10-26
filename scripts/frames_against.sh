@@ -37,6 +37,19 @@
 # checkout, or no such tag in it, this says so and stops (exit 2) rather
 # than compare frames from the wrong compiler.
 #
+# AE3D_HERE_ENV="AE3D_MSL=1" draws this tree's frames with those variables set
+# and AE3D_THERE_ENV the ref's: this tree's own HEAD as the ref then holds a
+# switch to the frames it draws without it, as the MSL's (docs/aether_quote_design.md
+# section 11) are held to the SPIR-V's, at the same math mode:
+#   AE3D_HERE_ENV=AE3D_MSL=1 AE3D_THERE_ENV=MVK_CONFIG_FAST_MATH_ENABLED=0 \
+#       ./scripts/frames_against.sh HEAD
+#
+# AE3D_WITHIN and AE3D_OVER (steps, channels) let every frame but the two with
+# tolerances of their own differ by that much, for a comparison that is not
+# byte for byte: the MSL's at 4x draws one channel of seven frames (the same
+# pixel of the spheres, 77,80) a step off the SPIR-V's, so
+# AE3D_WITHIN=1 AE3D_OVER=2.
+#
 # Exits 0 when every frame matches, 1 naming those that do not, 2 when
 # something could not be built or drawn. Needs a GPU (a software rasteriser
 # draws it too, slowly); the frames are kept under build/frames_against/ to
@@ -129,11 +142,16 @@ build() {   # build <tree>: the programs this draws with, by the Aether it pins
 build "$ROOT"
 build "$THERE"
 
+# The variables only one side's draws get (AE3D_HERE_ENV, AE3D_THERE_ENV).
+here_env() {  # here_env <tree>
+    if [ "$1" = "$ROOT" ]; then echo "${AE3D_HERE_ENV:-}"; else echo "${AE3D_THERE_ENV:-}"; fi
+}
+
 # snap <tree> <png> <port> <api> [msaa]: zombie_city held at frame 90, snapshotted.
 snap() {
     (
         cd "$1" || exit 2
-        env ${5:+AE3D_MSAA=$5} AE3D_TICK=60 AE3D_HOLD=90 AE3D_AGENT="$3" AE3D_HIDDEN=1 AE3D_API="$4" \
+        env ${5:+AE3D_MSAA=$5} $(here_env "$1") AE3D_TICK=60 AE3D_HOLD=90 AE3D_AGENT="$3" AE3D_HIDDEN=1 AE3D_API="$4" \
             AE3D_WIDTH=320 AE3D_HEIGHT=180 ./build/zombie_city >"$2.log" 2>&1 &
         pid=$!
         i=0
@@ -151,7 +169,7 @@ snap() {
 }
 
 draw() {   # draw <tree> <dir>
-    (cd "$1" && AE3D_PARITY_DUMP="$2" ./build/test_backend_parity >"$2/parity.log" 2>&1)
+    (cd "$1" && env $(here_env "$1") AE3D_PARITY_DUMP="$2" ./build/test_backend_parity >"$2/parity.log" 2>&1)
     mkdir -p "$2/city"
     k=1
     while [ "$k" -le "$CITY_DRAWS" ]; do
@@ -169,6 +187,7 @@ differ=0
 for frame in "$OUT/there"/*.png; do
     name="$(basename "$frame")"
     tolerance=""
+    [ -n "${AE3D_WITHIN:-}" ] && tolerance="--within $AE3D_WITHIN --over ${AE3D_OVER:-0}"
     case "$name" in
         clouds_over_the_skybox_*) tolerance="--within $CLOUDS_WITHIN --over $CLOUDS_OVER" ;;
     esac
