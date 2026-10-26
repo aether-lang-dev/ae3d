@@ -46,6 +46,7 @@ import ae3d.shaders.fxaa
 import ae3d.shaders.bloom
 import ae3d.shaders.depth
 import ae3d.shaders.resolve
+import ae3d.shaders.viewrect
 import ae3d.shaders.taa
 import ae3d.shaders.ssao
 import ae3d.shaders.ssr
@@ -65,6 +66,7 @@ import std.io
 
 exports (
     STAGE_MEASURE, STAGE_DRAW, STAGE_READ, FRAMES, STAGES, mark_sorted, mark_rays_built, pick_begin, pick_end, pick_on,
+    VIEW_FRAME_CELLS, view_frame_new, view_frame_in, view_frame_out, view_frame_on, view_blit,
     start, shutdown, ready, resize, frame_begin, frame_end, flush_uploads,
     add_hooks, frame_wait, set_fence_wait_ms, hold_fence, frame_bgr, frame_commands, frame_slot, frame_image, frame_view, frame_format,
     frame_offscreen, frame_copyable, frame_width, frame_height, render_width, render_height, recording, pass_open,
@@ -848,6 +850,9 @@ start(width: int, height: int) -> bool {
         vkdevice.fail("colour resolve pass failed")
         return false
     }
+    g_view_blit_pass = vkquote.pass_new(viewrect.view_blit(Texture { image: null }), vkspirv.VIEW_BLIT_QUOTED_VERT,
+                                        vkspirv.VIEW_BLIT_QUOTED_FRAG, vkspirv.VIEW_BLIT_QUOTED_HASH, vktargets.post_pass(),
+                                        BLIT_RECTS) as ptr
     g_taa_pass = vkquote.pass_new(taa.taa(Texture { image: null }, Texture { image: null }, Texture { image: null },
                                           vec2(0.0, 0.0), 1.0, 1.0),
                                   vkspirv.TAA_QUOTED_VERT, vkspirv.TAA_QUOTED_FRAG, vkspirv.TAA_QUOTED_HASH,
@@ -933,6 +938,8 @@ shutdown() {
     g_depth_resolve_pass = null
     vkquote.pass_free(g_colour_resolve_pass as *QuotedPass)
     g_colour_resolve_pass = null
+    vkquote.pass_free(g_view_blit_pass as *QuotedPass)
+    g_view_blit_pass = null
     vkquote.pass_free(g_taa_pass as *QuotedPass)
     g_taa_pass = null
     vkquote.pass_free(g_ssao_pass as *QuotedPass)
@@ -1186,7 +1193,8 @@ frame_begin(r: float, g: float, b: float, a: float) -> bool {
     if !g_ready || vkhost.recording() { return false }
     flush_uploads()
     d = vkdevice.device()
-    if g_needs_resize {
+    // A view's frame is not the window's: the resize waits for the frame it is.
+    if g_needs_resize && !g_view_frame {
         if !rebuild(g_pending_width, g_pending_height) { return false }
     }
     fence = g_in_flight + g_frame * 8
@@ -1455,6 +1463,120 @@ pick_pipeline_for(handle: int, points: bool) -> ptr {
 instances_are_points(instances: int, count: int) -> bool {
     if count <= 0 || instances <= 0 { return false }
     return vkmesh.drawable(instances) && vkmesh.points(instances)
+}
+
+
+// --- views (#866) ------------------------------------------------------------------------------------------------
+//
+// A view is drawn as a frame of its own into images of its own
+// (ae3d.vktargets), submitted before the frame it is seen in. What the frame
+// keeps from one frame to the next that belongs to the camera it is drawn
+// from -- whether the occlusion has a history and which targets it was
+// drawn for, the exposure -- is a view's own, swapped in with it; the post
+// settings (the temporal pass, the bloom, FXAA) are the scene's, and a view
+// draws with them. A view is not upscaled (DLSS is the window's), and the
+// meter, the overlay and the readback, which are of the window's frame,
+// do not run for it.
+
+var g_view_frame = false
+// The window's own values while a view's are in; the window's mode of
+// upscaling, set aside while one is.
+var g_view_main: ptr = null
+var g_view_dlss = 0
+
+const VIEW_FRAME_CELLS = 5
+
+// The views drawn into rectangles of the frame (view_blit): a rectangle per
+// view, queued for the frame about to end, as the overlay's rectangles are.
+const BLIT_RECTS = 8
+var g_view_blit_pass: ptr = null
+var g_blits: ptr = null            // int[BLIT_RECTS * 5]: texture, x, y, width, height
+var g_blit_count = 0
+
+// The view whose texture is `texture` drawn into the rectangle `w` by `h`
+// from (x, y), the top-left, of the window's frame, when the frame ends: over
+// the scene and its post chain, under the overlay. For the frame about to
+// be drawn only. False past BLIT_RECTS of them.
+view_blit(texture: int, x: int, y: int, w: int, h: int) -> bool {
+    if g_blit_count >= BLIT_RECTS || g_view_frame { return false }
+    if g_blits == null { g_blits = calloc(BLIT_RECTS * 5, 4) }
+    at = (g_blits as int[])
+    k = g_blit_count * 5
+    at[k] = texture
+    at[k + 1] = x
+    at[k + 2] = y
+    at[k + 3] = w
+    at[k + 4] = h
+    g_blit_count = g_blit_count + 1
+    return true
+}
+
+// The queued rectangles drawn, in the pass that is writing the frame's
+// image, and forgotten.
+fn draw_view_blits() {
+    if g_view_frame { return }
+    k = 0
+    while k < g_blit_count {
+        at = g_blits as int[]
+        t = at[k * 5]
+        if vktexture.valid(t) && g_view_blit_pass != null {
+            viewport_at(at[k * 5 + 1], at[k * 5 + 2], at[k * 5 + 3], at[k * 5 + 4])
+            draw_quoted(g_view_blit_pass as *QuotedPass, k, vktexture.view(t), vktexture.sampler_of(t))
+        }
+        k = k + 1
+    }
+    g_blit_count = 0
+}
+
+view_frame_on() -> bool { return g_view_frame }
+
+// A new view's values: nothing known of its history, the exposure of the
+// scene.
+view_frame_new() -> ptr {
+    cells = calloc(VIEW_FRAME_CELLS, 8)
+    ((cells + 0) as int[])[0] = 0
+    ((cells + 8) as int[])[0] = 0 - 1
+    ((cells + 16) as int[])[0] = 0
+    ((cells + 24) as float[])[0] = g_frame_exposure
+    ((cells + 32) as int[])[0] = 0
+    return cells
+}
+
+fn view_frame_swap(cells: ptr) {
+    h = 0
+    if g_occlusion_history { h = 1 }
+    d = 0
+    if g_depth_resolved { d = 1 }
+    s = 0
+    if g_depth_split { s = 1 }
+    was = g_occlusion_serial
+    exposure = g_frame_exposure
+    g_occlusion_history = ((cells + 0) as int[])[0] != 0
+    g_occlusion_serial = ((cells + 8) as int[])[0]
+    g_depth_resolved = ((cells + 16) as int[])[0] != 0
+    g_frame_exposure = ((cells + 24) as float[])[0]
+    g_depth_split = ((cells + 32) as int[])[0] != 0
+    ((cells + 0) as int[])[0] = h
+    ((cells + 8) as int[])[0] = was
+    ((cells + 16) as int[])[0] = d
+    ((cells + 24) as float[])[0] = exposure
+    ((cells + 32) as int[])[0] = s
+}
+
+// The view whose values are `cells` becomes the frame's: the window's are
+// kept in the cells, and the window's upscaler is put aside.
+view_frame_in(cells: ptr) {
+    view_frame_swap(cells)
+    g_view_frame = true
+    g_view_dlss = g_dlss_mode
+    g_dlss_mode = 0
+}
+
+// And the window's values come back, the view's left in the cells.
+view_frame_out(cells: ptr) {
+    view_frame_swap(cells)
+    g_view_frame = false
+    g_dlss_mode = g_view_dlss
 }
 
 // --- the pick pass (#865) ---------------------------------------------------------------------------------------
@@ -2535,6 +2657,7 @@ draw_composite(source: int, bloom: int) {
         quoted_texture(p, "bloom", bloom)
         draw_quoted_with(p, 0)
     }
+    if !fxaa { draw_view_blits() }
     vk.vkCmdEndRenderPass(commands)
     vkhost.set_pass_open(false)
     if !fxaa { return }
@@ -2550,6 +2673,7 @@ draw_composite(source: int, bloom: int) {
     viewport(fw, fh)
     ldr = vktargets.ldr_texture()
     draw_quoted(g_fxaa_pass as *QuotedPass, 0, vktexture.view(ldr), vktexture.sampler_of(ldr))
+    draw_view_blits()
     vk.vkCmdEndRenderPass(commands)
     vkhost.set_pass_open(false)
 }
@@ -2863,7 +2987,9 @@ frame_end() -> bool {
     // (ae3d.vkreadback). An offscreen frame's image is left in
     // transfer-source layout by its pass; a windowed one's each moves from
     // presenting and back.
-    run_hooks(0)
+    // The meter, the overlay and the readback are the window's frame's.
+    if !g_view_frame { run_hooks(0) }
+    if !g_view_frame { g_blit_count = 0 }
 
     stamp_through(9)
     stamped = 0
