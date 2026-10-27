@@ -1,0 +1,148 @@
+// ae3d.shaders.dof: depth of field (#870), two passes written with `quote`
+// that the composite then mixes in beside the bloom.
+//
+// A lens focused on a distance puts what is nearer or farther out of focus,
+// each point of it a disc of confusion on the film. The passes work at half
+// the scene's size, where a disc of a few pixels costs a quarter of the
+// taps:
+//
+// dof_coc: for each texel of the half-size target, the light (the mean of
+// four taps, a 2x2 box) and, in its alpha, the signed radius of the disc of
+// confusion of the depth there, in this target's texels. The depth is the
+// scene's, fetched exactly (no sampler's filter) at the four texels of the
+// scene's size the target texel covers, the disc farthest from focus kept. With the view depth z (1 / w of the depth
+// taken back through the camera's inverse, whatever the dialect's clip
+// depth) the disc is `aperture * (z - focus) / z`, thin-lens shaped: nothing
+// at the focus distance, growing to `aperture` toward infinity and without
+// bound toward the lens, held to `max_radius`. Positive is farther than the
+// focus, negative nearer.
+//
+// dof_gather: each texel gathers the light of the 32 about it on a
+// golden-angle spiral out to `max_radius` (turned the same way in the picture
+// on both renderers: OpenGL's texture rows run up and Vulkan's down), each tap weighed by how far its
+// own disc reaches this texel (scatter as gather): a tap whose disc is
+// wider than its distance (by a half texel's falloff) contributes, so a near thing's blur spreads over
+// the sharp ground behind it and the far ground's does not spread over a
+// sharp thing in front of it (a far tap is weighed by the texel's own radius,
+// so it gives nothing to a texel in focus). The alpha is how much of the
+// texel is blurred light and not its own: its own radius, or the share of
+// the taps a near disc of the widest radius met would cover (half the ring,
+// of 32 taps over the whole disc, as the radius over the reach squared),
+// whichever is more, 0 to 1.
+//
+//   screen              the scene's light (the upscaler's, when there is one)
+//   depth               the scene's depth
+//   texel               one texel of this target, (1 / width, 1 / height)
+//   inv_view_projection the camera's, from clip space back to the world
+//   focus               the distance in focus, in the scene's units
+//   aperture            the disc at infinity, in this target's texels
+//   max_radius          the widest disc, in this target's texels
+//
+// The values reach the shader in the target's own texels, so the pass is the
+// same at any frame size: ae3d scales the engine's settings (hundredths of a
+// 1080-line frame) by the frame's height.
+
+import std.quote
+import ae3d.gpu (GpuShader, fragment)
+import ae3d.shaders.ssao (world_at)
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, texture, texel_fetch, texture_size, rgb, mul, abs, min, max,
+                       clamp, clamp_v2, floor_v2, sqrt, sin, cos, depth_clip, screen_y_sign, float_of)
+
+exports (dof_coc, dof_gather, view_depth, disc_radius, tap_weight, texel_disc)
+
+// The view depth of the scene at screen `uv`, depth `d`: the clip w the
+// point had, 1 / the homogeneous w of its unprojection. 0 past the far
+// plane's depth (nothing drawn) so the caller can say "infinitely far".
+@quotable
+view_depth(inv_view_projection: mat4, uv: vec2, d: float) -> float {
+    p = mul(inv_view_projection, vec4(vec3(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth_clip(d)), 1.0))
+    return 1.0 / max(abs(p.w), 0.0000001)
+}
+
+// The signed radius of the disc of confusion at view depth `z` (0: nothing
+// drawn, infinitely far): aperture (z - focus) / z, held to the widest.
+@quotable
+disc_radius(z: float, d: float, focus: float, aperture: float, max_radius: float) -> float {
+    r = aperture
+    if d < 0.99999 {
+        r = aperture * (z - focus) / max(z, 0.0001)
+    }
+    return clamp(r, 0.0 - max_radius, max_radius)
+}
+
+// What a tap of radius `tap` (signed, as the first pass wrote it) at distance
+// `dist` from the texel whose own radius is `own` gives it: 0 to 1 by how
+// far the tap's disc reaches past the distance, and for a far tap no more
+// than the texel's own radius lets (a texel in focus takes nothing from the
+// far ground's blur).
+@quotable
+tap_weight(tap: float, dist: float, own: float) -> float {
+    reach = clamp(abs(tap) - dist + 0.5, 0.0, 1.0)
+    if tap > 0.0 {
+        return reach * clamp(own, 0.0, 1.0)
+    }
+    return reach
+}
+
+// The depth at the full-size texel `p` (clamped to the image), read exactly
+// whatever the sampler: its disc of confusion.
+@quotable
+texel_disc(depth: Texture, dsize: vec2, p: vec2, inv_view_projection: mat4, focus: float, aperture: float,
+           max_radius: float) -> float {
+    q = clamp_v2(p, vec2(0.0, 0.0), dsize - vec2(1.0, 1.0))
+    d = texel_fetch(depth, q).x
+    uv = (q + vec2(0.5, 0.5)) / dsize
+    return disc_radius(view_depth(inv_view_projection, uv, d), d, focus, aperture, max_radius)
+}
+
+dof_coc(screen: Texture, depth: Texture, texel: vec2, inv_view_projection: mat4, focus: float, aperture: float,
+        max_radius: float) -> *GpuShader {
+    return fragment("dof_coc") quote | uv: vec2 | {
+        q = texel * 0.25
+        c = (rgb(texture(screen, uv + vec2(-q.x, -q.y))) + rgb(texture(screen, uv + vec2(q.x, -q.y))) + rgb(texture(screen, uv + vec2(-q.x, q.y))) + rgb(texture(screen, uv + vec2(q.x, q.y)))) * 0.25
+        // The four depth texels the target texel covers: the 2x2 block whose
+        // corner the target texel's centre is.
+        dsize = texture_size(depth)
+        b = floor_v2(uv * dsize - vec2(0.5, 0.5))
+        r0 = texel_disc(depth, dsize, b, inv_view_projection, focus, aperture, max_radius)
+        r1 = texel_disc(depth, dsize, b + vec2(1.0, 0.0), inv_view_projection, focus, aperture, max_radius)
+        r2 = texel_disc(depth, dsize, b + vec2(0.0, 1.0), inv_view_projection, focus, aperture, max_radius)
+        r3 = texel_disc(depth, dsize, b + vec2(1.0, 1.0), inv_view_projection, focus, aperture, max_radius)
+        r = r0
+        if abs(r1) > abs(r) { r = r1 }
+        if abs(r2) > abs(r) { r = r2 }
+        if abs(r3) > abs(r) { r = r3 }
+        return vec4(c, r)
+    }
+}
+
+dof_gather(coc: Texture, texel: vec2, max_radius: float) -> *GpuShader {
+    return fragment("dof_gather") quote | uv: vec2 | {
+        centre = texture(coc, uv)
+        own = abs(centre.w)
+        sum = rgb(centre)
+        total = 1.0
+        near = 0.0
+        widest = 0.0
+        i = 0
+        while i < 32 {
+            k = float_of(i)
+            a = k * 2.3999632
+            reach = sqrt((k + 0.5) / 32.0) * max_radius
+            tap = texture(coc, uv + vec2(cos(a), sin(a) * screen_y_sign()) * reach * texel)
+            w = tap_weight(tap.w, reach, own)
+            sum = sum + rgb(tap) * w
+            total = total + w
+            if tap.w < 0.0 && w > 0.0 {
+                near = near + w
+                widest = max(widest, abs(tap.w))
+            }
+            i = i + 1
+        }
+        // Half of the taps a near disc of the widest radius would cover is
+        // all of the blur there is to have: the texel is its light.
+        ring = max(16.0 * widest * widest / (max_radius * max_radius), 1.0)
+        blend = max(clamp(own, 0.0, 1.0), clamp(near / ring, 0.0, 1.0))
+        return vec4(sum / total, blend)
+    }
+}

@@ -20,8 +20,8 @@ struct ae_Params {
     float4x4 view_projection;
     int bloom_on;
     float bloom_intensity;
+    int dof_on;
     float frame_exposure;
-    char ae_pad1[4];
 };
 static_assert(sizeof(ae_Params) == 240, "ae_Params: std140");
 static_assert(__builtin_offsetof(ae_Params, haze) == 0, "ae_Params.haze: std140");
@@ -29,7 +29,8 @@ static_assert(__builtin_offsetof(ae_Params, capture_channel) == 144, "ae_Params.
 static_assert(__builtin_offsetof(ae_Params, view_projection) == 160, "ae_Params.view_projection: std140");
 static_assert(__builtin_offsetof(ae_Params, bloom_on) == 224, "ae_Params.bloom_on: std140");
 static_assert(__builtin_offsetof(ae_Params, bloom_intensity) == 228, "ae_Params.bloom_intensity: std140");
-static_assert(__builtin_offsetof(ae_Params, frame_exposure) == 232, "ae_Params.frame_exposure: std140");
+static_assert(__builtin_offsetof(ae_Params, dof_on) == 232, "ae_Params.dof_on: std140");
+static_assert(__builtin_offsetof(ae_Params, frame_exposure) == 236, "ae_Params.frame_exposure: std140");
 
 struct HazePoint {
     float2 at;
@@ -73,7 +74,8 @@ fragment ae_composite_frag_out ae_composite_fragment(
     ae_composite_in ae_in [[stage_in]],
     constant ae_Params& ae_params [[buffer(0)]],
     texture2d<float> screen [[texture(0)]], sampler ae_smp_screen [[sampler(0)]],
-    texture2d<float> bloom [[texture(1)]], sampler ae_smp_bloom [[sampler(1)]]) {
+    texture2d<float> bloom [[texture(1)]], sampler ae_smp_bloom [[sampler(1)]],
+    texture2d<float> dof [[texture(2)]], sampler ae_smp_dof [[sampler(2)]]) {
     ae_composite_frag_out ae_out;
     float4 ae_frag_coord = ae_in.ae_frag_coord;
     float2 uv = ae_in.uv;
@@ -82,6 +84,7 @@ fragment ae_composite_frag_out ae_composite_fragment(
     constant float4x4& view_projection = ae_params.view_projection;
     constant int& bloom_on = ae_params.bloom_on;
     constant float& bloom_intensity = ae_params.bloom_intensity;
+    constant int& dof_on = ae_params.dof_on;
     constant float& frame_exposure = ae_params.frame_exposure;
     float2 at = uv;
     if (haze.count > 0 && capture_channel == 0) {
@@ -126,6 +129,10 @@ fragment ae_composite_frag_out ae_composite_fragment(
     }
     if (bloom_on != 0) {
         radiance = radiance + bloom.sample(ae_smp_bloom, at).rgb * bloom_intensity;
+    }
+    if (dof_on != 0) {
+        float4 focused = dof.sample(ae_smp_dof, at);
+        radiance = radiance + (focused.rgb - screen.sample(ae_smp_screen, at).rgb) * focused.w;
     }
     float3 shown = ae3d_shaders_composite_aces(radiance * frame_exposure);
     shown = float3(ae3d_shaders_composite_srgb_encode(shown.x), ae3d_shaders_composite_srgb_encode(shown.y), ae3d_shaders_composite_srgb_encode(shown.z));
