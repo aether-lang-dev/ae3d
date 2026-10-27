@@ -195,7 +195,8 @@ struct Draw {
     float lift;
     int skinned;
     int impostor;
-    char ae_pad0[12];
+    int pick;
+    char ae_pad0[8];
 };
 static_assert(sizeof(Draw) == 240, "Draw: std140");
 static_assert(__builtin_offsetof(Draw, model) == 0, "Draw.model: std140");
@@ -210,6 +211,7 @@ static_assert(__builtin_offsetof(Draw, flip_rows) == 212, "Draw.flip_rows: std14
 static_assert(__builtin_offsetof(Draw, lift) == 216, "Draw.lift: std140");
 static_assert(__builtin_offsetof(Draw, skinned) == 220, "Draw.skinned: std140");
 static_assert(__builtin_offsetof(Draw, impostor) == 224, "Draw.impostor: std140");
+static_assert(__builtin_offsetof(Draw, pick) == 228, "Draw.pick: std140");
 
 struct WorldState {
     WorldLight lights[16];

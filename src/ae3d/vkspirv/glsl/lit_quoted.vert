@@ -14,6 +14,7 @@ struct Draw {
     float lift;
     int skinned;
     int impostor;
+    int pick;
 };
 struct Cut {
     int on;

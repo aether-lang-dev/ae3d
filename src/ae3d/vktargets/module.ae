@@ -41,12 +41,15 @@ exports (
     cloud_ensure, cloud_texture, cloud_framebuffer, cloud_width, cloud_height, cloud_serial,
     taa_framebuffer, taa_texture, taa_history_valid, set_taa_history, taa_current, set_taa_current,
     dlss_output, dlss_output_create, dlss_output_destroy, dlss_output_fresh, set_dlss_output_fresh,
-    lod_bias_for_scale
+    lod_bias_for_scale,
+    VIEW_CELLS, view_save, view_load, view_reset, view_make, view_unmake, view_texture_handle, view_read
 )
 
 extern calloc(count: int, size: int) -> ptr
 extern free(p: ptr)
 extern memset(p: ptr, value: int, n: long) -> ptr
+extern malloc(size: long) -> ptr
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
 extern log(x: float) -> float
 
 // The bloom's levels (ae3d.shaders.bloom): from half the
@@ -177,6 +180,12 @@ var g_dlss_output = 0
 var g_dlss_output_fresh = false
 
 var g_cell: ptr = null
+
+// A view's (#866): the final composite's pass, which ends in the layout a
+// material samples it in, shared by every view; and the registered
+// texture of a view's final image (the swapped one's, 0 for the frame).
+var g_view_pass: ptr = null
+var g_view_texture = 0
 
 // A made image kept here: a VKImage on the heap.
 kept(made: @keep vkhost.VKImage) -> ptr {
@@ -859,6 +868,12 @@ create_passes() -> bool {
         vkdevice.fail("post vkCreateRenderPass failed")
         return false
     }
+    // A view's composite ends sampleable, not presented or copied out.
+    g_view_pass = post_render_pass(g_color_format, read)
+    if g_view_pass == null {
+        vkdevice.fail("view vkCreateRenderPass failed")
+        return false
+    }
     return true
 }
 
@@ -873,6 +888,8 @@ destroy_passes() {
     if g_shadow_pass != null { vk.vkDestroyRenderPass(d, g_shadow_pass, null) }
     if g_lamp_pass != null { vk.vkDestroyRenderPass(d, g_lamp_pass, null) }
     if g_camdepth_pass != null { vk.vkDestroyRenderPass(d, g_camdepth_pass, null) }
+    if g_view_pass != null { vk.vkDestroyRenderPass(d, g_view_pass, null) }
+    g_view_pass = null
     g_scene_pass = null
     g_scene_pass_first = null
     g_scene_pass_rest = null
@@ -882,6 +899,291 @@ destroy_passes() {
     g_shadow_pass = null
     g_lamp_pass = null
     g_camdepth_pass = null
+}
+
+
+// --- views (#866) ------------------------------------------------------------------------------------------------
+//
+// A view is a second frame: a camera drawn into images of its own, at a size
+// of its own, with its own history (the temporal pass's, the camera depth's,
+// the clouds'), its own shadow atlases and its own bloom. The module holds a
+// frame as variables; a view is those variables with other values, saved
+// from and loaded into them (view_save, view_load, written by
+// scripts/gen_view_swap.py), so the frame's code is the view's, untouched. What
+// the views share with the frame beside them is its formats, its samples and
+// its passes: a pass is no size.
+
+view_texture_handle() -> int { return g_view_texture }
+
+// The variables as a fresh frame has them (view_reset), the frame's passes
+// kept: the module's variables are then a frame with nothing made.
+fn view_reset_keeping_passes() {
+    scene = g_scene_pass
+    first = g_scene_pass_first
+    rest = g_scene_pass_rest
+    shadow = g_shadow_pass
+    lamp = g_lamp_pass
+    camdepth = g_camdepth_pass
+    hdr = g_hdr_pass
+    ldr = g_ldr_pass
+    view_reset()
+    g_scene_pass = scene
+    g_scene_pass_first = first
+    g_scene_pass_rest = rest
+    g_shadow_pass = shadow
+    g_lamp_pass = lamp
+    g_camdepth_pass = camdepth
+    g_hdr_pass = hdr
+    g_ldr_pass = ldr
+    g_post_pass = g_view_pass
+}
+
+// The final image of a view: `g_width` by `g_height`, drawn through its
+// UNORM view and sampled through an sRGB one, so the encoded values the
+// composite writes are the light a surface samples. Registered as a texture
+// (g_view_texture). False, with the reason in the backend's last error, when
+// it would not make.
+fn create_view_image() -> bool {
+    d = vkhost.device()
+    g_image_count = 1
+    g_images = calloc(1, 8)
+    g_views = calloc(1, 8)
+    info = calloc(1, sizeof(VkImageCreateInfo)) as *VkImageCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_IMAGE_CREATE_INFO
+    info.flags = vk.IMAGE_CREATE_MUTABLE_FORMAT_BIT
+    info.imageType = vk.IMAGE_TYPE_2D
+    info.format = g_color_format
+    info.extent.width = g_width
+    info.extent.height = g_height
+    info.extent.depth = 1
+    info.mipLevels = 1
+    info.arrayLayers = 1
+    info.samples = vk.SAMPLE_COUNT_1_BIT
+    info.tiling = vk.IMAGE_TILING_OPTIMAL
+    info.usage = vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_SAMPLED_BIT | vk.IMAGE_USAGE_TRANSFER_SRC_BIT |
+                 vk.IMAGE_USAGE_TRANSFER_DST_BIT
+    info.sharingMode = vk.SHARING_MODE_EXCLUSIVE
+    info.initialLayout = vk.IMAGE_LAYOUT_UNDEFINED
+    c = cell()
+    r = vk.vkCreateImage(d, info as ptr, null, c)
+    free(info as ptr)
+    if r != vk.SUCCESS {
+        vkdevice.fail("view vkCreateImage failed")
+        return false
+    }
+    image = (c as ptr[])[0]
+    (g_images as ptr[])[0] = image
+    needs = calloc(1, sizeof(VkMemoryRequirements)) as *VkMemoryRequirements
+    vk.vkGetImageMemoryRequirements(d, image, needs as ptr)
+    g_offscreen_memory = vkhost.allocate(needs, vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+    free(needs as ptr)
+    if g_offscreen_memory == null {
+        vkdevice.fail("view vkAllocateMemory failed")
+        return false
+    }
+    vk.vkBindImageMemory(d, image, g_offscreen_memory, 0)
+    sampled_format = g_color_format
+    if g_color_format == vk.FORMAT_R8G8B8A8_UNORM { sampled_format = vk.FORMAT_R8G8B8A8_SRGB }
+    if g_color_format == vk.FORMAT_B8G8R8A8_UNORM { sampled_format = vk.FORMAT_B8G8R8A8_SRGB }
+    k = 0
+    while k < 2 {
+        format = g_color_format
+        if k == 1 { format = sampled_format }
+        vi = calloc(1, sizeof(VkImageViewCreateInfo)) as *VkImageViewCreateInfo
+        vi.sType = vk.STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+        vi.image = image
+        vi.viewType = vk.IMAGE_VIEW_TYPE_2D
+        vi.format = format
+        vi.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+        vi.subresourceRange.levelCount = 1
+        vi.subresourceRange.layerCount = 1
+        r = vk.vkCreateImageView(d, vi as ptr, null, c)
+        free(vi as ptr)
+        if r != vk.SUCCESS {
+            vkdevice.fail("view vkCreateImageView failed")
+            return false
+        }
+        if k == 0 { (g_views as ptr[])[0] = (c as ptr[])[0] }
+        if k == 1 {
+            sampler = vkhost.sampler(vk.FILTER_LINEAR, vk.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, vk.SAMPLER_MIPMAP_MODE_LINEAR, 1.0, 0.0)
+            if sampler == null {
+                vk.vkDestroyImageView(d, (c as ptr[])[0], null)
+                vkdevice.fail("view vkCreateSampler failed")
+                return false
+            }
+            // The texture owns the sampled view and its sampler and not the
+            // image, which the frame's offscreen branch frees.
+            g_view_texture = vktexture.adopt_target(vkhost.VKImage { image: null, memory: null, view: (c as ptr[])[0] }, sampler,
+                                                    g_width, g_height)
+            if g_view_texture == 0 {
+                vk.vkDestroySampler(d, sampler, null)
+                vk.vkDestroyImageView(d, (c as ptr[])[0], null)
+                return false
+            }
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// A view's frame, `w` by `h`, made into the module's variables, which are
+// the frame's when this is called: the caller saves them (view_save) and
+// loads them back after, and saves what this leaves as the view
+// (view_save into its own cells).
+view_make(w: int, h: int) -> bool {
+    if g_view_pass == null { return false }
+    view_reset_keeping_passes()
+    g_offscreen = true
+    g_render_scale = 1.0
+    g_width = w
+    g_height = h
+    if g_width < 1 { g_width = 1 }
+    if g_height < 1 { g_height = 1 }
+    scale_extent()
+    if !create_view_image() { return false }
+    if !cleared_view_image() { return false }
+    if !create_colour() || !create_depth() { return false }
+    return create_framebuffers()
+}
+
+// The view's image cleared to black and left sampleable: a material that
+// names a view before it is first drawn reads that, in a layout it is
+// read in.
+fn cleared_view_image() -> bool {
+    commands = vkhost.once_begin()
+    if commands == null {
+        vkdevice.fail("view: no command buffer to clear it with")
+        return false
+    }
+    image = (g_images as ptr[])[0]
+    b = calloc(1, sizeof(VkImageMemoryBarrier)) as *VkImageMemoryBarrier
+    b.sType = vk.STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+    b.oldLayout = vk.IMAGE_LAYOUT_UNDEFINED
+    b.newLayout = vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    b.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.image = image
+    b.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    b.subresourceRange.levelCount = 1
+    b.subresourceRange.layerCount = 1
+    b.dstAccessMask = vk.ACCESS_TRANSFER_WRITE_BIT
+    vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1,
+                            b as ptr)
+    black = calloc(4, 4)
+    range = calloc(1, sizeof(VkImageSubresourceRange)) as *VkImageSubresourceRange
+    range.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    range.levelCount = 1
+    range.layerCount = 1
+    vk.vkCmdClearColorImage(commands, image, vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, black, 1, range as ptr)
+    free(range as ptr)
+    free(black)
+    b.oldLayout = vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    b.newLayout = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    b.srcAccessMask = vk.ACCESS_TRANSFER_WRITE_BIT
+    b.dstAccessMask = vk.ACCESS_SHADER_READ_BIT
+    vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, null, 0, null,
+                            1, b as ptr)
+    free(b as ptr)
+    vkhost.once_end(commands)
+    return true
+}
+
+var g_view_read: ptr = null
+var g_view_read_bytes = 0
+
+// The loaded view's final image as RGBA bytes, top row first, `w` by `h`,
+// read back with the device waited on: in a buffer of this module's that the
+// next read overwrites. Null when it could not be read.
+view_read(w: int, h: int) -> ptr {
+    if g_images == null || (g_images as ptr[])[0] == null { return null }
+    image = (g_images as ptr[])[0]
+    bytes = w * h * 4
+    host = vkhost.host_buffer(bytes)
+    if host == null { return null }
+    commands = vkhost.once_begin()
+    if commands == null {
+        vkhost.host_buffer_free(host)
+        return null
+    }
+    barrier = calloc(1, sizeof(VkImageMemoryBarrier)) as *VkImageMemoryBarrier
+    barrier.sType = vk.STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+    barrier.oldLayout = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    barrier.newLayout = vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+    barrier.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    barrier.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    barrier.image = image
+    barrier.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    barrier.subresourceRange.levelCount = 1
+    barrier.subresourceRange.layerCount = 1
+    barrier.srcAccessMask = vk.ACCESS_SHADER_READ_BIT
+    barrier.dstAccessMask = vk.ACCESS_TRANSFER_READ_BIT
+    vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null,
+                            1, barrier as ptr)
+    region = calloc(1, sizeof(VkBufferImageCopy)) as *VkBufferImageCopy
+    region.imageSubresource.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    region.imageSubresource.layerCount = 1
+    region.imageExtent.width = w
+    region.imageExtent.height = h
+    region.imageExtent.depth = 1
+    vk.vkCmdCopyImageToBuffer(commands, image, vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, host.buffer, 1, region as ptr)
+    free(region as ptr)
+    barrier.oldLayout = vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+    barrier.newLayout = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    barrier.srcAccessMask = vk.ACCESS_TRANSFER_READ_BIT
+    barrier.dstAccessMask = vk.ACCESS_SHADER_READ_BIT
+    vk.vkCmdPipelineBarrier(commands, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, null, 0, null,
+                            1, barrier as ptr)
+    free(barrier as ptr)
+    vkhost.once_end(commands)
+    if bytes > g_view_read_bytes {
+        if g_view_read != null { free(g_view_read) }
+        g_view_read = malloc(bytes as long)
+        g_view_read_bytes = bytes
+    }
+    memcpy(g_view_read, host.mapped, bytes as long)
+    vkhost.host_buffer_free(host)
+    if g_color_format == vk.FORMAT_B8G8R8A8_UNORM {
+        px = g_view_read as uint8[]
+        i = 0
+        while i + 3 < bytes {
+            blue = px[i]
+            px[i] = px[i + 2]
+            px[i + 2] = blue
+            i = i + 4
+        }
+    }
+    return g_view_read
+}
+
+// The view loaded into the variables destroyed, the device idle first.
+view_unmake() {
+    d = vkhost.device()
+    if d == null { return }
+    vk.vkDeviceWaitIdle(d)
+    destroy_frame()
+    destroy_lamp_target()
+    dlss_output_destroy()
+    // The arrays the bloom, the clouds, the reflection's blur and the
+    // temporal pass made when first asked (and keep across a resize) are the
+    // view's: no variable names them once it is gone.
+    if g_bloom_textures != null { free(g_bloom_textures) }
+    if g_bloom_framebuffers != null { free(g_bloom_framebuffers) }
+    if g_bloom_sizes != null { free(g_bloom_sizes) }
+    if g_cloud_textures != null { free(g_cloud_textures) }
+    if g_cloud_framebuffers != null { free(g_cloud_framebuffers) }
+    if g_ssr_blur_textures != null { free(g_ssr_blur_textures) }
+    if g_ssr_blur_framebuffers != null { free(g_ssr_blur_framebuffers) }
+    if g_taa_texture != null { free(g_taa_texture) }
+    if g_taa_framebuffer != null { free(g_taa_framebuffer) }
+    g_bloom_textures = null
+    g_bloom_framebuffers = null
+    g_bloom_sizes = null
+    g_cloud_textures = null
+    g_cloud_framebuffers = null
+    g_ssr_blur_textures = null
+    g_ssr_blur_framebuffers = null
+    g_taa_texture = null
+    g_taa_framebuffer = null
 }
 
 // --- framebuffers ------------------------------------------------------------------------------------------------
@@ -1558,6 +1860,9 @@ destroy_frame() {
     }
     if g_images != null { free(g_images) }
     g_images = null
+    // A view's final image is also a texture a material samples.
+    if g_view_texture != 0 { vkdesc.texture_destroy(g_view_texture) }
+    g_view_texture = 0
     destroy_shadow_target()
     camdepth_destroy()
     if g_scene_framebuffer != null { vk.vkDestroyFramebuffer(d, g_scene_framebuffer, null) }
@@ -1584,3 +1889,224 @@ destroy_frame() {
     g_swapchain = null
     g_image_count = 0
 }
+// --- generated by scripts/gen_view_swap.py: the state a view swaps ---
+// 69 variables, 8 bytes each. A view is saved from and loaded into the module's variables.
+const VIEW_CELLS = 69
+
+view_save(cells: ptr) {
+    ((cells + 0) as int[])[0] = g_bloom_count
+    ((cells + 8) as ptr[])[0] = g_bloom_textures
+    ((cells + 16) as ptr[])[0] = g_bloom_framebuffers
+    ((cells + 24) as ptr[])[0] = g_bloom_sizes
+    ((cells + 32) as ptr[])[0] = g_cloud_textures
+    ((cells + 40) as ptr[])[0] = g_cloud_framebuffers
+    ((cells + 48) as int[])[0] = g_cloud_width
+    ((cells + 56) as int[])[0] = g_cloud_height
+    ((cells + 64) as int[])[0] = g_cloud_serial
+    if g_offscreen { ((cells + 72) as int[])[0] = 1 } else { ((cells + 72) as int[])[0] = 0 }
+    ((cells + 80) as int[])[0] = g_width
+    ((cells + 88) as int[])[0] = g_height
+    ((cells + 96) as int[])[0] = g_render_width
+    ((cells + 104) as int[])[0] = g_render_height
+    ((cells + 112) as float[])[0] = g_render_scale
+    ((cells + 120) as ptr[])[0] = g_swapchain
+    ((cells + 128) as int[])[0] = g_image_count
+    ((cells + 136) as ptr[])[0] = g_images
+    ((cells + 144) as ptr[])[0] = g_views
+    ((cells + 152) as ptr[])[0] = g_offscreen_memory
+    ((cells + 160) as ptr[])[0] = g_colour
+    ((cells + 168) as ptr[])[0] = g_depth
+    ((cells + 176) as ptr[])[0] = g_velocity
+    ((cells + 184) as int[])[0] = g_velocity_texture
+    ((cells + 192) as ptr[])[0] = g_scene_pass
+    ((cells + 200) as ptr[])[0] = g_scene_pass_first
+    ((cells + 208) as ptr[])[0] = g_scene_pass_rest
+    ((cells + 216) as ptr[])[0] = g_shadow_pass
+    ((cells + 224) as ptr[])[0] = g_lamp_pass
+    ((cells + 232) as ptr[])[0] = g_camdepth_pass
+    ((cells + 240) as ptr[])[0] = g_hdr_pass
+    ((cells + 248) as ptr[])[0] = g_ldr_pass
+    ((cells + 256) as ptr[])[0] = g_post_pass
+    ((cells + 264) as ptr[])[0] = g_shadow_framebuffer
+    ((cells + 272) as ptr[])[0] = g_shadow
+    ((cells + 280) as ptr[])[0] = g_shadow_sampler
+    ((cells + 288) as int[])[0] = g_shadow_targets
+    if g_shadow_ready { ((cells + 296) as int[])[0] = 1 } else { ((cells + 296) as int[])[0] = 0 }
+    ((cells + 304) as ptr[])[0] = g_lamp
+    ((cells + 312) as ptr[])[0] = g_lamp_static
+    ((cells + 320) as ptr[])[0] = g_lamp_framebuffer
+    ((cells + 328) as ptr[])[0] = g_lamp_static_framebuffer
+    ((cells + 336) as ptr[])[0] = g_lamp_sampler
+    ((cells + 344) as int[])[0] = g_lamp_generation
+    ((cells + 352) as ptr[])[0] = g_scene_framebuffer
+    ((cells + 360) as ptr[])[0] = g_resolve_framebuffer
+    ((cells + 368) as ptr[])[0] = g_post_framebuffers
+    ((cells + 376) as int[])[0] = g_post_texture
+    ((cells + 384) as int[])[0] = g_ldr_texture
+    ((cells + 392) as ptr[])[0] = g_ldr_framebuffer
+    ((cells + 400) as ptr[])[0] = g_camdepth_framebuffer
+    ((cells + 408) as ptr[])[0] = g_camdepth
+    ((cells + 416) as ptr[])[0] = g_camdepth_sampler
+    ((cells + 424) as int[])[0] = g_camdepth_width
+    ((cells + 432) as int[])[0] = g_camdepth_height
+    ((cells + 440) as int[])[0] = g_camdepth_serial
+    ((cells + 448) as ptr[])[0] = g_ssr_framebuffer
+    ((cells + 456) as int[])[0] = g_ssr_reflect_texture
+    ((cells + 464) as ptr[])[0] = g_ssr_blur_textures
+    ((cells + 472) as ptr[])[0] = g_ssr_blur_framebuffers
+    ((cells + 480) as int[])[0] = g_occlusion_texture
+    ((cells + 488) as ptr[])[0] = g_occlusion_framebuffer
+    ((cells + 496) as ptr[])[0] = g_taa_texture
+    ((cells + 504) as ptr[])[0] = g_taa_framebuffer
+    if g_taa_history_valid { ((cells + 512) as int[])[0] = 1 } else { ((cells + 512) as int[])[0] = 0 }
+    ((cells + 520) as int[])[0] = g_taa_current
+    ((cells + 528) as int[])[0] = g_dlss_output
+    if g_dlss_output_fresh { ((cells + 536) as int[])[0] = 1 } else { ((cells + 536) as int[])[0] = 0 }
+    ((cells + 544) as int[])[0] = g_view_texture
+}
+
+view_load(cells: ptr) {
+    g_bloom_count = ((cells + 0) as int[])[0]
+    g_bloom_textures = ((cells + 8) as ptr[])[0]
+    g_bloom_framebuffers = ((cells + 16) as ptr[])[0]
+    g_bloom_sizes = ((cells + 24) as ptr[])[0]
+    g_cloud_textures = ((cells + 32) as ptr[])[0]
+    g_cloud_framebuffers = ((cells + 40) as ptr[])[0]
+    g_cloud_width = ((cells + 48) as int[])[0]
+    g_cloud_height = ((cells + 56) as int[])[0]
+    g_cloud_serial = ((cells + 64) as int[])[0]
+    g_offscreen = ((cells + 72) as int[])[0] != 0
+    g_width = ((cells + 80) as int[])[0]
+    g_height = ((cells + 88) as int[])[0]
+    g_render_width = ((cells + 96) as int[])[0]
+    g_render_height = ((cells + 104) as int[])[0]
+    g_render_scale = ((cells + 112) as float[])[0]
+    g_swapchain = ((cells + 120) as ptr[])[0]
+    g_image_count = ((cells + 128) as int[])[0]
+    g_images = ((cells + 136) as ptr[])[0]
+    g_views = ((cells + 144) as ptr[])[0]
+    g_offscreen_memory = ((cells + 152) as ptr[])[0]
+    g_colour = ((cells + 160) as ptr[])[0]
+    g_depth = ((cells + 168) as ptr[])[0]
+    g_velocity = ((cells + 176) as ptr[])[0]
+    g_velocity_texture = ((cells + 184) as int[])[0]
+    g_scene_pass = ((cells + 192) as ptr[])[0]
+    g_scene_pass_first = ((cells + 200) as ptr[])[0]
+    g_scene_pass_rest = ((cells + 208) as ptr[])[0]
+    g_shadow_pass = ((cells + 216) as ptr[])[0]
+    g_lamp_pass = ((cells + 224) as ptr[])[0]
+    g_camdepth_pass = ((cells + 232) as ptr[])[0]
+    g_hdr_pass = ((cells + 240) as ptr[])[0]
+    g_ldr_pass = ((cells + 248) as ptr[])[0]
+    g_post_pass = ((cells + 256) as ptr[])[0]
+    g_shadow_framebuffer = ((cells + 264) as ptr[])[0]
+    g_shadow = ((cells + 272) as ptr[])[0]
+    g_shadow_sampler = ((cells + 280) as ptr[])[0]
+    g_shadow_targets = ((cells + 288) as int[])[0]
+    g_shadow_ready = ((cells + 296) as int[])[0] != 0
+    g_lamp = ((cells + 304) as ptr[])[0]
+    g_lamp_static = ((cells + 312) as ptr[])[0]
+    g_lamp_framebuffer = ((cells + 320) as ptr[])[0]
+    g_lamp_static_framebuffer = ((cells + 328) as ptr[])[0]
+    g_lamp_sampler = ((cells + 336) as ptr[])[0]
+    g_lamp_generation = ((cells + 344) as int[])[0]
+    g_scene_framebuffer = ((cells + 352) as ptr[])[0]
+    g_resolve_framebuffer = ((cells + 360) as ptr[])[0]
+    g_post_framebuffers = ((cells + 368) as ptr[])[0]
+    g_post_texture = ((cells + 376) as int[])[0]
+    g_ldr_texture = ((cells + 384) as int[])[0]
+    g_ldr_framebuffer = ((cells + 392) as ptr[])[0]
+    g_camdepth_framebuffer = ((cells + 400) as ptr[])[0]
+    g_camdepth = ((cells + 408) as ptr[])[0]
+    g_camdepth_sampler = ((cells + 416) as ptr[])[0]
+    g_camdepth_width = ((cells + 424) as int[])[0]
+    g_camdepth_height = ((cells + 432) as int[])[0]
+    g_camdepth_serial = ((cells + 440) as int[])[0]
+    g_ssr_framebuffer = ((cells + 448) as ptr[])[0]
+    g_ssr_reflect_texture = ((cells + 456) as int[])[0]
+    g_ssr_blur_textures = ((cells + 464) as ptr[])[0]
+    g_ssr_blur_framebuffers = ((cells + 472) as ptr[])[0]
+    g_occlusion_texture = ((cells + 480) as int[])[0]
+    g_occlusion_framebuffer = ((cells + 488) as ptr[])[0]
+    g_taa_texture = ((cells + 496) as ptr[])[0]
+    g_taa_framebuffer = ((cells + 504) as ptr[])[0]
+    g_taa_history_valid = ((cells + 512) as int[])[0] != 0
+    g_taa_current = ((cells + 520) as int[])[0]
+    g_dlss_output = ((cells + 528) as int[])[0]
+    g_dlss_output_fresh = ((cells + 536) as int[])[0] != 0
+    g_view_texture = ((cells + 544) as int[])[0]
+}
+
+// Every variable as a frame with nothing made has it.
+view_reset() {
+    g_bloom_count = 0
+    g_bloom_textures = null
+    g_bloom_framebuffers = null
+    g_bloom_sizes = null
+    g_cloud_textures = null
+    g_cloud_framebuffers = null
+    g_cloud_width = 0
+    g_cloud_height = 0
+    g_cloud_serial = 0
+    g_offscreen = false
+    g_width = 0
+    g_height = 0
+    g_render_width = 0
+    g_render_height = 0
+    g_render_scale = 0.0
+    g_swapchain = null
+    g_image_count = 0
+    g_images = null
+    g_views = null
+    g_offscreen_memory = null
+    g_colour = null
+    g_depth = null
+    g_velocity = null
+    g_velocity_texture = 0
+    g_scene_pass = null
+    g_scene_pass_first = null
+    g_scene_pass_rest = null
+    g_shadow_pass = null
+    g_lamp_pass = null
+    g_camdepth_pass = null
+    g_hdr_pass = null
+    g_ldr_pass = null
+    g_post_pass = null
+    g_shadow_framebuffer = null
+    g_shadow = null
+    g_shadow_sampler = null
+    g_shadow_targets = 0
+    g_shadow_ready = false
+    g_lamp = null
+    g_lamp_static = null
+    g_lamp_framebuffer = null
+    g_lamp_static_framebuffer = null
+    g_lamp_sampler = null
+    g_lamp_generation = 0
+    g_scene_framebuffer = null
+    g_resolve_framebuffer = null
+    g_post_framebuffers = null
+    g_post_texture = 0
+    g_ldr_texture = 0
+    g_ldr_framebuffer = null
+    g_camdepth_framebuffer = null
+    g_camdepth = null
+    g_camdepth_sampler = null
+    g_camdepth_width = 0
+    g_camdepth_height = 0
+    g_camdepth_serial = 0
+    g_ssr_framebuffer = null
+    g_ssr_reflect_texture = 0
+    g_ssr_blur_textures = null
+    g_ssr_blur_framebuffers = null
+    g_occlusion_texture = 0
+    g_occlusion_framebuffer = null
+    g_taa_texture = null
+    g_taa_framebuffer = null
+    g_taa_history_valid = false
+    g_taa_current = 0
+    g_dlss_output = 0
+    g_dlss_output_fresh = false
+    g_view_texture = 0
+}
+// --- end of the generated state ---

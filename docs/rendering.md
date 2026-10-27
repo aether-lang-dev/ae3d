@@ -1207,6 +1207,86 @@ the two halves the scene pass is drawn in, the nearest of the samples a
 pixel. Both are the depth of what was drawn -- the near figure's real
 silhouette, the picture of a far one -- and neither draws anything twice.
 
+### What is at a pixel
+
+`core.backend_pick(backend, camera, light, x, y, width, height)` answers what
+the frame shows at a pixel: the model drawn there (its `id`), which of its
+instances, the depth the scene wrote and the world point, as a `core.Pick`
+(`hit` false for the sky and anything nothing is drawn at). The engine's
+forms are `engine_pick` (an extra frame), and `engine_pick_ask` before a draw
+with `engine_pick_read` in a behaviour's `late_update` after it, which is how
+a loop that picks as the pointer moves costs no more than the pick pass.
+`backend_pick_ask` and `backend_pick_read` are the same on a backend, and one
+frame answers for as many as sixteen pixels. The editor selects by it, and
+the agent channel's `frame.pixel` carries it as `pick` (docs/agent.md).
+
+It is the scene's surfaces drawn again from the camera into a target that
+holds ids instead of colour: ae3d.shaders.lit's `pick_vertex` and `pick_pixel`
+(quote shaders, with the MSL), over the draw's own block, whose `Draw.pick`
+is the model's id. So what a pixel answers is what the colour pass drew
+there, not what a ray at the model's bounds would meet:
+
+- a skinned figure is where its bones have carried it;
+- an instanced model answers for the copy (`instance`), a point drawn from a
+  stream of matrices;
+- a cut model's far side, a wound's core and a cutout texture's clear texels
+  are holes, and a blended surface counts where it is at least half opaque;
+- a crowd, posed from its bank by phase, instanced or sorted on the device,
+  answers with the crowd's model; a device crowd's figure is the row of the
+  columns it was given nearest the point (`core.device_crowd_figure_at`), the
+  columns read and not changed. The crowd's impostor tier is drawn as the
+  quad it is.
+
+A particle's points, a surface added over the frame (flames) and the water
+are no one's: a pick sees through them. The pass runs only in a frame that was
+asked, before the scene pass, in the same command buffer; a frame that asks
+nothing has no target, no pipeline and no draw. It draws at the scene's size
+(the render scale applies), one sample, with the frame's jitter: the world
+point is unprojected through the camera's unjittered matrix, so with the
+temporal pass on it is within half a pixel of the surface.
+
+### Views
+
+A view is a camera drawn into a texture of its own, at a size of its own,
+before the frame that shows it: `core.backend_view_new(backend, w, h)`, then
+each frame `backend_view_render(backend, view, camera, light)` (the engine's:
+`engine_view_new`, `engine_view_render(e, view, camera)`). A material shows it
+(`engine_view_show`, `core.material_set_texture_id(material,
+backend_view_texture(...))`): a monitor, a mirror, a portal, a minimap on a
+wall. `backend_view_blit(backend, view, x, y, w, h)` draws it into a rectangle
+of the window's frame instead, over the scene and under the overlay, asked
+every frame it is wanted as the HUD's rectangles are: picture-in-picture, a
+split screen's halves. `backend_view_pixels` reads a view back (RGBA, top row
+first). The camera is the program's own, its aspect the view's.
+
+A view is a frame in everything but the window, and it keeps what a frame
+keeps of a camera:
+
+- the temporal pass's history, the camera depth the occlusion and the
+  reflection read, the clouds' history;
+- its own cascades' shadow atlas and lamps' atlas, and the clusters its camera
+  cuts the lamps into (a view's camera block is the camera set, set 1 of the
+  scene's layout, of the frame slot it is drawn in: docs/aether_quote_design.md
+  section 11);
+- the matrices its motion vectors are made from and the jitter's count;
+- its exposure (`backend_view_set_exposure`), which the window's adaptation
+  does not follow.
+
+The scene's settings are shared: the post chain, the shadow distance, the sky,
+the models, the lights and the textures. A view does not run the probes (it
+reads the window's volume where it is and the sky past it), is not upscaled,
+and draws no overlay; it does not close the frame's models, so the window's
+motion vectors do not lose the step a view drew. On Vulkan a view is drawn as
+a frame of its own into images of its own: the module's frame variables
+(ae3d.vktargets) are swapped for the view's while it is drawn
+(`scripts/gen_view_swap.py` writes the swap and `tests/test_view_swap`
+reads it against the module), and its final image is sampled as sRGB, so the
+encoded values the composite writes are the light a surface shows. On OpenGL
+the renderer's fields that belong to a camera are swapped (`GLViewKept`).
+Its cost is what a frame's is, its memory the frame's targets and, once
+shadows are on, the atlases (4096 squares of depth): views are made for what
+is shown.
+
 ## Lamps
 
 Every point and spot light a scene registers lights what it reaches, and

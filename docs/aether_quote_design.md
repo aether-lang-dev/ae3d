@@ -759,8 +759,16 @@ and every draw's set stay as they are. Nothing else in a shader, a pipeline
 or a layout changes: the pipelines are made on the three set layouts
 (`vkpipes.scene_layouts`), and a shader drawn beside the scene takes its
 own sets after them (`frame.SCENE_SETS`, the crowd's rings at 3).
-No second camera is drawn yet (Nic: no multi-camera work before the
-scene).
+A second camera is drawn now (#866): a view is a frame of its own, in the
+frame slot it is drawn in, so its camera block and images are that slot's set
+1 and the world's set 2 is the slot's too, with nothing in a shader, a
+pipeline or a layout changed; `docs/rendering.md`, "Views", has what it keeps
+apart (its images, its temporal history, its cascades' and lamps' atlases,
+its clusters, its exposure) and what it shares (the scene). The pick pass
+(#865) takes the same three sets: its shaders are quoted over the same
+blocks (`ae3d.shaders.lit`'s `pick_vertex`, `pick_plain_vertex`,
+`pick_pixel`, with `Draw.pick` the model's id), so a picked frame's pick draws
+are the scene's, bound as the scene's are.
 
 ### Step 6b: the ray-query pixel shader (2026-10-26)
 

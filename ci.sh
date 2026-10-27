@@ -102,7 +102,7 @@ apps_part() {
 # The suites the first shard's steps run again: the validation layer's, the
 # probes', and the determinism trail's.
 ONCE_SUITES="test_fog test_overlay test_hud_layout test_damage test_backend_parity test_gi
-    test_ray_shadows test_ray_occlusion test_determinism"
+    test_ray_shadows test_ray_occlusion test_determinism test_pick test_pick_crowd test_view"
 in_tier() {   # in_tier <tier>...: whether this run covers any of them
     [ "$TIER" = all ] && return 0
     for wanted in "$@"; do
@@ -129,7 +129,7 @@ PLATFORM_SUITES="test_net test_net_authority test_net_budget test_net_delta
 # to print SKIP and be held to `leaks` on the way out. AE3D_CI_GPU=0, which the
 # workflow sets on those runners, builds none of them. A suite left off this
 # list is built and skips as before: forgetting one costs time, not coverage.
-GPU_SUITES="test_gpu_fxaa test_agent test_agent_attached test_agent_components test_agent_explain test_anisotropy test_tile_breakup test_ground_bounce test_heat_haze test_water_sky test_clouds
+GPU_SUITES="test_gpu_fxaa test_pick test_pick_crowd test_view test_engine_view test_agent_pick test_agent test_agent_attached test_agent_components test_agent_explain test_anisotropy test_tile_breakup test_ground_bounce test_heat_haze test_water_sky test_clouds
     test_agent_net test_agent_record test_backend_parity test_batching
     test_blackhole test_camera_collision test_caustics test_character test_cluster_cut
     test_crowd_ecs test_crowd_render test_crowd_render_scale
@@ -714,7 +714,7 @@ step "Vulkan under the validation layer, synchronization included"
 # the layer reports fails the suite. The loader names every layer it inserts
 # when asked (VK_LOADER_DEBUG=layer): a run it did not insert the layer into
 # would pass having checked nothing, so that is a skip, never a pass.
-for name in test_fog test_overlay test_hud_layout test_damage test_backend_parity test_gi; do
+for name in test_fog test_overlay test_hud_layout test_damage test_backend_parity test_gi test_pick test_pick_crowd test_view; do
     if ! built_ok "$name"; then
         skip "$name under the layer" "did not build"
         continue

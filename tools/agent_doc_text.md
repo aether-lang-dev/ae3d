@@ -66,9 +66,23 @@ pixels are, so a 1280x720 rectangle costs an answer of about twenty bytes
 rather than 3.7MB.
 
     frame.capture                          -> {"width": 1024, "height": 768}
-    frame.pixel x=512 y=384                -> {"r": 133, "g": 85, "b": 70}
+    frame.pixel x=512 y=384                -> {"r": 133, "g": 85, "b": 70, "pick": {...}}
     frame.region x=412 y=284 width=200 height=200
                                            -> {"coverage": 0.991, "mean": [...]}
+
+`frame.pixel` also says what is drawn at the pixel (#865): the frame is drawn
+once more into a target of ids, and `pick` names the model there --
+
+    frame.pixel x=512 y=384
+      -> {"pick": {"available": true, "hit": true,
+                   "model": {"id": 17, "index": 3, "name": "zombie"},
+                   "instance": 41, "depth": 0.9852, "position": [1.2, 0.9, -3.4]}}
+
+-- however it is posed, instanced or cut out: a skinned figure's bent arm, one
+tree of a thousand and the visible part of an alpha-tested leaf are each the
+model that is seen there, where a ray against bind-pose bounds gets them
+wrong. A crowd the device sorts adds `figure`, the row of its columns nearest
+the point. `hit` is false for the sky and anything nothing is drawn at.
 
 `frame.hold` keeps the current capture as a reference and `frame.diff` reports
 what changed against it, which turns "did that command do anything" into a
