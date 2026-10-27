@@ -43,6 +43,7 @@ import ae3d.vkquote (QuotedPass)
 import ae3d.gpu
 import ae3d.gpu (GpuShader)
 import ae3d.shaders.fxaa
+import ae3d.shaders.upscale
 import ae3d.shaders.bloom
 import ae3d.shaders.depth
 import ae3d.shaders.resolve
@@ -76,6 +77,7 @@ exports (
     clusters_reserve, clusters_lights, clusters_words, set_post, post_active, set_frame_exposure, frame_exposure, composited, quoted_screen_pass,
     set_bloom_intensity, bloom_intensity, draw_calls, pass_ms, pipeline_binds, set_binds, sample_count,
     set_samples, set_scene_depth, scene_depth_ready, resolve_scene_depth, velocity_texture, set_render_scale,
+    set_upscaler, upscaler, upscale_sharpness,
     render_scale, set_taa, taa, taa_history, set_ssr, ssr, set_ssr_params, ssr_road_height, ssr_strength, set_ssao, ssao, ssao_radius,
     ssao_intensity, occlusion_pass, mark_sky_done, mark_opaque_done, set_capture_bypass, default_texture,
     max_texture_size, texture_destroy, dlss_available, set_dlss, dlss, dlss_failed, dlss_camera, clip_correct,
@@ -207,6 +209,14 @@ var g_nearest_sampler: ptr = null
 // kept across a start.
 var g_shadow_enabled = false
 var g_fxaa = false
+// The upscaler (#867): 0 the composite's bilinear sampling, 1 the spatial
+// upscale and sharpen (ae3d.shaders.upscale), asked for before the device
+// exists as often as after, so kept across a device; the sharpen's strength
+// (0 to 1, 0 leaves it out). The two passes are the quoted easu and rcas.
+var g_upscaler = 0
+var g_upscale_sharpness = 0.5
+var g_easu_pass: ptr = null
+var g_rcas_pass: ptr = null
 // FXAA's pass, from its quoted shader (ae3d.shaders.fxaa), and the frame
 // size its tree's texel was captured for; null where it would not build.
 var g_fxaa_pass: ptr = null
@@ -823,6 +833,10 @@ start(width: int, height: int) -> bool {
     g_fxaa_h = vktargets.height()
     g_fxaa_pass = vkquote.pass_new(fxaa_shader(g_fxaa_w, g_fxaa_h), vkspirv.FXAA_QUOTED_VERT, vkspirv.FXAA_QUOTED_FRAG,
                                    vkspirv.FXAA_QUOTED_HASH, vktargets.post_pass(), 1) as ptr
+    g_easu_pass = vkquote.pass_new(upscale.easu(Texture { image: null }, vec2(0.0, 0.0)), vkspirv.EASU_QUOTED_VERT,
+                                   vkspirv.EASU_QUOTED_FRAG, vkspirv.EASU_QUOTED_HASH, vktargets.hdr_pass(), 1) as ptr
+    g_rcas_pass = vkquote.pass_new(upscale.rcas(Texture { image: null }, vec2(0.0, 0.0), 0.0), vkspirv.RCAS_QUOTED_VERT,
+                                   vkspirv.RCAS_QUOTED_FRAG, vkspirv.RCAS_QUOTED_HASH, vktargets.hdr_pass(), 1) as ptr
     g_bloom_down_pass = vkquote.pass_new(bloom.bloom_down(Texture { image: null }, vec2(0.0, 0.0), 0, 1.0, 1.0),
                                          vkspirv.BLOOM_DOWN_QUOTED_VERT, vkspirv.BLOOM_DOWN_QUOTED_FRAG,
                                          vkspirv.BLOOM_DOWN_QUOTED_HASH, vktargets.hdr_pass(), BLOOM_DOWN_DRAWS) as ptr
@@ -928,6 +942,10 @@ shutdown() {
     vkpipes.destroy()
     vkquote.pass_free(g_fxaa_pass as *QuotedPass)
     g_fxaa_pass = null
+    vkquote.pass_free(g_easu_pass as *QuotedPass)
+    g_easu_pass = null
+    vkquote.pass_free(g_rcas_pass as *QuotedPass)
+    g_rcas_pass = null
     vkquote.pass_free(g_bloom_down_pass as *QuotedPass)
     g_bloom_down_pass = null
     vkquote.pass_free(g_bloom_up_pass as *QuotedPass)
@@ -993,6 +1011,7 @@ shutdown() {
     g_bloom_threshold = 0.0
     g_bloom_intensity = 0.0
     g_render_scale = 0.0
+    g_upscaler = 0
     vktargets.set_render_scale(0.0)
     g_ready = false
 }
@@ -2748,6 +2767,51 @@ draw_quoted_with(p: *QuotedPass, draw: int) {
     g_draw_calls = g_draw_calls + 1
 }
 
+// The upscaler asked for: 0 the composite's bilinear sampling (the default),
+// 1 the spatial upscale and sharpen (#867), `sharpness` from 0 (none) to 1.
+// What a program asks for before the device exists stands after it.
+set_upscaler(mode: int, sharpness: float) {
+    g_upscaler = mode
+    if g_upscaler < 0 { g_upscaler = 0 }
+    if g_upscaler > 1 { g_upscaler = 1 }
+    s = sharpness
+    if s < 0.0 { s = 0.0 }
+    if s > 1.0 { s = 1.0 }
+    g_upscale_sharpness = (s as f32) as float
+}
+upscaler() -> int { return g_upscaler }
+upscale_sharpness() -> float { return g_upscale_sharpness }
+
+// The scene `source`, `sw` by `sh` texels, made the frame's size: the
+// edge-adaptive upscale into the first of two frame-size targets and, with a
+// sharpness, the sharpen into the second. The texture the composite then
+// reads; 0 where the passes or their targets would not make (the composite
+// samples the scene bilinearly, as it always did).
+upscale_chain(source: int, sw: int, sh: int) -> int {
+    if g_easu_pass == null || !vktargets.upscale_ensure() { return 0 }
+    fw = vktargets.width()
+    fh = vktargets.height()
+    begin_pass(vktargets.hdr_pass(), vktargets.upscale_framebuffer(0), fw, fh, 0)
+    vkhost.set_pass_open(true)
+    viewport(fw, fh)
+    _s = gpu.set_vec2(vkquote.shader(g_easu_pass as *QuotedPass), "size", sw * 1.0, sh * 1.0)
+    draw_quoted(g_easu_pass as *QuotedPass, 0, vktexture.view(source), vktexture.sampler_of(source))
+    vk.vkCmdEndRenderPass(commands_now())
+    vkhost.set_pass_open(false)
+    made = vktargets.upscale_texture(0)
+    if g_upscale_sharpness <= 0.0 || g_rcas_pass == null { return made }
+    begin_pass(vktargets.hdr_pass(), vktargets.upscale_framebuffer(1), fw, fh, 0)
+    vkhost.set_pass_open(true)
+    viewport(fw, fh)
+    rcas_shader = vkquote.shader(g_rcas_pass as *QuotedPass)
+    _z = gpu.set_vec2(rcas_shader, "size", fw * 1.0, fh * 1.0)
+    _p = gpu.set_float(rcas_shader, "sharpness", g_upscale_sharpness)
+    draw_quoted(g_rcas_pass as *QuotedPass, 0, vktexture.view(made), vktexture.sampler_of(made))
+    vk.vkCmdEndRenderPass(commands_now())
+    vkhost.set_pass_open(false)
+    return vktargets.upscale_texture(1)
+}
+
 // The bloom pyramid over `source`, `sw` by `sh` texels: down the levels,
 // the first taking only the light past the threshold, then back up, each
 // its own and a tent of the coarser one's sum. The top's sum, which the
@@ -2977,6 +3041,19 @@ frame_end() -> bool {
         // The bloom over what the composite will show, and the composite, at
         // the frame's own size: the scene drawn smaller is scaled up by the
         // sampling here.
+        // The scene drawn smaller than the frame, made the frame's size by
+        // the spatial upscaler (#867) in place of the composite's bilinear
+        // sampling, when it was asked for and the scene is smaller. A view
+        // is never drawn smaller, and DLSS has made the frame's size.
+        if g_upscaler != 0 && !g_capture_bypass && g_dlss_mode == 0 && vktargets.scaled() && source > 0 {
+            made = upscale_chain(source, source_w, source_h)
+            if made > 0 {
+                source = made
+                source_w = vktargets.width()
+                source_h = vktargets.height()
+            }
+        }
+
         bloom = 0
         if g_bloom && !g_capture_bypass { bloom = bloom_chain(source, source_w, source_h) }
         draw_composite(source, bloom)
