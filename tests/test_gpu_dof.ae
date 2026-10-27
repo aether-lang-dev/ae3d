@@ -1,0 +1,412 @@
+// Depth of field (ae3d.shaders.dof, #870), run on the CPU by ae3d.gpu over
+// pictures whose right answer is known, and held to what makes it depth of
+// field and not a blur:
+//
+//   - the view depth the first pass takes back through the camera's inverse
+//     is the planar distance, on the axis and off it, in the Vulkan dialect's
+//     clip depth;
+//   - the disc of confusion is nothing at the focus distance, negative
+//     nearer and positive farther, held to the widest, and a pixel nothing
+//     was drawn in is infinitely far;
+//   - the first pass keeps the disc farthest from focus of the four depths a
+//     texel covers, and the mean of the four lights;
+//   - the second leaves what is in focus exactly as it is (alpha 0), blurs
+//     what is out of it (alpha 1, the light conserved), spreads a near
+//     thing's blur over the sharp ground beside it and no further than its
+//     disc, and lets none of the far ground's blur onto a texel in focus.
+//
+// Its GLSL, for Vulkan and OpenGL, is the fixtures, taken by glslang.
+//
+// AE3D_GPU_WRITE_GOLDEN=1 writes the fixtures from what is emitted.
+
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.lanes
+import std.quote
+import ae3d.core
+import ae3d.core (Mat4, Vec3, Vec4)
+import ae3d.gpu
+import ae3d.shaders.dof
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, ShaderImage, texture, rgb, mat4_of, image_new, image_set,
+                       image_channel, image_free, texture_of)
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+absf(a: float) -> float { if a < 0.0 { return 0.0 - a } return a }
+
+// glslang -V over `text` (as `stage`), then spirv-val; or, for desktop
+// OpenGL's GLSL (`opengl`), glslang's check of it. Skipped where they are
+// not on PATH.
+compiles(label: string, text: string, stage: string, opengl: bool) {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+        if status != 0 { println(out) }
+        return
+    }
+    check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    if status != 0 { println(out) }
+    if string.length(os.which("spirv-val")) == 0 {
+        println("  skip spirv-val (not on PATH)")
+        return
+    }
+    vargv = list.new()
+    list.add(vargv, spv)
+    vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+    check("spirv-val passes ${label}.${stage}", vstatus == 0)
+    if vstatus != 0 { println(vout) }
+    list.free(vargv)
+}
+
+// `text` is the fixture at `path`; AE3D_GPU_WRITE_GOLDEN=1 writes it.
+golden_is(text: string, path: string) {
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(path, text)
+        check("${path} written", werr == "")
+    }
+    golden, gerr = file.read(path)
+    check("${path} is there", gerr == "")
+    check("the GLSL written is ${path}", text == golden)
+    if text != golden {
+        println("--- emitted ---")
+        println(text)
+    }
+}
+
+
+
+// An OpenGL-shaped matrix as the Vulkan renderer puts it in its block
+// (vkdesc.clip_correct): clip y down, z in 0..1.
+vulkan_clip(m: Mat4) -> Mat4 {
+    return Mat4 {
+        m0: m.m0, m1: 0.0 - m.m1, m2: 0.5 * (m.m2 + m.m3), m3: m.m3,
+        m4: m.m4, m5: 0.0 - m.m5, m6: 0.5 * (m.m6 + m.m7), m7: m.m7,
+        m8: m.m8, m9: 0.0 - m.m9, m10: 0.5 * (m.m10 + m.m11), m11: m.m11,
+        m12: m.m12, m13: 0.0 - m.m13, m14: 0.5 * (m.m14 + m.m15), m15: m.m15
+    }
+}
+
+// The stored depth (0..1) of a point at view distance `z` on a camera with
+// planes `near` and `far`.
+depth_of(z: float, near: float, far: float) -> float {
+    return far * (z - near) / (z * (far - near))
+}
+
+// One run of a quoted shader at (u, v), the four lanes.
+run4(cx: *GpuRun, u: float, v: float) -> f32x4 {
+    uv = gpu.v2(u, v)
+    got = gpu.cpu_run(cx, uv)
+    heap.free(uv)
+    if got == null {
+        println("  cpu_run failed: ${gpu.last_error()}")
+        return lanes.splat4(0.0 - 99.0)
+    }
+    out = lanes.f32x4(gpu.val_x(got), gpu.val_y(got), gpu.val_z(got), gpu.val_w(got))
+    heap.free(got)
+    return out
+}
+
+// A w x h picture with `fill` at every texel.
+fill_image(w: int, h: int, r: float, g: float, b: float, a: float) -> *ShaderImage {
+    img = image_new(w, h)
+    y = 0
+    while y < h {
+        x = 0
+        while x < w {
+            image_set(img, x, y, r, g, b, a)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return img
+}
+
+const NEAR = 0.1
+const FAR = 100.0
+const FOCUS = 10.0
+const APERTURE = 4.0
+const MAX_RADIUS = 6.0
+
+main() {
+    println("ae3d.shaders.dof on the CPU")
+    proj = core.mat4_perspective(1.0, 1.5, NEAR, FAR)
+    view = core.mat4_look_at(core.vec3(0.0, 0.0, 0.0), core.vec3(0.0, 0.0, 0.0 - 1.0), core.vec3(0.0, 1.0, 0.0))
+    glm = core.mat4_mul(proj, view)
+    vkm = vulkan_clip(glm)
+    vk_inv = core.mat4_inverse(vkm)
+    inv = mat4_of(&vk_inv)
+
+    // ── the view depth ──
+    // A depth image of planes at twice the size of the target the first pass
+    // draws: near (z 2) to the left of the middle and far (z 40) to its right;
+    // and, in three of the target's texels, a step through the 2x2 block
+    // that texel covers, so that each of the block's four depths is the one
+    // the farthest from focus in turn.
+    dw = 64
+    dh = 48
+    depth = image_new(dw, dh)
+    colour = image_new(32, 24)
+    y = 0
+    while y < dh {
+        x = 0
+        while x < dw {
+            z = 2.0
+            if x >= dw / 2 { z = 40.0 }
+            // Block at target texel 20 (depth x 40, 41): only the top
+            // right is near; at 24 (48, 49): only the bottom left; at 28
+            // (56, 57): only the bottom right; the rest of the right half is far.
+            if x == 41 && y % 2 == 0 { z = 2.0 }
+            if x == 48 && y % 2 == 1 { z = 2.0 }
+            if x == 57 && y % 2 == 1 { z = 2.0 }
+            if x >= 40 && x < 42 && !(x == 41 && y % 2 == 0) { z = 40.0 }
+            if x >= 48 && x < 50 && !(x == 48 && y % 2 == 1) { z = 40.0 }
+            if x >= 56 && x < 58 && !(x == 57 && y % 2 == 1) { z = 40.0 }
+            image_set(depth, x, y, depth_of(z, NEAR, FAR), 0.0, 0.0, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    y = 0
+    while y < 24 {
+        x = 0
+        while x < 32 {
+            image_set(colour, x, y, 1.0, 0.5, 0.25, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    worst = 0.0
+    zs = calloc(5, 8) as float[]
+    zs[0] = 0.5
+    zs[1] = 2.0
+    zs[2] = 10.0
+    zs[3] = 40.0
+    zs[4] = 90.0
+    k = 0
+    while k < 5 {
+        // On the axis and 0.6 of the way to the frame's edge (a planar z is
+        // the same there; a radial distance would not be).
+        d = depth_of(zs[k], NEAR, FAR)
+        on_axis = dof.view_depth(inv, vec2(0.5, 0.5), d)
+        off_axis = dof.view_depth(inv, vec2(0.9, 0.2), d)
+        e1 = absf(on_axis - zs[k]) / zs[k]
+        e2 = absf(off_axis - zs[k]) / zs[k]
+        if e1 > worst { worst = e1 }
+        if e2 > worst { worst = e2 }
+        k = k + 1
+    }
+    free(zs as ptr)
+    check("the view depth is the planar distance, on the axis and off it (worst error ${worst})", worst < 0.001)
+
+    // ── the disc of confusion ──
+    at_focus = dof.disc_radius(10.0, depth_of(10.0, NEAR, FAR), FOCUS, APERTURE, MAX_RADIUS)
+    nearer = dof.disc_radius(5.0, depth_of(5.0, NEAR, FAR), FOCUS, APERTURE, MAX_RADIUS)
+    farther = dof.disc_radius(20.0, depth_of(20.0, NEAR, FAR), FOCUS, APERTURE, MAX_RADIUS)
+    very_near = dof.disc_radius(0.5, depth_of(0.5, NEAR, FAR), FOCUS, APERTURE, MAX_RADIUS)
+    sky = dof.disc_radius(0.0, 1.0, FOCUS, APERTURE, MAX_RADIUS)
+    check("a disc of nothing at the focus distance (${at_focus})", absf(at_focus) < 0.000001)
+    check("negative nearer, ${nearer} at half the focus distance: aperture (z - focus) / z = -4", absf(nearer - (0.0 - 4.0)) < 0.0001)
+    check("positive farther, ${farther} at twice it: 2", absf(farther - 2.0) < 0.0001)
+    check("held to the widest toward the lens (${very_near})", absf(very_near - (0.0 - MAX_RADIUS)) < 0.000001)
+    check("nothing drawn is infinitely far: the aperture (${sky})", absf(sky - APERTURE) < 0.000001)
+
+    // ── the first pass ──
+    cs = dof.dof_coc(texture_of(colour), texture_of(depth), vec2(1.0 / 32.0, 1.0 / 24.0), inv, FOCUS, APERTURE, MAX_RADIUS)
+    cx = gpu.cpu_new(cs)
+    near_px = run4(cx, 4.5 / 32.0, 11.5 / 24.0)
+    far_px = run4(cx, 18.5 / 32.0, 11.5 / 24.0)
+    check("the light is the picture's (a 2x2 mean of one colour): ${near_px.x}, ${near_px.y}, ${near_px.z}",
+          absf(near_px.x - 1.0) < 0.0001 && absf(near_px.y - 0.5) < 0.0001 && absf(near_px.z - 0.25) < 0.0001)
+    check("the near plane (z 2) has a negative disc, ${near_px.w}: -4 (2 - 10) / 2, held to ${MAX_RADIUS}",
+          absf(near_px.w - (0.0 - MAX_RADIUS)) < 0.0001)
+    check("the far plane (z 40) a positive one, ${far_px.w}: 4 (40 - 10) / 40 = 3", absf(far_px.w - 3.0) < 0.001)
+    // The texels over a step through their block take the disc farthest from focus.
+    top_right = run4(cx, 20.5 / 32.0, 11.5 / 24.0)
+    bottom_left = run4(cx, 24.5 / 32.0, 11.5 / 24.0)
+    bottom_right = run4(cx, 28.5 / 32.0, 11.5 / 24.0)
+    check("a texel whose top-right depth is near has the near disc, ${top_right.w}", absf(top_right.w - (0.0 - MAX_RADIUS)) < 0.001)
+    check("one whose bottom-left is near, ${bottom_left.w}", absf(bottom_left.w - (0.0 - MAX_RADIUS)) < 0.001)
+    check("one whose bottom-right is near, ${bottom_right.w}", absf(bottom_right.w - (0.0 - MAX_RADIUS)) < 0.001)
+    // The texel centred on the step between near and far ground (depth x
+    // 31 | 32) has both, the near one wider.
+    edge = run4(cx, 16.0 / 32.0, 11.5 / 24.0)
+    check("and the step between the planes, ${edge.w}: the near disc", absf(edge.w - (0.0 - MAX_RADIUS)) < 0.001)
+    gpu.cpu_free(cx)
+    gpu.shader_free(cs)
+    image_free(depth)
+    image_free(colour)
+
+    // ── the second pass ──
+    gw = 40
+    gh = 24
+    gs_in = fill_image(gw, gh, 0.1, 0.1, 0.1, 0.0)
+    // A bright dot in the middle of an in-focus picture: left exactly alone.
+    image_set(gs_in, 20, 12, 5.0, 5.0, 5.0, 0.0)
+    gs = dof.dof_gather(texture_of(gs_in), vec2(1.0 / gw, 1.0 / gh), MAX_RADIUS)
+    gx = gpu.cpu_new(gs)
+    dot = run4(gx, 20.5 / gw, 12.5 / gh)
+    beside = run4(gx, 21.5 / gw, 12.5 / gh)
+    check("in focus is left as it is: the dot's light (${dot.x}) and alpha 0 (${dot.w})", absf(dot.x - 5.0) < 0.0001 && dot.w == 0.0)
+    check("and so is what is beside it (${beside.x}, alpha ${beside.w})", absf(beside.x - 0.1) < 0.0001 && beside.w == 0.0)
+    gpu.cpu_free(gx)
+    gpu.shader_free(gs)
+    image_free(gs_in)
+
+    // The far ground, all of one disc of 3: the dot is spread, the light conserved.
+    far_in = fill_image(gw, gh, 0.1, 0.1, 0.1, 3.0)
+    image_set(far_in, 20, 12, 5.0, 5.0, 5.0, 3.0)
+    fs = dof.dof_gather(texture_of(far_in), vec2(1.0 / gw, 1.0 / gh), MAX_RADIUS)
+    fx = gpu.cpu_new(fs)
+    spread_peak = run4(fx, 20.5 / gw, 12.5 / gh)
+    total_in = 0.1 * (gw * gh - 1) + 5.0
+    total_out = 0.0
+    full_alpha = 0
+    y = 0
+    while y < gh {
+        x = 0
+        while x < gw {
+            p = run4(fx, (x + 0.5) / gw, (y + 0.5) / gh)
+            total_out = total_out + p.x
+            if p.w == 1.0 { full_alpha = full_alpha + 1 }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    check("blurred ground is all blurred light (alpha 1 at ${full_alpha} of ${gw * gh})", full_alpha == gw * gh)
+    check("the dot is spread (${spread_peak.x} from 5)", spread_peak.x < 1.5 && spread_peak.x > 0.1)
+    check("with its light conserved (${total_out} of ${total_in})", absf(total_out - total_in) / total_in < 0.05)
+    gpu.cpu_free(fx)
+    gpu.shader_free(fs)
+    image_free(far_in)
+
+    // A near thing (disc -4) on the left half of a sharp picture with a
+    // bright column just to its right: the blur spreads over the sharp
+    // ground, up to its disc and no further.
+    near_in = fill_image(gw, gh, 0.1, 0.1, 0.1, 0.0)
+    y = 0
+    while y < gh {
+        x = 0
+        while x < gw {
+            if x < 20 { image_set(near_in, x, y, 2.0, 0.2, 0.2, 0.0 - 4.0) }
+            if x == 21 { image_set(near_in, x, y, 0.1, 0.1, 5.0, 0.0) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    ns = dof.dof_gather(texture_of(near_in), vec2(1.0 / gw, 1.0 / gh), MAX_RADIUS)
+    nx = gpu.cpu_new(ns)
+    next_to = run4(nx, 20.5 / gw, 12.5 / gh)
+    two_over = run4(nx, 22.5 / gw, 12.5 / gh)
+    far_off = run4(nx, 30.5 / gw, 12.5 / gh)
+    check("sharp ground beside a near thing is blurred by it (alpha ${next_to.w} one texel off, ${two_over.w} three)", next_to.w > 0.7 && two_over.w > 0.15)
+    check("and the near thing's red is in it (${next_to.x} over 0.1)", next_to.x > 0.5)
+    check("but not past its disc: untouched ten texels off (alpha ${far_off.w})", far_off.w == 0.0 && absf(far_off.x - 0.1) < 0.0001)
+    // Over a smaller disc the reach is smaller: a near disc of 2 beside the same ground leaves a texel four off alone.
+    y = 0
+    while y < gh {
+        x = 0
+        while x < 20 {
+            image_set(near_in, x, y, 2.0, 0.2, 0.2, 0.0 - 2.0)
+            x = x + 1
+        }
+        x = 21
+        while x < 24 {
+            image_set(near_in, x, y, 0.1, 0.1, 0.1, 0.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    small_next = run4(nx, 20.5 / gw, 12.5 / gh)
+    small_far = run4(nx, 24.5 / gw, 12.5 / gh)
+    check("a smaller disc reaches less: beside it ${small_next.w}, four texels off ${small_far.w}", small_next.w > 0.3 && small_far.w == 0.0)
+    gpu.cpu_free(nx)
+    gpu.shader_free(ns)
+    image_free(near_in)
+
+    // Far ground (disc 4) on the left, a bright dot in focus on the right
+    // beside it: the dot is not blurred by the far ground's blur.
+    gap_in = fill_image(gw, gh, 0.1, 0.1, 0.1, 0.0)
+    y = 0
+    while y < gh {
+        x = 0
+        while x < 20 {
+            image_set(gap_in, x, y, 3.0, 3.0, 0.2, 4.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    gs2 = dof.dof_gather(texture_of(gap_in), vec2(1.0 / gw, 1.0 / gh), MAX_RADIUS)
+    gx2 = gpu.cpu_new(gs2)
+    sharp_beside = run4(gx2, 20.5 / gw, 12.5 / gh)
+    check("what is in focus beside far blur takes none of it (alpha ${sharp_beside.w}, ${sharp_beside.x} for 0.1)",
+          sharp_beside.w == 0.0 && absf(sharp_beside.x - 0.1) < 0.0001)
+    deep = run4(gx2, 5.5 / gw, 12.5 / gh)
+    check("and the far ground itself is blurred (alpha ${deep.w})", deep.w == 1.0)
+    gpu.cpu_free(gx2)
+    gpu.shader_free(gs2)
+    image_free(gap_in)
+
+    // ── the GLSL ──
+    blank_coc = dof.dof_coc(Texture { image: null }, Texture { image: null }, vec2(0.0, 0.0), inv, 1.0, 1.0, 1.0)
+    blank_gather = dof.dof_gather(Texture { image: null }, vec2(0.0, 0.0), 1.0)
+    vk = gpu.emit_glsl(blank_coc, gpu.VULKAN)
+    gl = gpu.emit_glsl(blank_coc, gpu.GL)
+    golden_is(vk, "tests/fixtures/gpu/dof_coc.frag")
+    golden_is(gl, "tests/fixtures/gpu/dof_coc_gl.frag")
+    compiles("dof_coc", vk, "frag", false)
+    compiles("dof_coc_gl", gl, "frag", true)
+    vk2 = gpu.emit_glsl(blank_gather, gpu.VULKAN)
+    gl2 = gpu.emit_glsl(blank_gather, gpu.GL)
+    golden_is(vk2, "tests/fixtures/gpu/dof_gather.frag")
+    golden_is(gl2, "tests/fixtures/gpu/dof_gather_gl.frag")
+    compiles("dof_gather", vk2, "frag", false)
+    compiles("dof_gather_gl", gl2, "frag", true)
+    check("the first pass's textures are the light and the depth, in that order",
+          gpu.samplers_count(blank_coc) == 2 && gpu.samplers_name(blank_coc, 0) == "screen" &&
+          gpu.samplers_name(blank_coc, 1) == "depth")
+    gpu.shader_free(blank_coc)
+    gpu.shader_free(blank_gather)
+
+    if g_failures == 0 {
+        println("dof: all checks passed (${g_checks})")
+        return
+    }
+    println("dof: ${g_failures} of ${g_checks} checks failed")
+    exit(1)
+}

@@ -1,0 +1,249 @@
+// ae3d.shaders.upscale: a spatial upscaler for a scene drawn smaller than the
+// frame (#867), in two passes written with `quote`: `easu` makes the frame's
+// size out of the scene's, edge-adaptively, and `rcas` sharpens it. Neither
+// is a vendor's: the same two trees are Vulkan's SPIR-V, OpenGL's GLSL and
+// the MSL, and run on any device that draws the scene.
+//
+// The shape is the one the published description of FSR 1 gives (AMD,
+// FidelityFX Super Resolution 1, the 2021 technical write-up and the
+// documentation of its two passes): an edge-adaptive upscale over a
+// twelve-texel footprint, then a contrast-adaptive sharpen over a cross of
+// five. The code is written from that description and is ours: the
+// footprint's gradients, the eigenvector of their tensor, the kernel (a
+// Catmull-Rom cubic of a stretched distance) and the sharpen's lobe limit
+// are this file's own arithmetic, and no FidelityFX source was read to write
+// it (it is MIT licensed, and docs/rendering.md says where the two differ).
+//
+// Both work on the square root of the light, the perceptual space the
+// hand-written upscalers ask a linear frame to be put in: the scene is HDR
+// (a sun is a hundred times a shadow), and filtering light directly makes the
+// edge of a bright thing a staircase once it is tone-mapped. The square root
+// keeps the range, has an exact inverse (the square) and needs no exposure.
+//
+// easu: for the output pixel at `uv`, the scene's position there is cut into
+// a texel and a fraction of one. The twelve texels about the four nearest
+// (a 4x4 block without its corners) give the light's gradient at each of the
+// four, by central differences of their luma; the gradients' outer products
+// are weighed by the position's bilinear weights into one 2x2 structure
+// tensor. Its dominant eigenvector is the direction across an edge, and how
+// far its two eigenvalues part (`coherence`, with the gradient's size) is how
+// much of an edge it is. The twelve texels are then weighed by a Catmull-Rom
+// cubic of their distance from the position, measured in a metric stretched
+// across the edge (so the kernel is narrow across it: sharp) and shrunk along
+// it (so the kernel reaches further along it: the staircase is averaged
+// away), and the sum is held to the range of the four nearest texels, so the
+// cubic's negative lobes cannot ring.
+//
+//   screen   the scene, at its own size
+//   size     that size in texels, (width, height)
+//
+// rcas: each pixel against the four about it, per channel. The pixel is
+// moved away from them by a lobe l (out = (c - l (n + e + s + w)) / (1 - 4 l),
+// the kernel (-l, -l, 1 + 4l... normalised) that sums to one), and l is the
+// largest the pixel can take without leaving the range its five set, widened
+// by a tenth of that range above and a quarter below and never below zero
+// light: a flat area has no range to leave, so it is not sharpened, a step
+// edge gets the overshoot those allow (dark side more than bright: a bright
+// halo is the one a viewer sees), and a lone bright pixel is not blown up.
+// Solved, not iterated: both limits are linear in l.
+//
+//   screen     the upscaled frame, at the frame's size
+//   size       that size in texels
+//   sharpness  0 to 1 of the biggest lobe (0.2: the centre 1 + 4l over a sum
+//              that leaves 1 - 4l = 0.2 of the light)
+
+import std.quote
+import ae3d.gpu (GpuShader, fragment)
+import ae3d.shaderlib (vec2, vec3, vec4, Texture, texture, rgb, dot, min, max, abs, clamp, sqrt, floor_v2, clamp_v2,
+                       min_v3, max_v3, texel_fetch, frag_coord, inversesqrt)
+
+exports (easu, rcas, tap_root, luma_of, root3, square3, lobe_weight, edge_axis, EdgeAxis, tap_weight, sharpen_channel)
+
+// The square root of each channel of the light, none below zero.
+@quotable
+root3(c: vec3) -> vec3 {
+    return vec3(sqrt(max(c.x, 0.0)), sqrt(max(c.y, 0.0)), sqrt(max(c.z, 0.0)))
+}
+
+@quotable
+square3(c: vec3) -> vec3 {
+    return vec3(c.x * c.x, c.y * c.y, c.z * c.z)
+}
+
+// A colour's luma by Rec. 709's weights, of the root space.
+@quotable
+luma_of(c: vec3) -> float {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722))
+}
+
+// The texel at pixel `p` of the scene, in the root space; a pixel past the
+// edge is the edge's (a texelFetch outside the image is undefined).
+@quotable
+tap_root(screen: Texture, p: vec2, size: vec2) -> vec3 {
+    q = clamp_v2(p, vec2(0.0, 0.0), size - vec2(1.0, 1.0))
+    return root3(rgb(texel_fetch(screen, q)))
+}
+
+// A Catmull-Rom cubic of the distance d (support 2, negative lobe past 1).
+@quotable
+lobe_weight(d: float) -> float {
+    if d < 1.0 {
+        return (1.5 * d - 2.5) * d * d + 1.0
+    }
+    if d < 2.0 {
+        return ((-0.5 * d + 2.5) * d - 4.0) * d + 2.0
+    }
+    return 0.0
+}
+
+// Across an edge: the unit direction of the dominant gradient (x, y) and
+// how much of an edge there is (z, 0 flat or all directions, 1 a straight
+// edge of some size).
+struct EdgeAxis {
+    x: float
+    y: float
+    z: float
+}
+
+// The tensor [[gxx, gxy], [gxy, gyy]] to its dominant eigenvector and strength.
+// `coherence` is (l1 - l2) / (l1 + l2), and the size of the gradient (the
+// trace, 32 of it is a whole edge) gates it so noise in a flat area is no edge.
+@quotable
+edge_axis(gxx: float, gyy: float, gxy: float) -> EdgeAxis {
+    a = gxx - gyy
+    tr = gxx + gyy
+    disc = sqrt(a * a + 4.0 * gxy * gxy)
+    vx = (a + disc) * 0.5
+    vy = gxy
+    if a < 0.0 {
+        vx = gxy
+        vy = (disc - a) * 0.5
+    }
+    len2 = vx * vx + vy * vy
+    if len2 < 0.00000001 {
+        return EdgeAxis { x: 1.0, y: 0.0, z: 0.0 }
+    }
+    inv = inversesqrt(len2)
+    coherence = disc / max(tr, 0.00000001)
+    size = clamp(tr * 32.0, 0.0, 1.0)
+    return EdgeAxis { x: vx * inv, y: vy * inv, z: coherence * size }
+}
+
+// The kernel's weight for a texel `ox`, `oy` texels from the position, on an
+// edge across `ax`: the distance with its across part stretched to 1 + 0.6 e
+// times and its along part shrunk to 1 - 0.4 e.
+@quotable
+tap_weight(ox: float, oy: float, ax: EdgeAxis) -> float {
+    across = ox * ax.x + oy * ax.y
+    along = oy * ax.x - ox * ax.y
+    sa = across * (1.0 + 0.6 * ax.z)
+    sl = along * (1.0 - 0.4 * ax.z)
+    return lobe_weight(sqrt(sa * sa + sl * sl))
+}
+
+// One channel of the sharpen: the pixel `c` against its cross, a lobe at
+// most `lobe`, no more than the range of the five widens to lets it take.
+@quotable
+sharpen_channel(c: float, n: float, e: float, s: float, w: float, lobe: float) -> float {
+    mn = min(c, min(min(n, e), min(s, w)))
+    mx = max(c, max(max(n, e), max(s, w)))
+    range = mx - mn
+    hi = mx + range * 0.1
+    lo = max(mn - range * 0.25, 0.0)
+    around = n + e + s + w
+    up = (hi - c) / max(4.0 * hi - around, 0.00000001)
+    down = 1000.0
+    if around - 4.0 * lo > 0.00000001 {
+        down = (c - lo) / (around - 4.0 * lo)
+    }
+    l = max(min(lobe, min(up, down)), 0.0)
+    return (c - l * around) / (1.0 - 4.0 * l)
+}
+
+easu(screen: Texture, size: vec2) -> *GpuShader {
+    return fragment("easu") quote | uv: vec2 | {
+        p = uv * size - vec2(0.5, 0.5)
+        b = floor_v2(p)
+        fx = p.x - b.x
+        fy = p.y - b.y
+        // The twelve texels: a 4x4 block without its corners, named by their
+        // offset from the nearest one up and to the left (m is minus).
+        t0m1 = tap_root(screen, b + vec2(0.0, -1.0), size)
+        t1m1 = tap_root(screen, b + vec2(1.0, -1.0), size)
+        tm10 = tap_root(screen, b + vec2(-1.0, 0.0), size)
+        t00 = tap_root(screen, b, size)
+        t10 = tap_root(screen, b + vec2(1.0, 0.0), size)
+        t20 = tap_root(screen, b + vec2(2.0, 0.0), size)
+        tm11 = tap_root(screen, b + vec2(-1.0, 1.0), size)
+        t01 = tap_root(screen, b + vec2(0.0, 1.0), size)
+        t11 = tap_root(screen, b + vec2(1.0, 1.0), size)
+        t21 = tap_root(screen, b + vec2(2.0, 1.0), size)
+        t02 = tap_root(screen, b + vec2(0.0, 2.0), size)
+        t12 = tap_root(screen, b + vec2(1.0, 2.0), size)
+        l0m1 = luma_of(t0m1)
+        l1m1 = luma_of(t1m1)
+        lm10 = luma_of(tm10)
+        l00 = luma_of(t00)
+        l10 = luma_of(t10)
+        l20 = luma_of(t20)
+        lm11 = luma_of(tm11)
+        l01 = luma_of(t01)
+        l11 = luma_of(t11)
+        l21 = luma_of(t21)
+        l02 = luma_of(t02)
+        l12 = luma_of(t12)
+        // The gradient at each of the four nearest, by central differences.
+        gx00 = (l10 - lm10) * 0.5
+        gy00 = (l01 - l0m1) * 0.5
+        gx10 = (l20 - l00) * 0.5
+        gy10 = (l11 - l1m1) * 0.5
+        gx01 = (l11 - lm11) * 0.5
+        gy01 = (l02 - l00) * 0.5
+        gx11 = (l21 - l01) * 0.5
+        gy11 = (l12 - l10) * 0.5
+        w00 = (1.0 - fx) * (1.0 - fy)
+        w10 = fx * (1.0 - fy)
+        w01 = (1.0 - fx) * fy
+        w11 = fx * fy
+        gxx = w00 * gx00 * gx00 + w10 * gx10 * gx10 + w01 * gx01 * gx01 + w11 * gx11 * gx11
+        gyy = w00 * gy00 * gy00 + w10 * gy10 * gy10 + w01 * gy01 * gy01 + w11 * gy11 * gy11
+        gxy = w00 * gx00 * gy00 + w10 * gx10 * gy10 + w01 * gx01 * gy01 + w11 * gx11 * gy11
+        ax = edge_axis(gxx, gyy, gxy)
+        // The kernel over the twelve, each texel's offset from the position.
+        k0m1 = tap_weight(0.0 - fx, -1.0 - fy, ax)
+        k1m1 = tap_weight(1.0 - fx, -1.0 - fy, ax)
+        km10 = tap_weight(-1.0 - fx, 0.0 - fy, ax)
+        k00 = tap_weight(0.0 - fx, 0.0 - fy, ax)
+        k10 = tap_weight(1.0 - fx, 0.0 - fy, ax)
+        k20 = tap_weight(2.0 - fx, 0.0 - fy, ax)
+        km11 = tap_weight(-1.0 - fx, 1.0 - fy, ax)
+        k01 = tap_weight(0.0 - fx, 1.0 - fy, ax)
+        k11 = tap_weight(1.0 - fx, 1.0 - fy, ax)
+        k21 = tap_weight(2.0 - fx, 1.0 - fy, ax)
+        k02 = tap_weight(0.0 - fx, 2.0 - fy, ax)
+        k12 = tap_weight(1.0 - fx, 2.0 - fy, ax)
+        total = k0m1 + k1m1 + km10 + k00 + k10 + k20 + km11 + k01 + k11 + k21 + k02 + k12
+        sum = t0m1 * k0m1 + t1m1 * k1m1 + tm10 * km10 + t00 * k00 + t10 * k10 + t20 * k20 + tm11 * km11 + t01 * k01 + t11 * k11 + t21 * k21 + t02 * k02 + t12 * k12
+        made = sum / max(total, 0.00000001)
+        // Held to the four nearest texels' range: the lobes cannot ring.
+        lo = min_v3(min_v3(t00, t10), min_v3(t01, t11))
+        hi = max_v3(max_v3(t00, t10), max_v3(t01, t11))
+        return vec4(square3(max_v3(min_v3(made, hi), lo)), 1.0)
+    }
+}
+
+rcas(screen: Texture, size: vec2, sharpness: float) -> *GpuShader {
+    return fragment("rcas") quote | uv: vec2 | {
+        p = frag_coord() - vec2(0.5, 0.5)
+        c = tap_root(screen, p, size)
+        n = tap_root(screen, p + vec2(0.0, -1.0), size)
+        e = tap_root(screen, p + vec2(1.0, 0.0), size)
+        s = tap_root(screen, p + vec2(0.0, 1.0), size)
+        w = tap_root(screen, p + vec2(-1.0, 0.0), size)
+        lobe = clamp(sharpness, 0.0, 1.0) * 0.2
+        r = sharpen_channel(c.x, n.x, e.x, s.x, w.x, lobe)
+        g = sharpen_channel(c.y, n.y, e.y, s.y, w.y, lobe)
+        b = sharpen_channel(c.z, n.z, e.z, s.z, w.z, lobe)
+        return vec4(square3(vec3(r, g, b)), 1.0)
+    }
+}

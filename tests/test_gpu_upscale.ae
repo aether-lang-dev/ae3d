@@ -1,0 +1,470 @@
+// The spatial upscaler (ae3d.shaders.upscale, #867), run on the CPU by
+// ae3d.gpu over pictures whose right answer is known, and held to what makes
+// it an upscaler and not a blur:
+//
+//   - a flat area comes out as it went in, and a scene drawn at a scale of
+//     one (every output pixel on a source texel) comes out unchanged;
+//   - a disk drawn at half the size and upscaled lands nearer the disk drawn
+//     at the full size than bilinear's upscale does, and its edge is
+//     narrower;
+//   - nothing leaves the range of the four texels about it (no ringing, no
+//     negative light), over a HDR scene a hundred times brighter than its
+//     ground;
+//   - the sharpen leaves a flat area alone, a sharpness of nothing is the
+//     identity, an edge gains contrast with sharpness and not past the
+//     range it is allowed, a lone bright pixel is not blown up, and no
+//     channel goes below zero.
+//
+// Its GLSL, for Vulkan and OpenGL, is the fixtures, taken by glslang (and
+// AE3D_GPU_WRITE_GOLDEN=1 writes them from what is emitted).
+//
+// The numbers are measured over the same pictures every run (the CPU's
+// doubles), so a limit here is what the shader does with a margin, and each
+// negative control (scripts in the commit) moves one of them past it.
+
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.quote
+import ae3d.gpu
+import ae3d.gpu (GpuShader, fragment)
+import ae3d.shaders.upscale
+import ae3d.shaderlib (vec2, vec3, vec4, Texture, texture, image_new, image_set, image_channel, image_free, texture_of, ShaderImage, sqrt)
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+// What the test makes is let go of at its end (ci.sh holds every suite to
+// `leaks`): the images, the shaders and the buffers it was handed, each
+// registered when made.
+var g_kept: ptr = null
+var g_kept_kinds: ptr = null
+var g_kept_count = 0
+
+keep(p: @keep ptr, kind: int) {
+    if g_kept == null {
+        g_kept = calloc(512, 8)
+        g_kept_kinds = calloc(512, 4)
+    }
+    (g_kept as ptr[])[g_kept_count] = p
+    (g_kept_kinds as int[])[g_kept_count] = kind
+    g_kept_count = g_kept_count + 1
+}
+
+keep_image(img: @keep *ShaderImage) -> *ShaderImage { keep(img as ptr, 0) return img }
+keep_shader(s: @keep *GpuShader) -> *GpuShader { keep(s as ptr, 1) return s }
+keep_buffer(b: @keep ptr) -> ptr { keep(b, 2) return b }
+
+release_all() {
+    i = 0
+    while i < g_kept_count {
+        p = (g_kept as ptr[])[i]
+        kind = (g_kept_kinds as int[])[i]
+        if kind == 0 { image_free(p as *ShaderImage) }
+        if kind == 1 { gpu.shader_free(p as *GpuShader) }
+        if kind == 2 { free(p) }
+        i = i + 1
+    }
+    g_kept_count = 0
+    free(g_kept)
+    free(g_kept_kinds)
+}
+
+absf(v: float) -> float {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+// A disk of radius `r` about (cx, cy) in a w x h picture: `inside` in it,
+// `outside` out, each texel the mean of a 4 x 4 grid of samples (what a
+// rasteriser with coverage makes of an edge).
+disk(w: int, h: int, cx: float, cy: float, r: float, inside: float, outside: float, grid: int) -> *ShaderImage {
+    img = keep_image(image_new(w, h))
+    y = 0
+    while y < h {
+        x = 0
+        while x < w {
+            hit = 0
+            j = 0
+            while j < grid {
+                i = 0
+                while i < grid {
+                    sx = x + (i + 0.5) / grid - cx
+                    sy = y + (j + 0.5) / grid - cy
+                    if sx * sx + sy * sy < r * r { hit = hit + 1 }
+                    i = i + 1
+                }
+                j = j + 1
+            }
+            v = outside + (inside - outside) * (hit / (grid * grid * 1.0))
+            image_set(img, x, y, v, v * 0.9, v * 0.8, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return img
+}
+
+flat(w: int, h: int, v: float) -> *ShaderImage {
+    img = keep_image(image_new(w, h))
+    y = 0
+    while y < h {
+        x = 0
+        while x < w {
+            image_set(img, x, y, v, v * 0.5, v * 0.25, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return img
+}
+
+// A shader run over every pixel of a w x h target: the red, green and blue
+// of each, in a run of doubles (3 a pixel).
+run_all(s: *GpuShader, w: int, h: int) -> ptr {
+    out = calloc(w * h * 3, 8) as float[]
+    cx = gpu.cpu_new(s)
+    gpu.cpu_set_viewport(cx, w, h)
+    y = 0
+    while y < h {
+        x = 0
+        while x < w {
+            uv = gpu.v2((x + 0.5) / w, (y + 0.5) / h)
+            got = gpu.cpu_run(cx, uv)
+            heap.free(uv)
+            if got != null {
+                k = (y * w + x) * 3
+                out[k] = gpu.val_x(got)
+                out[k + 1] = gpu.val_y(got)
+                out[k + 2] = gpu.val_z(got)
+                heap.free(got)
+            } else {
+                println("  cpu_run failed: ${gpu.last_error()}")
+                out[(y * w + x) * 3] = 0.0 - 99.0
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    gpu.cpu_free(cx)
+    return keep_buffer(out as ptr)
+}
+
+// The picture as the doubles of its red, green and blue.
+pixels_of(im: *ShaderImage) -> ptr {
+    out = calloc(im.w * im.h * 3, 8) as float[]
+    i = 0
+    while i < im.w * im.h {
+        out[i * 3] = image_channel(im, i % im.w, i / im.w, 0)
+        out[i * 3 + 1] = image_channel(im, i % im.w, i / im.w, 1)
+        out[i * 3 + 2] = image_channel(im, i % im.w, i / im.w, 2)
+        i = i + 1
+    }
+    return keep_buffer(out as ptr)
+}
+
+// The mean absolute difference of two runs in the root space (what the eye
+// weighs), over n pixels.
+root_error(a: ptr, b: ptr, n: int) -> float {
+    x = a as float[]
+    y = b as float[]
+    total = 0.0
+    i = 0
+    while i < n * 3 {
+        va = x[i]
+        vb = y[i]
+        if va < 0.0 { va = 0.0 }
+        if vb < 0.0 { vb = 0.0 }
+        total = total + absf(sqrt(va) - sqrt(vb))
+        i = i + 1
+    }
+    return total / (n * 3)
+}
+
+// How many pixels of a row the red goes from a tenth to nine tenths of the
+// way between `lo` and `hi` over (the crossings found between pixels by
+// interpolation): the width of an edge. The first rise, from the left.
+edge_width(run: ptr, w: int, row: int, lo: float, hi: float) -> float {
+    x = run as float[]
+    first = 0.0 - 1.0
+    last = 0.0 - 1.0
+    i = 1
+    while i < w {
+        a = (x[(row * w + i - 1) * 3] - lo) / (hi - lo)
+        t = (x[(row * w + i) * 3] - lo) / (hi - lo)
+        if first < 0.0 && t > 0.1 && a <= 0.1 { first = (i - 1) + (0.1 - a) / (t - a) }
+        if last < 0.0 && t > 0.9 && a <= 0.9 { last = (i - 1) + (0.9 - a) / (t - a) }
+        i = i + 1
+    }
+    if first < 0.0 || last < 0.0 { return 99.0 }
+    return last - first
+}
+
+// glslang -V over `text` (as `stage`), then spirv-val; or, for desktop
+// OpenGL's GLSL (`opengl`), glslang's check of it. Skipped where they are
+// not on PATH.
+compiles(label: string, text: string, stage: string, opengl: bool) {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+        if status != 0 { println(out) }
+        return
+    }
+    check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    if status != 0 { println(out) }
+    if string.length(os.which("spirv-val")) == 0 {
+        println("  skip spirv-val (not on PATH)")
+        return
+    }
+    vargv = list.new()
+    list.add(vargv, spv)
+    vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+    check("spirv-val passes ${label}.${stage}", vstatus == 0)
+    if vstatus != 0 { println(vout) }
+    list.free(vargv)
+}
+
+// `text` is the fixture at `path`; AE3D_GPU_WRITE_GOLDEN=1 writes it.
+golden_is(text: string, path: string) {
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(path, text)
+        check("${path} written", werr == "")
+    }
+    golden, gerr = file.read(path)
+    check("${path} is there", gerr == "")
+    check("the GLSL written is ${path}", text == golden)
+    if text != golden {
+        println("--- emitted ---")
+        println(text)
+    }
+}
+
+
+
+
+main() {
+    println("ae3d.shaders.upscale on the CPU")
+    sw = 32
+    sh = 24
+    ow = 64
+    oh = 48
+
+    // ── a flat area ──
+    f = flat(sw, sh, 3.0)
+    s = easu_rcas_easu(texture_of(f), vec2(sw * 1.0, sh * 1.0))
+    r = run_all(s, ow, oh)
+    want = flat(ow, oh, 3.0)
+    wp = pixels_of(want)
+    check("a flat area upscales to itself (error ${root_error(r, wp, ow * oh)})", root_error(r, wp, ow * oh) < 0.000001)
+
+    // ── the disk, at half the size and at the full size ──
+    low = disk(sw, sh, 15.3, 11.6, 8.4, 1.0, 0.05, 4)
+    full = disk(ow, oh, 30.6 + 1.0, 23.2 + 1.0, 16.8, 1.0, 0.05, 4)
+    // (the half-size picture's pixel k is the full one's 2k and 2k + 1, so a
+    // centre of 15.3 is 30.6 + 0.5 - 0.5 away: the +1.0 is the half texel's
+    // centre.)
+    fp = pixels_of(full)
+    easu_s = easu_rcas_easu(texture_of(low), vec2(sw * 1.0, sh * 1.0))
+    er = run_all(easu_s, ow, oh)
+    bilin = bilinear_shader(low)
+    br = run_all(bilin, ow, oh)
+    e_easu = root_error(er, fp, ow * oh)
+    e_bilin = root_error(br, fp, ow * oh)
+    println("       against the disk drawn at the full size: edge-adaptive ${e_easu}, bilinear ${e_bilin}")
+    check("the edge-adaptive upscale is nearer the full-size picture than bilinear (${e_easu} < ${e_bilin})", e_easu < e_bilin * 0.9)
+    w_easu = edge_width(er, ow, 24, 0.05, 1.0)
+    w_bilin = edge_width(br, ow, 24, 0.05, 1.0)
+    println("       the edge's width in output pixels: edge-adaptive ${w_easu}, bilinear ${w_bilin}")
+    check("its edge is narrower than bilinear's (${w_easu} < ${w_bilin})", w_easu < w_bilin * 0.8)
+
+    // ── the same disk drawn without anti-aliasing: a staircase ──
+    jag = disk(sw, sh, 15.3, 11.6, 8.4, 1.0, 0.05, 1)
+    js = easu_rcas_easu(texture_of(jag), vec2(sw * 1.0, sh * 1.0))
+    jr = run_all(js, ow, oh)
+    jb = run_all(bilinear_shader(jag), ow, oh)
+    j_easu = root_error(jr, fp, ow * oh)
+    j_bilin = root_error(jb, fp, ow * oh)
+    println("       from the aliased disk: edge-adaptive ${j_easu}, bilinear ${j_bilin}")
+    check("a staircase is nearer the smooth edge than bilinear leaves it (${j_easu} < ${j_bilin})", j_easu < j_bilin * 0.92)
+
+    // ── nothing leaves the range about it ──
+    hdr = disk(sw, sh, 15.3, 11.6, 5.0, 120.0, 0.4, 4)
+    hs = easu_rcas_easu(texture_of(hdr), vec2(sw * 1.0, sh * 1.0))
+    hr = run_all(hs, ow, oh)
+    h = hr as float[]
+    worst_low = 1000.0
+    worst_high = 0.0
+    nan = 0
+    i = 0
+    while i < ow * oh * 3 {
+        if h[i] < worst_low { worst_low = h[i] }
+        if h[i] > worst_high { worst_high = h[i] }
+        if h[i] != h[i] { nan = nan + 1 }
+        i = i + 1
+    }
+    check("an HDR scene (0.4 to 120) comes out in its own range (${worst_low} to ${worst_high})", worst_low >= 0.32 - 0.0001 && worst_high <= 120.0 + 0.001 && nan == 0)
+
+    // ── a scale of one: every output pixel on a source texel ──
+    same_s = easu_rcas_easu(texture_of(low), vec2(sw * 1.0, sh * 1.0))
+    sr = run_all(same_s, sw, sh)
+    lp = pixels_of(low)
+    check("drawn at the scene's own size it is the scene (error ${root_error(sr, lp, sw * sh)})", root_error(sr, lp, sw * sh) < 0.02)
+
+    // ── the sharpen ──
+    println("ae3d.shaders.upscale: rcas")
+    fl = flat(ow, oh, 2.0)
+    fs = easu_rcas_rcas(texture_of(fl), vec2(ow * 1.0, oh * 1.0), 1.0)
+    fr = run_all(fs, ow, oh)
+    flp = pixels_of(fl)
+    check("a flat area is not sharpened (error ${root_error(fr, flp, ow * oh)})", root_error(fr, flp, ow * oh) < 0.000001)
+
+    edge = disk(ow, oh, 32.0, 24.0, 14.0, 1.0, 0.05, 4)
+    ep = pixels_of(edge)
+    zero_s = easu_rcas_rcas(texture_of(edge), vec2(ow * 1.0, oh * 1.0), 0.0)
+    zr = run_all(zero_s, ow, oh)
+    check("a sharpness of nothing is the picture (error ${root_error(zr, ep, ow * oh)})", root_error(zr, ep, ow * oh) < 0.000001)
+    half_s = easu_rcas_rcas(texture_of(edge), vec2(ow * 1.0, oh * 1.0), 0.5)
+    hfr = run_all(half_s, ow, oh)
+    full_s = easu_rcas_rcas(texture_of(edge), vec2(ow * 1.0, oh * 1.0), 1.0)
+    ffr = run_all(full_s, ow, oh)
+    e_half = root_error(hfr, ep, ow * oh)
+    e_full = root_error(ffr, ep, ow * oh)
+    println("       the sharpen's change to the picture: half ${e_half}, full ${e_full}")
+    check("sharpness moves the picture, more of it more (${e_half} < ${e_full})", e_half > 0.0005 && e_half < e_full)
+    // The edge's contrast across a row: the step between the pixels either side of the edge.
+    mid_in = row_step(ffr, ow, 24)
+    mid_before = row_step(ep, ow, 24)
+    check("an edge gains contrast (the step ${mid_before} to ${mid_in})", mid_in > mid_before)
+    over = overshoot(ffr, ow * oh)
+    check("and does not go past its range by more than a tenth above it or a quarter below it (${over})", over < 0.26)
+
+    // ── a lone bright pixel and the dark ──
+    spot = flat(ow, oh, 0.01)
+    image_set(spot, 20, 20, 90.0, 90.0, 90.0, 1.0)
+    ss = easu_rcas_rcas(texture_of(spot), vec2(ow * 1.0, oh * 1.0), 1.0)
+    sr2 = run_all(ss, ow, oh)
+    s2 = sr2 as float[]
+    peak = s2[(20 * ow + 20) * 3]
+    lowest = 1000.0
+    i = 0
+    while i < ow * oh * 3 {
+        if s2[i] < lowest { lowest = s2[i] }
+        i = i + 1
+    }
+    check("a lone bright pixel is not blown up (90 to ${peak})", peak < 90.0 * 1.3 && peak > 80.0)
+    check("and no channel goes below zero (${lowest})", lowest >= 0.0)
+
+    // ── a black ground beside a bright edge stays black ──
+    dark = disk(ow, oh, 32.0, 24.0, 14.0, 4.0, 0.0, 1)
+    dp = pixels_of(dark)
+    dsh = easu_rcas_rcas(texture_of(dark), vec2(ow * 1.0, oh * 1.0), 1.0)
+    dr2 = run_all(dsh, ow, oh)
+    d_in = dp as float[]
+    d_out = dr2 as float[]
+    glow = 0
+    i = 0
+    while i < ow * oh * 3 {
+        if d_in[i] == 0.0 && d_out[i] > 0.0000001 { glow = glow + 1 }
+        i = i + 1
+    }
+    check("a black ground beside a bright disk stays black (${glow} channels lit)", glow == 0)
+
+    // ── the GLSL ──
+    blank_easu = easu_rcas_easu(Texture { image: null }, vec2(0.0, 0.0))
+    blank_rcas = easu_rcas_rcas(Texture { image: null }, vec2(0.0, 0.0), 0.0)
+    golden_is(gpu.emit_glsl(blank_easu, gpu.VULKAN), "tests/fixtures/gpu/easu.frag")
+    golden_is(gpu.emit_glsl(blank_easu, gpu.GL), "tests/fixtures/gpu/easu_gl.frag")
+    golden_is(gpu.emit_glsl(blank_rcas, gpu.VULKAN), "tests/fixtures/gpu/rcas.frag")
+    golden_is(gpu.emit_glsl(blank_rcas, gpu.GL), "tests/fixtures/gpu/rcas_gl.frag")
+    compiles("easu", gpu.emit_glsl(blank_easu, gpu.VULKAN), "frag", false)
+    compiles("easu_gl", gpu.emit_glsl(blank_easu, gpu.GL), "frag", true)
+    compiles("rcas", gpu.emit_glsl(blank_rcas, gpu.VULKAN), "frag", false)
+    compiles("rcas_gl", gpu.emit_glsl(blank_rcas, gpu.GL), "frag", true)
+    check("each reads its texels exactly: texelFetch, not a sampler's filter",
+          string.contains(gpu.emit_glsl(blank_easu, gpu.VULKAN), "texelFetch(screen") != 0 &&
+          string.contains(gpu.emit_glsl(blank_rcas, gpu.GL), "texelFetch(screen") != 0)
+
+    release_all()
+    if g_failures == 0 {
+        println("upscale: all checks passed (${g_checks})")
+        return
+    }
+    println("upscale: ${g_failures} of ${g_checks} checks failed")
+    exit(1)
+}
+
+easu_rcas_easu(screen: Texture, size: vec2) -> *GpuShader { return keep_shader(upscale.easu(screen, size)) }
+easu_rcas_rcas(screen: Texture, size: vec2, sharpness: float) -> *GpuShader { return keep_shader(upscale.rcas(screen, size, sharpness)) }
+
+// The bilinear upscale: the plain sample, as the composite takes it.
+bilinear_shader(img: *ShaderImage) -> *GpuShader {
+    screen = texture_of(img)
+    return keep_shader(fragment("bilinear") quote | uv: vec2 | {
+        return texture(screen, uv)
+    })
+}
+
+// The red step between the two pixels about the left edge of the disk on `row`.
+row_step(run: ptr, w: int, row: int) -> float {
+    x = run as float[]
+    best = 0.0
+    i = 1
+    while i < w {
+        d = absf(x[(row * w + i) * 3] - x[(row * w + i - 1) * 3])
+        if d > best { best = d }
+        i = i + 1
+    }
+    return best
+}
+
+// How far above 1 or below 0.05 (the picture's range) the run goes, in the
+// root space the sharpen works in, as a fraction of the range there: above
+// by at most a tenth, below by at most a quarter, and the larger of the two
+// fractions in the worse case is reported as the quarter it is allowed.
+overshoot(run: ptr, n: int) -> float {
+    x = run as float[]
+    span = 1.0 - sqrt(0.05)
+    worst = 0.0
+    i = 0
+    while i < n {
+        v = x[i * 3]
+        if v > 1.0 && (sqrt(v) - 1.0) / span / 0.1 * 0.25 > worst { worst = (sqrt(v) - 1.0) / span / 0.1 * 0.25 }
+        if v < 0.05 && (sqrt(0.05) - sqrt(v)) / span > worst { worst = (sqrt(0.05) - sqrt(v)) / span }
+        i = i + 1
+    }
+    return worst
+}

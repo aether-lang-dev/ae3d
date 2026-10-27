@@ -11,9 +11,11 @@ uniform int capture_channel;
 uniform mat4 view_projection;
 uniform int bloom_on;
 uniform float bloom_intensity;
+uniform int dof_on;
 uniform float frame_exposure;
 uniform sampler2D screen;
 uniform sampler2D bloom;
+uniform sampler2D dof;
 
 struct HazePoint {
     vec2 at;
@@ -91,6 +93,10 @@ void main() {
     }
     if (bloom_on != 0) {
         radiance = radiance + texture(bloom, at).rgb * bloom_intensity;
+    }
+    if (dof_on != 0) {
+        vec4 focused = texture(dof, at);
+        radiance = radiance + (focused.rgb - texture(screen, at).rgb) * focused.w;
     }
     vec3 shown = ae3d_shaders_composite_aces(radiance * frame_exposure);
     shown = vec3(ae3d_shaders_composite_srgb_encode(shown.x), ae3d_shaders_composite_srgb_encode(shown.y), ae3d_shaders_composite_srgb_encode(shown.z));
