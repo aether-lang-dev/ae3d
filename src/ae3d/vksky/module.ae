@@ -30,10 +30,13 @@ import ae3d.vkquote (QuotedPass)
 import ae3d.vkspirv
 import ae3d.gpu
 import ae3d.shaders.skyprobe
+import ae3d.shaders.envmap
+import ae3d.envimage
+import ae3d.hdrimage
 import ae3d.shaderlib (Texture, vec3)
 
 exports (
-    start, stop, capture, irradiance_at, reflections_view, reflections_sampler, set_ground
+    start, stop, capture, irradiance_at, reflections_view, reflections_sampler, set_ground, set_environment, environment
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -80,6 +83,15 @@ var g_irradiance_pass: ptr = null
 // which only the hand-written irradiance read.
 var g_ground: ptr = null
 var g_filter_pass: ptr = null
+// The user's environment map in place of the sky (#869): its texture in the
+// table (0 for none: the sky), the light scale and the mip it is read from,
+// and whether the capture has been made from it yet.
+var g_env_pass: ptr = null
+var g_env_texture = 0
+var g_env_half_v = 0.0
+var g_env_lod = 0.0
+var g_env_intensity = 1.0
+var g_env_drawn = false
 
 // A view of one level of `image`.
 level_view(image: @keep ptr, level: int) -> ptr {
@@ -250,6 +262,10 @@ start() -> bool {
                                      vkspirv.SKY_FILTER_QUOTED_VERT, vkspirv.SKY_FILTER_QUOTED_FRAG,
                                      vkspirv.SKY_FILTER_QUOTED_HASH, vktargets.hdr_pass(), LEVELS) as ptr
     if g_filter_pass == null { return failed("sky filter pass failed") }
+    g_env_pass = vkquote.pass_new(envmap.env_capture(Texture { image: null }, 0.0, 0.0, 0.0),
+                                  vkspirv.ENV_CAPTURE_QUOTED_VERT, vkspirv.ENV_CAPTURE_QUOTED_FRAG,
+                                  vkspirv.ENV_CAPTURE_QUOTED_HASH, vktargets.hdr_pass(), 1) as ptr
+    if g_env_pass == null { return failed("environment capture pass failed") }
 
     commands = vkhost.once_begin()
     blacked(commands, g_capture_image, CAPTURE_LEVELS)
@@ -297,6 +313,11 @@ stop() {
     g_irradiance_pass = null
     vkquote.pass_free(g_filter_pass as *QuotedPass)
     g_filter_pass = null
+    vkquote.pass_free(g_env_pass as *QuotedPass)
+    g_env_pass = null
+    if g_env_texture != 0 { vkdesc.texture_destroy(g_env_texture) }
+    g_env_texture = 0
+    g_env_drawn = false
     vkdesc.set_sky_light(null, null, null, null, null, null)
     g_capture = 0
     g_captured = false
@@ -402,17 +423,40 @@ inputs_now(sky: int, weather: int, shape: int) {
 // the inputs says when either changed.
 capture(sky: int, weather: int, shape: int, detail: int) {
     if g_capture == 0 { return }
-    inputs_now(sky, weather, shape)
-    if g_captured && memcmp(g_inputs, g_inputs_now, (INPUT_WORDS * 4) as long) == 0 { return }
-    memcpy(g_inputs, g_inputs_now, (INPUT_WORDS * 4) as long)
-    g_captured = true
+    environment_mode = g_env_texture != 0 && g_env_pass != null
+    if environment_mode {
+        // The map is the same every frame: the capture is made once, and
+        // again when the map, its scale or the mode changes (set_environment
+        // clears g_env_drawn).
+        if g_env_drawn { return }
+        g_env_drawn = true
+        g_captured = false
+    } else {
+        if g_env_drawn {
+            // Back to the sky: it is captured afresh.
+            g_env_drawn = false
+            g_captured = false
+        }
+        inputs_now(sky, weather, shape)
+        if g_captured && memcmp(g_inputs, g_inputs_now, (INPUT_WORDS * 4) as long) == 0 { return }
+        memcpy(g_inputs, g_inputs_now, (INPUT_WORDS * 4) as long)
+        g_captured = true
+    }
     commands = vkframe.frame_commands()
     pass = vktargets.hdr_pass()
     // The levels under the first are remade from it: what they held goes.
     turn(commands, g_capture_image, 1, CAPTURE_LEVELS - 1, vk.IMAGE_LAYOUT_UNDEFINED,
          vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, vk.ACCESS_TRANSFER_WRITE_BIT,
          vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT)
-    vkframe.sky_capture_pass(pass, g_capture_framebuffer, SIZE, sky, weather, shape, detail)
+    if environment_mode {
+        e = vkquote.shader(g_env_pass as *QuotedPass)
+        _l = gpu.set_float(e, "lod", g_env_lod)
+        _h = gpu.set_float(e, "half_v", g_env_half_v)
+        _i = gpu.set_float(e, "intensity", g_env_intensity)
+        vkframe.quoted_screen_pass(pass, g_capture_framebuffer, SIZE, SIZE, g_env_pass, 0, g_env_texture)
+    } else {
+        vkframe.sky_capture_pass(pass, g_capture_framebuffer, SIZE, sky, weather, shape, detail)
+    }
     turn(commands, g_capture_image, 0, 1, vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
          vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
          vk.ACCESS_TRANSFER_READ_BIT | vk.ACCESS_TRANSFER_WRITE_BIT,
@@ -423,8 +467,11 @@ capture(sky: int, weather: int, shape: int, detail: int) {
     irradiance_shader = vkquote.shader(g_irradiance_pass as *QuotedPass)
     if g_ground == null { set_ground(core.vec3(0.0, 0.0, 0.0), core.vec3(0.0, 0.0, 0.0)) }
     ground = g_ground as f32[]
-    _a = gpu.set_vec3(irradiance_shader, "ground_albedo", ground[0] as float, ground[1] as float, ground[2] as float)
-    _s = gpu.set_vec3(irradiance_shader, "ground_sun", ground[3] as float, ground[4] as float, ground[5] as float)
+    // A map has its own ground: no albedo is laid under the horizon.
+    ground_scale = 1.0
+    if environment_mode { ground_scale = 0.0 }
+    _a = gpu.set_vec3(irradiance_shader, "ground_albedo", ground[0] as float * ground_scale, ground[1] as float * ground_scale, ground[2] as float * ground_scale)
+    _s = gpu.set_vec3(irradiance_shader, "ground_sun", ground[3] as float * ground_scale, ground[4] as float * ground_scale, ground[5] as float * ground_scale)
     vkframe.quoted_screen_pass(pass, g_irradiance_framebuffer, IRRADIANCE, IRRADIANCE, g_irradiance_pass, 0, g_capture)
     filter_shader = vkquote.shader(g_filter_pass as *QuotedPass)
     k = 0
@@ -478,3 +525,33 @@ irradiance_at(n: Vec3) -> Vec3 {
     free(texels)
     return e
 }
+
+// The sky's light from a map (#869): `img` (an ae3d.hdrimage, equirectangular)
+// uploaded as a half-float texture with its mip chain and the capture made from
+// it in place of the sky, scaled by `intensity`; null `img` goes back to the
+// sky. The image is the caller's. False, the sky kept, when the texture would
+// not make.
+set_environment(img: ptr, intensity: float) -> bool {
+    if g_capture == 0 { return false }
+    if img == null {
+        if g_env_texture != 0 { vkdesc.texture_destroy(g_env_texture) }
+        g_env_texture = 0
+        g_env_drawn = false
+        return true
+    }
+    halves = envimage.half_rows(img)
+    if halves == null { return false }
+    handle = vktexture.texture_create_environment(hdrimage.width(img), hdrimage.height(img), halves)
+    free(halves)
+    if handle == 0 { return false }
+    if g_env_texture != 0 { vkdesc.texture_destroy(g_env_texture) }
+    g_env_texture = handle
+    g_env_half_v = 0.5 / (hdrimage.height(img) as float)
+    g_env_lod = envimage.lod_for_width(hdrimage.width(img))
+    g_env_intensity = intensity
+    g_env_drawn = false
+    return true
+}
+
+// Whether a map stands in for the sky.
+environment() -> bool { return g_env_texture != 0 }

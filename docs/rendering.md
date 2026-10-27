@@ -434,6 +434,36 @@ the sky's colour, and a black glossy one four percent of it
 (`tests/test_sky_light`, both backends). A material that turns image-based
 lighting off keeps the diffuse and loses the reflections.
 
+### An environment map in place of the sky (#869)
+
+`engine_set_environment(e, "studio.hdr", intensity)` (or `AE3D_ENV=studio.hdr`
+with `AE3D_ENV_INTENSITY=2` on any program) lights the scene from a picture
+instead of the sky model: a product, a model viewer or an interior has no sky,
+and a render is matched against reference lighting. An empty path goes back
+to the sky; a file that does not load leaves the sky (or the map before) in
+place and `engine_environment_error()` says why.
+
+The map is an equirectangular (latitude-longitude) Radiance `.hdr` (RGBE, flat
+or run-length, the four mirror orientations of its resolution line) or OpenEXR
+(`ae3d.envimage`, from the formats' descriptions, no library): scanline files,
+HALF or FLOAT, R G B (A) or a lone Y, compression NONE, RLE, ZIPS or ZIP, lines
+in any order and any data window. PIZ, PXR24, B44, B44A, DWAA, DWAB, tiled,
+deep and multipart files are refused by name. It is placed as a painted sky
+is: the top row is the zenith and the middle column looks along +x. Its light
+is the engine's radiance times `intensity` (a map's 1 is diffuse white).
+
+It takes the place of the sky's capture and nothing after it: one quoted pass,
+`ae3d.shaders.envmap.env_capture`, writes the 256-texel octahedral capture from
+the map (a mip of the map chosen by its width, so a small sun spreads over the
+texels it belongs to instead of aliasing), once when the map is set rather
+than every frame, and the mips, the irradiance, the GGX-prefiltered reflections,
+the split-sum table, the probes' sky and the water's reflection are the sky's
+own path unchanged, so a frame costs what it always did. The map is the light
+only: the sky model is still what is drawn behind the scene, the key light is
+the program's own, and no ground albedo is laid under the horizon (the map has
+its own ground). The map is held as half floats, so a texel's light is held to
+65504.
+
 The screen's occlusion (`engine_set_ssao`) is found before the scene, from
 the last frame's depth, into an occlusion map: the positions rebuilt with
 this frame's matrices, which is the last frame's geometry moved rigidly by
