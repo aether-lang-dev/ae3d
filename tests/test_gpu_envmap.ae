@@ -1,0 +1,359 @@
+// ae3d.shaders.envmap on the CPU (#869): the capture of a user's environment
+// map into the sky's octahedral layout, run by ae3d.gpu over equirectangular
+// pictures whose right answer is a formula.
+//
+//   - Every interior texel of the 256-texel capture reads the picture in its
+//     own direction: a picture whose red is the latitude and whose green is
+//     the longitude comes back with the red and green of the direction the
+//     texel stands for (away from the longitude seam, where the CPU's
+//     sampler clamps and the GPU's repeats, and the poles).
+//   - Intensity scales the light, light below zero is cut to zero.
+//   - The mip level is the shader's to read: a fine checkerboard read at
+//     level 0 is one square's value, at its coarsest level the mean.
+//   - Directly up, the latitude is held off the pole by half a texel.
+//
+// Its GLSL, for Vulkan and OpenGL, is the fixtures, taken by glslang
+// (AE3D_GPU_WRITE_GOLDEN=1 writes them from what is emitted). Each negative
+// control (scripts in the commit) moves one of the numbers past its limit.
+
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.quote
+import ae3d.gpu
+import ae3d.gpu (GpuShader, fragment)
+import ae3d.shaders.envmap
+import ae3d.shaderlib (vec2, vec3, vec4, Texture, texture, image_new, image_set, image_channel, image_free, image_mip_chain, texture_of, ShaderImage)
+import ae3d.core
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+// What the test makes is let go of at its end (ci.sh holds every suite to
+// `leaks`): the images, the shaders and the buffers it was handed, each
+// registered when made.
+var g_kept: ptr = null
+var g_kept_kinds: ptr = null
+var g_kept_count = 0
+
+keep(p: @keep ptr, kind: int) {
+    if g_kept == null {
+        g_kept = calloc(512, 8)
+        g_kept_kinds = calloc(512, 4)
+    }
+    (g_kept as ptr[])[g_kept_count] = p
+    (g_kept_kinds as int[])[g_kept_count] = kind
+    g_kept_count = g_kept_count + 1
+}
+
+keep_image(img: @keep *ShaderImage) -> *ShaderImage { keep(img as ptr, 0) return img }
+keep_shader(s: @keep *GpuShader) -> *GpuShader { keep(s as ptr, 1) return s }
+keep_buffer(b: @keep ptr) -> ptr { keep(b, 2) return b }
+
+release_all() {
+    i = 0
+    while i < g_kept_count {
+        p = (g_kept as ptr[])[i]
+        kind = (g_kept_kinds as int[])[i]
+        if kind == 0 { image_free(p as *ShaderImage) }
+        if kind == 1 { gpu.shader_free(p as *GpuShader) }
+        if kind == 2 { free(p) }
+        i = i + 1
+    }
+    g_kept_count = 0
+    free(g_kept)
+    free(g_kept_kinds)
+}
+
+absf(v: float) -> float {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+// A shader run over every pixel of a w x h target: the red, green and blue
+// of each, in a run of doubles (3 a pixel).
+run_all(s: *GpuShader, w: int, h: int) -> ptr {
+    out = calloc(w * h * 3, 8) as float[]
+    cx = gpu.cpu_new(s)
+    gpu.cpu_set_viewport(cx, w, h)
+    y = 0
+    while y < h {
+        x = 0
+        while x < w {
+            uv = gpu.v2((x + 0.5) / w, (y + 0.5) / h)
+            got = gpu.cpu_run(cx, uv)
+            heap.free(uv)
+            if got != null {
+                k = (y * w + x) * 3
+                out[k] = gpu.val_x(got)
+                out[k + 1] = gpu.val_y(got)
+                out[k + 2] = gpu.val_z(got)
+                heap.free(got)
+            } else {
+                println("  cpu_run failed: ${gpu.last_error()}")
+                out[(y * w + x) * 3] = 0.0 - 99.0
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    gpu.cpu_free(cx)
+    return keep_buffer(out as ptr)
+}
+
+// glslang -V over `text` (as `stage`), then spirv-val; or, for desktop
+// OpenGL's GLSL (`opengl`), glslang's check of it. Skipped where they are
+// not on PATH.
+compiles(label: string, text: string, stage: string, opengl: bool) {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+        if status != 0 { println(out) }
+        return
+    }
+    check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    if status != 0 { println(out) }
+    if string.length(os.which("spirv-val")) == 0 {
+        println("  skip spirv-val (not on PATH)")
+        return
+    }
+    vargv = list.new()
+    list.add(vargv, spv)
+    vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+    check("spirv-val passes ${label}.${stage}", vstatus == 0)
+    if vstatus != 0 { println(vout) }
+    list.free(vargv)
+}
+
+// `text` is the fixture at `path`; AE3D_GPU_WRITE_GOLDEN=1 writes it.
+golden_is(text: string, path: string) {
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(path, text)
+        check("${path} written", werr == "")
+    }
+    golden, gerr = file.read(path)
+    check("${path} is there", gerr == "")
+    check("the GLSL written is ${path}", text == golden)
+    if text != golden {
+        println("--- emitted ---")
+        println(text)
+    }
+}
+
+
+
+
+
+extern sqrt(x: float) -> float
+extern atan2(y: float, x: float) -> float
+extern asin(x: float) -> float
+
+const PI = 3.14159265358979323846
+
+// The direction octahedral texel (x, y) of a 256-texel level stands for, away
+// from the gutter: the inner square's point, folded at the lower hemisphere.
+direction(x: int, y: int) -> Vec3 {
+    px = ((x + 0.5 - 1.0) / 254.0) * 2.0 - 1.0
+    py = ((y + 0.5 - 1.0) / 254.0) * 2.0 - 1.0
+    dx = px
+    dy = 1.0 - absf(px) - absf(py)
+    dz = py
+    if dy < 0.0 {
+        sx = 1.0
+        if dx < 0.0 { sx = 0.0 - 1.0 }
+        sz = 1.0
+        if dz < 0.0 { sz = 0.0 - 1.0 }
+        nx = (1.0 - absf(dz)) * sx
+        nz = (1.0 - absf(dx)) * sz
+        dx = nx
+        dz = nz
+    }
+    n = sqrt(dx * dx + dy * dy + dz * dz)
+    return Vec3 { x: dx / n, y: dy / n, z: dz / n }
+}
+
+// A latitude-longitude picture, w by h, red the latitude (0 at the bottom row
+// to 1 at the top: rows are stored bottom first), green the longitude, blue 0.5.
+ramp(w: int, h: int) -> *ShaderImage {
+    img = keep_image(image_new(w, h))
+    y = 0
+    while y < h {
+        x = 0
+        while x < w {
+            image_set(img, x, y, (y + 0.5) / h, (x + 0.5) / w, 0.5, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return img
+}
+
+// The capture at texel (x, y), a run of one pixel.
+at_texel(cx: ptr, x: int, y: int) -> ptr {
+    uv = gpu.v2((x + 0.5) / 256.0, (y + 0.5) / 256.0)
+    got = gpu.cpu_run(cx, uv)
+    heap.free(uv)
+    return got
+}
+
+capture_of(img: *ShaderImage, lod: float, intensity: float) -> ptr {
+    half_v = 0.5 / img.h
+    s = keep_shader(envmap.env_capture(texture_of(img), lod, half_v, intensity))
+    cx = gpu.cpu_new(s)
+    gpu.cpu_set_viewport(cx, 256, 256)
+    return cx
+}
+
+main() {
+    println("ae3d.shaders.envmap on the CPU")
+    img = ramp(128, 64)
+    cx = capture_of(img, 0.0, 1.0)
+    worst = 0.0
+    checked = 0
+    y = 8
+    while y < 248 {
+        x = 8
+        while x < 248 {
+            d = direction(x, y)
+            u = (atan2(d.z, d.x) + PI) / (2.0 * PI)
+            v = (asin(d.y) + PI / 2.0) / PI
+            if u > 0.06 && u < 0.94 && v > 0.08 && v < 0.92 {
+                got = at_texel(cx, x, y)
+                er = absf(gpu.val_x(got) - v)
+                eg = absf(gpu.val_y(got) - u)
+                eb = absf(gpu.val_z(got) - 0.5)
+                if er > worst { worst = er }
+                if eg > worst { worst = eg }
+                if eb > worst { worst = eb }
+                checked = checked + 1
+                heap.free(got)
+            }
+            x = x + 9
+        }
+        y = y + 9
+    }
+    check("${checked} texels read the picture in their own direction (worst ${worst})", checked > 300 && worst < 0.01)
+    gpu.cpu_free(cx)
+
+    // The same, to the four sides: the +z, +x, -z and -x directions are the
+    // quarter longitudes, the lower hemisphere's centre is down.
+    cx = capture_of(img, 0.0, 1.0)
+    got = at_texel(cx, 128, 128)
+    check("the middle of the square is straight up: latitude 1 less half a texel, red ${gpu.val_x(got)}",
+          gpu.val_x(got) > 0.98 && gpu.val_x(got) <= 1.0 - 0.5 / 64.0 + 0.0001)
+    heap.free(got)
+    gpu.cpu_free(cx)
+
+    // Intensity, and light below zero.
+    cx = capture_of(img, 0.0, 2.5)
+    got = at_texel(cx, 60, 100)
+    base_cx = capture_of(img, 0.0, 1.0)
+    ref = at_texel(base_cx, 60, 100)
+    check("intensity 2.5 scales the light (${gpu.val_y(got)} against ${gpu.val_y(ref)})",
+          absf(gpu.val_y(got) - 2.5 * gpu.val_y(ref)) < 0.0001 && gpu.val_y(ref) > 0.05)
+    heap.free(got)
+    heap.free(ref)
+    gpu.cpu_free(cx)
+    gpu.cpu_free(base_cx)
+    neg = keep_image(image_new(16, 8))
+    y = 0
+    while y < 8 {
+        x = 0
+        while x < 16 {
+            image_set(neg, x, y, 0.0 - 3.0, 0.0 - 0.5, 2.0, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    cx = capture_of(neg, 0.0, 1.0)
+    got = at_texel(cx, 100, 100)
+    check("light below zero is cut to zero (${gpu.val_x(got)} ${gpu.val_y(got)} ${gpu.val_z(got)})",
+          gpu.val_x(got) == 0.0 && gpu.val_y(got) == 0.0 && absf(gpu.val_z(got) - 2.0) < 0.0001)
+    heap.free(got)
+    gpu.cpu_free(cx)
+
+    // The mip level: a checkerboard of 1 and 0 eight texels a square, level 0 and the top.
+    board = keep_image(image_new(64, 32))
+    y = 0
+    while y < 32 {
+        x = 0
+        while x < 64 {
+            v = 0.0
+            if (x / 8 + y / 8) % 2 == 0 { v = 1.0 }
+            image_set(board, x, y, v, v, v, 1.0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image_mip_chain(board, 7)
+    fine = capture_of(board, 0.0, 1.0)
+    coarse = capture_of(board, 6.0, 1.0)
+    spread = 0.0
+    far = 0.0
+    k = 0
+    while k < 40 {
+        gx = 60 + k * 3
+        gy = 90 + k
+        a = at_texel(fine, gx, gy)
+        b = at_texel(coarse, gx, gy)
+        spread = spread + absf(gpu.val_x(a) - 0.5)
+        far = far + absf(gpu.val_x(b) - 0.5)
+        heap.free(a)
+        heap.free(b)
+        k = k + 1
+    }
+    check("level 0 sees the squares, the coarsest level their mean (${spread / 40.0} against ${far / 40.0} from one half)",
+          spread / 40.0 > 0.3 && far / 40.0 < 0.05)
+    gpu.cpu_free(fine)
+    gpu.cpu_free(coarse)
+
+    // ── the GLSL ──
+    blank = keep_shader(envmap.env_capture(Texture { image: null }, 0.0, 0.0, 0.0))
+    golden_is(gpu.emit_glsl(blank, gpu.VULKAN), "tests/fixtures/gpu/env_capture.frag")
+    golden_is(gpu.emit_glsl(blank, gpu.GL), "tests/fixtures/gpu/env_capture_gl.frag")
+    compiles("env_capture", gpu.emit_glsl(blank, gpu.VULKAN), "frag", false)
+    compiles("env_capture_gl", gpu.emit_glsl(blank, gpu.GL), "frag", true)
+    check("it reads the map at a chosen level: textureLod", string.contains(gpu.emit_glsl(blank, gpu.GL), "textureLod(env") != 0)
+
+    release_all()
+    if g_failures == 0 {
+        println("envmap: all checks passed (${g_checks})")
+        return
+    }
+    println("envmap: ${g_failures} of ${g_checks} checks failed")
+    exit(1)
+}
