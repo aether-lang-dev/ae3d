@@ -160,17 +160,24 @@ a skeleton over its joint nodes with the inverse bind matrices the file
 gives (a skinned primitive stands at the origin and is placed by its
 joints alone, as the format's rule says); every animation one clip per node
 it drives, named `<animation>:<node>`, STEP, LINEAR and CUBICSPLINE alike.
-Images embedded in a `.glb` are decoded and registered under
-`<file>#image<n>`, a name any texture path resolves. What is not read --
-sparse accessors, `data:` URIs, morph targets -- is named in the scene's
-warnings, and the rest of the file loads. The palette holds ninety-six
+Images embedded in a `.glb`'s buffer views or written as base64 `data:` URIs
+are decoded (by what the bytes are: PNG, JPEG, TGA, BMP) and registered under
+`<file>#image<n>`, a name any texture path resolves; a buffer may be a
+`data:` URI too. A sparse accessor (#868) is made whole as it is opened, the
+base values (zeros with no buffer view) with the sparse elements written over
+them, so positions, normals, UVs and indices alike come out substituted; one
+that names an element it lacks is refused whole, with a warning. What is not
+read -- morph targets, cameras, lights -- is named in the scene's warnings,
+and the rest of the file loads. The palette holds ninety-six
 bones, which is a Mixamo rig with its fingers. `examples/gltf_viewer.ae`
 frames any file on a floor -- every vertex, skinned, over sixteen points of
 the clip it plays, filling 55% of the frame's height from a three-quarter
 view (`engine_frame_points`), a hundred-unit fox and a centimetre arm alike
 -- and plays one of its animations;
 `tests/test_gltf` holds the loader to a two-bone arm it can do the
-arithmetic for, and to the Khronos Fox.
+arithmetic for, to the Khronos Fox, and to a square written with sparse
+accessors and `data:` URIs and as a `.glb` with two embedded PNGs
+(`tools/make_gltf_gaps_fixture.ae`).
 
 A figure from a file joins a crowd the way the pipeline's zombie does:
 `gltf.bake_bank(scene, "Walk", 48)` plays the named animation over the
