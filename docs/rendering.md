@@ -582,7 +582,123 @@ size, which is the upscale. The answer is the scale adopted (clamped), so
 a program stepping down a quality ladder knows which rung it got. An
 upscaler that knows more than a bilinear sample -- DLSS (#324) -- sits
 where the composite samples, handed the scene's colour, depth and motion
-vectors at the scaled size and asked for the window's.
+vectors at the scaled size and asked for the window's. The vendor-neutral one is
+the spatial upscaler below.
+
+### The spatial upscaler
+
+`engine_set_upscaler(e, UPSCALER_SPATIAL, sharpness)`, or `AE3D_UPSCALER=1`
+with `AE3D_UPSCALE_SHARPNESS=50` (hundredths), chooses how a scene drawn below
+the window's size is made the window's. `UPSCALER_BILINEAR` (the default) is
+the composite's bilinear sampling, as the render scale above always was, and it
+stays as the fallback: a scale of 1, DLSS (which makes the frame's size
+itself), a capture channel (data, not light) or a pass that would not build
+leave the composite as it was. It is not tied to a vendor or a device: two
+quoted passes (`ae3d.shaders.upscale`, one source for Vulkan's SPIR-V, OpenGL's
+GLSL and the MSL) run wherever the scene does, which is what MoltenVK, an Intel
+N100's iGPU and a Pi 5 get, none of which have DLSS (#867, #823 item 2).
+
+The passes run after the temporal pass and before the bloom and the composite,
+so the bloom, the haze and the tone curve work at the frame's size and see the
+upscaled picture:
+
+- **`easu`**, the upscale. For the output pixel's place in the scene, the 12
+  texels about the four nearest (a 4x4 block without its corners) give the
+  luma's gradient at each of the four by central differences; their outer
+  products weighed by the place's bilinear weights are one 2x2 structure tensor,
+  whose dominant eigenvector is the direction across an edge and whose
+  coherence, gated by the gradient's size, is how much of an edge it is. The
+  twelve are weighed by a Catmull-Rom cubic of their distance, measured in a
+  metric stretched across the edge (so the kernel is narrow across it: sharp)
+  and shrunk along it (so it reaches along it and the staircase is averaged
+  away), and the sum is held to the range of the four nearest texels so the
+  cubic's negative lobes cannot ring.
+- **`rcas`**, the sharpen (skipped at a sharpness of 0). Each pixel against its
+  cross of four, per channel: out = (c - l (n + e + s + w)) / (1 - 4 l), with l
+  the largest lobe (0.2 at a sharpness of 1) the pixel can take without leaving
+  the range its five set, widened by a tenth of it above and a quarter below
+  and never below zero light. Both limits are linear in l, so it is solved and
+  not iterated: a flat area is not sharpened, a step edge gets the overshoot
+  the limits allow, a lone bright pixel is not blown up.
+
+Both work on the square root of the light, the perceptual space a hand-written
+upscaler asks a linear frame to be put in: the scene is HDR (a sun is a hundred
+times a shadow) and filtering light directly makes a bright edge a staircase
+once it is tone-mapped. The root keeps the range and has an exact inverse, the
+square, and needs no exposure.
+
+The algorithm's *shape* is the published description of FSR 1 (AMD's
+FidelityFX Super Resolution 1: an edge-adaptive upscale over a twelve-texel
+footprint, then a contrast-adaptive sharpen over a cross of five). The code is
+written from that description and is this repository's own: the tensor, the
+cubic, the metric's two factors and the sharpen's closed-form lobe limit are
+not AMD's arithmetic, and none of the FidelityFX source (MIT licensed) was read
+to write it. (If the FidelityFX source is consulted later, it is MIT licensed:
+say so here.)
+
+Two frame-size, scene-format targets hold the two passes' output, made the
+first frame they run (a scene that never asks allocates nothing) and with the
+frame. Views (several cameras) are drawn at their own size and never scaled, so
+they never take the upscaler; they take the scene's post settings otherwise, as
+the bloom and FXAA do.
+
+Measured by `tests/test_backend_parity` on a sphere and a cube at half scale
+(mean distance of the frame from the scene drawn at the full size, hundredths
+of a step of 255): bilinear 124, edge-adaptive 67 at one sample, 113 and 65 at
+4x, on both backends; the backends agree to the byte at one sample.
+`tests/test_gpu_upscale` runs the two on the CPU over pictures with known
+answers (a disk at half size against the full one, an aliased disk, a HDR
+scene 0.4 to 120, a flat area, a lone bright pixel, a black ground beside a
+bright edge), each with negative controls.
+
+### Depth of field
+
+`engine_set_depth_of_field(e, on, focus, aperture, max_radius)`, or
+`AE3D_DOF=1` with `AE3D_DOF_FOCUS`, `AE3D_DOF_APERTURE` and `AE3D_DOF_MAX`
+(#870, #823 item 4). Off by default, and off the frame is what it was, byte
+for byte. `focus` is the distance (the scene's units, from the lens along its
+axis) at which the picture is sharp; the disc of confusion at view depth z is
+`aperture (z - focus) / z` pixels: nothing at the focus, growing to `aperture`
+at infinity and without bound toward the lens, held to `max_radius`. Both are
+in pixels of a 1080-line frame and scaled by the frame's height, so a frame of
+any size is blurred as much of itself. Nothing drawn (a sky) is infinitely far.
+
+Two passes at half the scene's size (`ae3d.shaders.dof`, quoted, with the MSL),
+then a composite that mixes them in beside the bloom:
+
+- **`dof_coc`**: each target texel's light (a 2x2 mean) and, in its alpha, the
+  signed disc of the scene's depth there, fetched exactly (no sampler's
+  filter) at the four texels of the scene it covers, the disc farthest from
+  focus kept. The view depth is `1 / w` of the depth taken back through the
+  camera's inverse, whatever the dialect's clip depth, so it is the planar
+  distance and not the radial.
+- **`dof_gather`**: 32 taps on a golden-angle spiral out to `max_radius`, each
+  weighed by how far its own disc reaches this texel (scatter as gather): a
+  near thing's blur spreads over the sharp ground behind it, up to its disc,
+  and the far ground's does not spread over what is in focus (a far tap is
+  weighed by the texel's own radius). The alpha is how much of the texel is
+  blurred light: its own radius, or the share of the taps a near disc of the
+  widest radius met would cover, whichever is more. The spiral is turned the
+  same way in the picture on both renderers (OpenGL's rows run up, Vulkan's
+  down), which is what makes them agree to the byte at one sample.
+- **The composite**: with `dof_on`, the screen's light is moved toward the
+  blurred by its alpha *after* the bloom is added, as `radiance + (blurred -
+  screen) * alpha`, so the bloom is neither blurred twice nor dropped. With it
+  off the composite computes what it did: `tests/test_backend_parity` holds the
+  frame before and after a toggle identical, and `frames_against` holds every
+  existing frame identical to main's.
+
+It reads the scene's depth, so the depth is made the way the reflection's and
+the occlusion's are (a frame drawn in two halves with the depth resolved
+between them on Vulkan, copied on OpenGL). A view (several cameras) draws it
+with the engine's settings over its own camera's depth; a capture channel is
+data and is not blurred. The engine's settings are not part of a scene file.
+
+`tests/test_gpu_dof` runs the passes on the CPU over pictures with known
+answers; `tests/test_backend_parity` draws a ball in focus with a sphere near
+and a box far (both blurred, the ball not; focused on the box, the box is the
+one least changed) on both backends: 0 of 147,456 channels differ at one
+sample, 1.3% at 4x (the depth at silhouettes differs by a sample).
 
 ### Ray-traced shadows
 

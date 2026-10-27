@@ -991,3 +991,25 @@ smallest first (the first is built, less the vertex shaders):
 The recommendation is 1: the least new code, and the first time the MSL's
 arithmetic is held to frames; 3 after #312's groundwork.
 
+
+### The upscaler's and depth of field's passes (2026-10-27)
+
+Four more quote shaders, one source each for Vulkan's SPIR-V, OpenGL's GLSL
+and the MSL (generated, held by `--check` and the device compiler, appended to
+the generator's table so no constant moved): `ae3d.shaders.upscale` (`easu`,
+`rcas`: #867) and `ae3d.shaders.dof` (`dof_coc`, `dof_gather`: #870). The
+composite takes a third texture, `dof`, and a flag, `dof_on`; the textures are
+still bound by the order the body first reads them (screen, bloom, dof), and
+the block gains an int. Under `AE3D_MSL=1` the four are among the pixel shaders
+MoltenVK takes as MSL (vkmsl), held to the SPIR-V's frames by the same recipe
+as above (one math mode on both sides); their vertex shader is the full-screen
+one, SPIR-V as before.
+
+What the shaders needed of `ae3d.shaderlib`/`ae3d.gpu`, none of it new:
+`texel_fetch` for an exact read (the upscaler's taps, the depth's four texels:
+no sampler's filter, so Vulkan's nearest and OpenGL's agree), `texture_size`,
+`float_of` for the gather's loop, and `screen_y_sign()` to turn the gather's
+spiral the same way in the picture on both renderers (OpenGL's rows run up,
+Vulkan's down: unturned, the two disagreed in 4% of a frame wherever the blur
+was wide). A struct local to a helper (`EdgeAxis`) is returned by value, as
+`HazePoint` is.
