@@ -1041,6 +1041,54 @@ a streak of rain stays a streak; or full (mode 2), tipped to face the eye
 as well, for a flake or a mote. The weather's particles are a quad with a
 soft disc for a texture, drawn this way.
 
+### Text in the world
+
+Name tags, damage numbers, signs and labels are asked for the way the HUD's
+text is, every frame, from the HUD (`engine_hud(e)`), with a place in the scene
+instead of a place on the screen (#871):
+
+```
+hud.world_text(h, x, y, z, 0.4, "Grunt", hud.rgba(1.0, 1.0, 1.0, 1.0))          // faces the camera
+hud.world_text_fixed(h, x, y, z, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.5, "EXIT", c)  // lies along right and up
+hud.world_text_depth(h, false)                                                  // the runs after it are over everything
+```
+
+The size is the em in the world's units, so a label shrinks with distance as
+the thing it names does; the text is centred on the point both ways. A
+`world_text` run faces the camera it is drawn from (its axes are the camera's,
+so it is parallel to the picture) -- the window's, or a view's: a view draws
+the world text from its own camera. A `world_text_fixed` run lies in the plane
+its two axes make, drawn from both sides and mirrored from behind. Colours are
+display values, as the HUD's, turned to the scene's light the way the clear
+colour is. `hud.clear` forgets the runs after each frame like the rectangles;
+512 runs a frame at most, the rest dropped and said once.
+
+It is `ae3d.worldtext` (the runs and their vertices, one quad a glyph, laid out
+by `ae3d.glyphs` from the HUD's own atlas at 64 px to the em) drawn by one
+quoted pair, `ae3d.shaders.lettering` (docs/aether_quote_design.md section 11),
+on Vulkan and OpenGL: after the scene's transparent surfaces, in the scene
+pass, depth-tested against the scene's and not written, blended by the glyph's
+coverage (the atlas's distance against the outline, one pixel wide by the
+field's change over a pixel, so it is sharp at any size and angle). It writes
+the scene's motion vector, so the temporal pass follows it, and it goes through
+what follows the scene as the scene's light does: the upscaler, depth of field,
+the bloom and the tone curve. Three things follow from that:
+
+- Text writes no depth, as the water and the glass do not, so depth of field
+  blurs it by the depth under it, not its own, and the pick pass does not see it
+  (text is not picked: the click lands on what is behind).
+- The atlas is read at one level, as the HUD reads it: far away and small a
+  label is blurred rather than sharp (the field's width grows with the
+  minification) and can shimmer in motion.
+- With nothing asked for nothing runs: the frame is the frame it was.
+
+What a frame pays (`benchmarks/bench_world_text`, 1280x720, 24 spheres, an
+M6, labels of eight glyphs drawn over everything): 100 labels cost about 50 to
+110 us of a frame's wall time and 12 to 22 us of its GPU scene pass on each
+renderer, 500 labels about 250 to 330 and 60 to 160. The runs are laid out on
+the CPU each frame (a label is a few hundred nanoseconds) and drawn one draw
+a run, with no state changes between.
+
 ### A model cut by a plane
 
 `core.model_set_clip(m, normal, distance, noise, noise_scale)` cuts a model
