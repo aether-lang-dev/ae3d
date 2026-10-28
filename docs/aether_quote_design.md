@@ -1029,3 +1029,51 @@ and prefilter passes, the table and every reader of them are unchanged; under
 `AE3D_MSL=1` it is among the pixel shaders MoltenVK takes as MSL. The map's
 texture is RGBA16F with a mip chain made by blits (Vulkan) or `glGenerateMipmap`
 (OpenGL).
+
+### The world text's pair (2026-10-28)
+
+One more quote pair, `ae3d.shaders.lettering` (`world_text_vertex`,
+`world_text`: #871), SPIR-V, GLSL and MSL from the one source (generated and
+held by `--check` and the device compiler like the rest; the pixel shader is
+among the MSL ones MoltenVK takes under `AE3D_MSL=1`). The module is lettering,
+not worldtext: `ae3d.worldtext` is the engine's, and two modules of one last
+name in a program confuse a quote's helpers.
+
+The shapes it is made of, none of them new to `ae3d.gpu`:
+
+- the vertex shader reads the mesh vertex's attributes by the table's names
+  (`position`, `uv`, `normal`, `occlusion`) and an instance's matrix
+  (`instance_model`), so the pair is a mesh pair (`vkquote.mesh_pair_new`) on
+  Vulkan with no new vertex input, and a vertex array in a mesh's layout on
+  OpenGL. A glyph's layout pixel is in the position, its atlas place in the
+  uv, its colour in the normal's three floats and its alpha in the baked
+  occlusion's; the run is the draw's one instance: its right and up axes with
+  the scale in them (a billboard's the camera's, chosen by the renderer from
+  the view matrix, so the shader has no branch for the kind of run), its
+  point, and in the first column's w whether it is drawn over everything. One
+  vertex buffer and one instance buffer a frame slot, one `vkCmdDraw` a run
+  (the run's number is the draw's `firstInstance`), one set of values for the
+  frame (the pair's two captures are the matrices, from the scene block, and
+  the jitter). OpenGL sets each run's four matrix columns as the generic
+  attribute (`glVertexAttrib4f`) before its draw.
+- "Over everything" is the depth test every draw makes, passed: `depth_clip`
+  of a hundredth of a percent, times w, as the clip z, so Vulkan's 0..1 and
+  OpenGL's -1..1 are each right (the OpenGL GLSL is `(0.0001 * 2.0 - 1.0)`),
+  and the pipeline is one pipeline.
+- The glyph's coverage is the atlas's distance against 0.5 with the pixel's
+  width from `dFdx` and `dFdy` of the distance itself; a pixel with no coverage
+  is `discard()`ed, so the scene's second attachment keeps the motion vector
+  of what is behind it.
+- The HUD's atlas on Vulkan is one byte a texel; the world text reads it as the
+  device texture `vktexture.texture_create_rgba` makes of it (the distance in
+  red, one level), made again when the HUD's font changes. A texture of its own
+  rather than the overlay's: the overlay's is uploaded inside the overlay's
+  hook, after the scene pass the text is drawn in, and a view's frame (a
+  different format) must not remake the overlay's pass.
+
+It draws in `renderer_render`, after the transparent surfaces and before the
+frame ends, so a view's frame draws it with the view's camera and the post
+chain (the temporal pass, the upscaler, depth of field, the bloom, the
+composite) sees it as part of the scene's light. It writes no depth, so depth
+of field blurs it by what is under it; the pick pass runs before it, so it is
+not picked.

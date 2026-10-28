@@ -1,0 +1,322 @@
+// World-space text (ae3d.shaders.lettering, #871), run on the CPU by ae3d.gpu
+// and held to what makes it text in the world and not a sticker:
+//
+//   - a glyph's layout pixel lies along the run's axes, scaled: right with x,
+//     and up against y (the layout runs down), from the run's point;
+//   - the clip position is this frame's and last frame's, through each
+//     matrix; the depth is the product's own, and a run drawn over everything
+//     has the near plane's;
+//   - the glyph's field against its outline: nothing outside, all of it
+//     inside, half at the outline in a pixel as wide as the field's change,
+//     growing as the pixel gets wider, and dropped where nothing is covered
+//     (so it writes no colour and no motion vector);
+//   - the colour is the HUD's display value turned to light, the alpha the
+//     coverage times the run's, and the motion vector is the clip positions'.
+//
+// Its GLSL, for Vulkan and OpenGL, is the fixtures, taken by glslang.
+//
+// AE3D_GPU_WRITE_GOLDEN=1 writes the fixtures from what is emitted.
+
+import std.os
+import std.fs
+import std.file
+import std.list
+import std.string
+import std.heap
+import std.lanes
+import std.quote
+import ae3d.core
+import ae3d.core (Mat4, Vec3, Vec4)
+import ae3d.gpu
+import ae3d.shaders.lettering
+import ae3d.shaders.skydome (display_radiance)
+import ae3d.shaderlib (vec2, vec3, vec4, mat4, Texture, ShaderImage, texture, rgb, mat4_of, image_new, image_set,
+                       image_free, texture_of)
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+absf(a: float) -> float { if a < 0.0 { return 0.0 - a } return a }
+
+// glslang -V over `text` (as `stage`), then spirv-val; or, for desktop
+// OpenGL's GLSL (`opengl`), glslang's check of it. Skipped where they are
+// not on PATH.
+compiles(label: string, text: string, stage: string, opengl: bool) {
+    if string.length(os.which("glslangValidator")) == 0 {
+        println("  skip glslang (not on PATH)")
+        return
+    }
+    tmp = os.temp_dir()
+    src = "${tmp}/ae3d_gpu_${label}.${stage}"
+    spv = "${tmp}/ae3d_gpu_${label}.${stage}.spv"
+    _w = file.write(src, text)
+    argv = list.new()
+    if !opengl {
+        list.add(argv, "-V")
+        list.add(argv, "-o")
+        list.add(argv, spv)
+    }
+    list.add(argv, src)
+    out, status, _err = os.run_capture("glslangValidator", argv, null)
+    list.free(argv)
+    if opengl {
+        check("glslang takes ${label}.${stage} as OpenGL's GLSL", status == 0)
+        if status != 0 { println(out) }
+        return
+    }
+    check("glslang compiles ${label}.${stage} to SPIR-V", status == 0)
+    if status != 0 { println(out) }
+    if string.length(os.which("spirv-val")) == 0 {
+        println("  skip spirv-val (not on PATH)")
+        return
+    }
+    vargv = list.new()
+    list.add(vargv, spv)
+    vout, vstatus, _verr = os.run_capture("spirv-val", vargv, null)
+    check("spirv-val passes ${label}.${stage}", vstatus == 0)
+    if vstatus != 0 { println(vout) }
+    list.free(vargv)
+}
+
+// `text` is the fixture at `path`; AE3D_GPU_WRITE_GOLDEN=1 writes it.
+golden_is(text: string, path: string) {
+    if os.getenv("AE3D_GPU_WRITE_GOLDEN") != null {
+        _m = fs.mkdir_p("tests/fixtures/gpu")
+        werr = file.write(path, text)
+        check("${path} written", werr == "")
+    }
+    golden, gerr = file.read(path)
+    check("${path} is there", gerr == "")
+    check("the GLSL written is ${path}", text == golden)
+    if text != golden {
+        println("--- emitted ---")
+        println(text)
+    }
+}
+
+
+
+
+v3_of(v: vec3) -> *GpuVal {
+    p = v as f32x4
+    return gpu.v3(p.x, p.y, p.z)
+}
+v2_of(x: float, y: float) -> *GpuVal { return gpu.v2(x, y) }
+
+// The clip position of a world point through `m`, by hand: the product the
+// vertex shader writes.
+clip_of(m: Mat4, x: float, y: float, z: float) -> Vec4 {
+    return core.vec4(m.m0 * x + m.m4 * y + m.m8 * z + m.m12, m.m1 * x + m.m5 * y + m.m9 * z + m.m13,
+                     m.m2 * x + m.m6 * y + m.m10 * z + m.m14, m.m3 * x + m.m7 * y + m.m11 * z + m.m15)
+}
+
+// A run as the renderer hands it: its right and up with the scale in them, its
+// point, and `on_top` in the first column's w.
+run_matrix(right: vec3, up: vec3, scale: float, origin: vec3, on_top: float) -> Mat4 {
+    r = right as f32x4
+    u = up as f32x4
+    o = origin as f32x4
+    return Mat4 {
+        m0: r.x * scale, m1: r.y * scale, m2: r.z * scale, m3: on_top,
+        m4: u.x * scale, m5: u.y * scale, m6: u.z * scale, m7: 0.0,
+        m8: o.x, m9: o.y, m10: o.z, m11: 0.0,
+        m12: 0.0, m13: 0.0, m14: 0.0, m15: 1.0
+    }
+}
+
+// One vertex of the shader `vs` at layout pixel (x, y) of the run `run`, with
+// the colour and alpha the vertex carries.
+vertex_at(vs: *GpuShader, run: Mat4, x: float, y: float, u: float, v: float) -> *GpuRun {
+    cx = gpu.cpu_new(vs)
+    attrs = [gpu.v3(x, y, 0.0), gpu.v2(u, v), gpu.v3(0.5, 0.25, 0.125), gpu.v1(0.75), gpu.vmat4(mat4_of(&run))]
+    names = ["position", "uv", "normal", "occlusion", "instance_model"]
+    k = 0
+    while k < 5 {
+        gpu.cpu_vertex_attr(cx, names[k], attrs[k])
+        k = k + 1
+    }
+    if !gpu.cpu_run_vertex(cx) { println("  cpu_run_vertex: ${gpu.last_error()}") }
+    k = 0
+    while k < 5 {
+        gpu.val_free(attrs[k])
+        k = k + 1
+    }
+    return cx
+}
+
+const SCALE = 0.01
+
+main() {
+    println("ae3d.shaders.lettering on the CPU")
+    proj = core.mat4_perspective(1.0, 1.5, 0.1, 100.0)
+    view = core.mat4_look_at(core.vec3(1.0, 2.0, 6.0), core.vec3(0.5, 1.0, 0.0), core.vec3(0.0, 1.0, 0.0))
+    vp = core.mat4_mul(proj, view)
+    // Last frame's camera is a step to the side.
+    view2 = core.mat4_look_at(core.vec3(1.4, 2.0, 6.0), core.vec3(0.5, 1.0, 0.0), core.vec3(0.0, 1.0, 0.0))
+    prev = core.mat4_mul(proj, view2)
+    origin = vec3(2.0, 1.0, -3.0)
+    right = vec3(0.6, 0.0, 0.8)
+    up = vec3(0.0, 1.0, 0.0)
+
+// ── the place ──
+    place = lettering.text_place(origin, right * SCALE, up * SCALE, 40.0, 25.0) as f32x4
+    want_x = 2.0 + 0.6 * 40.0 * SCALE
+    want_y = 1.0 - 25.0 * SCALE
+    want_z = -3.0 + 0.8 * 40.0 * SCALE
+    check("a layout pixel lies along the run's right with x and against its up with y (${place.x}, ${place.y}, ${place.z})",
+          absf(place.x - want_x) < 0.00001 && absf(place.y - want_y) < 0.00001 && absf(place.z - want_z) < 0.00001)
+    at_origin = lettering.text_place(origin, right * SCALE, up * SCALE, 0.0, 0.0) as f32x4
+    check("and pixel (0, 0) is the run's point", absf(at_origin.x - 2.0) < 0.00001 && absf(at_origin.y - 1.0) < 0.00001 &&
+          absf(at_origin.z + 3.0) < 0.00001)
+
+    // ── the vertex shader ──
+    vs = lettering.world_text_vertex(mat4_of(&vp), mat4_of(&prev))
+    cx = vertex_at(vs, run_matrix(right, up, SCALE, origin, 0.0), 40.0, 25.0, 0.25, 0.75)
+    pos = gpu.cpu_varying(cx, "position")
+    now = gpu.cpu_varying(cx, "clip_now")
+    pv = gpu.cpu_varying(cx, "clip_prev")
+    uv = gpu.cpu_varying(cx, "uv")
+    want_now = clip_of(vp, want_x, want_y, want_z)
+    want_prev = clip_of(prev, want_x, want_y, want_z)
+    check("the clip position is this frame's matrix on the world point",
+          now != null && absf(gpu.val_x(now) - want_now.x) < 0.0001 && absf(gpu.val_y(now) - want_now.y) < 0.0001 &&
+          absf(gpu.val_z(now) - want_now.z) < 0.0001 && absf(gpu.val_w(now) - want_now.w) < 0.0001)
+    check("and last frame's the other matrix on the same point",
+          pv != null && absf(gpu.val_x(pv) - want_prev.x) < 0.0001 && absf(gpu.val_w(pv) - want_prev.w) < 0.0001 &&
+          absf(gpu.val_x(pv) - gpu.val_x(now)) > 0.001)
+    check("the position is the clip position, depth and all, when it is hidden by what is nearer",
+          pos != null && absf(gpu.val_z(pos) - want_now.z) < 0.0001 && absf(gpu.val_w(pos) - want_now.w) < 0.0001)
+    check("the atlas place goes on", uv != null && absf(gpu.val_x(uv) - 0.25) < 0.000001 && absf(gpu.val_y(uv) - 0.75) < 0.000001)
+    col = gpu.cpu_varying(cx, "colour")
+    al = gpu.cpu_varying(cx, "alpha")
+    check("and so do the vertex's colour and alpha",
+          col != null && al != null && absf(gpu.val_x(col) - 0.5) < 0.000001 && absf(gpu.val_y(col) - 0.25) < 0.000001 &&
+          absf(gpu.val_z(col) - 0.125) < 0.000001 && absf(gpu.val_x(al) - 0.75) < 0.000001)
+    gpu.cpu_free(cx)
+    gpu.shader_free(vs)
+
+    // Drawn over everything: the depth is the near plane's (a hundredth of
+    // a percent of w), the rest the same.
+    vt = lettering.world_text_vertex(mat4_of(&vp), mat4_of(&prev))
+    cx = vertex_at(vt, run_matrix(right, up, SCALE, origin, 1.0), 40.0, 25.0, 0.25, 0.75)
+    pos = gpu.cpu_varying(cx, "position")
+    check("drawn over everything its depth is at the near plane (z ${gpu.val_z(pos)} of w ${gpu.val_w(pos)}) and its x and y are where they were",
+          pos != null && absf(gpu.val_z(pos) - 0.0001 * want_now.w) < 0.00001 && absf(gpu.val_x(pos) - want_now.x) < 0.0001 &&
+          absf(gpu.val_y(pos) - want_now.y) < 0.0001)
+    gpu.cpu_free(cx)
+    gpu.shader_free(vt)
+
+    // ── the coverage ──
+    check("a glyph's field at the outline is half covered in a pixel as wide as the field changes (${lettering.coverage(0.5, 0.2)})",
+          absf(lettering.coverage(0.5, 0.2) - 0.5) < 0.0001)
+    check("all of it inside (${lettering.coverage(0.9, 0.2)}) and none outside (${lettering.coverage(0.1, 0.2)})",
+          lettering.coverage(0.9, 0.2) == 1.0 && lettering.coverage(0.1, 0.2) == 0.0)
+    check("a wider pixel puts a texel a little inside the outline further from full (${lettering.coverage(0.55, 0.4)} against ${lettering.coverage(0.55, 0.05)})",
+          lettering.coverage(0.55, 0.4) < lettering.coverage(0.55, 0.05) - 0.2)
+
+    // ── the pixel shader ──
+    // An atlas of two columns: the field 0 on the left, 1 on the right, 0.5 in
+    // the one column between them; on the CPU a pixel's neighbours are not
+    // seen, so the pixel is a point and the edge hard.
+    img = image_new(3, 1)
+    image_set(img, 0, 0, 0.0, 0.0, 0.0, 1.0)
+    image_set(img, 1, 0, 0.5, 0.0, 0.0, 1.0)
+    image_set(img, 2, 0, 1.0, 0.0, 0.0, 1.0)
+    shown = vec3(0.8, 0.4, 0.1)
+    ps = lettering.world_text(texture_of(img), vec2(0.0, 0.0))
+    px = gpu.cpu_new(ps)
+    vary = gpu.vstruct()
+    gpu.val_set(vary, "uv", v2_of(2.5 / 3.0, 0.5))
+    gpu.val_set(vary, "colour", v3_of(shown))
+    gpu.val_set(vary, "alpha", gpu.v1(0.75))
+    gpu.val_set(vary, "clip_now", gpu.v4(0.0, 0.0, 0.5, 2.0))
+    gpu.val_set(vary, "clip_prev", gpu.v4(0.2, 0.0, 0.5, 2.0))
+    out = gpu.cpu_run(px, vary)
+    light = display_radiance(shown) as f32x4
+    colour = null as *GpuVal
+    vel = null as *GpuVal
+    if out != null {
+        colour = gpu.val_field(out, "colour")
+        vel = gpu.val_field(out, "velocity")
+    }
+    check("inside the glyph the colour is the display value turned to light (${gpu.val_x(colour)}, ${gpu.val_y(colour)}, ${gpu.val_z(colour)})",
+          colour != null && absf(gpu.val_x(colour) - light.x) < 0.00001 && absf(gpu.val_y(colour) - light.y) < 0.00001 &&
+          absf(gpu.val_z(colour) - light.z) < 0.00001)
+    check("its alpha is the run's (${gpu.val_w(colour)} for 0.75)", colour != null && absf(gpu.val_w(colour) - 0.75) < 0.0001)
+    // (0.2 / 2 on x now less 0 / 2 before) halved to texture space: now - prev.
+    check("and its motion vector is the clip positions' (${gpu.val_x(vel)}, ${gpu.val_y(vel)}): -0.05, 0",
+          vel != null && absf(gpu.val_x(vel) + 0.05) < 0.00001 && absf(gpu.val_y(vel)) < 0.00001)
+    gpu.val_free(out)
+    out = null
+    // The frame's temporal nudge is taken out of the motion vector: the same
+    // pixel with a jitter of 0.01 of the frame moves 0.01 less.
+    jittered = lettering.world_text(texture_of(img), vec2(0.01, 0.0))
+    jx = gpu.cpu_new(jittered)
+    jout = gpu.cpu_run(jx, vary)
+    jvel = null as *GpuVal
+    if jout != null { jvel = gpu.val_field(jout, "velocity") }
+    check("a jitter is taken out of the motion vector (${gpu.val_x(jvel)} against -0.05 without it, less the 0.01)",
+          jvel != null && absf(gpu.val_x(jvel) + 0.06) < 0.00001)
+    gpu.val_free(jout)
+    gpu.cpu_free(jx)
+    gpu.shader_free(jittered)
+    gpu.val_free(vary)
+    vary = gpu.vstruct()
+    gpu.val_set(vary, "uv", v2_of(0.5 / 3.0, 0.5))
+    gpu.val_set(vary, "colour", v3_of(shown))
+    gpu.val_set(vary, "alpha", gpu.v1(0.75))
+    gpu.val_set(vary, "clip_now", gpu.v4(0.0, 0.0, 0.5, 2.0))
+    gpu.val_set(vary, "clip_prev", gpu.v4(0.0, 0.0, 0.5, 2.0))
+    outside = gpu.cpu_run(px, vary)
+    check("outside the glyph the pixel is dropped, so it writes neither a colour nor a motion vector",
+          outside == null && gpu.cpu_discarded(px))
+    gpu.val_free(outside)
+    gpu.val_free(vary)
+    gpu.cpu_free(px)
+    gpu.shader_free(ps)
+    image_free(img)
+
+    // ── the GLSL ──
+    bv = lettering.world_text_vertex(mat4_of(&vp), mat4_of(&prev))
+    bp = lettering.world_text(Texture { image: null }, vec2(0.0, 0.0))
+    check("the pair links by its varyings", gpu.link(bv, bp))
+    vkv = gpu.emit_vertex_glsl(bv, gpu.VULKAN, "", "")
+    glv = gpu.emit_vertex_glsl(bv, gpu.GL, "", "")
+    vkp = gpu.emit_glsl(bp, gpu.VULKAN)
+    glp = gpu.emit_glsl(bp, gpu.GL)
+    golden_is(vkv, "tests/fixtures/gpu/world_text.vert")
+    golden_is(glv, "tests/fixtures/gpu/world_text_gl.vert")
+    golden_is(vkp, "tests/fixtures/gpu/world_text.frag")
+    golden_is(glp, "tests/fixtures/gpu/world_text_gl.frag")
+    compiles("world_text", vkv, "vert", false)
+    compiles("world_text_gl", glv, "vert", true)
+    compiles("world_text", vkp, "frag", false)
+    compiles("world_text_gl", glp, "frag", true)
+    check("OpenGL's near plane is its clip depth of the same stored depth (-0.9998)",
+          string.contains(glv, "-0.9998") != 0 || string.contains(glv, "0.0001 * 2.0 - 1.0") != 0 ||
+          string.contains(glv, "0.0002 - 1.0") != 0)
+    check("the pixel shader's one texture is the atlas", gpu.samplers_count(bp) == 1 && gpu.samplers_name(bp, 0) == "atlas")
+    gpu.shader_free(bv)
+    gpu.shader_free(bp)
+
+    if g_failures == 0 {
+        println("lettering: all checks passed (${g_checks})")
+        return
+    }
+    println("lettering: ${g_failures} of ${g_checks} checks failed")
+    exit(1)
+}

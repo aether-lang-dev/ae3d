@@ -270,6 +270,11 @@ program sets one (`engine_set_ui_scale`, or `AE3D_UI_SCALE`).
   sets each line left, centred or right (`ALIGN_LEFT`, `_CENTRE`,
   `_RIGHT`) and returns the height it took. A word wider than the width
   gets a line of its own.
+- **Text in the world.** `hud.world_text(o, x, y, z, size, text, colour)` is
+  a label at a point in the scene, `size` tall to the em in the world's units,
+  facing the camera; `world_text_fixed` lies in a plane; `world_text_depth`
+  decides whether what is nearer hides it. It uses the same atlas and is drawn
+  into the scene, not over it: docs/rendering.md, "Text in the world".
 - **Clipped panels.** `hud.push_clip(o, x, y, w, h)` and `hud.pop_clip(o)`
   bound what is drawn to a panel, nested panels to where they meet. Each
   quad is cut to the clip as it is added, and the glyph or image area it
