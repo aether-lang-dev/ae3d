@@ -450,7 +450,17 @@ HALF or FLOAT, R G B (A) or a lone Y, compression NONE, RLE, ZIPS or ZIP, lines
 in any order and any data window. PIZ, PXR24, B44, B44A, DWAA, DWAB, tiled,
 deep and multipart files are refused by name. It is placed as a painted sky
 is: the top row is the zenith and the middle column looks along +x. Its light
-is the engine's radiance times `intensity` (a map's 1 is diffuse white).
+is the engine's radiance times `intensity`: 1 is the file's own values, and
+exposure handles the rest.
+
+The map can be turned about up: `engine_set_environment_yaw(e, degrees)` (or
+`AE3D_ENV_YAW=degrees`; `engine_set_environment_look(e, intensity, degrees)` sets
+the scale and the turn together). Yaw is in the sense the camera's yaw turns, so
+a feature of the picture at some azimuth is seen that many degrees on from it, a
+whole turn is no turn, and 0 is the map as placed above. It is one float
+(radians) of `env_capture`, so turning the map, like changing its scale, remakes
+the capture and its filters once (about 1-2 ms on the M6) and does not read the
+file again.
 
 It takes the place of the sky's capture and nothing after it: one quoted pass,
 `ae3d.shaders.envmap.env_capture`, writes the 256-texel octahedral capture from
