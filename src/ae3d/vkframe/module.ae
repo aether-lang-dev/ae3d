@@ -27,6 +27,7 @@
 
 import contrib.vulkan.vk
 import ae3d.vkhost
+import ae3d.vkhost (HostBuffer)
 import ae3d.vkdevice
 import ae3d.vkdesc
 import ae3d.vktargets
@@ -57,6 +58,9 @@ import ae3d.shaders.composite
 import ae3d.shaders.composite (Haze)
 import ae3d.shaders.sea
 import ae3d.shaders.sea (Water)
+import ae3d.shaders.lettering
+import ae3d.worldtext
+import ae3d.worldtext (WorldText, WorldRun)
 import ae3d.shaders.frame (Eye, KeyLight, Weather, Shadow, ShadowCascades, Grid, Probes, WorldState)
 import ae3d.shaders.lit
 import ae3d.shaders.lit (Draw, DrawMaterial, Surface, Cut, Wounds, Damage, Skin)
@@ -85,7 +89,7 @@ exports (
     SKY_PROJECTION, SKY_VIEW, SKY_CLOUD_SUN_COLOUR, SKY_SUN, SKY_CLOUD_FRAME, SKY_KIND, SKY_FLAT, SKY_TURBIDITY,
     SKY_CLOUD_SIZE, SKY_CLOUD_HISTORY, SKY_OVERCAST, SKY_OVERCAST_COLOUR, sky_words, set_sky_int, set_sky_float, set_sky_vec3,
     set_sky_mat4, set_sky_clip_mat4, set_composite_haze, water_word, set_water_int, set_water_float, set_water_vec3,
-    set_water_array, crowd_pull_pipeline, CROWD_FRAMES, CROWD_COLUMNS, CROWD_ROWS, CROWD_WIDTH, CROWD_HEIGHT,
+    set_water_array, draw_world_text, crowd_pull_pipeline, CROWD_FRAMES, CROWD_COLUMNS, CROWD_ROWS, CROWD_WIDTH, CROWD_HEIGHT,
     CROWD_TRAVEL, CROWD_PHASE_STEP, CROWD_PULL_BITS, CROWD_REACH, set_crowd_int, set_crowd_float, set_crowd_vec3
 )
 
@@ -297,6 +301,15 @@ var g_sky_words: ptr = null
 var g_water_pass: ptr = null
 var g_water_draw = 0
 const WATER_DRAWS = 64
+// The world text's (ae3d.shaders.lettering, #871): a pair drawn in the scene
+// pass over the runs' vertices, blended and depth-tested and not written, one
+// draw a frame (a view's frame counts as one) with a buffer of vertices and
+// of the runs as instances for each frame slot, grown as they need.
+var g_text_pass: ptr = null
+var g_text_draw = 0
+const TEXT_DRAWS = 2
+var g_text_vertices: ptr = null       // *HostBuffer[FRAMES]
+var g_text_instances: ptr = null      // *HostBuffer[FRAMES]
 // Each captured field's source (WATER_FROM_*) and its offset there, by
 // capture (WATER_CAPTURES) and field, looked up once.
 var g_water_offsets: ptr = null
@@ -910,6 +923,11 @@ start(width: int, height: int) -> bool {
     g_water_pass = vkquote.mesh_pair_new(sea_vertex_shader(), sea_shader(), vkspirv.SEA_QUOTED_VERT,
                                          vkspirv.SEA_QUOTED_FRAG, vkspirv.SEA_QUOTED_VERTEX_HASH, vkspirv.SEA_QUOTED_HASH,
                                          vktargets.scene_pass(), WATER_DRAWS) as ptr
+    g_text_pass = vkquote.mesh_pair_new(text_vertex_shader(), text_shader(), vkspirv.WORLD_TEXT_QUOTED_VERT,
+                                        vkspirv.WORLD_TEXT_QUOTED_FRAG, vkspirv.WORLD_TEXT_QUOTED_VERTEX_HASH,
+                                        vkspirv.WORLD_TEXT_QUOTED_HASH, vktargets.scene_pass(), TEXT_DRAWS) as ptr
+    g_text_vertices = calloc(FRAMES, 8)
+    g_text_instances = calloc(FRAMES, 8)
     water_offsets()
     crowd_rings()
     if g_dlss_loaded {
@@ -994,6 +1012,18 @@ shutdown() {
     g_composite_pass = null
     vkquote.pass_free(g_water_pass as *QuotedPass)
     g_water_pass = null
+    vkquote.pass_free(g_text_pass as *QuotedPass)
+    g_text_pass = null
+    k = 0
+    while k < FRAMES && g_text_vertices != null {
+        vkhost.host_buffer_free((g_text_vertices as ptr[])[k] as *HostBuffer)
+        vkhost.host_buffer_free((g_text_instances as ptr[])[k] as *HostBuffer)
+        k = k + 1
+    }
+    free(g_text_vertices)
+    free(g_text_instances)
+    g_text_vertices = null
+    g_text_instances = null
     crowd_rings_free()
     free(g_crowd_words)
     g_crowd_words = null
@@ -1311,6 +1341,7 @@ frame_begin(r: float, g: float, b: float, a: float) -> bool {
     g_frame_sets_named = false
     g_draw_calls = 0
     g_water_draw = 0
+    g_text_draw = 0
     vkquote.ring_frame(g_crowd_ring as *VertexRing, g_frame)
     vkquote.ring_frame(g_crowd_pull_ring as *VertexRing, g_frame)
     vkquote.ring_frame(g_crowd_depth_ring as *VertexRing, g_frame)
@@ -1986,6 +2017,76 @@ draw_water(handle: int, texture: int, instances: int, instance_count: int, first
     vk.vkCmdBindIndexBuffer(commands_now(), vkmesh.index_buffer(handle), 0, vk.INDEX_TYPE_UINT32)
     vk.vkCmdDrawIndexed(commands_now(), indices, count, first, 0, 0)
     g_draw_calls = g_draw_calls + 1
+    // The next scene draw binds the scene's set on the scene's layout.
+    g_bound_texture = 0 - 1
+    g_bound_normal = 0 - 1
+}
+
+// The world text's shaders with nothing set: what a frame's values are
+// copied into (draw_world_text).
+text_vertex_shader() -> *GpuShader { return lettering.world_text_vertex(zero_mat4(), zero_mat4()) }
+text_shader() -> *GpuShader { return lettering.world_text(Texture { image: null }, vec2(0.0, 0.0)) }
+
+// A frame slot's buffer in `cells` holding `bytes`, grown when it does not:
+// the slot's last frame is done with it (its fence was waited on before this
+// frame was recorded).
+text_buffer(cells: ptr, bytes: int) -> *HostBuffer {
+    b = (cells as ptr[])[g_frame] as *HostBuffer
+    if b != null && b.bytes >= bytes { return b }
+    vkhost.host_buffer_free(b)
+    (cells as ptr[])[g_frame] = null
+    room = 16384
+    while room < bytes { room = room * 2 }
+    b = vkhost.mapped_buffer(room, vk.BUFFER_USAGE_VERTEX_BUFFER_BIT)
+    (cells as ptr[])[g_frame] = b as ptr
+    return b
+}
+
+// The runs of world text (ae3d.worldtext) drawn into the scene pass, in the
+// pass's blended pipeline (depth-tested, not written): the vertices of every
+// run in one buffer, the runs as instances in another, one draw a run (the
+// run is the draw's one instance, its first the run's number), the atlas the
+// texture handle `atlas`. The matrices and the jitter are the frame's, in
+// the scene program's block; (rx, ry, rz) and (ux, uy, uz) are the camera's
+// right and up, which a billboard run lies along. Nothing is drawn for a
+// frame past TEXT_DRAWS, or when the pair could not be made.
+draw_world_text(w: *WorldText, atlas: int, rx: float, ry: float, rz: float, ux: float, uy: float, uz: float) {
+    if g_text_pass == null || atlas <= 0 || !vkhost.recording() { return }
+    n = worldtext.run_count(w)
+    if n == 0 || worldtext.vertex_count(w) == 0 { return }
+    open_scene_pass()
+    p = g_text_pass as *QuotedPass
+    vertices = text_buffer(g_text_vertices, worldtext.vertex_count(w) * worldtext.VERTEX_BYTES)
+    instances = text_buffer(g_text_instances, n * worldtext.INSTANCE_BYTES)
+    if vertices == null || instances == null { return }
+    memcpy(vertices.mapped, worldtext.vertex_data(w), (worldtext.vertex_count(w) * worldtext.VERTEX_BYTES) as long)
+    worldtext.instances(w, rx, ry, rz, ux, uy, uz, instances.mapped)
+    block = vkdesc.block(vkdesc.PROGRAM_SCENE)
+    vs = vkquote.vertex_shader(p)
+    _vp = gpu.set_mat4_f32(vs, "view_projection", block + vkscene.OFF_VIEWPROJECTION)
+    _pv = gpu.set_mat4_f32(vs, "prev_view_projection", block + vkscene.OFF_PREVVIEWPROJECTION)
+    ps = vkquote.shader(p)
+    _j = gpu.set_vec2_f32(ps, "jitter", block + vkscene.OFF_JITTER)
+    quoted_texture(p, "atlas", atlas)
+    draw = g_text_draw
+    g_text_draw = g_text_draw + 1
+    set = vkquote.prepare(p, g_frame, draw, g_quoted_views, g_quoted_samplers)
+    vset = vkquote.vertex_set(p, g_frame, draw)
+    if set == null || vset == null { return }
+    bind_pipeline(vkquote.mesh_pipeline(p, true, false))
+    (g_set_cell as ptr[])[0] = set
+    vk.vkCmdBindDescriptorSets(commands_now(), vk.PIPELINE_BIND_POINT_GRAPHICS, vkquote.layout(p), 0, 1, g_set_cell, 0, null)
+    (g_set_cell as ptr[])[0] = vset
+    vk.vkCmdBindDescriptorSets(commands_now(), vk.PIPELINE_BIND_POINT_GRAPHICS, vkquote.layout(p), 1, 1, g_set_cell, 0, null)
+    bind_vertices(0, vertices.buffer)
+    bind_vertices(1, instances.buffer)
+    i = 0
+    while i < n {
+        run = worldtext.run(w, i)
+        vk.vkCmdDraw(commands_now(), run.count, 1, run.first, i)
+        g_draw_calls = g_draw_calls + 1
+        i = i + 1
+    }
     // The next scene draw binds the scene's set on the scene's layout.
     g_bound_texture = 0 - 1
     g_bound_normal = 0 - 1
