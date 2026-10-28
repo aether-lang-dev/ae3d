@@ -141,7 +141,7 @@ GPU_SUITES="test_gpu_fxaa test_pick test_pick_crowd test_view test_engine_view t
     test_lamp_shadows test_lights test_mesh_edit test_model_mesh
     test_motion test_offscreen test_overlay test_particles_drawn test_physics
     test_ray_occlusion test_ray_shadows test_readback_buffers
-    test_render test_render_scale test_scene_hold test_shading_isolation
+    test_render test_render_scale test_scene_hold test_scene_look test_shading_isolation
     test_shading_knobs test_shadow_batches test_shadow_cascades test_sky_light
     test_shadows test_skinned_render test_ssr test_taa test_texture_swap
     test_trace test_velocity test_vk_fence_wait test_vk_mesh test_vk_msl test_weather"

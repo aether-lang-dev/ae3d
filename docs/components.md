@@ -105,7 +105,7 @@ that position agree without anything syncing them.
 | Natural Motion | the motion record the scene file writes with the figure | mode (animated, powered, limp), protective, strength, get up after; no natural motion is no component |
 | Audio Source | the source (ae3d.audio, registered by `audio.register_kind`) | clip, bus (music, effects, ambience, voice), volume, pitch, loop, spatial, min and max distance, Doppler, play on start; bound to the engine's sound in its start phase |
 | Environment | the engine | sky (an image, or none), sky color, sun by time, time of day, clouds, cloud wind, overcast and its color, fog, fog start, end, density and color |
-| Rendering | the engine | FXAA, bloom and its threshold and intensity, shadows and their distance, reflections and their height and strength, ambient occlusion and its radius and intensity, temporal antialiasing |
+| Rendering | the engine | FXAA, bloom and its threshold and intensity, shadows and their distance, reflections and their height and strength, ambient occlusion and its radius and intensity, temporal antialiasing, exposure, global illumination, depth of field (on, focus distance, aperture, widest blur) |
 
 `engine.object` gives every object a Transform first, and a drawn one its
 Mesh Renderer and Material. An object with no model still has a Transform:

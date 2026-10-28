@@ -693,6 +693,17 @@ at infinity and without bound toward the lens, held to `max_radius`. Both are
 in pixels of a 1080-line frame and scaled by the frame's height, so a frame of
 any size is blurred as much of itself. Nothing drawn (a sky) is infinitely far.
 
+Depth of field is an authored look, so it is on the scene's **Rendering**
+component beside the bloom and TAA: `depth of field`, `dof focus distance`
+(scene units, planar depth), `dof aperture` and `dof max blur` (pixels of a
+1080-line frame). They are the engine's own fields, so the editor's Scene
+panel, `component.get` and `component.set` over the agent channel, a save
+game and the scene file all carry them, and a program calling
+`engine_set_depth_of_field` and the panel edit one value. A component or scene
+file writes only what differs from the defaults (off, 10, 12, 16), so every
+earlier file loads with it off. The upscaler and the render scale are the
+device's, not the scene's, and are not on the component.
+
 Two passes at half the scene's size (`ae3d.shaders.dof`, quoted, with the MSL),
 then a composite that mixes them in beside the bloom:
 
