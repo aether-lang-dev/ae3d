@@ -462,6 +462,16 @@ whole turn is no turn, and 0 is the map as placed above. It is one float
 the capture and its filters once (about 1-2 ms on the M6) and does not read the
 file again.
 
+The map is the scene's **Environment** component's too (Nic, 875-7): the fields
+`environment map` (a path; empty is the sky), `environment intensity` and
+`environment yaw` (degrees, -360 to 360) are the engine's own, so the scene
+file (`view.environment`: `image`, `intensity`, `yaw`, each written only when it
+differs from none, 1 and 0), the editor's Scene panel (a Browse for the file),
+`component.get`/`component.set` over the agent channel and a save game carry them
+with no other change. Setting the path reads the file; the intensity and the yaw
+never do. A path that does not load is refused and the field keeps the map that
+lights the scene; a scene file that names no map puts the sky back.
+
 It takes the place of the sky's capture and nothing after it: one quoted pass,
 `ae3d.shaders.envmap.env_capture`, writes the 256-texel octahedral capture from
 the map (a mip of the map chosen by its width, so a small sun spreads over the
