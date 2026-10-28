@@ -1013,3 +1013,19 @@ spiral the same way in the picture on both renderers (OpenGL's rows run up,
 Vulkan's down: unturned, the two disagreed in 4% of a frame wherever the blur
 was wide). A struct local to a helper (`EdgeAxis`) is returned by value, as
 `HazePoint` is.
+
+
+### The environment map's capture (2026-10-27)
+
+One more quote shader, `ae3d.shaders.envmap.env_capture` (#869): each texel of
+the sky's 256-texel octahedral capture reads a user's equirectangular map in the
+texel's direction (the same texel-to-direction rule as the sky's capture, the
+painted sky's longitude and latitude, repeat in longitude, latitude held a half
+texel off the poles, a mip level and an intensity as captures). One source for
+SPIR-V, OpenGL's GLSL and the MSL (generated, held by `--check` and the device
+compiler, appended to the generator's table so no constant moved). It replaces
+`sky_capture` in the capture's place and nothing after it, so the irradiance
+and prefilter passes, the table and every reader of them are unchanged; under
+`AE3D_MSL=1` it is among the pixel shaders MoltenVK takes as MSL. The map's
+texture is RGBA16F with a mip chain made by blits (Vulkan) or `glGenerateMipmap`
+(OpenGL).

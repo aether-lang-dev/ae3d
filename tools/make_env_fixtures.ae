@@ -1,0 +1,643 @@
+// Write the environment-map fixtures tests/fixtures/env/ (#869) from nothing
+// but the two formats' descriptions, so every file is one the decoders can be
+// held to number for number.
+//
+// Two pictures, each written several ways:
+//
+//   coded     8 wide, 20 tall (the widths and heights are the point: 8 is the
+//             narrowest an RGBE scanline can be run-length coded, and 20 lines
+//             are two ZIP blocks, the second four lines short): texel (x, y)
+//             is (x + 1, y + 1, 0.5 or 2 by the parity of x + y) and alpha
+//             (y % 4 + 1) / 4. Every value is exact in RGBE and in half floats,
+//             so a decode is compared to the formula with no tolerance.
+//   gradient  64 by 32, an equirectangular sky: a blue that brightens to
+//             zenith (to 4 in blue), a dim brown ground under the horizon.
+//             The lighting tests integrate the decoded map and hold the GPU's
+//             irradiance to it.
+//
+// Radiance: coded_flat.hdr, coded_rle.hdr (both -Y 20 +X 8), coded_flip.hdr
+// (+Y rows bottom first, -X columns right to left: the same picture),
+// coded_old_rle.hdr (the old run-length texels), gradient.hdr (run-length);
+// wide_{old_rle,flat}.hdr, 600 by 2 of one colour, whose rows are one run of 599
+// repeats in the old run-length form, two digits (87 and 2 shifted up eight
+// bits); flat.hdr, 16 by 8 of one colour (0.5, 0.25, 0.125) for the lighting tests;
+// and bands_{flat,rle,old_rle}.hdr, a third picture, 32 by 4, whose rows are
+// one colour across (so the runs are long): the row's red is y + 1, green 1,
+// blue 0.5.
+// OpenEXR: coded_{none,rle,zips,zip}.exr (HALF RGB), coded_float_rgba.exr
+// (FLOAT RGBA, ZIP), coded_extra.exr (A, B, G, R and a FLOAT Z depth channel,
+// RLE, the lines last-first, a data window from (-3, 5)), gradient.exr (HALF,
+// ZIP), and the refusals: coded_piz.exr (PIZ), coded_tiled.exr (a tiled
+// version bit) and coded_short.exr (cut off mid-block).
+//
+//     ./build.sh tools/make_env_fixtures.ae && ./build/make_env_fixtures tests/fixtures/env
+import std.os
+import std.string
+import std.mem
+import ae3d.deflate
+
+extern malloc(size: long) -> ptr
+extern calloc(count: long, size: long) -> ptr
+extern free(p: ptr)
+extern fopen(path: string, mode: string) -> ptr
+extern fwrite(buffer: ptr, size: long, count: long, f: ptr) -> long
+extern fclose(f: ptr) -> int
+extern sin(x: float) -> float
+extern ldexp(x: float, e: int) -> float
+extern floor(x: float) -> float
+
+const CODED_W = 8
+const CODED_H = 20
+const WIDE_W = 600
+const WIDE_H = 2
+const FLAT_W = 16
+const FLAT_H = 8
+const BANDS_W = 32
+const BANDS_H = 4
+var g_grad_w = 64
+var g_grad_h = 32
+var g_capacity_bytes = 1048576
+const PI = 3.14159265358979323846
+
+// ---------------------------------------------------------------------------
+// The pictures.
+// ---------------------------------------------------------------------------
+
+// Channel c (0 red, 1 green, 2 blue, 3 alpha) of texel (x, y) of picture
+// `which` (0 coded, 1 gradient).
+value(which: int, x: int, y: int, c: int) -> float {
+    if which == 0 {
+        if c == 0 { return (x + 1) as float }
+        if c == 1 { return (y + 1) as float }
+        if c == 2 {
+            if (x + y) % 2 == 0 { return 0.5 }
+            return 2.0
+        }
+        return ((y % 4) + 1) as float * 0.25
+    }
+    if which == 4 {
+        if c == 0 { return 0.5 }
+        if c == 1 { return 0.75 }
+        if c == 2 { return 0.25 }
+        return 1.0
+    }
+    if which == 3 {
+        if c == 0 { return 0.5 }
+        if c == 1 { return 0.25 }
+        if c == 2 { return 0.125 }
+        return 1.0
+    }
+    if which == 2 {
+        if c == 0 { return (y + 1) as float }
+        if c == 1 { return 1.0 }
+        if c == 2 { return 0.5 }
+        return 1.0
+    }
+    if c == 3 { return 1.0 }
+    lat = (0.5 - ((y as float) + 0.5) / (g_grad_h as float)) * PI
+    s = sin(lat)
+    // A little east-west structure so the longitude is checked too.
+    lon = 1.0 + 0.25 * sin(((x as float) + 0.5) / (g_grad_w as float) * 2.0 * PI)
+    if s >= 0.0 {
+        if c == 0 { return (0.5 + 1.5 * s) * lon }
+        if c == 1 { return (0.8 + 1.2 * s) * lon }
+        return (1.0 + 3.0 * s) * lon
+    }
+    k = 1.0 + 0.5 * s
+    if c == 0 { return 0.30 * k }
+    if c == 1 { return 0.25 * k }
+    return 0.20 * k
+}
+
+width_of(which: int) -> int {
+    if which == 0 { return CODED_W }
+    if which == 2 { return BANDS_W }
+    if which == 3 { return FLAT_W }
+    if which == 4 { return WIDE_W }
+    return g_grad_w
+}
+
+height_of(which: int) -> int {
+    if which == 0 { return CODED_H }
+    if which == 2 { return BANDS_H }
+    if which == 3 { return FLAT_H }
+    if which == 4 { return WIDE_H }
+    return g_grad_h
+}
+
+// ---------------------------------------------------------------------------
+// Files.
+// ---------------------------------------------------------------------------
+
+var g_out: ptr = null
+var g_size = 0
+var g_capacity = 0
+
+begin() {
+    if g_out != null { free(g_out) }
+    g_capacity = g_capacity_bytes
+    g_out = malloc(g_capacity as long)
+    g_size = 0
+}
+
+put_u8(v: int) {
+    mem.set_uint8(g_out, g_size, v & 255)
+    g_size = g_size + 1
+}
+
+put_u16(v: int) {
+    put_u8(v)
+    put_u8(v >> 8)
+}
+
+put_u32(v: int) {
+    put_u16(v)
+    put_u16(v >> 16)
+}
+
+put_text(s: string) {
+    n = string.length(s)
+    i = 0
+    while i < n {
+        put_u8(string.char_at(s, i))
+        i = i + 1
+    }
+}
+
+// An EXR string with its NUL.
+put_name(s: string) {
+    put_text(s)
+    put_u8(0)
+}
+
+finish(path: string) {
+    f = fopen(path, "wb")
+    if f == null {
+        println("make_env_fixtures: cannot write ${path}")
+        os.exit(1)
+    }
+    fwrite(g_out, 1 as long, g_size as long, f)
+    fclose(f)
+}
+
+// ---------------------------------------------------------------------------
+// Radiance.
+// ---------------------------------------------------------------------------
+
+// The e with x = f * 2^e, f in [0.5, 1), for x > 0.
+exponent_of(x: float) -> int {
+    e = 0
+    a = x
+    while a >= 1.0 {
+        a = a * 0.5
+        e = e + 1
+    }
+    while a < 0.5 {
+        a = a * 2.0
+        e = e - 1
+    }
+    return e
+}
+
+// A texel's four RGBE bytes into `quad` at q: the shared exponent of the
+// largest channel, the mantissas below it.
+rgbe(r: float, g: float, b: float, quad: ptr, q: int) {
+    m = r
+    if g > m { m = g }
+    if b > m { m = b }
+    if m < 1e-32 {
+        mem.set_uint8(quad, q, 0)
+        mem.set_uint8(quad, q + 1, 0)
+        mem.set_uint8(quad, q + 2, 0)
+        mem.set_uint8(quad, q + 3, 0)
+        return
+    }
+    e = exponent_of(m)
+    f = ldexp(m, 0 - e)
+    scale = f * 256.0 / m
+    mem.set_uint8(quad, q, (r * scale) as int)
+    mem.set_uint8(quad, q + 1, (g * scale) as int)
+    mem.set_uint8(quad, q + 2, (b * scale) as int)
+    mem.set_uint8(quad, q + 3, e + 128)
+}
+
+// "new" run-length: the channel `c` of the scanline's `w` texels, runs of
+// four or more as a run, the rest as literals of at most 128.
+rle_channel(quads: ptr, w: int, c: int) {
+    x = 0
+    while x < w {
+        run = 1
+        while x + run < w && run < 127 && mem.get_uint8(quads, (x + run) * 4 + c) == mem.get_uint8(quads, x * 4 + c) {
+            run = run + 1
+        }
+        if run >= 4 {
+            put_u8(128 + run)
+            put_u8(mem.get_uint8(quads, x * 4 + c))
+            x = x + run
+        } else {
+            // Literals up to the next run of four.
+            n = 0
+            stop = false
+            while !stop && x + n < w && n < 128 {
+                look = 1
+                while x + n + look < w && look < 4 && mem.get_uint8(quads, (x + n + look) * 4 + c) == mem.get_uint8(quads, (x + n) * 4 + c) {
+                    look = look + 1
+                }
+                if look >= 4 { stop = true } else { n = n + 1 }
+            }
+            if n == 0 { n = 1 }
+            put_u8(n)
+            k = 0
+            while k < n {
+                put_u8(mem.get_uint8(quads, (x + k) * 4 + c))
+                k = k + 1
+            }
+            x = x + n
+        }
+    }
+}
+
+// mode 0 flat, 1 new run-length, 2 old run-length; flip writes +Y rows bottom
+// first and -X columns right to left.
+write_hdr(path: string, which: int, mode: int, flip: bool) {
+    begin()
+    put_text("#?RADIANCE\n")
+    put_text("# Made by tools/make_env_fixtures.ae\n")
+    put_text("FORMAT=32-bit_rle_rgbe\n")
+    put_text("EXPOSURE=1.0\n\n")
+    w = width_of(which)
+    h = height_of(which)
+    if flip {
+        put_text("+Y ${h} -X ${w}\n")
+    } else {
+        put_text("-Y ${h} +X ${w}\n")
+    }
+    quads = calloc((w * 4) as long, 1 as long)
+    row = 0
+    while row < h {
+        y = row
+        if flip { y = h - 1 - row }
+        x = 0
+        while x < w {
+            sx = x
+            if flip { sx = w - 1 - x }
+            rgbe(value(which, sx, y, 0), value(which, sx, y, 1), value(which, sx, y, 2), quads, x * 4)
+            x = x + 1
+        }
+        if mode == 1 {
+            put_u8(2)
+            put_u8(2)
+            put_u8(w >> 8)
+            put_u8(w & 255)
+            c = 0
+            while c < 4 {
+                rle_channel(quads, w, c)
+                c = c + 1
+            }
+        } else if mode == 2 {
+            // Old run-length: a texel that repeats the one before it, 1 1 1 n.
+            x = 0
+            while x < w {
+                run = 1
+                while x + run < w && run < 65536 && mem.get_uint8(quads, (x + run) * 4) == mem.get_uint8(quads, x * 4) &&
+                      mem.get_uint8(quads, (x + run) * 4 + 1) == mem.get_uint8(quads, x * 4 + 1) &&
+                      mem.get_uint8(quads, (x + run) * 4 + 2) == mem.get_uint8(quads, x * 4 + 2) &&
+                      mem.get_uint8(quads, (x + run) * 4 + 3) == mem.get_uint8(quads, x * 4 + 3) {
+                    run = run + 1
+                }
+                k = 0
+                while k < 4 { put_u8(mem.get_uint8(quads, x * 4 + k)); k = k + 1 }
+                // The repeats in base 256, the low digit first: each (1, 1, 1, n)
+                // is n shifted up eight bits more than the one before.
+                again = run - 1
+                while again > 0 {
+                    put_u8(1)
+                    put_u8(1)
+                    put_u8(1)
+                    put_u8(again & 255)
+                    again = again >> 8
+                }
+                x = x + run
+            }
+        } else {
+            x = 0
+            while x < w {
+                k = 0
+                while k < 4 { put_u8(mem.get_uint8(quads, x * 4 + k)); k = k + 1 }
+                x = x + 1
+            }
+        }
+        row = row + 1
+    }
+    free(quads)
+    finish(path)
+}
+
+// ---------------------------------------------------------------------------
+// OpenEXR.
+// ---------------------------------------------------------------------------
+
+// A float as a binary16, round to nearest even; the fixtures' values are
+// normal numbers or zero.
+float_to_half(v: float) -> int {
+    if v == 0.0 { return 0 }
+    sign = 0
+    a = v
+    if a < 0.0 {
+        sign = 32768
+        a = 0.0 - a
+    }
+    e = exponent_of(a)
+    f = ldexp(a, 0 - e)
+    // a = f * 2^e with f in [0.5, 1): a half is 1.m * 2^(e-1), exponent e + 14.
+    mantissa = f * 2048.0
+    m = floor(mantissa + 0.5) as int
+    he = e + 14
+    if m >= 2048 {
+        m = 1024
+        he = he + 1
+    }
+    return sign | (he << 10) | (m - 1024)
+}
+
+// How a picture is laid out in an EXR, the channels in the order the file
+// lists them (alphabetical): layout 0 is B G R, HALF; 1 is A B G R, FLOAT;
+// 2 is A B G R and a Z, FLOAT; 3 is A B G R, HALF.
+channel_name(layout: int, k: int) -> string {
+    if layout == 0 {
+        if k == 0 { return "B" }
+        if k == 1 { return "G" }
+        return "R"
+    }
+    if k == 0 { return "A" }
+    if k == 1 { return "B" }
+    if k == 2 { return "G" }
+    if k == 3 { return "R" }
+    return "Z"
+}
+
+channel_count(layout: int) -> int {
+    if layout == 0 { return 3 }
+    if layout == 1 || layout == 3 { return 4 }
+    return 5
+}
+
+// The picture's channel a file's channel carries: 0 R, 1 G, 2 B, 3 A, -1 Z.
+channel_source(layout: int, k: int) -> int {
+    name = channel_name(layout, k)
+    if name == "R" { return 0 }
+    if name == "G" { return 1 }
+    if name == "B" { return 2 }
+    if name == "A" { return 3 }
+    return 0 - 1
+}
+
+// HALF (1) or FLOAT (2): layout 0 and 3 are half, 1 and 2 float.
+channel_type(layout: int, k: int) -> int {
+    if layout == 0 { return 1 }
+    if layout == 3 { return 1 }
+    return 2
+}
+
+lines_of(compression: int) -> int {
+    if compression == 3 { return 16 }
+    if compression == 4 { return 32 }
+    return 1
+}
+
+put_attribute_head(name: string, kind: string, size: int) {
+    put_name(name)
+    put_name(kind)
+    put_u32(size)
+}
+
+// A block's raw bytes (its lines, each channel after another) into `raw`.
+raw_block(which: int, layout: int, first: int, lines: int, min_x: int, raw: ptr) -> int {
+    w = width_of(which)
+    n = 0
+    line = 0
+    while line < lines {
+        y = first + line
+        k = 0
+        while k < channel_count(layout) {
+            src = channel_source(layout, k)
+            x = 0
+            while x < w {
+                v = 0.0
+                if src >= 0 { v = value(which, x, y, src) } else { v = (y * w + x) as float * 0.125 }
+                if channel_type(layout, k) == 1 {
+                    h = float_to_half(v)
+                    mem.set_uint8(raw, n, h & 255)
+                    mem.set_uint8(raw, n + 1, (h >> 8) & 255)
+                    n = n + 2
+                } else {
+                    mem.set_float32(raw, n, v)
+                    n = n + 4
+                }
+                x = x + 1
+            }
+            k = k + 1
+        }
+        line = line + 1
+    }
+    return n
+}
+
+// The two steps before ZIP's deflate and RLE: the even bytes then the odd,
+// each byte as its difference from the one before plus 128.
+predict(raw: ptr, n: int, out: ptr) {
+    half = (n + 1) / 2
+    k = 0
+    while k < half {
+        mem.set_uint8(out, k, mem.get_uint8(raw, 2 * k))
+        if 2 * k + 1 < n { mem.set_uint8(out, half + k, mem.get_uint8(raw, 2 * k + 1)) }
+        k = k + 1
+    }
+    i = n - 1
+    while i >= 1 {
+        d = mem.get_uint8(out, i) - mem.get_uint8(out, i - 1) + 128
+        mem.set_uint8(out, i, d & 255)
+        i = i - 1
+    }
+}
+
+// OpenEXR's byte runs: a run of 3 or more as (count - 1, byte), the rest as a
+// negative count and its literals.
+rle_pack(src: ptr, n: int, dst: ptr) -> int {
+    o = 0
+    i = 0
+    while i < n {
+        run = 1
+        while i + run < n && run < 127 && mem.get_uint8(src, i + run) == mem.get_uint8(src, i) { run = run + 1 }
+        if run >= 3 {
+            mem.set_uint8(dst, o, run - 1)
+            mem.set_uint8(dst, o + 1, mem.get_uint8(src, i))
+            o = o + 2
+            i = i + run
+        } else {
+            lit = 0
+            stop = false
+            while !stop && i + lit < n && lit < 127 {
+                look = 1
+                while i + lit + look < n && look < 3 && mem.get_uint8(src, i + lit + look) == mem.get_uint8(src, i + lit) { look = look + 1 }
+                if look >= 3 { stop = true } else { lit = lit + 1 }
+            }
+            if lit == 0 { lit = 1 }
+            mem.set_uint8(dst, o, 256 - lit)
+            o = o + 1
+            k = 0
+            while k < lit {
+                mem.set_uint8(dst, o + k, mem.get_uint8(src, i + k))
+                k = k + 1
+            }
+            o = o + lit
+            i = i + lit
+        }
+    }
+    return o
+}
+
+// compression: 0 NONE, 1 RLE, 2 ZIPS, 3 ZIP, 4 PIZ (the header only says so).
+// order 0 increasing, 1 decreasing. version_flags are ORed into the version
+// word (512 tiled). cut > 0 writes only that many bytes of the file.
+write_exr(path: string, which: int, layout: int, compression: int, order: int, min_x: int, min_y: int, version_flags: int, cut: int) {
+    begin()
+    w = width_of(which)
+    h = height_of(which)
+    put_u8(118)
+    put_u8(47)
+    put_u8(49)
+    put_u8(1)
+    put_u32(2 | version_flags)
+    // channels
+    size = 1
+    k = 0
+    while k < channel_count(layout) {
+        size = size + string.length(channel_name(layout, k)) + 1 + 16
+        k = k + 1
+    }
+    put_attribute_head("channels", "chlist", size)
+    k = 0
+    while k < channel_count(layout) {
+        put_name(channel_name(layout, k))
+        put_u32(channel_type(layout, k))
+        put_u32(0)           // pLinear and its three reserved bytes
+        put_u32(1)
+        put_u32(1)
+        k = k + 1
+    }
+    put_u8(0)
+    put_attribute_head("compression", "compression", 1)
+    put_u8(compression)
+    put_attribute_head("dataWindow", "box2i", 16)
+    put_u32(min_x)
+    put_u32(min_y)
+    put_u32(min_x + w - 1)
+    put_u32(min_y + h - 1)
+    put_attribute_head("displayWindow", "box2i", 16)
+    put_u32(0)
+    put_u32(0)
+    put_u32(w - 1)
+    put_u32(h - 1)
+    put_attribute_head("lineOrder", "lineOrder", 1)
+    put_u8(order)
+    put_attribute_head("pixelAspectRatio", "float", 4)
+    put_u32(1065353216)
+    put_attribute_head("screenWindowCenter", "v2f", 8)
+    put_u32(0)
+    put_u32(0)
+    put_attribute_head("screenWindowWidth", "float", 4)
+    put_u32(1065353216)
+    // A few attributes the reader must step over.
+    put_attribute_head("comments", "string", 5)
+    put_text("hello")
+    put_u8(0)
+
+    per_block = lines_of(compression)
+    blocks = (h + per_block - 1) / per_block
+    table_at = g_size
+    b = 0
+    while b < blocks { put_u32(0); put_u32(0); b = b + 1 }
+
+    raw = malloc(1048576 as long)
+    staged = malloc(1048576 as long)
+    packed = malloc(1048576 as long)
+    step = 0
+    while step < blocks {
+        b = step
+        if order == 1 { b = blocks - 1 - step }
+        first = b * per_block
+        lines = per_block
+        if first + lines > h { lines = h - first }
+        n = raw_block(which, layout, first, lines, min_x, raw)
+        start = g_size
+        // The table entry.
+        mem.set_uint32(g_out, table_at + b * 8, start as long)
+        put_u32(min_y + first)
+        if compression == 0 || compression == 4 {
+            put_u32(n)
+            k = 0
+            while k < n { put_u8(mem.get_uint8(raw, k)); k = k + 1 }
+        } else if compression == 1 {
+            predict(raw, n, staged)
+            m = rle_pack(staged, n, packed)
+            put_u32(m)
+            k = 0
+            while k < m { put_u8(mem.get_uint8(packed, k)); k = k + 1 }
+        } else {
+            predict(raw, n, staged)
+            z = deflate.zlib(staged, n, 6)
+            m = deflate.size(z)
+            out = deflate.take(z)
+            deflate.done(z)
+            put_u32(m)
+            k = 0
+            while k < m { put_u8(mem.get_uint8(out, k)); k = k + 1 }
+            free(out)
+        }
+        step = step + 1
+    }
+    free(raw)
+    free(staged)
+    free(packed)
+    if cut > 0 && cut < g_size { g_size = cut }
+    finish(path)
+}
+
+main() {
+    dir = "tests/fixtures/env"
+    if os.args_count() > 1 { dir = os.args_get(1) }
+    // `make_env_fixtures <dir> big`: the gradient at 4096 by 2048, as .hdr and
+    // .exr (ZIP), for timing a real-sized map; nothing else is written.
+    if os.args_count() > 2 && os.args_get(2) == "big" {
+        g_grad_w = 4096
+        g_grad_h = 2048
+        g_capacity_bytes = 200000000
+        write_hdr("${dir}/gradient_4k.hdr", 1, 1, false)
+        write_exr("${dir}/gradient_4k.exr", 1, 3, 3, 0, 0, 0, 0, 0)
+        println("make_env_fixtures: wrote the 4096 by 2048 gradient in ${dir}")
+        return
+    }
+    write_hdr("${dir}/coded_flat.hdr", 0, 0, false)
+    write_hdr("${dir}/coded_rle.hdr", 0, 1, false)
+    write_hdr("${dir}/coded_flip.hdr", 0, 1, true)
+    write_hdr("${dir}/coded_old_rle.hdr", 0, 2, false)
+    write_hdr("${dir}/bands_flat.hdr", 2, 0, false)
+    write_hdr("${dir}/bands_rle.hdr", 2, 1, false)
+    write_hdr("${dir}/bands_old_rle.hdr", 2, 2, false)
+    write_hdr("${dir}/wide_old_rle.hdr", 4, 2, false)
+    write_hdr("${dir}/wide_flat.hdr", 4, 0, false)
+    write_hdr("${dir}/flat.hdr", 3, 1, false)
+    write_hdr("${dir}/gradient.hdr", 1, 1, false)
+    write_exr("${dir}/coded_none.exr", 0, 0, 0, 0, 0, 0, 0, 0)
+    write_exr("${dir}/coded_rle.exr", 0, 0, 1, 0, 0, 0, 0, 0)
+    write_exr("${dir}/coded_zips.exr", 0, 0, 2, 0, 0, 0, 0, 0)
+    write_exr("${dir}/coded_zip.exr", 0, 0, 3, 0, 0, 0, 0, 0)
+    write_exr("${dir}/coded_float_rgba.exr", 0, 1, 3, 0, 0, 0, 0, 0)
+    write_exr("${dir}/coded_extra.exr", 0, 2, 1, 1, 0 - 3, 5, 0, 0)
+    write_exr("${dir}/gradient.exr", 1, 3, 3, 0, 0, 0, 0, 0)
+    write_exr("${dir}/coded_piz.exr", 0, 0, 4, 0, 0, 0, 0, 0)
+    write_exr("${dir}/coded_tiled.exr", 0, 0, 0, 0, 0, 0, 512, 0)
+    write_exr("${dir}/coded_short.exr", 0, 0, 0, 0, 0, 0, 0, 400)
+    println("make_env_fixtures: wrote the environment fixtures in ${dir}")
+}

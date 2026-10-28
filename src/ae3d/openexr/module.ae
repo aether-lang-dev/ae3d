@@ -1,0 +1,489 @@
+// OpenEXR pictures, decoded from the file layout the format documents ("The
+// OpenEXR File Layout"): a magic number and version, a header of named,
+// typed attributes, a table of where each block of scanlines starts, and the
+// blocks.
+//
+//   img = openexr.decode(bytes, length)       // an ae3d.hdrimage, null on failure: hdrimage.error()
+//   openexr.is_openexr(bytes, length)         // the magic number
+//
+// What an environment map is in practice, read in full:
+//   - single-part scanline files (not tiled, not deep, not multipart);
+//   - channels R, G, B and optionally A, or Y alone (grey), each HALF or FLOAT
+//     (other channels -- depth, ids, anything else, of any type -- are stepped
+//     over); no subsampled channel;
+//   - compression NONE, RLE, ZIPS (one scanline a block) and ZIP (sixteen),
+//     the four the format's lossless, byte-oriented writers produce by default;
+//   - the lines in any order (every block says which lines it holds), and a
+//     data window that does not start at the origin.
+//
+// What is not read, each refused by name and never guessed at: PIZ (wavelet
+// and Huffman), PXR24 (24-bit float truncation), B44 and B44A (fixed-rate
+// blocks), DWAA and DWAB (DCT), tiled files, deep and multipart files.
+//
+// A ZIP or ZIPS block is zlib-deflated after two steps the writer took to make
+// it deflate well, undone here in the other order: the bytes of the block were
+// split into the even-numbered ones and then the odd-numbered ones, and each
+// byte was replaced by its difference from the one before, plus 128. An RLE
+// block has the same two steps and then byte runs: a signed count, negative
+// for that many literal bytes after it, otherwise one byte repeated count + 1
+// times. A block whose compressed size is its raw size was stored raw.
+//
+// Inside a block, each scanline holds its channels one after another in
+// alphabetical order, each as a run of width samples. HALF is IEEE binary16
+// (converted here, denormals and all; infinities and NaNs of a file become the
+// largest finite float and zero, since a texture should not carry them), FLOAT
+// is binary32. Little-endian throughout.
+//
+// Every read is bounds-checked; the sizes a file claims are checked against
+// its length before anything is allocated.
+import std.string
+import std.mem
+import ae3d.hdrimage
+import ae3d.inflate
+
+exports (decode, is_openexr, half_to_float)
+
+extern calloc(count: long, size: long) -> ptr
+extern malloc(size: long) -> ptr
+extern free(p: ptr)
+extern ldexp(x: float, e: int) -> float
+
+const COMPRESSION_NONE = 0
+const COMPRESSION_RLE = 1
+const COMPRESSION_ZIPS = 2
+const COMPRESSION_ZIP = 3
+const COMPRESSION_PIZ = 4
+const COMPRESSION_PXR24 = 5
+const COMPRESSION_B44 = 6
+const COMPRESSION_B44A = 7
+const COMPRESSION_DWAA = 8
+const COMPRESSION_DWAB = 9
+
+const TYPE_UINT = 0
+const TYPE_HALF = 1
+const TYPE_FLOAT = 2
+
+const MAX_CHANNELS = 64
+const MAX_ATTRIBUTE = 1048576
+const FLOAT_MAX = 3.4028234663852886e38
+
+// A channel of the file, in the order the file lists them (which is the
+// order their samples are laid in, the format sorting them by name).
+// `slot` is where its samples go in a texel: 0 red, 1 green, 2 blue, 3
+// alpha, or -1 for one that is stepped over.
+struct Channel {
+    slot: int
+    kind: int
+}
+
+is_openexr(data: ptr, length: int) -> bool {
+    if length < 8 { return false }
+    return mem.get_uint8(data, 0) == 118 && mem.get_uint8(data, 1) == 47 &&
+           mem.get_uint8(data, 2) == 49 && mem.get_uint8(data, 3) == 1
+}
+
+fail(reason: string) -> ptr {
+    hdrimage.set_error(reason)
+    return null
+}
+
+u32(data: ptr, at: int) -> int { return mem.get_u32_le(data, at) as int }
+
+// A binary16 as a float.
+half_to_float(h: int) -> float {
+    sign = (h >> 15) & 1
+    e = (h >> 10) & 31
+    m = h & 1023
+    v = 0.0
+    if e == 0 {
+        // Zero and the denormals: m * 2^-24.
+        v = ldexp(m as float, 0 - 24)
+    } else if e == 31 {
+        // An infinity or a NaN: a texture holds neither.
+        if m == 0 { v = FLOAT_MAX } else { v = 0.0 }
+    } else {
+        v = ldexp((1024 + m) as float, e - 25)
+    }
+    if sign == 1 { return 0.0 - v }
+    return v
+}
+
+// The index after the NUL-terminated string at `at`, or -1 when none ends before `limit`.
+after_name(data: ptr, at: int, limit: int) -> int {
+    i = at
+    while i < limit {
+        if mem.get_uint8(data, i) == 0 { return i + 1 }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Whether the NUL-terminated string at `at` is exactly `text`.
+name_is(data: ptr, at: int, text: string) -> bool {
+    n = string.length(text)
+    i = 0
+    while i < n {
+        if mem.get_uint8(data, at + i) != string.char_at(text, i) { return false }
+        i = i + 1
+    }
+    return mem.get_uint8(data, at + n) == 0
+}
+
+lines_per_block(compression: int) -> int {
+    if compression == COMPRESSION_ZIP { return 16 }
+    if compression == COMPRESSION_PIZ || compression == COMPRESSION_B44 || compression == COMPRESSION_B44A || compression == COMPRESSION_DWAA { return 32 }
+    if compression == COMPRESSION_PXR24 { return 16 }
+    if compression == COMPRESSION_DWAB { return 256 }
+    return 1
+}
+
+compression_name(compression: int) -> string {
+    if compression == COMPRESSION_PIZ { return "PIZ" }
+    if compression == COMPRESSION_PXR24 { return "PXR24" }
+    if compression == COMPRESSION_B44 { return "B44" }
+    if compression == COMPRESSION_B44A { return "B44A" }
+    if compression == COMPRESSION_DWAA { return "DWAA" }
+    if compression == COMPRESSION_DWAB { return "DWAB" }
+    return "unknown"
+}
+
+// Undo a ZIP/RLE block's two steps in `block` of `n` bytes into `out`: the
+// running sum of differences, then the even/odd split.
+unpredict(block: ptr, n: int, out: ptr) {
+    i = 1
+    while i < n {
+        d = mem.get_uint8(block, i - 1) + mem.get_uint8(block, i) - 128
+        mem.set_uint8(block, i, d & 255)
+        i = i + 1
+    }
+    half = (n + 1) / 2
+    k = 0
+    while k < half {
+        mem.set_uint8(out, 2 * k, mem.get_uint8(block, k))
+        if 2 * k + 1 < n { mem.set_uint8(out, 2 * k + 1, mem.get_uint8(block, half + k)) }
+        k = k + 1
+    }
+}
+
+// An RLE block's `size` bytes at `src` expanded into `dst`, which must come
+// to exactly `want`. False when the runs do not.
+rle_expand(src: ptr, size: int, dst: ptr, want: int) -> bool {
+    i = 0
+    o = 0
+    while i < size {
+        c = mem.get_uint8(src, i)
+        i = i + 1
+        if c >= 128 {
+            n = 256 - c
+            if i + n > size || o + n > want { return false }
+            mem.copy(dst + o, src + i, n as long)
+            i = i + n
+            o = o + n
+        } else {
+            n = c + 1
+            if i >= size || o + n > want { return false }
+            v = mem.get_uint8(src, i)
+            i = i + 1
+            k = 0
+            while k < n {
+                mem.set_uint8(dst, o + k, v)
+                k = k + 1
+            }
+            o = o + n
+        }
+    }
+    return o == want
+}
+
+decode(data: @keep ptr, length: int) -> ptr {
+    if data == null || length < 8 { return fail("not an OpenEXR picture: too short") }
+    if !is_openexr(data, length) { return fail("not an OpenEXR picture: no magic number") }
+    version = u32(data, 4)
+    if (version & 255) != 2 { return fail("an OpenEXR file of a version other than 2") }
+    if (version & 512) != 0 { return fail("a tiled OpenEXR file is not read (scanline files only)") }
+    if (version & 2048) != 0 { return fail("a deep OpenEXR file is not read") }
+    if (version & 4096) != 0 { return fail("a multipart OpenEXR file is not read") }
+
+    // The header's attributes.
+    at = 8
+    compression = 0 - 1
+    min_x = 0
+    min_y = 0
+    max_x = 0 - 1
+    max_y = 0 - 1
+    have_window = false
+    channels = calloc(MAX_CHANNELS as long, 8 as long)
+    channel_count = 0
+    ended = false
+    while !ended {
+        if at >= length { free(channels); return fail("the OpenEXR header does not end") }
+        if mem.get_uint8(data, at) == 0 {
+            ended = true
+            at = at + 1
+        } else {
+            name_at = at
+            type_at = after_name(data, name_at, length)
+            if type_at < 0 { free(channels); return fail("the OpenEXR header is damaged") }
+            value_at = after_name(data, type_at, length)
+            if value_at < 0 || value_at + 4 > length { free(channels); return fail("the OpenEXR header is damaged") }
+            size = u32(data, value_at)
+            body = value_at + 4
+            if size < 0 || size > MAX_ATTRIBUTE || body + size > length {
+                free(channels)
+                return fail("an OpenEXR attribute reaches past the file")
+            }
+            if name_is(data, name_at, "compression") && size >= 1 {
+                compression = mem.get_uint8(data, body)
+            } else if name_is(data, name_at, "dataWindow") && size >= 16 {
+                min_x = u32(data, body)
+                min_y = u32(data, body + 4)
+                max_x = u32(data, body + 8)
+                max_y = u32(data, body + 12)
+                have_window = true
+            } else if name_is(data, name_at, "channels") {
+                p = body
+                stop = body + size
+                bad = false
+                while p < stop && mem.get_uint8(data, p) != 0 && !bad {
+                    n_end = after_name(data, p, stop)
+                    if n_end < 0 || n_end + 16 > stop { bad = true } else {
+                        kind = u32(data, n_end)
+                        x_sampling = u32(data, n_end + 8)
+                        y_sampling = u32(data, n_end + 12)
+                        if channel_count >= MAX_CHANNELS { bad = true } else {
+                            if x_sampling != 1 || y_sampling != 1 {
+                                free(channels)
+                                return fail("an OpenEXR picture with subsampled channels is not read")
+                            }
+                            // The slot: the channel's name, when it is one of ours.
+                            slot = 0 - 1
+                            if n_end - p == 2 {
+                                c = mem.get_uint8(data, p)
+                                if c == 82 { slot = 0 }
+                                if c == 71 { slot = 1 }
+                                if c == 66 { slot = 2 }
+                                if c == 65 { slot = 3 }
+                                // Y, a grey picture's one channel: it goes in red and is spread to the others after.
+                                if c == 89 { slot = 4 }
+                            }
+                            (channels as int[])[channel_count * 2] = slot
+                            (channels as int[])[channel_count * 2 + 1] = kind
+                            channel_count = channel_count + 1
+                            p = n_end + 16
+                        }
+                    }
+                }
+                if bad { free(channels); return fail("the OpenEXR channel list is damaged") }
+            }
+            at = body + size
+        }
+    }
+    if compression < 0 || !have_window || channel_count == 0 {
+        free(channels)
+        return fail("the OpenEXR header lacks its channels, compression or data window")
+    }
+    if compression > COMPRESSION_DWAB {
+        free(channels)
+        return fail("an OpenEXR compression this reader does not know")
+    }
+    if compression >= COMPRESSION_PIZ {
+        free(channels)
+        return fail("OpenEXR compression ${compression_name(compression)} is not read (NONE, RLE, ZIPS and ZIP are)")
+    }
+    width = max_x - min_x + 1
+    height = max_y - min_y + 1
+    if width <= 0 || height <= 0 || width > hdrimage.MAX_DIMENSION || height > hdrimage.MAX_DIMENSION {
+        free(channels)
+        return fail("the OpenEXR data window has no usable size")
+    }
+
+    // What the channels are: a picture needs R, G and B, or a Y.
+    has_red = false
+    has_green = false
+    has_blue = false
+    has_alpha = false
+    has_grey = false
+    bytes_per_line = 0
+    k = 0
+    while k < channel_count {
+        slot = (channels as int[])[k * 2]
+        kind = (channels as int[])[k * 2 + 1]
+        if kind != TYPE_UINT && kind != TYPE_HALF && kind != TYPE_FLOAT {
+            free(channels)
+            return fail("an OpenEXR channel of a pixel type this reader does not know")
+        }
+        // A colour channel must be a float one; UINT is a count, not light.
+        if slot >= 0 && kind == TYPE_UINT {
+            free(channels)
+            return fail("an OpenEXR colour channel of unsigned integers is not read")
+        }
+        if slot == 0 { has_red = true }
+        if slot == 1 { has_green = true }
+        if slot == 2 { has_blue = true }
+        if slot == 3 { has_alpha = true }
+        if slot == 4 { has_grey = true }
+        size_of = 4
+        if kind == TYPE_HALF { size_of = 2 }
+        bytes_per_line = bytes_per_line + size_of * width
+        k = k + 1
+    }
+    if !(has_red && has_green && has_blue) && !has_grey {
+        free(channels)
+        return fail("the OpenEXR picture has neither R, G and B channels nor a Y")
+    }
+
+    per_block = lines_per_block(compression)
+    blocks = (height + per_block - 1) / per_block
+    table_at = at
+    if (blocks as long) * (8 as long) + (table_at as long) > (length as long) {
+        free(channels)
+        return fail("the OpenEXR line offset table reaches past the file")
+    }
+    img = hdrimage.new_image(width, height)
+    if img == null { free(channels); return null }
+    pixels = hdrimage.pixels(img) as f32[]
+    raw_capacity = bytes_per_line * per_block
+    raw = malloc((raw_capacity + 8) as long)
+    stage = malloc((raw_capacity + 8) as long)
+    if raw == null || stage == null {
+        if raw != null { free(raw) }
+        if stage != null { free(stage) }
+        free(channels)
+        hdrimage.dispose(img)
+        return fail("out of memory")
+    }
+    seen = calloc((height + 1) as long, 1 as long)
+    problem = ""
+    b = 0
+    while b < blocks && problem == "" {
+        // The offset: 64 bits, of which a file under 2 GB uses the low 32.
+        lo = u32(data, table_at + b * 8)
+        hi = u32(data, table_at + b * 8 + 4)
+        start = lo
+        if hi != 0 || start < 0 || start + 8 > length {
+            problem = "an OpenEXR block starts outside the file (a truncated file?)"
+        } else {
+            y = u32(data, start)
+            size = u32(data, start + 4)
+            first = b * per_block
+            lines = per_block
+            if first + lines > height { lines = height - first }
+            want = bytes_per_line * lines
+            if y - min_y != first {
+                problem = "an OpenEXR block holds other lines than its table entry says"
+            } else if size < 0 || start + 8 + size > length {
+                problem = "an OpenEXR block reaches past the file"
+            } else {
+                packed = data + (start + 8)
+                src = packed
+                if compression == COMPRESSION_NONE || size == want {
+                    if size != want { problem = "an uncompressed OpenEXR block of the wrong size" }
+                } else if compression == COMPRESSION_RLE {
+                    if !rle_expand(packed, size, stage, want) {
+                        problem = "an OpenEXR RLE block that does not expand to its size"
+                    } else {
+                        unpredict(stage, want, raw)
+                        src = raw
+                    }
+                } else {
+                    z = inflate.zlib(packed, size, want, want, 1)
+                    if inflate.failed(z) {
+                        problem = "an OpenEXR ZIP block that would not inflate: ${inflate.reason(inflate.error_code(z))}"
+                        inflate.done(z)
+                    } else if inflate.size(z) != want {
+                        problem = "an OpenEXR ZIP block that inflates to the wrong size"
+                        inflate.done(z)
+                    } else {
+                        got = inflate.take(z)
+                        inflate.done(z)
+                        unpredict(got, want, raw)
+                        free(got)
+                        src = raw
+                    }
+                }
+                if problem == "" {
+                    // The lines of the block: channel after channel, a line each.
+                    line = 0
+                    while line < lines {
+                        row = first + line
+                        offset = line * bytes_per_line
+                        c = 0
+                        while c < channel_count {
+                            slot = (channels as int[])[c * 2]
+                            kind = (channels as int[])[c * 2 + 1]
+                            x = 0
+                            if kind == TYPE_HALF {
+                                while x < width {
+                                    if slot >= 0 {
+                                        v = half_to_float(mem.get_u16_le(src, offset + x * 2))
+                                        if slot == 4 {
+                                            pixels[(row * width + x) * 4] = v as f32
+                                            pixels[(row * width + x) * 4 + 1] = v as f32
+                                            pixels[(row * width + x) * 4 + 2] = v as f32
+                                        } else {
+                                            pixels[(row * width + x) * 4 + slot] = v as f32
+                                        }
+                                    }
+                                    x = x + 1
+                                }
+                                offset = offset + width * 2
+                            } else {
+                                while x < width {
+                                    if slot >= 0 {
+                                        v = mem.get_float32(src, offset + x * 4)
+                                        // A texture holds neither infinity nor NaN.
+                                        if v > FLOAT_MAX { v = FLOAT_MAX }
+                                        if v < 0.0 - FLOAT_MAX { v = 0.0 - FLOAT_MAX }
+                                        if v != v { v = 0.0 }
+                                        if slot == 4 {
+                                            pixels[(row * width + x) * 4] = v as f32
+                                            pixels[(row * width + x) * 4 + 1] = v as f32
+                                            pixels[(row * width + x) * 4 + 2] = v as f32
+                                        } else {
+                                            pixels[(row * width + x) * 4 + slot] = v as f32
+                                        }
+                                    }
+                                    x = x + 1
+                                }
+                                offset = offset + width * 4
+                            }
+                            c = c + 1
+                        }
+                        mem.set_uint8(seen, row, 1)
+                        line = line + 1
+                    }
+                }
+            }
+        }
+        b = b + 1
+    }
+    free(raw)
+    free(stage)
+    free(channels)
+    complete = true
+    r = 0
+    while r < height {
+        if mem.get_uint8(seen, r) == 0 { complete = false }
+        r = r + 1
+    }
+    free(seen)
+    if problem != "" {
+        hdrimage.dispose(img)
+        return fail(problem)
+    }
+    if !complete {
+        hdrimage.dispose(img)
+        return fail("the OpenEXR picture is missing lines")
+    }
+    // Without an alpha channel the texels are opaque (hdrimage.new_image's 1).
+    // A picture with one keeps the file's.
+    if !has_alpha {
+        i = 0
+        n = width * height
+        while i < n {
+            pixels[i * 4 + 3] = 1.0 as f32
+            i = i + 1
+        }
+    }
+    return img
+}

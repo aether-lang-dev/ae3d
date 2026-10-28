@@ -26,6 +26,9 @@ import ae3d.gpu (GpuShader)
 import ae3d.shaders.fxaa
 import ae3d.shaders.upscale
 import ae3d.shaders.dof
+import ae3d.shaders.envmap
+import ae3d.envimage
+import ae3d.hdrimage
 import ae3d.shaders.bloom
 import ae3d.shaders.resolve
 import ae3d.shaders.viewrect
@@ -58,7 +61,7 @@ exports (
     renderer_add_light, renderer_remove_light, renderer_light_count, renderer_light, renderer_model_count, renderer_model,
     renderer_draw_calls, renderer_instance_count,
     renderer_set_clear_color, renderer_set_fxaa, renderer_set_bloom, renderer_set_msaa, renderer_set_taa, renderer_taa,
-    renderer_set_upscaler, renderer_upscaler, renderer_upscale_sharpness, renderer_set_dof, renderer_dof,
+    renderer_set_upscaler, renderer_upscaler, renderer_upscale_sharpness, renderer_set_dof, renderer_dof, renderer_set_environment, renderer_environment,
     renderer_set_render_scale, renderer_render_scale,
     renderer_set_target, renderer_set_overlay,
     renderer_set_bloom_params, renderer_set_bloom_intensity, renderer_bloom_intensity, renderer_sky_irradiance,
@@ -1871,6 +1874,16 @@ struct GLRenderer {
     // half-size targets they write, made the first frame they run and again
     // when the scene's size changes.
     dof_enabled: bool
+    // The user's environment map in place of the sky (#869): its texture (0
+    // for none), the capture program and shader, the light scale, the mip it
+    // is read from, and whether the capture has been made from it.
+    env_texture: int
+    env_program: int
+    env_shader: ptr
+    env_intensity: float
+    env_lod: float
+    env_half_v: float
+    env_drawn: bool
     dof_focus: float
     dof_aperture: float
     dof_max_radius: float
@@ -5049,6 +5062,49 @@ renderer_set_dof(r: *GLRenderer, on: bool, focus: float, aperture: float, max_ra
     r.dof_max_radius = max_radius
 }
 renderer_dof(r: *GLRenderer) -> bool { return r.dof_enabled }
+
+// The sky's light from an environment map (#869): the Radiance .hdr or OpenEXR
+// at `path`, uploaded as a half-float texture with its mip chain and captured
+// in place of the sky, scaled by `intensity`; an empty path goes back to the
+// sky. False, the sky kept, when it would not load.
+renderer_set_environment(r: *GLRenderer, path: string, intensity: float) -> bool {
+    if r.env_program == 0 { return false }
+    if path == "" {
+        if r.env_texture != 0 { gl_texture_delete(r.env_texture) }
+        r.env_texture = 0
+        r.env_drawn = false
+        return true
+    }
+    img = envimage.load(path)
+    if img == null { return false }
+    rows = envimage.float_rows(img)
+    if rows == null {
+        envimage.dispose(img)
+        return false
+    }
+    w = hdrimage.width(img)
+    h = hdrimage.height(img)
+    texture = gl_name(NAME_TEXTURE)
+    glapi.glActiveTexture(glapi.TEXTURE0 as uint32)
+    glapi.glBindTexture(glapi.TEXTURE_2D as uint32, texture as uint32)
+    glapi.glTexImage2D(glapi.TEXTURE_2D as uint32, 0, glapi.RGBA16F, w, h, 0, glapi.RGBA as uint32, glapi.FLOAT as uint32, rows)
+    glapi.glGenerateMipmap(glapi.TEXTURE_2D as uint32)
+    // Wrapping round the longitude, held off the poles by the shader.
+    texture_params(glapi.TEXTURE_2D, glapi.CLAMP_TO_EDGE, false, glapi.LINEAR, glapi.LINEAR_MIPMAP_LINEAR)
+    texture_param(glapi.TEXTURE_2D, glapi.TEXTURE_WRAP_S, glapi.REPEAT)
+    glapi.glBindTexture(glapi.TEXTURE_2D as uint32, 0)
+    r.bound_texture = 0 - 1
+    free(rows)
+    if r.env_texture != 0 { gl_texture_delete(r.env_texture) }
+    r.env_texture = texture
+    r.env_half_v = 0.5 / (h as float)
+    r.env_lod = envimage.lod_for_width(w)
+    r.env_intensity = intensity
+    r.env_drawn = false
+    envimage.dispose(img)
+    return true
+}
+renderer_environment(r: *GLRenderer) -> bool { return r.env_texture != 0 }
 renderer_upscale_sharpness(r: *GLRenderer) -> float { return r.upscale_sharpness }
 
 // The Halton sequence: the k-th point of the base, in 0..1.
@@ -5538,6 +5594,17 @@ draw_sky_capture(r: *GLRenderer, cam: *Camera, light: *Light, texture: int, kind
     gl_set_depth_mask(0)
     set_blend(r, false)
     set_wireframe(r, false)
+    environment_mode = r.env_texture != 0 && r.env_program != 0
+    if environment_mode {
+        // The map read in every direction of the octahedral capture (#869).
+        s = r.env_shader as *GpuShader
+        use_program(r, r.env_program)
+        _l = gpu.set_float(s, "lod", r.env_lod)
+        _h = gpu.set_float(s, "half_v", r.env_half_v)
+        _i = gpu.set_float(s, "intensity", r.env_intensity)
+        quoted_uniforms(r.env_program, s)
+        quoted_bind(s, "env", r.env_texture)
+    } else {
     s = r.sky_capture_shader as *GpuShader
     use_program(r, r.sky_capture_program)
     sky_values(r, s, cam, light, kind)
@@ -5546,6 +5613,7 @@ draw_sky_capture(r: *GLRenderer, cam: *Camera, light: *Light, texture: int, kind
     quoted_bind(s, "cloud_shape", r.cloud_shape_texture)
     quoted_bind(s, "cloud_weather", r.cloud_weather_texture)
     quoted_bind(s, "skybox", texture)
+    }
     glapi.glActiveTexture(glapi.TEXTURE0 as uint32)
     r.bound_texture = 0 - 1
     gl_vao_bind(r.screen_vao)
@@ -5560,8 +5628,11 @@ draw_sky_capture(r: *GLRenderer, cam: *Camera, light: *Light, texture: int, kind
     use_program(r, r.sky_irradiance_program)
     lit = core.ground_sun(key_light(r.lights, light))
     irradiance = r.sky_irradiance_shader as *GpuShader
-    _a = gpu.set_vec3(irradiance, "ground_albedo", r.ground_albedo.x, r.ground_albedo.y, r.ground_albedo.z)
-    _s = gpu.set_vec3(irradiance, "ground_sun", lit.x, lit.y, lit.z)
+    // A map has its own ground: no albedo is laid under the horizon.
+    ground_scale = 1.0
+    if environment_mode { ground_scale = 0.0 }
+    _a = gpu.set_vec3(irradiance, "ground_albedo", r.ground_albedo.x * ground_scale, r.ground_albedo.y * ground_scale, r.ground_albedo.z * ground_scale)
+    _s = gpu.set_vec3(irradiance, "ground_sun", lit.x * ground_scale, lit.y * ground_scale, lit.z * ground_scale)
     quoted_uniforms(r.sky_irradiance_program, irradiance)
     gl_draw_arrays(0, 6)
 
@@ -5668,8 +5739,21 @@ capture_sky(r: *GLRenderer, cam: *Camera, light: *Light) {
         kind = 0
         if sky.procedural { kind = 1 }
     }
-    if sky_inputs_now(r, cam, light, texture, kind) {
-        draw_sky_capture(r, cam, light, texture, kind)
+    if r.env_texture != 0 && r.env_program != 0 {
+        // A map in place of the sky: captured once, not every frame.
+        if !r.env_drawn {
+            r.env_drawn = true
+            r.sky_captured = false
+            draw_sky_capture(r, cam, light, texture, kind)
+        }
+    } else {
+        if r.env_drawn {
+            r.env_drawn = false
+            r.sky_captured = false
+        }
+        if sky_inputs_now(r, cam, light, texture, kind) {
+            draw_sky_capture(r, cam, light, texture, kind)
+        }
     }
     gl_viewport(0, 0, frame_width, frame_height)
     // Units 12 and 11 first, so the active unit is left at 10 and then 0.
@@ -5757,6 +5841,10 @@ init_sky_light(r: *GLRenderer) -> bool {
     r.sky_capture_shader = sc as ptr
     _lc = gpu.link(gpu.screen_vertex(), sc)
     r.sky_capture_program = compile_program(gpu.emit_screen_vertex(sc, gpu.GL), gpu.emit_glsl(sc, gpu.GL), "sky capture")
+    ev = envmap.env_capture(Texture { image: null }, 0.0, 0.0, 0.0)
+    r.env_shader = ev as ptr
+    _le = gpu.link(gpu.screen_vertex(), ev)
+    r.env_program = compile_program(gpu.emit_screen_vertex(ev, gpu.GL), gpu.emit_glsl(ev, gpu.GL), "environment capture")
     cl = skydome.cloud(Texture { image: null }, Texture { image: null }, Texture { image: null }, Texture3D { image: null },
                        Texture3D { image: null }, 0, z, z, z, 0.0, z, 0.0, z, 0.0, 0.0, z, vec2(0.0, 0.0), zero_mat4(),
                        zero_mat4(), zero_mat4(), 0, 0)
@@ -6011,6 +6099,10 @@ sea_values(r: *GLRenderer, m: *Model, view_projection: *Mat4, light: *Light, cam
 free_sky_light(r: *GLRenderer) {
     if r.sky_program != 0 { gl_program_delete(r.sky_program) ; r.sky_program = 0 }
     if r.sky_capture_program != 0 { gl_program_delete(r.sky_capture_program) ; r.sky_capture_program = 0 }
+    if r.env_program != 0 { gl_program_delete(r.env_program) ; r.env_program = 0 }
+    if r.env_shader != null { gpu.shader_free(r.env_shader as *GpuShader) ; r.env_shader = null }
+    if r.env_texture != 0 { gl_texture_delete(r.env_texture) ; r.env_texture = 0 }
+    r.env_drawn = false
     if r.cloud_program != 0 { gl_program_delete(r.cloud_program) ; r.cloud_program = 0 }
     if r.sky_vertex_shader != null { gpu.shader_free(r.sky_vertex_shader as *GpuShader) ; r.sky_vertex_shader = null }
     if r.sky_shader != null { gpu.shader_free(r.sky_shader as *GpuShader) ; r.sky_shader = null }

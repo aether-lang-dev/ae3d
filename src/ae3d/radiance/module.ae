@@ -1,0 +1,284 @@
+// Radiance .hdr (RGBE) pictures, decoded from the format's description (the
+// Radiance file format as Greg Ward's "Real Pixels" (Graphics Gems II) gives
+// it): a text header, a resolution line, and a pixel of four bytes -- red,
+// green and blue mantissas and one shared exponent -- per texel.
+//
+//   img = radiance.decode(bytes, length)     // an ae3d.hdrimage, null on failure: hdrimage.error()
+//   radiance.is_radiance(bytes, length)      // the "#?" signature
+//
+// The header: "#?RADIANCE" (or "#?RGBE"), then lines of VARIABLE=value
+// (FORMAT=32-bit_rle_rgbe, EXPOSURE=, GAMMA= and the like), a blank line, and
+// the resolution as "-Y <height> +X <width>" -- the rows top to bottom, each
+// left to right, which is what nearly every file is. The other four
+// orientations of that form ("+Y" rows bottom to top, "-X" columns right to
+// left) are read and turned over to the usual; the X-major forms
+// ("+X <w> -Y <h>", columns of rows) are refused by name.
+//
+// The pixels, scanline by scanline, either of:
+//   - new run-length: a scanline of 8 to 32767 texels starts 2, 2, then its
+//     width in two bytes (big-endian), and holds the four channels one after
+//     another, each coded as runs: a count over 128 is that count less 128
+//     copies of the next byte, otherwise that many bytes as they are;
+//   - flat: the four bytes of every texel, one after another -- and the old
+//     run-length form inside it, a texel of (1, 1, 1, n) repeating the one
+//     before it n times (n shifted up eight bits for each such texel in a row).
+// A texel's value is its mantissa times two to the exponent less 136
+// (mantissa/256 * 2^(e - 128)); an exponent of zero is black. The result is
+// float RGB in the file's own units, alpha 1, EXPOSURE ignored (a file's
+// exposure says how the picture was scaled, and the map lights a scene in its
+// own units, which `engine_set_environment` scales if asked).
+//
+// Every read is bounds-checked: a file that is not what it says fails with a
+// reason and never reads past its end or writes past its image.
+import std.string
+import std.mem
+import ae3d.hdrimage
+
+exports (decode, is_radiance)
+
+extern pow(x: float, y: float) -> float
+extern free(p: ptr)
+extern calloc(count: long, size: long) -> ptr
+
+const MAX_HEADER = 4096
+
+// Whether the bytes begin the way a Radiance file does.
+is_radiance(data: ptr, length: int) -> bool {
+    if length < 10 { return false }
+    return mem.get_uint8(data, 0) == 35 && mem.get_uint8(data, 1) == 63
+}
+
+// The index of the newline ending the header line that starts at `at`; -1
+// when the data ends (or the line is absurdly long) first.
+line_end(data: ptr, length: int, at: int) -> int {
+    i = at
+    while i < length && i < at + MAX_HEADER {
+        if mem.get_uint8(data, i) == 10 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// The index of the first byte at or after `at`, before `stop`, that is not a space.
+skip_spaces(data: ptr, at: int, stop: int) -> int {
+    i = at
+    while i < stop && mem.get_uint8(data, i) == 32 { i = i + 1 }
+    return i
+}
+
+// The index after the decimal digits at `at` (at itself when there are none).
+skip_digits(data: ptr, at: int, stop: int) -> int {
+    i = at
+    while i < stop && mem.get_uint8(data, i) >= 48 && mem.get_uint8(data, i) <= 57 { i = i + 1 }
+    return i
+}
+
+// The number the digits from `at` to `stop` spell, or -1 for none or one past 1,000,000.
+digits_value(data: ptr, at: int, stop: int) -> int {
+    if stop <= at { return 0 - 1 }
+    n = 0
+    i = at
+    while i < stop {
+        n = n * 10 + (mem.get_uint8(data, i) - 48)
+        if n > 1000000 { return 0 - 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fail(reason: string) -> ptr {
+    hdrimage.set_error(reason)
+    return null
+}
+
+// The scale each exponent byte gives a mantissa byte: 2^(e - 136).
+scales() -> ptr {
+    t = calloc(256 as long, 4 as long)
+    f = t as f32[]
+    e = 1
+    while e < 256 {
+        f[e] = pow(2.0, ((e - 136) as float)) as f32
+        e = e + 1
+    }
+    return t
+}
+
+// A texel of four bytes at `quad` of the scanline into the image row.
+put_texel(row: f32[], at: int, quad: ptr, q: int, scale: f32[]) {
+    e = mem.get_uint8(quad, q + 3)
+    if e == 0 {
+        row[at] = 0.0 as f32
+        row[at + 1] = 0.0 as f32
+        row[at + 2] = 0.0 as f32
+    } else {
+        s = scale[e]
+        row[at] = ((mem.get_uint8(quad, q) as float) * (s as float)) as f32
+        row[at + 1] = ((mem.get_uint8(quad, q + 1) as float) * (s as float)) as f32
+        row[at + 2] = ((mem.get_uint8(quad, q + 2) as float) * (s as float)) as f32
+    }
+    row[at + 3] = 1.0 as f32
+}
+
+// One scanline, `width` texels, the four-byte form of each into `quads`
+// (width * 4 bytes), from `at`; the index after what it read, or -1.
+read_scanline(data: ptr, length: int, at: int, width: int, quads: ptr) -> int {
+    if width >= 8 && width <= 32767 && at + 4 <= length &&
+       mem.get_uint8(data, at) == 2 && mem.get_uint8(data, at + 1) == 2 &&
+       (mem.get_uint8(data, at + 2) & 128) == 0 {
+        coded = mem.get_uint8(data, at + 2) * 256 + mem.get_uint8(data, at + 3)
+        if coded != width { return 0 - 1 }
+        i = at + 4
+        channel = 0
+        while channel < 4 {
+            x = 0
+            while x < width {
+                if i >= length { return 0 - 1 }
+                count = mem.get_uint8(data, i)
+                i = i + 1
+                if count > 128 {
+                    count = count - 128
+                    if x + count > width || i >= length { return 0 - 1 }
+                    value = mem.get_uint8(data, i)
+                    i = i + 1
+                    k = 0
+                    while k < count {
+                        mem.set_uint8(quads, (x + k) * 4 + channel, value)
+                        k = k + 1
+                    }
+                } else {
+                    if count == 0 || x + count > width || i + count > length { return 0 - 1 }
+                    k = 0
+                    while k < count {
+                        mem.set_uint8(quads, (x + k) * 4 + channel, mem.get_uint8(data, i + k))
+                        k = k + 1
+                    }
+                    i = i + count
+                }
+                x = x + count
+            }
+            channel = channel + 1
+        }
+        return i
+    }
+    // Flat, with the old run-length texels in it.
+    i = at
+    x = 0
+    shift = 0
+    while x < width {
+        if i + 4 > length { return 0 - 1 }
+        r = mem.get_uint8(data, i)
+        g = mem.get_uint8(data, i + 1)
+        b = mem.get_uint8(data, i + 2)
+        e = mem.get_uint8(data, i + 3)
+        i = i + 4
+        if r == 1 && g == 1 && b == 1 {
+            // (1, 1, 1, n): the texel before it, n << shift times over.
+            if x == 0 { return 0 - 1 }
+            repeat = e << shift
+            if x + repeat > width { return 0 - 1 }
+            k = 0
+            while k < repeat {
+                mem.copy(quads + (x + k) * 4, quads + (x - 1) * 4, 4 as long)
+                k = k + 1
+            }
+            x = x + repeat
+            shift = shift + 8
+        } else {
+            mem.set_uint8(quads, x * 4, r)
+            mem.set_uint8(quads, x * 4 + 1, g)
+            mem.set_uint8(quads, x * 4 + 2, b)
+            mem.set_uint8(quads, x * 4 + 3, e)
+            x = x + 1
+            shift = 0
+        }
+    }
+    return i
+}
+
+// The picture in `length` bytes at `data`, or null with the reason in
+// hdrimage.error().
+decode(data: @keep ptr, length: int) -> ptr {
+    if data == null || length < 10 { return fail("not a Radiance picture: too short") }
+    if !is_radiance(data, length) { return fail("not a Radiance picture: no #? signature") }
+    // The header: lines up to the empty one.
+    at = 0
+    first = true
+    rgbe = true
+    done = false
+    while !done {
+        stop = line_end(data, length, at)
+        if stop < 0 { return fail("the Radiance header does not end") }
+        if stop == at {
+            done = true
+        } else if !first {
+            // FORMAT=32-bit_rle_rgbe is the one we read; 32-bit_rle_xyze is
+            // CIE XYZ, which would need its own conversion.
+            if stop - at > 7 && mem.get_uint8(data, at) == 70 && mem.get_uint8(data, at + 1) == 79 &&
+               mem.get_uint8(data, at + 2) == 82 && mem.get_uint8(data, at + 3) == 77 &&
+               mem.get_uint8(data, at + 4) == 65 && mem.get_uint8(data, at + 5) == 84 &&
+               mem.get_uint8(data, at + 6) == 61 {
+                if stop - at >= 7 + 3 && mem.get_uint8(data, stop - 4) == 120 && mem.get_uint8(data, stop - 3) == 121 &&
+                   mem.get_uint8(data, stop - 2) == 122 && mem.get_uint8(data, stop - 1) == 101 {
+                    rgbe = false
+                }
+            }
+        }
+        first = false
+        at = stop + 1
+    }
+    if !rgbe { return fail("a Radiance picture in XYZE, not RGBE") }
+    // The resolution line: "-Y h +X w" and the like.
+    stop = line_end(data, length, at)
+    if stop < 0 { return fail("the Radiance resolution line is missing") }
+    if stop - at < 9 { return fail("the Radiance resolution line is not one") }
+    y_sign = mem.get_uint8(data, at)
+    y_axis = mem.get_uint8(data, at + 1)
+    if (y_sign != 45 && y_sign != 43) || y_axis != 89 {
+        return fail("a Radiance picture stored column by column (+X/-X first) is not read")
+    }
+    p = skip_spaces(data, at + 2, stop)
+    q = skip_digits(data, p, stop)
+    height = digits_value(data, p, q)
+    if height < 0 { return fail("the Radiance resolution line has no height") }
+    p = skip_spaces(data, q, stop)
+    if p + 2 > stop { return fail("the Radiance resolution line has no width") }
+    x_sign = mem.get_uint8(data, p)
+    x_axis = mem.get_uint8(data, p + 1)
+    if (x_sign != 45 && x_sign != 43) || x_axis != 88 {
+        return fail("the Radiance resolution line is neither -Y h +X w nor one of its mirror forms")
+    }
+    p = skip_spaces(data, p + 2, stop)
+    q = skip_digits(data, p, stop)
+    width = digits_value(data, p, q)
+    if width < 0 { return fail("the Radiance resolution line has no width") }
+    img = hdrimage.new_image(width, height)
+    if img == null { return null }
+    pixels = hdrimage.pixels(img) as f32[]
+    scale = scales() as f32[]
+    quads = calloc((width as long) * (4 as long), 1 as long)
+    pos = stop + 1
+    row = 0
+    while row < height {
+        pos = read_scanline(data, length, pos, width, quads)
+        if pos < 0 {
+            free(quads)
+            free(scale as ptr)
+            hdrimage.dispose(img)
+            return fail("the Radiance picture's pixels are damaged or end early")
+        }
+        // "+Y" stores the bottom row first: turn it over.
+        dest = row
+        if y_sign == 43 { dest = height - 1 - row }
+        x = 0
+        while x < width {
+            src = x
+            if x_sign == 45 { src = width - 1 - x }
+            put_texel(pixels, (dest * width + x) * 4, quads, src * 4, scale)
+            x = x + 1
+        }
+        row = row + 1
+    }
+    free(quads)
+    free(scale as ptr)
+    return img
+}
