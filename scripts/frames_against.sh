@@ -50,6 +50,12 @@
 # pixel of the spheres, 77,80) a step off the SPIR-V's, so
 # AE3D_WITHIN=1 AE3D_OVER=2.
 #
+# The known case, so nobody widens this later without knowing why: with
+# AE3D_MSL=1 at 4x, seven frames differ by one step in one channel at the
+# spheres' pixel (77,80). That is the whole of what 1 step on 2 channels
+# excuses, and it is opt-in only; a byte-for-byte run (no AE3D_WITHIN) stays
+# the default and the bar for every change that is not the MSL.
+#
 # Exits 0 when every frame matches, 1 naming those that do not, 2 when
 # something could not be built or drawn. Needs a GPU (a software rasteriser
 # draws it too, slowly); the frames are kept under build/frames_against/ to
