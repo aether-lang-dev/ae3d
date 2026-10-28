@@ -1431,8 +1431,10 @@ there, not what a ray at the model's bounds would meet:
   columns read and not changed. The crowd's impostor tier is drawn as the
   quad it is.
 
-A particle's points, a surface added over the frame (flames) and the water
-are no one's: a pick sees through them. The pass runs only in a frame that was
+A particle's points, a surface added over the frame (flames), the water and
+world text (drawn after the pass) are no one's: a pick sees through them.
+Crowds are picked (above). The water stays out on purpose: a boat or a
+fishing cursor asks `water.simulation_height_at` on the CPU. The pass runs only in a frame that was
 asked, before the scene pass, in the same command buffer; a frame that asks
 nothing has no target, no pipeline and no draw. It draws at the scene's size
 (the render scale applies), one sample, with the frame's jitter: the world
