@@ -1,0 +1,498 @@
+// ci: optimised -- its run is CPU work -O0 makes three to six times slower
+// Text in the 3D world (#871), on both backends, drawn into the same scene and
+// held to what makes it text in the world:
+//
+//   - occlusion: a label in front of a wall draws, a label behind the wall
+//     does not (the frame with it is the frame without it, to the pixel),
+//     and the same label asked to be drawn over everything does;
+//   - billboard: a label that faces the camera is as wide on the screen from
+//     two cameras a quarter of a turn apart at the same distance, where a
+//     label written in a plane of the world is a sign seen from the front and
+//     then edge-on;
+//   - views: the text is in a view's picture, drawn from the view's camera,
+//     and the window's frame is the same with a view drawn before it;
+//   - unused, it costs nothing and changes nothing (the frame with no text asked
+//     is the frame it was, in the same test).
+//
+// Then Vulkan's frames are held to OpenGL's. AE3D_MSAA=0 draws both with one
+// sample; AE3D_PARITY_DUMP=<dir> writes the frames.
+
+import std.mem
+import std.os
+import std.string
+import ae3d.core
+import ae3d.png
+import ae3d.gl
+import ae3d.vulkan
+import ae3d.offscreen
+import ae3d.loader
+import ae3d.hud
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, bytes: int) -> ptr
+extern exit(code: int)
+
+const WIDTH = 256
+const HEIGHT = 192
+const VIEW_W = 128
+const VIEW_H = 96
+
+var failures = 0
+var checks = 0
+
+check(name: string, ok: bool) {
+    checks = checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+channel(pixels: ptr, index: int) -> int { return mem.get_byte(pixels, index) }
+
+kept(pixels: ptr, w: int, h: int) -> ptr {
+    copy = calloc(w * h, 4)
+    memcpy(copy, pixels, w * h * 4)
+    return copy
+}
+
+dump(name: string, backend: string, pixels: ptr, w: int, h: int) {
+    dir = core.text(os.getenv("AE3D_PARITY_DUMP"))
+    if dir == "" { return }
+    png.write("${dir}/world_text_${name}_${backend}.png", pixels, w, h)
+}
+
+// What changed between two frames: the pixels a channel of which is more
+// than 24 apart, and their bounding box.
+struct Ink {
+    count: int
+    min_x: int
+    max_x: int
+    min_y: int
+    max_y: int
+}
+
+ink(a: ptr, b: ptr, w: int, h: int) -> Ink {
+    r = Ink { count: 0, min_x: w, max_x: 0 - 1, min_y: h, max_y: 0 - 1 }
+    y = 0
+    while y < h {
+        x = 0
+        while x < w {
+            i = (y * w + x) * 4
+            moved = false
+            c = 0
+            while c < 3 {
+                d = channel(a, i + c) - channel(b, i + c)
+                if d < 0 { d = 0 - d }
+                if d > 24 { moved = true }
+                c = c + 1
+            }
+            if moved {
+                r.count = r.count + 1
+                if x < r.min_x { r.min_x = x }
+                if x > r.max_x { r.max_x = x }
+                if y < r.min_y { r.min_y = y }
+                if y > r.max_y { r.max_y = y }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return r
+}
+
+width_of(r: Ink) -> int {
+    if r.count == 0 { return 0 }
+    return r.max_x - r.min_x + 1
+}
+
+// How many channels of two frames are more than 8 apart.
+apart(a: ptr, b: ptr, w: int, h: int) -> int {
+    n = 0
+    i = 0
+    while i < w * h * 4 {
+        if i % 4 != 3 {
+            d = channel(a, i) - channel(b, i)
+            if d < 0 { d = 0 - d }
+            if d > 8 { n = n + 1 }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Ink inside the square of `half` pixels about (cx, cy) only.
+ink_near(a: ptr, b: ptr, w: int, h: int, cx: int, cy: int, half: int) -> int {
+    n = 0
+    y = cy - half
+    while y <= cy + half {
+        x = cx - half
+        while x <= cx + half {
+            if x >= 0 && x < w && y >= 0 && y < h {
+                i = (y * w + x) * 4
+                c = 0
+                moved = false
+                while c < 3 {
+                    d = channel(a, i + c) - channel(b, i + c)
+                    if d < 0 { d = 0 - d }
+                    if d > 24 { moved = true }
+                    c = c + 1
+                }
+                if moved { n = n + 1 }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n
+}
+
+project_x(cam: *Camera, x: float, y: float, z: float) -> int {
+    v = core.mat4_mul_v4(core.camera_view_projection(cam), core.vec4(x, y, z, 1.0))
+    return (((v.x / v.w) * 0.5 + 0.5) * (WIDTH as float)) as int
+}
+project_y(cam: *Camera, x: float, y: float, z: float) -> int {
+    v = core.mat4_mul_v4(core.camera_view_projection(cam), core.vec4(x, y, z, 1.0))
+    return ((0.5 - (v.y / v.w) * 0.5) * (HEIGHT as float)) as int
+}
+
+look(cam: *Camera, x: float, y: float, z: float, tx: float, ty: float, tz: float) {
+    core.camera_set_position(cam, core.vec3(x, y, z))
+    core.camera_look_at(cam, core.vec3(tx, ty, tz))
+}
+
+// A wall across the frame, a hand's width thick, at the origin.
+wall() -> *Model {
+    w = loader.cube(1.0)
+    core.model_set_scale(w, 400.0, 300.0, 10.0)
+    core.model_set_diffuse(w, 0.35, 0.35, 0.4)
+    return w
+}
+
+// One backend's frames of the world text, each kept.
+struct Shots {
+    base: ptr          // the wall alone, camera A
+    both: ptr          // a label in front of the wall and one behind it
+    top: ptr           // and the one behind drawn over everything
+    one_base: ptr      // camera 1 on the label's point, no text
+    one_bill: ptr      // a label that faces the camera
+    one_fixed: ptr     // a label in a plane of the world
+    two_base: ptr      // camera 2, a quarter of a turn round
+    two_bill: ptr
+    two_fixed: ptr
+    view_base: ptr     // a view from camera 2, no text
+    view_text: ptr     // and with the label
+    window_before: ptr // the window's frame with the label, before a view is drawn
+    window_after: ptr  // and after
+    taa_base: ptr      // the post chain on: the wall alone, then with a label (temporal, depth of field, upscaler)
+    taa_text: ptr
+    dof_base: ptr
+    dof_text: ptr
+    up_base: ptr
+    up_text: ptr
+}
+
+ask_front_and_behind(h: *Hud, over: bool) {
+    white = hud.rgba(1.0, 1.0, 1.0, 1.0)
+    hud.world_text(h, 0.0 - 30.0, 15.0, 100.0, 14.0, "FRONT", white)
+    if over { hud.world_text_depth(h, false) }
+    hud.world_text(h, 30.0, 15.0, 0.0 - 30.0, 14.0, "BEHIND", hud.rgba(1.0, 0.9, 0.2, 1.0))
+}
+
+// `which`: 0 OpenGL (its target), 1 Vulkan.
+shoot(pass: *Backend, which: int, target: ptr, renderer: ptr, h: *Hud, cam_a: *Camera, c1: *Camera, c2: *Camera, light: *Light) -> *Shots {
+    s = calloc(1, sizeof(Shots)) as *Shots
+    hud.clear(h)
+    s.base = take(pass, which, target, cam_a, light)
+    ask_front_and_behind(h, false)
+    s.both = take(pass, which, target, cam_a, light)
+    hud.clear(h)
+    ask_front_and_behind(h, true)
+    s.top = take(pass, which, target, cam_a, light)
+    hud.clear(h)
+
+    s.one_base = take(pass, which, target, c1, light)
+    s.two_base = take(pass, which, target, c2, light)
+    white = hud.rgba(1.0, 1.0, 1.0, 1.0)
+    // Both labels are over everything here so that the wall is not what is
+    // measured; what is measured is how wide the label is.
+    hud.world_text_depth(h, false)
+    hud.world_text(h, 0.0, 0.0, 100.0, 14.0, "Hello", white)
+    s.one_bill = take(pass, which, target, c1, light)
+    s.two_bill = take(pass, which, target, c2, light)
+    hud.clear(h)
+    hud.world_text_depth(h, false)
+    hud.world_text_fixed(h, 0.0, 0.0, 100.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 14.0, "Hello", white)
+    s.one_fixed = take(pass, which, target, c1, light)
+    s.two_fixed = take(pass, which, target, c2, light)
+    hud.clear(h)
+
+    // A view from camera 2.
+    view = core.backend_view_new(pass, VIEW_W, VIEW_H)
+    core.backend_view_render(pass, view, c2, light)
+    s.view_base = kept(core.backend_view_pixels(pass, view), VIEW_W, VIEW_H)
+    hud.world_text_depth(h, false)
+    hud.world_text(h, 0.0, 0.0, 100.0, 14.0, "Hello", white)
+    core.backend_view_render(pass, view, c2, light)
+    s.view_text = kept(core.backend_view_pixels(pass, view), VIEW_W, VIEW_H)
+    hud.clear(h)
+
+    // The window's frame with the label, with and without a view drawn first.
+    hud.world_text(h, 0.0 - 30.0, 15.0, 100.0, 14.0, "FRONT", white)
+    s.window_before = take(pass, which, target, cam_a, light)
+    core.backend_view_render(pass, view, c2, light)
+    s.window_after = take(pass, which, target, cam_a, light)
+    hud.clear(h)
+    core.backend_view_free(pass, view)
+
+    // What follows the scene treats the text as part of it. The label asked
+    // for on every frame, over everything, from camera 1.
+    set_taa(renderer, which, true)
+    s.taa_base = settled(pass, which, target, c1, light, h, false)
+    s.taa_text = settled(pass, which, target, c1, light, h, true)
+    set_taa(renderer, which, false)
+    set_dof(renderer, which, true)
+    s.dof_base = settled(pass, which, target, c1, light, h, false)
+    s.dof_text = settled(pass, which, target, c1, light, h, true)
+    set_dof(renderer, which, false)
+    core.backend_set_render_scale(pass, 0.5)
+    set_upscaler(renderer, which, 1)
+    s.up_base = settled(pass, which, target, c1, light, h, false)
+    s.up_text = settled(pass, which, target, c1, light, h, true)
+    set_upscaler(renderer, which, 0)
+    core.backend_set_render_scale(pass, 1.0)
+    return s
+}
+
+set_taa(renderer: ptr, which: int, on: bool) {
+    if which == 0 { gl.renderer_set_taa(renderer as *GLRenderer, on) } else { vulkan.renderer_set_taa(renderer as *VKRenderer, on) }
+}
+
+// Focused on the label's distance from camera 1 (about 100), so it is in focus
+// and the wall behind it is not.
+set_dof(renderer: ptr, which: int, on: bool) {
+    if which == 0 {
+        gl.renderer_set_dof(renderer as *GLRenderer, on, 100.0, 60.0, 120.0)
+    } else {
+        vulkan.renderer_set_dof(renderer as *VKRenderer, on, 100.0, 60.0, 120.0)
+    }
+}
+
+set_upscaler(renderer: ptr, which: int, mode: int) {
+    if which == 0 { gl.renderer_set_upscaler(renderer as *GLRenderer, mode, 0.5) } else { vulkan.renderer_set_upscaler(renderer as *VKRenderer, mode, 0.5) }
+}
+
+// A frame some frames in, so a temporal pass has its history: the label asked
+// for on each, or not.
+settled(pass: *Backend, which: int, target: ptr, cam: *Camera, light: *Light, h: *Hud, text: bool) -> ptr {
+    hud.clear(h)
+    k = 0
+    while k < 4 {
+        hud.clear(h)
+        if text {
+            hud.world_text_depth(h, false)
+            hud.world_text(h, 0.0, 0.0, 100.0, 14.0, "Hello", hud.rgba(1.0, 1.0, 1.0, 1.0))
+        }
+        core.backend_render(pass, cam, light)
+        k = k + 1
+    }
+    hud.clear(h)
+    if which == 0 { return kept(offscreen.target_pixels(target), WIDTH, HEIGHT) }
+    return kept(vulkan.offscreen_pixels(), WIDTH, HEIGHT)
+}
+
+take(pass: *Backend, which: int, target: ptr, cam: *Camera, light: *Light) -> ptr {
+    core.backend_render(pass, cam, light)
+    if which == 0 { return kept(offscreen.target_pixels(target), WIDTH, HEIGHT) }
+    return kept(vulkan.offscreen_pixels(), WIDTH, HEIGHT)
+}
+
+free_shots(s: *Shots) {
+    free(s.base)
+    free(s.both)
+    free(s.top)
+    free(s.one_base)
+    free(s.one_bill)
+    free(s.one_fixed)
+    free(s.two_base)
+    free(s.two_bill)
+    free(s.two_fixed)
+    free(s.view_base)
+    free(s.view_text)
+    free(s.window_before)
+    free(s.window_after)
+    free(s.taa_base)
+    free(s.taa_text)
+    free(s.dof_base)
+    free(s.dof_text)
+    free(s.up_base)
+    free(s.up_text)
+    free(s as ptr)
+}
+
+judge(name: string, s: *Shots, cam_a: *Camera) {
+    dump("base", name, s.base, WIDTH, HEIGHT)
+    dump("both", name, s.both, WIDTH, HEIGHT)
+    dump("top", name, s.top, WIDTH, HEIGHT)
+    dump("one_bill", name, s.one_bill, WIDTH, HEIGHT)
+    dump("one_fixed", name, s.one_fixed, WIDTH, HEIGHT)
+    dump("two_bill", name, s.two_bill, WIDTH, HEIGHT)
+    dump("two_fixed", name, s.two_fixed, WIDTH, HEIGHT)
+    dump("view_text", name, s.view_text, VIEW_W, VIEW_H)
+
+    // Occlusion.
+    fx = project_x(cam_a, 0.0 - 30.0, 15.0, 100.0)
+    fy = project_y(cam_a, 0.0 - 30.0, 15.0, 100.0)
+    bx = project_x(cam_a, 30.0, 15.0, 0.0 - 30.0)
+    by = project_y(cam_a, 30.0, 15.0, 0.0 - 30.0)
+    front = ink_near(s.base, s.both, WIDTH, HEIGHT, fx, fy, 30)
+    behind = ink_near(s.base, s.both, WIDTH, HEIGHT, bx, by, 30)
+    over = ink_near(s.base, s.top, WIDTH, HEIGHT, bx, by, 30)
+    println("  ${name}: ink near the front label ${front}, near the label behind the wall ${behind}, behind and over everything ${over}")
+    check("${name}: the label in front of the wall is drawn (${front} pixels)", front > 150)
+    check("${name}: the label behind the wall is not: its place is the wall's (${behind} pixels)", behind == 0)
+    check("${name}: asked to be over everything it is (${over} pixels)", over > 150)
+
+    // Billboard.
+    one_b = ink(s.one_base, s.one_bill, WIDTH, HEIGHT)
+    two_b = ink(s.two_base, s.two_bill, WIDTH, HEIGHT)
+    one_f = ink(s.one_base, s.one_fixed, WIDTH, HEIGHT)
+    two_f = ink(s.two_base, s.two_fixed, WIDTH, HEIGHT)
+    println("  ${name}: label widths on the screen: facing the camera ${width_of(one_b)} then ${width_of(two_b)}, in a plane of the world ${width_of(one_f)} then ${width_of(two_f)}")
+    check("${name}: the label that faces the camera is drawn from both (${one_b.count}, ${two_b.count} pixels)", one_b.count > 150 && two_b.count > 150)
+    delta = width_of(one_b) - width_of(two_b)
+    if delta < 0 { delta = 0 - delta }
+    check("${name}: and as wide from one as from the other (${width_of(one_b)} and ${width_of(two_b)})", delta <= 2 && width_of(one_b) > 30)
+    check("${name}: the label in a plane is a sign from the front (${width_of(one_f)} wide)", width_of(one_f) > 30)
+    check("${name}: and edge-on from the side, where it is a sliver (${width_of(two_f)} wide against ${width_of(one_f)})",
+          width_of(two_f) * 4 < width_of(one_f))
+    // The camera turned: the billboard's pixels are not the fixed label's.
+    check("${name}: and the camera is what turned the billboard (the two cameras' frames differ)",
+          apart(s.one_bill, s.two_bill, WIDTH, HEIGHT) > 100)
+
+    // Views.
+    vi = ink(s.view_base, s.view_text, VIEW_W, VIEW_H)
+    println("  ${name}: the view's ink ${vi.count} pixels, ${width_of(vi)} wide")
+    check("${name}: the text is in the view's picture (${vi.count} pixels)", vi.count > 60 && width_of(vi) > 15)
+    check("${name}: the window's frame is the same with a view drawn before it", apart(s.window_before, s.window_after, WIDTH, HEIGHT) == 0)
+
+    // The post chain.
+    ta = ink(s.taa_base, s.taa_text, WIDTH, HEIGHT)
+    da = ink(s.dof_base, s.dof_text, WIDTH, HEIGHT)
+    ua = ink(s.up_base, s.up_text, WIDTH, HEIGHT)
+    println("  ${name}: label ink with the temporal pass ${ta.count} (${width_of(ta)} wide), depth of field ${da.count} (${width_of(da)}), the upscaler at half scale ${ua.count} (${width_of(ua)})")
+    check("${name}: with the temporal pass the label is in the frame, as wide as without (${width_of(ta)})", ta.count > 150 && width_of(ta) >= 60)
+    check("${name}: with depth of field it is there (${da.count} pixels, ${width_of(da)} wide): blurred by the depth under it, the wall's, as the water and the glass are, since text writes no depth", da.count > 150 && width_of(da) >= 60)
+    check("${name}: with the upscaler at half scale it is there (${ua.count} pixels, ${width_of(ua)} wide)", ua.count > 100 && width_of(ua) >= 55)
+}
+
+main() {
+    if !vulkan.available() {
+        println("world text: SKIP no Vulkan driver (${vulkan.last_error()})")
+        return
+    }
+    context = offscreen.context_create(WIDTH, HEIGHT)
+    if context == null {
+        println("world text: SKIP no OpenGL context")
+        return
+    }
+    cam_a = core.camera_new(WIDTH, HEIGHT)
+    look(cam_a, 0.0, 20.0, 220.0, 0.0, 0.0, 0.0)
+    c1 = core.camera_new(WIDTH, HEIGHT)
+    look(c1, 0.0, 20.0, 200.0, 0.0, 0.0, 100.0)
+    c2 = core.camera_new(WIDTH, HEIGHT)
+    look(c2, 100.0, 20.0, 100.0, 0.0, 0.0, 100.0)
+    light = core.light_sun(core.vec3(0.3, 0.6, 0.8))
+
+    gl_renderer = gl.renderer_new()
+    opengl_pass = gl.backend(gl_renderer)
+    check("opengl started", core.backend_init(&opengl_pass, context, WIDTH, HEIGHT))
+    target = offscreen.target_create(WIDTH, HEIGHT)
+    gl.renderer_set_target(gl_renderer, target)
+    gl.renderer_set_clear_color(gl_renderer, 0.0, 0.0, 0.0)
+    one_sample = core.env_int("AE3D_MSAA", 0 - 1) == 0
+    if one_sample { gl.renderer_set_msaa(gl_renderer, false) }
+
+    vk_renderer = vulkan.renderer_new()
+    if one_sample { vulkan.set_samples(1) }
+    vulkan_pass = vulkan.backend(vk_renderer)
+    if !core.backend_init(&vulkan_pass, null, WIDTH, HEIGHT) {
+        println("world text: SKIP Vulkan would not start (${vulkan.last_error()})")
+        return
+    }
+    vulkan.renderer_set_clear_color(vk_renderer, 0.0, 0.0, 0.0)
+
+    gl_wall = wall()
+    vk_wall = wall()
+    core.backend_add_model(&opengl_pass, gl_wall)
+    core.backend_add_model(&vulkan_pass, vk_wall)
+    gl_hud = hud.hud_new()
+    vk_hud = hud.hud_new()
+    core.backend_set_overlay(&opengl_pass, gl_hud as ptr)
+    core.backend_set_overlay(&vulkan_pass, vk_hud as ptr)
+
+    println("OpenGL")
+    gl_shots = shoot(&opengl_pass, 0, target, gl_renderer as ptr, gl_hud, cam_a, c1, c2, light)
+    judge("opengl", gl_shots, cam_a)
+    println("Vulkan")
+    vk_shots = shoot(&vulkan_pass, 1, null, vk_renderer as ptr, vk_hud, cam_a, c1, c2, light)
+    judge("vulkan", vk_shots, cam_a)
+
+    // Vulkan's frames against OpenGL's.
+    println("Vulkan against OpenGL")
+    check("the walls alone agree (${apart(gl_shots.base, vk_shots.base, WIDTH, HEIGHT)} channels)", apart(gl_shots.base, vk_shots.base, WIDTH, HEIGHT) < WIDTH * HEIGHT * 3 / 100)
+    names = ["label in front, label behind", "behind drawn over everything", "billboard from camera 1", "billboard from camera 2",
+             "fixed label from camera 1", "fixed label from camera 2"]
+    gls = [gl_shots.both, gl_shots.top, gl_shots.one_bill, gl_shots.two_bill, gl_shots.one_fixed, gl_shots.two_fixed]
+    vks = [vk_shots.both, vk_shots.top, vk_shots.one_bill, vk_shots.two_bill, vk_shots.one_fixed, vk_shots.two_fixed]
+    k = 0
+    while k < 6 {
+        n = apart(gls[k], vks[k], WIDTH, HEIGHT)
+        println("  ${names[k]}: ${n} of ${WIDTH * HEIGHT * 3} channels differ")
+        check("${names[k]}: the two backends agree (${n} channels)", n * 100 < WIDTH * HEIGHT * 3)
+        k = k + 1
+    }
+    n = apart(gl_shots.taa_text, vk_shots.taa_text, WIDTH, HEIGHT)
+    println("  with the temporal pass: ${n} of ${WIDTH * HEIGHT * 3} channels differ")
+    check("with the temporal pass: the two backends agree (${n} channels)", n * 50 < WIDTH * HEIGHT * 3)
+    n = apart(gl_shots.dof_text, vk_shots.dof_text, WIDTH, HEIGHT)
+    println("  with depth of field: ${n} of ${WIDTH * HEIGHT * 3} channels differ")
+    check("with depth of field: the two backends agree (${n} channels)", n * 50 < WIDTH * HEIGHT * 3)
+    n = apart(gl_shots.up_text, vk_shots.up_text, WIDTH, HEIGHT)
+    println("  with the upscaler: ${n} of ${WIDTH * HEIGHT * 3} channels differ")
+    check("with the upscaler: the two backends agree (${n} channels)", n * 50 < WIDTH * HEIGHT * 3)
+    n = apart(gl_shots.view_text, vk_shots.view_text, VIEW_W, VIEW_H)
+    println("  the view with text: ${n} of ${VIEW_W * VIEW_H * 3} channels differ")
+    check("the view with text: the two backends agree (${n} channels)", n * 100 < VIEW_W * VIEW_H * 3)
+
+    free_shots(gl_shots)
+    free_shots(vk_shots)
+    core.backend_set_overlay(&opengl_pass, null)
+    core.backend_set_overlay(&vulkan_pass, null)
+    hud.hud_free(gl_hud)
+    hud.hud_free(vk_hud)
+    core.backend_remove_model(&opengl_pass, gl_wall)
+    core.backend_remove_model(&vulkan_pass, vk_wall)
+    core.backend_cleanup(&opengl_pass)
+    core.backend_cleanup(&vulkan_pass)
+    offscreen.target_destroy(target)
+    offscreen.context_destroy(context)
+    core.model_free(gl_wall)
+    core.model_free(vk_wall)
+    gl.renderer_free(gl_renderer)
+    vulkan.renderer_free(vk_renderer)
+    core.camera_free(cam_a)
+    core.camera_free(c1)
+    core.camera_free(c2)
+    core.light_free(light)
+
+    if failures == 0 {
+        println("world text: all checks passed (${checks})")
+        return
+    }
+    println("world text: ${failures} of ${checks} checks failed")
+    exit(1)
+}
