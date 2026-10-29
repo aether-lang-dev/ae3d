@@ -1,0 +1,480 @@
+// ae3d.campath -- a camera flown along keys (#823): a cutscene, a replay, a
+// fly-through. Keys of (time, position, where to look, field of view),
+// sampled at any time, played, paused, sought and looped from the engine's
+// update.
+//
+//   p = campath.path_new()
+//   campath.path_add_target(p, 0.0, core.vec3(0.0, 2.0, 12.0), core.vec3(0.0, 1.0, 0.0), 45.0)
+//   campath.path_add_target(p, 4.0, core.vec3(9.0, 3.0, 6.0), core.vec3(0.0, 1.0, 0.0), 35.0)
+//   campath.path_add_look(p, 8.0, core.vec3(4.0, 6.0, 0.0), 0.0 - 90.0, 0.0 - 40.0, 0.0)   // yaw, pitch
+//   campath.attach(e, p, cam)         // the engine's update advances it and puts `cam` on it
+//   campath.play(p)
+//
+// A view follows a path by being drawn from a camera the path is attached to
+// (core.camera_new; engine_view_render(e, view, cam) in a late update).
+//
+// A key looks one of two ways: AT A TARGET point (path_add_target), or along
+// an ORIENTATION, a yaw and a pitch as the camera has them (path_add_look;
+// path_add_camera reads both off a camera). The camera has no roll, so an
+// orientation is a direction.
+//
+// How it is interpolated, and why:
+//
+// - Position goes through every key as a cubic Hermite spline with
+//   Catmull-Rom tangents: the tangent at a key is the straight-line velocity
+//   between its neighbours, (P[i+1] - P[i-1]) / (t[i+1] - t[i-1]) -- in time,
+//   not in key count, so keys at uneven times neither pause nor rush -- and
+//   at the two ends the velocity of the one segment. The path is C1 in time:
+//   the camera's velocity has no jump at a key, which linear interpolation
+//   gives (a visible lurch at every key) and which a camera shows more than
+//   any other thing. It passes through the keys, which a B-spline does not
+//   and an author wants (a key is a place the shot must be). Catmull-Rom can
+//   overshoot a little where keys bunch; the other cubics that interpolate
+//   (monotone, centripetal) cost more and do not matter for a camera.
+// - A segment between two TARGET keys interpolates the target point the same
+//   way, and looks at it: a camera that circles a fixed point keeps it in
+//   the middle of the frame between the keys, which interpolating a
+//   direction would not (the direction to a point is not the great circle
+//   between two directions to it).
+// - Any other segment (an orientation at either end) slerps the two look
+//   directions, a target key's being the direction from its position to its
+//   target: a constant angular speed along the shortest arc, the quaternion
+//   slerp of two roll-free orientations. Slerp is C0 at a key: the turn's
+//   speed changes there. Squad would be C1; it needs a full orientation with
+//   roll, which the camera does not have.
+// - The field of view goes through the keys as the position does, when every
+//   key has one (fov > 0); otherwise the camera's own is left alone.
+//
+// Time: keys sit at their own times (seconds, any origin; adding a key at a
+// time a key has replaces it). The playhead runs from the first key's time
+// to the last's at `rate` times real time (negative plays backwards). At the
+// end a path stops there, or, looping, goes round to the start; seek moves
+// the playhead (held to the keys' range, or wrapped into it when looping).
+// A path is open: looping jumps from the last key to the first.
+import std.heap
+import std.list
+import ae3d.core
+import ae3d.engine
+
+exports (
+    CameraPath, Pose, KEY_TARGET, KEY_LOOK,
+    path_new, path_free, path_clear, path_count, path_add_target, path_add_look, path_add_camera,
+    path_start, path_end, path_duration, path_key_time,
+    sample, apply_pose, apply,
+    play, pause, stop, seek, set_loop, set_rate, advance,
+    path_time, path_playing, path_finished, path_looping, path_rate,
+    attach, detach, slerp
+)
+
+const KEY_TARGET = 0
+const KEY_LOOK = 1
+
+struct Key {
+    time: float
+    position: Vec3
+    aim: Vec3                        // the target point, or the unit look direction
+    kind: int
+    fov: float                       // degrees; 0 for none
+}
+
+// Where the camera is at a time: its place, the unit direction it looks
+// along, and its field of view (0 when the path does not set one).
+struct Pose {
+    position: Vec3
+    front: Vec3
+    fov: float
+}
+
+struct CameraPath {
+    keys: ptr                        // list of *Key, in time order
+    head: float                      // the playhead, seconds
+    rate: float
+    is_playing: bool
+    is_looping: bool
+    is_finished: bool
+    dirty: bool                      // the playhead moved since the camera was put on it
+    engine: ptr
+    behaviour: ptr
+    camera: ptr
+}
+
+path_new() -> *CameraPath {
+    p = heap.new(CameraPath)
+    p.keys = list.new()
+    p.rate = 1.0
+    return p
+}
+
+path_clear(p: *CameraPath) {
+    i = 0
+    while i < list.size(p.keys) {
+        heap.free(list.get_raw(p.keys, i) as *Key)
+        i = i + 1
+    }
+    list.clear(p.keys)
+    p.head = 0.0
+    p.is_playing = false
+    p.is_finished = false
+    p.dirty = true
+}
+
+path_free(p: *CameraPath) {
+    if p == null { return }
+    detach(p)
+    path_clear(p)
+    list.free(p.keys)
+    heap.free(p)
+}
+
+path_count(p: *CameraPath) -> int { return list.size(p.keys) }
+
+key_at(p: *CameraPath, i: int) -> *Key { return list.get_raw(p.keys, i) as *Key }
+
+path_key_time(p: *CameraPath, i: int) -> float { return key_at(p, i).time }
+path_start(p: *CameraPath) -> float {
+    if list.size(p.keys) == 0 { return 0.0 }
+    return key_at(p, 0).time
+}
+path_end(p: *CameraPath) -> float {
+    n = list.size(p.keys)
+    if n == 0 { return 0.0 }
+    return key_at(p, n - 1).time
+}
+path_duration(p: *CameraPath) -> float { return path_end(p) - path_start(p) }
+
+// The unit vector a yaw and a pitch (degrees, the camera's) look along.
+look_vector(yaw: float, pitch: float) -> Vec3 {
+    y = core.deg_to_rad(yaw)
+    pt = core.deg_to_rad(pitch)
+    return core.v3_normalize(core.vec3(core.cos_of(y) * core.cos_of(pt), core.sin_of(pt), core.sin_of(y) * core.cos_of(pt)))
+}
+
+// A key into its place in time order; a key at the time of one that is
+// there replaces it. The key's index.
+put(p: *CameraPath, k: *Key) -> int {
+    n = list.size(p.keys)
+    i = 0
+    while i < n && key_at(p, i).time < k.time { i = i + 1 }
+    if i < n && key_at(p, i).time == k.time {
+        heap.free(key_at(p, i))
+        list.set(p.keys, i, k as ptr)
+    } else {
+        list.add_raw(p.keys, k as ptr)
+        j = n
+        while j > i {
+            list.set(p.keys, j, list.get_raw(p.keys, j - 1))
+            j = j - 1
+        }
+        list.set(p.keys, i, k as ptr)
+    }
+    p.dirty = true
+    return i
+}
+
+// A key at `time` with the camera at `position` looking at `target`. A
+// field of view of 0 or less is none.
+path_add_target(p: *CameraPath, at: float, position: Vec3, target: Vec3, fov: float) -> int {
+    k = heap.new(Key)
+    k.time = at
+    k.position = position
+    k.aim = target
+    k.kind = KEY_TARGET
+    k.fov = fov
+    if fov < 0.0 { k.fov = 0.0 }
+    return put(p, k)
+}
+
+// A key at `time` with the camera at `position` looking along a yaw and a
+// pitch, in degrees as the camera has them.
+path_add_look(p: *CameraPath, at: float, position: Vec3, yaw: float, pitch: float, fov: float) -> int {
+    k = heap.new(Key)
+    k.time = at
+    k.position = position
+    k.aim = look_vector(yaw, pitch)
+    k.kind = KEY_LOOK
+    k.fov = fov
+    if fov < 0.0 { k.fov = 0.0 }
+    return put(p, k)
+}
+
+// A key at `time` with the camera as it is now: its place, its look and its
+// field of view.
+path_add_camera(p: *CameraPath, at: float, cam: *Camera) -> int {
+    return path_add_look(p, at, cam.position, cam.yaw, cam.pitch, cam.fov)
+}
+
+// --- interpolation ------------------------------------------------------------------------------------------------
+
+// What a key holds that is a point (which: 0 its position, 1 its aim) or a
+// number (2: its field of view in x).
+value_of(k: *Key, which: int) -> Vec3 {
+    if which == 0 { return k.position }
+    if which == 1 { return k.aim }
+    return core.vec3(k.fov, 0.0, 0.0)
+}
+
+// The velocity a key is passed at: the line through its neighbours in time
+// (Catmull-Rom), the one segment's at the ends. A neighbour whose aim is not
+// a point (a look key, with `which` 1) stands in for the key itself.
+tangent(p: *CameraPath, i: int, which: int) -> Vec3 {
+    n = list.size(p.keys)
+    if n < 2 { return core.v3_zero() }
+    k = key_at(p, i)
+    lo = i - 1
+    hi = i + 1
+    if lo < 0 { lo = 0 }
+    if hi > n - 1 { hi = n - 1 }
+    a = key_at(p, lo)
+    b = key_at(p, hi)
+    va = value_of(a, which)
+    vb = value_of(b, which)
+    ta = a.time
+    tb = b.time
+    if which == 1 {
+        if a.kind != KEY_TARGET { va = k.aim ; ta = k.time }
+        if b.kind != KEY_TARGET { vb = k.aim ; tb = k.time }
+    }
+    if tb <= ta { return core.v3_zero() }
+    return core.v3_mul(core.v3_sub(vb, va), 1.0 / (tb - ta))
+}
+
+// The cubic Hermite through a at u = 0 and b at u = 1 over a segment h long,
+// leaving a at velocity ma and reaching b at mb.
+hermite(a: Vec3, ma: Vec3, b: Vec3, mb: Vec3, h: float, u: float) -> Vec3 {
+    u2 = u * u
+    u3 = u2 * u
+    h00 = 2.0 * u3 - 3.0 * u2 + 1.0
+    h10 = u3 - 2.0 * u2 + u
+    h01 = 3.0 * u2 - 2.0 * u3
+    h11 = u3 - u2
+    r = core.v3_mul(a, h00)
+    r = core.v3_add(r, core.v3_mul(ma, h10 * h))
+    r = core.v3_add(r, core.v3_mul(b, h01))
+    r = core.v3_add(r, core.v3_mul(mb, h11 * h))
+    return r
+}
+
+spline(p: *CameraPath, i: int, which: int, h: float, u: float) -> Vec3 {
+    a = value_of(key_at(p, i), which)
+    b = value_of(key_at(p, i + 1), which)
+    return hermite(a, tangent(p, i, which), b, tangent(p, i + 1, which), h, u)
+}
+
+// The shortest arc between two unit vectors, `u` of the way: a constant
+// angular speed. Nearly the same direction is a normalised lerp (the arc is
+// the chord); exactly opposite turns about an axis across both.
+slerp(a: Vec3, b: Vec3, u: float) -> Vec3 {
+    d = core.clampf(core.v3_dot(a, b), 0.0 - 1.0, 1.0)
+    if d > 0.9995 { return core.v3_normalize(core.v3_lerp(a, b, u)) }
+    if d < 0.0 - 0.9995 {
+        axis = core.v3_cross(a, core.vec3(0.0, 1.0, 0.0))
+        if core.v3_len(axis) < 0.001 { axis = core.v3_cross(a, core.vec3(1.0, 0.0, 0.0)) }
+        axis = core.v3_normalize(axis)
+        angle = core.PI * u
+        return core.v3_normalize(core.v3_add(core.v3_mul(a, core.cos_of(angle)), core.v3_mul(core.v3_cross(axis, a), core.sin_of(angle))))
+    }
+    theta = core.acos_of(d)
+    s = core.sin_of(theta)
+    wa = core.sin_of((1.0 - u) * theta) / s
+    wb = core.sin_of(u * theta) / s
+    return core.v3_normalize(core.v3_add(core.v3_mul(a, wa), core.v3_mul(b, wb)))
+}
+
+// The direction a key looks along.
+key_front(k: *Key) -> Vec3 {
+    if k.kind == KEY_LOOK { return k.aim }
+    d = core.v3_sub(k.aim, k.position)
+    if core.v3_len(d) < 0.000001 { return core.vec3(0.0, 0.0, 0.0 - 1.0) }
+    return core.v3_normalize(d)
+}
+
+all_have_fov(p: *CameraPath) -> bool {
+    i = 0
+    while i < list.size(p.keys) {
+        if key_at(p, i).fov <= 0.0 { return false }
+        i = i + 1
+    }
+    return list.size(p.keys) > 0
+}
+
+// The camera at `t`: before the first key it is the first, after the last the
+// last. No keys, a pose at the origin looking down -z.
+sample(p: *CameraPath, t: float) -> Pose {
+    n = list.size(p.keys)
+    if n == 0 { return Pose { position: core.v3_zero(), front: core.vec3(0.0, 0.0, 0.0 - 1.0), fov: 0.0 } }
+    fov_set = all_have_fov(p)
+    first = key_at(p, 0)
+    last = key_at(p, n - 1)
+    if n == 1 || t <= first.time {
+        f0 = 0.0
+        if fov_set { f0 = first.fov }
+        return Pose { position: first.position, front: key_front(first), fov: f0 }
+    }
+    if t >= last.time {
+        f1 = 0.0
+        if fov_set { f1 = last.fov }
+        return Pose { position: last.position, front: key_front(last), fov: f1 }
+    }
+    i = 0
+    while i < n - 2 && key_at(p, i + 1).time <= t { i = i + 1 }
+    a = key_at(p, i)
+    b = key_at(p, i + 1)
+    h = b.time - a.time
+    u = (t - a.time) / h
+
+    position = spline(p, i, 0, h, u)
+    front = core.vec3(0.0, 0.0, 0.0 - 1.0)
+    if a.kind == KEY_TARGET && b.kind == KEY_TARGET {
+        target = spline(p, i, 1, h, u)
+        d = core.v3_sub(target, position)
+        if core.v3_len(d) < 0.000001 {
+            front = slerp(key_front(a), key_front(b), u)
+        } else {
+            front = core.v3_normalize(d)
+        }
+    } else {
+        front = slerp(key_front(a), key_front(b), u)
+    }
+    fov = 0.0
+    if fov_set { fov = spline(p, i, 2, h, u).x }
+    return Pose { position: position, front: front, fov: fov }
+}
+
+// The camera put on a pose: its place, its look, and its field of view if
+// the pose has one.
+apply_pose(cam: *Camera, pose: Pose) {
+    if cam == null { return }
+    cam.position = pose.position
+    core.camera_look_at(cam, core.v3_add(pose.position, pose.front))
+    if pose.fov > 0.0 && pose.fov != cam.fov { core.camera_set_fov(cam, pose.fov) }
+}
+
+// The camera put where the path is at its playhead.
+apply(p: *CameraPath, cam: *Camera) {
+    if list.size(p.keys) == 0 { return }
+    apply_pose(cam, sample(p, p.head))
+    p.dirty = false
+}
+
+// --- playing ------------------------------------------------------------------------------------------------------
+
+path_time(p: *CameraPath) -> float { return p.head }
+path_playing(p: *CameraPath) -> bool { return p.is_playing }
+// Whether a path that is not looping has played to its end (or, backwards,
+// its start).
+path_finished(p: *CameraPath) -> bool { return p.is_finished }
+path_looping(p: *CameraPath) -> bool { return p.is_looping }
+path_rate(p: *CameraPath) -> float { return p.rate }
+
+set_loop(p: *CameraPath, on: bool) { p.is_looping = on }
+set_rate(p: *CameraPath, r: float) { p.rate = r }
+
+// Play from the playhead; a path that has finished plays again from the
+// end it stopped at, back the way it came if the rate is reversed.
+play(p: *CameraPath) {
+    if list.size(p.keys) == 0 { return }
+    if p.is_finished {
+        if p.rate >= 0.0 {
+            p.head = path_start(p)
+        } else {
+            p.head = path_end(p)
+        }
+        p.is_finished = false
+    }
+    p.is_playing = true
+    p.dirty = true
+}
+
+pause(p: *CameraPath) { p.is_playing = false }
+
+// Stopped, and back at the start.
+stop(p: *CameraPath) {
+    p.is_playing = false
+    p.is_finished = false
+    p.head = path_start(p)
+    p.dirty = true
+}
+
+// The playhead moved to `t`: held to the range of the keys, or, looping,
+// wrapped into it.
+seek(p: *CameraPath, t: float) {
+    p.head = hold(p, t)
+    p.is_finished = false
+    p.dirty = true
+}
+
+hold(p: *CameraPath, t: float) -> float {
+    lo = path_start(p)
+    hi = path_end(p)
+    span = hi - lo
+    r = t
+    if p.is_looping && span > 0.0 {
+        r = t - lo
+        while r >= span { r = r - span }
+        while r < 0.0 { r = r + span }
+        return lo + r
+    }
+    if r < lo { r = lo }
+    if r > hi { r = hi }
+    return r
+}
+
+// The playhead moved on by `delta` seconds of real time, at the rate. Where
+// a path that is not looping runs out it stops at the end, finished.
+advance(p: *CameraPath, delta: float) {
+    if !p.is_playing || list.size(p.keys) == 0 { return }
+    lo = path_start(p)
+    hi = path_end(p)
+    t = p.head + delta * p.rate
+    p.dirty = true
+    if p.is_looping && hi > lo {
+        p.head = hold(p, t)
+        return
+    }
+    if t >= hi && p.rate > 0.0 {
+        p.head = hi
+        p.is_playing = false
+        p.is_finished = true
+        return
+    }
+    if t <= lo && p.rate < 0.0 {
+        p.head = lo
+        p.is_playing = false
+        p.is_finished = true
+        return
+    }
+    p.head = hold(p, t)
+}
+
+update_path(state: ptr, e: *Engine, delta: float) {
+    p = state as *CameraPath
+    advance(p, delta)
+    if p.camera != null && p.dirty { apply(p, p.camera as *Camera) }
+}
+
+// The engine's update advances the path by its delta and puts `cam` on it
+// while it plays (and once after a seek). The engine's own camera loses its
+// fly controls (engine_set_camera_input off); a camera of the program's own
+// (a view's) has none to lose. A path is attached to one camera at a time.
+attach(e: *Engine, p: *CameraPath, cam: *Camera) {
+    if e == null || p == null || cam == null { return }
+    detach(p)
+    if cam == engine.engine_camera(e) { engine.engine_set_camera_input(e, false) }
+    b = engine.behaviour_new("campath", p as ptr)
+    b.update = update_path
+    engine.engine_add_behaviour(e, b)
+    p.engine = e as ptr
+    p.behaviour = b as ptr
+    p.camera = cam as ptr
+    p.dirty = true
+}
+
+detach(p: *CameraPath) {
+    if p == null || p.behaviour == null { return }
+    e = p.engine as *Engine
+    engine.engine_remove_behaviour(e, p.behaviour as *Behaviour)
+    heap.free(p.behaviour as *Behaviour)
+    p.behaviour = null
+    p.engine = null
+    p.camera = null
+}
