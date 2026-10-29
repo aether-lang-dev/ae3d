@@ -1392,6 +1392,61 @@ lands on the rows the numbers give, within a pixel; a crowd of foxes at
 their own poses the same; a walking group followed stays 55-62% of the
 height and never moves the camera further in a frame than it moved.
 
+### Camera controllers (#823)
+
+Two controllers, each a module of its own that the engine runs from its update
+(they are behaviours: `attach` adds one, `detach` takes it out). Neither is
+a scene component: they hold a few numbers and a list of keys, are made in
+code, and are not saved in a scene file. First-person is the character
+controller's, and the free-fly camera and the chase boom are the engine's
+(above).
+
+**`ae3d.orbitcam`** orbits a point, lifted from the editor's viewport (which
+now uses it, so there is one implementation). `orbit_new(target, distance,
+yaw, pitch)` (degrees); `orbit_apply(o, cam)` puts the camera at the eye and
+looks at the target; `orbit_turn(o, dx, dy)` is a drag in pixels
+(0.35 degrees a pixel), `orbit_zoom_step(o, closer)` and `orbit_zoom(o,
+notches)` the wheel (the distance by 1.12 a notch). Pitch is held to
+-85..85 degrees and the distance to 0.1..10000 by default
+(`orbit_set_limits`; the editor's are 8..8000). `orbit_from_camera` makes an
+orbit from where a camera stands and looks. `orbitcam.attach(e, o, cam)` has
+the engine read its input every update: the left mouse button dragged (after
+3 pixels, so a click is not a drag; `orbit_set_button` changes it), the
+wheel, and the arrow keys (90 degrees a second; `orbit_bind_zoom_keys` binds
+two keys to zoom). A menu that blocks the input moves nothing.
+Attached to the engine's own camera it switches the fly controls off
+(`engine_set_camera_input`); `orbit_set_active(o, false)` stands it down so
+that something else has the camera.
+
+**`ae3d.campath`** flies a camera along keys. A key is a time, a position,
+where to look and a field of view: `path_add_target(p, time, position,
+target, fov)` looks at a point, `path_add_look(p, time, position, yaw,
+pitch, fov)` along an orientation (a yaw and a pitch as the camera has
+them), `path_add_camera(p, time, cam)` reads one off a camera. `sample(p,
+t)` is the pose at a time, `apply(p, cam)` puts a camera on the playhead,
+`play`, `pause`, `stop`, `seek(p, t)`, `set_loop`, `set_rate` (negative
+plays backwards) and `advance(p, delta)` are the transport, and
+`campath.attach(e, p, cam)` advances it by the engine's delta each update and
+puts `cam` on it while it plays (and once after a seek).
+
+Position (and the field of view) go through the keys as a cubic Hermite
+spline with Catmull-Rom tangents, taken over the keys' times, so the speed
+has no jump at a key and keys at uneven times are flown at the speed they
+say. Between two target keys the target is interpolated the same way and
+looked at, so a camera circling a point keeps it in the middle of the
+frame; any other segment slerps the two look directions at a constant angular
+speed (the camera has no roll, so a direction is its orientation). A path
+is open: looping jumps from the last key to the first, so end a loop on its
+first key to make it seamless. See the module's header for the reasoning.
+
+**A view follows a path** by being drawn from a camera a path is attached to:
+`campath.attach(e, p, view_cam)` with the view's own camera
+(`core.camera_new`), and `engine_view_render(e, view, view_cam)` in a late
+update. `examples/camera_rig.ae` flies the engine's camera along a path and
+switches to an orbit with the 1 and 2 keys; `tests/test_camera_path.ae`
+holds the frames of both on Vulkan and OpenGL, and a view's, to a camera
+placed by hand.
+
 ### The scene's depth
 
 The occlusion, the reflection and the water read the scene's depth. On
