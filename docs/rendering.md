@@ -446,9 +446,11 @@ place and `engine_environment_error()` says why.
 The map is an equirectangular (latitude-longitude) Radiance `.hdr` (RGBE, flat
 or run-length, the four mirror orientations of its resolution line) or OpenEXR
 (`ae3d.envimage`, from the formats' descriptions, no library): scanline files,
-HALF or FLOAT, R G B (A) or a lone Y, compression NONE, RLE, ZIPS or ZIP, lines
-in any order and any data window. PIZ, PXR24, B44, B44A, DWAA, DWAB, tiled,
-deep and multipart files are refused by name. It is placed as a painted sky
+HALF or FLOAT, R G B (A) or a lone Y, compression NONE, RLE, ZIPS, ZIP or PIZ
+(`ae3d.exrpiz`, what Poly Haven's EXRs are), lines in any order and any data
+window. PXR24, B44, B44A, DWAA, DWAB, tiled, deep and multipart files are
+refused by name, and so is a map that is not twice as wide as it is tall (a cube
+cross, a mirror ball; the error names its size). It is placed as a painted sky
 is: the top row is the zenith and the middle column looks along +x. Its light
 is the engine's radiance times `intensity`: 1 is the file's own values, and
 exposure handles the rest.
@@ -1517,8 +1519,10 @@ there, not what a ray at the model's bounds would meet:
   columns read and not changed. The crowd's impostor tier is drawn as the
   quad it is.
 
-A particle's points, a surface added over the frame (flames) and the water
-are no one's: a pick sees through them. The pass runs only in a frame that was
+A particle's points, a surface added over the frame (flames), the water and
+world text (drawn after the pass) are no one's: a pick sees through them.
+Crowds are picked (above). The water stays out on purpose: a boat or a
+fishing cursor asks `water.simulation_height_at` on the CPU. The pass runs only in a frame that was
 asked, before the scene pass, in the same command buffer; a frame that asks
 nothing has no target, no pipeline and no draw. It draws at the scene's size
 (the render scale applies), one sample, with the frame's jitter: the world

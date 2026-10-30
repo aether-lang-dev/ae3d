@@ -33,6 +33,7 @@ import ae3d.core
 import ae3d.vulkan
 import ae3d.vkdevice
 import ae3d.vkpipes
+import ae3d.vkspirv
 import ae3d.loader
 
 extern calloc(count: int, size: int) -> ptr
@@ -47,9 +48,25 @@ const HEIGHT = 64
 // two, the passes' (composite, FXAA, bloom, depth copy, resolves, TAA, SSAO,
 // SSR, the sky's). Counted on 2026-10-26 (see the check below for the count).
 const FLOOR = 20
+// The pick's answers: a grid of PICKS_X by PICKS_Y pixels asked in one frame
+// (the frame answers for 16 at most), and the view that is drawn into a
+// rectangle of the frame.
+const PICKS_X = 4
+const PICKS_Y = 4
+const VIEW_W = 40
+const VIEW_H = 28
+const BLIT_X = 44
+const BLIT_Y = 30
 
 var g_checks = 0
 var g_failures = 0
+// What the last draw() found, for main to hold the MSL's to the SPIR-V's:
+// the pick's model ids, instances and depths, and the frame with a view
+// blitted into it.
+var g_pick_id: ptr = null
+var g_pick_instance: ptr = null
+var g_pick_depth: ptr = null
+var g_blit: ptr = null
 
 check(name: string, ok: bool) {
     g_checks = g_checks + 1
@@ -93,12 +110,96 @@ draw() -> ptr {
     bytes = WIDTH * HEIGHT * 4
     frame = calloc(bytes, 1)
     memcpy(frame, vulkan.offscreen_pixels(), bytes)
+
+    // The pick pass (pick_quoted.frag): a grid of pixels asked in one frame,
+    // the ids and depths it wrote read back.
+    if g_pick_id != null { free(g_pick_id) }
+    if g_pick_instance != null { free(g_pick_instance) }
+    if g_pick_depth != null { free(g_pick_depth) }
+    g_pick_id = calloc(PICKS_X * PICKS_Y, 4)
+    g_pick_instance = calloc(PICKS_X * PICKS_Y, 4)
+    g_pick_depth = calloc(PICKS_X * PICKS_Y, 4)
+    asked = calloc(PICKS_X * PICKS_Y, 4)
+    n = 0
+    while n < PICKS_X * PICKS_Y {
+        px = (n % PICKS_X) * (WIDTH / PICKS_X) + WIDTH / PICKS_X / 2
+        py = (n / PICKS_X) * (HEIGHT / PICKS_Y) + HEIGHT / PICKS_Y / 2
+        (asked as int[])[n] = core.backend_pick_ask(&pass, px, py)
+        n = n + 1
+    }
+    core.backend_render(&pass, cam, light)
+    n = 0
+    while n < PICKS_X * PICKS_Y {
+        px = (n % PICKS_X) * (WIDTH / PICKS_X) + WIDTH / PICKS_X / 2
+        py = (n / PICKS_X) * (HEIGHT / PICKS_Y) + HEIGHT / PICKS_Y / 2
+        got = core.backend_pick_read(&pass, (asked as int[])[n], cam, px, py, WIDTH, HEIGHT)
+        if got.hit {
+            (g_pick_id as int[])[n] = got.model_id
+            (g_pick_instance as int[])[n] = got.instance
+            (g_pick_depth as f32[])[n] = got.depth as f32
+        }
+        n = n + 1
+    }
+    free(asked)
+
+    // The view blit (view_blit_quoted.frag): a view that looks at the box from
+    // close by, drawn into a rectangle of the frame.
+    view_cam = core.camera_new(VIEW_W, VIEW_H)
+    core.camera_set_position(view_cam, core.vec3(22.0, 10.0, 40.0))
+    core.camera_look_at(view_cam, core.vec3(22.0, 0.0, 0.0 - 10.0))
+    v = core.backend_view_new(&pass, VIEW_W, VIEW_H)
+    core.backend_view_render(&pass, v, view_cam, light)
+    // A blit is asked for the next frame alone.
+    core.backend_view_blit(&pass, v, BLIT_X, BLIT_Y, VIEW_W, VIEW_H)
+    core.backend_render(&pass, cam, light)
+    if g_blit != null { free(g_blit) }
+    g_blit = calloc(bytes, 1)
+    memcpy(g_blit, vulkan.offscreen_pixels(), bytes)
+    core.backend_view_free(&pass, v)
+    core.camera_free(view_cam)
+
     core.camera_free(cam)
     vulkan.renderer_free(renderer)
     core.model_free(ball)
     core.model_free(box)
     core.light_free(light)
     return frame
+}
+
+copy_of(p: ptr, bytes: int) -> ptr {
+    c = calloc(bytes, 1)
+    memcpy(c, p, bytes)
+    return c
+}
+
+// How many of the frames' channels differ, and the worst by.
+channels_differ(a: ptr, b: ptr, bytes: int) -> int {
+    differ = 0
+    i = 0
+    while i < bytes {
+        d = mem.get_byte(a, i) - mem.get_byte(b, i)
+        if d != 0 { differ = differ + 1 }
+        i = i + 1
+    }
+    return differ
+}
+
+// An id as an offset from its run's lowest; a pixel nothing is at stays 0 - 1.
+offset_of(id: int, base: int) -> int {
+    if id <= 0 { return 0 - 1 }
+    return id - base
+}
+
+// The lowest model id a pick named (0 where it named none).
+lowest_id(ids: ptr, n: int) -> int {
+    low = 0
+    k = 0
+    while k < n {
+        id = (ids as int[])[k]
+        if id > 0 && (low == 0 || id < low) { low = id }
+        k = k + 1
+    }
+    return low
 }
 
 lit_pixels(frame: ptr) -> int {
@@ -126,14 +227,60 @@ main() {
             spirv = draw()
             if spirv != null {
                 check("the SPIR-V draw made no module from MSL", vkpipes.msl_made() == 0)
+                grid = PICKS_X * PICKS_Y
+                spirv_id = copy_of(g_pick_id, grid * 4)
+                spirv_instance = copy_of(g_pick_instance, grid * 4)
+                spirv_depth = copy_of(g_pick_depth, grid * 4)
+                spirv_blit = copy_of(g_blit, WIDTH * HEIGHT * 4)
+                hits = 0
+                ids_seen = 0
+                first_id = 0
+                k = 0
+                while k < grid {
+                    id = (spirv_id as int[])[k]
+                    if id > 0 {
+                        hits = hits + 1
+                        if first_id == 0 { first_id = id }
+                        if id != first_id { ids_seen = 1 }
+                    }
+                    k = k + 1
+                }
+                check("the SPIR-V pick names the scene's models (${hits} of ${grid} pixels hit, more than one model: ${ids_seen})",
+                      hits >= 3 && hits < grid && ids_seen == 1)
+                check("the SPIR-V frame with a view blitted in differs from the plain frame (the blit drew)",
+                      channels_differ(spirv, spirv_blit, WIDTH * HEIGHT * 4) > 100)
+                check("the SPIR-V draws made no pick or view-blit pixel shader from MSL",
+                      vkpipes.msl_made_for(vkspirv.PICK_QUOTED_FRAG) == 0 && vkpipes.msl_made_for(vkspirv.VIEW_BLIT_QUOTED_FRAG) == 0)
                 check("its frame has the scene in it (${lit_pixels(spirv)} of ${WIDTH * HEIGHT} pixels lit)",
                       lit_pixels(spirv) > WIDTH * HEIGHT / 10 && lit_pixels(spirv) < WIDTH * HEIGHT)
                 vkdevice.set_msl(true)
                 msl = draw()
                 made = vkpipes.msl_made()
                 check("the MSL draw made ${made} pixel-shader modules from MSL (at least ${FLOOR})", made >= FLOOR)
+                check("pick_quoted.frag was made from MSL (${vkpipes.msl_made_for(vkspirv.PICK_QUOTED_FRAG)} module)",
+                      vkpipes.msl_made_for(vkspirv.PICK_QUOTED_FRAG) >= 1)
+                check("view_blit_quoted.frag was made from MSL (${vkpipes.msl_made_for(vkspirv.VIEW_BLIT_QUOTED_FRAG)} module)",
+                      vkpipes.msl_made_for(vkspirv.VIEW_BLIT_QUOTED_FRAG) >= 1)
                 if msl != null {
                     bytes = WIDTH * HEIGHT * 4
+                    // A model's id is a counter's, so the second draw's models
+                    // are numbered after the first's: each run's ids are held
+                    // as offsets from its own lowest (the sphere, added first).
+                    base_spirv = lowest_id(spirv_id, grid)
+                    base_msl = lowest_id(g_pick_id, grid)
+                    pick_wrong = 0
+                    k = 0
+                    while k < grid {
+                        if offset_of((g_pick_id as int[])[k], base_msl) != offset_of((spirv_id as int[])[k], base_spirv) { pick_wrong = pick_wrong + 1 }
+                        if (g_pick_instance as int[])[k] != (spirv_instance as int[])[k] { pick_wrong = pick_wrong + 1 }
+                        if (g_pick_depth as f32[])[k] != (spirv_depth as f32[])[k] { pick_wrong = pick_wrong + 1 }
+                        k = k + 1
+                    }
+                    check("the MSL pick answers the SPIR-V's, id, instance and depth (${pick_wrong} of ${grid * 3} answers differ)",
+                          pick_wrong == 0)
+                    blit_differ = channels_differ(g_blit, spirv_blit, bytes)
+                    check("the MSL view blit's frame is the SPIR-V's, byte for byte (${blit_differ} of ${bytes} channels differ)",
+                          blit_differ == 0)
                     differ = 0
                     worst = 0
                     i = 0
@@ -148,12 +295,21 @@ main() {
                     check("the MSL's frame is the SPIR-V's, byte for byte (${differ} of ${bytes} channels differ, worst ${worst})", differ == 0)
                     free(msl)
                 }
+                free(spirv_id)
+                free(spirv_instance)
+                free(spirv_depth)
+                free(spirv_blit)
                 free(spirv)
             }
         }
     } else {
         println("  skip MSL modules are MoltenVK's (macOS only)")
     }
+
+    if g_pick_id != null { free(g_pick_id) }
+    if g_pick_instance != null { free(g_pick_instance) }
+    if g_pick_depth != null { free(g_pick_depth) }
+    if g_blit != null { free(g_blit) }
 
     // ci.sh passes a suite on this line.
     if g_failures == 0 {
