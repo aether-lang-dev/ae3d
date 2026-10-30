@@ -1,0 +1,339 @@
+// ci: optimised -- its run is CPU work -O0 makes three to six times slower
+// The camera controllers' frames (#823), on both backends: a keyframed path
+// and an orbit camera put on a camera that draws a scene, and a view drawn
+// from a camera a path is on.
+//
+//   - at a key's time the path's frame is the frame of a camera placed at
+//     that key by hand (position, target and field of view), to the pixel;
+//   - between keys, and at other keys, the frames are different pictures;
+//   - an orbit pose is the frame of a camera put at that eye looking at the
+//     target by hand, and turning it changes the picture;
+//   - a view drawn from the camera a path is on is the view of a camera
+//     placed by hand at the path's pose, and differs from the view an
+//     earlier time gave.
+//
+// Then Vulkan's frames are held to OpenGL's. AE3D_MSAA=0 draws both with one
+// sample (the whole frame agrees); at 4 samples only the edges differ.
+// AE3D_PARITY_DUMP=<dir> writes the frames.
+
+import std.mem
+import std.os
+import std.string
+import ae3d.core
+import ae3d.png
+import ae3d.gl
+import ae3d.vulkan
+import ae3d.offscreen
+import ae3d.loader
+import ae3d.campath
+import ae3d.orbitcam
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, bytes: int) -> ptr
+extern exit(code: int)
+
+const WIDTH = 256
+const HEIGHT = 192
+const VIEW_W = 128
+const VIEW_H = 96
+const SHOTS = 11
+
+var failures = 0
+var checks = 0
+
+check(name: string, ok: bool) {
+    checks = checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        failures = failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+channel(pixels: ptr, index: int) -> int { return mem.get_byte(pixels, index) }
+
+kept(pixels: ptr, w: int, h: int) -> ptr {
+    copy = calloc(w * h, 4)
+    memcpy(copy, pixels, w * h * 4)
+    return copy
+}
+
+dump(name: string, backend: string, pixels: ptr, w: int, h: int) {
+    dir = core.text(os.getenv("AE3D_PARITY_DUMP"))
+    if dir == "" { return }
+    png.write("${dir}/camera_path_${name}_${backend}.png", pixels, w, h)
+}
+
+// How many channels of two frames are more than 8 apart.
+apart(a: ptr, b: ptr, w: int, h: int) -> int {
+    n = 0
+    i = 0
+    while i < w * h * 4 {
+        if i % 4 != 3 {
+            d = channel(a, i) - channel(b, i)
+            if d < 0 { d = 0 - d }
+            if d > 8 { n = n + 1 }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+v(x: float, y: float, z: float) -> Vec3 { return core.vec3(x, y, z) }
+
+const CENTRE_Y = 12.0
+
+// The example's path, shorter: keys at 0, 3, 6 seconds, the field of view narrowing.
+build_path() -> *CameraPath {
+    p = campath.path_new()
+    centre = v(0.0, CENTRE_Y, 0.0)
+    campath.path_add_target(p, 0.0, v(0.0, 30.0, 95.0), centre, 45.0)
+    campath.path_add_target(p, 3.0, v(90.0, 18.0, 40.0), centre, 40.0)
+    campath.path_add_target(p, 6.0, v(70.0, 45.0, 0.0 - 70.0), centre, 32.0)
+    return p
+}
+
+// A camera placed by hand where key `k` of the path's keys is.
+by_hand(cam: *Camera, x: float, y: float, z: float, fov: float) {
+    core.camera_set_position(cam, v(x, y, z))
+    core.camera_look_at(cam, v(0.0, CENTRE_Y, 0.0))
+    core.camera_set_fov(cam, fov)
+}
+
+scene() -> ptr {
+    // The models of one backend: [ground, four pieces].
+    models = calloc(5, 8)
+    list = models as ptr[]
+    ground = loader.cube(1.0)
+    core.model_set_scale(ground, 400.0, 2.0, 400.0)
+    core.model_set_position(ground, 0.0, 0.0 - 1.0, 0.0)
+    core.model_set_diffuse(ground, 0.35, 0.4, 0.35)
+    list[0] = ground as ptr
+    k = 0
+    while k < 4 {
+        angle = (k as float) * 1.5707964
+        piece = null as *Model
+        if k % 2 == 0 {
+            piece = loader.cube(1.0)
+        } else {
+            piece = loader.sphere(0.5, 24, 16)
+        }
+        core.model_set_scale(piece, 16.0, 16.0 + (k as float) * 4.0, 16.0)
+        core.model_set_position(piece, 38.0 * core.cos_of(angle), 8.0 + (k as float) * 2.0, 38.0 * core.sin_of(angle))
+        core.model_set_diffuse(piece, 0.9 - (k as float) * 0.2, 0.3 + (k as float) * 0.15, 0.2 + (k as float) * 0.2)
+        list[k + 1] = piece as ptr
+        k = k + 1
+    }
+    return models
+}
+
+// One backend's frames.
+//   0 path at 0 s            1 path at 1.5 s       2 path at 3 s (a key)
+//   3 a camera by hand at that key
+//   4 path at 4.5 s          5 path at 6 s (the last key)
+//   6 orbit, yaw 90 pitch 20 7 a camera by hand at that eye
+//   8 orbit turned 60 degrees
+//   9, 10 views: from the path at 0 s and at 3 s (on its camera); 11 by hand at the key
+struct Shots {
+    frame: ptr[12]
+    view: ptr[3]
+}
+
+take(pass: *Backend, which: int, target: ptr, cam: *Camera, light: *Light) -> ptr {
+    core.backend_render(pass, cam, light)
+    if which == 0 { return kept(offscreen.target_pixels(target), WIDTH, HEIGHT) }
+    return kept(vulkan.offscreen_pixels(), WIDTH, HEIGHT)
+}
+
+view_of(pass: *Backend, view: int, cam: *Camera, light: *Light) -> ptr {
+    core.backend_view_render(pass, view, cam, light)
+    return kept(core.backend_view_pixels(pass, view), VIEW_W, VIEW_H)
+}
+
+shoot(pass: *Backend, which: int, target: ptr, light: *Light) -> *Shots {
+    s = calloc(1, sizeof(Shots)) as *Shots
+    cam = core.camera_new(WIDTH, HEIGHT)
+    hand = core.camera_new(WIDTH, HEIGHT)
+    p = build_path()
+
+    // The path onto the window's camera, as the engine's update does.
+    campath.seek(p, 0.0)
+    campath.apply(p, cam)
+    s.frame[0] = take(pass, which, target, cam, light)
+    campath.seek(p, 1.5)
+    campath.apply(p, cam)
+    s.frame[1] = take(pass, which, target, cam, light)
+    campath.seek(p, 3.0)
+    campath.apply(p, cam)
+    s.frame[2] = take(pass, which, target, cam, light)
+    by_hand(hand, 90.0, 18.0, 40.0, 40.0)
+    s.frame[3] = take(pass, which, target, hand, light)
+    campath.seek(p, 4.5)
+    campath.apply(p, cam)
+    s.frame[4] = take(pass, which, target, cam, light)
+    campath.seek(p, 6.0)
+    campath.apply(p, cam)
+    s.frame[5] = take(pass, which, target, cam, light)
+
+    // The orbit.
+    o = orbitcam.orbit_new(v(0.0, CENTRE_Y, 0.0), 100.0, 90.0, 20.0)
+    core.camera_set_fov(cam, 45.0)
+    orbitcam.orbit_apply(o, cam)
+    s.frame[6] = take(pass, which, target, cam, light)
+    eye = orbitcam.orbit_eye(o)
+    core.camera_set_position(hand, eye)
+    core.camera_look_at(hand, v(0.0, CENTRE_Y, 0.0))
+    core.camera_set_fov(hand, 45.0)
+    s.frame[7] = take(pass, which, target, hand, light)
+    orbitcam.orbit_turn(o, 60.0 / 0.35, 0.0)
+    orbitcam.orbit_apply(o, cam)
+    s.frame[8] = take(pass, which, target, cam, light)
+
+    // A view drawn from a camera the path is on.
+    view_cam = core.camera_new(VIEW_W, VIEW_H)
+    view = core.backend_view_new(pass, VIEW_W, VIEW_H)
+    campath.seek(p, 0.0)
+    campath.apply(p, view_cam)
+    s.view[0] = view_of(pass, view, view_cam, light)
+    campath.seek(p, 3.0)
+    campath.apply(p, view_cam)
+    s.view[1] = view_of(pass, view, view_cam, light)
+    by_hand(hand, 90.0, 18.0, 40.0, 40.0)
+    core.camera_set_aspect(hand, (VIEW_W as float) / (VIEW_H as float))
+    s.view[2] = view_of(pass, view, hand, light)
+    core.backend_view_free(pass, view)
+
+    core.camera_free(view_cam)
+    core.camera_free(cam)
+    core.camera_free(hand)
+    campath.path_free(p)
+    orbitcam.orbit_free(o)
+    return s
+}
+
+free_shots(s: *Shots) {
+    k = 0
+    while k < 9 { free(s.frame[k]) ; k = k + 1 }
+    k = 0
+    while k < 3 { free(s.view[k]) ; k = k + 1 }
+    free(s)
+}
+
+frames_per_pixel() -> int { return WIDTH * HEIGHT * 3 }
+
+judge(name: string, s: *Shots) {
+    println(name)
+    total = frames_per_pixel()
+    check("${name}: the path at 0 s and at 1.5 s are different pictures", apart(s.frame[0], s.frame[1], WIDTH, HEIGHT) * 50 > total)
+    check("${name}: 1.5 s and the key at 3 s differ", apart(s.frame[1], s.frame[2], WIDTH, HEIGHT) * 50 > total)
+    check("${name}: 4.5 s and 6 s differ", apart(s.frame[4], s.frame[5], WIDTH, HEIGHT) * 50 > total)
+    n = apart(s.frame[2], s.frame[3], WIDTH, HEIGHT)
+    check("${name}: at the key the path's frame is the hand-placed camera's (${n} channels)", n == 0)
+    n = apart(s.frame[6], s.frame[7], WIDTH, HEIGHT)
+    check("${name}: the orbit's frame is the camera put at its eye by hand (${n} channels)", n == 0)
+    check("${name}: turning the orbit changes the picture", apart(s.frame[6], s.frame[8], WIDTH, HEIGHT) * 50 > total)
+    vtotal = VIEW_W * VIEW_H * 3
+    n = apart(s.view[1], s.view[2], VIEW_W, VIEW_H)
+    check("${name}: a view from the camera the path is on is the hand-placed camera's view (${n} channels)", n == 0)
+    check("${name}: and the view at 0 s is another picture", apart(s.view[0], s.view[1], VIEW_W, VIEW_H) * 50 > vtotal)
+}
+
+main() {
+    if !vulkan.available() {
+        println("camera path: SKIP no Vulkan driver (${vulkan.last_error()})")
+        return
+    }
+    context = offscreen.context_create(WIDTH, HEIGHT)
+    if context == null {
+        println("camera path: SKIP no OpenGL context")
+        return
+    }
+    light = core.light_sun(v(0.3, 0.6, 0.8))
+
+    gl_renderer = gl.renderer_new()
+    opengl_pass = gl.backend(gl_renderer)
+    check("opengl started", core.backend_init(&opengl_pass, context, WIDTH, HEIGHT))
+    target = offscreen.target_create(WIDTH, HEIGHT)
+    gl.renderer_set_target(gl_renderer, target)
+    gl.renderer_set_clear_color(gl_renderer, 0.0, 0.0, 0.0)
+    one_sample = core.env_int("AE3D_MSAA", 0 - 1) == 0
+    if one_sample { gl.renderer_set_msaa(gl_renderer, false) }
+
+    vk_renderer = vulkan.renderer_new()
+    if one_sample { vulkan.set_samples(1) }
+    vulkan_pass = vulkan.backend(vk_renderer)
+    if !core.backend_init(&vulkan_pass, null, WIDTH, HEIGHT) {
+        println("camera path: SKIP Vulkan would not start (${vulkan.last_error()})")
+        return
+    }
+    vulkan.renderer_set_clear_color(vk_renderer, 0.0, 0.0, 0.0)
+
+    gl_models = scene()
+    vk_models = scene()
+    gl_list = gl_models as ptr[]
+    vk_list = vk_models as ptr[]
+    k = 0
+    while k < 5 {
+        core.backend_add_model(&opengl_pass, gl_list[k] as *Model)
+        core.backend_add_model(&vulkan_pass, vk_list[k] as *Model)
+        k = k + 1
+    }
+
+    gl_shots = shoot(&opengl_pass, 0, target, light)
+    judge("OpenGL", gl_shots)
+    vk_shots = shoot(&vulkan_pass, 1, null, light)
+    judge("Vulkan", vk_shots)
+
+    println("Vulkan against OpenGL")
+    names = ["path at 0 s", "path at 1.5 s", "path at the key, 3 s", "path at 4.5 s", "path at 6 s", "orbit", "orbit turned"]
+    which_frames = [0, 1, 2, 4, 5, 6, 8]
+    k = 0
+    while k < 7 {
+        n = apart(gl_shots.frame[which_frames[k]], vk_shots.frame[which_frames[k]], WIDTH, HEIGHT)
+        println("  ${names[k]}: ${n} of ${WIDTH * HEIGHT * 3} channels differ")
+        // One sample: the frames agree to the pixel but for rounding. Four:
+        // only the edges of the cubes and spheres differ.
+        share = 3
+        if one_sample { share = 1 }
+        check("${names[k]}: the two backends agree (${n} channels)", n * 100 < WIDTH * HEIGHT * 3 * share)
+        dump(names[k], "opengl", gl_shots.frame[which_frames[k]], WIDTH, HEIGHT)
+        dump(names[k], "vulkan", vk_shots.frame[which_frames[k]], WIDTH, HEIGHT)
+        k = k + 1
+    }
+    n = apart(gl_shots.view[1], vk_shots.view[1], VIEW_W, VIEW_H)
+    println("  the view at the key: ${n} of ${VIEW_W * VIEW_H * 3} channels differ")
+    check("the view at the key: the two backends agree (${n} channels)", n * 100 < VIEW_W * VIEW_H * 3)
+
+    free_shots(gl_shots)
+    free_shots(vk_shots)
+    k = 0
+    while k < 5 {
+        core.backend_remove_model(&opengl_pass, gl_list[k] as *Model)
+        core.backend_remove_model(&vulkan_pass, vk_list[k] as *Model)
+        k = k + 1
+    }
+    core.backend_cleanup(&opengl_pass)
+    core.backend_cleanup(&vulkan_pass)
+    offscreen.target_destroy(target)
+    offscreen.context_destroy(context)
+    k = 0
+    while k < 5 {
+        core.model_free(gl_list[k] as *Model)
+        core.model_free(vk_list[k] as *Model)
+        k = k + 1
+    }
+    free(gl_models)
+    free(vk_models)
+    gl.renderer_free(gl_renderer)
+    vulkan.renderer_free(vk_renderer)
+    core.light_free(light)
+
+    if failures == 0 {
+        println("camera path: all checks passed (${checks})")
+        return
+    }
+    println("camera path: ${failures} of ${checks} checks failed")
+    exit(1)
+}
