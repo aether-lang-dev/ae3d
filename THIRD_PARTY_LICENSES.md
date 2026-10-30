@@ -105,3 +105,10 @@ wrote the PIZ test fixtures and the decodes they are held to.
 
 `tests/fixtures/env/polyhaven/` holds two 1k HDRIs from [Poly Haven](https://polyhaven.com), published under
 CC0 1.0 (public domain); see `tests/fixtures/env/PIZ.md` for the assets and their URLs.
+
+## 100STYLE (tests/fixtures/people/100style/)
+
+Cuts of motion capture takes from [the 100STYLE dataset](https://ianxmason.github.io/100style/), "The 100STYLE
+Dataset - Ian Mason", licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/legalcode). Each
+file is a range of frames of one of the dataset's BVH files, otherwise unchanged; `tests/fixtures/people/README.md`
+names the file and frames each was cut from. Test fixtures only: no build or program ships them.

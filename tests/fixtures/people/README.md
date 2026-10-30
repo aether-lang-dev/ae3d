@@ -11,3 +11,21 @@ All three files are by Quaternius and are dedicated to the public domain under [
 | `ual1_rigify.glb` | A mannequin on a Rigify-named skeleton (`DEF-hips`, `DEF-thigh.L`, 53 joints), with 46 clips from Universal Animation Library Standard: `Idle_Loop`, `Walk_Loop`, `Jog_Fwd_Loop`, `Sprint_Loop`, crouch, jumps, sitting, hits, death, roll, pistol and sword. | `Godot/AnimationLibrary_Godot_Standard.glb` in https://opengameart.org/sites/default/files/universal_animation_librarystandard.zip (zip sha256 `18ff1a7215f4852b320203e8aaf02a1578b5c8eef9027fbaedfcedc7b85a3ac2`) | `1b7bf67866360665426bb99e4c71bd619f19b408453c24e30f0c3071601eee5c` |
 
 Each archive's `License.txt` reads: "CC0 1.0 Universal (CC0 1.0) Public Domain Dedication. Models by @Quaternius."
+
+## 100STYLE: motion capture (`100style/`)
+
+Cuts of the Neutral style of [the 100STYLE dataset](https://ianxmason.github.io/100style/) by Ian Mason, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/): "The 100STYLE Dataset - Ian Mason" (Mason, Starke and Komura, *Real-Time Style Modelling of Human Locomotion via Feature-Wise Transformations and Local Motion Phases*, 2022). The takes are Xsens inertial captures at 60 frames a second, in centimetres, of one actor walking and running around a capture volume for minutes at a time. Each file here is a stretch of one take where the figure goes straight (or, for the stop and the start, where it comes to a stand and leaves it), cut by `tools/bvh_cut.ae`: the skeleton and the frames exactly as the dataset has them, and nothing else changed. The retargeter is held to them (`tests/test_anim_pipeline.ae`), and the blend spaces, starts, stops and turns are made from them.
+
+The dataset's `100STYLE.zip` (Zenodo record 8127870, md5 `3cf627852fd8192024c04a8d0ef49583`), `100STYLE/Neutral/`:
+
+| file | what it is | source file and frames (from 0) | sha256 |
+|---|---|---|---|
+| `neutral_fw.bvh` | a walk forward, 0.82 m/s | `Neutral_FW.bvh` 528 to 768 | `1f89cacb0aa09abbc0a4553e03157bcec479286ae060ec2d721b56b06881cc32` |
+| `neutral_bw.bvh` | a walk backward, 0.68 m/s | `Neutral_BW.bvh` 6702 to 6942 | `d66799e803a85591b4d6f0e4e8c1a2dfa0ce83154cfe96dc3cca3dd35be4647d` |
+| `neutral_sw.bvh` | a walk sideways, 0.52 m/s | `Neutral_SW.bvh` 1624 to 1864 | `a2464a5d09982dab338c2254c72a95b251ef14bf36ceea372b69162593fdae96` |
+| `neutral_fr.bvh` | a run forward, 1.4 m/s | `Neutral_FR.bvh` 499 to 631 | `91235d3cd6142d35168847e6eecafa2cad8e0f2b03f1eb1e1bed3b21b904bed8` |
+| `neutral_br.bvh` | a run backward, 1.1 m/s | `Neutral_BR.bvh` 785 to 917 | `77ab9272623e495aa7e9c4290869b34ede8939c2fd5f15a6ea98f5b31f37425b` |
+| `neutral_sr.bvh` | a run sideways, 1.3 m/s | `Neutral_SR.bvh` 1136 to 1268 | `87b4c3963d96a309b01d8bced0a300532a7622bbb6c630f1ebafb6c34d726acd` |
+| `neutral_tr1.bvh` | walking turns | `Neutral_TR1.bvh` 6128 to 6368 | `f2acba066f0f68b02ac84b5e7ef7779ae78337e921715930977b995dcb5642a8` |
+| `neutral_stop.bvh` | walking in, coming to a stand, standing | `Neutral_ID.bvh` 150 to 630 | `9a3ef0a411e6b68621e7c5f3005d338a09d139f1e470373fa5b0eb31058e1aa8` |
+| `neutral_start.bvh` | standing, then walking off | `Neutral_ID.bvh` 1620 to 1890 | `f3620aabf95fbe0cf340d018ad6f4c6534519ee0cebe24d3f70c8ea825398b15` |
