@@ -14,18 +14,18 @@ Each archive's `License.txt` reads: "CC0 1.0 Universal (CC0 1.0) Public Domain D
 
 ## 100STYLE: motion capture (`100style/`)
 
-Cuts of the Neutral style of [the 100STYLE dataset](https://ianxmason.github.io/100style/) by Ian Mason, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/): "The 100STYLE Dataset - Ian Mason" (Mason, Starke and Komura, *Real-Time Style Modelling of Human Locomotion via Feature-Wise Transformations and Local Motion Phases*, 2022). The takes are Xsens inertial captures at 60 frames a second, in centimetres, of one actor walking and running around a capture volume for minutes at a time. Each file here is a stretch of one take where the figure goes straight (or, for the stop and the start, where it comes to a stand and leaves it), cut by `tools/bvh_cut.ae`: the skeleton and the frames exactly as the dataset has them, and nothing else changed. The retargeter is held to them (`tests/test_anim_pipeline.ae`), and the blend spaces, starts, stops and turns are made from them.
+Cuts of the Neutral style of [the 100STYLE dataset](https://ianxmason.github.io/100style/) by Ian Mason, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/): "The 100STYLE Dataset - Ian Mason" (Mason, Starke and Komura, *Real-Time Style Modelling of Human Locomotion via Feature-Wise Transformations and Local Motion Phases*, 2022). The takes are Xsens inertial captures at 60 frames a second, in centimetres, of one actor walking and running around a capture volume for minutes at a time. Each locomotion file here is whole strides of one take, from a left footfall to a left footfall, where both the figure's travel and its hips keep their direction best (the stop and the start are where it comes to a stand and leaves it), cut by `tools/bvh_cut.ae`: the skeleton and the frames exactly as the dataset has them, and nothing else changed. The retargeter is held to them (`tests/test_anim_pipeline.ae`), and the blend spaces, starts, stops and turns are made from them.
 
 The dataset's `100STYLE.zip` (Zenodo record 8127870, md5 `3cf627852fd8192024c04a8d0ef49583`), `100STYLE/Neutral/`:
 
 | file | what it is | source file and frames (from 0) | sha256 |
 |---|---|---|---|
-| `neutral_fw.bvh` | a walk forward, 0.82 m/s | `Neutral_FW.bvh` 528 to 768 | `1f89cacb0aa09abbc0a4553e03157bcec479286ae060ec2d721b56b06881cc32` |
-| `neutral_bw.bvh` | a walk backward, 0.68 m/s | `Neutral_BW.bvh` 6702 to 6942 | `d66799e803a85591b4d6f0e4e8c1a2dfa0ce83154cfe96dc3cca3dd35be4647d` |
-| `neutral_sw.bvh` | a walk sideways, 0.52 m/s | `Neutral_SW.bvh` 1624 to 1864 | `a2464a5d09982dab338c2254c72a95b251ef14bf36ceea372b69162593fdae96` |
-| `neutral_fr.bvh` | a run forward, 1.4 m/s | `Neutral_FR.bvh` 499 to 631 | `91235d3cd6142d35168847e6eecafa2cad8e0f2b03f1eb1e1bed3b21b904bed8` |
-| `neutral_br.bvh` | a run backward, 1.1 m/s | `Neutral_BR.bvh` 785 to 917 | `77ab9272623e495aa7e9c4290869b34ede8939c2fd5f15a6ea98f5b31f37425b` |
-| `neutral_sr.bvh` | a run sideways, 1.3 m/s | `Neutral_SR.bvh` 1136 to 1268 | `87b4c3963d96a309b01d8bced0a300532a7622bbb6c630f1ebafb6c34d726acd` |
-| `neutral_tr1.bvh` | walking turns | `Neutral_TR1.bvh` 6128 to 6368 | `f2acba066f0f68b02ac84b5e7ef7779ae78337e921715930977b995dcb5642a8` |
+| `neutral_fw.bvh` | a walk forward, three strides, 0.83 m/s | `Neutral_FW.bvh` 1836 to 1974 | `fb0aeb4ab1bb4c56beddd1a8be2f7c08715a30b84b01afa483cd2688d8d7fcc7` |
+| `neutral_bw.bvh` | a walk backward, 0.70 m/s | `Neutral_BW.bvh` 6732 to 6866 | `55a302533c24f34118224be5e5a1df26a2ad3288e1e2939dbd39a7174265297c` |
+| `neutral_sw.bvh` | a walk sideways, 0.60 m/s | `Neutral_SW.bvh` 2199 to 2347 | `4a4a47b9d6dcfe4814f0f6ff727bb24d305b59f07b81c1a246fb05d0aeada3ef` |
+| `neutral_fr.bvh` | a run forward, 1.75 m/s | `Neutral_FR.bvh` 499 to 577 | `1f3e394493c1ebb1d75f968f57781eb98868adc899ba19a7339587223ae97457` |
+| `neutral_br.bvh` | a run backward, 1.40 m/s | `Neutral_BR.bvh` 508 to 575 | `af06ec64f5afe64228ca968754d67e21adb311999da94f36dd238e2503429c6d` |
+| `neutral_sr.bvh` | a run sideways, 1.51 m/s | `Neutral_SR.bvh` 2685 to 2760 | `ccfc5b8f3d27fc04b989d4e5df62a9b09caec7f2fb649f3e58fc53cb0fb4b0ab` |
+| `neutral_tr1.bvh` | walking turns | `Neutral_TR1.bvh` 6158 to 6338 | `95e2599479e9c868312b908fd116a1740296cbb11efdee711520ce033ac9ba41` |
 | `neutral_stop.bvh` | walking in, coming to a stand, standing | `Neutral_ID.bvh` 150 to 630 | `9a3ef0a411e6b68621e7c5f3005d338a09d139f1e470373fa5b0eb31058e1aa8` |
 | `neutral_start.bvh` | standing, then walking off | `Neutral_ID.bvh` 1620 to 1890 | `f3620aabf95fbe0cf340d018ad6f4c6534519ee0cebe24d3f70c8ea825398b15` |
