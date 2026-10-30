@@ -1,0 +1,632 @@
+// Inverse kinematics over poses (#853, layer 3).
+//
+// The animator's last word on a pose before it is drawn, in the rig's space:
+// the clip said where the limbs go, the world says where they can.
+//
+// Feet: each foot over the ground under it, at the height the clip gives it
+// over its own floor. The clip was made on a floor level with the figure's
+// feet; where the ground is higher or lower under a foot, the foot goes with
+// it. The pelvis comes down by as much as the lower foot needs, so a leg
+// stepping down a stair reaches, and each leg is solved again from the hip:
+// two bones, the knee kept in the plane the clip bent it in, the reach eased
+// off as the leg straightens (soft IK) so a knee never snaps to straight.
+// While the clip has a foot down, the foot is locked where it came down, and
+// let go over RELEASE once the clip lifts it. The animator plays its takes at
+// the speed the figure moves, so a lock holds what a speed or a turn would
+// otherwise slide, a few centimetres at most. A planted foot lies on the
+// surface's slope.
+//
+// Look: the head turned toward a point, the turn shared by the upper spine,
+// the neck and the head (a fifth, three tenths and half), never past LOOK_MOST
+// from where the clip faces it.
+
+import std.heap
+import ae3d.core
+import ae3d.behaviour
+import ae3d.physics
+import ae3d.pose
+
+exports (
+    Feet, Look, RELEASE, LOCK_SLIP,
+    feet_new, feet_free, feet_ground_physics, feet_set_lock, feet_set_weight, feet_solve,
+    feet_locked, feet_drop, feet_target, toe_tip, two_bone, soft_reach,
+    look_new, look_free, look_set, look_solve, look_weight,
+    to_ground, to_rig, dir_to_rig, dir_to_ground
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern exp(x: float) -> float
+
+// Seconds a foot the clip lifts takes to leave where it was locked.
+const RELEASE = 0.15
+// A locked foot further than this from where the clip has it is let go at
+// once: the figure has moved on.
+const LOCK_SLIP = 0.3
+// Of a foot's ankle-to-ball span, how far its toe's tip lies ahead of its ball.
+const TOE_SHARE = 0.5
+// Radians a locked foot peels its heel up at the most, to keep its toe.
+const PEEL_MOST = 1.05
+// Of a leg's full length, where its reach starts to ease off.
+const SOFT_FROM = 0.97
+// Metres the pelvis comes down at the most.
+const DROP_MOST = 0.6
+// The spring a foot follows the ground's height under it on, and the pelvis
+// its drop: radians a second, settled in about 0.3 s.
+const SETTLE = 15.0
+// Metres over a foot a ray looks down from for the ground, and how far.
+const LOOK_UP = 0.6
+const LOOK_DOWN = 1.6
+// Radians the head turns at the most from where the clip faces it.
+const LOOK_MOST = 1.2
+const LOOK_RATE = 3.0
+
+struct Feet {
+    object: ptr                    // *GameObject, the figure's: its height is the clip's floor
+    physics: ptr                   // *Physics whose static world is the ground, or null: flat at the figure's feet
+    lock: bool
+    weight: float
+    legs: ptr                      // int[8]: thigh, calf, foot, ball, for the left then the right
+    locked: ptr                    // float[2]: 1 while the foot is locked
+    lock_at: ptr                   // float[6]: where it was locked, the ground's space
+    release: ptr                   // float[2]: seconds left of its release
+    released: ptr                  // float[6]: where it was released from
+    targets: ptr                   // float[6]: the ankles' targets this frame, the ground's space
+    shift: ptr                     // float[2]: how much higher the ground is under each foot, followed
+    shift_speed: ptr               // float[2]: and how fast that is changing
+    drop_speed: float
+    pivot: ptr                     // float[2]: what a locked foot is locked on, 1 its ankle, 2 its toe's tip
+    tips: ptr                      // float[6]: each toe's tip in its ball's frame (rig units), from the rest pose
+    drop: float
+    forward: Vec3                  // the figure's forward in the rig's space, from its rest pose
+}
+
+struct Look {
+    point: Vec3
+    goal: float
+    weight: float
+    forward: Vec3                  // the head's forward in the rig's space at rest
+    rest_head: Quat                // the head's rest rotation in the rig's space
+}
+
+// --- spaces -------------------------------------------------------------------------------------
+
+// A point of the rig's space in the ground's (where the figure stands, y up).
+to_ground(rig: *pose.Rig, p: Vec3) -> Vec3 {
+    base = pose.base_model(rig)
+    if base == null { return p }
+    core.model_sync_transform(base)
+    s = base.world_scale
+    return core.v3_add(base.world_position, core.quat_apply(base.world_rotation, core.vec3(p.x * s.x, p.y * s.y, p.z * s.z)))
+}
+
+to_rig(rig: *pose.Rig, p: Vec3) -> Vec3 {
+    base = pose.base_model(rig)
+    if base == null { return p }
+    core.model_sync_transform(base)
+    s = base.world_scale
+    v = core.quat_apply(core.quat_conjugate(base.world_rotation), core.v3_sub(p, base.world_position))
+    return core.vec3(v.x / s.x, v.y / s.y, v.z / s.z)
+}
+
+dir_to_rig(rig: *pose.Rig, v: Vec3) -> Vec3 {
+    base = pose.base_model(rig)
+    if base == null { return v }
+    core.model_sync_transform(base)
+    s = base.world_scale
+    w = core.quat_apply(core.quat_conjugate(base.world_rotation), v)
+    return core.vec3(w.x / s.x, w.y / s.y, w.z / s.z)
+}
+
+dir_to_ground(rig: *pose.Rig, v: Vec3) -> Vec3 {
+    base = pose.base_model(rig)
+    if base == null { return v }
+    core.model_sync_transform(base)
+    s = base.world_scale
+    return core.quat_apply(base.world_rotation, core.vec3(v.x * s.x, v.y * s.y, v.z * s.z))
+}
+
+// A turn given in the ground's space as the rig's space has it.
+turn_to_rig(rig: *pose.Rig, q: Quat) -> Quat {
+    base = pose.base_model(rig)
+    if base == null { return q }
+    core.model_sync_transform(base)
+    b = base.world_rotation
+    return core.quat_normalize(core.quat_mul(core.quat_conjugate(b), core.quat_mul(q, b)))
+}
+
+// The figure's forward in the rig's space: from its heels to its toes at rest.
+rest_forward(rig: *pose.Rig) -> Vec3 {
+    worlds = pose.new(rig)
+    pose.rest_world(rig, worlds)
+    ahead = core.vec3(0.0, 0.0, 0.0)
+    pairs = [pose.FOOT_L, pose.BALL_L, pose.FOOT_R, pose.BALL_R]
+    k = 0
+    while k < 4 {
+        a = pose.human(rig, pairs[k])
+        b = pose.human(rig, pairs[k + 1])
+        if a >= 0 && b >= 0 { ahead = core.v3_add(ahead, core.v3_sub(pose.translation(worlds, b), pose.translation(worlds, a))) }
+        k = k + 2
+    }
+    pose.release(worlds)
+    if core.v3_len(ahead) < 0.000001 { return core.vec3(0.0, 0.0, 1.0) }
+    return core.v3_normalize(ahead)
+}
+
+// --- two bones ----------------------------------------------------------------------------------
+
+// The reach a leg of full length `full` is given toward a target `d` away:
+// the target's own until `soft` (SOFT_FROM of the leg, or the clip's own
+// stretch where that is straighter), then eased so that it comes to the
+// full length only far beyond it. A knee straightened to the target snaps
+// the last few degrees in a frame; eased, it slows into straight.
+soft_reach(d: float, full: float, soft_in: float) -> float {
+    soft = soft_in
+    if soft < full * SOFT_FROM { soft = full * SOFT_FROM }
+    if soft > full { soft = full }
+    if d <= soft { return d }
+    room = full - soft
+    if room <= 0.0 { return full }
+    return soft + room * (1.0 - exp(0.0 - (d - soft) / room))
+}
+
+// Joints `upper`, `middle` and `end` of pose `p` (local) solved so `end`
+// sits at `target` (the rig's space), the middle joint in the plane the pose
+// bent it in (toward `hint` where the limb is straight), and `end` turned as
+// `end_turn` (the rig's space). `worlds` is `p` in the rig's space and is
+// kept so. False when the target is out of reach (the limb then reaches
+// toward it as far as it eases to).
+two_bone(rig: *pose.Rig, p: ptr, worlds: ptr, upper: int, middle: int, end: int, target: Vec3, hint: Vec3, end_turn: Quat) -> bool {
+    h = pose.translation(worlds, upper)
+    k = pose.translation(worlds, middle)
+    a = pose.translation(worlds, end)
+    l1 = core.v3_len(core.v3_sub(k, h))
+    l2 = core.v3_len(core.v3_sub(a, k))
+    if l1 < 0.000001 || l2 < 0.000001 { return false }
+    d = core.v3_sub(target, h)
+    dist = core.v3_len(d)
+    if dist < 0.000001 { return false }
+    full = l1 + l2
+    reach = soft_reach(dist, full, core.v3_len(core.v3_sub(a, h)))
+    if reach < core.abs_of(l1 - l2) + 0.0001 { reach = core.abs_of(l1 - l2) + 0.0001 }
+    along = core.v3_mul(d, 1.0 / dist)
+    goal = core.v3_add(h, core.v3_mul(along, reach))
+    // Where the knee bends: off the line from hip to target, as the pose has it.
+    bend = core.v3_sub(k, h)
+    bend = core.v3_sub(bend, core.v3_mul(along, core.v3_dot(bend, along)))
+    if core.v3_len(bend) < 0.001 * l1 {
+        bend = core.v3_sub(hint, core.v3_mul(along, core.v3_dot(hint, along)))
+    }
+    if core.v3_len(bend) < 0.000001 { return false }
+    bend = core.v3_normalize(bend)
+    x = (l1 * l1 - l2 * l2 + reach * reach) / (2.0 * reach)
+    y2 = l1 * l1 - x * x
+    y = 0.0
+    if y2 > 0.0 { y = core.sqrt_of(y2) }
+    knee = core.v3_add(h, core.v3_add(core.v3_mul(along, x), core.v3_mul(bend, y)))
+    // The upper bone turned onto the new knee, then the lower onto the goal.
+    q1 = core.quat_from_to(core.v3_sub(k, h), core.v3_sub(knee, h))
+    upper_w = core.quat_normalize(core.quat_mul(q1, pose.rotation(worlds, upper)))
+    middle_w = core.quat_normalize(core.quat_mul(q1, pose.rotation(worlds, middle)))
+    a1 = core.v3_add(knee, core.quat_apply(q1, core.v3_sub(a, k)))
+    q2 = core.quat_from_to(core.v3_sub(a1, knee), core.v3_sub(goal, knee))
+    middle_w = core.quat_normalize(core.quat_mul(q2, middle_w))
+    pose.set_rotation(p, upper, pose.local_rotation_of(rig, worlds, upper, upper_w))
+    pose.set_rotation(worlds, upper, upper_w)
+    pose.set_translation(worlds, middle, knee)
+    pose.set_rotation(p, middle, core.quat_normalize(core.quat_mul(core.quat_conjugate(upper_w), middle_w)))
+    pose.set_rotation(worlds, middle, middle_w)
+    pose.set_translation(worlds, end, goal)
+    pose.set_rotation(p, end, core.quat_normalize(core.quat_mul(core.quat_conjugate(middle_w), end_turn)))
+    pose.set_rotation(worlds, end, end_turn)
+    return dist <= full
+}
+
+// --- feet ---------------------------------------------------------------------------------------
+
+// Feet for a humanoid rig on the figure `o`; null when the rig maps no legs.
+feet_new(rig: *pose.Rig, o: *GameObject) -> *Feet {
+    slots = [pose.THIGH_L, pose.CALF_L, pose.FOOT_L, pose.BALL_L, pose.THIGH_R, pose.CALF_R, pose.FOOT_R, pose.BALL_R]
+    legs = calloc(8, 4) as int[]
+    k = 0
+    while k < 8 {
+        legs[k] = pose.human(rig, slots[k])
+        if k % 4 != 3 && legs[k] < 0 {
+            free(legs as ptr)
+            return null
+        }
+        k = k + 1
+    }
+    f = heap.new(Feet)
+    f.object = o as ptr
+    f.lock = true
+    f.weight = 1.0
+    f.legs = legs as ptr
+    f.locked = calloc(2, 8)
+    f.lock_at = calloc(6, 8)
+    f.release = calloc(2, 8)
+    f.released = calloc(6, 8)
+    f.targets = calloc(6, 8)
+    f.shift = calloc(2, 8)
+    f.shift_speed = calloc(2, 8)
+    f.pivot = calloc(2, 8)
+    f.forward = rest_forward(rig)
+    f.tips = calloc(6, 8)
+    find_tips(f, rig)
+    return f
+}
+
+// Each toe's tip in its ball's own frame, so it moves with the toe: the
+// ball's child joint where it has one (UE5's ball_leaf, the toe's end), else
+// TOE_SHARE of the ankle-to-ball span along the toe bone itself, the ball's
+// local axis lying nearest the figure's forward at rest. What a rolling foot
+// pivots on: the clip rolls a foot off its toe's tip, not its ball's joint,
+// and a foot locked on the ball joint as it rolled had its ankle pulled back
+// past the leg's reach, the toe dragged 12 mm. Taken level ahead of the ball
+// in the rest pose, the tip stood 3 to 6 cm under the floor through a stance:
+// a rest pose's toes do not lie as a standing figure's do.
+find_tips(f: *Feet, rig: *pose.Rig) {
+    legs = f.legs as int[]
+    tips = f.tips as float[]
+    worlds = pose.new(rig)
+    pose.rest_world(rig, worlds)
+    side = 0
+    while side < 2 {
+        foot = legs[side * 4 + 2]
+        ball = legs[side * 4 + 3]
+        if ball >= 0 {
+            local = core.vec3(0.0, 0.0, 0.0)
+            child = 0 - 1
+            j = 0
+            while j < pose.count(rig) {
+                if pose.parent(rig, j) == ball && child < 0 { child = j }
+                j = j + 1
+            }
+            if child >= 0 {
+                local = core.quat_apply(core.quat_conjugate(pose.rotation(worlds, ball)),
+                                        core.v3_sub(pose.translation(worlds, child), pose.translation(worlds, ball)))
+            } else {
+                span = core.v3_len(core.v3_sub(pose.translation(worlds, ball), pose.translation(worlds, foot)))
+                axes = [core.vec3(1.0, 0.0, 0.0), core.vec3(0.0 - 1.0, 0.0, 0.0), core.vec3(0.0, 1.0, 0.0),
+                        core.vec3(0.0, 0.0 - 1.0, 0.0), core.vec3(0.0, 0.0, 1.0), core.vec3(0.0, 0.0, 0.0 - 1.0)]
+                best = 0 - 2.0
+                k = 0
+                while k < 6 {
+                    along = core.v3_dot(core.quat_apply(pose.rotation(worlds, ball), axes[k]), f.forward)
+                    if along > best {
+                        best = along
+                        local = core.v3_mul(axes[k], span * TOE_SHARE)
+                    }
+                    k = k + 1
+                }
+            }
+            tips[side * 3] = local.x
+            tips[side * 3 + 1] = local.y
+            tips[side * 3 + 2] = local.z
+        }
+        side = side + 1
+    }
+    pose.release(worlds)
+}
+
+// The tip of toe `side` in the ground's space, `worlds` being the pose in the
+// rig's (its ball where there is no toe).
+toe_tip(f: *Feet, rig: *pose.Rig, worlds: ptr, side: int) -> Vec3 {
+    legs = f.legs as int[]
+    tips = f.tips as float[]
+    ball = legs[side * 4 + 3]
+    if ball < 0 { return to_ground(rig, pose.translation(worlds, legs[side * 4 + 2])) }
+    local = core.vec3(tips[side * 3], tips[side * 3 + 1], tips[side * 3 + 2])
+    return to_ground(rig, core.v3_add(pose.translation(worlds, ball), core.quat_apply(pose.rotation(worlds, ball), local)))
+}
+
+feet_free(f: *Feet) {
+    if f == null { return }
+    free(f.legs)
+    free(f.locked)
+    free(f.lock_at)
+    free(f.release)
+    free(f.released)
+    free(f.targets)
+    free(f.shift)
+    free(f.shift_speed)
+    free(f.pivot)
+    free(f.tips)
+    heap.free(f)
+}
+
+// The ground under the feet: the static world of `p` (null: flat at the
+// figure's own height).
+feet_ground_physics(f: *Feet, p: *Physics) { f.physics = p as ptr }
+feet_set_lock(f: *Feet, on: bool) { f.lock = on }
+feet_set_weight(f: *Feet, w: float) { f.weight = w }
+feet_locked(f: *Feet, side: int) -> bool { return (f.locked as float[])[side] > 0.5 }
+feet_drop(f: *Feet) -> float { return f.drop }
+
+// Where the ankle of foot `side` was put this frame, the ground's space.
+feet_target(f: *Feet, side: int) -> Vec3 {
+    t = f.targets as float[]
+    return core.vec3(t[side * 3], t[side * 3 + 1], t[side * 3 + 2])
+}
+
+// The ground's height and normal under (x, z), from over `top`; the figure's
+// own height and up where nothing is there or no physics was given.
+ground_at(f: *Feet, x: float, z: float, top: float, floor: float) -> (float, Vec3) {
+    if f.physics == null { return floor, core.vec3(0.0, 1.0, 0.0) }
+    hit = physics.ray_static_hit(f.physics as *Physics, core.vec3(x, top + LOOK_UP, z), core.vec3(0.0, 0.0 - 1.0, 0.0), LOOK_UP + LOOK_DOWN)
+    if !hit.hit { return floor, core.vec3(0.0, 1.0, 0.0) }
+    return hit.point.y, core.v3_normalize(hit.normal)
+}
+
+// Pose `p` (local; `worlds` is scratch) with its feet on the ground: `left`
+// and `right` say how far the clip has each foot down (0 to 1), and
+// `left_planted` and `right_planted` how far it has each planted (flat, or on
+// its ball for a gait run on it: clips.planted).
+feet_solve(f: *Feet, rig: *pose.Rig, p: ptr, worlds: ptr, left: float, right: float, left_planted: float, right_planted: float, dt: float) {
+    if f == null || f.weight <= 0.0 { return }
+    legs = f.legs as int[]
+    o = f.object as *GameObject
+    floor = behaviour.object_position(o).y
+    pose.world(rig, p, worlds)
+    targets = f.targets as float[]
+    shift = f.shift as float[]
+    normals = [core.vec3(0.0, 1.0, 0.0), core.vec3(0.0, 1.0, 0.0)]
+    downs = [left, right]
+    plants = [left_planted, right_planted]
+    speeds = f.shift_speed as float[]
+    side = 0
+    while side < 2 {
+        ankle = to_ground(rig, pose.translation(worlds, legs[side * 4 + 2]))
+        ball = toe_tip(f, rig, worlds, side)
+        g, n = ground_at(f, ankle.x, ankle.z, ankle.y, floor)
+        // How much higher the ground is under this foot than under the
+        // figure, followed on a critically damped spring rather than jumped
+        // to: onto a step the foot rises over a few frames, starting and
+        // ending at rest. Followed by a fraction a frame, the foot rose
+        // fastest the first frame and turned the knee 11 degrees in it.
+        rise, rising = spring(shift[side], speeds[side], g - floor, SETTLE, dt)
+        shift[side] = rise
+        speeds[side] = rising
+        normals[side] = n
+        lift = core.vec3(0.0, shift[side], 0.0)
+        ball_down = plants[side] > 0.5
+        target = lock_foot(f, side, downs[side], ball_down, core.v3_add(ankle, lift), core.v3_add(ball, lift), dt)
+        targets[side * 3] = target.x
+        targets[side * 3 + 1] = target.y
+        targets[side * 3 + 2] = target.z
+        side = side + 1
+    }
+    // The pelvis down by what the lower foot needs.
+    wanted = shift[0]
+    if shift[1] < wanted { wanted = shift[1] }
+    if wanted > 0.0 { wanted = 0.0 }
+    if wanted < 0.0 - DROP_MOST { wanted = 0.0 - DROP_MOST }
+    sink, sinking = spring(f.drop, f.drop_speed, wanted, SETTLE, dt)
+    f.drop = sink
+    f.drop_speed = sinking
+    pelvis = pose.human(rig, pose.PELVIS)
+    if pelvis >= 0 && core.abs_of(f.drop) > 0.00001 {
+        up = pose.parent(rig, pelvis)
+        down = dir_to_rig(rig, core.vec3(0.0, f.drop * f.weight, 0.0))
+        local = down
+        if up >= 0 {
+            ps = pose.scale(worlds, up)
+            v = core.quat_apply(core.quat_conjugate(pose.rotation(worlds, up)), down)
+            local = core.vec3(v.x / ps.x, v.y / ps.y, v.z / ps.z)
+        }
+        pose.set_translation(p, pelvis, core.v3_add(pose.translation(p, pelvis), local))
+        pose.world(rig, p, worlds)
+    }
+    hint = f.forward
+    side = 0
+    while side < 2 {
+        thigh = legs[side * 4]
+        calf = legs[side * 4 + 1]
+        foot = legs[side * 4 + 2]
+        target = core.vec3(targets[side * 3], targets[side * 3 + 1], targets[side * 3 + 2])
+        ankle = to_ground(rig, pose.translation(worlds, foot))
+        goal = core.v3_lerp(ankle, target, f.weight)
+        turn = pose.rotation(worlds, foot)
+        // A planted foot laid on the slope under it.
+        if downs[side] > 0.0 {
+            tilt = turn_to_rig(rig, core.quat_from_to(core.vec3(0.0, 1.0, 0.0), normals[side]))
+            turn = core.quat_normalize(core.quat_mul(core.quat_slerp(core.quat_ident(), tilt, downs[side] * f.weight), turn))
+        }
+        // A foot locked on its toe that the leg cannot reach peels its heel up
+        // about the toe (foot roll) rather than letting the toe slide.
+        if (f.locked as float[])[side] > 0.5 && (f.pivot as float[])[side] > 1.5 {
+            tip = core.vec3((f.lock_at as float[])[side * 3], 0.0, (f.lock_at as float[])[side * 3 + 2])
+            tip = toe_tip_now(f, rig, worlds, side, tip)
+            peeled, angle, axis = peel(rig, worlds, thigh, calf, foot, goal, tip, core.v3_normalize(dir_to_ground(rig, hint)))
+            if angle > 0.0 {
+                goal = peeled
+                turn = core.quat_normalize(core.quat_mul(turn_to_rig(rig, core.quat_rotate(angle, axis)), turn))
+            }
+        }
+        two_bone(rig, p, worlds, thigh, calf, foot, to_rig(rig, goal), hint, turn)
+        // Its ball and toes follow the foot (children of it).
+        pose.world(rig, p, worlds)
+        side = side + 1
+    }
+}
+
+// A critically damped spring's next value and speed after `dt`, from `x`
+// moving at `v` toward `goal`, exactly (no overshoot at any step).
+spring(x: float, v: float, goal: float, omega: float, dt: float) -> (float, float) {
+    e = exp(0.0 - omega * dt)
+    d = x - goal
+    lead = (v + omega * d) * dt
+    return goal + (d + lead) * e, (v - omega * lead) * e
+}
+
+// The locked toe's tip, where it was locked: its height the tip's now.
+toe_tip_now(f: *Feet, rig: *pose.Rig, worlds: ptr, side: int, at: Vec3) -> Vec3 {
+    now = toe_tip(f, rig, worlds, side)
+    return core.vec3(at.x, now.y, at.z)
+}
+
+// The ankle `goal` turned up about the toe's `tip` (around the foot's
+// sideways axis, the heel rising) just far enough that the leg from its
+// thigh reaches it within SOFT_FROM of its length, PEEL_MOST at the most:
+// the ankle, the turn and its axis (the ground's), and 0 when it reaches as
+// it is. Found by halving.
+peel(rig: *pose.Rig, worlds: ptr, thigh: int, calf: int, foot: int, goal: Vec3, tip: Vec3, ahead: Vec3) -> (Vec3, float, Vec3) {
+    hip = to_ground(rig, pose.translation(worlds, thigh))
+    knee = to_ground(rig, pose.translation(worlds, calf))
+    ankle = to_ground(rig, pose.translation(worlds, foot))
+    full = core.v3_len(core.v3_sub(knee, hip)) + core.v3_len(core.v3_sub(ankle, knee))
+    // As far as the leg is let reach: SOFT_FROM of its length, or the clip's
+    // own stretch now where that is straighter (a standing leg). Held to
+    // SOFT_FROM alone, an idle's all but straight legs peeled their heels and
+    // lifted the soles 5 mm.
+    room = full * SOFT_FROM
+    own = core.v3_len(core.v3_sub(ankle, hip))
+    if own > room { room = own }
+    if room > full { room = full }
+    if core.v3_len(core.v3_sub(goal, hip)) <= room { return goal, 0.0, core.vec3(1.0, 0.0, 0.0) }
+    level = core.v3_normalize(core.vec3(ahead.x, 0.0, ahead.z))
+    axis = core.v3_normalize(core.v3_cross(level, core.vec3(0.0, 1.0, 0.0)))
+    // The way round that lifts the heel.
+    lifted = core.v3_add(tip, core.quat_apply(core.quat_rotate(0.1, axis), core.v3_sub(goal, tip)))
+    if lifted.y < goal.y { axis = core.v3_mul(axis, 0.0 - 1.0) }
+    low = 0.0
+    high = PEEL_MOST
+    k = 0
+    while k < 14 {
+        middle = (low + high) * 0.5
+        a = core.v3_add(tip, core.quat_apply(core.quat_rotate(middle, axis), core.v3_sub(goal, tip)))
+        if core.v3_len(core.v3_sub(a, hip)) > room { low = middle } else { high = middle }
+        k = k + 1
+    }
+    return core.v3_add(tip, core.quat_apply(core.quat_rotate(high, axis), core.v3_sub(goal, tip))), high, axis
+}
+
+// Where foot `side`'s ankle goes this frame, from where the clip puts its
+// ankle and its ball (`ankle`, `ball`, over the ground under it). While the
+// clip has the foot down it is locked on what is on the ground: its ankle
+// from the heel's strike, its ball once the ball is down too (the foot then
+// rolls over its ball as the clip rolls it, the toe staying where it came
+// down). Locked on the ankle alone, the clip's roll swung the toe 7 cm a
+// stance. Let go of over RELEASE once the clip lifts it.
+lock_foot(f: *Feet, side: int, down: float, ball_down: bool, ankle: Vec3, ball: Vec3, dt: float) -> Vec3 {
+    locked = f.locked as float[]
+    pivot = f.pivot as float[]
+    at = f.lock_at as float[]
+    release = f.release as float[]
+    released = f.released as float[]
+    targets = f.targets as float[]
+    k = side * 3
+    if !f.lock {
+        locked[side] = 0.0
+        release[side] = 0.0
+        return ankle
+    }
+    reach = core.v3_sub(ball, ankle)
+    if down > 0.5 {
+        if locked[side] < 0.5 {
+            locked[side] = 1.0
+            release[side] = 0.0
+            if ball_down {
+                pivot[side] = 2.0
+                at[k] = ball.x
+                at[k + 2] = ball.z
+            } else {
+                pivot[side] = 1.0
+                at[k] = ankle.x
+                at[k + 2] = ankle.z
+            }
+        } else if pivot[side] < 1.5 && ball_down {
+            // Onto the ball: locked where the ball is under the locked ankle.
+            pivot[side] = 2.0
+            at[k] = at[k] + reach.x
+            at[k + 2] = at[k + 2] + reach.z
+        }
+        target = core.vec3(at[k], ankle.y, at[k + 2])
+        if pivot[side] > 1.5 { target = core.vec3(at[k] - reach.x, ankle.y, at[k + 2] - reach.z) }
+        dx = target.x - ankle.x
+        dz = target.z - ankle.z
+        if core.sqrt_of(dx * dx + dz * dz) > LOCK_SLIP {
+            locked[side] = 0.0
+            return ankle
+        }
+        return target
+    }
+    if locked[side] > 0.5 {
+        locked[side] = 0.0
+        release[side] = RELEASE
+        released[k] = targets[k]
+        released[k + 2] = targets[k + 2]
+    }
+    if release[side] > 0.0 {
+        u = release[side] / RELEASE
+        s = u * u * (3.0 - 2.0 * u)
+        release[side] = release[side] - dt
+        return core.vec3(ankle.x + (released[k] - ankle.x) * s, ankle.y, ankle.z + (released[k + 2] - ankle.z) * s)
+    }
+    return ankle
+}
+
+// --- look -------------------------------------------------------------------------------------
+
+look_new(rig: *pose.Rig) -> *Look {
+    l = heap.new(Look)
+    l.forward = rest_forward(rig)
+    head = pose.human(rig, pose.HEAD)
+    l.rest_head = core.quat_ident()
+    if head >= 0 {
+        worlds = pose.new(rig)
+        pose.rest_world(rig, worlds)
+        l.rest_head = pose.rotation(worlds, head)
+        pose.release(worlds)
+    }
+    return l
+}
+
+look_free(l: *Look) { if l != null { heap.free(l) } }
+
+// Look toward `point` (the world's), `weight` of the way (0: let go).
+look_set(l: *Look, point: Vec3, weight: float) {
+    l.point = point
+    l.goal = weight
+}
+
+look_weight(l: *Look) -> float { return l.weight }
+
+look_solve(l: *Look, rig: *pose.Rig, p: ptr, worlds: ptr, dt: float) {
+    step = dt * LOOK_RATE
+    if l.weight < l.goal {
+        l.weight = l.weight + step
+        if l.weight > l.goal { l.weight = l.goal }
+    } else if l.weight > l.goal {
+        l.weight = l.weight - step
+        if l.weight < l.goal { l.weight = l.goal }
+    }
+    head = pose.human(rig, pose.HEAD)
+    if l.weight <= 0.0001 || head < 0 { return }
+    chain = [pose.human(rig, pose.SPINE_03), pose.human(rig, pose.NECK), head]
+    shares = [0.2, 0.375, 1.0]
+    k = 0
+    while k < 3 {
+        j = chain[k]
+        if j >= 0 {
+            pose.world(rig, p, worlds)
+            from = to_ground(rig, pose.translation(worlds, head))
+            facing = core.quat_apply(core.quat_mul(pose.rotation(worlds, head), core.quat_conjugate(l.rest_head)), l.forward)
+            face = core.v3_normalize(dir_to_ground(rig, facing))
+            to = core.v3_sub(l.point, from)
+            if core.v3_len(to) > 0.0001 {
+                to = core.v3_normalize(to)
+                angle = core.acos_of(core.clampf(core.v3_dot(face, to), 0.0 - 1.0, 1.0))
+                if angle > LOOK_MOST {
+                    axis = core.v3_cross(face, to)
+                    if core.v3_len(axis) > 0.000001 { to = core.quat_apply(core.quat_rotate(LOOK_MOST, core.v3_normalize(axis)), face) }
+                }
+                turn = core.quat_slerp(core.quat_ident(), core.quat_from_to(face, to), shares[k] * l.weight)
+                wanted = core.quat_normalize(core.quat_mul(turn_to_rig(rig, turn), pose.rotation(worlds, j)))
+                pose.set_rotation(p, j, pose.local_rotation_of(rig, worlds, j, wanted))
+            }
+        }
+        k = k + 1
+    }
+    pose.world(rig, p, worlds)
+}
