@@ -452,7 +452,27 @@ deep and multipart files are refused by name, and so is a map that is not twice
 as wide as it is tall (a cube cross, a mirror ball; the error names its size).
 It is placed as a painted sky
 is: the top row is the zenith and the middle column looks along +x. Its light
-is the engine's radiance times `intensity` (a map's 1 is diffuse white).
+is the engine's radiance times `intensity`: 1 is the file's own values, and
+exposure handles the rest.
+
+The map can be turned about up: `engine_set_environment_yaw(e, degrees)` (or
+`AE3D_ENV_YAW=degrees`; `engine_set_environment_look(e, intensity, degrees)` sets
+the scale and the turn together). Yaw is in the sense the camera's yaw turns, so
+a feature of the picture at some azimuth is seen that many degrees on from it, a
+whole turn is no turn, and 0 is the map as placed above. It is one float
+(radians) of `env_capture`, so turning the map, like changing its scale, remakes
+the capture and its filters once (about 1-2 ms on the M6) and does not read the
+file again.
+
+The map is the scene's **Environment** component's too (Nic, 875-7): the fields
+`environment map` (a path; empty is the sky), `environment intensity` and
+`environment yaw` (degrees, -360 to 360) are the engine's own, so the scene
+file (`view.environment`: `image`, `intensity`, `yaw`, each written only when it
+differs from none, 1 and 0), the editor's Scene panel (a Browse for the file),
+`component.get`/`component.set` over the agent channel and a save game carry them
+with no other change. Setting the path reads the file; the intensity and the yaw
+never do. A path that does not load is refused and the field keeps the map that
+lights the scene; a scene file that names no map puts the sky back.
 
 It takes the place of the sky's capture and nothing after it: one quoted pass,
 `ae3d.shaders.envmap.env_capture`, writes the 256-texel octahedral capture from
@@ -694,6 +714,17 @@ axis) at which the picture is sharp; the disc of confusion at view depth z is
 at infinity and without bound toward the lens, held to `max_radius`. Both are
 in pixels of a 1080-line frame and scaled by the frame's height, so a frame of
 any size is blurred as much of itself. Nothing drawn (a sky) is infinitely far.
+
+Depth of field is an authored look, so it is on the scene's **Rendering**
+component beside the bloom and TAA: `depth of field`, `dof focus distance`
+(scene units, planar depth), `dof aperture` and `dof max blur` (pixels of a
+1080-line frame). They are the engine's own fields, so the editor's Scene
+panel, `component.get` and `component.set` over the agent channel, a save
+game and the scene file all carry them, and a program calling
+`engine_set_depth_of_field` and the panel edit one value. A component or scene
+file writes only what differs from the defaults (off, 10, 12, 16), so every
+earlier file loads with it off. The upscaler and the render scale are the
+device's, not the scene's, and are not on the component.
 
 Two passes at half the scene's size (`ae3d.shaders.dof`, quoted, with the MSL),
 then a composite that mixes them in beside the bloom:
@@ -1393,6 +1424,61 @@ behind the near plane; drawn through OpenGL and Vulkan off the screen, each
 lands on the rows the numbers give, within a pixel; a crowd of foxes at
 their own poses the same; a walking group followed stays 55-62% of the
 height and never moves the camera further in a frame than it moved.
+
+### Camera controllers (#823)
+
+Two controllers, each a module of its own that the engine runs from its update
+(they are behaviours: `attach` adds one, `detach` takes it out). Neither is
+a scene component: they hold a few numbers and a list of keys, are made in
+code, and are not saved in a scene file. First-person is the character
+controller's, and the free-fly camera and the chase boom are the engine's
+(above).
+
+**`ae3d.orbitcam`** orbits a point, lifted from the editor's viewport (which
+now uses it, so there is one implementation). `orbit_new(target, distance,
+yaw, pitch)` (degrees); `orbit_apply(o, cam)` puts the camera at the eye and
+looks at the target; `orbit_turn(o, dx, dy)` is a drag in pixels
+(0.35 degrees a pixel), `orbit_zoom_step(o, closer)` and `orbit_zoom(o,
+notches)` the wheel (the distance by 1.12 a notch). Pitch is held to
+-85..85 degrees and the distance to 0.1..10000 by default
+(`orbit_set_limits`; the editor's are 8..8000). `orbit_from_camera` makes an
+orbit from where a camera stands and looks. `orbitcam.attach(e, o, cam)` has
+the engine read its input every update: the left mouse button dragged (after
+3 pixels, so a click is not a drag; `orbit_set_button` changes it), the
+wheel, and the arrow keys (90 degrees a second; `orbit_bind_zoom_keys` binds
+two keys to zoom). A menu that blocks the input moves nothing.
+Attached to the engine's own camera it switches the fly controls off
+(`engine_set_camera_input`); `orbit_set_active(o, false)` stands it down so
+that something else has the camera.
+
+**`ae3d.campath`** flies a camera along keys. A key is a time, a position,
+where to look and a field of view: `path_add_target(p, time, position,
+target, fov)` looks at a point, `path_add_look(p, time, position, yaw,
+pitch, fov)` along an orientation (a yaw and a pitch as the camera has
+them), `path_add_camera(p, time, cam)` reads one off a camera. `sample(p,
+t)` is the pose at a time, `apply(p, cam)` puts a camera on the playhead,
+`play`, `pause`, `stop`, `seek(p, t)`, `set_loop`, `set_rate` (negative
+plays backwards) and `advance(p, delta)` are the transport, and
+`campath.attach(e, p, cam)` advances it by the engine's delta each update and
+puts `cam` on it while it plays (and once after a seek).
+
+Position (and the field of view) go through the keys as a cubic Hermite
+spline with Catmull-Rom tangents, taken over the keys' times, so the speed
+has no jump at a key and keys at uneven times are flown at the speed they
+say. Between two target keys the target is interpolated the same way and
+looked at, so a camera circling a point keeps it in the middle of the
+frame; any other segment slerps the two look directions at a constant angular
+speed (the camera has no roll, so a direction is its orientation). A path
+is open: looping jumps from the last key to the first, so end a loop on its
+first key to make it seamless. See the module's header for the reasoning.
+
+**A view follows a path** by being drawn from a camera a path is attached to:
+`campath.attach(e, p, view_cam)` with the view's own camera
+(`core.camera_new`), and `engine_view_render(e, view, view_cam)` in a late
+update. `examples/camera_rig.ae` flies the engine's camera along a path and
+switches to an orbit with the 1 and 2 keys; `tests/test_camera_path.ae`
+holds the frames of both on Vulkan and OpenGL, and a view's, to a camera
+placed by hand.
 
 ### The scene's depth
 
