@@ -8,7 +8,7 @@ ae3d's animation is a pipeline of layers, the way shipped engines build it (#853
 | L0 | `ae3d.retarget` | A take made on one humanoid played by another: rest poses aligned bone by bone, turns carried in the ground's space, the pelvis and root scaled by the two figures' pelvis heights. |
 | L1 | `ae3d.clips` | A take is an animation resampled for a rig at the file's key rate. Read from it at import: root motion (the root's travel and turn, taken out), foot contacts, planted frames, its speed over the ground, its heading, and footfall sync markers. |
 | L2 | `ae3d.animator` | The single writer. States (a take, or a blend space along one parameter), inertialized transitions, gait-to-gait hand-overs in step, masked and additive layers, root motion onto the figure's object. |
-| L3 | `ae3d.ikrig` | Feet on the ground (ground height under each foot, pelvis drop, the foot locked where the clip plants it, the heel peeled up when the leg cannot reach), two-bone legs with soft reach, the head turned to a point. |
+| L3 | `ae3d.ikrig` | Feet on the ground (ground height under each foot, pelvis drop, the foot locked where the clip plants it, the heel peeled up when the leg cannot reach), two-bone legs and arms with soft reach, hands on a prop's grips, the head turned to a point. |
 
 ## A figure on its gaits
 
@@ -59,12 +59,13 @@ A take made for another rig goes in with `animator.add_take(a, retarget.retarget
 | the female's planted toe on retargeted gaits | under 10⁻¹² mm | 5 mm |
 | the roll's root motion carried onto the object | 4.9914 of 4.9914 m | 1% |
 | one foot over a 10 cm block: its sole, the other's, the fastest turn | +100.0 mm, 0.0 mm, 4.4° a step | 5 mm, 5 mm, 6° |
+| walking with a bowl in both hands: each hand off its grip, the elbows | 2.0 mm at worst, 122 to 159° | 5 mm, 25 to 172° |
 
 `tools/anim_showcase.ae` puts three figures on these layers for a person to watch. Its runs measure the toes as the test does: through a 20 s cycle of starts, stops, accelerations and a circle, a planted toe slides under 10⁻¹¹ mm.
 
 ## Next
 
 - Blend spaces in two dimensions (direction and speed) and starts, stops and turns as clips (#856).
-- Full-body IK, hand IK on props, aim constraints (#857).
+- Full-body IK and aim constraints (#857).
 - The physics asset and physical animation (#858), then ragdolls and get-ups into matched clips (#859).
 - The plaza, the motion showcase and Siltreach moved onto the pipeline, and the old writers retired (#860).
