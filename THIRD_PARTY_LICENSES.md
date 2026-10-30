@@ -91,3 +91,17 @@ repository, unchanged.
 - Model: © 2014 PixelMannen, [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/legalcode).
 - Rigging and animation: © 2014 tomkranis, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/legalcode).
 - Conversion to glTF: © 2017 @AsoboStudio and @scurest, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/legalcode).
+
+## OpenEXR
+
+`src/ae3d/exrpiz` (the PIZ block decoder of `ae3d.openexr`) follows the structure of the OpenEXR library's PIZ
+decoder, written from the format's documentation and that library's source: the wavelet's level loop and its
+Haar steps, the code-length table's run codes and the canonical code assignment. The library is BSD-3-Clause,
+Copyright (c) Contributors to the OpenEXR Project; its notice is in that module's header. ae3d links none of it:
+`tools/exr_reference/exrref.cpp` is a development tool against the official library, outside every build, that
+wrote the PIZ test fixtures and the decodes they are held to.
+
+## Poly Haven
+
+`tests/fixtures/env/polyhaven/` holds two 1k HDRIs from [Poly Haven](https://polyhaven.com), published under
+CC0 1.0 (public domain); see `tests/fixtures/env/PIZ.md` for the assets and their URLs.

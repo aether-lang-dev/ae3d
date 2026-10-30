@@ -1,0 +1,511 @@
+// PIZ, OpenEXR's wavelet-and-Huffman block compression, decoded; the part of
+// ae3d.openexr that reads a PIZ block.
+//
+//   problem = exrpiz.decode(packed, packed_size, out, width, lines, channels, channel_count)
+//
+// `packed` is one block as the file stores it (after the line number and the
+// size), `out` the block's bytes as the other compressions leave them -- each
+// line holding its channels one after another -- and `channels` the file's
+// channel list as ae3d.openexr keeps it: (slot, pixel type) pairs of ints.
+// The answer is "" when the block decoded, or the reason it did not.
+//
+// What PIZ does to a block of up to 32 lines, undone here in the order the
+// reader meets it:
+//   - the samples are seen as 16-bit words (a HALF is one, a FLOAT or UINT
+//     two), channel after channel, each channel's lines one after another;
+//   - the writer found which 16-bit values occur at all, sent that as a
+//     bitmap (only the bytes from the first nonzero to the last), and
+//     replaced each value by its rank among them, so the values are dense;
+//   - each channel was then put through a 2-D Haar-like wavelet, once per
+//     level up to the smaller side, separately for the two words of a
+//     4-byte sample: a 14-bit form when the largest rank is under 2^14 (the
+//     differences then fit in 16 bits and the sums are kept as they are), the
+//     plain 16-bit form otherwise;
+//   - the words were Huffman coded: a header (the first and last symbol used,
+//     the number of bits), a table of code lengths for the symbols between
+//     them, 6 bits each with runs of unused symbols, and the codes, canonical
+//     and most significant bit first. The last symbol is not a value: it
+//     means "repeat the previous word" and a byte count follows.
+//
+// Here the Huffman stream is decoded first (a table of the first 14 bits of
+// a code for the many short codes, the canonical code's limits for the
+// longer), then each channel's wavelet is run backwards from the coarsest
+// level, then the ranks go back through the bitmap's table to the values, and
+// the words are laid out line by line.
+//
+// Words are stored and read in the machine's order, which is the file's
+// (little-endian) on every platform ae3d runs on.
+//
+// This is written from the format as the OpenEXR documentation and the
+// OpenEXR library's source (BSD-3-Clause, Copyright (c) Contributors to the
+// OpenEXR Project) describe it, and follows that library's decoder in its
+// structure: the wavelet's level loop and its Haar steps, the code-length
+// table's run codes and the canonical code assignment are its. Its notice:
+//
+//   Redistribution and use in source and binary forms, with or without
+//   modification, are permitted provided that the following conditions are
+//   met: Redistributions of source code must retain the above copyright
+//   notice, this list of conditions and the following disclaimer.
+//   Redistributions in binary form must reproduce the above copyright notice,
+//   this list of conditions and the following disclaimer in the documentation
+//   and/or other materials provided with the distribution. Neither the name of
+//   the copyright holder nor the names of its contributors may be used to
+//   endorse or promote products derived from this software without specific
+//   prior written permission. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT
+//   HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+//   INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+//   AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+//   COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+//   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+//   NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+//   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+//   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+//   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+//   THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+// Every read is bounds-checked and every size a block claims is checked
+// against the bytes it has before anything is allocated or written.
+import std.mem
+
+exports (decode)
+
+extern calloc(count: long, size: long) -> ptr
+extern free(p: ptr)
+
+const BITMAP_SIZE = 8192
+const USHORT_RANGE = 65536
+const ENC_SIZE = 65537
+const DEC_BITS = 14
+const DEC_SIZE = 16384
+const DEC_MASK = 16383
+const MAX_CODE_LENGTH = 58
+const SHORT_ZEROCODE_RUN = 59
+const LONG_ZEROCODE_RUN = 63
+const SHORTEST_LONG_RUN = 6
+const HEADER_BYTES = 20
+
+u32(data: ptr, at: int) -> int { return mem.get_u32_le(data, at) as int }
+
+// The code-length table at `start` (before `end`), for the symbols im..iM,
+// into `lens` (zeros already there). The index after it, or -1.
+unpack_lengths(src: ptr, start: int, end: int, im: int, iM: int, lens: int[]) -> int {
+    p = start
+    c = 0 as long
+    lc = 0
+    i = im
+    while i <= iM {
+        while lc < 6 {
+            if p >= end { return 0 - 1 }
+            c = ((c & (65535 as long)) << 8) | (mem.get_uint8(src, p) as long)
+            p = p + 1
+            lc = lc + 8
+        }
+        lc = lc - 6
+        l = ((c >> lc) & (63 as long)) as int
+        if l >= SHORT_ZEROCODE_RUN {
+            run = 0
+            if l == LONG_ZEROCODE_RUN {
+                while lc < 8 {
+                    if p >= end { return 0 - 1 }
+                    c = ((c & (65535 as long)) << 8) | (mem.get_uint8(src, p) as long)
+                    p = p + 1
+                    lc = lc + 8
+                }
+                lc = lc - 8
+                run = (((c >> lc) & (255 as long)) as int) + SHORTEST_LONG_RUN
+            } else {
+                run = l - SHORT_ZEROCODE_RUN + 2
+            }
+            if i + run > iM + 1 { return 0 - 1 }
+            i = i + run
+        } else {
+            lens[i] = l
+            i = i + 1
+        }
+    }
+    return p
+}
+
+// The Huffman stream `src[start..]` of `nbits` bits and the table before it,
+// as `compressed` bytes at `src`, into `n` words at `t`. "" or the reason.
+huffman(src: ptr, compressed: int, t: uint16[], n: int) -> string {
+    if compressed == 0 {
+        if n != 0 { return "an OpenEXR PIZ block with no Huffman data for its samples" }
+        return ""
+    }
+    if compressed < HEADER_BYTES { return "an OpenEXR PIZ block with a damaged Huffman header" }
+    im = u32(src, 0)
+    iM = u32(src, 4)
+    nbits = u32(src, 12)
+    if im < 0 || im >= ENC_SIZE || iM < 0 || iM >= ENC_SIZE || im > iM {
+        return "an OpenEXR PIZ block with a damaged Huffman header"
+    }
+    if nbits < 0 || nbits > 8 * compressed { return "an OpenEXR PIZ block whose Huffman data runs past the block" }
+
+    lens = calloc(ENC_SIZE as long, 4 as long) as int[]
+    prim = calloc(DEC_SIZE as long, 4 as long) as int[]
+    counts = calloc(64 as long, 4 as long) as int[]
+    offs = calloc(64 as long, 4 as long) as int[]
+    firsts = calloc(64 as long, 8 as long) as long[]
+    nexts = calloc(64 as long, 8 as long) as long[]
+    sorted = calloc(ENC_SIZE as long, 4 as long) as int[]
+    problem = ""
+
+    data_at = unpack_lengths(src, HEADER_BYTES, compressed, im, iM, lens)
+    if data_at < 0 {
+        problem = "an OpenEXR PIZ block whose Huffman table runs past the block"
+    } else if nbits > 8 * (compressed - data_at) {
+        problem = "an OpenEXR PIZ block whose Huffman data runs past the block"
+    }
+
+    // The canonical code: longer codes are the numerically smaller ones, and
+    // among codes of a length the lower symbol has the lower code.
+    if problem == "" {
+        i = im
+        while i <= iM {
+            counts[lens[i]] = counts[lens[i]] + 1
+            i = i + 1
+        }
+        c = 0 as long
+        l = MAX_CODE_LENGTH
+        while l > 0 {
+            nc = (c + (counts[l] as long)) >> 1
+            firsts[l] = c
+            nexts[l] = c
+            c = nc
+            l = l - 1
+        }
+        total = 0
+        l = 1
+        while l <= MAX_CODE_LENGTH {
+            offs[l] = total
+            total = total + counts[l]
+            l = l + 1
+        }
+        i = im
+        while i <= iM && problem == "" {
+            l = lens[i]
+            if l > 0 {
+                code = nexts[l]
+                nexts[l] = code + (1 as long)
+                if (code >> l) != (0 as long) {
+                    problem = "an OpenEXR PIZ block with an invalid Huffman table"
+                } else if l > DEC_BITS {
+                    sorted[offs[l] + ((code - firsts[l]) as int)] = i
+                } else {
+                    base = (code as int) << (DEC_BITS - l)
+                    span = 1 << (DEC_BITS - l)
+                    k = 0
+                    entry = (l << 17) | i
+                    while k < span {
+                        if prim[base + k] != 0 { problem = "an OpenEXR PIZ block with an invalid Huffman table" }
+                        prim[base + k] = entry
+                        k = k + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    if problem == "" {
+        // The codes, a bit at a time out of a 64-bit window that holds at
+        // most 63 bits, so that a code of up to 58 is always in it.
+        acc = 0 as long
+        nacc = 0
+        pos = data_at
+        ie = data_at + (nbits + 7) / 8
+        bitpos = 0
+        out = 0
+        prev = 0
+        while bitpos < nbits && problem == "" {
+            while nacc <= 55 && pos < ie {
+                acc = (acc << 8) | (mem.get_uint8(src, pos) as long)
+                nacc = nacc + 8
+                pos = pos + 1
+            }
+            idx = 0
+            if nacc >= DEC_BITS {
+                idx = ((acc >> (nacc - DEC_BITS)) & (DEC_MASK as long)) as int
+            } else {
+                idx = ((acc << (DEC_BITS - nacc)) & (DEC_MASK as long)) as int
+            }
+            e = prim[idx]
+            len = 0
+            sym = 0
+            if e != 0 {
+                len = e >> 17
+                sym = e & 131071
+            } else {
+                l = DEC_BITS + 1
+                while l <= MAX_CODE_LENGTH && len == 0 {
+                    if counts[l] > 0 {
+                        v = 0 as long
+                        if nacc >= l {
+                            v = (acc >> (nacc - l)) & (((1 as long) << l) - (1 as long))
+                        } else {
+                            v = (acc << (l - nacc)) & (((1 as long) << l) - (1 as long))
+                        }
+                        d = v - firsts[l]
+                        if d >= (0 as long) && d < (counts[l] as long) {
+                            len = l
+                            sym = sorted[offs[l] + (d as int)]
+                        }
+                    }
+                    l = l + 1
+                }
+                if len == 0 { problem = "an OpenEXR PIZ block with a Huffman code that is in no table" }
+            }
+            if problem == "" {
+                if bitpos + len > nbits {
+                    problem = "an OpenEXR PIZ block whose last Huffman code is cut short"
+                } else if len > nacc {
+                    // The window holds 56 bits at least; a code of 57 or 58 would need a
+                    // file of more than 2^32 samples to be anything but damage.
+                    problem = "an OpenEXR PIZ block with a Huffman code of more than 56 bits"
+                } else {
+                    nacc = nacc - len
+                    acc = acc & (((1 as long) << nacc) - (1 as long))
+                    bitpos = bitpos + len
+                    if sym == iM {
+                        // The run code: a byte of how many times to repeat the word before.
+                        if bitpos + 8 > nbits {
+                            problem = "an OpenEXR PIZ block whose last Huffman code is cut short"
+                        } else {
+                            while nacc < 8 && pos < ie {
+                                acc = (acc << 8) | (mem.get_uint8(src, pos) as long)
+                                nacc = nacc + 8
+                                pos = pos + 1
+                            }
+                            nacc = nacc - 8
+                            cs = ((acc >> nacc) & (255 as long)) as int
+                            acc = acc & (((1 as long) << nacc) - (1 as long))
+                            bitpos = bitpos + 8
+                            if out + cs > n {
+                                problem = "an OpenEXR PIZ block with more Huffman data than samples"
+                            } else if out == 0 {
+                                problem = "an OpenEXR PIZ block that repeats a word before any"
+                            } else {
+                                k = 0
+                                while k < cs {
+                                    t[out + k] = prev as uint16
+                                    k = k + 1
+                                }
+                                out = out + cs
+                            }
+                        }
+                    } else if out >= n {
+                        problem = "an OpenEXR PIZ block with more Huffman data than samples"
+                    } else {
+                        t[out] = sym as uint16
+                        prev = sym
+                        out = out + 1
+                    }
+                }
+            }
+        }
+        if problem == "" && out != n { problem = "an OpenEXR PIZ block with less Huffman data than samples" }
+    }
+
+    free(lens as ptr)
+    free(prim as ptr)
+    free(counts as ptr)
+    free(offs as ptr)
+    free(firsts as ptr)
+    free(nexts as ptr)
+    free(sorted as ptr)
+    return problem
+}
+
+// One Haar step undone on two words of `t`, the 14-bit form: the low is a
+// sum kept as it is, the high a signed difference.
+dec14(t: uint16[], lo: int, hi: int) {
+    ls = t[lo] as int
+    hs = t[hi] as int
+    if ls >= 32768 { ls = ls - 65536 }
+    if hs >= 32768 { hs = hs - 65536 }
+    ai = ls + (hs & 1) + (hs >> 1)
+    bi = ai - hs
+    t[lo] = (ai & 65535) as uint16
+    t[hi] = (bi & 65535) as uint16
+}
+
+// The same in the 16-bit form: modulo 2^16 throughout, the encoder having
+// offset the first of the pair by half the range to keep the difference's
+// sign out of the way.
+dec16(t: uint16[], lo: int, hi: int) {
+    m = t[lo] as int
+    d = t[hi] as int
+    bi = (m - (d >> 1)) & 65535
+    ai = (d + bi - 32768) & 65535
+    t[lo] = (ai & 65535) as uint16
+    t[hi] = (bi & 65535) as uint16
+}
+
+// The 2-D step on the four words of a 2 by 2 cell: its rows, then its columns.
+// `a` and `b` are the words of the top row and `c` and `d` the bottom's.
+dec_cell(t: uint16[], a: int, b: int, c: int, d: int, w14: bool) {
+    // The encoder took each row of the cell as a low and a high and then the
+    // two lows and the two highs the same way, so: the columns first, which
+    // leaves the two rows' lows and highs where the encoder's first step put
+    // them, then the rows.
+    if w14 {
+        dec14(t, a, c)
+        dec14(t, b, d)
+        dec14(t, a, b)
+        dec14(t, c, d)
+    } else {
+        dec16(t, a, c)
+        dec16(t, b, d)
+        dec16(t, a, b)
+        dec16(t, c, d)
+    }
+}
+
+// A channel's plane of nx by ny words, `ox` apart along a line and `oy` apart
+// between lines, from word `base` of `t`, wavelet-decoded in place.
+wavelet(t: uint16[], base: int, nx: int, ox: int, ny: int, oy: int, mx: int) {
+    w14 = mx < 16384
+    n = nx
+    if ny < n { n = ny }
+    p = 1
+    while p <= n { p = p << 1 }
+    p = p >> 1
+    p2 = p
+    p = p >> 1
+    while p >= 1 {
+        r = 0
+        while r <= ny - p2 {
+            row = base + r * oy
+            col = 0
+            while col <= nx - p2 {
+                a = row + col * ox
+                dec_cell(t, a, a + ox * p, a + oy * p, a + oy * p + ox * p, w14)
+                col = col + p2
+            }
+            if (nx & p) != 0 {
+                a = row + col * ox
+                if w14 { dec14(t, a, a + oy * p) } else { dec16(t, a, a + oy * p) }
+            }
+            r = r + p2
+        }
+        if (ny & p) != 0 {
+            row = base + r * oy
+            col = 0
+            while col <= nx - p2 {
+                a = row + col * ox
+                if w14 { dec14(t, a, a + ox * p) } else { dec16(t, a, a + ox * p) }
+                col = col + p2
+            }
+        }
+        p2 = p
+        p = p >> 1
+    }
+}
+
+decode(src: @keep ptr, size: int, out: ptr, width: int, lines: int, channels: ptr, channel_count: int) -> string {
+    // The words of the block, channel after channel.
+    n = 0
+    k = 0
+    while k < channel_count {
+        words = 1
+        if (channels as int[])[k * 2 + 1] != 1 { words = 2 }
+        n = n + width * lines * words
+        k = k + 1
+    }
+    if size < 4 { return "an OpenEXR PIZ block too short for its header" }
+    min_nz = mem.get_u16_le(src, 0)
+    max_nz = mem.get_u16_le(src, 2)
+    if max_nz >= BITMAP_SIZE { return "an OpenEXR PIZ block with a damaged value bitmap" }
+    at = 4
+    bitmap = calloc(BITMAP_SIZE as long, 1 as long)
+    if min_nz <= max_nz {
+        count = max_nz - min_nz + 1
+        if at + count > size {
+            free(bitmap)
+            return "an OpenEXR PIZ block whose value bitmap runs past the block"
+        }
+        mem.copy(bitmap + min_nz, src + at, count as long)
+        at = at + count
+    }
+    // The table from rank to value: zero, which always has one, and each
+    // value the bitmap marks, in order.
+    lut = calloc(USHORT_RANGE as long, 2 as long) as uint16[]
+    kept = 0
+    v = 0
+    while v < USHORT_RANGE {
+        if v == 0 || (mem.get_uint8(bitmap, v >> 3) & (1 << (v & 7))) != 0 {
+            lut[kept] = v as uint16
+            kept = kept + 1
+        }
+        v = v + 1
+    }
+    free(bitmap)
+    max_value = kept - 1
+
+    if at + 4 > size {
+        free(lut as ptr)
+        return "an OpenEXR PIZ block too short for its Huffman data"
+    }
+    hlen = u32(src, at)
+    at = at + 4
+    if hlen < 0 || at + hlen > size {
+        free(lut as ptr)
+        return "an OpenEXR PIZ block whose Huffman data runs past the block"
+    }
+    t = calloc((n + 4) as long, 2 as long) as uint16[]
+    problem = huffman(src + at, hlen, t, n)
+    if problem != "" {
+        free(t as ptr)
+        free(lut as ptr)
+        return problem
+    }
+
+    // Each channel's plane (two, for a 4-byte sample), wavelet-decoded.
+    start = 0
+    k = 0
+    while k < channel_count {
+        words = 1
+        if (channels as int[])[k * 2 + 1] != 1 { words = 2 }
+        j = 0
+        while j < words {
+            wavelet(t, start + j, width, words, lines, width * words, max_value)
+            j = j + 1
+        }
+        start = start + width * lines * words
+        k = k + 1
+    }
+
+    // Ranks to values, then the lines.
+    i = 0
+    while i < n {
+        t[i] = lut[t[i] as int]
+        i = i + 1
+    }
+    o = out as uint16[]
+    dst = 0
+    start = 0
+    line = 0
+    while line < lines {
+        k = 0
+        offset = 0
+        while k < channel_count {
+            words = 1
+            if (channels as int[])[k * 2 + 1] != 1 { words = 2 }
+            row_words = width * words
+            s = start + offset + line * row_words
+            i = 0
+            while i < row_words {
+                o[dst + i] = t[s + i]
+                i = i + 1
+            }
+            dst = dst + row_words
+            offset = offset + width * lines * words
+            k = k + 1
+        }
+        line = line + 1
+    }
+    free(t as ptr)
+    free(lut as ptr)
+    return ""
+}

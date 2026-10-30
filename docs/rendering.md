@@ -446,11 +446,11 @@ place and `engine_environment_error()` says why.
 The map is an equirectangular (latitude-longitude) Radiance `.hdr` (RGBE, flat
 or run-length, the four mirror orientations of its resolution line) or OpenEXR
 (`ae3d.envimage`, from the formats' descriptions, no library): scanline files,
-HALF or FLOAT, R G B (A) or a lone Y, compression NONE, RLE, ZIPS or ZIP, lines
-in any order and any data window. PIZ, PXR24, B44, B44A, DWAA, DWAB, tiled,
-deep and multipart files are refused by name, and so is a map that is not twice
-as wide as it is tall (a cube cross, a mirror ball; the error names its size).
-It is placed as a painted sky
+HALF or FLOAT, R G B (A) or a lone Y, compression NONE, RLE, ZIPS, ZIP or PIZ
+(`ae3d.exrpiz`, what Poly Haven's EXRs are), lines in any order and any data
+window. PXR24, B44, B44A, DWAA, DWAB, tiled, deep and multipart files are
+refused by name, and so is a map that is not twice as wide as it is tall (a cube
+cross, a mirror ball; the error names its size). It is placed as a painted sky
 is: the top row is the zenith and the middle column looks along +x. Its light
 is the engine's radiance times `intensity`: 1 is the file's own values, and
 exposure handles the rest.
