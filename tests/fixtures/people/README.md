@@ -29,3 +29,4 @@ The dataset's `100STYLE.zip` (Zenodo record 8127870, md5 `3cf627852fd8192024c04a
 | `neutral_tr1.bvh` | walking turns | `Neutral_TR1.bvh` 6158 to 6338 | `95e2599479e9c868312b908fd116a1740296cbb11efdee711520ce033ac9ba41` |
 | `neutral_stop.bvh` | walking in, coming to a stand, standing | `Neutral_ID.bvh` 150 to 630 | `9a3ef0a411e6b68621e7c5f3005d338a09d139f1e470373fa5b0eb31058e1aa8` |
 | `neutral_start.bvh` | standing, then walking off | `Neutral_ID.bvh` 1620 to 1890 | `f3620aabf95fbe0cf340d018ad6f4c6534519ee0cebe24d3f70c8ea825398b15` |
+| `lookup_stop.bvh` | a walk ahead at 0.82 m/s coming straight to a stand (the LookUp style, its head tilted up: of every style's transitions, the straightest forward stop; the Neutral style has none) | `100STYLE/LookUp/LookUp_TR1.bvh` 75 to 314 | `4836e9cc7a4acd8e97420c8af60816ef121bcc05a3e47e57891c89f7815496b3` |
