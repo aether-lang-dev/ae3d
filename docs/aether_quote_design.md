@@ -1021,7 +1021,9 @@ One more quote shader, `ae3d.shaders.envmap.env_capture` (#869): each texel of
 the sky's 256-texel octahedral capture reads a user's equirectangular map in the
 texel's direction (the same texel-to-direction rule as the sky's capture, the
 painted sky's longitude and latitude, repeat in longitude, latitude held a half
-texel off the poles, a mip level and an intensity as captures). One source for
+texel off the poles, a mip level, an intensity and a yaw (radians, Nic 875-6:
+subtracted from the azimuth before the longitude is formed, so 0 is the same
+arithmetic as before) as captures). One source for
 SPIR-V, OpenGL's GLSL and the MSL (generated, held by `--check` and the device
 compiler, appended to the generator's table so no constant moved). It replaces
 `sky_capture` in the capture's place and nothing after it, so the irradiance

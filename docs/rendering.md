@@ -450,7 +450,27 @@ HALF or FLOAT, R G B (A) or a lone Y, compression NONE, RLE, ZIPS or ZIP, lines
 in any order and any data window. PIZ, PXR24, B44, B44A, DWAA, DWAB, tiled,
 deep and multipart files are refused by name. It is placed as a painted sky
 is: the top row is the zenith and the middle column looks along +x. Its light
-is the engine's radiance times `intensity` (a map's 1 is diffuse white).
+is the engine's radiance times `intensity`: 1 is the file's own values, and
+exposure handles the rest.
+
+The map can be turned about up: `engine_set_environment_yaw(e, degrees)` (or
+`AE3D_ENV_YAW=degrees`; `engine_set_environment_look(e, intensity, degrees)` sets
+the scale and the turn together). Yaw is in the sense the camera's yaw turns, so
+a feature of the picture at some azimuth is seen that many degrees on from it, a
+whole turn is no turn, and 0 is the map as placed above. It is one float
+(radians) of `env_capture`, so turning the map, like changing its scale, remakes
+the capture and its filters once (about 1-2 ms on the M6) and does not read the
+file again.
+
+The map is the scene's **Environment** component's too (Nic, 875-7): the fields
+`environment map` (a path; empty is the sky), `environment intensity` and
+`environment yaw` (degrees, -360 to 360) are the engine's own, so the scene
+file (`view.environment`: `image`, `intensity`, `yaw`, each written only when it
+differs from none, 1 and 0), the editor's Scene panel (a Browse for the file),
+`component.get`/`component.set` over the agent channel and a save game carry them
+with no other change. Setting the path reads the file; the intensity and the yaw
+never do. A path that does not load is refused and the field keeps the map that
+lights the scene; a scene file that names no map puts the sky back.
 
 It takes the place of the sky's capture and nothing after it: one quoted pass,
 `ae3d.shaders.envmap.env_capture`, writes the 256-texel octahedral capture from
@@ -692,6 +712,17 @@ axis) at which the picture is sharp; the disc of confusion at view depth z is
 at infinity and without bound toward the lens, held to `max_radius`. Both are
 in pixels of a 1080-line frame and scaled by the frame's height, so a frame of
 any size is blurred as much of itself. Nothing drawn (a sky) is infinitely far.
+
+Depth of field is an authored look, so it is on the scene's **Rendering**
+component beside the bloom and TAA: `depth of field`, `dof focus distance`
+(scene units, planar depth), `dof aperture` and `dof max blur` (pixels of a
+1080-line frame). They are the engine's own fields, so the editor's Scene
+panel, `component.get` and `component.set` over the agent channel, a save
+game and the scene file all carry them, and a program calling
+`engine_set_depth_of_field` and the panel edit one value. A component or scene
+file writes only what differs from the defaults (off, 10, 12, 16), so every
+earlier file loads with it off. The upscaler and the render scale are the
+device's, not the scene's, and are not on the component.
 
 Two passes at half the scene's size (`ae3d.shaders.dof`, quoted, with the MSL),
 then a composite that mixes them in beside the bloom:
