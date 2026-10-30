@@ -87,8 +87,8 @@ from their kinds ([components](components.md)):
   it reached.
 
 Selecting **Scene** shows the scene's own components: Environment (the sky
-image or colour, the sun by the hour, clouds, overcast, fog) and Rendering
-(the post passes, shadows, reflections, occlusion, TAA). They are the
+image or colour, the environment map with its intensity and yaw, the sun by the hour, clouds, overcast, fog) and Rendering
+(the post passes, shadows, reflections, occlusion, TAA, depth of field). They are the
 settings of the engine the viewport is drawn with, so a scene opened, a
 preset or an undo shows in the rows as it lands. The key light is the
 scene's Light. The scene's other sections (the weather, the render

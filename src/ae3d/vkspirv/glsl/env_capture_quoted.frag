@@ -3,6 +3,7 @@
 
 layout(std140, set = 0, binding = 0) uniform Params {
     float half_v;
+    float yaw;
     float lod;
     float intensity;
 };
@@ -38,8 +39,8 @@ vec3 ae3d_shaders_skyprobe_oct_texel_direction(vec2 uv, float size) {
     return ae3d_shaders_skyprobe_oct_decode(vec2(px, py));
 }
 
-vec2 ae3d_shaders_envmap_equirect_uv(vec3 d, float half_v) {
-    float u = (atan(d.z, d.x) + 3.14159265) / 6.28318531;
+vec2 ae3d_shaders_envmap_equirect_uv(vec3 d, float half_v, float yaw) {
+    float u = (atan(d.z, d.x) + 3.14159265 - yaw) / 6.28318531;
     float v = (asin(clamp(d.y, -1.0, 1.0)) + 1.57079633) / 3.14159265;
     return vec2(u, clamp(v, half_v, 1.0 - half_v));
 }
@@ -50,6 +51,6 @@ layout(location = 0) out vec4 FragColor;
 void main() {
     vec2 fc = gl_FragCoord.xy;
     vec3 dir = ae3d_shaders_skyprobe_oct_texel_direction(vec2(fc.x / 256.0, fc.y / 256.0), 256.0);
-    vec3 light = textureLod(env, ae3d_shaders_envmap_equirect_uv(dir, half_v), lod).rgb;
+    vec3 light = textureLod(env, ae3d_shaders_envmap_equirect_uv(dir, half_v, yaw), lod).rgb;
     FragColor = vec4(max(light * intensity, vec3(0.0)), 1.0);
 }
