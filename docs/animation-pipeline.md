@@ -92,7 +92,7 @@ mover.step(m, dt)
 
 - **Blend spaces in two directions** are weighted by polar gradient bands (Johansen 2009, Unity's freeform directional): between two samples of a speed, a direction blends them at that speed. The takes play in step by their footfalls, paced so their blended velocity is the one asked.
 - **Starts and stops by distance** (Paragon, GDC 2016). A start is played by the way the figure has come since it stood, a stop by the way left to where the mover brings it to rest, so its feet plant where the clip planted them whatever the braking. The mover brakes at the stop take's own deceleration, so the stop enters with its feet where the walk's are in the stride; of a stop and its mirror, the transition takes the one whose feet match.
-- **Turning on the spot in steps** (`ikrig.feet_set_steps`, #827). A planted foot keeps its heading as the body turns above it; when it is twisted or moved too far, it is lifted and set down where the clip has it, one foot at a time, begun on the twist it will have half a step on.
+- **Turning on the spot in steps** (`ikrig.feet_set_steps`, #827). A planted foot keeps its heading over the ground as the body turns above it; when it is twisted or moved too far, it is lifted off the ground and set down where the clip has it, one foot at a time, begun on the twist it will have half a step on.
 - **Motion matching** (`add_matcher`; Clavet, GDC 2016; Holden). Every frame of its takes is known by its feet's places and velocities, its hips' velocity, and where its root will be and face a third, two thirds and a whole second on; every 0.1 s the frame nearest the pose drawn and the way ahead the mover predicts is played, changing only for a clear gain and only to a frame that keeps each planted foot planted. With `mover.set_follow`, the figure goes by its clips' root motion and the mover's springs are a simulation it is eased toward.
 - **Aim offsets** (`add_aim`): poses aiming at their yaw and pitch, blended at the aim asked and added over the spine.
 - **A pose held** (`snapshot`): the pose drawn now as a state, what a get-up blends out of.
@@ -151,7 +151,8 @@ The last word on a pose before it is drawn is `ae3d.ikrig`'s, in the animator's 
 | halfway through a 0.6 s cross-fade: from each state, the two 83° apart | 42° and 43° | between a fifth and four fifths of it |
 | a pistol's aim offset aimed down, level, up: the hand's height | 0.90, 1.40, 1.80 m | in that order; level, the pose unchanged |
 | stand, start, walk 4 s, stop on a mover (feet locked): a planted toe's slide | 0.1 mm | 5 mm |
-| half a turn on the spot in steps: a planted toe's slide; the hips off their spot; the degrees a step | 0.001 mm; 5.3 mm; 26° in 7 steps | 5 mm; 5 cm; 45° |
+| half a turn on the spot in steps: a planted toe's slide; the hips off their spot; the degrees a step | 0.0007 mm; 5.3 mm; 18° in 10 steps | 5 mm; 5 cm; 45° |
+| and as a player sees it: a foot past the hips' middle; a knee out off the hips; a step's lift; the fastest ankle | never (4.9 cm short of it); 0°; 60 mm; 0.89 m/s | never; 30°; 30 mm or more; 3 m/s |
 | motion matching through a stand, a walk, a side step, a turn and a stop: the frame played's root velocity walking, stepping left, at rest | 0.69 m/s ahead, 0.48 m/s left, still | a walk ahead, a step left, still |
 
 `tests/test_ik_constraints.ae` holds the IK (#857) to these, on the Rigify mannequin:
