@@ -8,7 +8,8 @@ ae3d's animation is a pipeline of layers, the way shipped engines build it (#853
 | L0 | `ae3d.bvh` | Motion capture read from BVH files: the skeleton and its channels, End Sites as joints, units found from its height. |
 | L0 | `ae3d.retarget` | A take made on one humanoid played by another: facings and rest poses aligned, turns carried in the ground's space, the pelvis scaled by the two figures' pelvis heights, the feet kept on their contacts (a planted toe's tip held on the source's ground, the legs solved by IK, the pelvis lowered where they cannot reach), and a root made under the hips for a capture that has none. |
 | L1 | `ae3d.clips` | A take is an animation resampled for a rig at the file's key rate. Read from it at import: foot contacts, planted frames, its speed over the ground, its heading, footfall sync markers and footfall events. Loops sealed. Root motion taken out with the root locked to the rest pose, straightened for a blend space, mirrored. |
-| L2 | `ae3d.animator` | The single writer. States (a take, or a blend space along one parameter), inertialized transitions, gait-to-gait hand-overs in step, masked and additive layers, events fired as the clock passes them, root motion onto the figure's object or through its character controller. |
+| L2 | `ae3d.animator` | The single writer, a graph of states over pose buffers: a take (by its clock, or by a distance: `clock_by`), a blend space along one parameter or over the ground's two directions, a motion matcher, a held pose. Named parameters a game drives it by; transitions it takes itself on their conditions, inertialized or cross-faded, in step with the stride, to whichever of several states' feet match; masked and additive layers, aim offsets, events, root motion onto the figure's object or through its character controller. |
+| L2 | `ae3d.mover` | The controller a game drives with a velocity (and a facing, strafing): Holden's springs move the figure and feed the graph its parameters (its velocity in its own frame, speed, the way come and the way left to rest); braking at a stop's own rate; or following its clips' root motion, the springs a simulation the figure is eased toward. |
 | L3 | `ae3d.ikrig` | Feet on the ground (ground height under each foot, pelvis drop, the foot locked where the clip plants it, the heel peeled up when the leg cannot reach), two-bone legs and arms with soft reach, hands on a prop's grips, the head turned to a point. |
 
 ## A figure on its gaits
@@ -58,6 +59,45 @@ The capture's skeleton has no root, so the retargeter makes one on the ground un
 - Footfalls are found at import as events (`clips.FOOT_LEFT`, `clips.FOOT_RIGHT`), and a program adds its own (`clips.add_event`). The animator fires each as its clock passes it, a blend's from its heaviest take; a game asks `animator.fired(a, "cue")` after the pose phase.
 - A take that loops is sealed at import, as Unity's Loop Pose does it: the gap between its last frame and its first is spread over it, so it never snaps as it wraps.
 - `pose.mirror` and `clips.mirror` swap left for right: each joint's turn from its rest pose is reflected onto its other side's joint (names with left and right swapped), and its place reflected. A walk leading with its left foot leads with its right.
+- A capture becomes a loop with `clips.loop_cut`: the two frames at least 0.6 s apart whose feet, hands, head and pelvis match best in place and motion, cropped and sealed. `clips.straighten` lays its path on the root's own frame and, `cardinal`, onto the nearest of forward, back, left and right, poses and path turned together.
+
+## The graph, and a figure on a stick
+
+A game drives a figure with `ae3d.mover` and lets the graph choose its clips:
+
+```aether
+move = animator.add_blend2(a, "move")               // each gait at its velocity: x to the left, z ahead
+animator.blend_add2(a, move, walk_ahead, 0.0, 0.8)
+animator.blend_add2(a, move, step_left, 0.51, 0.0)
+animator.bind2(a, move, "vx", "vz")                  // the mover writes these
+start = animator.add_state(a, "start", start_take, false)
+animator.clock_by(a, start, "travelled", false)      // played by the way come
+stop = animator.add_state(a, "stop", stop_take, false)
+animator.clock_by(a, stop, "rest", true)             // played by the way left to rest
+go = animator.add_transition(a, idle, start, 0.2)
+animator.transition_when(a, go, "go", animator.IS, 0.0)
+on = animator.add_transition(a, start, move, 0.3)
+animator.transition_when(a, on, "", animator.ENDED, 0.0)
+animator.transition_synced(a, on, true)              // the gaits take over in step
+halt = animator.add_transition(a, move, stop, 0.25)
+animator.transition_when(a, halt, "go", animator.IS_NOT, 0.0)
+animator.transition_when(a, halt, "rest", animator.BELOW, clips.travel_length(stop_take))
+animator.transition_or(a, halt, stop_on_the_other_foot)   // whichever's feet match
+m = mover.mover_new(a, o)
+mover.set_braking(m, clips.braking(stop_take))       // it comes to rest as the stop does
+// Each frame: the stick.
+mover.ask(m, velocity)
+mover.step(m, dt)
+```
+
+- **Blend spaces in two directions** are weighted by polar gradient bands (Johansen 2009, Unity's freeform directional): between two samples of a speed, a direction blends them at that speed. The takes play in step by their footfalls, paced so their blended velocity is the one asked.
+- **Starts and stops by distance** (Paragon, GDC 2016). A start is played by the way the figure has come since it stood, a stop by the way left to where the mover brings it to rest, so its feet plant where the clip planted them whatever the braking. The mover brakes at the stop take's own deceleration, so the stop enters with its feet where the walk's are in the stride; of a stop and its mirror, the transition takes the one whose feet match.
+- **Turning on the spot in steps** (`ikrig.feet_set_steps`, #827). A planted foot keeps its heading as the body turns above it; when it is twisted or moved too far, it is lifted and set down where the clip has it, one foot at a time, begun on the twist it will have half a step on.
+- **Motion matching** (`add_matcher`; Clavet, GDC 2016; Holden). Every frame of its takes is known by its feet's places and velocities, its hips' velocity, and where its root will be and face a third, two thirds and a whole second on; every 0.1 s the frame nearest the pose drawn and the way ahead the mover predicts is played, changing only for a clear gain and only to a frame that keeps each planted foot planted. With `mover.set_follow`, the figure goes by its clips' root motion and the mover's springs are a simulation it is eased toward.
+- **Aim offsets** (`add_aim`): poses aiming at their yaw and pitch, blended at the aim asked and added over the spine.
+- **A pose held** (`snapshot`): the pose drawn now as a state, what a get-up blends out of.
+
+`tools/anim_showcase.ae`'s fifth figure (`AE3D_WATCH=5`) is this graph on the UE5 mannequin: it stands, walks, steps left and right facing ahead, runs, stops, turns round on the spot, and walks back aiming.
 
 ## The techniques, and where they come from
 
@@ -94,12 +134,20 @@ The capture's skeleton has no root, so the retargeter makes one on the ground un
 | 100STYLE's walk, run and backward walk onto the UE5 mannequin, turned bone by bone: every bone against the source's | 1.6° at worst | 2° |
 | with the feet kept: a planted toe's slide a stance | under 10⁻¹¹ mm (11.0 mm turned bone by bone; the capture's own 5.6 mm) | 5 mm |
 | the root made under the hips: its root motion against the hips' travel | 1.786 of 1.786 m | 1% |
+| the head as it stands after retargeting, against the capture's | 1.2·10⁻⁶° | 2° |
+| the 2D blend at 8 directions by 0.6, 1.0 and 1.3 m/s, feet locked: a planted toe's slide; the speed against the speed asked | under 10⁻¹¹ mm; 0% | 5 mm; 1% |
+| a graph of idle, gaits and a roll driven by its parameters alone: its fastest joint turn | 32.6 rad/s (the takes' own 38.7) | the takes' own, plus 2% |
+| halfway through a 0.6 s cross-fade: from each state, the two 83° apart | 42° and 43° | between a fifth and four fifths of it |
+| a pistol's aim offset aimed down, level, up: the hand's height | 0.90, 1.40, 1.80 m | in that order; level, the pose unchanged |
+| stand, start, walk 4 s, stop on a mover (feet locked): a planted toe's slide | under 10⁻¹¹ mm | 5 mm |
+| half a turn on the spot in steps: a planted toe's slide; the hips off their spot; the degrees a step | under 10⁻¹¹ mm; 5.3 mm; 26° in 7 steps | 5 mm; 5 cm; 45° |
+| motion matching through a stand, a walk, a side step, a turn and a stop: the frame played's root velocity walking, stepping left, at rest | 0.69 m/s ahead, 0.48 m/s left, still | a walk ahead, a step left, still |
 
 `tools/anim_showcase.ae` puts four figures on these layers for a person to watch. Its runs measure the toes as the test does: through a 20 s cycle of starts, stops, accelerations and a circle, a planted toe slides under 10⁻¹¹ mm. The fourth walks 100STYLE's captured forward and backward walks out along a line and back on a character controller, by root motion.
 
 ## Next
 
-- Blend spaces in two dimensions (direction and speed) and starts, stops and turns as clips (#856).
+- Motion matching on a database of the style's whole takes, its changes held to the takes' own joint speeds (today's database is one short take of each motion).
 - Full-body IK and aim constraints (#857).
 - The physics asset and physical animation (#858), then ragdolls and get-ups into matched clips (#859).
 - The plaza, the motion showcase and Siltreach moved onto the pipeline, and the old writers retired (#860).
