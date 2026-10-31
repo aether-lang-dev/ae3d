@@ -16,6 +16,7 @@ layout(location = 1) out vec3 colour;
 layout(location = 2) out float alpha;
 layout(location = 3) out vec4 clip_now;
 layout(location = 4) out vec4 clip_prev;
+layout(location = 5) flat out int edge;
 
 vec3 ae3d_shaders_lettering_text_place(vec3 origin, vec3 right, vec3 up, float x, float y) {
     return origin + right * x - up * y;
@@ -23,7 +24,8 @@ vec3 ae3d_shaders_lettering_text_place(vec3 origin, vec3 right, vec3 up, float x
 
 void main() {
     vec4 right = instanceModel[0];
-    vec3 world = ae3d_shaders_lettering_text_place(instanceModel[2].xyz, right.xyz, instanceModel[1].xyz, inPosition.x, inPosition.y);
+    vec4 up = instanceModel[1];
+    vec3 world = ae3d_shaders_lettering_text_place(instanceModel[2].xyz, right.xyz, up.xyz, inPosition.x, inPosition.y);
     vec4 now = (view_projection * vec4(world, 1.0));
     vec4 prev = (prev_view_projection * vec4(world, 1.0));
     float z = mix(now.z, 0.0001 * now.w, right.w);
@@ -33,4 +35,5 @@ void main() {
     alpha = inOcclusion;
     clip_now = now;
     clip_prev = prev;
+    edge = int((up.w * 65536.0 + 0.5));
 }
