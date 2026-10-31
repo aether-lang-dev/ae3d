@@ -272,9 +272,13 @@ program sets one (`engine_set_ui_scale`, or `AE3D_UI_SCALE`).
   gets a line of its own.
 - **Text in the world.** `hud.world_text(o, x, y, z, size, text, colour)` is
   a label at a point in the scene, `size` tall to the em in the world's units,
-  facing the camera; `world_text_fixed` lies in a plane; `world_text_depth`
-  decides whether what is nearer hides it. It uses the same atlas and is drawn
-  into the scene, not over it: docs/rendering.md, "Text in the world".
+  facing the camera; `world_text_upright` turns about the world's up only;
+  `world_text_fixed` lies in a plane. `world_text_depth` decides whether what
+  is nearer hides it, `world_text_pixels` sizes it in screen pixels instead,
+  and `world_text_outline` and `world_text_shadow` outline and shadow it as
+  `text_outlined` and `text_shadowed` do; all four are state until the frame's
+  clear. It uses the same atlas and is drawn into the scene, not over it:
+  docs/rendering.md, "Text in the world".
 - **Clipped panels.** `hud.push_clip(o, x, y, w, h)` and `hud.pop_clip(o)`
   bound what is drawn to a panel, nested panels to where they meet. Each
   quad is cut to the clip as it is added, and the glyph or image area it

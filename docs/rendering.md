@@ -1083,15 +1083,37 @@ instead of a place on the screen (#871):
 ```
 hud.world_text(h, x, y, z, 0.4, "Grunt", hud.rgba(1.0, 1.0, 1.0, 1.0))          // faces the camera
 hud.world_text_fixed(h, x, y, z, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.5, "EXIT", c)  // lies along right and up
+hud.world_text_upright(h, x, y, z, 0.4, "Oak", c)                               // turns about the world's up only
 hud.world_text_depth(h, false)                                                  // the runs after it are over everything
+hud.world_text_pixels(h, true)                                                  // their sizes in screen pixels
+hud.world_text_outline(h, hud.rgba(0.0, 0.0, 0.0, 1.0), 2.0)                    // outlined, 2 of the size's units wide
+hud.world_text_shadow(h, hud.rgba(0.0, 0.0, 0.0, 0.6), 2.0)                     // shadowed, 2 down and right
 ```
 
 The size is the em in the world's units, so a label shrinks with distance as
 the thing it names does; the text is centred on the point both ways. A
 `world_text` run faces the camera it is drawn from (its axes are the camera's,
 so it is parallel to the picture) -- the window's, or a view's: a view draws
-the world text from its own camera. A `world_text_fixed` run lies in the plane
-its two axes make, drawn from both sides and mirrored from behind. Colours are
+the world text from its own camera. A `world_text_upright` run turns to the
+camera about the world's up (+y) only, its lines level and its tops up however
+high or low the camera is: a sign on a post. A `world_text_fixed` run lies in
+the plane its two axes make, drawn from both sides and mirrored from behind.
+
+After `world_text_pixels(h, true)` the size is the em in pixels on the screen,
+so a name tag is as readable far away as near. Its scale is found at each
+draw, from that draw's camera and the height of the frame as it is shown (the
+window's, or a view's; the render scale does not change it): twice the point's
+clip w over the projection's vertical scale and the height is the world a
+pixel spans there. It holds under an orthographic camera too.
+
+`world_text_outline(h, colour, width)` draws a run of the same glyphs under the
+text in `colour`, its edge lowered in the field by `width` (the HUD's
+`text_outlined` rule, and its limit: about 0.08 of the em); `world_text_shadow(h,
+colour, offset)` a run moved `offset` right and down along the text's own axes.
+Both are in the size's units, so a share of the em at any size, and each is a
+run (and a draw) of its own, before the text. Like `world_text_depth`, the
+pixels, outline and shadow switches hold for the runs after them until the
+frame's `hud.clear`. Colours are
 display values, as the HUD's, turned to the scene's light the way the clear
 colour is. `hud.clear` forgets the runs after each frame like the rectangles;
 512 runs a frame at most, the rest dropped and said once.
@@ -1112,7 +1134,9 @@ the bloom and the tone curve. Three things follow from that:
   (text is not picked: the click lands on what is behind).
 - The atlas is read at one level, as the HUD reads it: far away and small a
   label is blurred rather than sharp (the field's width grows with the
-  minification) and can shimmer in motion.
+  minification) and can shimmer in motion. Mips would sharpen it but make the
+  two APIs' frames differ by the driver's mip filter, so it stays one level;
+  a label sized in pixels does not shrink, and does not shimmer.
 - With nothing asked for nothing runs: the frame is the frame it was.
 
 What a frame pays (`benchmarks/bench_world_text`, 1280x720, 24 spheres, an
@@ -1469,8 +1493,12 @@ say. Between two target keys the target is interpolated the same way and
 looked at, so a camera circling a point keeps it in the middle of the
 frame; any other segment slerps the two look directions at a constant angular
 speed (the camera has no roll, so a direction is its orientation). A path
-is open: looping jumps from the last key to the first, so end a loop on its
-first key to make it seamless. See the module's header for the reasoning.
+is open unless `set_closed(p, seconds)` closes it: then a segment that long
+goes from the last key back to the first, the Catmull-Rom tangents wrapping
+round it (the first key's neighbour before it is the last, a period earlier),
+so a closed path that loops goes round with no jump in place or speed. Open,
+looping jumps from the last key to the first. See the module's header for the
+reasoning.
 
 **A view follows a path** by being drawn from a camera a path is attached to:
 `campath.attach(e, p, view_cam)` with the view's own camera
