@@ -15,6 +15,7 @@ struct ae_world_text_in {
     float alpha [[user(locn2)]];
     float4 clip_now [[user(locn3)]];
     float4 clip_prev [[user(locn4)]];
+    int edge [[user(locn5)]] [[flat]];
 };
 
 struct ae_world_text_frag_out {
@@ -22,9 +23,9 @@ struct ae_world_text_frag_out {
     float4 out_velocity [[color(1)]];
 };
 
-static float ae3d_shaders_lettering_coverage(float d, float w) {
+static float ae3d_shaders_lettering_coverage(float d, float w, float edge) {
     float reach = max(w * 0.5, 0.00001);
-    return smoothstep(0.5 - reach, 0.5 + reach, d);
+    return smoothstep(edge - reach, edge + reach, d);
 }
 
 static float ae3d_shaders_skydome_aces_inverse(float y_in) {
@@ -62,10 +63,11 @@ fragment ae_world_text_frag_out ae_world_text_fragment(
     float alpha = ae_in.alpha;
     float4 clip_now = ae_in.clip_now;
     float4 clip_prev = ae_in.clip_prev;
+    int edge = ae_in.edge;
     constant float2& jitter = ae_params.jitter;
     float d = atlas.sample(ae_smp_atlas, uv).x;
     float w = abs(dfdx(d)) + abs(dfdy(d));
-    float a = ae3d_shaders_lettering_coverage(d, w) * alpha;
+    float a = ae3d_shaders_lettering_coverage(d, w, float(edge) / 65536.0) * alpha;
     if (a < 0.002) {
         discard_fragment();
     }

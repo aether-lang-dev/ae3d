@@ -6,9 +6,9 @@ layout(std140, set = 0, binding = 0) uniform Params {
 };
 layout(set = 0, binding = 1) uniform sampler2D atlas;
 
-float ae3d_shaders_lettering_coverage(float d, float w) {
+float ae3d_shaders_lettering_coverage(float d, float w, float edge) {
     float reach = max(w * 0.5, 0.00001);
-    return smoothstep(0.5 - reach, 0.5 + reach, d);
+    return smoothstep(edge - reach, edge + reach, d);
 }
 
 float ae3d_shaders_skydome_aces_inverse(float y_in) {
@@ -41,13 +41,14 @@ layout(location = 1) in vec3 colour;
 layout(location = 2) in float alpha;
 layout(location = 3) in vec4 clip_now;
 layout(location = 4) in vec4 clip_prev;
+layout(location = 5) flat in int edge;
 layout(location = 0) out vec4 out_colour;
 layout(location = 1) out vec2 out_velocity;
 
 void main() {
     float d = texture(atlas, uv).x;
     float w = abs(dFdx(d)) + abs(dFdy(d));
-    float a = ae3d_shaders_lettering_coverage(d, w) * alpha;
+    float a = ae3d_shaders_lettering_coverage(d, w, float(edge) / 65536.0) * alpha;
     if (a < 0.002) {
         discard;
     }

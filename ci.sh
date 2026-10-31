@@ -672,7 +672,7 @@ for suite in $SUITES; do
     fi
     if grep -qE "warning|^error" "$BUILD_DIR/$name.log"; then
         fail "$name (build warnings or errors)"
-        grep -E "warning|^error" "$BUILD_DIR/$name.log" | sed 's/^/        /' | head -10
+        grep -E "warning|^error|In function|inlined from" "$BUILD_DIR/$name.log" | sed 's/^/        /' | head -30
         continue
     fi
     needs_window=0
@@ -805,7 +805,7 @@ for example in examples/*.ae; do
     fi
     if grep -qE "warning|^error" "$BUILD_DIR/$name.log"; then
         fail "$name (build warnings or errors)"
-        grep -E "warning|^error" "$BUILD_DIR/$name.log" | sed 's/^/        /' | head -10
+        grep -E "warning|^error|In function|inlined from" "$BUILD_DIR/$name.log" | sed 's/^/        /' | head -30
         continue
     fi
     if ! have_display; then
@@ -1134,7 +1134,7 @@ else
         # not, so an unused variable in the largest Aether source in the repo
         # went through ci without a word.
         fail "ae3d_editor (build warnings or errors)"
-        grep -E "warning|^error" /tmp/ae3d_build.log | sed 's/^/        /' | head -10
+        grep -E "warning|^error|In function|inlined from" /tmp/ae3d_build.log | sed 's/^/        /' | head -30
     else
         sed -n 's/^built: /        /p' /tmp/ae3d_build.log
         # The roundtrip scene is this one saved and loaded again before the
