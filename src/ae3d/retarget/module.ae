@@ -1,0 +1,635 @@
+// Retargeting (#853, layer 0): a take made on one humanoid played by another.
+//
+// Both rigs are mapped onto the same humanoid layout (ae3d.pose: the UE5
+// mannequin's bones), whatever their own bones are named. A clip is then
+// carried from one to the other bone by bone, the way a shipped engine's
+// retargeter does it (Unreal's IK Retargeter, Unity's Humanoid avatar):
+//   - the two figures' facings aligned: a capture made facing one way plays
+//     on a figure made facing another, turned about up by the angle between
+//     their rest facings (heel to toe);
+//   - the rest poses aligned: for each bone, the turn that lays the target's
+//     rest direction (from its joint to the next humanoid joint down its
+//     chain, or to its own first child where the map has no next: a BVH
+//     wrist's End Site) onto the source's. Two rigs never stand alike at
+//     rest (a T-pose against an A-pose, hands flat or turned in), and
+//     carried as turns from rest alone, a T-posed clip put an A-posed
+//     figure's arms 45 degrees off its own;
+//   - each frame, every bone of the target turned from its aligned rest as
+//     the source's turned from its rest, in the ground's space: it points
+//     where the source's points, and twists as it twists;
+//   - the pelvis and the root carried as the source's moved, scaled by the
+//     two figures' pelvis heights, so a shorter figure takes shorter steps
+//     over the same ground in the same time;
+//   - the feet kept on their contacts (Unreal's IK goals): each leg reaches
+//     by two-bone IK for where the source's ball is, scaled the same way,
+//     and through a stretch the source plants a foot its ball is held where
+//     it was planted. Turned bone by bone alone, a figure whose shins and
+//     feet are not the source's in proportion slid its planted feet by the
+//     difference; and the source's own slip (an inertial capture's feet
+//     drift a few millimetres a stance) is left out;
+//   - a root made for a target that has one when the source has none (a
+//     capture's skeleton starts at its hips), so its root motion can be taken;
+//   - bones the source has no match for keep the target's own rest.
+// The take that comes out is the target's own: its contacts, speed and
+// heading found on it, as for one read from its own file.
+
+import ae3d.core
+import ae3d.pose
+import ae3d.clips
+import ae3d.ikrig
+
+exports (retarget, retarget_with, height_ratio, facing, RELEASE)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+// Seconds a planted ball's hold fades over once the source lifts the foot.
+const RELEASE = 0.15
+// A leg reaches its goal exactly within this share of its length (ikrig's
+// soft reach eases it beyond); the pelvis comes down where a goal is farther.
+const REACH = 0.97
+// Seconds either side over which the pelvis's drop is eased.
+const SMOOTH = 0.1
+// Seconds either side over which a made root's heading is averaged.
+const ROOT_SMOOTH = 0.4
+
+// The humanoid slot each slot's direction is taken toward (the next joint
+// down its chain), -1 where none follows.
+next_slot(slot: int) -> int {
+    if slot == pose.PELVIS { return pose.SPINE_01 }
+    if slot == pose.SPINE_01 { return pose.SPINE_02 }
+    if slot == pose.SPINE_02 { return pose.SPINE_03 }
+    if slot == pose.SPINE_03 { return pose.NECK }
+    if slot == pose.NECK { return pose.HEAD }
+    if slot == pose.CLAVICLE_L { return pose.UPPERARM_L }
+    if slot == pose.UPPERARM_L { return pose.LOWERARM_L }
+    if slot == pose.LOWERARM_L { return pose.HAND_L }
+    if slot == pose.HAND_L { return pose.FINGERS + 2 * 3 }
+    if slot == pose.CLAVICLE_R { return pose.UPPERARM_R }
+    if slot == pose.UPPERARM_R { return pose.LOWERARM_R }
+    if slot == pose.LOWERARM_R { return pose.HAND_R }
+    if slot == pose.HAND_R { return pose.FINGERS + 15 + 2 * 3 }
+    if slot == pose.THIGH_L { return pose.CALF_L }
+    if slot == pose.CALF_L { return pose.FOOT_L }
+    if slot == pose.FOOT_L { return pose.BALL_L }
+    if slot == pose.THIGH_R { return pose.CALF_R }
+    if slot == pose.CALF_R { return pose.FOOT_R }
+    if slot == pose.FOOT_R { return pose.BALL_R }
+    if slot >= pose.FINGERS {
+        phalanx = (slot - pose.FINGERS) % 3
+        if phalanx < 2 { return slot + 1 }
+    }
+    return 0 - 1
+}
+
+// The joint a bone's direction is taken toward: the next humanoid joint down
+// its chain, or, where the rig maps none, the joint's own first child (a BVH
+// wrist's End Site, a toe's tip); -1 when it has neither.
+toward(r: *Rig, j: int, slot: int) -> int {
+    nxt = next_slot(slot)
+    if nxt >= 0 && pose.human(r, nxt) >= 0 { return pose.human(r, nxt) }
+    c = 0
+    while c < pose.count(r) {
+        if pose.parent(r, c) == j { return c }
+        c = c + 1
+    }
+    return 0 - 1
+}
+
+// A rotation of the rig's space as the ground has it (through its armature).
+to_ground_turn(rig: *Rig, q: Quat) -> Quat {
+    base = pose.base_model(rig)
+    if base == null { return q }
+    core.model_sync_transform(base)
+    return core.quat_normalize(core.quat_mul(base.world_rotation, q))
+}
+
+from_ground_turn(rig: *Rig, q: Quat) -> Quat {
+    base = pose.base_model(rig)
+    if base == null { return q }
+    core.model_sync_transform(base)
+    return core.quat_normalize(core.quat_mul(core.quat_conjugate(base.world_rotation), q))
+}
+
+// The ratio of the target's pelvis height at rest to the source's, over the
+// lowest of each one's feet: what a step and a stride are scaled by.
+height_ratio(source: *Rig, target: *Rig) -> float {
+    hs = pelvis_height(source)
+    ht = pelvis_height(target)
+    if hs <= 0.000001 { return 1.0 }
+    return ht / hs
+}
+
+pelvis_height(r: *Rig) -> float {
+    w = pose.new(r)
+    pose.rest_world(r, w)
+    pelvis = pose.human(r, pose.PELVIS)
+    if pelvis < 0 {
+        pose.release(w)
+        return 0.0
+    }
+    top = clips.ground_point(r, pose.translation(w, pelvis)).y
+    low = top
+    feet = [pose.FOOT_L, pose.FOOT_R, pose.BALL_L, pose.BALL_R]
+    k = 0
+    while k < 4 {
+        j = pose.human(r, feet[k])
+        if j >= 0 {
+            y = clips.ground_point(r, pose.translation(w, j)).y
+            if y < low { low = y }
+        }
+        k = k + 1
+    }
+    pose.release(w)
+    return top - low
+}
+
+// The way the rig's figure faces at rest over the ground (unit, level):
+// square to the line from its right thigh to its left, turned about up (a
+// figure facing +z has its left at +x). Every humanoid has its thighs; the
+// box man has no balls, and taken from its feet his facing was guessed and
+// his walk turned 120 degrees. From its ankles to its balls where it maps no
+// thighs; +z where it maps neither.
+facing(r: *Rig) -> Vec3 {
+    w = pose.new(r)
+    pose.rest_world(r, w)
+    sum = core.vec3(0.0, 0.0, 0.0)
+    left = pose.human(r, pose.THIGH_L)
+    right = pose.human(r, pose.THIGH_R)
+    if left >= 0 && right >= 0 {
+        across = core.v3_sub(clips.ground_point(r, pose.translation(w, left)), clips.ground_point(r, pose.translation(w, right)))
+        sum = core.v3_cross(across, core.vec3(0.0, 1.0, 0.0))
+    } else {
+        pairs = [pose.FOOT_L, pose.BALL_L, pose.FOOT_R, pose.BALL_R]
+        k = 0
+        while k < 4 {
+            a = pose.human(r, pairs[k])
+            b = pose.human(r, pairs[k + 1])
+            if a >= 0 && b >= 0 { sum = core.v3_add(sum, ground_dir(r, w, a, b)) }
+            k = k + 2
+        }
+    }
+    pose.release(w)
+    flat = core.vec3(sum.x, 0.0, sum.z)
+    if core.v3_len(flat) < 0.000001 { return core.vec3(0.0, 0.0, 1.0) }
+    return core.v3_normalize(flat)
+}
+
+// `take`, made for `source`, as a take for `target`, its feet kept on their
+// contacts. Null when either rig maps no pelvis.
+retarget(source: *Rig, take: *Take, target: *Rig) -> *Take { return retarget_with(source, take, target, true) }
+
+// As retarget, the feet kept on their contacts only when `feet` (turned bone
+// by bone alone otherwise).
+retarget_with(source: *Rig, take: *Take, target: *Rig, feet: bool) -> *Take {
+    if pose.human(source, pose.PELVIS) < 0 || pose.human(target, pose.PELVIS) < 0 { return null }
+    nt = pose.count(target)
+    // The turn about up from the source's facing to the target's.
+    fs = facing(source)
+    ft = facing(target)
+    yaw = core.quat_rotate(core.atan2_of(fs.z * ft.x - fs.x * ft.z, fs.x * ft.x + fs.z * ft.z), core.vec3(0.0, 1.0, 0.0))
+    // Per target joint: its source joint (-1 none) and its rest alignment.
+    from = calloc(nt, 4) as int[]
+    align = calloc(nt * 4, 8) as float[]
+    j = 0
+    while j < nt {
+        from[j] = 0 - 1
+        align[j * 4 + 3] = 1.0
+        j = j + 1
+    }
+    rest_s = pose.new(source)
+    rest_t = pose.new(target)
+    pose.rest_world(source, rest_s)
+    pose.rest_world(target, rest_t)
+    slot = 0
+    while slot < pose.SLOTS {
+        js = pose.human(source, slot)
+        jt = pose.human(target, slot)
+        if js >= 0 && jt >= 0 {
+            from[jt] = js
+            to_s = toward(source, js, slot)
+            to_t = toward(target, jt, slot)
+            // A bone one rig has nothing beyond (the UE5 head has no child) is
+            // aligned on both by the bone coming into it, its parent's to it:
+            // left unaligned, the mannequin's head, pitched 11 degrees at rest
+            // where the capture's stands upright, bowed that much further.
+            from_s = js
+            from_t = jt
+            if to_s < 0 || to_t < 0 {
+                to_s = js
+                to_t = jt
+                from_s = pose.parent(source, js)
+                from_t = pose.parent(target, jt)
+            }
+            if from_s >= 0 && from_t >= 0 && to_s >= 0 && to_t >= 0 {
+                ds = core.quat_apply(yaw, ground_dir(source, rest_s, from_s, to_s))
+                dt = ground_dir(target, rest_t, from_t, to_t)
+                if core.v3_len(ds) > 0.000001 && core.v3_len(dt) > 0.000001 {
+                    a = core.quat_from_to(dt, ds)
+                    align[jt * 4] = a.x
+                    align[jt * 4 + 1] = a.y
+                    align[jt * 4 + 2] = a.z
+                    align[jt * 4 + 3] = a.w
+                }
+            }
+        }
+        slot = slot + 1
+    }
+    k = height_ratio(source, target)
+    out = clips.from_frames(target, clips.name(take), clips.frames(take), clips.rate(take))
+    clips.set_looping(out, clips.looping(take))
+    worlds_s = pose.new(source)
+    worlds_t = pose.new(target)
+    f = 0
+    while f < clips.frames(take) {
+        pose.world(source, clips.frame(take, f), worlds_s)
+        carry_frame(source, target, worlds_s, rest_s, rest_t, from, align, k, yaw, clips.frame(out, f), worlds_t)
+        f = f + 1
+    }
+    if feet { keep_feet(source, take, target, out, k, yaw) }
+    if pose.human(source, pose.ROOT) < 0 { make_root(target, out) }
+    clips.contacts_like(out, target, take)
+    pose.release(worlds_s)
+    pose.release(worlds_t)
+    pose.release(rest_s)
+    pose.release(rest_t)
+    free(from as ptr)
+    free(align as ptr)
+    return out
+}
+
+// The ground direction from joint `a` to joint `b` of the rig-space pose `w`.
+ground_dir(r: *Rig, w: ptr, a: int, b: int) -> Vec3 {
+    pa = clips.ground_point(r, pose.translation(w, a))
+    pb = clips.ground_point(r, pose.translation(w, b))
+    d = core.v3_sub(pb, pa)
+    if core.v3_len(d) < 0.000001 { return core.vec3(0.0, 0.0, 0.0) }
+    return core.v3_normalize(d)
+}
+
+// One frame carried across: `worlds_s` the source's pose in its rig's
+// space, `out` the target's frame (local) to fill, `worlds_t` scratch.
+carry_frame(source: *Rig, target: *Rig, worlds_s: ptr, rest_s: ptr, rest_t: ptr, from: int[], align: float[], k: float, yaw: Quat, out: ptr, worlds_t: ptr) {
+    nt = pose.count(target)
+    pelvis_s = pose.human(source, pose.PELVIS)
+    pelvis_t = pose.human(target, pose.PELVIS)
+    root_s = pose.human(source, pose.ROOT)
+    root_t = pose.human(target, pose.ROOT)
+    unyaw = core.quat_conjugate(yaw)
+    pose.rest_pose(target, out)
+    at = 0
+    while at < nt {
+        j = pose.order(target, at)
+        up = pose.parent(target, j)
+        parent_q = core.quat_ident()
+        if up >= 0 { parent_q = pose.rotation(worlds_t, up) }
+        js = from[j]
+        if js >= 0 {
+            // The source bone's turn from its rest, in the ground's space and
+            // the target's facing, laid on the target's rest aligned to the
+            // source's.
+            turned = core.quat_mul(to_ground_turn(source, pose.rotation(worlds_s, js)),
+                                   core.quat_conjugate(to_ground_turn(source, pose.rotation(rest_s, js))))
+            turned = core.quat_mul(yaw, core.quat_mul(turned, unyaw))
+            a = core.quat(align[j * 4], align[j * 4 + 1], align[j * 4 + 2], align[j * 4 + 3])
+            wanted = from_ground_turn(target, core.quat_normalize(core.quat_mul(turned, core.quat_mul(a, to_ground_turn(target, pose.rotation(rest_t, j))))))
+            pose.set_rotation(out, j, core.quat_normalize(core.quat_mul(core.quat_conjugate(parent_q), wanted)))
+        }
+        // Where the pelvis and the root go: the source's, turned and scaled.
+        if (j == pelvis_t && pelvis_s >= 0) || (j == root_t && root_s >= 0) {
+            js_place = pelvis_s
+            if j == root_t { js_place = root_s }
+            rig_at = carried_point(source, target, worlds_s, js_place, k, yaw)
+            local = rig_at
+            if up >= 0 {
+                ps = pose.scale(worlds_t, up)
+                v = core.quat_apply(core.quat_conjugate(parent_q), core.v3_sub(rig_at, pose.translation(worlds_t, up)))
+                local = core.vec3(v.x / ps.x, v.y / ps.y, v.z / ps.z)
+            }
+            pose.set_translation(out, j, local)
+        }
+        // The joint's own rig-space transform, for its children.
+        place_world(target, out, worlds_t, j)
+        at = at + 1
+    }
+}
+
+// Source joint `js` of the rig-space pose `worlds_s` put where the target
+// takes it: over the ground, turned to the target's facing and scaled by
+// `k`, then in the target rig's space.
+carried_point(source: *Rig, target: *Rig, worlds_s: ptr, js: int, k: float, yaw: Quat) -> Vec3 {
+    return carried(source, target, pose.translation(worlds_s, js), k, yaw)
+}
+
+// A point of the source rig's space carried into the target rig's, over
+// each figure's own ground: where the source figure stands is not carried.
+// Carried through the world, a source figure kept out of sight 50 m below
+// put the showcase's female 50 m underground.
+carried(source: *Rig, target: *Rig, p: Vec3, k: float, yaw: Quat) -> Vec3 {
+    ground_at = core.v3_sub(clips.ground_point(source, p), placed(source))
+    return ground_to_rig(target, core.v3_add(placed(target), core.v3_mul(core.quat_apply(yaw, ground_at), k)))
+}
+
+// Where a rig's figure stands in the world (the origin for a rig drawn by
+// none, a capture's).
+placed(r: *Rig) -> Vec3 {
+    base = pose.base_model(r)
+    if base == null { return core.vec3(0.0, 0.0, 0.0) }
+    core.model_sync_transform(base)
+    return base.world_position
+}
+
+// The feet kept on their contacts (see the top of the file), in two passes.
+// First each frame's goals: a planted ball is held where it was planted on
+// the source's ground (clips.ground_carry: still for a capture, going back
+// under an in-place clip at its speed, carried by the root's motion where
+// that was taken out), a free one goes where the source's goes, and the ankle
+// goal is the ball's less the foot as the carried pose turns it. Then the
+// pelvis lowered where a leg cannot reach its goal within REACH of its
+// length, the drop the most either leg needs within SMOOTH seconds, eased;
+// and each leg solved to its goal by two-bone IK. Scaled by its pelvis
+// height alone, the UE5 mannequin's hip stood 0.86 m from a goal its leg
+// could not reach, and its held ball was dragged 27 mm.
+keep_feet(source: *Rig, take: *Take, target: *Rig, out: *Take, k: float, yaw: Quat) {
+    legs_t = [pose.THIGH_L, pose.CALF_L, pose.FOOT_L, pose.BALL_L, pose.THIGH_R, pose.CALF_R, pose.FOOT_R, pose.BALL_R]
+    frames = clips.frames(take)
+    worlds_s = pose.new(source)
+    worlds_t = pose.new(target)
+    goals = calloc(frames * 6, 8) as float[]
+    aimed = calloc(frames * 2, 4) as int[]
+    needed = calloc(frames, 8) as float[]
+    held = [false, false]
+    hold = [core.vec3(0.0, 0.0, 0.0), core.vec3(0.0, 0.0, 0.0)]
+    held_at = [0, 0]
+    after = [core.vec3(0.0, 0.0, 0.0), core.vec3(0.0, 0.0, 0.0)]
+    fading = [0.0, 0.0]
+    step = 1.0 / clips.rate(take)
+    up = ikrig.dir_to_rig(target, core.vec3(0.0, 1.0, 0.0))
+    ahead = ikrig.dir_to_rig(target, facing(target))
+    ahead_s = ikrig.dir_to_rig(source, facing(source))
+    limbs = [ikrig.leg_limb(target, 0), ikrig.leg_limb(target, 1)]
+    f = 0
+    while f < frames {
+        p = clips.frame(out, f)
+        pose.world(source, clips.frame(take, f), worlds_s)
+        pose.world(target, p, worlds_t)
+        side = 0
+        while side < 2 {
+            thigh = pose.human(target, legs_t[side * 4])
+            calf = pose.human(target, legs_t[side * 4 + 1])
+            foot = pose.human(target, legs_t[side * 4 + 2])
+            ball = pose.human(target, legs_t[side * 4 + 3])
+            ball_s = pose.human(source, legs_t[side * 4 + 3])
+            foot_s = pose.human(source, legs_t[side * 4 + 2])
+            if thigh >= 0 && calf >= 0 && foot >= 0 && foot_s >= 0 {
+                // What the leg reaches for: the toe's tip where the source's
+                // is (what a planted foot stands and rolls on, as ikrig locks
+                // it), or the ankle where the source's is on a rig with no
+                // balls. Held by the ball, the toe's tip of a backward walk,
+                // which lands on it and rolls, went 5.1 mm through a stance.
+                reach_ball = ball >= 0 && ball_s >= 0
+                end_s = pose.translation(worlds_s, foot_s)
+                if reach_ball {
+                    toe_s = ikrig.toe_local(source, foot_s, ball_s, ahead_s)
+                    end_s = core.v3_add(pose.translation(worlds_s, ball_s), core.quat_apply(pose.rotation(worlds_s, ball_s), toe_s))
+                }
+                free_goal = carried(source, target, end_s, k, yaw)
+                goal = free_goal
+                if clips.planted(take, side, (f as float) * step, false) {
+                    if !held[side] {
+                        held[side] = true
+                        hold[side] = end_s
+                        held_at[side] = f
+                    }
+                    goal = carried(source, target, clips.ground_carry(take, source, hold[side], held_at[side], f), k, yaw)
+                } else {
+                    if held[side] {
+                        held[side] = false
+                        last = carried(source, target, clips.ground_carry(take, source, hold[side], held_at[side], f), k, yaw)
+                        after[side] = core.v3_sub(last, free_goal)
+                        fading[side] = RELEASE
+                    }
+                    if fading[side] > 0.0 {
+                        goal = core.v3_add(free_goal, core.v3_mul(after[side], fading[side] / RELEASE))
+                        fading[side] = fading[side] - step
+                    }
+                }
+                ankle_goal = goal
+                if reach_ball {
+                    // The foot and toe as the carried pose turns them: its
+                    // toe's tip on the goal.
+                    toe_t = core.quat_apply(pose.rotation(worlds_t, ball), ikrig.toe_local(target, foot, ball, ahead))
+                    ball_goal = core.v3_sub(goal, toe_t)
+                    ankle_goal = core.v3_sub(ball_goal, core.v3_sub(pose.translation(worlds_t, ball), pose.translation(worlds_t, foot)))
+                }
+                at = (f * 2 + side) * 3
+                goals[at] = ankle_goal.x
+                goals[at + 1] = ankle_goal.y
+                goals[at + 2] = ankle_goal.z
+                aimed[f * 2 + side] = 1
+                // How far the pelvis must come down for the leg to reach.
+                hip = pose.translation(worlds_t, thigh)
+                length = core.v3_len(core.v3_sub(pose.translation(worlds_t, calf), hip)) + core.v3_len(core.v3_sub(pose.translation(worlds_t, foot), pose.translation(worlds_t, calf)))
+                drop = drop_to_reach(core.v3_sub(hip, ankle_goal), up, length * REACH)
+                if drop > needed[f] { needed[f] = drop }
+            }
+            side = side + 1
+        }
+        f = f + 1
+    }
+    // The drop eased: the most needed within SMOOTH seconds, then averaged
+    // over the same span.
+    span = (SMOOTH * clips.rate(take) + 0.5) as int
+    most = calloc(frames, 8) as float[]
+    f = 0
+    while f < frames {
+        g = f - span
+        while g <= f + span {
+            if g >= 0 && g < frames && needed[g] > most[f] { most[f] = needed[g] }
+            g = g + 1
+        }
+        f = f + 1
+    }
+    pelvis = pose.human(target, pose.PELVIS)
+    f = 0
+    while f < frames {
+        sum = 0.0
+        n = 0
+        g = f - span
+        while g <= f + span {
+            if g >= 0 && g < frames {
+                sum = sum + most[g]
+                n = n + 1
+            }
+            g = g + 1
+        }
+        drop = sum / (n as float)
+        p = clips.frame(out, f)
+        if drop > 0.0 {
+            pose.world(target, p, worlds_t)
+            lowered = core.v3_sub(pose.translation(worlds_t, pelvis), core.v3_mul(up, drop))
+            above = pose.parent(target, pelvis)
+            if above < 0 {
+                pose.set_translation(p, pelvis, lowered)
+            } else {
+                ps = pose.scale(worlds_t, above)
+                v = core.quat_apply(core.quat_conjugate(pose.rotation(worlds_t, above)), core.v3_sub(lowered, pose.translation(worlds_t, above)))
+                pose.set_translation(p, pelvis, core.vec3(v.x / ps.x, v.y / ps.y, v.z / ps.z))
+            }
+        }
+        pose.world(target, p, worlds_t)
+        side = 0
+        while side < 2 {
+            if aimed[f * 2 + side] == 1 {
+                foot = pose.human(target, legs_t[side * 4 + 2])
+                at = (f * 2 + side) * 3
+                goal = core.vec3(goals[at], goals[at + 1], goals[at + 2])
+                _reached = ikrig.limb_solve(limbs[side], target, p, worlds_t, goal, pose.rotation(worlds_t, foot))
+            }
+            side = side + 1
+        }
+        f = f + 1
+    }
+    ikrig.limb_free(limbs[0])
+    ikrig.limb_free(limbs[1])
+    free(goals as ptr)
+    free(aimed as ptr)
+    free(needed as ptr)
+    free(most as ptr)
+    pose.release(worlds_s)
+    pose.release(worlds_t)
+}
+
+// How far a hip `from` its goal (hip less goal) must come down along `up` to
+// be within `reach` of it; 0 when it is already.
+drop_to_reach(from: Vec3, up: Vec3, reach: float) -> float {
+    if core.v3_len(from) <= reach { return 0.0 }
+    rise = core.v3_dot(from, up)
+    level2 = core.v3_dot(from, from) - rise * rise
+    if level2 >= reach * reach { return rise }
+    return rise - core.sqrt_of(reach * reach - level2)
+}
+
+// Joint `j`'s rig-space transform from its local in `p` and its parent's in
+// `worlds` (already placed).
+place_world(r: *Rig, p: ptr, worlds: ptr, j: int) {
+    up = pose.parent(r, j)
+    if up < 0 {
+        pose.set_translation(worlds, j, pose.translation(p, j))
+        pose.set_rotation(worlds, j, pose.rotation(p, j))
+        pose.set_scale(worlds, j, pose.scale(p, j))
+        return
+    }
+    ps = pose.scale(worlds, up)
+    t = pose.translation(p, j)
+    pose.set_translation(worlds, j, core.v3_add(pose.translation(worlds, up), core.quat_apply(pose.rotation(worlds, up), core.vec3(t.x * ps.x, t.y * ps.y, t.z * ps.z))))
+    pose.set_rotation(worlds, j, core.quat_normalize(core.quat_mul(pose.rotation(worlds, up), pose.rotation(p, j))))
+    s = pose.scale(p, j)
+    pose.set_scale(worlds, j, core.vec3(s.x * ps.x, s.y * ps.y, s.z * ps.z))
+}
+
+// A ground point in the rig's space (through its armature).
+ground_to_rig(r: *Rig, p: Vec3) -> Vec3 {
+    base = pose.base_model(r)
+    if base == null { return p }
+    core.model_sync_transform(base)
+    s = base.world_scale
+    v = core.quat_apply(core.quat_conjugate(base.world_rotation), core.v3_sub(p, base.world_position))
+    return core.vec3(v.x / s.x, v.y / s.y, v.z / s.z)
+}
+
+// --- a root from the pelvis -----------------------------------------------------------------------
+
+// A root under the pelvis, for a target that has one, made from a source
+// that has none (a capture's skeleton starts at its hips): on the ground
+// below the pelvis, turned the way the hips face (square to the line from
+// the right thigh to the left), its place and heading averaged over ROOT_SMOOTH
+// seconds either side so the root does not sway with each step (a walk's
+// pelvis goes 3 cm to the side and back each stride). The pelvis
+// is kept where it was in the rig's space. Unreal's retargeter makes one
+// the same way, and root motion is then taken from it as from any root:
+// before it, a capture retargeted onto the UE5 mannequin moved its pelvis
+// 3 m and left its root at the origin, and no root motion was found.
+make_root(target: *Rig, out: *Take) {
+    root = pose.human(target, pose.ROOT)
+    pelvis = pose.human(target, pose.PELVIS)
+    left = pose.human(target, pose.THIGH_L)
+    right = pose.human(target, pose.THIGH_R)
+    if root < 0 || pelvis < 0 || left < 0 || right < 0 { return }
+    if pose.parent(target, pelvis) != root || pose.parent(target, root) >= 0 { return }
+    frames = clips.frames(out)
+    worlds = pose.new(target)
+    rest = pose.new(target)
+    pose.rest_world(target, rest)
+    rest_heading = heading_of(target, rest, left, right)
+    rest_turn = to_ground_turn(target, pose.rotation(rest, root))
+    rest_height = clips.ground_point(target, pose.translation(rest, root)).y
+    headings = calloc(frames, 8) as float[]
+    places = calloc(frames * 2, 8) as float[]
+    f = 0
+    while f < frames {
+        pose.world(target, clips.frame(out, f), worlds)
+        h = heading_of(target, worlds, left, right)
+        // Unwrapped against the frame before, so an average does not jump.
+        if f > 0 {
+            while h - headings[f - 1] > 3.141592653589793 { h = h - 6.283185307179586 }
+            while h - headings[f - 1] < 0.0 - 3.141592653589793 { h = h + 6.283185307179586 }
+        }
+        headings[f] = h
+        hips_at = clips.ground_point(target, pose.translation(worlds, pelvis))
+        places[f * 2] = hips_at.x
+        places[f * 2 + 1] = hips_at.z
+        f = f + 1
+    }
+    span = (ROOT_SMOOTH * clips.rate(out) + 0.5) as int
+    up = core.vec3(0.0, 1.0, 0.0)
+    f = 0
+    while f < frames {
+        sum = 0.0
+        sum_x = 0.0
+        sum_z = 0.0
+        n = 0
+        // Narrowed toward the ends, so the root starts and ends under the
+        // hips: a one-sided average sits a fifth of a second's travel off them
+        // at either end, and its root motion would fall short by twice that.
+        reach = span
+        if f < reach { reach = f }
+        if frames - 1 - f < reach { reach = frames - 1 - f }
+        g = f - reach
+        while g <= f + reach {
+            if g >= 0 && g < frames {
+                sum = sum + headings[g]
+                sum_x = sum_x + places[g * 2]
+                sum_z = sum_z + places[g * 2 + 1]
+                n = n + 1
+            }
+            g = g + 1
+        }
+        heading = sum / (n as float)
+        p = clips.frame(out, f)
+        pose.world(target, p, worlds)
+        root_at = ground_to_rig(target, core.vec3(sum_x / (n as float), rest_height, sum_z / (n as float)))
+        root_q = from_ground_turn(target, core.quat_normalize(core.quat_mul(core.quat_rotate(heading - rest_heading, up), rest_turn)))
+        // The pelvis kept in the rig's space, under the new root.
+        back = core.quat_conjugate(root_q)
+        rs = pose.scale(p, root)
+        d = core.quat_apply(back, core.v3_sub(pose.translation(worlds, pelvis), root_at))
+        pose.set_translation(p, root, root_at)
+        pose.set_rotation(p, root, root_q)
+        pose.set_translation(p, pelvis, core.vec3(d.x / rs.x, d.y / rs.y, d.z / rs.z))
+        pose.set_rotation(p, pelvis, core.quat_normalize(core.quat_mul(back, pose.rotation(worlds, pelvis))))
+        f = f + 1
+    }
+    free(headings as ptr)
+    free(places as ptr)
+    pose.release(worlds)
+    pose.release(rest)
+}
+
+// The way the hips of rig-space pose `w` face over the ground, as an angle
+// about up (0 facing +z, +x at a quarter turn).
+heading_of(r: *Rig, w: ptr, left: int, right: int) -> float {
+    across = core.v3_sub(clips.ground_point(r, pose.translation(w, left)), clips.ground_point(r, pose.translation(w, right)))
+    ahead = core.v3_cross(across, core.vec3(0.0, 1.0, 0.0))
+    return core.atan2_of(ahead.x, ahead.z)
+}

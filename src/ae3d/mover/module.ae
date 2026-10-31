@@ -1,0 +1,346 @@
+// A figure's mover (#856): the controller that moves a figure the way a game
+// asks and feeds its animator's graph, which picks the clips.
+//
+// A game asks for a velocity over the ground (a stick's, metres a second)
+// and, optionally, a way to face (strafing: facing a target while moving
+// any way; otherwise the figure faces the way it goes). The mover is
+// Holden's simulation: its velocity follows the one asked on a critically
+// damped spring (half-life HALF_LIFE), its facing follows on another
+// (FACING_HALF_LIFE), and the figure's object goes where the springs take
+// it. Each step it writes the graph's parameters, which the animator's
+// blend spaces and transitions read:
+//   - "vx", "vz": the velocity in the figure's own frame (x across to its
+//     left, z ahead), a 2D blend space's;
+//   - "speed": the velocity's size, a 1D blend space's;
+//   - "moving": on while it moves or is asked to (above MOVING);
+//   - "turning": the facing's rate, radians a second, to its left;
+//   - "go": on while a velocity is asked for;
+//   - "travelled": the metres gone since it last stood still, what a start
+//     is played by;
+//   - "rest": the distance left to where the springs bring it to rest,
+//     what a stop is played by (distance matching).
+// Its gait is chosen by the graph from the real velocity, not by the
+// mover: the clip choice that used to be hard-coded in ae3d.locomotion is
+// the graph's.
+//
+// The springs' way ahead (future) is what motion matching asks for.
+
+import std.heap
+import ae3d.core
+import ae3d.behaviour
+import ae3d.animator
+
+extern exp(x: float) -> float
+
+exports (
+    Mover, HALF_LIFE, FACING_HALF_LIFE, MOVING,
+    mover_new, mover_free, ask, face, step, velocity, facing_of, future, rest_distance, rest_point, set_half_lives, set_braking, set_matcher, set_follow, sim_at
+)
+
+// Seconds the springs halve their gap to the velocity and facing asked in.
+const HALF_LIFE = 0.27
+const FACING_HALF_LIFE = 0.27
+// Metres a second over which a figure counts as moving.
+const MOVING = 0.1
+// Following its clips (set_follow): the figure eased toward the simulation
+// over this half-life, at most this many metres a second over its own
+// motion, and the simulation kept within CLAMP metres of it.
+const ADJUST_HALF_LIFE = 0.3
+// (Each metre the figure is eased is a metre its planted feet's locks drift:
+// at 0.5 m/s, a matched turn's stance drifted past the lock's slip.)
+const ADJUST_MOST = 0.2
+const CLAMP = 0.15
+
+struct Mover {
+    animator: ptr                  // *Animator
+    object: ptr                    // *GameObject
+    velocity: Vec3                 // over the ground, the world's
+    acceleration: Vec3
+    asked: Vec3                    // the velocity asked for
+    facing: float                  // yaw about up, radians (0 facing +z)
+    facing_rate: float
+    face_asked: float
+    strafing: bool                 // facing held to face_asked; else it faces the way it goes
+    half_life: float
+    facing_half_life: float
+    travelled: float               // metres gone since it last stood still
+    braking: float                 // m/s a second it slows at with nothing asked, 0 for the spring
+    matcher: int                   // the animator's matcher state it asks the way ahead of, -1 none
+    follow: bool                   // the figure moved by its clips' root motion, the springs a simulation (set_follow)
+    sim: Vec3                      // the simulation's place, following
+}
+
+// A mover for the figure on `o`, played by `a`. Its object starts where it
+// stands, facing as it faces.
+mover_new(a: *Animator, o: *GameObject) -> *Mover {
+    m = heap.new(Mover)
+    m.animator = a as ptr
+    m.object = o as ptr
+    m.half_life = HALF_LIFE
+    m.facing_half_life = FACING_HALF_LIFE
+    q = behaviour.object_rotation(o)
+    ahead = core.quat_apply(q, core.vec3(0.0, 0.0, 1.0))
+    m.facing = core.atan2_of(ahead.x, ahead.z)
+    m.face_asked = m.facing
+    m.matcher = 0 - 1
+    return m
+}
+
+mover_free(m: *Mover) { if m != null { heap.free(m) } }
+
+set_half_lives(m: *Mover, velocity: float, facing: float) {
+    m.half_life = velocity
+    m.facing_half_life = facing
+}
+
+// The velocity a game asks for, over the ground (its y is not read).
+ask(m: *Mover, v: Vec3) { m.asked = core.vec3(v.x, 0.0, v.z) }
+
+// Hold the figure facing `yaw` (strafing) whatever way it goes; `hold`
+// false lets it face the way it goes again.
+face(m: *Mover, yaw: float, hold: bool) {
+    m.face_asked = yaw
+    m.strafing = hold
+}
+
+velocity(m: *Mover) -> Vec3 { return m.velocity }
+facing_of(m: *Mover) -> float { return m.facing }
+
+// --- the springs ----------------------------------------------------------------------------------
+
+damping(half_life: float) -> float { return (4.0 * 0.69314718056) / (half_life + 0.00001) }
+
+// A critically damped spring on a velocity `v` (accelerating at `a`) toward
+// `goal`, after `t`: the velocity, the acceleration, and how far it moved.
+spring(v: float, a: float, goal: float, half_life: float, t: float) -> (float, float, float) {
+    y = damping(half_life) * 0.5
+    j0 = v - goal
+    j1 = a + j0 * y
+    e = exp(0.0 - y * t)
+    moved = e * ((0.0 - j1) / (y * y) + (0.0 - j0 - j1 * t) / y) + j1 / (y * y) + j0 / y + goal * t
+    return e * (j0 + j1 * t) + goal, e * (a - j1 * y * t), moved
+}
+
+wrap(x: float) -> float {
+    a = x
+    while a > 3.141592653589793 { a = a - 6.283185307179586 }
+    while a < 0.0 - 3.141592653589793 { a = a + 6.283185307179586 }
+    return a
+}
+
+// The facing wanted now: held, or the way the velocity asked goes (kept
+// where it is when nothing is asked).
+facing_goal(m: *Mover) -> float {
+    if m.strafing { return m.face_asked }
+    if core.v3_len(m.asked) > MOVING { return core.atan2_of(m.asked.x, m.asked.z) }
+    return m.facing
+}
+
+// One step of `dt`: the springs on, the object moved and turned by them,
+// and the graph's parameters written.
+step(m: *Mover, dt: float) {
+    if dt <= 0.0 { return }
+    o = m.object as *GameObject
+    dx = 0.0
+    dz = 0.0
+    if braking_now(m) {
+        // Braking at a constant deceleration along its way, to a stand.
+        speed = core.v3_len(m.velocity)
+        slower = speed - m.braking * dt
+        if slower < 0.0 { slower = 0.0 }
+        went = (speed + slower) * 0.5 * dt
+        if speed > 0.000001 {
+            dx = m.velocity.x / speed * went
+            dz = m.velocity.z / speed * went
+            m.velocity = core.v3_mul(m.velocity, slower / speed)
+        }
+        m.acceleration = core.vec3(0.0, 0.0, 0.0)
+    } else {
+        vx, ax, mx = spring(m.velocity.x, m.acceleration.x, m.asked.x, m.half_life, dt)
+        vz, az, mz = spring(m.velocity.z, m.acceleration.z, m.asked.z, m.half_life, dt)
+        dx = mx
+        dz = mz
+        m.velocity = core.vec3(vx, 0.0, vz)
+        m.acceleration = core.vec3(ax, 0.0, az)
+    }
+    // The facing: a spring on the angle, toward the nearer way round.
+    goal = m.facing + wrap(facing_goal(m) - m.facing)
+    f, fr, _turned = spring_angle(m.facing, m.facing_rate, goal, m.facing_half_life, dt)
+    m.facing = wrap(f)
+    m.facing_rate = fr
+    // The way come since it last stood still, a start's distance.
+    if core.v3_len(m.velocity) < MOVING && core.v3_len(m.asked) < MOVING {
+        m.travelled = 0.0
+    } else {
+        m.travelled = m.travelled + core.sqrt_of(dx * dx + dz * dz)
+    }
+    if m.follow {
+        m.sim = core.vec3(m.sim.x + dx, m.sim.y, m.sim.z + dz)
+        adjust(m, dt)
+    } else {
+        at = behaviour.object_position(o)
+        behaviour.object_set_position(o, core.vec3(at.x + dx, at.y, at.z + dz))
+        behaviour.object_set_rotation(o, core.quat_rotate(m.facing, core.vec3(0.0, 1.0, 0.0)))
+    }
+    feed(m)
+}
+
+// The figure moved by its clips' own root motion (the animator's), the
+// springs a simulation of where it should be (Holden's, for motion
+// matching: a clip played at its own speed and way keeps its feet; moved
+// by the springs, a matched clip's feet skated a third of a metre and the
+// lock let them go). Each step the figure is eased toward the simulation
+// (half-life ADJUST_HALF_LIFE, at most ADJUST_MOST metres a second over its
+// own motion, the planted feet's lock taking it up) and turned toward its
+// facing; the simulation is kept within CLAMP of the figure.
+set_follow(m: *Mover, on: bool) {
+    o = m.object as *GameObject
+    m.follow = on
+    m.sim = behaviour.object_position(o)
+    animator.set_root_motion(m.animator as *Animator, on)
+}
+
+adjust(m: *Mover, dt: float) {
+    o = m.object as *GameObject
+    at = behaviour.object_position(o)
+    dx = m.sim.x - at.x
+    dz = m.sim.z - at.z
+    share = 1.0 - exp(0.0 - 0.69314718056 * dt / ADJUST_HALF_LIFE)
+    mx = dx * share
+    mz = dz * share
+    far = core.sqrt_of(mx * mx + mz * mz)
+    if far > ADJUST_MOST * dt {
+        mx = mx * ADJUST_MOST * dt / far
+        mz = mz * ADJUST_MOST * dt / far
+    }
+    at = core.vec3(at.x + mx, at.y, at.z + mz)
+    behaviour.object_set_position(o, at)
+    // Its facing: turned toward the simulation's, the same share.
+    q = behaviour.object_rotation(o)
+    ahead = core.quat_apply(q, core.vec3(0.0, 0.0, 1.0))
+    yaw = core.atan2_of(ahead.x, ahead.z)
+    turn = wrap(m.facing - yaw) * share
+    behaviour.object_set_rotation(o, core.quat_normalize(core.quat_mul(core.quat_rotate(turn, core.vec3(0.0, 1.0, 0.0)), q)))
+    // The simulation kept near the figure.
+    ox = m.sim.x - at.x
+    oz = m.sim.z - at.z
+    gap = core.sqrt_of(ox * ox + oz * oz)
+    if gap > CLAMP {
+        m.sim = core.vec3(at.x + ox * CLAMP / gap, m.sim.y, at.z + oz * CLAMP / gap)
+    }
+}
+
+// Where the simulation is: the figure's object, unless the figure follows
+// its clips (set_follow).
+sim_at(m: *Mover) -> Vec3 {
+    if m.follow { return m.sim }
+    return behaviour.object_position(m.object as *GameObject)
+}
+
+// The angle spring: the angle itself goes to `goal` critically damped.
+spring_angle(x: float, v: float, goal: float, half_life: float, dt: float) -> (float, float, float) {
+    y = damping(half_life) * 0.5
+    j0 = x - goal
+    j1 = v + j0 * y
+    e = exp(0.0 - y * dt)
+    return e * (j0 + j1 * dt) + goal, e * (v - j1 * y * dt), 0.0
+}
+
+// The graph's parameters, from the springs.
+feed(m: *Mover) {
+    a = m.animator as *Animator
+    c = core.cos_of(m.facing)
+    s = core.sin_of(m.facing)
+    // Ahead is (sin f, cos f); the figure's left is (cos f, -sin f).
+    ahead = m.velocity.x * s + m.velocity.z * c
+    across = m.velocity.x * c - m.velocity.z * s
+    speed = core.v3_len(m.velocity)
+    animator.set_float(a, "vx", across)
+    animator.set_float(a, "vz", ahead)
+    animator.set_float(a, "speed", speed)
+    animator.set_bool(a, "moving", speed > MOVING || core.v3_len(m.asked) > MOVING)
+    animator.set_float(a, "turning", m.facing_rate)
+    animator.set_float(a, "rest", rest_distance(m))
+    animator.set_float(a, "travelled", m.travelled)
+    animator.set_bool(a, "go", core.v3_len(m.asked) > MOVING)
+    if m.matcher >= 0 { ask_matcher(m) }
+}
+
+// Where the springs take the figure `t` seconds on, from where it is: its
+// offset over the ground (the world's x and z) and its facing then. What
+// motion matching asks a clip's way ahead to match.
+future(m: *Mover, t: float) -> (Vec3, float) {
+    _vx, _ax, dx = spring(m.velocity.x, m.acceleration.x, m.asked.x, m.half_life, t)
+    _vz, _az, dz = spring(m.velocity.z, m.acceleration.z, m.asked.z, m.half_life, t)
+    goal = m.facing + wrap(facing_goal(m) - m.facing)
+    f, _fr, _x = spring_angle(m.facing, m.facing_rate, goal, m.facing_half_life, t)
+    return core.vec3(dx, 0.0, dz), wrap(f)
+}
+
+// Where the figure comes to rest if nothing more is asked: braking, v²/2a
+// along its way; on the spring, the spring's end. What a stop is played
+// toward.
+rest_point(m: *Mover) -> Vec3 {
+    at = sim_at(m)
+    if m.braking > 0.0 {
+        speed = core.v3_len(m.velocity)
+        if speed < 0.000001 { return at }
+        far = speed * speed / (2.0 * m.braking)
+        return core.vec3(at.x + m.velocity.x / speed * far, at.y, at.z + m.velocity.z / speed * far)
+    }
+    // The spring's total travel to rest from v, a toward 0: j0/y + j1/y^2.
+    y = damping(m.half_life) * 0.5
+    jx = m.velocity.x
+    jz = m.velocity.z
+    kx = m.acceleration.x + jx * y
+    kz = m.acceleration.z + jz * y
+    return core.vec3(at.x + jx / y + kx / (y * y), at.y, at.z + jz / y + kz / (y * y))
+}
+
+// The distance to rest_point over the ground.
+rest_distance(m: *Mover) -> float {
+    at = sim_at(m)
+    p = rest_point(m)
+    return core.sqrt_of((p.x - at.x) * (p.x - at.x) + (p.z - at.z) * (p.z - at.z))
+}
+
+// With nothing asked, slow at `deceleration` metres a second a second to a
+// stand, the way Unreal's movement brakes (0: the velocity's spring brings
+// it to rest). Set from a stop take's own (clips.braking), the figure comes
+// to rest over the distance the take does, and the stop played by the
+// distance left enters where its feet are in the stride the figure's are:
+// on the spring, a walk at 0.8 m/s came to rest in 0.3 m where the capture's
+// actor took a metre, and the stop entered on its last half step.
+set_braking(m: *Mover, deceleration: float) { m.braking = deceleration }
+
+braking_now(m: *Mover) -> bool { return m.braking > 0.0 && core.v3_len(m.asked) <= MOVING && core.v3_len(m.velocity) > 0.0 }
+
+// The animator's matcher `state` asked, every step, for the way ahead the
+// springs predict (its place and facing a third, two thirds and a whole
+// second on, in the figure's frame now).
+set_matcher(m: *Mover, state: int) { m.matcher = state }
+
+ask_matcher(m: *Mover) {
+    a = m.animator as *Animator
+    // From the figure as it stands (following its clips, it is not where
+    // the simulation is): the simulation's way ahead in the figure's frame.
+    o = m.object as *GameObject
+    at = behaviour.object_position(o)
+    sim = sim_at(m)
+    ahead_now = core.quat_apply(behaviour.object_rotation(o), core.vec3(0.0, 0.0, 1.0))
+    yaw = core.atan2_of(ahead_now.x, ahead_now.z)
+    c = core.cos_of(yaw)
+    s = core.sin_of(yaw)
+    ahead = [0.33, 0.67, 1.0]
+    k = 0
+    while k < 3 {
+        offset, facing = future(m, ahead[k])
+        px = sim.x + offset.x - at.x
+        pz = sim.z + offset.z - at.z
+        // Ahead is (sin f, cos f); the figure's left is (cos f, -sin f).
+        x = px * c - pz * s
+        z = px * s + pz * c
+        animator.match_trajectory(a, m.matcher, k, x, z, wrap(facing - yaw))
+        k = k + 1
+    }
+}
