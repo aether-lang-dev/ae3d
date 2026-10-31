@@ -10,7 +10,7 @@ ae3d's animation is a pipeline of layers, the way shipped engines build it (#853
 | L1 | `ae3d.clips` | A take is an animation resampled for a rig at the file's key rate. Read from it at import: foot contacts, planted frames, its speed over the ground, its heading, footfall sync markers and footfall events. Loops sealed. Root motion taken out with the root locked to the rest pose, straightened for a blend space, mirrored. |
 | L2 | `ae3d.animator` | The single writer, a graph of states over pose buffers: a take (by its clock, or by a distance: `clock_by`), a blend space along one parameter or over the ground's two directions, a motion matcher, a held pose. Named parameters a game drives it by; transitions it takes itself on their conditions, inertialized or cross-faded, in step with the stride, to whichever of several states' feet match; masked and additive layers, aim offsets, events, root motion onto the figure's object or through its character controller. |
 | L2 | `ae3d.mover` | The controller a game drives with a velocity (and a facing, strafing): Holden's springs move the figure and feed the graph its parameters (its velocity in its own frame, speed, the way come and the way left to rest); braking at a stop's own rate; or following its clips' root motion, the springs a simulation the figure is eased toward. |
-| L3 | `ae3d.ikrig` | Feet on the ground (ground height under each foot, pelvis drop, the foot locked where the clip plants it, the heel peeled up when the leg cannot reach), two-bone legs and arms with soft reach, hands on a prop's grips, the head turned to a point. |
+| L3 | `ae3d.ikrig` | Limbs with joint limits and twist shared into the forearm, FABRIK chains, whole-body reach with effector weights, aim and look over several bones, hands on a prop's grips (held on a joint, so a rifle aimed with the chest carries them), and feet on any ground: soles traced heel to toe, laid on slopes, rested on stair edges, toes bent at the ball, the pelvis down by what the legs need, strides cut to fit a stair's tread. |
 
 ## A figure on its gaits
 
@@ -99,6 +99,17 @@ mover.step(m, dt)
 
 `tools/anim_showcase.ae`'s fifth figure (`AE3D_WATCH=5`) is this graph on the UE5 mannequin: it stands, walks, steps left and right facing ahead, runs, stops, turns round on the spot, and walks back aiming.
 
+## Limbs, chains, the whole body, and feet on any ground
+
+The last word on a pose before it is drawn is `ae3d.ikrig`'s, in the animator's order: feet, aim, the whole body, hands, look.
+
+- **Limbs** (`ikrig.leg_limb`, `ikrig.arm_limb`, `ikrig.limb_solve`). Two bones solved as a triangle (`ae3d.ik.triangle`, the one the physical figure's limbs use too). A limb bends in the plane its clip bends it in while the clip bends it, and in its hinge's plane as it comes straight: the hinge's axis is read off the rest pose in the upper bone's own frame, so it turns with the thigh's twist and a straight knee never flips. No knee or elbow bends past 150 degrees, a knee never bends backward, and a target nearer than the joint lets the end come is reached as near as it comes. Of the twist the end's turn asks beyond the clip's, the forearm takes half.
+- **Chains** (`ikrig.chain_solve`). FABRIK (Aristidou and Lasenby, 2011) over any parent chain, a spine's or a tail's, each joint held within a cone of the pose's own bend.
+- **The whole body** (`ikrig.body_new`, `animator.set_body`). Four ends with points and weights. What the hands cannot reach from the shoulders bends the spine toward them (a chain from the pelvis to the chest), what is still out of reach moves the pelvis as far as the held feet let it, then each limb is solved onto its point.
+- **Aim and look** (`animator.aim_at`, `animator.look_at`, `ikrig.aim_chain`). A line held on the chest (a rifle's, from its butt) or the head's forward turned onto a point, the turn shared up the spine. Hands held on a joint (`ikrig.hands_set_on`) go on the rifle where the aim put it in the same solve.
+- **Feet on any ground.** Each sole is traced at its heel, its pad and its toe, where the IK puts the foot, not where the clip has it. One surface under them is a plane the foot is laid on, its ankle stood off along its normal; an edge under them is a stair's, the foot level on the higher side and rested on the edge's corner, found by halving. A foot in the air looks a foot's length ahead for an edge its toe would meet. After each leg is solved, a foot down is put on the ground by the lowest point of its sole, and its toes are bent up at the ball until they are out of it (the walk's clip, rolled off its toes, put them 29 mm into the floor). The pelvis comes down by what the lower foot needs and by what a leg needs to reach its foot. The figure's object stepping up a stair at once leaves the feet and the pelvis where they were in the world, eased to their new heights from there.
+- **Stride warping** (`ikrig.feet_set_stride`, as in Unreal's animation warping). Each foot stepped nearer the hips along the way the figure faces: the clip's cadence kept, its steps a stair's tread long.
+
 ## The techniques, and where they come from
 
 - **One pose, one writer.** This is Unreal's pose buffers, Unity's Playables and ozz-animation. It ends the class of bugs where one system draws over another.
@@ -118,14 +129,14 @@ mover.step(m, dt)
 | | measured | held to |
 |---|---|---|
 | a take against the figure's own sampler, any joint | 0.027° | 0.1° |
-| a planted toe's slide, feet locked, 1 to 8 m/s | under 10⁻¹² mm | 5 mm |
+| a planted toe's slide, feet locked, 1 to 8 m/s | 1.4 mm at 1 m/s, 0.07 mm at 2 to 8 | 5 mm |
 | the blend's feet against the speed asked, 1 to 8 m/s | 0% | 1% |
 | idle to sprint and back, the fastest joint turn | 35.80 rad/s | the takes' own 35.54, plus 2% |
 | a retargeted walk's segments against the source's | 0.00005° | 0.5° |
-| the female's planted toe on retargeted gaits | under 10⁻¹² mm | 5 mm |
+| the female's planted toe on retargeted gaits | 0.03 mm | 5 mm |
 | the roll's root motion carried onto the object | 4.9914 of 4.9914 m | 1% |
-| one foot over a 10 cm block: its sole, the other's, the fastest turn | +100.0 mm, 0.0 mm, 4.4° a step | 5 mm, 5 mm, 6° |
-| walking with a bowl in both hands: each hand off its grip, the elbows | 2.0 mm at worst, 122 to 159° | 5 mm, 25 to 172° |
+| one foot over a 10 cm block: its sole, the other's, the fastest turn | +100.6 mm, 0.0 mm, 4.4° a step | 5 mm, 5 mm, 6° |
+| walking with a bowl in both hands: each hand off its grip, the elbows | 0.2 mm at worst, 102 to 152° | 5 mm, 25 to 172° |
 | a rest pose against its mirror; a walk mirrored twice | 0.021°; 3·10⁻⁶° | 0.5°; 0.001° |
 | an event at 0.25 s over three cycles of the walk | fired 3 times | once a cycle |
 | a loop's last frame against its first, after sealing | 2·10⁻⁶° | 0.1° |
@@ -135,19 +146,36 @@ mover.step(m, dt)
 | with the feet kept: a planted toe's slide a stance | under 10⁻¹¹ mm (11.0 mm turned bone by bone; the capture's own 5.6 mm) | 5 mm |
 | the root made under the hips: its root motion against the hips' travel | 1.786 of 1.786 m | 1% |
 | the head as it stands after retargeting, against the capture's | 1.2·10⁻⁶° | 2° |
-| the 2D blend at 8 directions by 0.6, 1.0 and 1.3 m/s, feet locked: a planted toe's slide; the speed against the speed asked | under 10⁻¹¹ mm; 0% | 5 mm; 1% |
+| the 2D blend at 8 directions by 0.6, 1.0 and 1.3 m/s, feet locked: a planted toe's slide; the speed against the speed asked | 0.1 mm; 0% | 5 mm; 1% |
 | a graph of idle, gaits and a roll driven by its parameters alone: its fastest joint turn | 32.6 rad/s (the takes' own 38.7) | the takes' own, plus 2% |
 | halfway through a 0.6 s cross-fade: from each state, the two 83° apart | 42° and 43° | between a fifth and four fifths of it |
 | a pistol's aim offset aimed down, level, up: the hand's height | 0.90, 1.40, 1.80 m | in that order; level, the pose unchanged |
-| stand, start, walk 4 s, stop on a mover (feet locked): a planted toe's slide | under 10⁻¹¹ mm | 5 mm |
-| half a turn on the spot in steps: a planted toe's slide; the hips off their spot; the degrees a step | under 10⁻¹¹ mm; 5.3 mm; 26° in 7 steps | 5 mm; 5 cm; 45° |
+| stand, start, walk 4 s, stop on a mover (feet locked): a planted toe's slide | 0.1 mm | 5 mm |
+| half a turn on the spot in steps: a planted toe's slide; the hips off their spot; the degrees a step | 0.001 mm; 5.3 mm; 26° in 7 steps | 5 mm; 5 cm; 45° |
 | motion matching through a stand, a walk, a side step, a turn and a stop: the frame played's root velocity walking, stepping left, at rest | 0.69 m/s ahead, 0.48 m/s left, still | a walk ahead, a step left, still |
 
-`tools/anim_showcase.ae` puts four figures on these layers for a person to watch. Its runs measure the toes as the test does: through a 20 s cycle of starts, stops, accelerations and a circle, a planted toe slides under 10⁻¹¹ mm. The fourth walks 100STYLE's captured forward and backward walks out along a line and back on a character controller, by root motion.
+`tests/test_ik_constraints.ae` holds the IK (#857) to these, on the Rigify mannequin:
+
+| | measured | held to |
+|---|---|---|
+| walk, jog, crouch and idle, feet locked, hands on a bowl: the most a knee and an elbow bend; a knee behind straight | 133°, 150°; 0 mm | 150°; 1 mm |
+| a hand asked to its own shoulder, a foot to its hip: the elbow, the knee | 150°, 150° | stopped at 150° |
+| a hand turned 90° about its forearm: off its grip, off its turn; what the wrist took | 0.00003 mm, 0°; 44° | 5 mm, 0.5°; 40 to 50° |
+| a FABRIK spine bowing the head 10 cm on and 2 down: off the point; the bones' lengths | 0.51 mm; 2·10⁻¹³ mm | 1 mm; 0.01 mm |
+| a hand 15 cm past its arm's length, the whole body reaching: the hand; the feet; at half weight, the hand off half way | 10⁻⁶ mm; 2·10⁻¹³ mm; 10⁻⁷ mm | 5 mm; 1 mm; 5 mm |
+| a rifle held bladed, aimed 40° right and 15° up at 10 m: the barrel; the hands off their grips; the elbows; the forearm off the trunk's line | 0.10°; 0.002 mm; 123°; 24 cm | 1°; 5 mm; 150°; 12 cm |
+| walking on flat ground: a sole into the floor, the walk alone and with ikrig | 29 mm and 0.008 mm | 5 mm |
+| five 0.2 m stairs a stride deep, up and down: a foot down's sole off the ground; a sole into it | 0.07 mm; 0.05 mm | 1 cm; 5 mm |
+| five 0.2 m stairs 0.3 m deep, a tread a step (the stride cut to 0.40): the same; the knees | 0.94 mm; 0.94 mm; 138° | 1 cm; 5 mm; 150° |
+| a 20° ramp up and down at 0.7 of the stride: a foot down's sole off it; into it; a flat foot's heel and pad off where the clip has them | 4.5 mm; 0.008 mm; 4.4 mm | 1 cm; 5 mm; 5 mm |
+
+`tools/anim_showcase.ae` puts seven figures on these layers for a person to watch, and prints each cycle the worst a planted toe slid. The fourth walks 100STYLE's captured forward and backward walks out along a line and back on a character controller, by root motion; the sixth climbs stairs and walks a ramp with a bowl in its hands; the seventh aims a rifle with both hands.
 
 ## Next
 
 - Motion matching on a database of the style's whole takes, its changes held to the takes' own joint speeds (today's database is one short take of each motion).
-- Full-body IK and aim constraints (#857).
+- One foot system (#857): `ae3d.feet`, the physical figure's own feet and `ae3d.lookat` retired onto `ikrig` as the plaza and the motion showcase move onto the pipeline (#860).
+- A reach across the trunk (#700): the physical figure's forearm still rests against its chest 22 cm short of a wound on the other arm. An elbow swung clear of the trunk brought it to 19 cm but turned the arm at 26 rad/s; a route that keeps the arm's speed is still to find.
+- Walking a 20° ramp at the walk's own stride, the trailing leg is straight at its push-off and its toe stands 16 mm off the slope; the ramp is walked at 0.7 of the stride, as people step short up a steep slope. A gait for slopes would let the stride stay long.
 - The physics asset and physical animation (#858), then ragdolls and get-ups into matched clips (#859).
 - The plaza, the motion showcase and Siltreach moved onto the pipeline, and the old writers retired (#860).
