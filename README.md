@@ -31,10 +31,10 @@ ae3d is the next generation of [Gopher3D](https://github.com/nicolas-maman/gophe
 
 **Animation** ([docs](docs/animation-pipeline.md))
 - One pose per figure per frame, one writer: games set a speed or a state, never a bone.
-- Rigs read from UE5, Rigify or Mixamo naming onto one humanoid layout, and clips retargeted between bodies.
-- Blend spaces synced on footfalls and played at exactly the speed the figure moves, inertialized transitions, and masked and additive layers.
-- Feet locked where they land and peeled up as the leg runs out of reach; hands on a prop's grips; the head turned to a point.
-- Held to numbers on authored clips: from 1 to 8 m/s a planted toe holds still to 10⁻¹² mm and the feet carry the ground at the speed asked within 1%, and a change of gait turns no joint more than 2% faster than the clips themselves do.
+- Rigs from UE5, Rigify or Mixamo naming on one humanoid layout; clips retargeted between bodies, and motion capture read from BVH (100STYLE) with its feet kept.
+- A state graph, 1D and 2D blend spaces synced on footfalls, inertialized transitions, aim offsets, masked and additive layers, motion matching, and a mover that starts, stops and turns on the spot in steps.
+- IK with knees and elbows held to their limits, FABRIK chains, whole-body reach, an aim spread up the spine with both hands on a rifle, and feet on any ground: soles traced heel to toe on stairs and slopes, toes bent at the ball.
+- Held to numbers on real people: from 1 to 8 m/s a planted toe slides under 1.5 mm and the feet carry the ground at the speed asked within 1%; on 0.2 m stairs and a 20° ramp no sole sinks 1 mm into the ground; a change of gait turns no joint 2% faster than the clips themselves do.
 
 ![A mannequin mid-sprint on its blended gaits, one foot planted, its shadow long under a late afternoon sky](docs/images/animation-pipeline.png)
 
@@ -78,7 +78,7 @@ ae run examples/spinning_cube.ae                 # build and run, as any Aether 
 
 ```bash
 ./build.sh examples/street_drive.ae && ./build/street_drive      # W/S A/D, space, shift; drives itself if left alone
-./build.sh tools/anim_showcase.ae && ./build/anim_showcase       # the animation pipeline on three people
+./build.sh tools/anim_showcase.ae && ./build/anim_showcase       # the animation pipeline on seven people
 ./build.sh examples/zombie_city.ae && AE3D_CROWD=100000 ./build/zombie_city
 AE3D_API=opengl ./build/zombie_city                              # the other renderer
 ```
@@ -166,7 +166,7 @@ How the loop, the behaviours, the renderers and the job pool fit together is in 
 | `net_walk`, `net_cars` | Multiplayer: `./build/net_walk` hosts, `AE3D_NET=join:127.0.0.1 ./build/net_walk` joins. |
 | `gltf_crowd`, `gltf_viewer` | Any glTF figure as a horde, or on a floor playing one of its animations. |
 | `physics` | The reference scenes: `AE3D_PHYSICS_SCENE=pyramid`, `pile`, `ragdolls` or `cloth`. |
-| `tools/anim_showcase` | The animation pipeline on three people: locomotion, retargeting, aim and hit layers, feet and look IK. |
+| `tools/anim_showcase` | The animation pipeline on seven people: gaits, retargets, motion capture, a graph on a mover, stairs and a ramp, a rifle aimed with both hands, hit layers, feet and look IK; `AE3D_METRICS=1` measures what a player would see wrong. |
 | `caustics`, `smooth_terrain`, `voxel_world`, `sand`, `black_hole` | Water, terrain, voxels, a million instances, curved space. |
 | `lights`, `models`, `blender_pipeline`, `backend_switch`, `spinning_cube` | Materials and lights, OBJ, the Blender export, the two renderers, the smallest program. |
 

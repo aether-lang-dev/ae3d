@@ -672,7 +672,11 @@ for suite in $SUITES; do
     fi
     if grep -qE "warning|^error" "$BUILD_DIR/$name.log"; then
         fail "$name (build warnings or errors)"
-        grep -E "warning|^error" "$BUILD_DIR/$name.log" | sed 's/^/        /' | head -10
+        # With the lines GCC puts over a warning (the function it is in, and
+        # what it was inlined from, at the .ae line aetherc marks): the two
+        # warning lines alone did not say which memset a new Ubuntu's GCC
+        # meant in test_falls.
+        grep -B6 -E "warning|^error" "$BUILD_DIR/$name.log" | sed 's/^/        /' | head -40
         continue
     fi
     needs_window=0
@@ -805,7 +809,11 @@ for example in examples/*.ae; do
     fi
     if grep -qE "warning|^error" "$BUILD_DIR/$name.log"; then
         fail "$name (build warnings or errors)"
-        grep -E "warning|^error" "$BUILD_DIR/$name.log" | sed 's/^/        /' | head -10
+        # With the lines GCC puts over a warning (the function it is in, and
+        # what it was inlined from, at the .ae line aetherc marks): the two
+        # warning lines alone did not say which memset a new Ubuntu's GCC
+        # meant in test_falls.
+        grep -B6 -E "warning|^error" "$BUILD_DIR/$name.log" | sed 's/^/        /' | head -40
         continue
     fi
     if ! have_display; then
