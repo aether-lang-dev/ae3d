@@ -557,25 +557,32 @@ fi
 # critical path's thirteen minutes.
 if in_tier suites && first_shard; then
 step "modules type-check"
+# In the pool, JOBS at a time, and said in order after: one after another
+# they were most of the first Linux suites shard (19 to 25 minutes of its
+# 40, run 41249856048 cut off in its last step).
+export CHECK_DIR="${TMPDIR:-/tmp}/ae3d_checks"
+rm -rf "$CHECK_DIR"
+mkdir -p "$CHECK_DIR"
+check_module() {   # check_module <module>: a program importing it through aetherc, its log and status under CHECK_DIR
+    probe="$(mktemp -t ae3d_probe.XXXXXX).ae"
+    printf 'import %s\nmain() { println("ok") }\n' "$1" > "$probe"
+    # The same search path build.sh gives every program: the engine, and
+    # the physics engine in its submodule, which ae3d.physics imports.
+    # The examples' shared code is found from the root, as they import it.
+    lib="$PWD/src:$PWD/deps/aephysics"
+    case "$1" in examples.*) lib="$PWD/src" ;; esac
+    AETHER_LIB_DIR="$lib" aetherc "$probe" "${probe%.ae}.c" >"$CHECK_DIR/$1.log" 2>&1
+    echo $? >"$CHECK_DIR/$1.status"
+    rm -f "$probe" "${probe%.ae}.c"
+}
+checked=""
 # A module's own modules too (ae3d.shaders.fxaa, src/ae3d/shaders/fxaa).
 for module in src/ae3d/*/ src/ae3d/*/*/; do
     [ -f "$module/module.ae" ] || continue
     name="${module#src/ae3d/}"
     name="${name%/}"
-    name="${name//\//.}"
-    probe="$(mktemp -t ae3d_probe.XXXXXX).ae"
-    printf 'import ae3d.%s\nmain() { println("ok") }\n' "$name" > "$probe"
-    # The same search path build.sh gives every program: the engine, and
-    # the physics engine in its submodule, which ae3d.physics imports.
-    if AETHER_LIB_DIR="$PWD/src:$PWD/deps/aephysics" aetherc "$probe" "${probe%.ae}.c" >/tmp/ae3d_mod.log 2>&1; then
-        pass "ae3d.$name"
-    else
-        fail "ae3d.$name"
-        sed 's/^/        /' /tmp/ae3d_mod.log | head -10
-    fi
-    rm -f "$probe" "${probe%.ae}.c"
+    checked="$checked ae3d.${name//\//.}"
 done
-
 # Shared code belonging to the examples, outside the engine's namespace and
 # imported by its path from the root (examples.lib.<name>), as the examples
 # import it. Type-checked the same way: a module that stops compiling
@@ -583,16 +590,18 @@ done
 # get built first.
 for module in examples/lib/*/; do
     [ -e "$module" ] || continue
-    name="$(basename "$module")"
-    probe="$(mktemp -t ae3d_probe.XXXXXX).ae"
-    printf 'import examples.lib.%s\nmain() { println("ok") }\n' "$name" > "$probe"
-    if AETHER_LIB_DIR="$PWD/src" aetherc "$probe" "${probe%.ae}.c" >/tmp/ae3d_mod.log 2>&1; then
-        pass "examples/lib/$name"
+    checked="$checked examples.lib.$(basename "$module")"
+done
+in_pool check_module $checked
+for name in $checked; do
+    shown="$name"
+    case "$name" in examples.lib.*) shown="examples/lib/${name#examples.lib.}" ;; esac
+    if [ "$(cat "$CHECK_DIR/$name.status" 2>/dev/null)" = "0" ]; then
+        pass "$shown"
     else
-        fail "examples/lib/$name"
-        sed 's/^/        /' /tmp/ae3d_mod.log | head -10
+        fail "$shown"
+        sed 's/^/        /' "$CHECK_DIR/$name.log" 2>/dev/null | head -10
     fi
-    rm -f "$probe" "${probe%.ae}.c"
 done
 fi
 
