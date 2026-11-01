@@ -1,0 +1,1367 @@
+// Clips for a rig (#853, layer 1).
+//
+// A take is one animation of a file resampled for a rig: every joint's local
+// transform at a fixed rate, laid out as poses one after another, so a sample
+// is two frames and a blend with no key search. glTF stores an animation as
+// keys per node, each node on its own clock; resampled at the file's own key
+// rate a take is exact at its frames and, between them, within the nlerp of a
+// thirtieth of a second of motion.
+//
+// What the engine needs to know about a clip is read from it once, as it is
+// made, the way a shipped engine finds it at import:
+//   - root motion: where the root (the UE5 skeleton's `root`, the pelvis
+//     where there is none) travels and turns over the ground, taken out of
+//     the poses and kept beside them, so the game moves the figure by it or
+//     plays the clip in place;
+//   - foot contacts: each foot down while its sole is within CONTACT_UP of
+//     the lowest it comes, so foot placement locks it and a blend can keep
+//     two gaits' feet in step;
+//   - its speed over the ground: its root's, or for a clip made in place,
+//     its stance feet's, which carry the ground backwards under it at that
+//     speed; a locomotion blend plays the clips at the pace the figure moves.
+
+import std.heap
+import std.list
+import std.string
+import ae3d.core
+import ae3d.anim
+import ae3d.gltf
+import ae3d.pose
+
+exports (
+    Take, CONTACT_UP,
+    from_scene, from_frames, take_free, name, frames, rate, duration, looping, set_looping, mirror, seal_loop, straighten,
+    loop_cut, crop, travel_length, time_at_distance, time_at_distance_left, moving_at, still_at, braking,
+    add_event, event_count, event_time, event_name, event_found, FOOT_LEFT, FOOT_RIGHT,
+    frame, sample, sample_frame, extract_root, root_joint, travel, root_delta, has_root_motion,
+    contact, planted, find_contacts, contacts_like, speed, foot_down, phase_of, time_at_phase, time_of, ground_point, up_of, heading,
+    ground_carry
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+// Metres over its lowest a foot's sole may be and count as down.
+const CONTACT_UP = 0.03
+// Flat frames (both feet, the whole take) under which a take is taken to run
+// on its balls.
+const FLAT_LEAST = 6
+// A take whose root travels less than this over its length is in place.
+const MOVES = 0.05
+// And a pelvis that ends this far from where it began carries the take.
+const TRAVELS = 0.25
+// A planted foot moves with the ground: its ball within SLIP_SPEED metres a
+// second of the ground's speed, or SLIP_SHARE of it for a fast take.
+const SLIP_SPEED = 0.25
+const SLIP_SHARE = 0.15
+// A loop whose ends are farther apart than this at any joint (radians) was
+// not made to loop, and is left as it is.
+const LOOP_GAP = 0.175
+// The shortest loop loop_cut cuts, seconds.
+const LOOP_LEAST = 0.6
+// The events found at import: a foot coming down.
+const FOOT_LEFT = "foot_l"
+const FOOT_RIGHT = "foot_r"
+
+// A named moment of a take (a footfall, a blow landing, a cup at the lips),
+// fired by the animator as its clock passes it.
+struct Event {
+    at: float                      // seconds into the take
+    name: string
+    found: bool                    // found at import (a footfall), not added by a program
+}
+
+struct Take {
+    name: string
+    count: int                     // the rig's joints
+    frames: int
+    rate: float                    // frames a second
+    duration: float                // seconds, (frames - 1) / rate
+    looping: bool
+    data: ptr                      // float[frames * count * pose.FLOATS]
+    root: int                      // the joint its root motion was taken from, -1 none
+    motion: ptr                    // float[frames * 4]: the root's x, z and yaw from frame 0, and its y
+    contacts: ptr                  // float[frames * 2]: left and right foot down (1) or not (0)
+    flat: ptr                      // float[frames * 2]: left and right foot planted, flat or on its ball (see planted)
+    speed: float                   // metres a second over the ground
+    left_down: float               // seconds the left foot first comes down, -1 when it never does
+    right_down: float
+    heading: Vec3                  // the way it carries the figure over the ground (unit, x and z), at rest
+    events: ptr                    // list of *Event, in order of time
+    pivot: Vec3                    // where its root was held (frame 0's place), in the rig's space
+    up: Vec3                       // the rig's up its root motion was taken about
+    travels: bool                  // its root travels in its frames (see find_contacts)
+}
+
+// --- making -------------------------------------------------------------------------------------
+
+// Animation `animation` of `scene` resampled for `rig` at `per_second`
+// frames a second (0: the file's own key rate, at least 24). Joints the
+// animation does not drive hold their rest pose. Null when the scene has no
+// animation by that name.
+from_scene(rig: *Rig, scene: *GltfScene, animation: string, per_second: float) -> *Take {
+    n = pose.count(rig)
+    driven = calloc(n, 8) as ptr[]
+    prefix = string.concat(animation, ":")
+    any = false
+    longest = 0.0
+    finest = 1000.0
+    i = 0
+    while i < gltf.clip_count(scene) {
+        c = gltf.clip(scene, i)
+        if string.starts_with(anim.clip_name(c), prefix) == 1 {
+            node = gltf.clip_node(scene, i)
+            j = 0
+            while j < n {
+                if pose.joint(rig, j) == node { driven[j] = c as ptr }
+                j = j + 1
+            }
+            any = true
+            if anim.clip_duration(c) > longest { longest = anim.clip_duration(c) }
+            gap = key_gap(c)
+            if gap > 0.0 && gap < finest { finest = gap }
+        }
+        i = i + 1
+    }
+    string.free(prefix)
+    if !any {
+        free(driven as ptr)
+        return null
+    }
+    r = per_second
+    if r <= 0.0 {
+        r = 30.0
+        if finest < 1000.0 { r = 1.0 / finest }
+        if r < 24.0 { r = 24.0 }
+        if r > 120.0 { r = 120.0 }
+    }
+    count = (longest * r + 0.5) as int + 1
+    t = blank_take(rig, animation, count, r)
+    t.duration = longest
+    f = 0
+    while f < count {
+        at = (f as float) / r
+        if at > longest { at = longest }
+        p = frame(t, f)
+        pose.rest_pose(rig, p)
+        j = 0
+        while j < n {
+            if driven[j] != null { sample_joint(driven[j] as *Clip, at, p, j) }
+            j = j + 1
+        }
+        f = f + 1
+    }
+    free(driven as ptr)
+    if t.looping { _sealed = seal_loop(t, rig) }
+    find_contacts(t, rig)
+    return t
+}
+
+// A take of `count` frames at `per_second`, every frame the rest pose: one a
+// program fills itself (a retarget, a capture).
+from_frames(rig: *Rig, title: string, count: int, per_second: float) -> *Take {
+    t = blank_take(rig, title, count, per_second)
+    f = 0
+    while f < count {
+        pose.rest_pose(rig, frame(t, f))
+        f = f + 1
+    }
+    return t
+}
+
+blank_take(rig: *Rig, title: string, count: int, per_second: float) -> *Take {
+    t = heap.new(Take)
+    t.name = string.copy(title)
+    t.count = pose.count(rig)
+    t.frames = count
+    t.rate = per_second
+    t.duration = ((count - 1) as float) / per_second
+    t.looping = string.contains(title, "Loop") == 1
+    t.data = calloc(count * t.count * pose.FLOATS, 8)
+    t.root = 0 - 1
+    t.motion = calloc(count * 4, 8)
+    t.contacts = calloc(count * 2, 8)
+    t.flat = calloc(count * 2, 8)
+    t.events = list.new()
+    t.left_down = 0.0 - 1.0
+    t.right_down = 0.0 - 1.0
+    return t
+}
+
+take_free(t: *Take) {
+    if t == null { return }
+    free(t.data)
+    free(t.motion)
+    free(t.contacts)
+    free(t.flat)
+    i = 0
+    while i < list.size(t.events) {
+        ev = list.get_raw(t.events, i) as *Event
+        string.free(ev.name)
+        heap.free(ev)
+        i = i + 1
+    }
+    list.free(t.events)
+    string.free(t.name)
+    heap.free(t)
+}
+
+// The smallest gap between two keys of any of the clip's channels.
+key_gap(c: *Clip) -> float {
+    best = 0.0
+    k = 0
+    while k < anim.clip_channel_count(c) {
+        ch = anim.clip_channel(c, k)
+        keys = anim.channel_key_count(ch)
+        if keys > 1 {
+            gap = anim.channel_duration(ch) / ((keys - 1) as float)
+            if best <= 0.0 || gap < best { best = gap }
+        }
+        k = k + 1
+    }
+    return best
+}
+
+// Joint `j` of pose `p` from clip `c` at `at` seconds, channel by channel.
+sample_joint(c: *Clip, at: float, p: ptr, j: int) {
+    k = 0
+    while k < anim.clip_channel_count(c) {
+        ch = anim.clip_channel(c, k)
+        target = anim.channel_target(ch)
+        if target == anim.TRANSLATION { pose.set_translation(p, j, anim.sample_vec3(ch, at)) }
+        if target == anim.ROTATION { pose.set_rotation(p, j, core.quat_normalize(anim.sample_quat(ch, at))) }
+        if target == anim.SCALE { pose.set_scale(p, j, anim.sample_vec3(ch, at)) }
+        k = k + 1
+    }
+}
+
+// --- reading ------------------------------------------------------------------------------------
+
+name(t: *Take) -> string { return t.name }
+frames(t: *Take) -> int { return t.frames }
+rate(t: *Take) -> float { return t.rate }
+duration(t: *Take) -> float { return t.duration }
+looping(t: *Take) -> bool { return t.looping }
+set_looping(t: *Take, on: bool) { t.looping = on }
+speed(t: *Take) -> float { return t.speed }
+root_joint(t: *Take) -> int { return t.root }
+has_root_motion(t: *Take) -> bool { return t.root >= 0 }
+
+// Frame `f`'s pose, in place in the take.
+frame(t: *Take, f: int) -> ptr {
+    k = f
+    if k < 0 { k = 0 }
+    if k >= t.frames { k = t.frames - 1 }
+    return t.data + k * t.count * pose.FLOATS * 8
+}
+
+// The time `at` seconds into the take: wrapped into its length when it
+// loops, held at its ends when not.
+time_of(t: *Take, at: float, loop: bool) -> float {
+    if t.duration <= 0.0 { return 0.0 }
+    if loop {
+        x = at - t.duration * floor_of(at / t.duration)
+        if x >= t.duration { x = 0.0 }
+        return x
+    }
+    if at < 0.0 { return 0.0 }
+    if at > t.duration { return t.duration }
+    return at
+}
+
+floor_of(x: float) -> float {
+    i = x as int
+    f = i as float
+    if f > x { f = f - 1.0 }
+    return f
+}
+
+// The take's pose `at` seconds in, into `out`: the two frames around it
+// blended. Looping, the last frame runs into the first (a loop's last frame
+// is its first again).
+sample(t: *Take, rig: *Rig, at: float, loop: bool, out: ptr) {
+    x = time_of(t, at, loop) * t.rate
+    f0 = x as int
+    if f0 >= t.frames - 1 {
+        pose.copy(rig, frame(t, t.frames - 1), out)
+        return
+    }
+    u = x - (f0 as float)
+    pose.blend(rig, frame(t, f0), frame(t, f0 + 1), u, out)
+}
+
+// Frame `f`'s pose into `out`.
+sample_frame(t: *Take, rig: *Rig, f: int, out: ptr) { pose.copy(rig, frame(t, f), out) }
+
+// The take's phase at `at` seconds, 0 to 1, by its feet: 0 as its left foot
+// first comes down, 0.5 as its right does, back to 1 at the left's next. A
+// locomotion blend plays its takes at one phase, so every take's left foot
+// comes down together and every right foot does too, whatever their steps'
+// lengths (sync markers, as a shipped engine's blend spaces keep them).
+// Synced by the left foot alone, a jog and a sprint blended put their right
+// feet down a few frames apart, and the blended foot slid between them. A
+// take with no footfalls runs its phase evenly from its start.
+phase_of(t: *Take, at: float) -> float {
+    if t.duration <= 0.0 { return 0.0 }
+    left, right = markers(t)
+    x = at - t.duration * floor_of(at / t.duration)
+    if x < left { x = x + t.duration }
+    if x < right { return 0.5 * (x - left) / (right - left) }
+    return 0.5 + 0.5 * (x - right) / (left + t.duration - right)
+}
+
+// The time in the take at `phase` (phase_of the other way).
+time_at_phase(t: *Take, phase: float) -> float {
+    if t.duration <= 0.0 { return 0.0 }
+    left, right = markers(t)
+    p = phase - floor_of(phase)
+    x = 0.0
+    if p < 0.5 {
+        x = left + (p / 0.5) * (right - left)
+    } else {
+        x = right + ((p - 0.5) / 0.5) * (left + t.duration - right)
+    }
+    return time_of(t, x, true)
+}
+
+// Its left and right footfalls as times, the right after the left within a
+// cycle; for a take without them, its start and its middle.
+markers(t: *Take) -> (float, float) {
+    left = t.left_down
+    right = t.right_down
+    if left < 0.0 || right < 0.0 || left == right {
+        left = 0.0
+        if t.left_down >= 0.0 { left = t.left_down }
+        return left, left + t.duration * 0.5
+    }
+    if right < left { right = right + t.duration }
+    return left, right
+}
+
+// Root motion taken out: the root joint's travel over the ground and its
+// turn about up, kept per frame as offsets from frame 0, and the joint held
+// over its rest place in every frame (frame 0's height, its own tilt kept),
+// turned to face the rig's forward as it does at rest (Unreal's root lock
+// to the reference pose): the figure is drawn on its object, and its travel
+// is along its own facing. A capture's first frame stands and faces wherever
+// the actor was in the volume: held there, its figure was drawn 8 m from its
+// object, and 100STYLE's backward walk took it off 45 degrees from its back.
+// The turn is the root's twist about up, whatever its own axes are (the
+// UE5 root's forward axis points up, and read off that its turn was 0).
+// The root is the rig's `root` where it moves, otherwise its pelvis, which
+// carries its travel only. Nothing is taken from a take whose root travels
+// less than MOVES: it is already in place. `up` is the rig's up in its own
+// space (the armature's).
+extract_root(t: *Take, rig: *Rig, up: Vec3) {
+    joint = pick_root(t, rig)
+    if joint < 0 { return }
+    turns = joint == pose.human(rig, pose.ROOT)
+    first_t = pose.translation(frame(t, 0), joint)
+    // Where it is held: over the rest pose's place, at frame 0's height.
+    rest_t = pose.translation(pose.rest(rig), joint)
+    held = core.v3_add(core.v3_sub(rest_t, core.v3_mul(up, core.v3_dot(rest_t, up))), core.v3_mul(up, core.v3_dot(first_t, up)))
+    first_q = pose.rotation(frame(t, 0), joint)
+    // Frame 0's heading against the rest pose's: what the root lock takes off.
+    facing0 = 0.0
+    if turns { facing0 = wrap_angle(twist_about(core.quat_mul(first_q, core.quat_conjugate(pose.rotation(pose.rest(rig), joint))), up)) }
+    unface = core.quat_rotate(0.0 - facing0, up)
+    m = t.motion as float[]
+    f = 0
+    while f < t.frames {
+        p = frame(t, f)
+        tr = pose.translation(p, joint)
+        q = pose.rotation(p, joint)
+        d = core.v3_sub(tr, first_t)
+        rise = core.v3_dot(d, up)
+        flat = core.quat_apply(unface, core.v3_sub(d, core.v3_mul(up, rise)))
+        turn = 0.0
+        if turns { turn = wrap_angle(twist_about(core.quat_mul(q, core.quat_conjugate(first_q)), up)) }
+        m[f * 4] = flat.x
+        m[f * 4 + 1] = flat.z
+        m[f * 4 + 2] = turn
+        m[f * 4 + 3] = rise
+        // Held at frame 0's place over the ground, facing as at rest.
+        pose.set_translation(p, joint, core.v3_add(held, core.v3_mul(up, rise)))
+        pose.set_rotation(p, joint, core.quat_normalize(core.quat_mul(core.quat_rotate(0.0 - turn - facing0, up), q)))
+        f = f + 1
+    }
+    t.root = joint
+    t.pivot = core.vec3(held.x, held.y, held.z)
+    t.up = up
+    from_root(t, rig)
+}
+
+// The turn of `q` about `up` (its twist, as a swing-twist decomposition
+// finds it), radians.
+twist_about(q: Quat, up: Vec3) -> float {
+    along = q.x * up.x + q.y * up.y + q.z * up.z
+    return 2.0 * core.atan2_of(along, q.w)
+}
+
+// The take's speed and heading from its root's travel over its length.
+from_root(t: *Take, rig: *Rig) {
+    m = t.motion as float[]
+    find_speed_from_root(t)
+    last = (t.frames - 1) * 4
+    across = core.sqrt_of(m[last] * m[last] + m[last + 1] * m[last + 1])
+    if across > 0.000001 { t.heading = ground_dir(rig, core.vec3(m[last] / across, 0.0, m[last + 1] / across)) }
+}
+
+// The root joint. On a rig with a root bone (UE5's `root`) it is that bone,
+// when it moves MOVES anywhere in the take: the root carries the motion
+// there, and a pelvis moving under a still root is the motion itself (a
+// figure getting up where it lies, sitting down onto where it stood). On a
+// rig with none (Mixamo's) it is the pelvis, when it ends TRAVELS from where
+// it began (an in-place walk's pelvis sways a few centimetres and comes
+// back). -1 when there is nothing to take.
+pick_root(t: *Take, rig: *Rig) -> int {
+    candidates = [pose.human(rig, pose.ROOT), pose.human(rig, pose.PELVIS)]
+    k = 0
+    while k < 2 {
+        j = candidates[k]
+        if j >= 0 {
+            a = pose.translation(frame(t, 0), j)
+            b = pose.translation(frame(t, t.frames - 1), j)
+            far = 0.0
+            f = 0
+            while f < t.frames {
+                d = core.v3_len(core.v3_sub(pose.translation(frame(t, f), j), a))
+                if d > far { far = d }
+                f = f + 1
+            }
+            if k == 0 { if far >= MOVES { return j } else { return 0 - 1 } }
+            if k == 1 && core.v3_len(core.v3_sub(b, a)) >= TRAVELS { return j }
+        }
+        k = k + 1
+    }
+    return 0 - 1
+}
+wrap_angle(a: float) -> float {
+    x = a
+    while x > 3.141592653589793 { x = x - 6.283185307179586 }
+    while x < 0.0 - 3.141592653589793 { x = x + 6.283185307179586 }
+    return x
+}
+
+find_speed_from_root(t: *Take) {
+    if t.duration <= 0.0 { return }
+    m = t.motion as float[]
+    last = (t.frames - 1) * 4
+    t.speed = core.sqrt_of(m[last] * m[last] + m[last + 1] * m[last + 1]) / t.duration
+}
+
+// The root's offset `at` seconds in from frame 0: x and z over the ground
+// in the rig's space, and its turn about up.
+travel(t: *Take, at: float) -> Vec3 {
+    if t.root < 0 { return core.vec3(0.0, 0.0, 0.0) }
+    m = t.motion as float[]
+    x = time_of(t, at, false) * t.rate
+    f0 = x as int
+    if f0 >= t.frames - 1 {
+        k = (t.frames - 1) * 4
+        return core.vec3(m[k], m[k + 1], m[k + 2])
+    }
+    u = x - (f0 as float)
+    a = f0 * 4
+    b = a + 4
+    return core.vec3(m[a] + (m[b] - m[a]) * u, m[a + 1] + (m[b + 1] - m[a + 1]) * u, m[a + 2] + (m[b + 2] - m[a + 2]) * u)
+}
+
+// The root's motion from `from` to `to` seconds (wrapping when it loops),
+// as the figure takes it: x and z over the ground in the root's own frame at
+// `from` (x across, z ahead, in the rig's axes turned back by its heading
+// then), and the turn about up.
+root_delta(t: *Take, from: float, to: float, loop: bool) -> Vec3 {
+    if t.root < 0 { return core.vec3(0.0, 0.0, 0.0) }
+    if !loop || to >= from { return segment(t, time_of(t, from, loop), time_of(t, to, loop)) }
+    // Wrapped: to the end, then from the start.
+    a = time_of(t, from, true)
+    b = time_of(t, to, true)
+    first = segment(t, a, t.duration)
+    second = segment(t, 0.0, b)
+    c = core.cos_of(first.z)
+    s = core.sin_of(first.z)
+    return core.vec3(first.x + c * second.x + s * second.y, first.y - s * second.x + c * second.y, first.z + second.z)
+}
+
+// The root's motion over [a, b] in the frame of its heading at a. The vector
+// carries x, z and yaw in x, y and z.
+segment(t: *Take, a: float, b: float) -> Vec3 {
+    pa = travel(t, a)
+    pb = travel(t, b)
+    dx = pb.x - pa.x
+    dz = pb.y - pa.y
+    c = core.cos_of(pa.z)
+    s = core.sin_of(pa.z)
+    return core.vec3(c * dx - s * dz, s * dx + c * dz, wrap_angle(pb.z - pa.z))
+}
+
+// --- contacts -----------------------------------------------------------------------------------
+
+// Whether foot `side` (0 left, 1 right) is down `at` seconds in.
+contact(t: *Take, side: int, at: float, loop: bool) -> bool {
+    f = (time_of(t, at, loop) * t.rate + 0.5) as int
+    if f >= t.frames { f = t.frames - 1 }
+    return (t.contacts as float[])[f * 2 + side] > 0.5
+}
+
+// The first time foot `side` comes down, -1 when it never does.
+foot_down(t: *Take, side: int) -> float {
+    if side == 0 { return t.left_down }
+    return t.right_down
+}
+
+// A point of the rig given in its space put in the ground's (the space the
+// figure stands in: up is y), through the armature the rig hangs from.
+ground_point(rig: *Rig, p: Vec3) -> Vec3 {
+    base = pose.base_model(rig)
+    if base == null { return p }
+    core.model_sync_transform(base)
+    s = base.world_scale
+    scaled = core.vec3(p.x * s.x, p.y * s.y, p.z * s.z)
+    return core.v3_add(base.world_position, core.quat_apply(base.world_rotation, scaled))
+}
+
+// The way take `t` carries the figure over the ground when the figure stands
+// at rest (unit; zero for a take that goes nowhere).
+heading(t: *Take) -> Vec3 { return t.heading }
+
+// A direction of the rig's space in the ground's, level.
+ground_dir(rig: *Rig, v: Vec3) -> Vec3 {
+    base = pose.base_model(rig)
+    w = v
+    if base != null {
+        core.model_sync_transform(base)
+        w = core.quat_apply(base.world_rotation, v)
+    }
+    flat = core.vec3(w.x, 0.0, w.z)
+    if core.v3_len(flat) < 0.000001 { return core.vec3(0.0, 0.0, 0.0) }
+    return core.v3_normalize(flat)
+}
+
+// Up in the rig's own space: the ground's up turned back through the
+// armature (a Blender armature stands Z-up under a turned node).
+up_of(rig: *Rig) -> Vec3 {
+    base = pose.base_model(rig)
+    if base == null { return core.vec3(0.0, 1.0, 0.0) }
+    core.model_sync_transform(base)
+    return core.v3_normalize(core.quat_apply(core.quat_conjugate(base.world_rotation), core.vec3(0.0, 1.0, 0.0)))
+}
+
+// Each foot's contacts, the take's speed over the ground when it has no root
+// motion, its heading, and the first touchdowns, found from its frames. A
+// foot is down while its sole (the lower of its ankle and its ball) is
+// within CONTACT_UP of the lowest that sole comes in the take, and flat while
+// its ankle and its ball both are.
+find_contacts(t: *Take, rig: *Rig) { contacts_like(t, rig, null) }
+
+// As find_contacts, with the contacts and planted frames of `like` (a take of
+// the same motion and length: what it was retargeted from) in place of those
+// its own feet show; its speed, heading and footfalls found from them.
+contacts_like(t: *Take, rig: *Rig, like: *Take) {
+    worlds = pose.new(rig)
+    c = t.contacts as float[]
+    flatness = t.flat as float[]
+    // Per frame and foot: the ankle's height, the ball's, and the ball's x, z.
+    marks = calloc(t.frames * 8, 8) as float[]
+    feet = [pose.human(rig, pose.FOOT_L), pose.human(rig, pose.FOOT_R)]
+    balls = [pose.human(rig, pose.BALL_L), pose.human(rig, pose.BALL_R)]
+    lowest_ankle = [1000000.0, 1000000.0]
+    lowest_ball = [1000000.0, 1000000.0]
+    balls_down = calloc(t.frames * 2, 8) as float[]
+    flat_count = 0
+    f = 0
+    while f < t.frames {
+        pose.world(rig, frame(t, f), worlds)
+        side = 0
+        while side < 2 {
+            at = (f * 2 + side) * 4
+            if feet[side] >= 0 {
+                a = ground_point(rig, pose.translation(worlds, feet[side]))
+                b = a
+                if balls[side] >= 0 { b = ground_point(rig, pose.translation(worlds, balls[side])) }
+                marks[at] = a.y
+                marks[at + 1] = b.y
+                marks[at + 2] = b.x
+                marks[at + 3] = b.z
+                if a.y < lowest_ankle[side] { lowest_ankle[side] = a.y }
+                if b.y < lowest_ball[side] { lowest_ball[side] = b.y }
+            }
+            side = side + 1
+        }
+        f = f + 1
+    }
+    f = 0
+    while f < t.frames {
+        side = 0
+        while side < 2 {
+            at = (f * 2 + side) * 4
+            sole = marks[at]
+            if marks[at + 1] < sole { sole = marks[at + 1] }
+            lowest = lowest_ankle[side]
+            if lowest_ball[side] < lowest { lowest = lowest_ball[side] }
+            c[f * 2 + side] = 0.0
+            flatness[f * 2 + side] = 0.0
+            balls_down[f * 2 + side] = 0.0
+            if feet[side] >= 0 && sole <= lowest + CONTACT_UP { c[f * 2 + side] = 1.0 }
+            if feet[side] >= 0 && marks[at + 1] <= lowest_ball[side] + CONTACT_UP { balls_down[f * 2 + side] = 1.0 }
+            if feet[side] >= 0 && marks[at] <= lowest_ankle[side] + CONTACT_UP && marks[at + 1] <= lowest_ball[side] + CONTACT_UP {
+                flatness[f * 2 + side] = 1.0
+                flat_count = flat_count + 1
+            }
+            side = side + 1
+        }
+        f = f + 1
+    }
+    // Planted: flat where the take puts its feet down flat (a walk), its balls
+    // down where it never does (a run on its forefoot: the sprint is flat one
+    // frame a stance).
+    if flat_count < FLAT_LEAST {
+        f = 0
+        while f < t.frames * 2 {
+            flatness[f] = balls_down[f]
+            f = f + 1
+        }
+    }
+    free(balls_down as ptr)
+    // Whether its pelvis travels in its frames (a capture read whole, its
+    // root motion not taken out): such a take goes over a still ground, and
+    // only there must a planted foot also be still (keep_still).
+    went = core.vec3(0.0, 0.0, 0.0)
+    pelvis = pose.human(rig, pose.PELVIS)
+    if pelvis >= 0 {
+        pose.world(rig, frame(t, 0), worlds)
+        a = ground_point(rig, pose.translation(worlds, pelvis))
+        pose.world(rig, frame(t, t.frames - 1), worlds)
+        b = ground_point(rig, pose.translation(worlds, pelvis))
+        went = core.vec3(b.x - a.x, 0.0, b.z - a.z)
+    }
+    t.travels = t.root < 0 && core.v3_len(went) >= TRAVELS
+    if t.travels { keep_still(t, flatness, marks) }
+    if like != null && like.frames == t.frames {
+        k = 0
+        while k < t.frames * 2 {
+            c[k] = (like.contacts as float[])[k]
+            flatness[k] = (like.flat as float[])[k]
+            k = k + 1
+        }
+    }
+    // The speed over the ground, from the feet while planted: every planted
+    // stretch's travel of the ball over its time. A planted foot is what
+    // stays put on the ground; the rest of a stance is the foot rolling onto its
+    // heel and off its toe, about points the joints are not on. Taken over the
+    // whole stance, the walk rolling forward off its toe came out at 0.94 m/s,
+    // and its flat foot slid back 7 cm a stance under a figure moved at that.
+    sum_x = 0.0
+    sum_z = 0.0
+    flat_frames = 0
+    side = 0
+    while side < 2 {
+        started = 0 - 1
+        f = 0
+        while f <= t.frames {
+            down = f < t.frames && flatness[f * 2 + side] > 0.5
+            if down && started < 0 { started = f }
+            if !down && started >= 0 {
+                last = f - 1
+                if last > started {
+                    a0 = (started * 2 + side) * 4
+                    a1 = (last * 2 + side) * 4
+                    sum_x = sum_x + marks[a1 + 2] - marks[a0 + 2]
+                    sum_z = sum_z + marks[a1 + 3] - marks[a0 + 3]
+                    flat_frames = flat_frames + last - started
+                }
+                started = 0 - 1
+            }
+            f = f + 1
+        }
+        side = side + 1
+    }
+    // First touchdowns: a foot down after a frame it was up (or down from
+    // the start when it never lifts).
+    t.left_down = touchdown(t, 0)
+    t.right_down = touchdown(t, 1)
+    find_footfalls(t)
+    across = core.sqrt_of(sum_x * sum_x + sum_z * sum_z)
+    if t.root < 0 && flat_frames > 0 { t.speed = across / ((flat_frames as float) / t.rate) }
+    // The way it goes: against its feet's travel (they carry the ground back).
+    // Not the way its toes point: feet stand turned out, and a figure moved
+    // heel to toe walks off its gait's line, its toes sliding.
+    if t.root < 0 && across > 0.000001 { t.heading = core.vec3(0.0 - sum_x / across, 0.0, 0.0 - sum_z / across) }
+    // Over a still ground (see above): its speed and heading are its pelvis's,
+    // and its planted feet's travel is only their slip (a capture's forward
+    // walk came out at 0.027 m/s).
+    if t.travels && t.duration > 0.0 && core.v3_len(went) > 0.000001 {
+        t.speed = core.v3_len(went) / t.duration
+        t.heading = core.v3_normalize(went)
+    }
+    free(marks as ptr)
+    pose.release(worlds)
+}
+
+// Whether foot `side` is planted `at` seconds in: flat on the ground, or on
+// its ball for a take that runs on it.
+planted(t: *Take, side: int, at: float, loop: bool) -> bool {
+    f = (time_of(t, at, loop) * t.rate + 0.5) as int
+    if f >= t.frames { f = t.frames - 1 }
+    return (t.flat as float[])[f * 2 + side] > 0.5
+}
+
+touchdown(t: *Take, side: int) -> float {
+    c = t.contacts as float[]
+    f = 1
+    while f < t.frames {
+        if c[f * 2 + side] > 0.5 && c[(f - 1) * 2 + side] < 0.5 { return (f as float) / t.rate }
+        f = f + 1
+    }
+    if c[side] > 0.5 { return 0.0 }
+    return 0.0 - 1.0
+}
+
+// --- events -------------------------------------------------------------------------------------
+
+// Every footfall as an event (FOOT_LEFT, FOOT_RIGHT): a foot down after a
+// frame it was up. A loop's footfall on its first frame is on its last (the
+// same moment). Found again whenever the contacts are.
+find_footfalls(t: *Take) {
+    drop_found(t)
+    c = t.contacts as float[]
+    side = 0
+    while side < 2 {
+        title = FOOT_LEFT
+        if side == 1 { title = FOOT_RIGHT }
+        f = 1
+        while f < t.frames {
+            if c[f * 2 + side] > 0.5 && c[(f - 1) * 2 + side] < 0.5 { insert_event(t, (f as float) / t.rate, title, true) }
+            f = f + 1
+        }
+        side = side + 1
+    }
+}
+
+// An event named `title` `at` seconds into `t`, fired whenever the
+// animator's clock for the take passes it.
+add_event(t: *Take, at: float, title: string) { insert_event(t, at, title, false) }
+
+insert_event(t: *Take, at: float, title: string, found: bool) {
+    ev = heap.new(Event)
+    ev.at = at
+    ev.name = string.copy(title)
+    ev.found = found
+    list.add_raw(t.events, ev as ptr)
+    k = list.size(t.events) - 1
+    while k > 0 {
+        before = list.get_raw(t.events, k - 1) as *Event
+        if before.at <= at { break }
+        list.set(t.events, k, before as ptr)
+        k = k - 1
+    }
+    list.set(t.events, k, ev as ptr)
+}
+
+drop_found(t: *Take) {
+    kept = list.new()
+    i = 0
+    while i < list.size(t.events) {
+        ev = list.get_raw(t.events, i) as *Event
+        if ev.found {
+            string.free(ev.name)
+            heap.free(ev)
+        } else {
+            list.add_raw(kept, ev as ptr)
+        }
+        i = i + 1
+    }
+    list.free(t.events)
+    t.events = kept
+}
+
+event_count(t: *Take) -> int { return list.size(t.events) }
+event_time(t: *Take, i: int) -> float { return (list.get_raw(t.events, i) as *Event).at }
+event_name(t: *Take, i: int) -> string { return (list.get_raw(t.events, i) as *Event).name }
+event_found(t: *Take, i: int) -> bool { return (list.get_raw(t.events, i) as *Event).found }
+
+// --- mirroring ----------------------------------------------------------------------------------
+
+// Take `t` mirrored across the figure (pose.mirror on every frame), made for
+// this call and owned by the caller: its root's travel reflected and its
+// turns the other way, its contacts the take's left for right, its speed and heading found again, its
+// events kept (its footfalls found again, so a left foot's is a right's).
+// Named as `t` with "_Mirror" after it.
+mirror(t: *Take, rig: *Rig) -> *Take {
+    title = string.concat(t.name, "_Mirror")
+    m = blank_take(rig, title, t.frames, t.rate)
+    string.free(title)
+    m.duration = t.duration
+    m.looping = t.looping
+    f = 0
+    while f < t.frames {
+        pose.mirror(rig, frame(t, f), frame(m, f))
+        f = f + 1
+    }
+    if t.root >= 0 {
+        m.root = pose.mirror_of(rig, t.root)
+        n = pose.mirror_normal(rig)
+        level = core.sqrt_of(n.x * n.x + n.z * n.z)
+        nx = 1.0
+        nz = 0.0
+        if level > 0.000001 {
+            nx = n.x / level
+            nz = n.z / level
+        }
+        a = t.motion as float[]
+        b = m.motion as float[]
+        f = 0
+        while f < t.frames {
+            d = a[f * 4] * nx + a[f * 4 + 1] * nz
+            b[f * 4] = a[f * 4] - 2.0 * d * nx
+            b[f * 4 + 1] = a[f * 4 + 1] - 2.0 * d * nz
+            b[f * 4 + 2] = 0.0 - a[f * 4 + 2]
+            b[f * 4 + 3] = a[f * 4 + 3]
+            f = f + 1
+        }
+        m.pivot = t.pivot
+        m.up = t.up
+        from_root(m, rig)
+    }
+    // Its contacts the take's, left for right: found again from the mirrored
+    // feet's heights, a capture's dragged foot came back down.
+    like = blank_take(rig, t.name, t.frames, t.rate)
+    f = 0
+    while f < t.frames {
+        (like.contacts as float[])[f * 2] = (t.contacts as float[])[f * 2 + 1]
+        (like.contacts as float[])[f * 2 + 1] = (t.contacts as float[])[f * 2]
+        (like.flat as float[])[f * 2] = (t.flat as float[])[f * 2 + 1]
+        (like.flat as float[])[f * 2 + 1] = (t.flat as float[])[f * 2]
+        f = f + 1
+    }
+    contacts_like(m, rig, like)
+    take_free(like)
+    i = 0
+    while i < list.size(t.events) {
+        ev = list.get_raw(t.events, i) as *Event
+        if !ev.found { insert_event(m, ev.at, ev.name, false) }
+        i = i + 1
+    }
+    return m
+}
+
+// --- the ground under a take ----------------------------------------------------------------------
+
+// Where a point fixed to the ground, at `p` in frame `from` of the take (the
+// rig's space), is in frame `to`. A take whose root motion was taken out
+// carries the ground back by that motion (the root's travel and turn about
+// its held place); a take made in place, by the ground its planted feet push
+// back at its speed along its heading; a take whose root moves in its frames
+// (a capture read whole) leaves it where it is, its feet's planted travel
+// being nothing.
+ground_carry(t: *Take, rig: *Rig, p: Vec3, from: int, to: int) -> Vec3 {
+    if from == to { return p }
+    if t.root >= 0 {
+        m = t.motion as float[]
+        a = clamp_frame(t, from) * 4
+        b = clamp_frame(t, to) * 4
+        // Into the ground's frame at `from`, then back out at `to`.
+        level = core.v3_sub(p, core.v3_mul(t.up, core.v3_dot(p, t.up)))
+        pivot = core.v3_sub(t.pivot, core.v3_mul(t.up, core.v3_dot(t.pivot, t.up)))
+        rise = core.v3_mul(t.up, core.v3_dot(p, t.up))
+        world = core.v3_add(core.v3_add(core.quat_apply(core.quat_rotate(m[a + 2], t.up), core.v3_sub(level, pivot)), pivot), core.vec3(m[a], 0.0, m[a + 1]))
+        back = core.v3_sub(core.v3_sub(world, core.vec3(m[b], 0.0, m[b + 1])), pivot)
+        return core.v3_add(core.v3_add(core.quat_apply(core.quat_rotate(0.0 - m[b + 2], t.up), back), pivot), rise)
+    }
+    // Its root travelling in its frames (a capture read whole): the ground is still.
+    if t.travels { return p }
+    // Made in place: the ground goes back at the take's speed.
+    seconds = ((to - from) as float) / t.rate
+    shift = core.v3_mul(t.heading, 0.0 - t.speed * seconds)
+    base = pose.base_model(rig)
+    if base == null { return core.v3_add(p, shift) }
+    core.model_sync_transform(base)
+    s = base.world_scale
+    v = core.quat_apply(core.quat_conjugate(base.world_rotation), shift)
+    return core.v3_add(p, core.vec3(v.x / s.x, v.y / s.y, v.z / s.z))
+}
+
+clamp_frame(t: *Take, f: int) -> int {
+    if f < 0 { return 0 }
+    if f >= t.frames { return t.frames - 1 }
+    return f
+}
+
+// Planted means still on the ground, not only low: a foot dragged or pivoted
+// along the floor (a shuffle as a figure turns) is low and flat, and went 13
+// cm through what was counted its stance. Over a still ground (a capture
+// read whole), a planted frame's ball must stay still, within SLIP_SPEED of
+// the planted frames' own mean velocity (taken twice, the second time
+// without the frames far off the first). Not under a clip made in place,
+// whose feet are planted because it was made so: at a sprint's touchdown
+// and push-off the ball strays more than SLIP_SHARE from the ground's speed
+// while it is down, and filtered so, the runner's lock let go mid-stance at
+// 8.5 m/s and its toe went 327 mm.
+keep_still(t: *Take, flatness: float[], marks: float[]) {
+    if t.frames < 3 { return }
+    gx = 0.0
+    gz = 0.0
+    pass = 0
+    while pass < 2 {
+        sx = 0.0
+        sz = 0.0
+        n = 0
+        f = 0
+        while f < t.frames {
+            side = 0
+            while side < 2 {
+                if flatness[f * 2 + side] > 0.5 {
+                    vx, vz = ball_velocity(t, marks, f, side)
+                    if pass == 0 || slip_ok(vx - gx, vz - gz, gx, gz) {
+                        sx = sx + vx
+                        sz = sz + vz
+                        n = n + 1
+                    }
+                }
+                side = side + 1
+            }
+            f = f + 1
+        }
+        if n > 0 {
+            gx = sx / (n as float)
+            gz = sz / (n as float)
+        }
+        pass = pass + 1
+    }
+    // A foot dragged is neither planted nor down: feet locking holds a foot
+    // that is down, and 100STYLE's side step drags its trailing foot along
+    // the floor for most of a stride, held and then let go a third of a
+    // metre behind it.
+    c = t.contacts as float[]
+    f = 0
+    while f < t.frames {
+        side = 0
+        while side < 2 {
+            if flatness[f * 2 + side] > 0.5 || c[f * 2 + side] > 0.5 {
+                vx, vz = ball_velocity(t, marks, f, side)
+                if !slip_ok(vx - gx, vz - gz, gx, gz) {
+                    flatness[f * 2 + side] = 0.0
+                    c[f * 2 + side] = 0.0
+                }
+            }
+            side = side + 1
+        }
+        f = f + 1
+    }
+}
+
+slip_ok(dx: float, dz: float, gx: float, gz: float) -> bool {
+    allowed = SLIP_SHARE * core.sqrt_of(gx * gx + gz * gz)
+    if allowed < SLIP_SPEED { allowed = SLIP_SPEED }
+    return dx * dx + dz * dz <= allowed * allowed
+}
+
+// The ball's velocity over the ground at frame `f` (x and z), from the
+// frames either side (one side at the ends).
+ball_velocity(t: *Take, marks: float[], f: int, side: int) -> (float, float) {
+    a = f - 1
+    b = f + 1
+    if a < 0 { a = 0 }
+    if b >= t.frames { b = t.frames - 1 }
+    if b == a { return 0.0, 0.0 }
+    pa = (a * 2 + side) * 4
+    pb = (b * 2 + side) * 4
+    seconds = ((b - a) as float) / t.rate
+    return (marks[pb + 2] - marks[pa + 2]) / seconds, (marks[pb + 3] - marks[pa + 3]) / seconds
+}
+
+// --- loops --------------------------------------------------------------------------------------
+
+// A loop made seamless, as Unity's Loop Pose makes one: the gap between its
+// last frame and its first, at each joint, spread over the take (none of it
+// at the first frame, all of it at the last), so the last frame is the first
+// again and nothing snaps as it wraps. UAL's jog and sprint end 0.78 degrees
+// off where they begin. Not the root while it carries the take (its travel
+// and turn are the root motion: it moves MOVES or more and its motion was
+// not taken out), nor the pelvis's place over the ground while it travels
+// TRAVELS or more, only its height; and not a take whose ends are more than
+// LOOP_GAP apart at any joint, which was not made to loop. A capture looped
+// after its root motion was taken out has its pelvis sealed too, or its hips
+// would jump at the seam. Whether it was sealed.
+seal_loop(t: *Take, rig: *Rig) -> bool {
+    if t.frames < 3 { return false }
+    first = frame(t, 0)
+    last = frame(t, t.frames - 1)
+    root = pose.human(rig, pose.ROOT)
+    pelvis = pose.human(rig, pose.PELVIS)
+    up = up_of(rig)
+    if root >= 0 && t.root < 0 && core.v3_len(core.v3_sub(pose.translation(last, root), pose.translation(first, root))) < MOVES { root = 0 - 1 }
+    carries = false
+    if pelvis >= 0 && t.root != pelvis {
+        went = core.v3_sub(pose.translation(last, pelvis), pose.translation(first, pelvis))
+        went = core.v3_sub(went, core.v3_mul(up, core.v3_dot(went, up)))
+        carries = core.v3_len(went) >= TRAVELS
+    }
+    j = 0
+    while j < t.count {
+        if j != root {
+            q = core.quat_mul(pose.rotation(first, j), core.quat_conjugate(pose.rotation(last, j)))
+            w = core.abs_of(q.w)
+            if w > 1.0 { w = 1.0 }
+            if 2.0 * core.acos_of(w) > LOOP_GAP { return false }
+        }
+        j = j + 1
+    }
+    n = t.frames - 1
+    j = 0
+    while j < t.count {
+        if j != root {
+            turn = core.quat_normalize(core.quat_mul(pose.rotation(first, j), core.quat_conjugate(pose.rotation(last, j))))
+            move = core.v3_sub(pose.translation(first, j), pose.translation(last, j))
+            if j == pelvis && carries { move = core.v3_mul(up, core.v3_dot(move, up)) }
+            f = 1
+            while f <= n {
+                u = (f as float) / (n as float)
+                p = frame(t, f)
+                pose.set_rotation(p, j, core.quat_normalize(core.quat_mul(core.quat_slerp(core.quat_ident(), turn, u), pose.rotation(p, j))))
+                pose.set_translation(p, j, core.v3_add(pose.translation(p, j), core.v3_mul(move, u)))
+                f = f + 1
+            }
+        }
+        j = j + 1
+    }
+    return true
+}
+
+// --- straightening ------------------------------------------------------------------------------
+
+// A take's root motion made to go straight, as a capture's locomotion is
+// cleaned for a blend space: its root turns nowhere, and each step of its
+// path is the step as the root took it, in its own frame then (the turn
+// taken out of the path as the root lock took it out of the poses), so a
+// planted foot stays where it is over the ground but for the turn's own
+// sweep (the turn's rate times the foot's distance from the root). With
+// `cardinal`, the take is turned, poses and path together, so its travel
+// lies on the nearest of the figure's forward, back, left and right, as a
+// blend space's samples stand. 100STYLE's forward and backward walks turn
+// their actor a few degrees each: played out and back, a figure went round
+// in a circle, and on their diagonals 0.6 m to the side every 20 s.
+// Straightened by zeroing the turn and dropping the path's side, a capture's
+// stop that turned 29 degrees slid its planted ball 362 mm over its own
+// ground. Nothing for a take with no root motion.
+straighten(t: *Take, rig: *Rig, cardinal: bool) {
+    if t.root < 0 || t.frames < 2 { return }
+    m = t.motion as float[]
+    // The path in the root's own frame, step by step.
+    nx = 0.0
+    nz = 0.0
+    px = m[0]
+    pz = m[1]
+    m[0] = 0.0
+    m[1] = 0.0
+    f = 1
+    while f < t.frames {
+        dx = m[f * 4] - px
+        dz = m[f * 4 + 1] - pz
+        px = m[f * 4]
+        pz = m[f * 4 + 1]
+        turn = (m[(f - 1) * 4 + 2] + m[f * 4 + 2]) * 0.5
+        c = core.cos_of(turn)
+        s = core.sin_of(turn)
+        nx = nx + c * dx - s * dz
+        nz = nz + s * dx + c * dz
+        m[f * 4] = nx
+        m[f * 4 + 1] = nz
+        f = f + 1
+    }
+    f = 0
+    while f < t.frames {
+        m[f * 4 + 2] = 0.0
+        f = f + 1
+    }
+    far = core.sqrt_of(nx * nx + nz * nz)
+    if cardinal && far > 0.000001 {
+        // The turn from the travel's way to the nearest axis.
+        lx = 0.0
+        lz = 0.0
+        if core.abs_of(nx) > core.abs_of(nz) {
+            lx = 1.0
+            if nx < 0.0 { lx = 0.0 - 1.0 }
+        } else {
+            lz = 1.0
+            if nz < 0.0 { lz = 0.0 - 1.0 }
+        }
+        // (quat_rotate turns +z toward +x.)
+        delta = core.atan2_of(nz * lx - nx * lz, nx * lx + nz * lz)
+        turn_all(t, rig, delta)
+    }
+    from_root(t, rig)
+}
+
+// Take `t` (its root motion taken out) turned by `angle` about its up, about
+// where its root is held: every frame's root joint, and the path.
+turn_all(t: *Take, rig: *Rig, angle: float) {
+    q = core.quat_rotate(angle, t.up)
+    m = t.motion as float[]
+    f = 0
+    while f < t.frames {
+        moved = core.quat_apply(q, core.vec3(m[f * 4], 0.0, m[f * 4 + 1]))
+        m[f * 4] = moved.x
+        m[f * 4 + 1] = moved.z
+        p = frame(t, f)
+        at = pose.translation(p, t.root)
+        pose.set_translation(p, t.root, core.v3_add(t.pivot, core.quat_apply(q, core.v3_sub(at, t.pivot))))
+        pose.set_rotation(p, t.root, core.quat_normalize(core.quat_mul(q, pose.rotation(p, t.root))))
+        f = f + 1
+    }
+}
+
+// --- loops cut from captures ----------------------------------------------------------------------
+
+// The take's best loop, made for this call and owned by the caller: the two
+// frames at least LOOP_LEAST seconds apart whose poses match best (the feet,
+// balls, hands, head and pelvis where they stand about the root, and how fast
+// they move there, a tenth of a second's motion weighed as a place), the take
+// cut from the first to the second and sealed. A capture cut between two
+// footfalls ends 16 to 41 degrees off its start at a foot (a footfall's frame
+// is where the sole crosses 3 cm, a few frames either way from stride to
+// stride), too far to seal, and wrapping it jumped the foot. Root motion
+// carried over from the first frame; contacts kept, its speed and footfalls
+// found again. Null when the take is shorter than LOOP_LEAST and a frame.
+loop_cut(t: *Take, rig: *Rig) -> *Take {
+    least = (LOOP_LEAST * t.rate + 0.5) as int
+    if t.frames < least + 2 { return null }
+    slots = [pose.FOOT_L, pose.BALL_L, pose.FOOT_R, pose.BALL_R, pose.HAND_L, pose.HAND_R, pose.HEAD, pose.PELVIS]
+    keys = calloc(8, 4) as int[]
+    nk = 0
+    k = 0
+    while k < 8 {
+        j = pose.human(rig, slots[k])
+        if j >= 0 {
+            keys[nk] = j
+            nk = nk + 1
+        }
+        k = k + 1
+    }
+    // Every frame's key joints' places in the rig's space.
+    places = calloc(t.frames * nk * 3, 8) as float[]
+    worlds = pose.new(rig)
+    f = 0
+    while f < t.frames {
+        pose.world(rig, frame(t, f), worlds)
+        k = 0
+        while k < nk {
+            p = pose.translation(worlds, keys[k])
+            at = (f * nk + k) * 3
+            places[at] = p.x
+            places[at + 1] = p.y
+            places[at + 2] = p.z
+            k = k + 1
+        }
+        f = f + 1
+    }
+    pose.release(worlds)
+    lead = 0.1 * t.rate
+    best = 1000000000.0
+    best_a = 0
+    best_b = t.frames - 1
+    a = 0
+    while a < t.frames - 1 - least {
+        b = a + least
+        while b < t.frames - 1 {
+            score = 0.0
+            k = 0
+            while k < nk * 3 {
+                pa = places[a * nk * 3 + k]
+                pb = places[b * nk * 3 + k]
+                va = (places[(a + 1) * nk * 3 + k] - pa) * lead
+                vb = (places[(b + 1) * nk * 3 + k] - pb) * lead
+                score = score + (pa - pb) * (pa - pb) + (va - vb) * (va - vb)
+                k = k + 1
+            }
+            if score < best {
+                best = score
+                best_a = a
+                best_b = b
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    free(places as ptr)
+    free(keys as ptr)
+    return crop(t, rig, best_a, best_b, true)
+}
+
+// Frames `a` to `b` of `t` (inclusive) as a take of their own, made for this
+// call: its root motion from frame `a`'s, its contacts kept, its speed and
+// footfalls found again, sealed as a loop when `loop`.
+crop(t: *Take, rig: *Rig, a: int, b: int, loop: bool) -> *Take {
+    n = b - a + 1
+    out = blank_take(rig, t.name, n, t.rate)
+    out.looping = loop
+    floats = t.count * pose.FLOATS
+    src = t.data as float[]
+    dst = out.data as float[]
+    k = 0
+    while k < n * floats {
+        dst[k] = src[a * floats + k]
+        k = k + 1
+    }
+    like = blank_take(rig, t.name, n, t.rate)
+    f = 0
+    while f < n * 2 {
+        (like.contacts as float[])[f] = (t.contacts as float[])[a * 2 + f]
+        (like.flat as float[])[f] = (t.flat as float[])[a * 2 + f]
+        f = f + 1
+    }
+    if t.root >= 0 {
+        out.root = t.root
+        out.pivot = t.pivot
+        out.up = t.up
+        m = t.motion as float[]
+        o = out.motion as float[]
+        // From frame a's place and heading.
+        c = core.cos_of(m[a * 4 + 2])
+        s = core.sin_of(m[a * 4 + 2])
+        f = 0
+        while f < n {
+            dx = m[(a + f) * 4] - m[a * 4]
+            dz = m[(a + f) * 4 + 1] - m[a * 4 + 1]
+            o[f * 4] = c * dx - s * dz
+            o[f * 4 + 1] = s * dx + c * dz
+            o[f * 4 + 2] = wrap_angle(m[(a + f) * 4 + 2] - m[a * 4 + 2])
+            o[f * 4 + 3] = m[(a + f) * 4 + 3]
+            f = f + 1
+        }
+        from_root(out, rig)
+    }
+    if loop { _sealed = seal_loop(out, rig) }
+    contacts_like(out, rig, like)
+    take_free(like)
+    i = 0
+    while i < list.size(t.events) {
+        ev = list.get_raw(t.events, i) as *Event
+        at = ev.at - (a as float) / t.rate
+        if !ev.found && at >= 0.0 && at <= out.duration { insert_event(out, at, ev.name, false) }
+        i = i + 1
+    }
+    return out
+}
+
+// --- distance matching --------------------------------------------------------------------------
+
+// The length of the path take `t`'s root travels over the ground, metres;
+// 0 for a take with no root motion.
+travel_length(t: *Take) -> float {
+    if t.root < 0 { return 0.0 }
+    m = t.motion as float[]
+    total = 0.0
+    f = 1
+    while f < t.frames {
+        dx = m[f * 4] - m[(f - 1) * 4]
+        dz = m[f * 4 + 1] - m[(f - 1) * 4 + 1]
+        total = total + core.sqrt_of(dx * dx + dz * dz)
+        f = f + 1
+    }
+    return total
+}
+
+// The time at which take `t`'s root has gone `d` metres along its path (its
+// end past the whole of it, its start at 0 or less): distance matching, as
+// Paragon played its starts and stops (GDC 2016), so a start's feet plant
+// where the clip planted them whatever the speed it is driven at.
+time_at_distance(t: *Take, d: float) -> float {
+    if t.root < 0 || d <= 0.0 { return 0.0 }
+    m = t.motion as float[]
+    total = 0.0
+    f = 1
+    while f < t.frames {
+        dx = m[f * 4] - m[(f - 1) * 4]
+        dz = m[f * 4 + 1] - m[(f - 1) * 4 + 1]
+        step = core.sqrt_of(dx * dx + dz * dz)
+        if total + step >= d {
+            u = 0.0
+            if step > 0.0000001 { u = (d - total) / step }
+            return ((f - 1) as float + u) / t.rate
+        }
+        total = total + step
+        f = f + 1
+    }
+    return t.duration
+}
+
+// The time at which `d` metres of its root's path are left before its end:
+// how a stop is played toward the point the figure comes to rest on.
+time_at_distance_left(t: *Take, d: float) -> float { return time_at_distance(t, travel_length(t) - d) }
+
+// The first time take `t`'s root moves faster than `speed` over the ground
+// (where a start leaves its stand); -1 when it never does.
+moving_at(t: *Take, speed: float) -> float {
+    if t.root < 0 { return 0.0 - 1.0 }
+    f = 1
+    while f < t.frames {
+        if root_speed(t, f) > speed { return (f as float) / t.rate }
+        f = f + 1
+    }
+    return 0.0 - 1.0
+}
+
+// The first time after its fastest that take `t`'s root falls to `speed` or
+// slower (where a stop comes to its stand); -1 when it never does. The
+// last time it moves would be a start after the stop, in a take that goes
+// on.
+still_at(t: *Take, speed: float) -> float {
+    if t.root < 0 { return 0.0 - 1.0 }
+    fastest = 1
+    f = 1
+    while f < t.frames {
+        if root_speed(t, f) > root_speed(t, fastest) { fastest = f }
+        f = f + 1
+    }
+    f = fastest
+    while f < t.frames {
+        if root_speed(t, f) <= speed { return (f as float) / t.rate }
+        f = f + 1
+    }
+    return 0.0 - 1.0
+}
+
+// The root's speed over the ground at frame `f` (from the frame before).
+root_speed(t: *Take, f: int) -> float {
+    m = t.motion as float[]
+    dx = m[f * 4] - m[(f - 1) * 4]
+    dz = m[f * 4 + 1] - m[(f - 1) * 4 + 1]
+    return core.sqrt_of(dx * dx + dz * dz) * t.rate
+}
+
+// The deceleration take `t` (one that comes to a stand) brakes at, metres a
+// second a second: the speed its root last moves at nine tenths of the
+// speed it begins at, squared, over twice the way from there to its end. A
+// mover braking at it comes to rest as the take does, so a stop played by
+// the distance left (time_at_distance_left) enters where the take's feet
+// are in the stride the figure's are. 0 when it has no root motion.
+braking(t: *Take) -> float {
+    if t.root < 0 || t.frames < 8 { return 0.0 }
+    m = t.motion as float[]
+    // Its speed at the start, over its first tenth of a second.
+    n = (0.1 * t.rate) as int
+    if n < 1 { n = 1 }
+    v0 = core.sqrt_of(m[n * 4] * m[n * 4] + m[n * 4 + 1] * m[n * 4 + 1]) * t.rate / (n as float)
+    if v0 <= 0.01 { return 0.0 }
+    from = 0
+    f = 1
+    while f < t.frames {
+        dx = m[f * 4] - m[(f - 1) * 4]
+        dz = m[f * 4 + 1] - m[(f - 1) * 4 + 1]
+        if core.sqrt_of(dx * dx + dz * dz) * t.rate >= 0.9 * v0 { from = f }
+        f = f + 1
+    }
+    left = 0.0
+    f = from + 1
+    while f < t.frames {
+        dx = m[f * 4] - m[(f - 1) * 4]
+        dz = m[f * 4 + 1] - m[(f - 1) * 4 + 1]
+        left = left + core.sqrt_of(dx * dx + dz * dz)
+        f = f + 1
+    }
+    if left <= 0.01 { return 0.0 }
+    v = 0.9 * v0
+    return v * v / (2.0 * left)
+}

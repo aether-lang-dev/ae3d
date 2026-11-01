@@ -1,0 +1,388 @@
+// Motion capture in BVH files (#855).
+//
+// A BVH file (Biovision hierarchy, what motion capture systems export: Xsens,
+// Vicon, OptiTrack, the CMU and 100STYLE libraries) is a skeleton and then
+// its motion. The skeleton is joints in braces, each with its offset from
+// its parent and the channels that drive it (positions and rotations about
+// x, y and z, in the order they are applied). The motion is one line of
+// numbers a frame, every joint's channels in the order the skeleton listed
+// them, rotations in degrees.
+//
+// A capture read here is a rig no skin wears (pose.of_joints) and its frames
+// as a take for that rig, which the retargeter carries onto a figure. The
+// skeleton's rest pose is its offsets with no turn, the pose its channels
+// turn from. A joint's "End Site" (the tip of a head, a toe or a finger) is
+// a joint of its own, named after its parent with "_end", so the tip a foot
+// rolls about is there for the feet to find.
+
+import std.fs
+import std.heap
+import std.string
+import ae3d.core
+import ae3d.pose
+import ae3d.clips
+
+exports (
+    Capture, load, capture_free, rig, take, frames, frame_time, unit, error
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+// The most joints a skeleton may have, End Sites included.
+const MOST_JOINTS = 512
+// Channel kinds.
+const X_POSITION = 0
+const Y_POSITION = 1
+const Z_POSITION = 2
+const X_ROTATION = 3
+const Y_ROTATION = 4
+const Z_ROTATION = 5
+
+struct Capture {
+    rig: ptr                       // *Rig
+    joints: int
+    frames: int
+    frame_time: float              // seconds a frame
+    unit: float                    // metres a file unit
+    channels: int                  // numbers a frame
+    offsets: ptr                   // float[joints * 3]: each joint's offset from its parent, in file units
+    first: ptr                     // int[joints]: each joint's first channel in a frame
+    counts: ptr                    // int[joints]: and how many it has
+    kinds: ptr                     // int[channels]: what each channel drives
+    data: ptr                      // float[frames * channels]
+}
+
+var g_text: string = ""
+var g_at = 0
+var g_length = 0
+var g_error: string = ""
+var g_number: ptr = null           // one double, the parser's out-value
+
+// What the last load that failed said, "" after one that did not.
+error() -> string { return g_error }
+
+// The capture in the BVH file at `path`, with lengths in metres:
+// `metres_per_unit` of them a file unit, or, given 0, read from the
+// skeleton's height (a figure 3 to 300 units tall is taken to be in
+// centimetres, one under 3 in metres, and one taller in millimetres; give
+// 0.0254 for a file in inches). Null when the file cannot be read or is not
+// a BVH file (error() says why).
+load(path: string, metres_per_unit: float) -> *Capture {
+    g_error = ""
+    content, err = fs.read(path)
+    if err != "" {
+        g_error = "cannot read the file"
+        return null
+    }
+    g_text = content
+    g_at = 0
+    g_length = string.length(content)
+    if g_number == null { g_number = calloc(1, 8) }
+    c = heap.new(Capture)
+    names = calloc(MOST_JOINTS, 8)
+    parents = calloc(MOST_JOINTS, 4) as int[]
+    c.offsets = calloc(MOST_JOINTS * 3, 8)
+    c.first = calloc(MOST_JOINTS, 4)
+    c.counts = calloc(MOST_JOINTS, 4)
+    kind_room = MOST_JOINTS * 6
+    c.kinds = calloc(kind_room, 4)
+    good = read_skeleton(c, names, parents)
+    if good { good = read_motion(c) }
+    if good && c.joints > 0 {
+        c.unit = metres_per_unit
+        if c.unit <= 0.0 { c.unit = unit_of_height(c, parents) }
+        rest = calloc(c.joints * pose.FLOATS, 8)
+        offsets = c.offsets as float[]
+        j = 0
+        while j < c.joints {
+            pose.set_translation(rest, j, core.vec3(offsets[j * 3] * c.unit, offsets[j * 3 + 1] * c.unit, offsets[j * 3 + 2] * c.unit))
+            pose.set_rotation(rest, j, core.quat_ident())
+            pose.set_scale(rest, j, core.vec3(1.0, 1.0, 1.0))
+            j = j + 1
+        }
+        c.rig = pose.of_joints(c.joints, names, parents, rest) as ptr
+        free(rest)
+    }
+    j = 0
+    while j < c.joints {
+        string.release_kept((names as ptr[])[j])
+        j = j + 1
+    }
+    free(names)
+    free(parents as ptr)
+    string.free(content)
+    g_text = ""
+    if !good || c.rig == null {
+        if g_error == "" { g_error = "no skeleton" }
+        capture_free(c)
+        return null
+    }
+    return c
+}
+
+capture_free(c: *Capture) {
+    if c == null { return }
+    if c.rig != null { pose.rig_free(c.rig as *Rig) }
+    free(c.offsets)
+    free(c.first)
+    free(c.counts)
+    free(c.kinds)
+    if c.data != null { free(c.data) }
+    heap.free(c)
+}
+
+rig(c: *Capture) -> *Rig { return c.rig as *Rig }
+frames(c: *Capture) -> int { return c.frames }
+frame_time(c: *Capture) -> float { return c.frame_time }
+unit(c: *Capture) -> float { return c.unit }
+
+// --- the skeleton ---------------------------------------------------------------------------------
+
+// The joints, their parents, offsets and channels, up to MOTION.
+read_skeleton(c: *Capture, names: ptr, parents: int[]) -> bool {
+    stack = calloc(MOST_JOINTS, 4) as int[]
+    depth = 0
+    pending = 0 - 1                // the joint named, its brace not yet open
+    offsets = c.offsets as float[]
+    first = c.first as int[]
+    counts = c.counts as int[]
+    kinds = c.kinds as int[]
+    good = true
+    while good {
+        word = next_token()
+        if string.length(word) == 0 {
+            g_error = "the file ends before its MOTION"
+            good = false
+        } else if string.equals(word, "MOTION") == 1 {
+            string.free(word)
+            break
+        } else if string.equals(word, "ROOT") == 1 || string.equals(word, "JOINT") == 1 || string.equals(word, "End") == 1 {
+            title = next_token()
+            if string.equals(word, "End") == 1 {
+                string.free(title)
+                up = 0 - 1
+                if depth > 0 { up = stack[depth - 1] }
+                if up >= 0 {
+                    above, _why = string.from_ptr((names as ptr[])[up])
+                    title = string.concat(above, "_end")
+                } else {
+                    title = string.copy("end")
+                }
+            }
+            if c.joints >= MOST_JOINTS {
+                g_error = "more joints than a skeleton may have"
+                string.free(title)
+                good = false
+            } else {
+                j = c.joints
+                (names as ptr[])[j] = string.keep(title)
+                string.free(title)
+                parents[j] = 0 - 1
+                if depth > 0 { parents[j] = stack[depth - 1] }
+                first[j] = c.channels
+                counts[j] = 0
+                c.joints = j + 1
+                pending = j
+            }
+        } else if string.equals(word, "{") == 1 {
+            if pending >= 0 {
+                stack[depth] = pending
+                depth = depth + 1
+                pending = 0 - 1
+            }
+        } else if string.equals(word, "}") == 1 {
+            if depth > 0 { depth = depth - 1 }
+        } else if string.equals(word, "OFFSET") == 1 {
+            if depth > 0 {
+                j = stack[depth - 1]
+                offsets[j * 3] = next_number()
+                offsets[j * 3 + 1] = next_number()
+                offsets[j * 3 + 2] = next_number()
+            }
+        } else if string.equals(word, "CHANNELS") == 1 {
+            n = next_number() as int
+            if depth == 0 || n < 0 || n > 6 {
+                g_error = "a CHANNELS line outside a joint, or with more than six"
+                good = false
+            } else {
+                j = stack[depth - 1]
+                first[j] = c.channels
+                counts[j] = n
+                k = 0
+                while k < n {
+                    kind_word = next_token()
+                    kinds[c.channels] = kind_of(kind_word)
+                    string.free(kind_word)
+                    c.channels = c.channels + 1
+                    k = k + 1
+                }
+            }
+        }
+        string.free(word)
+    }
+    free(stack as ptr)
+    return good
+}
+
+kind_of(word: string) -> int {
+    kinds = ["Xposition", "Yposition", "Zposition", "Xrotation", "Yrotation", "Zrotation"]
+    k = 0
+    while k < 6 {
+        if string.equals(word, kinds[k]) == 1 { return k }
+        k = k + 1
+    }
+    g_error = "a channel of a kind BVH has none of"
+    return X_ROTATION
+}
+
+// The metres a unit by the skeleton's height at rest (see load).
+unit_of_height(c: *Capture, parents: int[]) -> float {
+    offsets = c.offsets as float[]
+    ys = calloc(c.joints, 8) as float[]
+    low = 0.0
+    high = 0.0
+    j = 0
+    while j < c.joints {
+        y = offsets[j * 3 + 1]
+        if parents[j] >= 0 { y = y + ys[parents[j]] }
+        ys[j] = y
+        if j == 0 || y < low { low = y }
+        if j == 0 || y > high { high = y }
+        j = j + 1
+    }
+    free(ys as ptr)
+    height = high - low
+    if height < 3.0 { return 1.0 }
+    if height <= 300.0 { return 0.01 }
+    return 0.001
+}
+
+// --- the motion -----------------------------------------------------------------------------------
+
+// "Frames: n", "Frame Time: s", then n frames of numbers.
+read_motion(c: *Capture) -> bool {
+    word = next_token()
+    if string.equals(word, "Frames:") != 1 {
+        string.free(word)
+        g_error = "no Frames: after MOTION"
+        return false
+    }
+    string.free(word)
+    c.frames = next_number() as int
+    a = next_token()
+    b = next_token()
+    good = string.equals(a, "Frame") == 1 && string.equals(b, "Time:") == 1
+    string.free(a)
+    string.free(b)
+    if !good || c.frames <= 0 {
+        g_error = "no Frame Time:, or no frames"
+        return false
+    }
+    c.frame_time = next_number()
+    if c.frame_time <= 0.0 {
+        g_error = "a frame time of no length"
+        return false
+    }
+    total = c.frames * c.channels
+    c.data = calloc(total + 1, 8)
+    data = c.data as float[]
+    i = 0
+    while i < total {
+        skip_blanks()
+        if g_at >= g_length {
+            g_error = "the file ends before its last frame"
+            return false
+        }
+        data[i] = next_number()
+        i = i + 1
+    }
+    return true
+}
+
+// --- the take -----------------------------------------------------------------------------------
+
+// Frames `from` to `to` (inclusive; -1 for the last) of the capture as a
+// take named `title` for its rig, at the capture's own rate, its contacts,
+// speed and footfalls found. The caller owns it (clips.take_free).
+take(c: *Capture, title: string, from: int, to: int) -> *Take {
+    r = c.rig as *Rig
+    a = from
+    if a < 0 { a = 0 }
+    b = to
+    if b < 0 || b >= c.frames { b = c.frames - 1 }
+    if b < a { b = a }
+    t = clips.from_frames(r, title, b - a + 1, 1.0 / c.frame_time)
+    f = a
+    while f <= b {
+        pose_of(c, f, clips.frame(t, f - a))
+        f = f + 1
+    }
+    clips.find_contacts(t, r)
+    return t
+}
+
+// Frame `f` as a pose: each joint at its offset, or where its position
+// channels put it, turned by its rotation channels in the order the file
+// lists them (Z, X, Y is the turn Rz Rx Ry).
+pose_of(c: *Capture, f: int, out: ptr) {
+    offsets = c.offsets as float[]
+    first = c.first as int[]
+    counts = c.counts as int[]
+    kinds = c.kinds as int[]
+    data = c.data as float[]
+    row = f * c.channels
+    j = 0
+    while j < c.joints {
+        x = offsets[j * 3]
+        y = offsets[j * 3 + 1]
+        z = offsets[j * 3 + 2]
+        q = core.quat_ident()
+        k = 0
+        while k < counts[j] {
+            at = first[j] + k
+            v = data[row + at]
+            kind = kinds[at]
+            if kind == X_POSITION { x = v }
+            if kind == Y_POSITION { y = v }
+            if kind == Z_POSITION { z = v }
+            if kind >= X_ROTATION {
+                axis = core.vec3(1.0, 0.0, 0.0)
+                if kind == Y_ROTATION { axis = core.vec3(0.0, 1.0, 0.0) }
+                if kind == Z_ROTATION { axis = core.vec3(0.0, 0.0, 1.0) }
+                q = core.quat_mul(q, core.quat_rotate(v * 0.017453292519943295, axis))
+            }
+            k = k + 1
+        }
+        pose.set_translation(out, j, core.vec3(x * c.unit, y * c.unit, z * c.unit))
+        pose.set_rotation(out, j, core.quat_normalize(q))
+        pose.set_scale(out, j, core.vec3(1.0, 1.0, 1.0))
+        j = j + 1
+    }
+}
+
+// --- reading the text -----------------------------------------------------------------------------
+
+is_blank(ch: int) -> bool { return ch == 32 || ch == 9 || ch == 10 || ch == 13 }
+
+skip_blanks() {
+    while g_at < g_length && is_blank(string.char_at(g_text, g_at)) { g_at = g_at + 1 }
+}
+
+// The next run of characters that are not blank, made for this call; ""
+// at the end of the text.
+next_token() -> string {
+    skip_blanks()
+    start = g_at
+    while g_at < g_length && !is_blank(string.char_at(g_text, g_at)) { g_at = g_at + 1 }
+    if g_at == start { return string.copy("") }
+    return string.substring(g_text, start, g_at)
+}
+
+next_number() -> float {
+    word = next_token()
+    value = 0.0
+    if string.length(word) > 0 && string.to_double_raw(word, g_number) != 0 { value = (g_number as float[])[0] }
+    string.free(word)
+    return value
+}

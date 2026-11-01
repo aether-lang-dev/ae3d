@@ -1,0 +1,2176 @@
+// The animator (#853, layer 2): a figure's joints, owned.
+//
+// One animator per figure evaluates the frame's pose and writes it to the
+// figure's joints once, in the engine's pose phase, after every update has run.
+// Nothing else writes those joints. A game sets parameters (a state to play, a
+// speed, a layer's weight, a point to look at) and never touches a bone.
+//
+// What it evaluates, in order:
+//   - the current state: a take (looping or not, with or without its root
+//     motion), or a blend space of takes along one parameter. A locomotion
+//     blend keeps its takes in step by phase (each take's phase runs from its
+//     left foot's first touchdown, a sync marker found at import). It picks
+//     its weights from the takes' measured speeds over the ground, and sets
+//     its pace so its feet carry the ground at the speed the figure is moved
+//     at: the feet do not skate;
+//   - the transition into it, inertialized (Bollo, GDC 2018: Gears of War
+//     4). At a change the new state plays from where it enters. The offset
+//     from the pose drawn the frame before, and the speed that offset was
+//     changing at, decay to nothing along a quintic over the blend time. A
+//     cross-fade of two poses drags a foot between two strides and plays two
+//     clips for the length of the fade; this plays one, and carries the
+//     motion through;
+//   - layers over it: a take blended over a mask of joints (an upper body
+//     waving or aiming over the legs walking), or added over it as a
+//     difference from its first frame (a flinch over anything);
+//   - inverse kinematics (ae3d.ikrig): feet onto the ground, the head turned
+//     to a point;
+//   - root motion, when it is on: the state's root travel and turn moved onto
+//     the figure's object.
+
+import std.heap
+import std.list
+import std.string
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.figure
+import ae3d.pose
+import ae3d.clips
+import ae3d.ikrig
+import ae3d.physics
+
+exports (
+    Animator, STATE_TAKE, STATE_BLEND, STATE_BLEND2, STATE_POSE, add_blend2, blend_add2, set_velocity, blend_weight,
+    ANY, ABOVE, BELOW, IS, IS_NOT, TRIGGERED, ENDED, set_float, set_bool, trigger, float_param,
+    add_transition, transition_when, transition_crossfade, bind, bind2, snapshot, add_aim, aim_add, set_aim, set_time, clock_by, transition_synced, transition_or,
+    STATE_MATCH, add_matcher, matcher_add, matcher_build, match_trajectory, matcher_searches, matcher_changes,
+    attach, animator_free, rig, take, add_take, add_state, add_blend, blend_add, set_param, param, play, play_at, play_synced, phase,
+    current, current_take, state_name, find_state, state_time, set_rate, rate, transitioning, set_root_motion,
+    root_moved, ground_speed, add_layer, layer_weight, layer_restart, layer_time,
+    set_feet, feet, set_hands, hands, look_at, look_off, aim_at, aim_off, trunk_aim, set_body, body, evaluate, pose_now, contact_weight, plant_weight, figure_object, update_now,
+    event_count, event_name, fired
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+const STATE_TAKE = 0
+const STATE_BLEND = 1
+const STATE_BLEND2 = 2
+const STATE_POSE = 3               // a pose held (animator.snapshot)
+const STATE_MATCH = 4              // motion matching (add_matcher)
+// Motion matching: features a frame (two feet's places and velocities, the
+// hips' velocity, the way ahead at three times), the way ahead's share,
+// seconds between searches, how near the take playing a best frame may be
+// and play on, the change's blend, and the way ahead's weight against the pose.
+const MATCH_DIM = 26
+const MATCH_TRAJ = 12
+const MATCH_EVERY = 0.1
+const MATCH_NEAR = 0.2
+const MATCH_BLEND = 0.2
+const MATCH_WAY = 1.5
+// A change is made only for a frame this share of the playing one's cost or less.
+const MATCH_GAIN = 0.9
+// Metres a candidate's planted foot may lie from the planted foot playing.
+const MATCH_FOOT = 0.15
+// A transition from any state.
+const ANY = 0 - 1
+// Conditions: a parameter above or below a value, a switch on or off, a
+// trigger set, the state's take at its end (less the transition's time).
+const ABOVE = 0
+const BELOW = 1
+const IS = 2
+const IS_NOT = 3
+const TRIGGERED = 4
+const ENDED = 5
+// The gradient bands' weight of a turn against a change of speed (Johansen's
+// and Unity's: a radian counts as two of the speeds' relative difference).
+const TURN_WEIGHT = 2.0
+// Floats a joint's transition takes: the rotation's axis (3), then four
+// quintics of QUINTIC floats (the angle about that axis, then x, y, z).
+const QUINTIC = 7
+const INERTIA_FLOATS = 31
+// A blend's pace is bent to its speed within these, beyond which it plays at
+// the nearest (a gait pushed far past its own speed looks wrong however it
+// is timed: the next take up should be playing).
+const PACE_LEAST = 0.5
+const PACE_MOST = 1.75
+
+struct State {
+    name: string
+    kind: int
+    takes: ptr                     // list of *Take
+    values: ptr                    // float[]: each take's place on the parameter (its speed, for a gait)
+    values2: ptr                   // float[]: and its second, for a 2D blend (x is values, z this)
+    count: int
+    room: int
+    time: float                    // a take's seconds; a blend's phase, 0 to 1
+    rate: float                    // the game's pace on top of the state's own
+    loop: bool
+    root_motion: bool
+    param: float
+    param2: float                  // a 2D blend's second parameter (param is its x)
+    bind: int                      // the parameter set as its own each frame, -1 none
+    bind2: int                     // and its second, for a 2D blend
+    held: ptr                      // the pose a STATE_POSE holds
+    clock: int                     // the parameter its take is played by, by distance (clock_by), -1 none
+    clock_left: bool               // the distance left to its end, not the distance from its start
+    matcher: ptr                   // *Matcher, a STATE_MATCH's
+    weights: ptr                   // float[]: each take's weight now (a blend)
+    pace: float                    // the blend's own pace, to its parameter
+    entered: bool                  // played since its clock last ran: an event where it starts fires
+}
+
+struct Layer {
+    take: ptr                      // *Take
+    mask: ptr                      // float[count]: per joint, how much of the layer it takes
+    additive: bool
+    loop: bool
+    time: float
+    weight: float
+    goal: float
+    fade: float                    // weight a second it moves toward its goal at
+    base: ptr                      // the take's first frame (an additive layer's reference)
+}
+
+struct Animator {
+    rig: ptr                       // *pose.Rig
+    object: ptr                    // *GameObject, the figure's
+    engine: ptr                    // *Engine
+    out: ptr                       // the pose drawn this frame
+    before: ptr                    // and the frame before
+    work: ptr                      // scratch poses
+    work2: ptr
+    worlds: ptr                    // rig-space scratch for IK
+    states: ptr                    // list of *State
+    current: int
+    inertia: ptr                   // float[count * INERTIA_FLOATS]
+    blend_t: float
+    blend_time: float
+    layers: ptr                    // list of *Layer
+    takes: ptr                     // list of *Take this animator loaded and frees
+    root_motion: bool
+    moved: Vec3                    // last frame's root motion on the object: world x, z and the turn about up
+    ground_speed: float            // the current state's ground speed now, metres a second
+    feet: ptr                      // *Feet (ikrig), or null
+    hands: ptr                     // *Hands (ikrig), or null
+    look: ptr                      // *Look (ikrig), or null
+    aim: ptr                       // *Aim (ikrig), or null
+    body: ptr                      // *Body (ikrig), or null
+    dt_before: float
+    evaluated: bool
+    stepper: ptr                   // the behaviour
+    fired_takes: ptr               // ptr[]: the take of each event fired this frame
+    fired_at: ptr                  // int[]: and its index in the take
+    fired_count: int
+    fired_room: int
+    params: ptr                    // list of *Param: the graph's named parameters
+    transitions: ptr               // list of *Transition, tried in order each frame
+    fade_from: int                 // the state cross-faded from, -1 none
+    fade_t: float
+    fade_time: float
+    work3: ptr                     // the faded-from state's pose
+    aims: ptr                      // list of *Aim: aim offsets, after the layers
+}
+
+// A named parameter of the graph: a number, a switch (0 or 1), or a trigger
+// (1 until a transition takes it).
+struct Param {
+    name: string
+    value: float
+    trigger: bool
+}
+
+// A change of state the graph makes by itself when all its conditions hold.
+struct Transition {
+    from: int                      // the state it leaves, ANY for any
+    to: int
+    seconds: float
+    crossfade: bool                // the two states' poses blended; inertialized otherwise
+    synced: bool                   // entered at the stride phase the current state is at (play_synced)
+    others: ptr                    // int[]: states it may go to instead, the one whose feet match best (transition_or)
+    other_count: int
+    conditions: ptr                // list of *Condition
+}
+
+struct Condition {
+    param: int                     // the parameter tested, -1 for ENDED
+    test: int                      // ABOVE, BELOW, IS, IS_NOT, TRIGGERED, ENDED
+    value: float
+}
+
+// An aim offset (Unreal's): poses that aim a figure up, down and to the sides,
+// each at its yaw and pitch, blended at the aim asked by gradient bands and
+// added over the joints under one, as their difference from the neutral one.
+// A matcher's database and where it is playing.
+struct Matcher {
+    features: ptr                  // float[frames * MATCH_DIM]
+    owner: ptr                     // int[frames]: each frame's take
+    at: ptr                        // int[frames]: and its frame in it
+    frames: int
+    mean: ptr                      // float[MATCH_DIM]
+    spread: ptr                    // float[MATCH_DIM]
+    query: ptr                     // float[MATCH_TRAJ]: the way ahead asked
+    playing: int                   // the take playing
+    since: float                   // seconds since its last search
+    searches: int
+    changes: int
+}
+
+struct Aim {
+    mask: ptr                      // float[count]
+    poses: ptr                     // list of poses (ptr): each sample's
+    yaws: ptr                      // float[]
+    pitches: ptr                   // float[]
+    count: int
+    room: int
+    reference: ptr                 // the pose the samples are differences from
+    yaw: float
+    pitch: float
+    weight: float
+}
+
+// --- making -------------------------------------------------------------------------------------
+
+// An animator for the figure on `o`, stepped by the engine in its pose phase.
+// Null when `o` wears no figure, or its figure no skin.
+attach(e: *Engine, o: *GameObject) -> *Animator {
+    f = figure.figure_of(o)
+    if f == null { return null }
+    rig = pose.of_skeleton(figure.skeleton(f))
+    if rig == null { return null }
+    figure.stop(f)
+    a = heap.new(Animator)
+    a.rig = rig as ptr
+    a.object = o as ptr
+    a.engine = e as ptr
+    a.out = pose.new(rig)
+    a.before = pose.new(rig)
+    a.work = pose.new(rig)
+    a.work2 = pose.new(rig)
+    a.worlds = pose.new(rig)
+    a.states = list.new()
+    a.layers = list.new()
+    a.takes = list.new()
+    a.current = 0 - 1
+    a.inertia = calloc(pose.count(rig) * INERTIA_FLOATS, 8)
+    a.dt_before = 1.0 / 60.0
+    a.fired_room = 16
+    a.fired_takes = calloc(a.fired_room, 8)
+    a.fired_at = calloc(a.fired_room, 4)
+    a.params = list.new()
+    a.transitions = list.new()
+    a.aims = list.new()
+    a.fade_from = 0 - 1
+    a.work3 = pose.new(rig)
+    b = engine.behaviour_new("Animator", a as ptr)
+    b.pose = animator_pose
+    engine.engine_add_behaviour(e, b)
+    a.stepper = b as ptr
+    return a
+}
+
+animator_free(a: *Animator) {
+    if a == null { return }
+    i = 0
+    while i < list.size(a.states) {
+        s = list.get_raw(a.states, i) as *State
+        list.free(s.takes)
+        free(s.values)
+        free(s.values2)
+        free(s.weights)
+        pose.release(s.held)
+        if s.matcher != null { matcher_free(s.matcher as *Matcher) }
+        string.free(s.name)
+        heap.free(s)
+        i = i + 1
+    }
+    list.free(a.states)
+    i = 0
+    while i < list.size(a.layers) {
+        l = list.get_raw(a.layers, i) as *Layer
+        pose.mask_free(l.mask)
+        pose.release(l.base)
+        heap.free(l)
+        i = i + 1
+    }
+    list.free(a.layers)
+    i = 0
+    while i < list.size(a.takes) {
+        clips.take_free(list.get_raw(a.takes, i) as *Take)
+        i = i + 1
+    }
+    list.free(a.takes)
+    if a.feet != null { ikrig.feet_free(a.feet as *Feet) }
+    if a.hands != null { ikrig.hands_free(a.hands as *Hands) }
+    if a.look != null { ikrig.look_free(a.look as *Look) }
+    if a.aim != null { ikrig.aim_free(a.aim as *ikrig.Aim) }
+    if a.body != null { ikrig.body_free(a.body as *Body) }
+    pose.release(a.out)
+    pose.release(a.before)
+    pose.release(a.work)
+    pose.release(a.work2)
+    pose.release(a.worlds)
+    free(a.inertia)
+    free(a.fired_takes)
+    free(a.fired_at)
+    free_graph(a)
+    pose.rig_free(a.rig as *pose.Rig)
+    heap.free(a)
+}
+
+rig(a: *Animator) -> *pose.Rig { return a.rig as *pose.Rig }
+figure_object(a: *Animator) -> *GameObject { return a.object as *GameObject }
+
+// The figure's animation `animation` as a take for this animator's rig,
+// loaded once and freed with the animator; null when the figure's file has
+// none by that name. With root motion taken out when `root` (the figure is
+// moved by it, or it plays in place).
+take(a: *Animator, animation: string, root: bool) -> *Take {
+    i = 0
+    while i < list.size(a.takes) {
+        t = list.get_raw(a.takes, i) as *Take
+        if string.equals(clips.name(t), animation) == 1 { return t }
+        i = i + 1
+    }
+    f = figure.figure_of(a.object as *GameObject)
+    r = a.rig as *pose.Rig
+    t = clips.from_scene(r, figure.scene(f), animation, 0.0)
+    if t == null { return null }
+    if root { clips.extract_root(t, r, clips.up_of(r)) }
+    list.add_raw(a.takes, t as ptr)
+    return t
+}
+
+// A take made elsewhere for this animator's rig (a retarget, a capture),
+// given to it: freed with the animator. Root motion taken out when `root`.
+add_take(a: *Animator, t: *Take, root: bool) -> *Take {
+    if t == null { return null }
+    r = a.rig as *pose.Rig
+    if root && !clips.has_root_motion(t) { clips.extract_root(t, r, clips.up_of(r)) }
+    list.add_raw(a.takes, t as ptr)
+    return t
+}
+
+// A state playing `t`, looping or not. Its index.
+add_state(a: *Animator, title: string, t: *Take, loop: bool) -> int {
+    s = new_state(title, STATE_TAKE)
+    s.loop = loop
+    add_to_state(s, t, 0.0)
+    list.add_raw(a.states, s as ptr)
+    return list.size(a.states) - 1
+}
+
+// A blend space along one parameter: takes added with blend_add, each at a
+// value of the parameter (a gait at its speed). It loops, its takes in step.
+add_blend(a: *Animator, title: string) -> int {
+    s = new_state(title, STATE_BLEND)
+    s.loop = true
+    list.add_raw(a.states, s as ptr)
+    return list.size(a.states) - 1
+}
+
+// A blend space over the ground's two directions: takes added with
+// blend_add2, each at its velocity relative to the figure's facing (x
+// across to its left, z ahead), the figure's own velocity its parameter
+// (set_velocity). Weights by polar gradient band interpolation (Johansen
+// 2009, Unity's freeform directional blend): a direction between two
+// samples of one speed blends them at that speed, where weights linear in
+// x and z would slow it down. Its takes play in step by their footfalls,
+// paced so their blended velocity carries the ground at the speed asked.
+add_blend2(a: *Animator, title: string) -> int {
+    s = new_state(title, STATE_BLEND2)
+    s.loop = true
+    list.add_raw(a.states, s as ptr)
+    return list.size(a.states) - 1
+}
+
+blend_add2(a: *Animator, state: int, t: *Take, x: float, z: float) {
+    s = state_at(a, state)
+    if s == null || t == null || s.kind != STATE_BLEND2 { return }
+    make_room(s)
+    (s.values as float[])[s.count] = x
+    (s.values2 as float[])[s.count] = z
+    list.add_raw(s.takes, t as ptr)
+    s.count = s.count + 1
+}
+
+// Take `k`'s weight in blend `state` at its parameter now (in the order
+// they were added; a 1D blend's in order of value).
+blend_weight(a: *Animator, state: int, k: int) -> float {
+    s = state_at(a, state)
+    if s == null || k < 0 || k >= s.count || s.kind == STATE_TAKE { return 0.0 }
+    blend_weights(s)
+    return (s.weights as float[])[k]
+}
+
+// The figure's velocity a 2D blend space plays at: x across to its left,
+// z ahead, metres a second.
+set_velocity(a: *Animator, state: int, x: float, z: float) {
+    s = state_at(a, state)
+    if s == null { return }
+    s.param = x
+    s.param2 = z
+}
+
+blend_add(a: *Animator, state: int, t: *Take, value: float) {
+    s = state_at(a, state)
+    if s == null || t == null { return }
+    add_to_state(s, t, value)
+}
+
+new_state(title: string, kind: int) -> *State {
+    s = heap.new(State)
+    s.name = string.copy(title)
+    s.kind = kind
+    s.takes = list.new()
+    s.room = 8
+    s.values = calloc(s.room, 8)
+    s.values2 = calloc(s.room, 8)
+    s.weights = calloc(s.room, 8)
+    s.rate = 1.0
+    s.bind = 0 - 1
+    s.bind2 = 0 - 1
+    s.clock = 0 - 1
+    s.pace = 1.0
+    return s
+}
+
+// Room for one more take in `s`.
+make_room(s: *State) {
+    if s.count < s.room { return }
+    bigger = s.room * 2
+    values = calloc(bigger, 8) as float[]
+    values2 = calloc(bigger, 8) as float[]
+    weights = calloc(bigger, 8) as float[]
+    old_v = s.values as float[]
+    old_v2 = s.values2 as float[]
+    k = 0
+    while k < s.count {
+        values[k] = old_v[k]
+        values2[k] = old_v2[k]
+        k = k + 1
+    }
+    free(s.values)
+    free(s.values2)
+    free(s.weights)
+    s.values = values as ptr
+    s.values2 = values2 as ptr
+    s.weights = weights as ptr
+    s.room = bigger
+}
+
+add_to_state(s: *State, t: *Take, value: float) {
+    make_room(s)
+    // Kept in order of value.
+    v = s.values as float[]
+    at = s.count
+    while at > 0 && v[at - 1] > value {
+        v[at] = v[at - 1]
+        at = at - 1
+    }
+    v[at] = value
+    list.add_raw(s.takes, t as ptr)
+    k = s.count
+    while k > at {
+        list.set(s.takes, k, list.get_raw(s.takes, k - 1))
+        k = k - 1
+    }
+    list.set(s.takes, at, t as ptr)
+    s.count = s.count + 1
+}
+
+state_at(a: *Animator, state: int) -> *State {
+    if state < 0 || state >= list.size(a.states) { return null }
+    return list.get_raw(a.states, state) as *State
+}
+
+find_state(a: *Animator, title: string) -> int {
+    i = 0
+    while i < list.size(a.states) {
+        if string.equals((list.get_raw(a.states, i) as *State).name, title) == 1 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+current(a: *Animator) -> int { return a.current }
+
+// The take the current state plays: its own, or a blend's heaviest now;
+// null when nothing plays.
+current_take(a: *Animator) -> *Take {
+    s = state_at(a, a.current)
+    if s == null || s.count == 0 { return null }
+    if s.kind == STATE_MATCH { return matched_take(s) }
+    if s.kind == STATE_TAKE { return list.get_raw(s.takes, 0) as *Take }
+    w = s.weights as float[]
+    heaviest = 0
+    k = 1
+    while k < s.count {
+        if w[k] > w[heaviest] { heaviest = k }
+        k = k + 1
+    }
+    return list.get_raw(s.takes, heaviest) as *Take
+}
+
+state_name(a: *Animator, state: int) -> string {
+    s = state_at(a, state)
+    if s == null { return "" }
+    return s.name
+}
+
+state_time(a: *Animator) -> float {
+    s = state_at(a, a.current)
+    if s == null { return 0.0 }
+    return s.time
+}
+
+set_param(a: *Animator, state: int, value: float) {
+    s = state_at(a, state)
+    if s != null { s.param = value }
+}
+
+param(a: *Animator, state: int) -> float {
+    s = state_at(a, state)
+    if s == null { return 0.0 }
+    return s.param
+}
+
+set_rate(a: *Animator, state: int, r: float) {
+    s = state_at(a, state)
+    if s != null { s.rate = r }
+}
+
+rate(a: *Animator, state: int) -> float {
+    s = state_at(a, state)
+    if s == null { return 0.0 }
+    return s.rate
+}
+
+// The figure is moved by its states' root motion (on) or plays them in place.
+set_root_motion(a: *Animator, on: bool) { a.root_motion = on }
+
+// Last frame's root motion put on the object: x and z over the ground in the
+// world, and its turn about up in z.
+root_moved(a: *Animator) -> Vec3 { return a.moved }
+
+// The current state's speed over the ground as it plays now.
+ground_speed(a: *Animator) -> float { return a.ground_speed }
+
+transitioning(a: *Animator) -> bool { return a.blend_t < a.blend_time }
+
+// --- playing ------------------------------------------------------------------------------------
+
+// Play `state` from its start, inertialized over `seconds` from what is
+// drawn now (0: a cut).
+play(a: *Animator, state: int, seconds: float) { play_at(a, state, 0.0, seconds) }
+
+// As play, entered `at` seconds in (a blend: at that phase, 0 to 1).
+play_at(a: *Animator, state: int, at: float, seconds: float) {
+    s = state_at(a, state)
+    if s == null { return }
+    s.time = at
+    if s.kind == STATE_TAKE && s.clock >= 0 { s.time = distance_time(a, s) }
+    s.entered = true
+    was = a.current
+    a.current = state
+    if was < 0 || seconds <= 0.0 || !a.evaluated {
+        a.blend_t = 0.0
+        a.blend_time = 0.0
+        return
+    }
+    // Where the new state starts, against what was drawn the last two frames.
+    sample_state(a, s, a.work)
+    inertialize(a, a.out, a.before, a.work, seconds)
+}
+
+// The current state's stride phase, 0 to 1 from its left foot's first
+// touchdown: a blend's own, a take's from its clock.
+phase(a: *Animator) -> float {
+    s = state_at(a, a.current)
+    if s == null { return 0.0 }
+    if s.kind == STATE_POSE { return 0.0 }
+    if s.kind == STATE_MATCH { return clips.phase_of(matched_take(s), s.time) }
+    if s.kind != STATE_TAKE { return s.time }
+    return clips.phase_of(list.get_raw(s.takes, 0) as *Take, s.time)
+}
+
+// Play `state` in step with the stride now: entered at the phase the
+// current state is at, so a gait hands over to another with its feet where
+// they were in the cycle. Entered at its first frame, a jog handed to the
+// sprint mid-stride swung a shin 39 rad/s against the sprint's own 35.5.
+play_synced(a: *Animator, state: int, seconds: float) {
+    s = state_at(a, state)
+    if s == null { return }
+    at = phase(a)
+    if s.kind == STATE_TAKE { at = take_time_at(list.get_raw(s.takes, 0) as *Take, at) }
+    play_at(a, state, at, seconds)
+}
+
+// Each joint's offset from `target` to the pose drawn now, and the speed it
+// was changing at (from the pose drawn the frame before), as quintics.
+inertialize(a: *Animator, now: ptr, before: ptr, target: ptr, seconds: float) {
+    r = a.rig as *pose.Rig
+    inertia = a.inertia as float[]
+    dt = a.dt_before
+    if dt <= 0.0 { dt = 1.0 / 60.0 }
+    j = 0
+    while j < pose.count(r) {
+        off = j * INERTIA_FLOATS
+        new_q = pose.rotation(target, j)
+        q = core.quat_normalize(core.quat_mul(pose.rotation(now, j), core.quat_conjugate(new_q)))
+        if q.w < 0.0 { q = core.quat(0.0 - q.x, 0.0 - q.y, 0.0 - q.z, 0.0 - q.w) }
+        half_sin = core.sqrt_of(q.x * q.x + q.y * q.y + q.z * q.z)
+        angle = 2.0 * core.atan2_of(half_sin, q.w)
+        axis = core.vec3(0.0, 1.0, 0.0)
+        if half_sin > 0.0000001 { axis = core.vec3(q.x / half_sin, q.y / half_sin, q.z / half_sin) }
+        qb = core.quat_normalize(core.quat_mul(pose.rotation(before, j), core.quat_conjugate(new_q)))
+        if qb.w < 0.0 { qb = core.quat(0.0 - qb.x, 0.0 - qb.y, 0.0 - qb.z, 0.0 - qb.w) }
+        angle_before = 2.0 * core.atan2_of(qb.x * axis.x + qb.y * axis.y + qb.z * axis.z, qb.w)
+        inertia[off] = axis.x
+        inertia[off + 1] = axis.y
+        inertia[off + 2] = axis.z
+        quintic(inertia, off + 3, angle, (angle - angle_before) / dt, seconds)
+        p = pose.translation(now, j)
+        pb = pose.translation(before, j)
+        np = pose.translation(target, j)
+        quintic(inertia, off + 3 + QUINTIC, p.x - np.x, (p.x - pb.x) / dt, seconds)
+        quintic(inertia, off + 3 + 2 * QUINTIC, p.y - np.y, (p.y - pb.y) / dt, seconds)
+        quintic(inertia, off + 3 + 3 * QUINTIC, p.z - np.z, (p.z - pb.z) / dt, seconds)
+        j = j + 1
+    }
+    a.blend_t = 0.0
+    a.blend_time = seconds
+}
+
+// Bollo's quintic for an offset of x0 changing at v0, to rest at t1: its
+// t^5..t^2 coefficients, v0, x0 and t1 into `q` at `at`. An offset growing
+// away from rest is taken as still (it would overshoot); one falling fast
+// reaches rest no later than its own speed allows (figure's, over poses).
+quintic(q: float[], at: int, x0_in: float, v0_in: float, t1_in: float) {
+    x0 = x0_in
+    v0 = v0_in
+    flip = x0 < 0.0
+    if flip {
+        x0 = 0.0 - x0
+        v0 = 0.0 - v0
+    }
+    if v0 > 0.0 { v0 = 0.0 }
+    t1 = t1_in
+    if v0 < 0.0 {
+        limit = 0.0 - 5.0 * x0 / v0
+        if limit < t1 { t1 = limit }
+    }
+    if t1 <= 0.000001 || x0 <= 0.0 {
+        k = 0
+        while k < QUINTIC {
+            q[at + k] = 0.0
+            k = k + 1
+        }
+        return
+    }
+    a0 = (0.0 - 8.0 * v0 * t1 - 20.0 * x0) / (t1 * t1)
+    t2 = t1 * t1
+    t3 = t2 * t1
+    t4 = t3 * t1
+    t5 = t4 * t1
+    sign = 1.0
+    if flip { sign = 0.0 - 1.0 }
+    q[at] = sign * (0.0 - (a0 * t2 + 6.0 * v0 * t1 + 12.0 * x0) / (2.0 * t5))
+    q[at + 1] = sign * ((3.0 * a0 * t2 + 16.0 * v0 * t1 + 30.0 * x0) / (2.0 * t4))
+    q[at + 2] = sign * (0.0 - (3.0 * a0 * t2 + 12.0 * v0 * t1 + 20.0 * x0) / (2.0 * t3))
+    q[at + 3] = sign * (a0 * 0.5)
+    q[at + 4] = sign * v0
+    q[at + 5] = sign * x0
+    q[at + 6] = t1
+}
+
+quintic_at(q: float[], at: int, t: float) -> float {
+    if t >= q[at + 6] { return 0.0 }
+    return (((q[at] * t + q[at + 1]) * t + q[at + 2]) * t + q[at + 3]) * t * t + q[at + 4] * t + q[at + 5]
+}
+
+// The transition's offsets at `t` laid over `p`, in place.
+apply_inertia(a: *Animator, p: ptr, t: float) {
+    r = a.rig as *pose.Rig
+    inertia = a.inertia as float[]
+    j = 0
+    while j < pose.count(r) {
+        off = j * INERTIA_FLOATS
+        angle = quintic_at(inertia, off + 3, t)
+        if angle != 0.0 {
+            axis = core.vec3(inertia[off], inertia[off + 1], inertia[off + 2])
+            pose.set_rotation(p, j, core.quat_normalize(core.quat_mul(core.quat_rotate(angle, axis), pose.rotation(p, j))))
+        }
+        d = core.vec3(quintic_at(inertia, off + 3 + QUINTIC, t), quintic_at(inertia, off + 3 + 2 * QUINTIC, t),
+                      quintic_at(inertia, off + 3 + 3 * QUINTIC, t))
+        pose.set_translation(p, j, core.v3_add(pose.translation(p, j), d))
+        j = j + 1
+    }
+}
+
+// --- states -------------------------------------------------------------------------------------
+
+// The blend's weights at its parameter: the two takes around it, linear by
+// value; at or past either end, that end alone. A 2D blend's by gradient
+// bands (weights_2d).
+blend_weights(s: *State) {
+    if s.kind == STATE_BLEND2 {
+        weights_2d(s)
+        return
+    }
+    w = s.weights as float[]
+    v = s.values as float[]
+    k = 0
+    while k < s.count {
+        w[k] = 0.0
+        k = k + 1
+    }
+    if s.count == 0 { return }
+    if s.param <= v[0] {
+        w[0] = 1.0
+        return
+    }
+    if s.param >= v[s.count - 1] {
+        w[s.count - 1] = 1.0
+        return
+    }
+    k = 0
+    while k < s.count - 1 && s.param > v[k + 1] { k = k + 1 }
+    span = v[k + 1] - v[k]
+    u = 1.0
+    if span > 0.0000001 { u = (s.param - v[k]) / span }
+    w[k] = 1.0 - u
+    w[k + 1] = u
+}
+
+// A 2D blend's weights at its velocity, by polar gradient band
+// interpolation (Johansen, "Automated Semi-Procedural Animation for
+// Character Locomotion", 2009): each sample's weight is the least, over
+// every other sample, of how far the velocity has not yet gone from it
+// toward that one, the way measured in speed relative to the two speeds'
+// mean and in the angle between them (TURN_WEIGHT to a radian); a pair with
+// a sample standing still is measured in metres a second. A sample is
+// alone at its own velocity, and the weights change continuously.
+weights_2d(s: *State) {
+    w = s.weights as float[]
+    xs = s.values as float[]
+    zs = s.values2 as float[]
+    n = s.count
+    if n == 0 { return }
+    px = s.param
+    pz = s.param2
+    pm = core.sqrt_of(px * px + pz * pz)
+    total = 0.0
+    i = 0
+    while i < n {
+        mi = core.sqrt_of(xs[i] * xs[i] + zs[i] * zs[i])
+        least = 1.0
+        j = 0
+        while j < n {
+            if j != i {
+                mj = core.sqrt_of(xs[j] * xs[j] + zs[j] * zs[j])
+                ij_a = 0.0
+                ij_b = 0.0
+                ip_a = 0.0
+                ip_b = 0.0
+                if mi > 0.000001 && mj > 0.000001 {
+                    mean = (mi + mj) * 0.5
+                    ij_a = (mj - mi) / mean
+                    ij_b = TURN_WEIGHT * turn_between(xs[i], zs[i], xs[j], zs[j])
+                    ip_a = (pm - mi) / mean
+                    if pm > 0.000001 { ip_b = TURN_WEIGHT * turn_between(xs[i], zs[i], px, pz) }
+                } else {
+                    ij_a = xs[j] - xs[i]
+                    ij_b = zs[j] - zs[i]
+                    ip_a = px - xs[i]
+                    ip_b = pz - zs[i]
+                }
+                apart = ij_a * ij_a + ij_b * ij_b
+                if apart > 0.0000000001 {
+                    h = 1.0 - (ip_a * ij_a + ip_b * ij_b) / apart
+                    if h < least { least = h }
+                }
+            }
+            j = j + 1
+        }
+        if least < 0.0 { least = 0.0 }
+        w[i] = least
+        total = total + least
+        i = i + 1
+    }
+    if total > 0.0 {
+        i = 0
+        while i < n {
+            w[i] = w[i] / total
+            i = i + 1
+        }
+        return
+    }
+    // Outside every band (a velocity far past the samples): the nearest alone.
+    nearest = 0
+    best = 1000000000.0
+    i = 0
+    while i < n {
+        d = (xs[i] - px) * (xs[i] - px) + (zs[i] - pz) * (zs[i] - pz)
+        if d < best {
+            best = d
+            nearest = i
+        }
+        w[i] = 0.0
+        i = i + 1
+    }
+    w[nearest] = 1.0
+}
+
+// The signed angle from direction (ax, az) to (bx, bz), radians.
+turn_between(ax: float, az: float, bx: float, bz: float) -> float {
+    return core.atan2_of(ax * bz - az * bx, ax * bx + az * bz)
+}
+
+// A blend's cycle in seconds, its takes' lengths weighted.
+blend_cycle(s: *State) -> float {
+    w = s.weights as float[]
+    cycle = 0.0
+    k = 0
+    while k < s.count {
+        cycle = cycle + w[k] * clips.duration(list.get_raw(s.takes, k) as *Take)
+        k = k + 1
+    }
+    return cycle
+}
+
+// A take's time at the blend's phase: its own phase origin (its left foot's
+// first touchdown) carried on by the phase.
+take_time_at(t: *Take, phase: float) -> float { return clips.time_at_phase(t, phase) }
+
+// The blend's speed over the ground at its pace now: each take's speed, as
+// fast as the blend plays it (its length over the cycle), weighted.
+blend_speed(s: *State, cycle: float) -> float {
+    if cycle <= 0.0 { return 0.0 }
+    w = s.weights as float[]
+    if s.kind == STATE_BLEND2 {
+        // Its takes' velocities (where they stand in the space), summed: a
+        // walk ahead and a walk across go the way between, slower than either.
+        xs = s.values as float[]
+        zs = s.values2 as float[]
+        vx = 0.0
+        vz = 0.0
+        k = 0
+        while k < s.count {
+            t = list.get_raw(s.takes, k) as *Take
+            share = w[k] * clips.duration(t) / cycle
+            vx = vx + share * xs[k]
+            vz = vz + share * zs[k]
+            k = k + 1
+        }
+        return core.sqrt_of(vx * vx + vz * vz)
+    }
+    speed = 0.0
+    k = 0
+    while k < s.count {
+        t = list.get_raw(s.takes, k) as *Take
+        speed = speed + w[k] * clips.speed(t) * clips.duration(t) / cycle
+        k = k + 1
+    }
+    return speed
+}
+
+// State `s`'s pose now into `out`.
+sample_state(a: *Animator, s: *State, out: ptr) {
+    r = a.rig as *pose.Rig
+    if s.kind == STATE_POSE {
+        pose.copy(r, s.held, out)
+        return
+    }
+    if s.kind == STATE_MATCH {
+        clips.sample(matched_take(s), r, s.time, clips.looping(matched_take(s)), out)
+        return
+    }
+    if s.kind == STATE_TAKE {
+        clips.sample(list.get_raw(s.takes, 0) as *Take, r, s.time, s.loop, out)
+        return
+    }
+    blend_weights(s)
+    w = s.weights as float[]
+    first = true
+    total = 0.0
+    k = 0
+    while k < s.count {
+        if w[k] > 0.0 {
+            t = list.get_raw(s.takes, k) as *Take
+            if first {
+                clips.sample(t, r, take_time_at(t, s.time), true, out)
+                total = w[k]
+                first = false
+            } else {
+                clips.sample(t, r, take_time_at(t, s.time), true, a.work2)
+                total = total + w[k]
+                pose.blend(r, out, a.work2, w[k] / total, out)
+            }
+        }
+        k = k + 1
+    }
+}
+
+// The current state carried on `dt` seconds: a take's clock, or a blend's
+// phase at its pace, bent so its feet carry the ground at the parameter's
+// speed. Its root motion over the step, as the take gives it (x, z, turn), or
+// nothing.
+advance(a: *Animator, s: *State, dt: float) -> Vec3 {
+    if s.kind == STATE_POSE {
+        s.time = s.time + dt
+        a.ground_speed = 0.0
+        return core.vec3(0.0, 0.0, 0.0)
+    }
+    if s.kind == STATE_MATCH {
+        t = matched_take(s)
+        from = s.time
+        s.time = s.time + dt * s.rate
+        // A take that loops plays on round; one that does not holds its end.
+        looping = clips.looping(t)
+        if looping && s.time >= clips.duration(t) { s.time = s.time - clips.duration(t) }
+        if !looping && s.time > clips.duration(t) { s.time = clips.duration(t) }
+        a.ground_speed = clips.speed(t) * s.rate
+        if clips.has_root_motion(t) && a.root_motion { return clips.root_delta(t, from, s.time, looping) }
+        return core.vec3(0.0, 0.0, 0.0)
+    }
+    if s.kind == STATE_TAKE {
+        t = list.get_raw(s.takes, 0) as *Take
+        from = s.time
+        if s.clock >= 0 {
+            // Played by distance: never back, and the step's own speed.
+            s.time = distance_time(a, s)
+            if s.time < from { s.time = from }
+            a.ground_speed = 0.0
+            if dt > 0.0 && s.time > from {
+                d = clips.root_delta(t, from, s.time, false)
+                a.ground_speed = core.sqrt_of(d.x * d.x + d.y * d.y) / dt
+            }
+            if clips.has_root_motion(t) && a.root_motion { return clips.root_delta(t, from, s.time, false) }
+            return core.vec3(0.0, 0.0, 0.0)
+        }
+        s.time = s.time + dt * s.rate
+        if !s.loop && s.time > clips.duration(t) { s.time = clips.duration(t) }
+        a.ground_speed = clips.speed(t) * s.rate
+        if clips.has_root_motion(t) && a.root_motion { return clips.root_delta(t, from, s.time, s.loop) }
+        return core.vec3(0.0, 0.0, 0.0)
+    }
+    blend_weights(s)
+    cycle = blend_cycle(s)
+    if cycle <= 0.0 { return core.vec3(0.0, 0.0, 0.0) }
+    natural = blend_speed(s, cycle)
+    asked = s.param
+    if s.kind == STATE_BLEND2 { asked = core.sqrt_of(s.param * s.param + s.param2 * s.param2) }
+    pace = 1.0
+    if natural > 0.0001 && asked > 0.0 {
+        pace = asked / natural
+        if pace < PACE_LEAST { pace = PACE_LEAST }
+        if pace > PACE_MOST { pace = PACE_MOST }
+    }
+    s.pace = pace
+    a.ground_speed = natural * pace * s.rate
+    from = s.time
+    s.time = s.time + dt * pace * s.rate / cycle
+    s.time = s.time - floor_of(s.time)
+    if !a.root_motion { return core.vec3(0.0, 0.0, 0.0) }
+    // Its takes' root motion over the step, weighted.
+    w = s.weights as float[]
+    moved = core.vec3(0.0, 0.0, 0.0)
+    k = 0
+    while k < s.count {
+        t = list.get_raw(s.takes, k) as *Take
+        if w[k] > 0.0 && clips.has_root_motion(t) {
+            d = clips.root_delta(t, take_time_at(t, from), take_time_at(t, s.time), true)
+            moved = core.v3_add(moved, core.v3_mul(d, w[k]))
+        }
+        k = k + 1
+    }
+    return moved
+}
+
+floor_of(x: float) -> float {
+    i = x as int
+    f = i as float
+    if f > x { f = f - 1.0 }
+    return f
+}
+
+// How far foot `side` is down in the current state now, 0 to 1: its takes'
+// contacts, weighted. What foot placement locks a foot by.
+contact_weight(a: *Animator, side: int) -> float {
+    s = state_at(a, a.current)
+    if s == null { return 1.0 }
+    if s.kind == STATE_POSE { return 0.0 }
+    if s.kind == STATE_MATCH {
+        if clips.contact(matched_take(s), side, s.time, clips.looping(matched_take(s))) { return 1.0 }
+        return 0.0
+    }
+    if s.kind == STATE_TAKE {
+        if clips.contact(list.get_raw(s.takes, 0) as *Take, side, s.time, s.loop) { return 1.0 }
+        return 0.0
+    }
+    w = s.weights as float[]
+    down = 0.0
+    k = 0
+    while k < s.count {
+        if w[k] > 0.0 {
+            t = list.get_raw(s.takes, k) as *Take
+            if clips.contact(t, side, take_time_at(t, s.time), true) { down = down + w[k] }
+        }
+        k = k + 1
+    }
+    return down
+}
+
+// How planted foot `side` is in the current state now, 0 to 1
+// (flat, or on its ball for a gait run on it), its takes weighted.
+plant_weight(a: *Animator, side: int) -> float {
+    s = state_at(a, a.current)
+    if s == null { return 1.0 }
+    if s.kind == STATE_POSE { return 0.0 }
+    if s.kind == STATE_MATCH {
+        if clips.planted(matched_take(s), side, s.time, clips.looping(matched_take(s))) { return 1.0 }
+        return 0.0
+    }
+    if s.kind == STATE_TAKE {
+        if clips.planted(list.get_raw(s.takes, 0) as *Take, side, s.time, s.loop) { return 1.0 }
+        return 0.0
+    }
+    w = s.weights as float[]
+    down = 0.0
+    k = 0
+    while k < s.count {
+        if w[k] > 0.0 {
+            t = list.get_raw(s.takes, k) as *Take
+            if clips.planted(t, side, take_time_at(t, s.time), true) { down = down + w[k] }
+        }
+        k = k + 1
+    }
+    return down
+}
+
+// --- layers -------------------------------------------------------------------------------------
+
+// A layer playing `t` over the joints under `from` (a mask; -1: the whole
+// figure), blended over the state, or added to it as its difference from its
+// first frame. It starts at weight 0. Its index.
+add_layer(a: *Animator, t: *Take, from: int, additive: bool, loop: bool) -> int {
+    r = a.rig as *pose.Rig
+    l = heap.new(Layer)
+    l.take = t as ptr
+    top = from
+    if top < 0 { top = pose.order(r, 0) }
+    l.mask = pose.mask(r, top, 1.0)
+    if from < 0 {
+        m = l.mask as float[]
+        j = 0
+        while j < pose.count(r) {
+            m[j] = 1.0
+            j = j + 1
+        }
+    }
+    l.additive = additive
+    l.loop = loop
+    l.base = pose.new(r)
+    clips.sample_frame(t, r, 0, l.base)
+    list.add_raw(a.layers, l as ptr)
+    return list.size(a.layers) - 1
+}
+
+// The layer's weight toward `w`, reached over `seconds` (0: at once).
+layer_weight(a: *Animator, layer: int, w: float, seconds: float) {
+    if layer < 0 || layer >= list.size(a.layers) { return }
+    l = list.get_raw(a.layers, layer) as *Layer
+    l.goal = w
+    if seconds <= 0.0 {
+        l.weight = w
+        l.fade = 0.0
+    } else {
+        l.fade = core.abs_of(w - l.weight) / seconds
+    }
+}
+
+layer_restart(a: *Animator, layer: int) {
+    if layer < 0 || layer >= list.size(a.layers) { return }
+    (list.get_raw(a.layers, layer) as *Layer).time = 0.0
+}
+
+layer_time(a: *Animator, layer: int) -> float {
+    if layer < 0 || layer >= list.size(a.layers) { return 0.0 }
+    return (list.get_raw(a.layers, layer) as *Layer).time
+}
+
+apply_layers(a: *Animator, dt: float) {
+    r = a.rig as *pose.Rig
+    i = 0
+    while i < list.size(a.layers) {
+        l = list.get_raw(a.layers, i) as *Layer
+        if l.weight < l.goal {
+            l.weight = l.weight + l.fade * dt
+            if l.weight > l.goal || l.fade <= 0.0 { l.weight = l.goal }
+        } else if l.weight > l.goal {
+            l.weight = l.weight - l.fade * dt
+            if l.weight < l.goal || l.fade <= 0.0 { l.weight = l.goal }
+        }
+        t = l.take as *Take
+        was = l.time
+        l.time = l.time + dt
+        if !l.loop && l.time > clips.duration(t) { l.time = clips.duration(t) }
+        if l.weight > 0.0 {
+            pass_events(a, t, was, l.time, l.loop, false)
+            clips.sample(t, r, l.time, l.loop, a.work)
+            if l.additive {
+                pose.difference(r, a.work, l.base, a.work2)
+                pose.add_weighted(r, a.out, a.work2, l.mask, l.weight, a.out)
+            } else {
+                pose.blend_weighted(r, a.out, a.work, l.mask, l.weight, a.out)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// --- inverse kinematics -----------------------------------------------------------------------
+
+// Feet placed on the ground by `f` (ae3d.ikrig.feet_new), taken by the
+// animator and freed with it.
+set_feet(a: *Animator, f: *Feet) { a.feet = f as ptr }
+
+// Hands put on grips by `h` (ae3d.ikrig.hands_new), taken by the animator and
+// freed with it; the game moves the grips (ikrig.hands_set).
+set_hands(a: *Animator, h: *Hands) { a.hands = h as ptr }
+hands(a: *Animator) -> *Hands { return a.hands as *Hands }
+feet(a: *Animator) -> *Feet { return a.feet as *Feet }
+
+// The head and neck turned toward `point` (the world's), `weight` of the way.
+look_at(a: *Animator, point: Vec3, weight: float) {
+    if a.look == null { a.look = ikrig.look_new(a.rig as *pose.Rig) as ptr }
+    ikrig.look_set(a.look as *Look, point, weight)
+}
+
+look_off(a: *Animator) {
+    if a.look != null { ikrig.look_set(a.look as *Look, core.vec3(0.0, 0.0, 0.0), 0.0) }
+}
+
+// The trunk turned so the line it holds (ikrig.aim_set_line: a rifle's,
+// the chest's forward by default) points at `point` (the world's),
+// `weight` of the way: solved after the feet, before the hands go on what
+// it holds.
+aim_at(a: *Animator, point: Vec3, weight: float) {
+    ikrig.aim_set(trunk_aim(a), point, weight)
+}
+
+aim_off(a: *Animator) {
+    if a.aim != null { ikrig.aim_set(a.aim as *ikrig.Aim, core.vec3(0.0, 0.0, 0.0), 0.0) }
+}
+
+trunk_aim(a: *Animator) -> *ikrig.Aim {
+    if a.aim == null { a.aim = ikrig.aim_new(a.rig as *pose.Rig) as ptr }
+    return a.aim as *ikrig.Aim
+}
+
+// Whole-body reach by `b` (ae3d.ikrig.body_new), taken by the animator and
+// freed with it: solved after the feet and the aim, before the hands.
+set_body(a: *Animator, b: *Body) { a.body = b as ptr }
+body(a: *Animator) -> *Body { return a.body as *Body }
+
+// --- the graph's parameters and transitions -----------------------------------------------------
+
+// The parameter named `title`, made when `create` and it is new; -1 when it is
+// not there and not made.
+param_index(a: *Animator, title: string, create: bool) -> int {
+    i = 0
+    while i < list.size(a.params) {
+        if string.equals((list.get_raw(a.params, i) as *Param).name, title) == 1 { return i }
+        i = i + 1
+    }
+    if !create { return 0 - 1 }
+    p = heap.new(Param)
+    p.name = string.copy(title)
+    list.add_raw(a.params, p as ptr)
+    return list.size(a.params) - 1
+}
+
+param_at(a: *Animator, i: int) -> *Param { return list.get_raw(a.params, i) as *Param }
+
+// A number the graph reads: a blend space's speed or velocity, a condition's.
+set_float(a: *Animator, title: string, value: float) { param_at(a, param_index(a, title, true)).value = value }
+
+set_bool(a: *Animator, title: string, on: bool) {
+    v = 0.0
+    if on { v = 1.0 }
+    param_at(a, param_index(a, title, true)).value = v
+}
+
+// A trigger: set until a transition that tests it is taken.
+trigger(a: *Animator, title: string) {
+    p = param_at(a, param_index(a, title, true))
+    p.value = 1.0
+    p.trigger = true
+}
+
+float_param(a: *Animator, title: string) -> float {
+    i = param_index(a, title, false)
+    if i < 0 { return 0.0 }
+    return param_at(a, i).value
+}
+
+// A transition from `from` (or ANY state) to `to` over `seconds`, taken by
+// the graph itself the first frame all its conditions hold (transition_when),
+// in the order they were added. Inertialized, unless cross-faded. Its index.
+add_transition(a: *Animator, from: int, to: int, seconds: float) -> int {
+    t = heap.new(Transition)
+    t.from = from
+    t.to = to
+    t.seconds = seconds
+    t.conditions = list.new()
+    list.add_raw(a.transitions, t as ptr)
+    return list.size(a.transitions) - 1
+}
+
+// A condition of transition `tr`: parameter `title` ABOVE or BELOW `value`,
+// a switch that IS or IS_NOT on, a trigger TRIGGERED; or the state's take
+// ENDED (`title` unread), the transition's time before its end.
+transition_when(a: *Animator, tr: int, title: string, test: int, value: float) {
+    if tr < 0 || tr >= list.size(a.transitions) { return }
+    t = list.get_raw(a.transitions, tr) as *Transition
+    c = heap.new(Condition)
+    c.param = 0 - 1
+    if test != ENDED { c.param = param_index(a, title, true) }
+    c.test = test
+    c.value = value
+    list.add_raw(t.conditions, c as ptr)
+}
+
+// Transition `tr` cross-fades: both states play through it, their poses
+// blended (for two takes made to be blended, a turn into a walk); one
+// inertialized plays the new state alone from the pose drawn.
+transition_crossfade(a: *Animator, tr: int, on: bool) {
+    if tr < 0 || tr >= list.size(a.transitions) { return }
+    (list.get_raw(a.transitions, tr) as *Transition).crossfade = on
+}
+
+// Blend space `state` takes parameter `title` as its own every frame (its
+// speed), or for a 2D blend `title` and `title2` (its velocity across and
+// ahead).
+bind(a: *Animator, state: int, title: string) {
+    s = state_at(a, state)
+    if s != null { s.bind = param_index(a, title, true) }
+}
+
+bind2(a: *Animator, state: int, title: string, title2: string) {
+    s = state_at(a, state)
+    if s == null { return }
+    s.bind = param_index(a, title, true)
+    s.bind2 = param_index(a, title2, true)
+}
+
+apply_bindings(a: *Animator) {
+    i = 0
+    while i < list.size(a.states) {
+        s = list.get_raw(a.states, i) as *State
+        if s.bind >= 0 { s.param = param_at(a, s.bind).value }
+        if s.bind2 >= 0 { s.param2 = param_at(a, s.bind2).value }
+        i = i + 1
+    }
+}
+
+condition_holds(a: *Animator, c: *Condition) -> bool {
+    if c.test == ENDED { return false }
+    v = param_at(a, c.param).value
+    if c.test == ABOVE { return v > c.value }
+    if c.test == BELOW { return v < c.value }
+    if c.test == IS || c.test == TRIGGERED { return v > 0.5 }
+    if c.test == IS_NOT { return v < 0.5 }
+    return false
+}
+
+// The first transition whose conditions all hold, taken; its triggers spent.
+take_transitions(a: *Animator) {
+    i = 0
+    while i < list.size(a.transitions) {
+        t = list.get_raw(a.transitions, i) as *Transition
+        if (t.from == ANY || t.from == a.current) && t.to != a.current && list.size(t.conditions) > 0 {
+            holds = true
+            k = 0
+            while k < list.size(t.conditions) && holds {
+                c = list.get_raw(t.conditions, k) as *Condition
+                if c.test == ENDED {
+                    holds = ended(a, t.seconds)
+                } else {
+                    holds = condition_holds(a, c)
+                }
+                k = k + 1
+            }
+            if holds {
+                k = 0
+                while k < list.size(t.conditions) {
+                    c = list.get_raw(t.conditions, k) as *Condition
+                    if c.test == TRIGGERED { param_at(a, c.param).value = 0.0 }
+                    k = k + 1
+                }
+                to = best_target(a, t)
+                if t.synced {
+                    play_synced(a, to, t.seconds)
+                } else if t.crossfade {
+                    crossfade_to(a, to, t.seconds)
+                } else {
+                    play(a, to, t.seconds)
+                }
+                return
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Whether the current state's take has `before` seconds or less left to
+// play (a take that does not loop; a blend never ends).
+ended(a: *Animator, before: float) -> bool {
+    s = state_at(a, a.current)
+    if s == null || s.kind != STATE_TAKE || s.loop { return false }
+    return s.time >= clips.duration(list.get_raw(s.takes, 0) as *Take) - before
+}
+
+// The current state cross-faded into `state` over `seconds`: both play, the
+// old one's weight falling as the new one's rises.
+crossfade_to(a: *Animator, state: int, seconds: float) {
+    s = state_at(a, state)
+    if s == null { return }
+    if seconds <= 0.0 || a.current < 0 {
+        play(a, state, 0.0)
+        return
+    }
+    a.fade_from = a.current
+    a.fade_t = 0.0
+    a.fade_time = seconds
+    s.time = 0.0
+    s.entered = true
+    a.current = state
+    a.blend_t = 0.0
+    a.blend_time = 0.0
+}
+
+free_graph(a: *Animator) {
+    i = 0
+    while i < list.size(a.params) {
+        p = list.get_raw(a.params, i) as *Param
+        string.free(p.name)
+        heap.free(p)
+        i = i + 1
+    }
+    list.free(a.params)
+    i = 0
+    while i < list.size(a.transitions) {
+        t = list.get_raw(a.transitions, i) as *Transition
+        k = 0
+        while k < list.size(t.conditions) {
+            heap.free(list.get_raw(t.conditions, k) as *Condition)
+            k = k + 1
+        }
+        list.free(t.conditions)
+        if t.others != null { free(t.others) }
+        heap.free(t)
+        i = i + 1
+    }
+    list.free(a.transitions)
+    i = 0
+    while i < list.size(a.aims) {
+        m = list.get_raw(a.aims, i) as *Aim
+        k = 0
+        while k < list.size(m.poses) {
+            pose.release(list.get_raw(m.poses, k))
+            k = k + 1
+        }
+        list.free(m.poses)
+        free(m.yaws)
+        free(m.pitches)
+        pose.mask_free(m.mask)
+        pose.release(m.reference)
+        heap.free(m)
+        i = i + 1
+    }
+    list.free(a.aims)
+    pose.release(a.work3)
+}
+
+// --- a pose held --------------------------------------------------------------------------------
+
+// A state that holds the pose drawn now (a ragdoll's as it lands, the last
+// frame of a dive), to be played and blended from like any other: what a
+// get-up blends out of. Taken again under the same name, the state's pose
+// is taken again. Its index.
+snapshot(a: *Animator, title: string) -> int {
+    r = a.rig as *pose.Rig
+    i = find_state(a, title)
+    s = state_at(a, i)
+    if s == null {
+        s = new_state(title, STATE_POSE)
+        s.held = pose.new(r)
+        list.add_raw(a.states, s as ptr)
+        i = list.size(a.states) - 1
+    }
+    pose.copy(r, a.out, s.held)
+    return i
+}
+
+// --- aim offsets --------------------------------------------------------------------------------
+
+// An aim offset over the joints under `from` (a figure's spine, for a gun
+// held in both hands): poses added with aim_add, each at the yaw and pitch
+// it aims at (radians, yaw to the figure's left, pitch up), the first at
+// (0, 0) or the one there its reference. Its index.
+add_aim(a: *Animator, from: int) -> int {
+    r = a.rig as *pose.Rig
+    m = heap.new(Aim)
+    top = from
+    if top < 0 { top = pose.order(r, 0) }
+    m.mask = pose.mask(r, top, 1.0)
+    m.poses = list.new()
+    m.room = 8
+    m.yaws = calloc(m.room, 8)
+    m.pitches = calloc(m.room, 8)
+    m.reference = pose.new(r)
+    m.weight = 1.0
+    list.add_raw(a.aims, m as ptr)
+    return list.size(a.aims) - 1
+}
+
+// Take `t`'s first frame as the aim at `yaw` and `pitch`.
+aim_add(a: *Animator, aim: int, t: *Take, yaw: float, pitch: float) {
+    if aim < 0 || aim >= list.size(a.aims) || t == null { return }
+    r = a.rig as *pose.Rig
+    m = list.get_raw(a.aims, aim) as *Aim
+    if m.count >= m.room {
+        bigger = m.room * 2
+        ys = calloc(bigger, 8) as float[]
+        ps = calloc(bigger, 8) as float[]
+        k = 0
+        while k < m.count {
+            ys[k] = (m.yaws as float[])[k]
+            ps[k] = (m.pitches as float[])[k]
+            k = k + 1
+        }
+        free(m.yaws)
+        free(m.pitches)
+        m.yaws = ys as ptr
+        m.pitches = ps as ptr
+        m.room = bigger
+    }
+    p = pose.new(r)
+    clips.sample_frame(t, r, 0, p)
+    list.add_raw(m.poses, p)
+    (m.yaws as float[])[m.count] = yaw
+    (m.pitches as float[])[m.count] = pitch
+    if m.count == 0 || yaw * yaw + pitch * pitch < 0.000001 { pose.copy(r, p, m.reference) }
+    m.count = m.count + 1
+}
+
+// Aim offset `aim` aimed at `yaw` and `pitch`, `weight` deep.
+set_aim(a: *Animator, aim: int, yaw: float, pitch: float, weight: float) {
+    if aim < 0 || aim >= list.size(a.aims) { return }
+    m = list.get_raw(a.aims, aim) as *Aim
+    m.yaw = yaw
+    m.pitch = pitch
+    m.weight = weight
+}
+
+// Each aim offset's samples blended at its aim by cartesian gradient bands
+// (an aim's yaw and pitch are angles alike), their difference from its
+// reference added over its joints.
+apply_aims(a: *Animator) {
+    r = a.rig as *pose.Rig
+    i = 0
+    while i < list.size(a.aims) {
+        m = list.get_raw(a.aims, i) as *Aim
+        if m.count > 0 && m.weight > 0.0 {
+            ys = m.yaws as float[]
+            ps = m.pitches as float[]
+            first = true
+            total = 0.0
+            k = 0
+            while k < m.count {
+                w = band_weight(ys, ps, m.count, k, m.yaw, m.pitch)
+                if w > 0.0 {
+                    if first {
+                        pose.copy(r, list.get_raw(m.poses, k), a.work)
+                        total = w
+                        first = false
+                    } else {
+                        total = total + w
+                        pose.blend(r, a.work, list.get_raw(m.poses, k), w / total, a.work)
+                    }
+                }
+                k = k + 1
+            }
+            if !first {
+                pose.difference(r, a.work, m.reference, a.work2)
+                pose.add_weighted(r, a.out, a.work2, m.mask, m.weight, a.out)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Sample `i`'s gradient band weight among `n` at (x, y) (cartesian, not
+// normalized: a share of the weights' sum).
+band_weight(xs: float[], ys: float[], n: int, i: int, x: float, y: float) -> float {
+    least = 1.0
+    j = 0
+    while j < n {
+        if j != i {
+            dx = xs[j] - xs[i]
+            dy = ys[j] - ys[i]
+            apart = dx * dx + dy * dy
+            if apart > 0.0000000001 {
+                h = 1.0 - ((x - xs[i]) * dx + (y - ys[i]) * dy) / apart
+                if h < least { least = h }
+            }
+        }
+        j = j + 1
+    }
+    if least < 0.0 { return 0.0 }
+    return least
+}
+
+// --- events -------------------------------------------------------------------------------------
+
+// The events the last frame's clocks passed: the current state's (a blend's
+// from its heaviest take, as Unreal fires a blend's notifies by default: two
+// gaits' footfalls are one footfall) and every weighted layer's, in the order
+// the frame met them. A game reads them after the pose phase, until the next.
+event_count(a: *Animator) -> int { return a.fired_count }
+
+event_name(a: *Animator, i: int) -> string {
+    if i < 0 || i >= a.fired_count { return "" }
+    return clips.event_name((a.fired_takes as ptr[])[i] as *Take, (a.fired_at as int[])[i])
+}
+
+// Whether an event named `title` fired last frame.
+fired(a: *Animator, title: string) -> bool {
+    i = 0
+    while i < a.fired_count {
+        if string.equals(event_name(a, i), title) == 1 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+events_clear(a: *Animator) { a.fired_count = 0 }
+
+event_fire(a: *Animator, t: *Take, index: int) {
+    if a.fired_count >= a.fired_room {
+        bigger = a.fired_room * 2
+        takes = calloc(bigger, 8) as ptr[]
+        at = calloc(bigger, 4) as int[]
+        old_t = a.fired_takes as ptr[]
+        old_a = a.fired_at as int[]
+        k = 0
+        while k < a.fired_count {
+            takes[k] = old_t[k]
+            at[k] = old_a[k]
+            k = k + 1
+        }
+        free(a.fired_takes)
+        free(a.fired_at)
+        a.fired_takes = takes as ptr
+        a.fired_at = at as ptr
+        a.fired_room = bigger
+    }
+    (a.fired_takes as ptr[])[a.fired_count] = t as ptr
+    (a.fired_at as int[])[a.fired_count] = index
+    a.fired_count = a.fired_count + 1
+}
+
+// The current state's events its clock passed this frame, from `from`.
+pass_state(a: *Animator, s: *State, from: float) {
+    entered = s.entered
+    s.entered = false
+    if s.kind == STATE_MATCH {
+        pass_events(a, matched_take(s), from, s.time, clips.looping(matched_take(s)), entered)
+        return
+    }
+    if s.kind == STATE_TAKE {
+        pass_events(a, list.get_raw(s.takes, 0) as *Take, from, s.time, s.loop, entered)
+        return
+    }
+    w = s.weights as float[]
+    heaviest = 0 - 1
+    k = 0
+    while k < s.count {
+        if heaviest < 0 || w[k] > w[heaviest] { heaviest = k }
+        k = k + 1
+    }
+    if heaviest < 0 { return }
+    t = list.get_raw(s.takes, heaviest) as *Take
+    pass_events(a, t, take_time_at(t, from), take_time_at(t, s.time), true, entered)
+}
+
+// The events of `t` passed going from `from` to `to` seconds, wrapping when
+// it loops: those after `from` (at it too, when the clock has just been
+// started there) up to `to`.
+pass_events(a: *Animator, t: *Take, from: float, to: float, loop: bool, entered: bool) {
+    n = clips.event_count(t)
+    if n == 0 || to == from && !entered { return }
+    whole = loop && to - from >= clips.duration(t)
+    fw = clips.time_of(t, from, loop)
+    tw = clips.time_of(t, to, loop)
+    wrapped = loop && tw < fw
+    i = 0
+    while i < n {
+        at = clips.event_time(t, i)
+        after = at > fw || entered && at == fw
+        passed = false
+        if whole {
+            passed = true
+        } else if wrapped {
+            passed = after || at <= tw
+        } else {
+            passed = after && at <= tw
+        }
+        if passed { event_fire(a, t, i) }
+        i = i + 1
+    }
+}
+
+// --- the frame ----------------------------------------------------------------------------------
+
+animator_pose(state: ptr, e: *Engine) {
+    a = state as *Animator
+    evaluate(a, engine.engine_delta_time(e))
+}
+
+// The frame's pose after `dt` seconds, written to the figure's joints. The
+// pose phase calls it; a program stepping its engine by hand calls
+// update_now after engine_update for what the frame drew.
+evaluate(a: *Animator, dt: float) {
+    r = a.rig as *pose.Rig
+    apply_bindings(a)
+    if a.evaluated { take_transitions(a) }
+    s = state_at(a, a.current)
+    if s == null { return }
+    // A matcher searches before the frame moves on, from the two poses drawn last.
+    if s.kind == STATE_MATCH { match_due(a, s, dt) }
+    pose.copy(r, a.out, a.before)
+    events_clear(a)
+    from = s.time
+    moved = advance(a, s, dt)
+    pass_state(a, s, from)
+    sample_state(a, s, a.out)
+    if a.blend_t < a.blend_time {
+        a.blend_t = a.blend_t + dt
+        if a.blend_t < a.blend_time { apply_inertia(a, a.out, a.blend_t) }
+    }
+    // A cross-fade: the state left still playing, its pose blended out.
+    if a.fade_from >= 0 {
+        a.fade_t = a.fade_t + dt
+        old = state_at(a, a.fade_from)
+        if old == null || a.fade_t >= a.fade_time || a.fade_from == a.current {
+            a.fade_from = 0 - 1
+        } else {
+            speed_now = a.ground_speed
+            old_moved = advance(a, old, dt)
+            sample_state(a, old, a.work3)
+            u = a.fade_t / a.fade_time
+            w = u * u * (3.0 - 2.0 * u)
+            pose.blend(r, a.work3, a.out, w, a.out)
+            moved = core.v3_add(core.v3_mul(old_moved, 1.0 - w), core.v3_mul(moved, w))
+            a.ground_speed = a.ground_speed * (1.0 - w) + speed_now * w
+        }
+    }
+    apply_layers(a, dt)
+    apply_aims(a)
+    if a.root_motion { move_object(a, moved, dt) } else { a.moved = core.vec3(0.0, 0.0, 0.0) }
+    if a.feet != null {
+        ikrig.feet_solve(a.feet as *Feet, r, a.out, a.worlds, contact_weight(a, 0), contact_weight(a, 1),
+                         plant_weight(a, 0), plant_weight(a, 1), dt)
+    }
+    if a.aim != null { ikrig.aim_solve(a.aim as *ikrig.Aim, r, a.out, a.worlds, dt) }
+    if a.body != null { ikrig.body_solve(a.body as *Body, r, a.out, a.worlds) }
+    if a.hands != null { ikrig.hands_solve(a.hands as *Hands, r, a.out, a.worlds, dt) }
+    if a.look != null { ikrig.look_solve(a.look as *Look, r, a.out, a.worlds, dt) }
+    pose.apply(r, a.out)
+    if dt > 0.0 { a.dt_before = dt }
+    a.evaluated = true
+}
+
+update_now(a: *Animator, dt: float) { evaluate(a, dt) }
+
+// The pose drawn this frame.
+pose_now(a: *Animator) -> ptr { return a.out }
+
+// The root's motion over the step put on the figure's object: its travel
+// turned into the world through the armature the rig hangs from, and its
+// turn about the world's up. A figure with a character controller
+// (physics.character_controller) is moved by its capsule: the travel asked
+// as that step's velocity, so a wall stops it and a kerb lifts it, and what
+// it moved is what the capsule went. One with none is set where the travel
+// puts it.
+move_object(a: *Animator, d: Vec3, dt: float) {
+    o = a.object as *GameObject
+    r = a.rig as *pose.Rig
+    capsule = physics.character_of(o)
+    if d.x == 0.0 && d.y == 0.0 && d.z == 0.0 {
+        if capsule != null && dt > 0.0 { physics.character_move(capsule, core.vec3(0.0, 0.0, 0.0), 0.0, dt) }
+        a.moved = d
+        return
+    }
+    base = pose.base_model(r)
+    step = core.vec3(d.x, 0.0, d.y)
+    if base != null {
+        core.model_sync_transform(base)
+        s = base.world_scale
+        step = core.quat_apply(base.world_rotation, core.vec3(d.x * s.x, 0.0, d.y * s.z))
+    } else {
+        step = core.quat_apply(behaviour.object_rotation(o), step)
+    }
+    step = core.vec3(step.x, 0.0, step.z)
+    at = behaviour.object_position(o)
+    if capsule != null && dt > 0.0 {
+        physics.character_move(capsule, core.v3_mul(step, 1.0 / dt), 0.0, dt)
+        went = core.v3_sub(behaviour.object_position(o), at)
+        step = core.vec3(went.x, 0.0, went.z)
+    } else {
+        behaviour.object_set_position(o, core.v3_add(at, step))
+    }
+    if d.z != 0.0 {
+        q = core.quat_normalize(core.quat_mul(core.quat_rotate(d.z, core.vec3(0.0, 1.0, 0.0)), behaviour.object_rotation(o)))
+        behaviour.object_set_rotation(o, q)
+    }
+    a.moved = core.vec3(step.x, step.z, d.z)
+}
+
+// State `state`'s clock set to `seconds` (a blend's phase, 0 to 1): what a
+// game playing a start or a stop by distance sets each frame, its rate 0.
+set_time(a: *Animator, state: int, seconds: float) {
+    s = state_at(a, state)
+    if s != null { s.time = seconds }
+}
+
+// State `state` (a take with root motion) played by distance: its clock the
+// time its root has gone parameter `title` metres along its path, or, when
+// `left`, the time `title` metres are left before its end. A start played
+// by the distance the figure has come, a stop by the distance to where it
+// comes to rest (Paragon's distance matching, GDC 2016): its feet plant
+// where the clip planted them, whatever the figure's braking. From the
+// frame it is entered.
+clock_by(a: *Animator, state: int, title: string, left: bool) {
+    s = state_at(a, state)
+    if s == null { return }
+    s.clock = param_index(a, title, true)
+    s.clock_left = left
+}
+
+distance_time(a: *Animator, s: *State) -> float {
+    t = list.get_raw(s.takes, 0) as *Take
+    d = param_at(a, s.clock).value
+    if s.clock_left { return clips.time_at_distance_left(t, d) }
+    return clips.time_at_distance(t, d)
+}
+
+// Transition `tr` enters its state in step: at the stride phase the state
+// it leaves is at (play_synced), so a gait hands its feet over where they
+// are in the stride. Entered at its first frame, the walk taking over from
+// a start put the planted foot a third of a metre from where the start had
+// it, and the lock held it there and let go.
+transition_synced(a: *Animator, tr: int, on: bool) {
+    if tr < 0 || tr >= list.size(a.transitions) { return }
+    (list.get_raw(a.transitions, tr) as *Transition).synced = on
+}
+
+// Transition `tr` may go to `state` instead of its own, whichever of them
+// enters with its feet nearer where they are now (pose matching at a
+// transition): a stop and its mirror, one for each foot, as Paragon picked
+// its stops by the foot down. One stop for both feet entered with its
+// planted foot a third of a metre from the walk's, and the lock let go.
+transition_or(a: *Animator, tr: int, state: int) {
+    if tr < 0 || tr >= list.size(a.transitions) { return }
+    t = list.get_raw(a.transitions, tr) as *Transition
+    if t.others == null { t.others = calloc(8, 4) }
+    if t.other_count >= 8 { return }
+    (t.others as int[])[t.other_count] = state
+    t.other_count = t.other_count + 1
+}
+
+// The state transition `t` goes to: its own, or of its others the one whose
+// feet (balls and ankles about the root, in the rig's space) at the time it
+// would enter lie nearest the pose drawn now's.
+best_target(a: *Animator, t: *Transition) -> int {
+    if t.other_count == 0 { return t.to }
+    r = a.rig as *pose.Rig
+    pose.world(r, a.out, a.worlds)
+    best = t.to
+    best_cost = feet_cost(a, t.to)
+    k = 0
+    while k < t.other_count {
+        candidate = (t.others as int[])[k]
+        cost = feet_cost(a, candidate)
+        if cost < best_cost {
+            best_cost = cost
+            best = candidate
+        }
+        k = k + 1
+    }
+    return best
+}
+
+// How far state `state`'s feet, as it would enter now, lie from the feet of
+// the pose drawn now (a.worlds, already placed): squared metres.
+feet_cost(a: *Animator, state: int) -> float {
+    s = state_at(a, state)
+    if s == null { return 1000000.0 }
+    r = a.rig as *pose.Rig
+    keep = s.time
+    if s.kind == STATE_TAKE {
+        s.time = 0.0
+        if s.clock >= 0 { s.time = distance_time(a, s) }
+    }
+    sample_state(a, s, a.work)
+    s.time = keep
+    pose.world(r, a.work, a.work2)
+    slots = [pose.FOOT_L, pose.BALL_L, pose.FOOT_R, pose.BALL_R]
+    root = pose.human(r, pose.ROOT)
+    if root < 0 { root = pose.human(r, pose.PELVIS) }
+    cost = 0.0
+    k = 0
+    while k < 4 {
+        j = pose.human(r, slots[k])
+        if j >= 0 && root >= 0 {
+            now = core.v3_sub(pose.translation(a.worlds, j), pose.translation(a.worlds, root))
+            then = core.v3_sub(pose.translation(a.work2, j), pose.translation(a.work2, root))
+            d = core.v3_sub(now, then)
+            cost = cost + core.v3_dot(d, d)
+        }
+        k = k + 1
+    }
+    return cost
+}
+
+// --- motion matching ----------------------------------------------------------------------------
+
+// A state that plays whichever moment of its takes best fits the pose drawn
+// now and the way the figure is asked to go (motion matching: Clavet's,
+// GDC 2016, For Honor; Holden's, as Unreal's pose search does it): the
+// takes' frames are known by their features, and every MATCH_EVERY seconds
+// the frame nearest the query is played, through an inertialized change
+// unless it is where the take playing already is. A frame's features, in its
+// root's frame (x across to the left, z ahead), each scaled by its spread
+// over the database:
+//   - each foot's place and velocity about the root, and the hips' velocity;
+//   - the way ahead: where the root will be and the way it will face
+//     MATCH_AHEAD seconds on (a third, two thirds and a whole), from the
+//     take's own root motion (held at its end for a take that stops).
+// The query is the playing frame's own pose features and the way ahead a
+// game asks for (match_trajectory; ae3d.mover sets it from its springs).
+// Each take must have its root motion taken out (animator.take with root,
+// or add_take), so its way ahead is known.
+add_matcher(a: *Animator, title: string) -> int {
+    s = new_state(title, STATE_MATCH)
+    m = heap.new(Matcher)
+    m.query = calloc(MATCH_TRAJ, 8)
+    m.mean = calloc(MATCH_DIM, 8)
+    m.spread = calloc(MATCH_DIM, 8)
+    s.matcher = m as ptr
+    s.loop = false
+    list.add_raw(a.states, s as ptr)
+    return list.size(a.states) - 1
+}
+
+// Take `t` (its root motion taken out) into matcher `state`'s database.
+matcher_add(a: *Animator, state: int, t: *Take) {
+    s = state_at(a, state)
+    if s == null || s.kind != STATE_MATCH || t == null { return }
+    make_room(s)
+    list.add_raw(s.takes, t as ptr)
+    s.count = s.count + 1
+}
+
+// Matcher `state`'s features found for every frame of its takes, and their
+// spreads: once its takes are in, before it plays.
+matcher_build(a: *Animator, state: int) {
+    s = state_at(a, state)
+    if s == null || s.kind != STATE_MATCH { return }
+    r = a.rig as *pose.Rig
+    m = s.matcher as *Matcher
+    total = 0
+    k = 0
+    while k < s.count {
+        total = total + clips.frames(list.get_raw(s.takes, k) as *Take)
+        k = k + 1
+    }
+    if m.features != null {
+        free(m.features)
+        free(m.owner)
+        free(m.at)
+    }
+    m.features = calloc(total * MATCH_DIM, 8)
+    m.owner = calloc(total, 4)
+    m.at = calloc(total, 4)
+    m.frames = total
+    features = m.features as float[]
+    owner = m.owner as int[]
+    ats = m.at as int[]
+    w = pose.new(r)
+    w2 = pose.new(r)
+    n = 0
+    k = 0
+    while k < s.count {
+        t = list.get_raw(s.takes, k) as *Take
+        f = 0
+        while f < clips.frames(t) {
+            frame_features(r, t, f, w, w2, features, n * MATCH_DIM)
+            owner[n] = k
+            ats[n] = f
+            n = n + 1
+            f = f + 1
+        }
+        k = k + 1
+    }
+    pose.release(w)
+    pose.release(w2)
+    // The spreads: each feature's standard deviation over the database.
+    mean = m.mean as float[]
+    spread = m.spread as float[]
+    d = 0
+    while d < MATCH_DIM {
+        sum = 0.0
+        i = 0
+        while i < total {
+            sum = sum + features[i * MATCH_DIM + d]
+            i = i + 1
+        }
+        mean[d] = sum / (total as float)
+        var2 = 0.0
+        i = 0
+        while i < total {
+            x = features[i * MATCH_DIM + d] - mean[d]
+            var2 = var2 + x * x
+            i = i + 1
+        }
+        spread[d] = core.sqrt_of(var2 / (total as float))
+        if spread[d] < 0.0001 { spread[d] = 0.0001 }
+        d = d + 1
+    }
+    m.playing = 0
+    s.time = 0.0
+}
+
+// Frame `f` of take `t`'s features into `out` at `at` (see add_matcher).
+frame_features(r: *pose.Rig, t: *Take, f: int, w: ptr, w2: ptr, out: float[], at: int) {
+    root = pose.human(r, pose.ROOT)
+    if root < 0 { root = pose.human(r, pose.PELVIS) }
+    feet = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    pelvis = pose.human(r, pose.PELVIS)
+    a0 = f - 1
+    if a0 < 0 { a0 = 0 }
+    b0 = f + 1
+    if b0 >= clips.frames(t) { b0 = clips.frames(t) - 1 }
+    span = ((b0 - a0) as float) / clips.rate(t)
+    pose.world(r, clips.frame(t, a0), w)
+    pose.world(r, clips.frame(t, b0), w2)
+    // The root's own velocity over the span, in its frame then.
+    move = clips.root_delta(t, (a0 as float) / clips.rate(t), (b0 as float) / clips.rate(t), false)
+    side = 0
+    while side < 2 {
+        if feet[side] >= 0 && root >= 0 {
+            p0 = core.v3_sub(pose.translation(w, feet[side]), pose.translation(w, root))
+            p1 = core.v3_sub(pose.translation(w2, feet[side]), pose.translation(w2, root))
+            mid = core.v3_mul(core.v3_add(p0, p1), 0.5)
+            out[at + side * 6] = mid.x
+            out[at + side * 6 + 1] = mid.y
+            out[at + side * 6 + 2] = mid.z
+            if span > 0.0 {
+                out[at + side * 6 + 3] = (p1.x - p0.x) / span + move.x / span
+                out[at + side * 6 + 4] = (p1.y - p0.y) / span
+                out[at + side * 6 + 5] = (p1.z - p0.z) / span + move.y / span
+            }
+        }
+        side = side + 1
+    }
+    if pelvis >= 0 && span > 0.0 {
+        h0 = pose.translation(w, pelvis)
+        h1 = pose.translation(w2, pelvis)
+        out[at + 12] = (h1.x - h0.x) / span + move.x / span
+        out[at + 13] = (h1.z - h0.z) / span + move.y / span
+    }
+    // The way ahead, from the take's root motion.
+    now = (f as float) / clips.rate(t)
+    ahead = [0.33, 0.67, 1.0]
+    k = 0
+    while k < 3 {
+        d = clips.root_delta(t, now, now + ahead[k], clips.looping(t))
+        out[at + 14 + k * 4] = d.x
+        out[at + 14 + k * 4 + 1] = d.y
+        out[at + 14 + k * 4 + 2] = core.sin_of(d.z)
+        out[at + 14 + k * 4 + 3] = core.cos_of(d.z)
+        k = k + 1
+    }
+}
+
+// The way ahead a game asks matcher `state` for, `k` (0, 1, 2) of MATCH_AHEAD
+// seconds on: the root's place (x across to the figure's left, z ahead, in
+// its frame now) and its facing then (`turn`, radians to the left).
+match_trajectory(a: *Animator, state: int, k: int, x: float, z: float, turn: float) {
+    s = state_at(a, state)
+    if s == null || s.kind != STATE_MATCH || k < 0 || k > 2 { return }
+    q = (s.matcher as *Matcher).query as float[]
+    q[k * 4] = x
+    q[k * 4 + 1] = z
+    q[k * 4 + 2] = core.sin_of(turn)
+    q[k * 4 + 3] = core.cos_of(turn)
+}
+
+// The searches and the changes matcher `state` has made.
+matcher_searches(a: *Animator, state: int) -> int {
+    s = state_at(a, state)
+    if s == null || s.kind != STATE_MATCH { return 0 }
+    return (s.matcher as *Matcher).searches
+}
+
+matcher_changes(a: *Animator, state: int) -> int {
+    s = state_at(a, state)
+    if s == null || s.kind != STATE_MATCH { return 0 }
+    return (s.matcher as *Matcher).changes
+}
+
+// The best frame for the query: the playing frame's pose features and the
+// game's way ahead, against every frame of the database. A change made to
+// it, inertialized, unless it is the take playing within MATCH_NEAR.
+match_search(a: *Animator, s: *State, forced: bool) {
+    m = s.matcher as *Matcher
+    if m.frames == 0 { return }
+    r = a.rig as *pose.Rig
+    features = m.features as float[]
+    spread = m.spread as float[]
+    q = m.query as float[]
+    owner = m.owner as int[]
+    ats = m.at as int[]
+    // The playing frame's index in the database.
+    playing_t = list.get_raw(s.takes, m.playing) as *Take
+    pf = (s.time * clips.rate(playing_t) + 0.5) as int
+    if pf >= clips.frames(playing_t) { pf = clips.frames(playing_t) - 1 }
+    base = 0
+    k = 0
+    while k < m.playing {
+        base = base + clips.frames(list.get_raw(s.takes, k) as *Take)
+        k = k + 1
+    }
+    now = (base + pf) * MATCH_DIM
+    // The feet down now: a frame is only a candidate with each of them down
+    // too, within MATCH_FOOT of where it is about the root (half the lock's
+    // slip, what the lock takes up as the change is inertialized; a change to a
+    // frame with a planted foot elsewhere drags that foot off its lock; a
+    // matcher changing into a stop had it a third of a metre off). At a
+    // take's end, a change forced, any frame when none is.
+    downs = [clips.contact(playing_t, 0, s.time, clips.looping(playing_t)), clips.contact(playing_t, 1, s.time, clips.looping(playing_t))]
+    best = 0 - 1
+    best_cost = 1000000000.0
+    pass = 0
+    while pass < 2 && best < 0 {
+        if pass == 1 && !forced { pass = 2 }
+        i = 0
+        while i < m.frames && pass < 2 {
+            if pass == 1 || feet_fit(s, features, now, i, downs) {
+                cost = match_cost(features, spread, q, now, i)
+                if cost < best_cost {
+                    best_cost = cost
+                    best = i
+                }
+            }
+            i = i + 1
+        }
+        pass = pass + 1
+    }
+    m.searches = m.searches + 1
+    if best < 0 { return }
+    take_i = owner[best]
+    t = list.get_raw(s.takes, take_i) as *Take
+    time = (ats[best] as float) / clips.rate(t)
+    if take_i == m.playing && core.abs_of(time - s.time) < MATCH_NEAR { return }
+    // Played on unless the change is a clear gain: the frame playing's own
+    // cost (its pose is the query's, so only its way ahead counts) against
+    // the best's. Changed whenever the best was elsewhere, the matcher went
+    // into a stop mid-stride with its planted foot a third of a metre off.
+    stay = 0.0
+    d = 14
+    while d < MATCH_DIM {
+        x = (q[d - 14] - features[now + d]) / spread[d]
+        stay = stay + MATCH_WAY * x * x
+        d = d + 1
+    }
+    if best_cost > stay * MATCH_GAIN { return }
+    // The change: from the pose drawn, inertialized.
+    m.playing = take_i
+    s.time = time
+    m.changes = m.changes + 1
+    clips.sample(t, r, time, false, a.work)
+    inertialize(a, a.out, a.before, a.work, MATCH_BLEND)
+}
+
+matcher_free(m: *Matcher) {
+    if m == null { return }
+    if m.features != null {
+        free(m.features)
+        free(m.owner)
+        free(m.at)
+    }
+    free(m.query)
+    free(m.mean)
+    free(m.spread)
+    heap.free(m)
+}
+
+// The take a matcher plays now.
+matched_take(s: *State) -> *Take { return list.get_raw(s.takes, (s.matcher as *Matcher).playing) as *Take }
+
+// Matcher `s` searches when MATCH_EVERY has gone since it last did, or its
+// take is at its end.
+match_due(a: *Animator, s: *State, dt: float) {
+    m = s.matcher as *Matcher
+    m.since = m.since + dt
+    at_end = !clips.looping(matched_take(s)) && s.time >= clips.duration(matched_take(s)) - 0.0001
+    if m.since >= MATCH_EVERY || at_end {
+        m.since = 0.0
+        match_search(a, s, at_end)
+    }
+}
+
+// Frame `i`'s cost against the query: the playing frame's (at `now`) pose
+// features and the way ahead asked, each scaled by its spread.
+match_cost(features: float[], spread: float[], q: float[], now: int, i: int) -> float {
+    cost = 0.0
+    d = 0
+    while d < 14 {
+        x = (features[now + d] - features[i * MATCH_DIM + d]) / spread[d]
+        cost = cost + x * x
+        d = d + 1
+    }
+    d = 14
+    while d < MATCH_DIM {
+        x = (q[d - 14] - features[i * MATCH_DIM + d]) / spread[d]
+        cost = cost + MATCH_WAY * x * x
+        d = d + 1
+    }
+    return cost
+}
+
+// Whether frame `i` keeps each foot down now down, within MATCH_FOOT of where
+// it is (features at `now`).
+feet_fit(s: *State, features: float[], now: int, i: int, downs: bool[]) -> bool {
+    m = s.matcher as *Matcher
+    t = list.get_raw(s.takes, (m.owner as int[])[i]) as *Take
+    at = ((m.at as int[])[i] as float) / clips.rate(t)
+    side = 0
+    while side < 2 {
+        if downs[side] {
+            if !clips.contact(t, side, at, clips.looping(t)) { return false }
+            dx = features[now + side * 6] - features[i * MATCH_DIM + side * 6]
+            dz = features[now + side * 6 + 2] - features[i * MATCH_DIM + side * 6 + 2]
+            if dx * dx + dz * dz > MATCH_FOOT * MATCH_FOOT { return false }
+        }
+        side = side + 1
+    }
+    return true
+}
