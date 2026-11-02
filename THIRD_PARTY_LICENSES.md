@@ -112,3 +112,9 @@ Cuts of motion capture takes from [the 100STYLE dataset](https://ianxmason.githu
 Dataset - Ian Mason", licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/legalcode). Each
 file is a range of frames of one of the dataset's BVH files, otherwise unchanged; `tests/fixtures/people/README.md`
 names the file and frames each was cut from. Test fixtures only: no build or program ships them.
+
+## Quaternius's modular people (resources/people/)
+
+Six figures from Quaternius's Ultimate Modular Men and Ultimate Modular Women packs, unchanged but for
+their names: [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/legalcode), models by
+Quaternius. The files, their sources and their hashes are in `resources/people/README.md`.
