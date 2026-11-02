@@ -568,9 +568,11 @@ check_module() {   # check_module <module>: a program importing it through aethe
     printf 'import %s\nmain() { println("ok") }\n' "$1" > "$probe"
     # The same search path build.sh gives every program: the engine, and
     # the physics engine in its submodule, which ae3d.physics imports.
-    # The examples' shared code is found from the root, as they import it.
+    # The examples' shared code is found from the root (where aetherc runs),
+    # as they import it, with the same path: examples/lib/street, which
+    # builds the street's colliders, imports ae3d.physics, and with the
+    # engine's src alone aephysics was not found.
     lib="$PWD/src:$PWD/deps/aephysics"
-    case "$1" in examples.*) lib="$PWD/src" ;; esac
     AETHER_LIB_DIR="$lib" aetherc "$probe" "${probe%.ae}.c" >"$CHECK_DIR/$1.log" 2>&1
     echo $? >"$CHECK_DIR/$1.status"
     rm -f "$probe" "${probe%.ae}.c"
