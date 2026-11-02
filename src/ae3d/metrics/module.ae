@@ -1,0 +1,558 @@
+// ae3d.metrics: how a figure's motion reads to a player, measured on what is
+// drawn (#854).
+//
+// A meter reads a figure's drawn skeleton every frame (pose.read), whoever
+// wrote it: the animator, motion's sit and get-up, a ragdoll, a hand-off
+// between them. So every writer, and every hand-off, is held to the same
+// definitions, and the engine's tests, its showcase and a game's scorecard
+// share them rather than each keeping its own copy.
+//
+//   m = metrics.meter_new(rig, object)
+//   metrics.meter_set_reference(m, fastest)   // a take's own fastest joint turn
+//   ... each frame, after the pose is drawn:
+//   metrics.meter_take(m, dt)
+//   ... then, for any measure:
+//   metrics.meter_worst(m, metrics.SKATE), metrics.meter_when(m, metrics.SKATE)
+//   metrics.meter_reset(m)                    // a new window
+//   metrics.meter_joint(m, metrics.POP)       // which joint it was
+//
+// A take's own fastest joint turn, the reference a pop is judged by, is
+// read from the take itself: metrics.take_fastest(take, rig).
+//
+// What it measures (the worst over the window, and when):
+//   POP           the fastest any joint turned in a frame, radians a second;
+//                 a pop is one past the reference (a take's own fastest)
+//   SKATE         how far a toe's tip slid over the ground while its foot stood
+//                 on it, metres a stance: a foot stands while its pad is within
+//                 CONTACT of the ground under it
+//   JERK_HANDS    the hands' jerk (the third derivative of position), m/s³
+//   JERK_PELVIS   the pelvis's
+//   INTO_GROUND   how far a sole (heel, pad or toe) went into the ground, m
+//   LEGS_APART    how close the legs came, shin to shin, thigh to thigh and
+//                 across, metres (the worst is the least)
+//   KNEE_OUT      how far a knee bent 6 cm off its leg's line pointed out off
+//                 the way the hips face, radians
+//   KNEE_IN       and in, toward the other leg
+//   CHEST_TWIST   the line across the shoulders against the line across the
+//                 hips, level, radians
+//   FOREARM_ROLL  a forearm's roll off its upper arm, radians
+//   FEET_CROSS    how far a foot stood past the hips' middle toward the other
+//                 side, metres (below 0 while neither crosses)
+//   GOAL          how far a joint was from a goal it was set (meter_goal), m
+//
+// The ground is the figure's floor (its object's height) unless a physics
+// world is given (meter_ground_physics), whose static geometry is then read
+// by ray under each foot. The soles are ikrig's: heel, pad and toe found from
+// the rig, or from the flesh where a foot has no toe joint.
+
+exports (
+    Meter, MEASURES, POP, SKATE, JERK_HANDS, JERK_PELVIS, INTO_GROUND, LEGS_APART,
+    KNEE_OUT, KNEE_IN, CHEST_TWIST, FOREARM_ROLL, FEET_CROSS, GOAL, CONTACT,
+    meter_new, meter_free, meter_ground_physics, meter_set_reference, meter_goal, meter_goal_off,
+    meter_take, meter_reset, meter_moved, meter_worst, meter_when, meter_joint, meter_last, meter_frames, measure_name, meter_pop,
+    take_fastest
+)
+
+import std.heap
+import ae3d.core
+import ae3d.behaviour
+import ae3d.physics
+import ae3d.pose
+import ae3d.ikrig
+import ae3d.clips
+
+extern calloc(count: int, size: int) -> ptr
+extern free(block: ptr)
+
+const POP = 0
+const SKATE = 1
+const JERK_HANDS = 2
+const JERK_PELVIS = 3
+const INTO_GROUND = 4
+const LEGS_APART = 5
+const KNEE_OUT = 6
+const KNEE_IN = 7
+const CHEST_TWIST = 8
+const FOREARM_ROLL = 9
+const FEET_CROSS = 10
+const GOAL = 11
+const MEASURES = 12
+
+// A foot stands on the ground while its pad (the ball of the foot) is within
+// this of the ground under it: down flat or rolling off its toes, not
+// coming down on its heel with its toes still up.
+const CONTACT = 0.015
+// A knee bent less than this off its leg's line says nothing about where it
+// points.
+const KNEE_BENT = 0.06
+// Metres over a foot a ground ray starts, and how far down it looks.
+const LOOK_UP = 0.6
+const LOOK_DOWN = 1.6
+
+struct Meter {
+    rig: ptr                       // *pose.Rig
+    object: ptr                    // *GameObject
+    feet: ptr                      // *Feet (ikrig): the soles' geometry, never solved
+    physics: ptr                   // *Physics, or null: the ground read by ray
+    pose_now: ptr                  // the drawn local pose, this frame and the one before
+    pose_before: ptr
+    worlds: ptr                    // scratch: the drawn pose in the rig's space
+    frames: int
+    clock: float
+    reference: float               // the fastest a joint may turn: a take's own
+    worst: ptr                     // float[MEASURES]
+    worst_at: ptr                  // float[MEASURES]: the clock at each worst
+    worst_joint: ptr               // int[MEASURES]: the joint each worst was at, -1 for none
+    last: ptr                      // float[MEASURES]: this frame's value
+    // Each toe: in contact, and where it came down.
+    touching: ptr                  // float[2]
+    down_at: ptr                   // float[6]
+    // The hands' and the pelvis's last four positions, for jerk: 3 points x 4 frames x 3.
+    trail: ptr                     // float[36]
+    trail_count: int
+    // A goal: a joint and the point it should be at.
+    goal_joint: int
+    goal_at: Vec3
+    moved: bool                    // put down elsewhere since the last frame (meter_moved)
+}
+
+meter_new(rig: *pose.Rig, o: *GameObject) -> *Meter {
+    if rig == null || o == null { return null }
+    m = heap.new(Meter)
+    m.rig = rig as ptr
+    m.object = o as ptr
+    m.feet = ikrig.feet_new(rig, o) as ptr
+    m.pose_now = pose.new(rig)
+    m.pose_before = pose.new(rig)
+    m.worlds = pose.new(rig)
+    m.worst = calloc(MEASURES, 8)
+    m.worst_at = calloc(MEASURES, 8)
+    m.worst_joint = calloc(MEASURES, 4)
+    m.last = calloc(MEASURES, 8)
+    m.touching = calloc(2, 8)
+    m.down_at = calloc(6, 8)
+    m.trail = calloc(36, 8)
+    m.goal_joint = 0 - 1
+    m.reference = 0.0
+    meter_reset(m)
+    return m
+}
+
+meter_free(m: *Meter) {
+    if m == null { return }
+    ikrig.feet_free(m.feet as *Feet)
+    pose.release(m.pose_now)
+    pose.release(m.pose_before)
+    pose.release(m.worlds)
+    free(m.worst)
+    free(m.worst_at)
+    free(m.worst_joint)
+    free(m.last)
+    free(m.touching)
+    free(m.down_at)
+    free(m.trail)
+    heap.free(m)
+}
+
+// The ground read from this physics world's static geometry by ray, not the
+// figure's floor.
+meter_ground_physics(m: *Meter, p: *Physics) { if m != null { m.physics = p as ptr } }
+
+// The fastest a joint may turn, radians a second (a take's own fastest): what
+// a POP is judged against (meter_pop).
+meter_set_reference(m: *Meter, fastest: float) { if m != null { m.reference = fastest } }
+
+// Joint `j` should be at `point` (the world's): GOAL measures how far it is.
+meter_goal(m: *Meter, j: int, point: Vec3) {
+    if m == null { return }
+    m.goal_joint = j
+    m.goal_at = point
+}
+
+meter_goal_off(m: *Meter) { if m != null { m.goal_joint = 0 - 1 } }
+
+// A new window: every worst forgotten.
+meter_reset(m: *Meter) {
+    worst = m.worst as float[]
+    worst_at = m.worst_at as float[]
+    worst_joint = m.worst_joint as int[]
+    k = 0
+    while k < MEASURES {
+        worst[k] = 0.0
+        worst_at[k] = 0.0 - 1.0
+        worst_joint[k] = 0 - 1
+        k = k + 1
+    }
+    // The legs' least gap and a foot past the middle start from where any
+    // frame is worse.
+    worst[LEGS_APART] = 1000.0
+    worst[FEET_CROSS] = 0.0 - 1000.0
+}
+
+// The figure was put down elsewhere (a teleport, a respawn, a course
+// begun again): its feet are taken afresh and its joints from where they
+// are, not measured as sliding or turning there. Measured through it, a
+// figure taken back to the foot of its stairs skated 2 m.
+meter_moved(m: *Meter) { if m != null { m.moved = true } }
+
+meter_worst(m: *Meter, which: int) -> float { return (m.worst as float[])[which] }
+meter_when(m: *Meter, which: int) -> float { return (m.worst_at as float[])[which] }
+// The joint the window's worst of `which` was at (a rig joint index), or -1:
+// for POP the joint that turned fastest, for SKATE, INTO_GROUND and
+// FEET_CROSS the foot, KNEE_OUT and KNEE_IN the calf, FOREARM_ROLL the
+// forearm, the jerks the hand or the pelvis, GOAL the goal's joint.
+meter_joint(m: *Meter, which: int) -> int { return (m.worst_joint as int[])[which] }
+meter_last(m: *Meter, which: int) -> float { return (m.last as float[])[which] }
+// Frames taken since the meter was made (a reset does not start it again).
+meter_frames(m: *Meter) -> int { return m.frames }
+
+// The window's fastest joint turn past the reference, as a share of it: 0
+// when no joint turned faster than the take's own (or no reference is set).
+meter_pop(m: *Meter) -> float {
+    if m == null || m.reference <= 0.0 { return 0.0 }
+    over = (m.worst as float[])[POP] / m.reference - 1.0
+    if over < 0.0 { return 0.0 }
+    return over
+}
+
+measure_name(which: int) -> string {
+    names = ["pop", "skate", "jerk of the hands", "jerk of the pelvis", "into the ground", "legs apart",
+             "knee out", "knee in", "chest twist", "forearm roll", "feet cross", "goal"]
+    if which < 0 || which >= MEASURES { return "" }
+    return names[which]
+}
+
+// A frame's value for measure `which`, at joint `joint` (-1 for none): kept
+// as the window's worst when it is (the least, for LEGS_APART), with the
+// time and the joint.
+note(m: *Meter, which: int, value: float, joint: int) {
+    worst = m.worst as float[]
+    worst_at = m.worst_at as float[]
+    (m.last as float[])[which] = value
+    worse = value > worst[which]
+    if which == LEGS_APART { worse = value < worst[which] }
+    if worse {
+        worst[which] = value
+        worst_at[which] = m.clock
+        (m.worst_joint as int[])[which] = joint
+    }
+}
+
+joint_at(m: *Meter, slot: int) -> Vec3 {
+    r = m.rig as *pose.Rig
+    j = pose.human(r, slot)
+    if j < 0 { return core.vec3(0.0, 0.0, 0.0) }
+    return ikrig.to_ground(r, pose.translation(m.worlds, j))
+}
+
+ground_under(m: *Meter, p: Vec3) -> float {
+    // The floor where the figure is drawn, as its pose is measured.
+    floor = behaviour.object_position(m.object as *GameObject).y
+    om = behaviour.object_model(m.object as *GameObject)
+    if om != null {
+        drawn_at, _q, _s = core.model_drawn_transform(om)
+        floor = drawn_at.y
+    }
+    if m.physics == null { return floor }
+    hit = physics.ray_static_hit(m.physics as *Physics, core.vec3(p.x, p.y + LOOK_UP, p.z), core.vec3(0.0, 0.0 - 1.0, 0.0), LOOK_UP + LOOK_DOWN)
+    if !hit.hit { return floor }
+    return hit.point.y
+}
+
+// Read the figure as it is drawn now and measure it, `dt` seconds after the
+// frame before.
+meter_take(m: *Meter, dt: float) {
+    if m == null { return }
+    r = m.rig as *pose.Rig
+    pose.copy(r, m.pose_now, m.pose_before)
+    pose.read(r, m.pose_now)
+    pose.world(r, m.pose_now, m.worlds)
+    m.clock = m.clock + dt
+    m.frames = m.frames + 1
+    if m.moved {
+        // A new place: nothing before it is measured against.
+        (m.touching as float[])[0] = 0.0
+        (m.touching as float[])[1] = 0.0
+        m.trail_count = 0
+        pose.copy(r, m.pose_now, m.pose_before)
+        m.moved = false
+    }
+    if m.frames > 1 && dt > 0.0 { turns(m, dt) }
+    feet(m)
+    legs(m)
+    trunk_and_arms(m)
+    jerk(m, dt)
+    if m.goal_joint >= 0 {
+        note(m, GOAL, core.v3_len(core.v3_sub(ikrig.to_ground(r, pose.translation(m.worlds, m.goal_joint)), m.goal_at)), m.goal_joint)
+    }
+}
+
+// The fastest any joint turned since the frame before.
+turns(m: *Meter, dt: float) {
+    r = m.rig as *pose.Rig
+    most, joint = fastest_between(r, m.pose_before, m.pose_now)
+    note(m, POP, most / dt, joint)
+}
+
+// The most any joint turns from pose `a` to pose `b`, radians, and which.
+fastest_between(r: *pose.Rig, a_pose: ptr, b_pose: ptr) -> (float, int) {
+    most = 0.0
+    joint = 0 - 1
+    j = 0
+    while j < pose.count(r) {
+        a = pose.rotation(a_pose, j)
+        b = pose.rotation(b_pose, j)
+        d = core.abs_of(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w)
+        if d > 1.0 { d = 1.0 }
+        angle = 2.0 * core.acos_of(d)
+        if angle > most {
+            most = angle
+            joint = j
+        }
+        j = j + 1
+    }
+    return most, joint
+}
+
+// A take's own fastest joint turn, radians a second, frame to frame (and
+// across its loop), on `rig`: the reference a pop is judged by
+// (meter_set_reference). The take's own motion only: what IK adds on a
+// figure is the figure's to measure.
+take_fastest(t: *Take, rig: *pose.Rig) -> float {
+    if t == null || rig == null || clips.frames(t) < 2 || clips.rate(t) <= 0.0 { return 0.0 }
+    most = 0.0
+    f = 1
+    while f < clips.frames(t) {
+        turned, _j = fastest_between(rig, clips.frame(t, f - 1), clips.frame(t, f))
+        if turned > most { most = turned }
+        f = f + 1
+    }
+    if clips.looping(t) {
+        turned, _j2 = fastest_between(rig, clips.frame(t, clips.frames(t) - 1), clips.frame(t, 0))
+        if turned > most { most = turned }
+    }
+    return most * clips.rate(t)
+}
+
+// The toes on the ground and the soles in it.
+feet(m: *Meter) {
+    r = m.rig as *pose.Rig
+    f = m.feet as *Feet
+    touching = m.touching as float[]
+    down_at = m.down_at as float[]
+    skate = 0.0
+    into = 0.0
+    skate_foot = 0 - 1
+    into_foot = 0 - 1
+    foots = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    side = 0
+    while side < 2 {
+        heel, pad, toe = ikrig.feet_soles(f, r, m.worlds, side)
+        tip = ikrig.toe_tip(f, r, m.worlds, side)
+        k = 0
+        while k < 3 {
+            p = heel
+            if k == 1 { p = pad }
+            if k == 2 { p = toe }
+            under = ground_under(m, p) - p.y
+            if under > into {
+                into = under
+                into_foot = foots[side]
+            }
+            k = k + 1
+        }
+        on = pad.y - ground_under(m, pad) < CONTACT
+        if on && touching[side] < 0.5 {
+            down_at[side * 3] = tip.x
+            down_at[side * 3 + 2] = tip.z
+        }
+        if on {
+            dx = tip.x - down_at[side * 3]
+            dz = tip.z - down_at[side * 3 + 2]
+            slid = core.sqrt_of(dx * dx + dz * dz)
+            if slid > skate {
+                skate = slid
+                skate_foot = foots[side]
+            }
+        }
+        touching[side] = 0.0
+        if on { touching[side] = 1.0 }
+        side = side + 1
+    }
+    note(m, SKATE, skate, skate_foot)
+    note(m, INTO_GROUND, into, into_foot)
+}
+
+// The least distance between the segments a0-a1 and b0-b1, from twelve
+// points along the first.
+segment_gap(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> float {
+    best = 1000000.0
+    k = 0
+    while k <= 12 {
+        u = (k as float) / 12.0
+        p = core.v3_lerp(a0, a1, u)
+        ab = core.v3_sub(b1, b0)
+        t = 0.0
+        l2 = core.v3_dot(ab, ab)
+        if l2 > 0.000000001 { t = core.clampf(core.v3_dot(core.v3_sub(p, b0), ab) / l2, 0.0, 1.0) }
+        d = core.v3_len(core.v3_sub(p, core.v3_add(b0, core.v3_mul(ab, t))))
+        if d < best { best = d }
+        k = k + 1
+    }
+    return best
+}
+
+legs(m: *Meter) {
+    hip_l = joint_at(m, pose.THIGH_L)
+    knee_l = joint_at(m, pose.CALF_L)
+    ankle_l = joint_at(m, pose.FOOT_L)
+    hip_r = joint_at(m, pose.THIGH_R)
+    knee_r = joint_at(m, pose.CALF_R)
+    ankle_r = joint_at(m, pose.FOOT_R)
+    // Shin against shin, thigh against thigh (from 40% down), and across.
+    gap = segment_gap(knee_l, ankle_l, knee_r, ankle_r)
+    g2 = segment_gap(core.v3_lerp(hip_l, knee_l, 0.4), knee_l, core.v3_lerp(hip_r, knee_r, 0.4), knee_r)
+    if g2 < gap { gap = g2 }
+    g3 = segment_gap(knee_l, ankle_l, core.v3_lerp(hip_r, knee_r, 0.4), knee_r)
+    if g3 < gap { gap = g3 }
+    g4 = segment_gap(knee_r, ankle_r, core.v3_lerp(hip_l, knee_l, 0.4), knee_l)
+    if g4 < gap { gap = g4 }
+    note(m, LEGS_APART, gap, 0 - 1)
+    // The way the hips face, level: square to the line from the right hip to the left.
+    across = core.v3_sub(hip_l, hip_r)
+    across = core.vec3(across.x, 0.0, across.z)
+    if core.v3_len(across) < 0.000001 { return }
+    across = core.v3_normalize(across)
+    facing = core.v3_cross(across, core.vec3(0.0, 1.0, 0.0))
+    out_most = 0.0
+    out_calf = 0 - 1
+    in_calf = 0 - 1
+    in_most = 0.0
+    side = 0
+    while side < 2 {
+        hip = hip_l
+        knee = knee_l
+        ankle = ankle_l
+        sign = 1.0
+        if side == 1 {
+            hip = hip_r
+            knee = knee_r
+            ankle = ankle_r
+            sign = 0.0 - 1.0
+        }
+        line = core.v3_sub(ankle, hip)
+        if core.v3_len(line) > 0.000001 {
+            line = core.v3_normalize(line)
+            off = core.v3_sub(core.v3_sub(knee, hip), core.v3_mul(line, core.v3_dot(core.v3_sub(knee, hip), line)))
+            flat = core.vec3(off.x, 0.0, off.z)
+            if core.v3_len(flat) > KNEE_BENT {
+                flat = core.v3_normalize(flat)
+                out = core.atan2_of(core.v3_dot(flat, core.v3_mul(across, sign)), core.v3_dot(flat, facing))
+                calf = pose.human(m.rig as *pose.Rig, pose.CALF_L + side * 4)
+                if out > out_most {
+                    out_most = out
+                    out_calf = calf
+                }
+                if 0.0 - out > in_most {
+                    in_most = 0.0 - out
+                    in_calf = calf
+                }
+            }
+        }
+        side = side + 1
+    }
+    note(m, KNEE_OUT, out_most, out_calf)
+    note(m, KNEE_IN, in_most, in_calf)
+    // A foot past the hips' middle toward the other side.
+    middle = core.v3_lerp(hip_l, hip_r, 0.5)
+    crossed = core.v3_dot(core.v3_sub(ankle_r, middle), across)
+    crossed_l = 0.0 - core.v3_dot(core.v3_sub(ankle_l, middle), across)
+    crossed_foot = pose.human(m.rig as *pose.Rig, pose.FOOT_R)
+    if crossed_l > crossed {
+        crossed = crossed_l
+        crossed_foot = pose.human(m.rig as *pose.Rig, pose.FOOT_L)
+    }
+    note(m, FEET_CROSS, crossed, crossed_foot)
+}
+
+trunk_and_arms(m: *Meter) {
+    r = m.rig as *pose.Rig
+    hips = core.v3_sub(joint_at(m, pose.THIGH_L), joint_at(m, pose.THIGH_R))
+    hips = core.vec3(hips.x, 0.0, hips.z)
+    shoulders = core.v3_sub(joint_at(m, pose.UPPERARM_L), joint_at(m, pose.UPPERARM_R))
+    shoulders = core.vec3(shoulders.x, 0.0, shoulders.z)
+    if core.v3_len(hips) > 0.000001 && core.v3_len(shoulders) > 0.000001 {
+        note(m, CHEST_TWIST, core.acos_of(core.clampf(core.v3_dot(core.v3_normalize(shoulders), core.v3_normalize(hips)), 0.0 - 1.0, 1.0)), pose.human(r, pose.SPINE_03))
+    }
+    most = 0.0
+    roll_joint = 0 - 1
+    side = 0
+    while side < 2 {
+        l = ikrig.arm_limb(r, side)
+        if l != null {
+            local = core.quat_mul(core.quat_conjugate(pose.rotation(m.worlds, l.upper)), pose.rotation(m.worlds, l.middle))
+            roll = core.abs_of(2.0 * core.atan2_of(local.x * l.lower.x + local.y * l.lower.y + local.z * l.lower.z, local.w))
+            if roll > 3.141592653589793 { roll = 6.283185307179586 - roll }
+            if roll > most {
+                most = roll
+                roll_joint = l.middle
+            }
+            ikrig.limb_free(l)
+        }
+        side = side + 1
+    }
+    note(m, FOREARM_ROLL, most, roll_joint)
+}
+
+// The hands' and the pelvis's jerk, from their last four positions.
+jerk(m: *Meter, dt: float) {
+    trail = m.trail as float[]
+    slots = [pose.HAND_L, pose.HAND_R, pose.PELVIS]
+    // Shift: the oldest frame out, this frame in at the end.
+    p = 0
+    while p < 3 {
+        f = 0
+        while f < 3 {
+            k = 0
+            while k < 3 {
+                trail[(p * 4 + f) * 3 + k] = trail[(p * 4 + f + 1) * 3 + k]
+                k = k + 1
+            }
+            f = f + 1
+        }
+        now = joint_at(m, slots[p])
+        trail[(p * 4 + 3) * 3] = now.x
+        trail[(p * 4 + 3) * 3 + 1] = now.y
+        trail[(p * 4 + 3) * 3 + 2] = now.z
+        p = p + 1
+    }
+    m.trail_count = m.trail_count + 1
+    if m.trail_count < 4 || dt <= 0.0 { return }
+    hands = 0.0
+    pelvis = 0.0
+    hand = 0 - 1
+    p = 0
+    while p < 3 {
+        // The third difference of the four positions, over dt cubed.
+        j = 0.0
+        k = 0
+        while k < 3 {
+            x0 = trail[(p * 4) * 3 + k]
+            x1 = trail[(p * 4 + 1) * 3 + k]
+            x2 = trail[(p * 4 + 2) * 3 + k]
+            x3 = trail[(p * 4 + 3) * 3 + k]
+            d = x3 - 3.0 * x2 + 3.0 * x1 - x0
+            j = j + d * d
+            k = k + 1
+        }
+        j = core.sqrt_of(j) / (dt * dt * dt)
+        if p < 2 && j > hands {
+            hands = j
+            hand = pose.human(m.rig as *pose.Rig, slots[p])
+        }
+        if p == 2 { pelvis = j }
+        p = p + 1
+    }
+    note(m, JERK_HANDS, hands, hand)
+    note(m, JERK_PELVIS, pelvis, pose.human(m.rig as *pose.Rig, pose.PELVIS))
+}
