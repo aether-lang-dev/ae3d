@@ -5,7 +5,7 @@
 
 **A 3D game engine for open worlds full of people, written in [Aether](https://github.com/aether-lang-dev/aether): streets and crowds, characters that move like people, physics, weather and multiplayer. Programs can drive it and check it.**
 
-![A street of brick terraces at half past five, the wet road gold under a low sun, people walking the pavements and two talking by a door](docs/images/hero.jpg)
+![A street of brick terraces at half past five, the low sun at its end, people walking the pavements and two talking by a door](docs/images/hero.jpg)
 
 <sub>`examples/street_life`, an unedited Vulkan frame. Quaternius's CC0 people walk and talk on the animation pipeline: gaits retargeted from authored clips, feet held on the paving and kerbs, the light ray-traced.</sub>
 
