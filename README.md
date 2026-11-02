@@ -3,56 +3,60 @@
 [![ci](https://github.com/aether-lang-dev/ae3d/actions/workflows/ci.yml/badge.svg)](https://github.com/aether-lang-dev/ae3d/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**A 3D game engine written in [Aether](https://github.com/aether-lang-dev/aether), built to be driven, and checked, by programs.**
+**A 3D game engine for open worlds full of people, written in [Aether](https://github.com/aether-lang-dev/aether): streets and crowds, characters that move like people, physics, weather and multiplayer. Programs can drive it and check it.**
 
-Vulkan and OpenGL behind one scene API, a physics engine of its own, an animation pipeline with retargeting and IK, crowds of half a million, multiplayer, a Blender pipeline and a scene editor. A program, a test or an AI agent can build a scene through a control channel, read back the frame it drew, and hold it to a number.
+![A street of brick terraces at half past five, the wet road gold under a low sun, people walking the pavements and two talking by a door](docs/images/hero.jpg)
 
-![Four unedited frames from ae3d: a sea floor under moving caustics, a black hole bending the stars around its disk, rain over an island in a Gerstner sea, and the editor with a selected cube and its components](docs/images/hero.png)
+<sub>`examples/street_life`, an unedited Vulkan frame. Quaternius's CC0 people walk and talk on the animation pipeline: gaits retargeted from authored clips, feet held on the paving and kerbs, the light ray-traced.</sub>
 
-<sub>Unedited Vulkan frames: `examples/caustics.ae`, `examples/black_hole.ae`, `examples/smooth_terrain.ae` under `AE3D_WEATHER=storm`, and the editor.</sub>
-
-ae3d is the next generation of [Gopher3D](https://github.com/nicolas-maman/gopher3D), the same author's Go engine, rebuilt in Aether and taken much further.
+ae3d draws with Vulkan or OpenGL behind one scene API, simulates with a physics engine of its own, animates people through a pipeline of retargeting, blending, IK and physical reactions, and puts half a million of them on screen as a crowd. A program, a test or an AI agent builds a scene through a control channel, reads back the frame it drew, and holds it to a number. It is the next generation of [Gopher3D](https://github.com/nicolas-maman/gopher3D), the same author's Go engine.
 
 ## Why ae3d
 
-- **Every claim is a number.** Features ship with a test that measures them on the frame or the simulation, and scenes are verified from a sweep of camera positions, not from one still. Each page of the docs gives the measurement behind what it claims ([testing](docs/testing.md)).
+- **Every claim is a number.** Each feature ships with a test that measures it on the frame or the simulation, and scenes are judged from a sweep of camera positions, not one flattering still ([testing](docs/testing.md)).
 - **Programs drive it.** `AE3D_AGENT=port` opens a JSON channel: change the scene, hold a frame, read its pixels, trace a model from its Blender object to the pixels it landed on ([agent channel](docs/agent.md)).
-- **One language, top to bottom.** The loop, the renderers, the physics and the crowd's kernels are Aether. The C that remains is listed with one reason each ([native/README.md](native/README.md)).
-- **Two renderers, one interface.** Vulkan by default and OpenGL at parity; one test draws the same scene through both and holds them to within 0.7% of channels. DirectX 12 and Metal are next on the same interface.
+- **One language, top to bottom.** The loop, the renderers, the physics and the crowd's kernels are Aether. The C that remains is listed with a reason for each ([native/README.md](native/README.md)).
+- **Two renderers, one interface.** Vulkan by default and OpenGL at parity; one test draws the same scene through both and holds them within 0.7% of channels. DirectX 12 and Metal are next on the same interface.
 
 ## What's inside
 
+**Characters and animation** ([docs](docs/animation-pipeline.md))
+
+![People walking a sunlit street toward the camera, others standing in pairs by the buildings](docs/images/street-life.gif)
+
+- **One writer per figure.** The animator owns a figure's pose. A game sets speeds, parameters and states, never a bone, and can hand the figure to another writer (a ragdoll, a sit) and take it back without a pop.
+- **Any humanoid.** Rigs named as UE5, Rigify, Mixamo or Quaternius's modular people map onto one layout. Clips are retargeted between bodies once and shared, and motion capture comes in from BVH (100STYLE) with its feet kept.
+- **The graph:** 1D and 2D blend spaces synced on footfalls, inertialized transitions, aim offsets, masked and additive layers, motion matching, and a mover that starts, stops and turns on the spot in steps.
+- **IK:**
+  - knees and elbows held to their limits;
+  - FABRIK chains and whole-body reach;
+  - an aim spread up the spine, with both hands on a rifle;
+  - feet on any ground: soles traced heel to toe on stairs and slopes, measured from the mesh where a rig has no toes.
+- **Held to numbers on real people:**
+  - from 1 to 8 m/s a planted toe slides under 1.5 mm, and the feet carry the ground at the speed asked within 1%;
+  - on 0.2 m stairs and a 20° ramp no sole sinks 1 mm into the ground;
+  - a change of gait turns no joint 2% faster than the clips themselves do.
+- **Active ragdolls** on any figure, struck and recovering ([natural motion](docs/motion.md)). Physical animation and get-ups into matched clips are under way ([#853](https://github.com/aether-lang-dev/ae3d/issues/853)).
+
 **Rendering** ([docs](docs/rendering.md))
 - Physically based materials, sixteen lights a frame from any number, normal maps, texel-snapped shadow maps.
-- Global illumination: DDGI probes traced on the GPU where it traces, the sky's own light elsewhere.
+- Global illumination: DDGI probes traced on the GPU where it can trace, and the sky's own light elsewhere.
 - Ray-traced shadows and ambient occlusion through Vulkan ray queries, screen-space reflections, SSAO.
-- MSAA, TAA, DLSS and a spatial upscaler, HDR with bloom and ACES, depth of field, environment maps from HDR and EXR files.
+- MSAA, TAA, DLSS and a spatial upscaler; HDR with bloom and ACES; depth of field; environment maps from HDR and EXR files.
 - A sky by the hour with volumetric clouds, weather (rain, snow, dust, storm), and a Gerstner sea with caustics.
 
-**Animation** ([docs](docs/animation-pipeline.md))
-- One pose per figure per frame, one writer: games set a speed or a state, never a bone.
-- Rigs from UE5, Rigify or Mixamo naming on one humanoid layout; clips retargeted between bodies, and motion capture read from BVH (100STYLE) with its feet kept.
-- A state graph, 1D and 2D blend spaces synced on footfalls, inertialized transitions, aim offsets, masked and additive layers, motion matching, and a mover that starts, stops and turns on the spot in steps.
-- IK with knees and elbows held to their limits, FABRIK chains, whole-body reach, an aim spread up the spine with both hands on a rifle, and feet on any ground: soles traced heel to toe on stairs and slopes, toes bent at the ball.
-- Held to numbers on real people: from 1 to 8 m/s a planted toe slides under 1.5 mm and the feet carry the ground at the speed asked within 1%; on 0.2 m stairs and a 20° ramp no sole sinks 1 mm into the ground; a change of gait turns no joint 2% faster than the clips themselves do.
-
-![A mannequin mid-sprint on its blended gaits, one foot planted, its shadow long under a late afternoon sky](docs/images/animation-pipeline.png)
-
-<sub>`tools/anim_showcase.ae`: Quaternius's Rigify mannequin (CC0) on its walk, jog and sprint blended by speed, the planted foot held by IK.</sub>
-
 **Physics** ([docs](docs/physics.md))
-- [aephysics](https://github.com/aether-lang-dev/aephysics), a rigid body engine on Box3D's design written in Aether: hulls, meshes, every joint, ragdolls that wear a skinned figure, vehicles, continuous collision, a parallel step identical to the bit at any thread count.
+- [aephysics](https://github.com/aether-lang-dev/aephysics), a rigid body engine on Box3D's design written in Aether: hulls, meshes, every joint, ragdolls that wear a skinned figure, vehicles, continuous collision, and a parallel step identical to the bit at any thread count.
 - A character controller over kerbs, stairs and slopes: 10,000 random moves through the street end no deeper than the solver's 5 mm slop.
-- Active ragdolls on any figure, struck and recovering ([natural motion](docs/motion.md)).
 
 **Crowds and navigation** ([docs](docs/crowds.md))
-- Walk cycles baked into pose banks and every instance posed on the GPU from its own phase, in three tiers by distance down to lit impostors, sorted and drawn indirect on the device.
+- Walk cycles baked into pose banks, every instance posed on the GPU from its own phase, in three tiers by distance down to lit impostors, sorted and drawn indirect on the device.
 - Half a million animated zombies at 79 fps, steered by a flow field over the ground.
 
 **Multiplayer** ([docs](docs/networking.md))
 - UDP with a reliable ordered channel of its own, TCP, or loopback with simulated latency, jitter and loss.
-- Snapshots quantised and sent as changes against what each client acknowledged, only what is near each client or in its view, within its budget of bytes.
-- Players predicted and reconciled, a horde simulated on every peer, and the editor playing a scene as a host and its clients.
+- Snapshots quantised and sent as changes against what each client acknowledged: only what is near each client or in its view, within its budget of bytes.
+- Players predicted and reconciled, a horde simulated on every peer, and the editor playing a scene as a host with its clients.
 
 **Tools and assets**
 - A scene editor in the Unity mould: objects as their components, gizmos, terrain sculpting, Simulate, and Play as a host with clients ([editor](docs/editor.md)).
@@ -78,6 +82,7 @@ ae run examples/spinning_cube.ae                 # build and run, as any Aether 
 
 ```bash
 ./build.sh examples/street_drive.ae && ./build/street_drive      # W/S A/D, space, shift; drives itself if left alone
+./build.sh examples/street_life.ae && ./build/street_life        # people on the street at half past five
 ./build.sh tools/anim_showcase.ae && ./build/anim_showcase       # the animation pipeline on seven people
 ./build.sh examples/zombie_city.ae && AE3D_CROWD=100000 ./build/zombie_city
 AE3D_API=opengl ./build/zombie_city                              # the other renderer
@@ -150,8 +155,8 @@ How the loop, the behaviours, the renderers and the job pool fit together is in 
 |---|---|
 | ![A car on wheel joints driving the zombie street at night](docs/images/street-drive.png) | ![The seabed under the swell, caustics on the sand](docs/images/caustics.png) |
 | **`street_drive`**: every building and kerb a collider of its own triangles, a car on suspension, drive and steering joints, and bystanders who are active ragdolls the car knocks down. 501 bodies; the physics takes 0.09 ms of a 144 fps frame. | **`caustics`**: the seabed under a Gerstner swell, the light refracted through the surface every frame. |
-| ![A pyramid of crates scattered by a cannonball](docs/images/physics-pyramid.png) | ![A hundred thousand survivors from a CC0 glTF](docs/images/gltf-crowd.png) |
-| **`physics`**: four of the physics engine's reference scenes, every body a game object. | **`gltf_crowd`**: a public glTF figure, its walk baked, a hundred thousand of it sorted on the device. |
+| ![A pyramid of crates scattered by a cannonball](docs/images/physics-pyramid.png) | ![A horde of zombies marching down a lamplit street at night](docs/images/zombie-city-night.png) |
+| **`physics`**: four of the physics engine's reference scenes, every body a game object. | **`zombie_city`**: the street made a city at night, and a horde of the real zombie marching down it, every one a decimated instance posed from a shared bank. |
 | ![Rain, a storm, dust and snow over an island](docs/images/weather.png) | ![A million grains of sand](docs/images/sand.png) |
 | **`smooth_terrain`** under `AE3D_WEATHER=rain`, `storm`, `dust` or `snow`. | **`sand`**: a million grains you plough into a heap that slumps to its angle of repose. |
 | ![A voxel island with a forest](docs/images/voxel-world.png) | ![A Kerr black hole](docs/images/black-hole.png) |
@@ -161,6 +166,7 @@ How the loop, the behaviours, the renderers and the job pool fit together is in 
 
 | | |
 |---|---|
+| `street_life` | People on the street at half past five, every one on the animation pipeline; `AE3D_TIME` sets the hour, `AE3D_AWAY=1` turns the camera from the sun. |
 | `street_drive` | Drive the street, then press E and walk it first person on a character controller. |
 | `zombie_city` | The street instanced into a city and a horde hunting the camera; `AE3D_CROWD` sets the count. |
 | `net_walk`, `net_cars` | Multiplayer: `./build/net_walk` hosts, `AE3D_NET=join:127.0.0.1 ./build/net_walk` joins. |
@@ -224,13 +230,13 @@ docs/         the documentation, docs/images/ its pictures
 
 The engine is built toward an open-world game it has to carry: hordes of animated zombies, extreme weather, the best picture the hardware gives, and multiplayer ([#326](https://github.com/aether-lang-dev/ae3d/issues/326)). Underway:
 
-- **Animation** ([#853](https://github.com/aether-lang-dev/ae3d/issues/853)): physical animation on a ragdoll with a weight per bone, ragdolls that get up into a matched clip, 2D blend spaces, and full-body IK, then the older motion code moved onto the pipeline.
+- **Animation** ([#853](https://github.com/aether-lang-dev/ae3d/issues/853)): physical animation on a ragdoll with a weight per bone, get-ups into matched clips, a character component that makes a person a few lines ([#903](https://github.com/aether-lang-dev/ae3d/issues/903)), motion matching over whole motion capture ([#906](https://github.com/aether-lang-dev/ae3d/issues/906)), and combat ([#907](https://github.com/aether-lang-dev/ae3d/issues/907)), then the older motion code moved onto the pipeline.
 - **DirectX 12 and Metal** ([#311](https://github.com/aether-lang-dev/ae3d/issues/311), [#312](https://github.com/aether-lang-dev/ae3d/issues/312)) beside Vulkan.
 - **Prompt to scene** ([#416](https://github.com/aether-lang-dev/ae3d/issues/416)): the agent pipeline that builds a game's scenes and assets through the engine.
 
 ## Credits
 
-ae3d continues [Gopher3D](https://github.com/nicolas-maman/gopher3D) (MIT), the same author's earlier Go engine. Its architecture, GLSL programs, material and lighting model and OBJ loader's behaviour carry over; the Go served as the reference and none of it was copied. Built with [GLFW](https://www.glfw.org/) and [Vulkan](https://www.vulkan.org/) (MoltenVK on macOS); the image decoders are Aether ports of [stb_image](https://github.com/nothings/stb)'s. The test figures are [Quaternius](https://quaternius.com)'s CC0 mannequins and animations. See [NOTICE](NOTICE) and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+ae3d continues [Gopher3D](https://github.com/nicolas-maman/gopher3D) (MIT), the same author's earlier Go engine. Its architecture, GLSL programs, material and lighting model and OBJ loader's behaviour carry over; the Go served as the reference and none of it was copied. Built with [GLFW](https://www.glfw.org/) and [Vulkan](https://www.vulkan.org/) (MoltenVK on macOS); the image decoders are Aether ports of [stb_image](https://github.com/nothings/stb)'s. The people are [Quaternius](https://quaternius.com)'s, all CC0: the test mannequins and their animations, and the modular men and women in `resources/people`. The motion capture is [100STYLE](https://ianxmason.github.io/100style/)'s (CC BY 4.0). See [NOTICE](NOTICE) and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
 ## License
 

@@ -1,0 +1,561 @@
+// Frames as an animated GIF, so motion can be shown where only a picture
+// goes: a README, an issue, a docs page. One palette for every frame (so a
+// still part of the scene keeps its colours from frame to frame instead of
+// shimmering), chosen by median cut over all of them, a light ordered dither
+// so a sky's gradient does not band, and the frames looped forever.
+//
+//   ./build.sh tools/gif.ae
+//   ./build/gif out.gif 4 2 frame_0001.png frame_0002.png ...
+//
+// The second argument is each frame's time in hundredths of a second (4 is
+// 25 a second), the third how many pixels each way become one (2 halves a
+// 1280x720 burst to 640x360). The frames are what AE3D_SNAPSHOT_BURST writes.
+
+import ae3d.core
+import ae3d.png
+import ae3d.picture
+import std.os
+import std.string
+
+extern calloc(count: int, size: int) -> ptr
+extern realloc(block: ptr, size: long) -> ptr
+extern free(block: ptr)
+extern fopen(path: string, mode: string) -> ptr
+extern fclose(f: ptr) -> int
+extern fwrite(buffer: ptr, size: long, count: long, f: ptr) -> long
+
+const COLOURS = 256
+const BINS = 32768               // 5 bits a channel
+const CODES = 4096               // LZW's largest table
+const TRANSPARENT = 255         // the palette's last entry: this pixel as the frame before
+
+// --- the output -------------------------------------------------------------------------------
+
+struct Bytes {
+    data: ptr
+    size: int
+    room: int
+}
+
+put(b: *Bytes, v: int) {
+    if b.size >= b.room {
+        b.room = b.room * 2 + 1024
+        b.data = realloc(b.data, b.room as long)
+    }
+    (b.data as byte[])[b.size] = (v & 255) as byte
+    b.size = b.size + 1
+}
+
+put16(b: *Bytes, v: int) {
+    put(b, v & 255)
+    put(b, (v >> 8) & 255)
+}
+
+put_text(b: *Bytes, s: string) {
+    i = 0
+    while i < string.length(s) {
+        put(b, string.char_at(s, i))
+        i = i + 1
+    }
+}
+
+// --- the frames, smaller ----------------------------------------------------------------------
+
+channel(pixels: ptr, index: int) -> int {
+    return ((pixels as byte[])[index] as int) & 255
+}
+
+// Frame `path` as w x h RGB (top row first), each pixel the mean of the
+// `scale` x `scale` it stood for. Null when it does not load or is not the
+// size of the first.
+shrink(path: string, scale: int, w: int, h: int) -> ptr {
+    img = picture.load(path)
+    if img == null { return null }
+    sw = picture.width(img)
+    sh = picture.height(img)
+    if sw / scale != w || sh / scale != h {
+        picture.dispose(img)
+        return null
+    }
+    src = picture.pixels(img)
+    out = calloc(w * h * 3, 4)
+    rgb = out as int[]
+    y = 0
+    while y < h {
+        x = 0
+        while x < w {
+            r = 0
+            g = 0
+            bl = 0
+            dy = 0
+            while dy < scale {
+                dx = 0
+                while dx < scale {
+                    // The loader puts the bottom row first.
+                    at = ((sh - 1 - (y * scale + dy)) * sw + x * scale + dx) * 4
+                    r = r + channel(src, at)
+                    g = g + channel(src, at + 1)
+                    bl = bl + channel(src, at + 2)
+                    dx = dx + 1
+                }
+                dy = dy + 1
+            }
+            n = scale * scale
+            k = (y * w + x) * 3
+            rgb[k] = r / n
+            rgb[k + 1] = g / n
+            rgb[k + 2] = bl / n
+            x = x + 1
+        }
+        y = y + 1
+    }
+    picture.dispose(img)
+    return out
+}
+
+// The 4x4 Bayer matrix's threshold at (x, y), -7 to +8: a light ordered
+// dither, the same at a pixel in every frame.
+bayer(x: int, y: int) -> int {
+    m = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
+    return m[(y % 4) * 4 + (x % 4)] - 7
+}
+
+clamp8(v: int) -> int {
+    if v < 0 { return 0 }
+    if v > 255 { return 255 }
+    return v
+}
+
+bin_of(r: int, g: int, b: int) -> int {
+    return ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)
+}
+
+// --- the palette: median cut over every frame's colours ---------------------------------------
+
+struct Box {
+    lo: ptr                        // int[3], 5-bit
+    hi: ptr                        // int[3]
+    count: int
+}
+
+box_count(hist: int[], lo: int[], hi: int[]) -> int {
+    n = 0
+    r = lo[0]
+    while r <= hi[0] {
+        g = lo[1]
+        while g <= hi[1] {
+            b = lo[2]
+            while b <= hi[2] {
+                n = n + hist[(r << 10) | (g << 5) | b]
+                b = b + 1
+            }
+            g = g + 1
+        }
+        r = r + 1
+    }
+    return n
+}
+
+// The box shrunk to the colours in it.
+box_fit(hist: int[], bx: *Box) {
+    lo = bx.lo as int[]
+    hi = bx.hi as int[]
+    nlo = [31, 31, 31]
+    nhi = [0, 0, 0]
+    found = false
+    r = lo[0]
+    while r <= hi[0] {
+        g = lo[1]
+        while g <= hi[1] {
+            b = lo[2]
+            while b <= hi[2] {
+                if hist[(r << 10) | (g << 5) | b] > 0 {
+                    found = true
+                    if r < nlo[0] { nlo[0] = r }
+                    if g < nlo[1] { nlo[1] = g }
+                    if b < nlo[2] { nlo[2] = b }
+                    if r > nhi[0] { nhi[0] = r }
+                    if g > nhi[1] { nhi[1] = g }
+                    if b > nhi[2] { nhi[2] = b }
+                }
+                b = b + 1
+            }
+            g = g + 1
+        }
+        r = r + 1
+    }
+    if found {
+        k = 0
+        while k < 3 {
+            lo[k] = nlo[k]
+            hi[k] = nhi[k]
+            k = k + 1
+        }
+    }
+    bx.count = box_count(hist, lo, hi)
+}
+
+new_box(lo0: int, lo1: int, lo2: int, hi0: int, hi1: int, hi2: int) -> *Box {
+    bx = calloc(1, sizeof(Box)) as *Box
+    bx.lo = calloc(3, 4)
+    bx.hi = calloc(3, 4)
+    lo = bx.lo as int[]
+    hi = bx.hi as int[]
+    lo[0] = lo0
+    lo[1] = lo1
+    lo[2] = lo2
+    hi[0] = hi0
+    hi[1] = hi1
+    hi[2] = hi2
+    return bx
+}
+
+// Up to COLOURS colours, each the mean of a box of the histogram, the boxes
+// split at their median along their longest side, the fullest first.
+median_cut(hist: int[], palette: int[]) -> int {
+    boxes = calloc(COLOURS, 8) as ptr[]
+    first = new_box(0, 0, 0, 31, 31, 31)
+    box_fit(hist, first)
+    boxes[0] = first as ptr
+    n = 1
+    while n < COLOURS - 1 {
+        // The fullest box that can still be split.
+        pick = 0 - 1
+        best = 0
+        i = 0
+        while i < n {
+            bx = boxes[i] as *Box
+            lo = bx.lo as int[]
+            hi = bx.hi as int[]
+            if (hi[0] > lo[0] || hi[1] > lo[1] || hi[2] > lo[2]) && bx.count > best {
+                best = bx.count
+                pick = i
+            }
+            i = i + 1
+        }
+        if pick < 0 { break }
+        bx = boxes[pick] as *Box
+        lo = bx.lo as int[]
+        hi = bx.hi as int[]
+        axis = 0
+        if hi[1] - lo[1] > hi[axis] - lo[axis] { axis = 1 }
+        if hi[2] - lo[2] > hi[axis] - lo[axis] { axis = 2 }
+        // The median along it: the first slice that takes the box past half.
+        half = bx.count / 2
+        seen = 0
+        cut = lo[axis]
+        v = lo[axis]
+        while v < hi[axis] {
+            slo = [lo[0], lo[1], lo[2]]
+            shi = [hi[0], hi[1], hi[2]]
+            slo[axis] = v
+            shi[axis] = v
+            seen = seen + box_count(hist, slo, shi)
+            cut = v
+            if seen >= half { break }
+            v = v + 1
+        }
+        other = new_box(lo[0], lo[1], lo[2], hi[0], hi[1], hi[2])
+        ohi = other.hi as int[]
+        olo = other.lo as int[]
+        hi[axis] = cut
+        olo[axis] = cut + 1
+        if olo[axis] > ohi[axis] { olo[axis] = ohi[axis] }
+        box_fit(hist, bx)
+        box_fit(hist, other)
+        boxes[n] = other as ptr
+        n = n + 1
+    }
+    // Each box's colour: the mean of the colours in it, weighted by count.
+    i = 0
+    while i < n {
+        bx = boxes[i] as *Box
+        lo = bx.lo as int[]
+        hi = bx.hi as int[]
+        sr = 0
+        sg = 0
+        sb = 0
+        total = 0
+        r = lo[0]
+        while r <= hi[0] {
+            g = lo[1]
+            while g <= hi[1] {
+                b = lo[2]
+                while b <= hi[2] {
+                    c = hist[(r << 10) | (g << 5) | b]
+                    sr = sr + c * (r * 8 + 4)
+                    sg = sg + c * (g * 8 + 4)
+                    sb = sb + c * (b * 8 + 4)
+                    total = total + c
+                    b = b + 1
+                }
+                g = g + 1
+            }
+            r = r + 1
+        }
+        if total == 0 { total = 1 }
+        palette[i * 3] = sr / total
+        palette[i * 3 + 1] = sg / total
+        palette[i * 3 + 2] = sb / total
+        free(bx.lo)
+        free(bx.hi)
+        free(bx as ptr)
+        i = i + 1
+    }
+    free(boxes as ptr)
+    return n
+}
+
+// Each 15-bit colour's nearest palette entry.
+nearest_table(palette: int[], n: int) -> int[] {
+    table = calloc(BINS, 4) as int[]
+    c = 0
+    while c < BINS {
+        r = ((c >> 10) & 31) * 8 + 4
+        g = ((c >> 5) & 31) * 8 + 4
+        b = (c & 31) * 8 + 4
+        best = 0
+        best_d = 1000000
+        i = 0
+        while i < n {
+            dr = r - palette[i * 3]
+            dg = g - palette[i * 3 + 1]
+            db = b - palette[i * 3 + 2]
+            d = dr * dr * 3 + dg * dg * 4 + db * db * 2
+            if d < best_d {
+                best_d = d
+                best = i
+            }
+            i = i + 1
+        }
+        table[c] = best
+        c = c + 1
+    }
+    return table
+}
+
+// --- LZW ----------------------------------------------------------------------------------------
+
+struct Bits {
+    out: ptr                       // *Bytes
+    block: ptr                     // byte[255]: the sub-block being filled
+    used: int
+    acc: int
+    count: int
+}
+
+bits_flush_block(w: *Bits) {
+    if w.used == 0 { return }
+    out = w.out as *Bytes
+    put(out, w.used)
+    i = 0
+    while i < w.used {
+        put(out, ((w.block as byte[])[i] as int) & 255)
+        i = i + 1
+    }
+    w.used = 0
+}
+
+bits_byte(w: *Bits, v: int) {
+    (w.block as byte[])[w.used] = (v & 255) as byte
+    w.used = w.used + 1
+    if w.used == 255 { bits_flush_block(w) }
+}
+
+bits_put(w: *Bits, code: int, size: int) {
+    w.acc = w.acc | (code << w.count)
+    w.count = w.count + size
+    while w.count >= 8 {
+        bits_byte(w, w.acc & 255)
+        w.acc = w.acc >> 8
+        w.count = w.count - 8
+    }
+}
+
+// The frame's indices, LZW-coded into sub-blocks, as GIF's image data.
+lzw(out: *Bytes, indices: int[], count: int) {
+    put(out, 8)                    // the minimum code size
+    w = Bits { out: out as ptr, block: calloc(256, 1), used: 0, acc: 0, count: 0 }
+    table = calloc(CODES * 256, 4) as int[]
+    touched = calloc(CODES, 4) as int[]
+    ntouched = 0
+    i = 0
+    while i < CODES * 256 {
+        table[i] = 0 - 1
+        i = i + 1
+    }
+    clear = 256
+    eoi = 257
+    next = 258
+    size = 9
+    bits_put(&w, clear, size)
+    prefix = indices[0]
+    i = 1
+    while i < count {
+        c = indices[i]
+        key = prefix * 256 + c
+        if table[key] >= 0 {
+            prefix = table[key]
+        } else {
+            bits_put(&w, prefix, size)
+            if next < CODES {
+                table[key] = next
+                touched[ntouched] = key
+                ntouched = ntouched + 1
+                if next == (1 << size) && size < 12 { size = size + 1 }
+                next = next + 1
+            } else {
+                // Full: start the table again.
+                bits_put(&w, clear, size)
+                k = 0
+                while k < ntouched {
+                    table[touched[k]] = 0 - 1
+                    k = k + 1
+                }
+                ntouched = 0
+                next = 258
+                size = 9
+            }
+            prefix = c
+        }
+        i = i + 1
+    }
+    bits_put(&w, prefix, size)
+    bits_put(&w, eoi, size)
+    if w.count > 0 { bits_byte(&w, w.acc & 255) }
+    bits_flush_block(&w)
+    put(out, 0)                    // the block terminator
+    free(table as ptr)
+    free(touched as ptr)
+    free(w.block)
+}
+
+main() {
+    if os.args_count() < 5 {
+        println("usage: gif out.gif hundredths scale frame.png [frame.png ...]")
+        return
+    }
+    out_path = os.args_get(1)
+    delay, _delay_error = string.to_int(os.args_get(2))
+    scale, _scale_error = string.to_int(os.args_get(3))
+    if scale < 1 { scale = 1 }
+    frames = os.args_count() - 4
+    first = picture.load(os.args_get(4))
+    if first == null {
+        println("gif: ${picture.error()}")
+        return
+    }
+    w = picture.width(first) / scale
+    h = picture.height(first) / scale
+    picture.dispose(first)
+
+    // Every frame, smaller, kept: the palette is chosen from all of them.
+    kept = calloc(frames, 8) as ptr[]
+    hist = calloc(BINS, 4) as int[]
+    f = 0
+    while f < frames {
+        rgb = shrink(os.args_get(f + 4), scale, w, h)
+        if rgb == null {
+            println("gif: ${os.args_get(f + 4)} did not load, or is not the first frame's size")
+            return
+        }
+        kept[f] = rgb
+        px = rgb as int[]
+        p = 0
+        while p < w * h {
+            hist[bin_of(px[p * 3], px[p * 3 + 1], px[p * 3 + 2])] = hist[bin_of(px[p * 3], px[p * 3 + 1], px[p * 3 + 2])] + 1
+            p = p + 1
+        }
+        f = f + 1
+    }
+    palette = calloc(COLOURS * 3, 4) as int[]
+    used = median_cut(hist, palette)
+    table = nearest_table(palette, used)
+    // AE3D_GIF_DITHER: the dither's strength, 0 to 8 (8 by default; 0 for none,
+    // which compresses best: a dithered pixel breaks the runs LZW codes).
+    dither = core.env_int("AE3D_GIF_DITHER", 8)
+
+    out = Bytes { data: calloc(1024, 1), size: 0, room: 1024 }
+    put_text(&out, "GIF89a")
+    put16(&out, w)
+    put16(&out, h)
+    put(&out, 0xF7)                // a global table of 256 colours, 8 bits a channel
+    put(&out, 0)
+    put(&out, 0)
+    c = 0
+    while c < COLOURS {
+        put(&out, palette[c * 3])
+        put(&out, palette[c * 3 + 1])
+        put(&out, palette[c * 3 + 2])
+        c = c + 1
+    }
+    // Loop forever (NETSCAPE2.0).
+    put(&out, 0x21)
+    put(&out, 0xFF)
+    put(&out, 11)
+    put_text(&out, "NETSCAPE2.0")
+    put(&out, 3)
+    put(&out, 1)
+    put16(&out, 0)
+    put(&out, 0)
+    indices = calloc(w * h, 4) as int[]
+    // What the frame before showed at each pixel: a pixel that has not
+    // changed is left to show through (TRANSPARENT), so a still camera's
+    // frames are runs of it that LZW codes in a few bits.
+    shown = calloc(w * h, 4) as int[]
+    f = 0
+    while f < frames {
+        px = kept[f] as int[]
+        y = 0
+        while y < h {
+            x = 0
+            while x < w {
+                k = (y * w + x) * 3
+                d = bayer(x, y) * dither / 8
+                index = table[bin_of(clamp8(px[k] + d), clamp8(px[k + 1] + d), clamp8(px[k + 2] + d))]
+                if f > 0 && shown[y * w + x] == index {
+                    indices[y * w + x] = TRANSPARENT
+                } else {
+                    indices[y * w + x] = index
+                    shown[y * w + x] = index
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        // Each frame shown `delay` hundredths and left for the next to draw
+        // over, TRANSPARENT where it has not changed.
+        put(&out, 0x21)
+        put(&out, 0xF9)
+        put(&out, 4)
+        put(&out, 0x05)
+        put16(&out, delay)
+        put(&out, TRANSPARENT)
+        put(&out, 0)
+        put(&out, 0x2C)
+        put16(&out, 0)
+        put16(&out, 0)
+        put16(&out, w)
+        put16(&out, h)
+        put(&out, 0)
+        lzw(&out, indices, w * h)
+        free(kept[f])
+        f = f + 1
+    }
+    put(&out, 0x3B)
+    file = fopen(out_path, "wb")
+    if file == null {
+        println("gif: could not write ${out_path}")
+        return
+    }
+    fwrite(out.data, 1 as long, out.size as long, file)
+    fclose(file)
+    println("gif: ${frames} frames of ${w}x${h}, ${used} colours, ${out.size / 1024} KB")
+    free(out.data)
+    free(indices as ptr)
+    free(shown as ptr)
+    free(palette as ptr)
+    free(table as ptr)
+    free(hist as ptr)
+    free(kept as ptr)
+}
