@@ -1576,10 +1576,12 @@ keeps of a camera:
 
 - the temporal pass's history, the camera depth the occlusion and the
   reflection read, the clouds' history;
-- its own cascades' shadow atlas and lamps' atlas, and the clusters its camera
-  cuts the lamps into (a view's camera block is the camera set, set 1 of the
-  scene's layout, of the frame slot it is drawn in: docs/aether_quote_design.md
-  section 11);
+- with shadows on, its own cascades' shadow atlas and its own pair of lamps'
+  atlases (the one the shader reads and the static layer under it), the
+  lamps in them chosen by its own budget for its own camera, and the
+  clusters its camera cuts the lamps into (a view's camera block is the
+  camera set, set 1 of the scene's layout, of the frame slot it is drawn in:
+  docs/aether_quote_design.md section 11);
 - the matrices its motion vectors are made from and the jitter's count;
 - its exposure (`backend_view_set_exposure`), which the window's adaptation
   does not follow.
@@ -1595,9 +1597,26 @@ a frame of its own into images of its own: the module's frame variables
 reads it against the module), and its final image is sampled as sRGB, so the
 encoded values the composite writes are the light a surface shows. On OpenGL
 the renderer's fields that belong to a camera are swapped (`GLViewKept`).
-Its cost is what a frame's is, its memory the frame's targets and, once
-shadows are on, the atlases (4096 squares of depth): views are made for what
-is shown.
+Its cost is what a frame's is, its memory the frame's targets and, while
+shadows are on, its atlases: views are made for what is shown.
+
+A view's atlases exist exactly while shadows are on for it, whenever that
+became true, on both renderers (#878, #879, #880): a view made with shadows
+on makes them on its first frame, `backend_set_shadows(backend, true)` makes
+them for every live view, and turning shadows off lets every view's go (the
+window keeps its own). A view made with shadows off holds no depth at all.
+Their size is the window's scaled to the view (`rendering.view_atlas`): the
+4096 square, or the cascades' atlas `AE3D_SHADOW_SIZE` sets, times the larger
+of the view's width over the window's and its height over the window's, never
+more than the window's and never under 1024 texels, where a lamp's face is
+128 texels across and its shadow still resolves. A view half the window's
+size has 2048-texel atlases, a quarter of the depth; a strip the window's
+width keeps the window's. The shader reads a lamp's face from its atlas's
+size, so the same lookup serves both. `gl.renderer_view_shadow_atlases` and
+`vulkan.renderer_view_shadow_atlases` say what a view holds;
+`tests/test_backend_parity.ae` draws a view under a lamp and under the sun,
+with shadows turned on before the view is made and after, on both renderers,
+and holds the rule to them.
 
 ## Lamps
 

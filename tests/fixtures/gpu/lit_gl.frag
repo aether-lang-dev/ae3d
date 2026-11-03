@@ -642,7 +642,7 @@ float ae3d_shaders_lit_lamp_shadow(int slot, vec3 surface) {
     vec3 to_lamp = -v / max(length(v), 0.0001);
     float facing = max(dot(surface, to_lamp), 0.0);
     float slope = min(sqrt(1.0 - facing * facing) / max(facing, 0.02), 32.0);
-    float texel_world = 2.0 * along / 512.0;
+    float texel_world = 2.0 * along / (vec2(textureSize(lamp_shadow_map, 0)).x / 8.0);
     int m = base + 2 + face * 4;
     mat4 face_matrix = mat4(texelFetch(cluster_lights, ivec2(m % 1024, m / 1024), 0), texelFetch(cluster_lights, ivec2((m + 1) % 1024, (m + 1) / 1024), 0), texelFetch(cluster_lights, ivec2((m + 2) % 1024, (m + 2) / 1024), 0), texelFetch(cluster_lights, ivec2((m + 3) % 1024, (m + 3) / 1024), 0));
     vec4 light_space = (face_matrix * vec4(FragPos + surface * texel_world * (1.0 + slope), 1.0));
