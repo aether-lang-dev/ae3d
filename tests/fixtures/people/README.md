@@ -33,6 +33,20 @@ The dataset's `100STYLE.zip` (Zenodo record 8127870, md5 `3cf627852fd8192024c04a
 | `neutral_arrive.bvh` | a walk ahead coming straight to a stand and standing, its arms by its sides (out 3 to 10 degrees from down through all of it; the neutral style's straightest stop, its path turning 1 degree over the 1.6 s before, no foot sliding after: found by scanning every style's transition and idle takes) | `Neutral_ID.bvh` 1745 to 2102 | `5b90fda4aa1d6978b5bcfe30795f2a59855a0ad5c00f6b73f9a8c06316cb66be` |
 | `startstop_start.bvh` | standing, then walking off ahead, its arms by its sides (6 to 14 degrees out; its path turning 8 degrees; the other styles' starts hold their arms out, or are mannered: a calibration gesture in the stands before them) | `100STYLE/StartStop/StartStop_TR1.bvh` 7400 to 7800 | `e555c7b65f89685d35f8ca2de5db9ec0574c25ebf32f782b3f28ac944798cbe8` |
 
+### The neutral style's whole takes (`100style/whole/`)
+
+The eight takes of `100STYLE/Neutral/` as the dataset has them, every frame, gzip'd (`gzip -9 -n`; `bvh.load` inflates a `.gz`): the database motion matching is held to at a style's full size (`tests/test_matching_db.ae`, #906). Each is minutes of one actor walking or running about the capture volume, its turns and stops included.
+
+| file | what it is | frames | sha256 (of the .gz) |
+|---|---|---|---|
+| `Neutral_FW.bvh.gz` | walking forward | 7896 | `f5aedd4bf0eb6d43cf6ca2a6c505521d15ba5f4779a40baebf510a604095ea0c` |
+| `Neutral_BW.bvh.gz` | walking backward | 8644 | `ca64d7fdc201fe6a6761bd293b54c6748605024d7ee0cb497bfa6c0ee43aa29b` |
+| `Neutral_SW.bvh.gz` | walking sideways | 6234 | `cedeb9c2fa495e45498e2787b4b46b5fbffad1b29ec40fd01c65504cf6be1b78` |
+| `Neutral_FR.bvh.gz` | running forward | 4625 | `1d7c5265a1fb30d3903c2e91c3039e86e1a8eb2f95c93cca79d554afa6cbb718` |
+| `Neutral_BR.bvh.gz` | running backward | 5904 | `f6f8f583695d7561d80e076ee79f5b9aef46751ab5e8ec788d4b2acde8aed2d1` |
+| `Neutral_SR.bvh.gz` | running sideways | 3547 | `062c4b6fad1faaab080a687ed1d4ef023046a70d51038ff2cc3976f2a082aab9` |
+| `Neutral_TR1.bvh.gz` | walking, turning, starting and stopping | 7119 | `71f9985e4178e1613b4c1906e4ed92ae5b3e810bb502d53ca95bca8bb3c864c5` |
+| `Neutral_ID.bvh.gz` | standing, idling, walking in and off | 2103 | `7c9596f10386c80813eef363908c8851e389ce3022d92acda8b787617bbc5fb7` |
 
 ## CMU: motion capture in its own format (`cmu/`)
 
