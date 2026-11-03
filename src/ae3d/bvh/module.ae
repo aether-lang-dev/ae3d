@@ -23,7 +23,7 @@ import ae3d.pose
 import ae3d.clips
 
 exports (
-    Capture, load, capture_free, rig, take, frames, frame_time, unit, error
+    Capture, load, load_asf, capture_free, rig, take, frames, frame_time, unit, error
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -51,6 +51,8 @@ struct Capture {
     counts: ptr                    // int[joints]: and how many it has
     kinds: ptr                     // int[channels]: what each channel drives
     data: ptr                      // float[frames * channels]
+    turns: ptr                     // float[frames * joints * 4]: each joint's turn a frame, or null (an ASF/AMC capture's)
+    places: ptr                    // float[frames * 3]: and the root's place, in file units
 }
 
 var g_text: string = ""
@@ -129,6 +131,8 @@ capture_free(c: *Capture) {
     free(c.counts)
     free(c.kinds)
     if c.data != null { free(c.data) }
+    if c.turns != null { free(c.turns) }
+    if c.places != null { free(c.places) }
     heap.free(c)
 }
 
@@ -326,6 +330,10 @@ take(c: *Capture, title: string, from: int, to: int) -> *Take {
 // channels put it, turned by its rotation channels in the order the file
 // lists them (Z, X, Y is the turn Rz Rx Ry).
 pose_of(c: *Capture, f: int, out: ptr) {
+    if c.turns != null {
+        turned_of(c, f, out)
+        return
+    }
     offsets = c.offsets as float[]
     first = c.first as int[]
     counts = c.counts as int[]
@@ -361,6 +369,30 @@ pose_of(c: *Capture, f: int, out: ptr) {
     }
 }
 
+// Frame `f` of a capture read as turns (load_asf): each joint at its
+// offset turned as the frame has it, the root where the frame puts it.
+turned_of(c: *Capture, f: int, out: ptr) {
+    offsets = c.offsets as float[]
+    turns = c.turns as float[]
+    places = c.places as float[]
+    j = 0
+    while j < c.joints {
+        at = (f * c.joints + j) * 4
+        x = offsets[j * 3]
+        y = offsets[j * 3 + 1]
+        z = offsets[j * 3 + 2]
+        if j == 0 {
+            x = places[f * 3]
+            y = places[f * 3 + 1]
+            z = places[f * 3 + 2]
+        }
+        pose.set_translation(out, j, core.vec3(x * c.unit, y * c.unit, z * c.unit))
+        pose.set_rotation(out, j, core.quat_normalize(core.quat(turns[at], turns[at + 1], turns[at + 2], turns[at + 3])))
+        pose.set_scale(out, j, core.vec3(1.0, 1.0, 1.0))
+        j = j + 1
+    }
+}
+
 // --- reading the text -----------------------------------------------------------------------------
 
 is_blank(ch: int) -> bool { return ch == 32 || ch == 9 || ch == 10 || ch == 13 }
@@ -385,4 +417,549 @@ next_number() -> float {
     if string.length(word) > 0 && string.to_double_raw(word, g_number) != 0 { value = (g_number as float[])[0] }
     string.free(word)
     return value
+}
+
+// --- Acclaim ASF/AMC (#912) ------------------------------------------------------------------------
+
+// A skeleton in an ASF file and a take of it in an AMC file: CMU's motion
+// capture library's own format. The ASF gives each bone the way it points
+// and its length at rest (in the world's frame), its own axis frame (`axis`,
+// angles about the world's axes in the order given), and the channels the
+// AMC drives it by (`dof`). The AMC gives a frame number, then each moving
+// bone's channel values. A bone turns about its axis frame: its turn in its
+// parent's frame is C E C^-1, C its axis frame and E its channels' angles
+// taken in turn about x, y and z. The root carries the place. Lengths are in
+// units of 1/length inches (`:units length 0.45` is 5.64 cm a unit), angles
+// in degrees unless `:units angle rad`.
+//
+// It is read into the same Capture a BVH file is: a joint at each bone's
+// start (its parent's end), its offset its parent bone's length along its
+// direction, the rest pose turned nowhere; a bone with nothing hanging from
+// it has an end joint of its own (name_end), as a BVH End Site does. So
+// retargeting and everything after it take a CMU capture as they take any
+// other. Its humanoid map is pose's SCHEME_ASF.
+
+// What ASF channels drive.
+const DOF_RX = 0
+const DOF_RY = 1
+const DOF_RZ = 2
+const DOF_TX = 3
+const DOF_TY = 4
+const DOF_TZ = 5
+const DOF_LENGTH = 6
+// The most bones an ASF skeleton may have.
+const MOST_BONES = 256
+
+// An ASF skeleton as read: its bones' rest and channels, the root's.
+struct Asf {
+    bones: int
+    names: ptr                     // ptr[MOST_BONES]: string.keep references
+    directions: ptr                // float[bones * 3]
+    lengths: ptr                   // float[bones]
+    axes: ptr                      // float[bones * 4]: each bone's axis frame, a turn
+    dofs: ptr                      // int[bones * 7]: its channels in the AMC's order
+    dof_counts: ptr                // int[bones]
+    parents: ptr                   // int[bones]: its parent bone, -1 for the root's children
+    root_dofs: ptr                 // int[7]
+    root_dof_count: int
+    root_place: Vec3               // where the root stands at rest, in units
+    root_axis: Quat                // its axis frame (`orientation`)
+    length: float                  // the `:units length`
+    degrees: bool
+}
+
+// The capture in the ASF skeleton at `asf_path` and the AMC take at
+// `amc_path`, `fps` frames a second (CMU's are 120), with lengths in metres:
+// `metres_per_unit` of them a file unit, or, given 0, as the ASF's units
+// say. Null when either cannot be read (error() says why).
+load_asf(asf_path: string, amc_path: string, fps: float, metres_per_unit: float) -> *Capture {
+    g_error = ""
+    if fps <= 0.0 {
+        g_error = "no frame rate"
+        return null
+    }
+    if g_number == null { g_number = calloc(1, 8) }
+    s = read_asf(asf_path)
+    if s == null { return null }
+    unit = metres_per_unit
+    if unit <= 0.0 { unit = 0.0254 / s.length }
+    c = heap.new(Capture)
+    c.unit = unit
+    c.frame_time = 1.0 / fps
+    c.offsets = calloc(MOST_JOINTS * 3, 8)
+    c.first = calloc(MOST_JOINTS, 4)
+    c.counts = calloc(MOST_JOINTS, 4)
+    c.kinds = calloc(1, 4)
+    // The joints: the root, a joint at each bone's start, parents first, and
+    // an end joint for each bone nothing hangs from.
+    names = calloc(MOST_JOINTS, 8)
+    parents = calloc(MOST_JOINTS, 4) as int[]
+    joint_of = calloc(MOST_BONES, 4) as int[]
+    offsets = c.offsets as float[]
+    (names as ptr[])[0] = string.keep("root")
+    parents[0] = 0 - 1
+    offsets[0] = s.root_place.x
+    offsets[1] = s.root_place.y
+    offsets[2] = s.root_place.z
+    c.joints = 1
+    directions = s.directions as float[]
+    lengths = s.lengths as float[]
+    bone_parents = s.parents as int[]
+    b = 0
+    while b < s.bones {
+        joint_of[b] = 0 - 1
+        b = b + 1
+    }
+    placed = 0
+    pass = 0
+    while placed < s.bones && pass < s.bones + 1 {
+        b = 0
+        while b < s.bones {
+            up = bone_parents[b]
+            if joint_of[b] < 0 && (up < 0 || joint_of[up] >= 0) && c.joints < MOST_JOINTS {
+                j = c.joints
+                joint_of[b] = j
+                (names as ptr[])[j] = string.keep(name_at(s, b))
+                if up < 0 {
+                    parents[j] = 0
+                } else {
+                    parents[j] = joint_of[up]
+                    offsets[j * 3] = directions[up * 3] * lengths[up]
+                    offsets[j * 3 + 1] = directions[up * 3 + 1] * lengths[up]
+                    offsets[j * 3 + 2] = directions[up * 3 + 2] * lengths[up]
+                }
+                c.joints = j + 1
+                placed = placed + 1
+            }
+            b = b + 1
+        }
+        pass = pass + 1
+    }
+    b = 0
+    while b < s.bones {
+        leaf = true
+        k = 0
+        while k < s.bones {
+            if bone_parents[k] == b { leaf = false }
+            k = k + 1
+        }
+        if leaf && joint_of[b] >= 0 && c.joints < MOST_JOINTS {
+            j = c.joints
+            end_name = string.concat(name_at(s, b), "_end")
+            (names as ptr[])[j] = string.keep(end_name)
+            string.free(end_name)
+            parents[j] = joint_of[b]
+            offsets[j * 3] = directions[b * 3] * lengths[b]
+            offsets[j * 3 + 1] = directions[b * 3 + 1] * lengths[b]
+            offsets[j * 3 + 2] = directions[b * 3 + 2] * lengths[b]
+            c.joints = j + 1
+        }
+        b = b + 1
+    }
+    good = placed == s.bones
+    if !good { g_error = "a bone hangs from no bone the hierarchy reaches" }
+    if good { good = read_amc(c, s, amc_path, joint_of) }
+    if good {
+        rest = calloc(c.joints * pose.FLOATS, 8)
+        j = 0
+        while j < c.joints {
+            pose.set_translation(rest, j, core.vec3(offsets[j * 3] * unit, offsets[j * 3 + 1] * unit, offsets[j * 3 + 2] * unit))
+            pose.set_rotation(rest, j, core.quat_ident())
+            pose.set_scale(rest, j, core.vec3(1.0, 1.0, 1.0))
+            j = j + 1
+        }
+        c.rig = pose.of_joints(c.joints, names, parents, rest) as ptr
+        free(rest)
+    }
+    j = 0
+    while j < c.joints {
+        string.release_kept((names as ptr[])[j])
+        j = j + 1
+    }
+    free(names)
+    free(parents as ptr)
+    free(joint_of as ptr)
+    asf_free(s)
+    if !good || c.rig == null {
+        if g_error == "" { g_error = "no skeleton" }
+        capture_free(c)
+        return null
+    }
+    return c
+}
+
+name_at(s: *Asf, b: int) -> string {
+    text, _why = string.from_ptr((s.names as ptr[])[b])
+    return text
+}
+
+asf_free(s: *Asf) {
+    if s == null { return }
+    b = 0
+    while b < s.bones {
+        string.release_kept((s.names as ptr[])[b])
+        b = b + 1
+    }
+    free(s.names)
+    free(s.directions)
+    free(s.lengths)
+    free(s.axes)
+    free(s.dofs)
+    free(s.dof_counts)
+    free(s.parents)
+    free(s.root_dofs)
+    heap.free(s)
+}
+
+// The ASF file at `path`, or null (g_error says why).
+read_asf(path: string) -> *Asf {
+    content, err = fs.read(path)
+    if err != "" {
+        g_error = "cannot read the ASF file"
+        return null
+    }
+    g_text = content
+    g_at = 0
+    g_length = string.length(content)
+    s = heap.new(Asf)
+    s.names = calloc(MOST_BONES, 8)
+    s.directions = calloc(MOST_BONES * 3, 8)
+    s.lengths = calloc(MOST_BONES, 8)
+    s.axes = calloc(MOST_BONES * 4, 8)
+    s.dofs = calloc(MOST_BONES * 7, 4)
+    s.dof_counts = calloc(MOST_BONES, 4)
+    s.parents = calloc(MOST_BONES, 4)
+    s.root_dofs = calloc(7, 4)
+    s.root_axis = core.quat_ident()
+    s.length = 1.0
+    s.degrees = true
+    directions = s.directions as float[]
+    lengths = s.lengths as float[]
+    axes = s.axes as float[]
+    dofs = s.dofs as int[]
+    dof_counts = s.dof_counts as int[]
+    parents = s.parents as int[]
+    section = 0                    // 1 units, 2 root, 3 bonedata, 4 hierarchy, 0 anything else
+    bone = 0 - 1
+    good = true
+    while good {
+        word = next_token()
+        if string.length(word) == 0 {
+            string.free(word)
+            break
+        }
+        if string.starts_with(word, ":") == 1 {
+            section = 0
+            if string.equals(word, ":units") == 1 { section = 1 }
+            if string.equals(word, ":root") == 1 { section = 2 }
+            if string.equals(word, ":bonedata") == 1 { section = 3 }
+            if string.equals(word, ":hierarchy") == 1 { section = 4 }
+        } else if section == 1 {
+            if string.equals(word, "length") == 1 { s.length = next_number() }
+            if string.equals(word, "angle") == 1 {
+                kind = next_token()
+                s.degrees = string.starts_with(kind, "rad") != 1
+                string.free(kind)
+            }
+        } else if section == 2 {
+            if string.equals(word, "order") == 1 { s.root_dof_count = read_dofs(s.root_dofs as int[], 0) }
+            if string.equals(word, "position") == 1 {
+                x = next_number()
+                y = next_number()
+                z = next_number()
+                s.root_place = core.vec3(x, y, z)
+            }
+            if string.equals(word, "orientation") == 1 { s.root_axis = read_axis(s, true) }
+        } else if section == 3 {
+            if string.equals(word, "begin") == 1 {
+                if s.bones >= MOST_BONES {
+                    g_error = "more bones than a skeleton may have"
+                    good = false
+                } else {
+                    bone = s.bones
+                    s.bones = s.bones + 1
+                    parents[bone] = 0 - 1
+                    axes[bone * 4 + 3] = 1.0
+                    (s.names as ptr[])[bone] = string.keep("")
+                }
+            } else if bone >= 0 {
+                if string.equals(word, "name") == 1 {
+                    title = next_token()
+                    string.release_kept((s.names as ptr[])[bone])
+                    (s.names as ptr[])[bone] = string.keep(title)
+                    string.free(title)
+                }
+                if string.equals(word, "direction") == 1 {
+                    directions[bone * 3] = next_number()
+                    directions[bone * 3 + 1] = next_number()
+                    directions[bone * 3 + 2] = next_number()
+                }
+                if string.equals(word, "length") == 1 { lengths[bone] = next_number() }
+                if string.equals(word, "axis") == 1 {
+                    q = read_axis(s, false)
+                    axes[bone * 4] = q.x
+                    axes[bone * 4 + 1] = q.y
+                    axes[bone * 4 + 2] = q.z
+                    axes[bone * 4 + 3] = q.w
+                }
+                if string.equals(word, "dof") == 1 { dof_counts[bone] = read_dofs(dofs, bone * 7) }
+                if string.equals(word, "end") == 1 { bone = 0 - 1 }
+            }
+        } else if section == 4 {
+            if string.equals(word, "begin") == 1 {
+                // Each line a parent, then the bones hanging from it.
+                more = true
+                while more {
+                    up_name = next_token()
+                    if string.length(up_name) == 0 || string.equals(up_name, "end") == 1 {
+                        more = false
+                    } else {
+                        up = bone_named(s, up_name)
+                        while !at_line_end() {
+                            child_name = next_token()
+                            child = bone_named(s, child_name)
+                            if child >= 0 { parents[child] = up }
+                            string.free(child_name)
+                        }
+                    }
+                    string.free(up_name)
+                }
+                section = 0
+            }
+        }
+        string.free(word)
+    }
+    string.free(content)
+    g_text = ""
+    if !good {
+        asf_free(s)
+        return null
+    }
+    if s.bones == 0 {
+        g_error = "no bones in the ASF file"
+        asf_free(s)
+        return null
+    }
+    return s
+}
+
+// The bone named `title`, or -1 (the root, or none).
+bone_named(s: *Asf, title: string) -> int {
+    b = 0
+    while b < s.bones {
+        if string.equals(name_at(s, b), title) == 1 { return b }
+        b = b + 1
+    }
+    return 0 - 1
+}
+
+// The channel names to the line's end into `out` from `at`; how many.
+read_dofs(out: int[], at: int) -> int {
+    n = 0
+    while !at_line_end() && n < 7 {
+        word = next_token()
+        low = string.to_lower(word)
+        kind = 0 - 1
+        if string.equals(low, "rx") == 1 { kind = DOF_RX }
+        if string.equals(low, "ry") == 1 { kind = DOF_RY }
+        if string.equals(low, "rz") == 1 { kind = DOF_RZ }
+        if string.equals(low, "tx") == 1 { kind = DOF_TX }
+        if string.equals(low, "ty") == 1 { kind = DOF_TY }
+        if string.equals(low, "tz") == 1 { kind = DOF_TZ }
+        if string.equals(low, "l") == 1 { kind = DOF_LENGTH }
+        if kind >= 0 {
+            out[at + n] = kind
+            n = n + 1
+        }
+        string.free(low)
+        string.free(word)
+    }
+    return n
+}
+
+// Three angles and, but for the root's `orientation`, the order they turn
+// in (about the world's axes, the first first): a bone's axis frame.
+read_axis(s: *Asf, root: bool) -> Quat {
+    angles = [next_number(), next_number(), next_number()]
+    order = "XYZ"
+    owned = false
+    if !root && !at_line_end() {
+        order = next_token()
+        owned = true
+    }
+    q = turn_in_order(angles, order, s.degrees)
+    if owned { string.free(order) }
+    return q
+}
+
+// Angles about x, y and z turned in `order` ("XYZ": x first), each about
+// the world's axis: the last turn the outermost.
+turn_in_order(angles: float[], order: string, degrees: bool) -> Quat {
+    scale = 1.0
+    if degrees { scale = 0.017453292519943295 }
+    q = core.quat_ident()
+    k = 0
+    while k < string.length(order) && k < 3 {
+        ch = string.char_at(order, k)
+        if ch == 88 || ch == 120 { q = core.quat_mul(core.quat_rotate(angles[0] * scale, core.vec3(1.0, 0.0, 0.0)), q) }
+        if ch == 89 || ch == 121 { q = core.quat_mul(core.quat_rotate(angles[1] * scale, core.vec3(0.0, 1.0, 0.0)), q) }
+        if ch == 90 || ch == 122 { q = core.quat_mul(core.quat_rotate(angles[2] * scale, core.vec3(0.0, 0.0, 1.0)), q) }
+        k = k + 1
+    }
+    return core.quat_normalize(q)
+}
+
+// Whether only spaces and tabs are left before the line's end.
+at_line_end() -> bool {
+    while g_at < g_length {
+        ch = string.char_at(g_text, g_at)
+        if ch != 32 && ch != 9 && ch != 13 { return ch == 10 }
+        g_at = g_at + 1
+    }
+    return true
+}
+
+// Past the end of the line `g_at` is on.
+skip_line() {
+    while g_at < g_length && string.char_at(g_text, g_at) != 10 { g_at = g_at + 1 }
+    if g_at < g_length { g_at = g_at + 1 }
+}
+
+// Whether `word` is a whole number: an AMC frame's number.
+is_whole(word: string) -> bool {
+    n = string.length(word)
+    if n == 0 { return false }
+    k = 0
+    while k < n {
+        ch = string.char_at(word, k)
+        if ch < 48 || ch > 57 { return false }
+        k = k + 1
+    }
+    return true
+}
+
+// The AMC take at `path` for skeleton `s`: counted, then read, each frame
+// each joint's turn (C E C^-1) and the root's place.
+read_amc(c: *Capture, s: *Asf, path: string, joint_of: int[]) -> bool {
+    content, err = fs.read(path)
+    if err != "" {
+        g_error = "cannot read the AMC file"
+        return false
+    }
+    g_text = content
+    g_length = string.length(content)
+    good = true
+    pass = 0
+    while pass < 2 && good {
+        g_at = 0
+        frame = 0 - 1
+        while good {
+            word = next_token()
+            if string.length(word) == 0 {
+                string.free(word)
+                break
+            }
+            if string.starts_with(word, "#") == 1 {
+                skip_line()
+            } else if string.starts_with(word, ":") == 1 {
+                // :FULLY-SPECIFIED, :DEGREES
+            } else if is_whole(word) {
+                frame = frame + 1
+                if pass == 1 && frame < c.frames { frame_rest(c, frame) }
+            } else if frame >= 0 {
+                good = read_amc_line(c, s, word, joint_of, frame, pass == 1 && frame < c.frames)
+            }
+            string.free(word)
+        }
+        if pass == 0 {
+            c.frames = frame + 1
+            if c.frames <= 0 {
+                g_error = "no frames in the AMC file"
+                good = false
+            } else {
+                c.turns = calloc(c.frames * c.joints * 4, 8)
+                c.places = calloc(c.frames * 3, 8)
+            }
+        }
+        pass = pass + 1
+    }
+    string.free(content)
+    g_text = ""
+    return good
+}
+
+// Frame `f` turned nowhere and the root at its rest place, before its lines.
+frame_rest(c: *Capture, f: int) {
+    turns = c.turns as float[]
+    j = 0
+    while j < c.joints {
+        turns[(f * c.joints + j) * 4 + 3] = 1.0
+        j = j + 1
+    }
+    offsets = c.offsets as float[]
+    places = c.places as float[]
+    places[f * 3] = offsets[0]
+    places[f * 3 + 1] = offsets[1]
+    places[f * 3 + 2] = offsets[2]
+}
+
+// One AMC line, its bone's name read: its channel values, kept (`keep`)
+// as the bone's joint's turn in frame `frame`.
+read_amc_line(c: *Capture, s: *Asf, name: string, joint_of: int[], frame: int, keep: bool) -> bool {
+    root = string.equals(name, "root") == 1
+    b = 0 - 1
+    if !root { b = bone_named(s, name) }
+    if !root && b < 0 {
+        // A bone the ASF does not have: its values passed over.
+        while !at_line_end() {
+            _ignored = next_number()
+        }
+        return true
+    }
+    kinds = s.root_dofs as int[]
+    count = s.root_dof_count
+    at = 0
+    if !root {
+        kinds = s.dofs as int[]
+        count = (s.dof_counts as int[])[b]
+        at = b * 7
+    }
+    angles = [0.0, 0.0, 0.0]
+    place = [0.0, 0.0, 0.0]
+    moved = false
+    k = 0
+    while k < count {
+        v = next_number()
+        kind = kinds[at + k]
+        if kind <= DOF_RZ { angles[kind] = v }
+        if kind >= DOF_TX && kind <= DOF_TZ {
+            place[kind - DOF_TX] = v
+            moved = true
+        }
+        k = k + 1
+    }
+    if !keep { return true }
+    axis = s.root_axis
+    j = 0
+    if !root {
+        axes = s.axes as float[]
+        axis = core.quat(axes[b * 4], axes[b * 4 + 1], axes[b * 4 + 2], axes[b * 4 + 3])
+        j = joint_of[b]
+    }
+    if j < 0 { return true }
+    e = turn_in_order(angles, "XYZ", s.degrees)
+    q = core.quat_normalize(core.quat_mul(axis, core.quat_mul(e, core.quat_conjugate(axis))))
+    turns = c.turns as float[]
+    at_t = (frame * c.joints + j) * 4
+    turns[at_t] = q.x
+    turns[at_t + 1] = q.y
+    turns[at_t + 2] = q.z
+    turns[at_t + 3] = q.w
+    if root && moved {
+        places = c.places as float[]
+        places[frame * 3] = place[0]
+        places[frame * 3 + 1] = place[1]
+        places[frame * 3 + 2] = place[2]
+    }
+    return true
 }

@@ -30,3 +30,15 @@ The dataset's `100STYLE.zip` (Zenodo record 8127870, md5 `3cf627852fd8192024c04a
 | `neutral_stop.bvh` | walking in, coming to a stand, standing | `Neutral_ID.bvh` 150 to 630 | `9a3ef0a411e6b68621e7c5f3005d338a09d139f1e470373fa5b0eb31058e1aa8` |
 | `neutral_start.bvh` | standing, then walking off | `Neutral_ID.bvh` 1620 to 1890 | `f3620aabf95fbe0cf340d018ad6f4c6534519ee0cebe24d3f70c8ea825398b15` |
 | `lookup_stop.bvh` | a walk ahead at 0.82 m/s coming straight to a stand (the LookUp style, its head tilted up: of every style's transitions, the straightest forward stop; the Neutral style has none) | `100STYLE/LookUp/LookUp_TR1.bvh` 75 to 314 | `4836e9cc7a4acd8e97420c8af60816ef121bcc05a3e47e57891c89f7815496b3` |
+
+## CMU: motion capture in its own format (`cmu/`)
+
+One take from the [Carnegie Mellon University Motion Capture Database](http://mocap.cs.cmu.edu/), read in its own Acclaim ASF/AMC format by `bvh.load_asf` (#912) and held to a BVH conversion of the same take. The database's terms: "The data used in this project was obtained from mocap.cs.cmu.edu. The database was created with funding from NSF EIA-0196217." CMU places no restrictions on its use. Its takes are Vicon optical captures at 120 frames a second, in units of 1/0.45 inch (5.64 cm), angles in degrees.
+
+The BVH is Bruce Hahne's conversion of the database (the cgspeed release, made with `amc2bvh`, its frame time set to 120/s), which adds no restrictions of its own. It is mirrored at https://github.com/meshula/cmu-mocap. It renames the bones (`LeftUpLeg` for `lfemur`), keeps the ASF's units and layout, and writes a rest frame before the take's first: its frame f + 1 is the AMC's frame f. It drops three bones' lengths: its neck joint sits on its thorax's, and each hand's finger and thumb joints on its wrist's.
+
+| file | what it is | source | sha256 |
+|---|---|---|---|
+| `02.asf` | subject 02's skeleton: 30 bones, VICON BodyBuilder's layout | `http://mocap.cs.cmu.edu/subjects/02/02.asf` | `c9f5ff45b4437b279f58b95dacf017afd3135373096274df69436a9354d796cf` |
+| `02_01.amc` | subject 02 walking, 343 frames | `http://mocap.cs.cmu.edu/subjects/02/02_01.amc` | `1503c481f4726e640c77888f0c841dd3be0694684bcd32296cf53685c6fc1492` |
+| `02_01.bvh` | the same take converted to BVH, 344 frames | `data/002/02_01.bvh` in https://github.com/meshula/cmu-mocap | `cf56db43157acc3d200b3d4215523f54d354a8926bea67e1f6c8031bd335ba7e` |
