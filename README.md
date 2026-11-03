@@ -132,19 +132,28 @@ physics.rigidbody(crate, physics.DYNAMIC)
 physics.box_collider(crate, core.vec3(0.5, 0.5, 0.5), physics.material(0.6, 0.0))
 ```
 
-And a figure on its gaits, its feet on the ground:
+And a person, from [examples/people.ae](examples/people.ae): the figure, its gaits from motion capture, its feet on the ground and its eyes where it goes, in one call, then asked:
 
 ```aether
-runner = figure.figure(e, "Runner", "people/runner.glb")
-a = animator.attach(e, runner)                                // the figure's one writer from now on
-move = animator.add_blend(a, "move")
-walk = animator.take(a, "Walk_Loop", false)
-sprint = animator.take(a, "Sprint_Loop", false)
-animator.blend_add(a, move, walk, clips.speed(walk))          // each gait at its own measured speed
-animator.blend_add(a, move, sprint, clips.speed(sprint))
-animator.set_feet(a, ikrig.feet_new(animator.rig(a), runner))
-animator.play(a, move, 0.0)
-animator.set_param(a, move, speed)                            // every frame, from the game
+gaits = character.gaits("${PEOPLE}100style/neutral")                    // walks, runs, a start, a stop, a stand
+hero = character.humanoid(e, "Hero", "${PEOPLE}ual1_rigify.glb", gaits)
+character.move(hero, core.v3_mul(way, speed), core.vec3(0.0, 0.0, 0.0)) // every frame, from the game
+s = usable.find(u, at, NEAR, "sit", hero as ptr)                        // the nearest free seat
+if s >= 0 { _sat = character.use(hero, u, s) }                          // walked to, turned at, sat on
+```
+
+Given whole captures instead (`character.match_add`), it moves by motion matching over them. Under it, each part is the game's to reach: the animator, the mover, the feet. A graph of states can be a file rather than calls ([runner.graph](tests/fixtures/graphs/runner.graph), `animgraph.load(a, path)`):
+
+```
+take idle Idle_Loop
+take walk Walk_Loop
+state idle idle loop
+blend move speed                    # along parameter speed
+  walk measured                     # at the take's own measured speed
+end
+transition idle move 0.2
+  when speed above 0.1
+end
 ```
 
 How the loop, the behaviours, the renderers and the job pool fit together is in [Architecture](docs/architecture.md).
@@ -167,6 +176,7 @@ How the loop, the behaviours, the renderers and the job pool fit together is in 
 | | |
 |---|---|
 | `street_life` | People on the street at half past five, every one on the animation pipeline; `AE3D_TIME` sets the hour, `AE3D_AWAY=1` turns the camera from the sun. |
+| `people` | A person made in one call (`ae3d.character`): WASD walks it, E sits it on a log, the right mouse aims its pistol. |
 | `street_drive` | Drive the street, then press E and walk it first person on a character controller. |
 | `zombie_city` | The street instanced into a city and a horde hunting the camera; `AE3D_CROWD` sets the count. |
 | `net_walk`, `net_cars` | Multiplayer: `./build/net_walk` hosts, `AE3D_NET=join:127.0.0.1 ./build/net_walk` joins. |
