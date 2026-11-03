@@ -29,7 +29,10 @@ The dataset's `100STYLE.zip` (Zenodo record 8127870, md5 `3cf627852fd8192024c04a
 | `neutral_tr1.bvh` | walking turns | `Neutral_TR1.bvh` 6158 to 6338 | `95e2599479e9c868312b908fd116a1740296cbb11efdee711520ce033ac9ba41` |
 | `neutral_stop.bvh` | walking in, coming to a stand, standing | `Neutral_ID.bvh` 150 to 630 | `9a3ef0a411e6b68621e7c5f3005d338a09d139f1e470373fa5b0eb31058e1aa8` |
 | `neutral_start.bvh` | standing, then walking off | `Neutral_ID.bvh` 1620 to 1890 | `f3620aabf95fbe0cf340d018ad6f4c6534519ee0cebe24d3f70c8ea825398b15` |
-| `lookup_stop.bvh` | a walk ahead at 0.82 m/s coming straight to a stand (the LookUp style, its head tilted up: of every style's transitions, the straightest forward stop; the Neutral style has none) | `100STYLE/LookUp/LookUp_TR1.bvh` 75 to 314 | `4836e9cc7a4acd8e97420c8af60816ef121bcc05a3e47e57891c89f7815496b3` |
+| `lookup_stop.bvh` | a walk ahead at 0.82 m/s coming straight to a stand (the LookUp style, its head tilted up, its arms held out 39 degrees from down: of the transition takes, the straightest forward stop at a walk; `neutral_arrive.bvh` is the neutral style's own, from its idle take) | `100STYLE/LookUp/LookUp_TR1.bvh` 75 to 314 | `4836e9cc7a4acd8e97420c8af60816ef121bcc05a3e47e57891c89f7815496b3` |
+| `neutral_arrive.bvh` | a walk ahead coming straight to a stand and standing, its arms by its sides (out 3 to 10 degrees from down through all of it; the neutral style's straightest stop, its path turning 1 degree over the 1.6 s before, no foot sliding after: found by scanning every style's transition and idle takes) | `Neutral_ID.bvh` 1745 to 2102 | `5b90fda4aa1d6978b5bcfe30795f2a59855a0ad5c00f6b73f9a8c06316cb66be` |
+| `startstop_start.bvh` | standing, then walking off ahead, its arms by its sides (6 to 14 degrees out; its path turning 8 degrees; the other styles' starts hold their arms out, or are mannered: a calibration gesture in the stands before them) | `100STYLE/StartStop/StartStop_TR1.bvh` 7400 to 7800 | `e555c7b65f89685d35f8ca2de5db9ec0574c25ebf32f782b3f28ac944798cbe8` |
+
 
 ## CMU: motion capture in its own format (`cmu/`)
 
