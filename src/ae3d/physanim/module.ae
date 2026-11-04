@@ -1,19 +1,23 @@
 // Physical animation (#858): a figure's ragdoll following its animated pose
-// body by body, each with a weight: 0 its body carried on the animation
-// (anchored to where the animation has it) and the figure drawn as the
-// animation has it, exactly; between, the figure drawn that share of the
-// way toward its body; 1 the body let go (simulated, no anchor) and drawn
-// as it falls. As Unreal's Physical Animation component and PuppetMaster's
-// pin weights read: the animation drives the bodies, and the bodies are
-// drawn as much as the game asks.
+// body by body. Each body has a mode, what moves it: kinematic (exactly
+// where the animation has it), driven (pulled there by its anchor at a
+// strength) or simulated (let go). And a weight, how it is drawn: 0 as the
+// animation has it, exactly; 1 wholly from its body; between, that share of
+// the way. As Unreal's Physical Animation component (its profiles'
+// strengths, its physics blend weights) and PuppetMaster's pin and muscle
+// weights read: the animation drives the bodies, and the bodies are drawn
+// as much as the game asks. Every body begins driven at weight 0 (the
+// profile "animated").
 //
 //     pa = physanim.attach(e, animator)          // every body animated
 //     physanim.hit(pa, physanim.bone_named(pa, "Chest"), point, impulse)
-//     physanim.set_weight(pa, bone, 1.0, 0.3)    // a body let go over 0.3 s
+//     physanim.set_weight(pa, bone, 1.0, 0.3)    // a body drawn from its body over 0.3 s
+//     physanim.profiles_read(pa, "people/physanim.profiles")
+//     physanim.apply_profile(pa, physanim.profile_find(pa, "guard"), 0.25)
 //
 // A hit: the body struck and those next to it let go, pushed, and drawn from
 // their bodies at once; after HIT_HOLD they are anchored again where they
-// are and eased back onto the animation over HIT_RECOVER. A walking figure
+// are and eased back to their weights over HIT_RECOVER. A walking figure
 // struck in the chest keeps walking: its legs stay on the animation.
 //
 // The order: the animator's graph poses the figure; this, a step after the
@@ -23,7 +27,9 @@
 // on from its own pose (pose_now). The physics steps in the fixed step, the
 // bodies following the animated pose.
 
+import std.fs
 import std.heap
+import std.list
 import std.string
 import ae3d.core
 import ae3d.engine
@@ -35,7 +41,9 @@ import ae3d.animator
 
 exports (
     Physanim, attach, physanim_free, ragdoll_of, bones, bone_named, parent_of, nearest,
-    set_weight, weight_of, hit, hit_count, set_hit_times, HIT_HOLD, HIT_RECOVER
+    set_weight, weight_of, hit, hit_count, set_hit_times, HIT_HOLD, HIT_RECOVER,
+    MODE_KINEMATIC, MODE_DRIVEN, MODE_SIMULATED, set_mode, mode_of, profile_add, profile_find, profile_set, profile_set_below,
+    apply_profile, profiles_read, profile_count, error
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -44,6 +52,30 @@ extern free(p: ptr)
 // Seconds a body struck is let go, and how long it eases back.
 const HIT_HOLD = 0.15
 const HIT_RECOVER = 0.6
+
+// What drives a body (set_mode, a profile's): moved exactly onto the
+// animation (a kinematic body, which pushes what it meets and is not
+// pushed), pulled onto it by its anchor at a strength, or simulated, no
+// anchor, as a ragdoll's. The pelvis is never simulated: the figure
+// stays on its feet (a fall is ae3d.motion's).
+const MODE_KINEMATIC = 0
+const MODE_DRIVEN = 1
+const MODE_SIMULATED = 2
+
+// A named set of every body's mode, anchor strength and weight, as
+// Unreal's physical animation profiles and PuppetMaster's pin and muscle
+// weights are: applied at once to the bodies, the weights eased.
+struct Profile {
+    name: string
+    modes: ptr                     // int[count]
+    pins: ptr                      // float[count * 3]: hertz (0 the default's), most force, most torque (0 unbounded)
+    weights: ptr                   // float[count]
+}
+
+var g_error: string = ""
+
+// What the last profiles_read that failed said.
+error() -> string { return g_error }
 
 struct Physanim {
     engine: ptr                    // *Engine
@@ -56,6 +88,10 @@ struct Physanim {
     times: ptr                     // float[count]: seconds the easing takes (0 at once)
     gone: ptr                      // float[count]: seconds into it
     holds: ptr                     // float[count]: seconds a hit keeps it let go, 0 none
+    modes: ptr                     // int[count]: each body's MODE_
+    bases: ptr                     // float[count]: the weight it is set to (set_weight, a profile), what a hit eases back to
+    struck: ptr                    // int[count]: 1 from a hit until it is eased back
+    profiles: ptr                  // list of *Profile
     parents: ptr                   // int[count]: the body above it, -1 the pelvis's
     order: ptr                     // int[count]: the bodies, each after the one above it
     anim: ptr                      // float[count * POSE_STRIDE]: the animated pose
@@ -64,6 +100,7 @@ struct Physanim {
     hold: float                    // a hit's HIT_HOLD and HIT_RECOVER, the game's to set
     recover: float
     hits: int
+    was_fixed: bool                // its animator at the fixed step before (animator.set_fixed)
     stepper: ptr                   // *Behaviour
 }
 
@@ -102,6 +139,10 @@ attach(e: *Engine, a: *Animator) -> *Physanim {
     pa.times = calloc(n, 8)
     pa.gone = calloc(n, 8)
     pa.holds = calloc(n, 8)
+    pa.modes = calloc(n, 4)
+    pa.bases = calloc(n, 8)
+    pa.struck = calloc(n, 4)
+    pa.profiles = list.new()
     pa.parents = calloc(n, 4)
     pa.order = calloc(n, 4)
     pa.anim = calloc(n * physics.POSE_STRIDE, 8)
@@ -111,17 +152,29 @@ attach(e: *Engine, a: *Animator) -> *Physanim {
     pa.recover = HIT_RECOVER
     find_parents(pa)
     find_order(pa)
+    k = 0
+    while k < n {
+        (pa.modes as int[])[k] = MODE_DRIVEN
+        k = k + 1
+    }
+    _animated = profile_add(pa, "animated")
     b = engine.behaviour_new("physanim", pa as ptr)
     b.fixed_update = physanim_step
     engine.engine_add_behaviour(e, b)
     pa.stepper = b as ptr
     animator.add_post(a, physanim_post, pa as ptr)
+    // Its graph at the fixed step, before the physics: the anchors chase
+    // this step's pose. Posed in the pose phase, after the physics, every
+    // body chased the frame before's.
+    pa.was_fixed = animator.fixed(a)
+    animator.set_fixed(a, true)
     return pa
 }
 
 physanim_free(pa: *Physanim) {
     if pa == null { return }
     animator.remove_post(pa.animator as *Animator, pa as ptr)
+    animator.set_fixed(pa.animator as *Animator, pa.was_fixed)
     if pa.stepper != null {
         engine.engine_remove_behaviour(pa.engine as *Engine, pa.stepper as *Behaviour)
         heap.free(pa.stepper as *Behaviour)
@@ -133,6 +186,20 @@ physanim_free(pa: *Physanim) {
     free(pa.times)
     free(pa.gone)
     free(pa.holds)
+    free(pa.modes)
+    free(pa.bases)
+    free(pa.struck)
+    i = 0
+    while i < list.size(pa.profiles) {
+        p = list.get_raw(pa.profiles, i) as *Profile
+        string.free(p.name)
+        free(p.modes)
+        free(p.pins)
+        free(p.weights)
+        heap.free(p)
+        i = i + 1
+    }
+    list.free(pa.profiles)
     free(pa.parents)
     free(pa.order)
     free(pa.anim)
@@ -211,8 +278,9 @@ find_parents(pa: *Physanim) {
     }
 }
 
-// Body `k`'s weight toward `w` (0 on the animation, 1 let go), over `seconds`
-// (0: at once), eased (a smooth step from where it is).
+// Body `k`'s weight toward `w` (0 drawn as the animation has it, 1 drawn
+// wholly from its body, as its mode moves it), over `seconds` (0: at
+// once), eased (a smooth step from where it is). What a hit eases back to.
 set_weight(pa: *Physanim, k: int, w: float, seconds: float) {
     if k < 0 || k >= pa.count { return }
     (pa.froms as float[])[k] = (pa.weights as float[])[k]
@@ -220,6 +288,8 @@ set_weight(pa: *Physanim, k: int, w: float, seconds: float) {
     (pa.times as float[])[k] = seconds
     (pa.gone as float[])[k] = 0.0
     (pa.holds as float[])[k] = 0.0
+    (pa.struck as int[])[k] = 0
+    (pa.bases as float[])[k] = core.clampf(w, 0.0, 1.0)
     if seconds <= 0.0 { (pa.weights as float[])[k] = core.clampf(w, 0.0, 1.0) }
     limp_by(pa, k)
 }
@@ -234,8 +304,9 @@ set_hit_times(pa: *Physanim, hold: float, recover: float) {
 
 // A blow: `impulse` (newton seconds) at `point` on body `k`. That body and
 // the ones above and below it are let go and drawn from their bodies at once;
-// held so for the hit's hold, then anchored where they are and eased back
-// onto the animation over its recovery. The pelvis is struck and pushed but
+// held so for the hit's hold, then driven by their anchors again where they
+// are and eased back to their weights over its recovery, and kinematic
+// again, if they were, once there. The pelvis is struck and pushed but
 // never let go: the figure stays on its feet.
 hit(pa: *Physanim, k: int, point: Vec3, impulse: Vec3) {
     if k < 0 || k >= pa.count { return }
@@ -251,6 +322,7 @@ hit(pa: *Physanim, k: int, point: Vec3, impulse: Vec3) {
             (pa.froms as float[])[j] = 1.0
             (pa.times as float[])[j] = 0.0
             (pa.holds as float[])[j] = pa.hold
+            (pa.struck as int[])[j] = 1
             limp_by(pa, j)
         }
         j = j + 1
@@ -259,11 +331,16 @@ hit(pa: *Physanim, k: int, point: Vec3, impulse: Vec3) {
     pa.hits = pa.hits + 1
 }
 
-// Its body let go while its weight is whole, anchored again under it.
+// Its body as its mode has it: let go while a hit holds it or it is
+// simulated; kinematic only when it is not easing back from a hit, where
+// it would be carried onto the animation in a step while it is drawn.
 limp_by(pa: *Physanim, k: int) {
     r = pa.ragdoll as *Ragdoll
-    limp = (pa.weights as float[])[k] >= 0.999 || (pa.holds as float[])[k] > 0.0
+    mode = (pa.modes as int[])[k]
+    limp = (pa.holds as float[])[k] > 0.0 || mode == MODE_SIMULATED
     if physics.ragdoll_bone_is_limp(r, k) != limp { physics.ragdoll_set_bone_limp(r, k, limp) }
+    kinematic = !limp && mode == MODE_KINEMATIC && (pa.struck as int[])[k] == 0
+    if physics.ragdoll_bone_is_kinematic(r, k) != kinematic { physics.ragdoll_set_bone_kinematic(r, k, kinematic) }
 }
 
 smooth(u: float) -> float {
@@ -290,12 +367,14 @@ physanim_step(state: ptr, e: *Engine, dt: float) {
                 // limp until it was drawn no more, the chest went on falling
                 // as it eased, 64 degrees off the twin's rather than 38, and
                 // its fastest joint turned 18.9 rad/s, not 14.8 (the walk's
-                // own 15.8).
+                // own 15.8), measured with the bodies chasing the frame
+                // before's pose (before animator.set_fixed).
                 holds[k] = 0.0
                 froms[k] = 1.0
-                goals[k] = 0.0
+                goals[k] = (pa.bases as float[])[k]
                 times[k] = pa.recover
                 gone[k] = 0.0
+                if w[k] == goals[k] { (pa.struck as int[])[k] = 0 }
                 limp_by(pa, k)
             }
         } else if w[k] != goals[k] {
@@ -306,6 +385,7 @@ physanim_step(state: ptr, e: *Engine, dt: float) {
                 w[k] = froms[k] + (goals[k] - froms[k]) * smooth(gone[k] / times[k])
                 if gone[k] >= times[k] { w[k] = goals[k] }
             }
+            if w[k] == goals[k] { (pa.struck as int[])[k] = 0 }
             limp_by(pa, k)
         }
         k = k + 1
@@ -402,4 +482,232 @@ find_order(pa: *Physanim) {
         }
     }
     free(placed as ptr)
+}
+
+// --- modes and profiles ----------------------------------------------------------------------------
+
+// Body `k` moved by `mode` (MODE_KINEMATIC, MODE_DRIVEN, MODE_SIMULATED), at
+// once.
+set_mode(pa: *Physanim, k: int, mode: int) {
+    if k < 0 || k >= pa.count || mode < MODE_KINEMATIC || mode > MODE_SIMULATED { return }
+    (pa.modes as int[])[k] = mode
+    limp_by(pa, k)
+}
+
+mode_of(pa: *Physanim, k: int) -> int { return (pa.modes as int[])[k] }
+
+profile_count(pa: *Physanim) -> int { return list.size(pa.profiles) }
+
+// The profile named `name`, made if there is none: every body driven at
+// the anchors' own strength, drawn at weight 0, as attach leaves them.
+profile_add(pa: *Physanim, name: string) -> int {
+    found = profile_find(pa, name)
+    if found >= 0 { return found }
+    p = heap.new(Profile)
+    p.name = string.copy(name)
+    p.modes = calloc(pa.count, 4)
+    p.pins = calloc(pa.count * 3, 8)
+    p.weights = calloc(pa.count, 8)
+    k = 0
+    while k < pa.count {
+        (p.modes as int[])[k] = MODE_DRIVEN
+        k = k + 1
+    }
+    list.add_raw(pa.profiles, p as ptr)
+    return list.size(pa.profiles) - 1
+}
+
+// The profile named `name`, or -1.
+profile_find(pa: *Physanim, name: string) -> int {
+    i = 0
+    while i < list.size(pa.profiles) {
+        if string.equals((list.get_raw(pa.profiles, i) as *Profile).name, name) == 1 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// In profile `profile`, body `k` moved by `mode`, its anchor at `hertz`
+// (0: the anchors' own) within `max_force` newtons and `max_torque` newton
+// metres (0: no bound), and drawn at `weight`.
+profile_set(pa: *Physanim, profile: int, k: int, mode: int, hertz: float, max_force: float, max_torque: float, weight: float) {
+    if profile < 0 || profile >= list.size(pa.profiles) || k < 0 || k >= pa.count { return }
+    p = list.get_raw(pa.profiles, profile) as *Profile
+    (p.modes as int[])[k] = mode
+    pins = p.pins as float[]
+    pins[k * 3] = hertz
+    pins[k * 3 + 1] = max_force
+    pins[k * 3 + 2] = max_torque
+    (p.weights as float[])[k] = core.clampf(weight, 0.0, 1.0)
+}
+
+// As profile_set, for body `k` and every body below it (an arm from its
+// shoulder, the trunk and all from the hips), as Unreal's profiles are
+// applied below a bone.
+profile_set_below(pa: *Physanim, profile: int, k: int, mode: int, hertz: float, max_force: float, max_torque: float, weight: float) {
+    j = 0
+    while j < pa.count {
+        if below(pa, j, k) { profile_set(pa, profile, j, mode, hertz, max_force, max_torque, weight) }
+        j = j + 1
+    }
+}
+
+// Whether body `j` is `k` or hangs from it.
+below(pa: *Physanim, j: int, k: int) -> bool {
+    parents = pa.parents as int[]
+    at = j
+    while at >= 0 {
+        if at == k { return true }
+        at = parents[at]
+    }
+    return false
+}
+
+// Every body to profile `profile`: its mode and its anchor's strength at
+// once, its weight eased there over `seconds`. A hit holding a body is let
+// go of; the profile is what it is now.
+apply_profile(pa: *Physanim, profile: int, seconds: float) {
+    if profile < 0 || profile >= list.size(pa.profiles) { return }
+    p = list.get_raw(pa.profiles, profile) as *Profile
+    r = pa.ragdoll as *Ragdoll
+    pins = p.pins as float[]
+    k = 0
+    while k < pa.count {
+        (pa.modes as int[])[k] = (p.modes as int[])[k]
+        physics.ragdoll_set_bone_pin(r, k, pins[k * 3], pins[k * 3 + 1], pins[k * 3 + 2])
+        set_weight(pa, k, (p.weights as float[])[k], seconds)
+        k = k + 1
+    }
+}
+
+// Profiles from a file, added to the figure's (a name already there is
+// set again). A line each, # a comment:
+//
+//     profile guard
+//     body Chest driven hertz 12 weight 0.2
+//     below ShoulderL driven hertz 3 force 400 torque 60 weight 0.5
+//     body Neck kinematic
+//     below ElbowR simulated weight 1
+//
+// `body` sets one body, `below` it and every body below it; the mode is
+// kinematic, driven or simulated, and hertz, force, torque and weight
+// follow as they are wanted (0 hertz, force and torque, and weight, by
+// default). A profile starts as "animated" is. False on a line it cannot
+// read (error() says which).
+profiles_read(pa: *Physanim, path: string) -> bool {
+    g_error = ""
+    content, err = fs.read(path)
+    if err != "" {
+        g_error = "cannot read ${path}"
+        return false
+    }
+    lines = string.split(content, "\n")
+    count = string.array_size(lines)
+    profile = 0 - 1
+    good = true
+    i = 0
+    while i < count && good {
+        line = string.trim(field(lines, i))
+        i = i + 1
+        if string.length(line) == 0 || string.char_at(line, 0) == 35 { continue }
+        words = string.split(line, " ")
+        n = word_count(words)
+        first = word(words, 0)
+        if string.equals(first, "profile") == 1 && n == 2 {
+            profile = profile_add(pa, word(words, 1))
+        } else if (string.equals(first, "body") == 1 || string.equals(first, "below") == 1) && n >= 3 && profile >= 0 {
+            good = body_line(pa, profile, words, n, string.equals(first, "below") == 1, i)
+        } else {
+            g_error = "${path}:${i}: `${line}` is no profile line"
+            good = false
+        }
+        string.array_free(words)
+    }
+    string.array_free(lines)
+    string.free(content)
+    return good
+}
+
+body_line(pa: *Physanim, profile: int, words: ptr, n: int, all_below: bool, line: int) -> bool {
+    name = word(words, 1)
+    k = bone_named(pa, name)
+    if k < 0 {
+        g_error = "line ${line}: no body `${name}`"
+        return false
+    }
+    mode_word = word(words, 2)
+    mode = 0 - 1
+    if string.equals(mode_word, "kinematic") == 1 { mode = MODE_KINEMATIC }
+    if string.equals(mode_word, "driven") == 1 { mode = MODE_DRIVEN }
+    if string.equals(mode_word, "simulated") == 1 { mode = MODE_SIMULATED }
+    if mode < 0 {
+        g_error = "line ${line}: `${mode_word}` is not kinematic, driven or simulated"
+        return false
+    }
+    hertz = 0.0
+    most_force = 0.0
+    most_torque = 0.0
+    weight = 0.0
+    w = 3
+    while w + 1 < n {
+        key = word(words, w)
+        value, bad = string.to_float(word(words, w + 1))
+        if bad != "" {
+            g_error = "line ${line}: `${word(words, w + 1)}` is not a number"
+            return false
+        }
+        if string.equals(key, "hertz") == 1 {
+            hertz = value
+        } else if string.equals(key, "force") == 1 {
+            most_force = value
+        } else if string.equals(key, "torque") == 1 {
+            most_torque = value
+        } else if string.equals(key, "weight") == 1 {
+            weight = value
+        } else {
+            g_error = "line ${line}: `${key}` is not hertz, force, torque or weight"
+            return false
+        }
+        w = w + 2
+    }
+    if w < n {
+        g_error = "line ${line}: `${word(words, w)}` has no value"
+        return false
+    }
+    if all_below {
+        profile_set_below(pa, profile, k, mode, hertz, most_force, most_torque, weight)
+    } else {
+        profile_set(pa, profile, k, mode, hertz, most_force, most_torque, weight)
+    }
+    return true
+}
+
+// std.string hands back a borrowed C string as a `ptr`; returned from a
+// function declared `-> string` it is one.
+field(fields: ptr, index: int) -> string { return string.array_get(fields, index) }
+
+// A line's words, split on spaces: the runs of them leave empty fields,
+// which are skipped.
+word_count(fields: ptr) -> int {
+    count = 0
+    i = 0
+    while i < string.array_size(fields) {
+        if string.length(field(fields, i)) > 0 { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+word(fields: ptr, index: int) -> string {
+    seen = 0
+    i = 0
+    while i < string.array_size(fields) {
+        value = field(fields, i)
+        if string.length(value) > 0 {
+            if seen == index { return value }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    return ""
 }
