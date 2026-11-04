@@ -152,3 +152,28 @@
   capsule from a point it does not stand at, meeting the world and the
   solid characters as a move from there would: a path search and the moves
   it plans agree.
+
+### Feet that land and roll as a person's do; a run that stops; held items and aims (#930, #932, #952, #959, #960, #961)
+
+- **A foot the take sets down without marking it lands where it touches.**
+  A stop's last step had its sole under the floor through the end of its
+  swing and was marked down 55 ms late: the foot overshot and slid back
+  12 mm into its lock. It lands where it is drawn as it touches, and is
+  held there till the take has it down.
+- **A heel-locked foot goes onto its toe once its heel rises over it**, as
+  well as when the take plants its ball: a start's foot rolling onto its
+  toe slid it 6 mm. Walking to a slot and turning, a toe skates 3.7 mm at
+  the most (10.2 before); sitting, 1.1 mm (4.95).
+- **A run slows to its stop's speeds before it stops.** Braked at its walk
+  stop's 0.41 m/s^2 from any speed, a figure let go from a 3 m/s run was
+  still going 1.35 m/s four seconds on; it rests in 2.2 s now.
+- **Two-handed holds** (#959). Fingers close from last frame's no faster
+  than the captures' own fingers turn (23.5 rad/s through a walk before,
+  7.6 now); the handle's line follows the blend the graph plays
+  (`animator.pose_graph`), not its heaviest take, and is kept within the
+  second arm's reach; an item moves only the hands it holds and lets one
+  go where it holds it (a sheathe with a draw in one frame flung the
+  second hand at 44.9 m/s, now 0.43).
+- **An aimed trunk is the aim's** (#960): the look turns the neck and head
+  while the trunk aims (`ikrig.look_spine`); looking as it aimed, a
+  rifle's barrel went 4.8 degrees off its target, 0.15 now.
