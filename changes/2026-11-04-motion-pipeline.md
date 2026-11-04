@@ -107,3 +107,7 @@
   and the others in 72 ms each, all walking alike within 6e-8 rad.
 - **A slot that names no takes** is held as it is reached, facing its way,
   until the figure leaves (it was refused).
+- **A person at another size than its file's** (#943): `character.humanoid`
+  and `graphed` take a `scale`, the figure's object scaled before anything is
+  made from it; at 0.9 and 1.1 its capsule is that share of its own, tall
+  and round, and it walks without a toe skating 5 mm.
