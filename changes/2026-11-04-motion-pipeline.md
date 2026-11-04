@@ -131,3 +131,24 @@
   it got to. Turned with a fading clip as it came down, a foot's toe swung
   9 mm round its held ankle on the floor. The stool's eight ways now skate
   0 mm.
+
+### People weigh what a person weighs; a graph's takes listed; a reach from a point (#955, #957)
+
+- **A figure's physical-animation bodies weigh a person** of its height
+  (`physics.person_mass`). Dressed in place, they kept the reference
+  human's densities, and kinematic bodies read no mass at all: the UE5
+  mannequin weighed 34.3 kg and Siltreach's people 38.5. They weigh 69.7 kg
+  now, and through `character.physical` a person of the character's
+  standing height. `physanim.set_mass(pa, kg)` gives each its own weight.
+  `physics.ragdoll_mass` and `ragdoll_set_mass` weigh a body by its shapes,
+  kinematic or not. A 40 N s blow to the chest turns it 20.9 degrees, not
+  62.6.
+- **Every take a graph plays**: `animator.state_count`, `state_take_count`
+  and `state_take_at` list a blend's every take and a matcher's every
+  capture, and `metrics.animator_fastest(a)` is the fastest joint turn over
+  all of them. On the UE5 mannequin's 100STYLE gaits: 23.9 rad/s over 14
+  takes, where the stand and the first gait alone gave 16.3.
+- **`physics.character_reach_from(c, feet, offset)`** casts a character's
+  capsule from a point it does not stand at, meeting the world and the
+  solid characters as a move from there would: a path search and the moves
+  it plans agree.
