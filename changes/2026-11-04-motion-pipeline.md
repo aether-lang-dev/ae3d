@@ -177,3 +177,9 @@
 - **An aimed trunk is the aim's** (#960): the look turns the neck and head
   while the trunk aims (`ikrig.look_spine`); looking as it aimed, a
   rifle's barrel went 4.8 degrees off its target, 0.15 now.
+- **`character.act(c, state, blend)`** (#958) plays a one-off take (a
+  knock-down, a get-up) with its root motion through the capsule, the mover
+  left alone, and takes up the stand where it got to at its end;
+  `act_stop` and `acting` with it. UAL2's knock-down moves the mannequin
+  its take's 3 m; a wall behind it stops it at its capsule.
+- A landed foot's sole is laid on the ground while it is held (#932).
