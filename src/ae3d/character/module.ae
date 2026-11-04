@@ -1,0 +1,974 @@
+// A character (#903): a moving, aiming, looking person in a few lines, the
+// way Unity's Animator and CharacterController read together.
+//
+//     hero = character.humanoid(e, "Hero", "people/mannequin.glb", character.gaits("people/100style/neutral"))
+//     character.move(hero, velocity, facing)      // every frame, from the game
+//     character.look(hero, point)
+//     character.aim(hero, target)
+//
+// Under it, set up as a person needs, the pipeline's own parts, each still
+// the game's to reach (character.animator, mover, feet):
+//   - the figure (ae3d.figure) and its animator;
+//   - locomotion from motion capture read by a name's prefix: `prefix`_fw,
+//     _bw, _sw, _fr, _br and _sr (walks and runs ahead, back and to the
+//     side; each side's mirror for the other) as one 2D blend by velocity,
+//     each a loop on its axis; a start (`prefix`_start) played by the
+//     distance gone, a stop (`prefix`_stop) and its mirror played by the
+//     distance left, the one entering with its feet where the figure's are;
+//     the stand at the stop's end. Retargeted onto the figure, feet kept.
+//     Or, given a database of whole captures (match_add), motion matching
+//     over it in their place; or a graph of states read from a file
+//     (graphed, ae3d.animgraph), its blends driven by the mover's
+//     parameters;
+//   - a capsule to move by where there is physics (a CharacterController);
+//   - a mover (ae3d.mover): the velocity and facing a game asks for followed
+//     on springs, the figure moved by them, the graph's parameters written;
+//   - feet locked on the ground and stepping as it turns on the spot
+//     (ikrig), on the physics' static world when there is one;
+//   - eyes ahead where it goes, or on what it is told to look at;
+//   - an aim offset over the spine from a file's pistol aims (aims), on a
+//     ready pose (the level aim over the upper body) while it aims.
+// The showcase's figure on a stick was 96 lines and 56 calls across seven
+// modules; through this it is the three above.
+
+import std.heap
+import std.string
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.physics
+import ae3d.figure
+import ae3d.pose
+import ae3d.clips
+import ae3d.animator
+import ae3d.retarget
+import ae3d.ikrig
+import ae3d.mover
+import ae3d.bvh
+import ae3d.usable
+import ae3d.animgraph
+import ae3d.physanim
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+exports (
+    Character, Gaits, gaits, gaits_set, gaits_free, GAIT_FW, GAIT_BW, GAIT_SW, GAIT_FR, GAIT_BR, GAIT_SR, GAIT_START, GAIT_STOP, GAIT_STAND,
+    humanoid, graphed, graph_of, character_free, capsule_off, match_add, matching, use_takes, use, leave, using, seated, use_phase, use_contact, use_enter_state,
+    USE_NONE, USE_GO, USE_TURN, USE_ENTER, USE_LOOP, USE_EXIT, move, look, look_ahead, look_free, aim, aim_off, aims,
+    hit, physanim_of, animator_of, mover_of, feet_of, object_of, idle_state, move_state, standing, error
+)
+
+// Seconds a character's look and aim ease on and off.
+const EASE = 0.4
+// How far ahead it looks, metres, and how high over its feet.
+const LOOK_AHEAD = 6.0
+const EYE_HIGH = 1.6
+// How much the stick's way through its stop the mover takes to brake by.
+const FACING_HALF_LIFE = 0.6
+// Seconds either side of where a stop or a start would enter it searches for
+// the entry whose feet match (animator.transition_match).
+const STOP_WINDOW = 0.5
+const START_WINDOW = 0.3
+// Seconds after it stands a stop's cut ends, and the stand begins.
+const STOP_AFTER = 0.3
+// Seconds of a capture's calmest stretch a stand is cut from.
+const STAND_SECONDS = 2.5
+// Metres a second under which a frame of a database is taken to stand.
+const STOOD = 0.1
+// Metres a character's capsule is round, and how far it reaches over the
+// top of its head joint.
+const CAPSULE_RADIUS = 0.3
+const HEAD_TOP = 0.12
+
+struct Character {
+    object: ptr                    // *GameObject
+    animator: ptr                  // *Animator
+    mover: ptr                     // *Mover
+    feet: ptr                      // *Feet
+    idle: int                      // its states
+    walk: int
+    start: int
+    stop: int
+    stop_m: int
+    idle_m: int                    // the stand, mirrored
+    start_m: int
+    aim: int                       // its aim offset, -1 none
+    ready: int                     // the level aim over its upper body, -1 none
+    asked: Vec3                    // the velocity asked, the world's
+    facing: Vec3                   // the way asked to face, or none (zero): the way it goes
+    looking: bool                  // told where to look
+    eyes_free: bool                // no look at all: the take's own head (look_free)
+    look_at: Vec3
+    aiming: bool
+    target: Vec3
+    engine: ptr                    // *Engine
+    use_source: ptr                // a string.keep reference: the file a slot's takes are read from (use_takes), or null
+    use_names: ptr                 // ptr[USE_TAKES]: the takes made into states, by name
+    use_states: ptr                // int[USE_TAKES]: and their states
+    use_count: int
+    use_u: ptr                     // *Usables of the slot in use
+    use_slot: int
+    use_phase: int                 // USE_NONE to USE_EXIT
+    use_t: float                   // seconds in the phase
+    use_enter: int                 // the slot's states
+    use_loop: int
+    use_exit: int
+    use_contact: float             // the enter take's time its part lands at
+    leaving: bool
+    matcher: int                   // its database's matcher state (match_add), -1 none
+    match_built: bool
+    capsule: ptr                   // *CharacterController it made itself, or null
+    physanim: ptr                  // *Physanim put on at its first blow (hit), or null
+    graph: ptr                     // *Graph read from a file (graphed), or null
+    stepper: ptr                   // *Behaviour: its step in the engine's loop
+}
+
+var g_error: string = ""
+
+// What the last humanoid that failed said.
+error() -> string { return g_error }
+
+// --- gaits ------------------------------------------------------------------------------------------
+
+// The captures a humanoid moves by, one file each role: walks and runs ahead,
+// back and to the side, a start, a stop, and a stand. gaits(prefix) names
+// them `prefix`_fw.bvh, _bw, _sw, _fr, _br, _sr, _start and _stop (the stand
+// from the stop's end); gaits_set changes one. A style's own stop may be a
+// poor one (100STYLE's neutral style has none that is straight: its stop,
+// cut from its idles, slides its planted foot 17 cm), so a stop from another
+// style can be given.
+struct Gaits {
+    paths: ptr                     // ptr[GAIT_ROLES]: string.keep references
+}
+
+const GAIT_FW = 0
+const GAIT_BW = 1
+const GAIT_SW = 2
+const GAIT_FR = 3
+const GAIT_BR = 4
+const GAIT_SR = 5
+const GAIT_START = 6
+const GAIT_STOP = 7
+const GAIT_STAND = 8
+const GAIT_ROLES = 9
+
+gaits(prefix: string) -> *Gaits {
+    g = heap.new(Gaits)
+    g.paths = calloc(GAIT_ROLES, 8)
+    suffixes = ["_fw", "_bw", "_sw", "_fr", "_br", "_sr", "_start", "_stop", "_stop"]
+    k = 0
+    while k < GAIT_ROLES {
+        path = "${prefix}${suffixes[k]}.bvh"
+        (g.paths as ptr[])[k] = string.keep(path)
+        k = k + 1
+    }
+    return g
+}
+
+// Role `role`'s capture read from `path` instead.
+gaits_set(g: *Gaits, role: int, path: string) {
+    if g == null || role < 0 || role >= GAIT_ROLES { return }
+    string.release_kept((g.paths as ptr[])[role])
+    (g.paths as ptr[])[role] = string.keep(path)
+}
+
+gaits_free(g: *Gaits) {
+    if g == null { return }
+    k = 0
+    while k < GAIT_ROLES {
+        string.release_kept((g.paths as ptr[])[k])
+        k = k + 1
+    }
+    free(g.paths)
+    heap.free(g)
+}
+
+gait_path(g: *Gaits, role: int) -> string {
+    text, _why = string.from_ptr((g.paths as ptr[])[role])
+    return text
+}
+
+// A person: the figure in the glTF file at `path` named `name`, on its
+// gaits read from the captures `prefix`_fw.bvh and the rest (see the top),
+// or, `g` null, on a database given by match_add before its first step.
+// Null when the file or a capture cannot be read (error() says which).
+humanoid(e: *Engine, name: string, path: string, g: *Gaits) -> *Character {
+    g_error = ""
+    o = figure.figure(e, name, path)
+    if o == null {
+        g_error = "cannot read ${path}"
+        return null
+    }
+    a = animator.attach(e, o)
+    r = animator.rig(a)
+    c = heap.new(Character)
+    c.object = o as ptr
+    c.animator = a as ptr
+    c.aim = 0 - 1
+    c.engine = e as ptr
+    c.use_names = calloc(USE_TAKES, 8)
+    c.use_states = calloc(USE_TAKES, 4)
+    c.ready = 0 - 1
+    c.matcher = 0 - 1
+    c.idle = 0 - 1
+    c.idle_m = 0 - 1
+    c.walk = 0 - 1
+    c.start = 0 - 1
+    c.start_m = 0 - 1
+    c.stop = 0 - 1
+    c.stop_m = 0 - 1
+    if g != null && !gaits_states(c, g) { return failed(c) }
+    feet = ikrig.feet_new(r, o)
+    if physics.of(e) != null { ikrig.feet_ground_physics(feet, physics.of(e)) }
+    ikrig.feet_set_steps(feet, true)
+    animator.set_feet(a, feet)
+    c.feet = feet as ptr
+    // A capsule to move by where there is physics, as Unity's Animator goes
+    // with a CharacterController: a wall stops it, a stair lifts it (the
+    // mover's springs and the takes' root motion both move it by its
+    // capsule), as tall as the figure.
+    if physics.of(e) != null && physics.character_of(o) == null {
+        c.capsule = physics.character_controller(o, CAPSULE_RADIUS, standing_height(r, o)) as ptr
+    }
+    m = mover.mover_new(a, o)
+    if c.stop >= 0 { mover.set_braking(m, clips.braking(animator.state_take(a, c.stop))) }
+    mover.set_half_lives(m, mover.HALF_LIFE, FACING_HALF_LIFE)
+    c.mover = m as ptr
+    if c.idle >= 0 { animator.play(a, c.idle, 0.0) }
+    b = engine.behaviour_new("character", c as ptr)
+    b.fixed_update = character_fixed
+    engine.engine_add_behaviour(e, b)
+    c.stepper = b as ptr
+    return c
+}
+
+// The gaits' states and the graph between them: the stand, the 2D blend,
+// the starts and the stops. False when a capture cannot be read.
+gaits_states(c: *Character, g: *Gaits) -> bool {
+    a = c.animator as *Animator
+    r = animator.rig(a)
+    // The stand: the capture's calmest STAND_SECONDS (clips.calmest), a
+    // loop. Cut where its root first stood still, 100STYLE's neutral stand
+    // began as its actor lifted its arms out to 78 degrees, and the figure
+    // stood with them held out like a gorilla.
+    stood = captured(a, gait_path(g, GAIT_STAND))
+    if stood == null { return false }
+    calm = clips.calmest(stood, r, STAND_SECONDS)
+    from = (calm * clips.rate(stood)) as int
+    to = ((calm + STAND_SECONDS) * clips.rate(stood)) as int
+    if to > clips.frames(stood) - 1 { to = clips.frames(stood) - 1 }
+    standing = clips.crop(stood, r, from, to, false)
+    idle_t = animator.add_take(a, clips.loop_cut(standing, r), false)
+    c.idle = animator.add_state(a, "idle", idle_t, true)
+    clips.take_free(standing)
+    // The gaits, each a loop on its axis, set in the space at its velocity.
+    c.walk = animator.add_blend2(a, "move")
+    roles = [GAIT_FW, GAIT_BW, GAIT_SW, GAIT_FR, GAIT_BR, GAIT_SR]
+    sides = [false, false, true, false, false, true]
+    k = 0
+    while k < 6 {
+        t = captured(a, gait_path(g, roles[k]))
+        if t == null { return false }
+        clips.straighten(t, r, true)
+        t = animator.add_take(a, clips.loop_cut(t, r), false)
+        clips.straighten(t, r, true)
+        went = clips.travel(t, clips.duration(t))
+        animator.blend_add2(a, c.walk, t, went.x / clips.duration(t), went.y / clips.duration(t))
+        if sides[k] {
+            other = animator.add_take(a, clips.mirror(t, r), false)
+            far = clips.travel(other, clips.duration(other))
+            animator.blend_add2(a, c.walk, other, far.x / clips.duration(other), far.y / clips.duration(other))
+        }
+        k = k + 1
+    }
+    animator.bind2(a, c.walk, "vx", "vz")
+    // The start by the way come, the stop by the way left; each with its
+    // mirror and the stand with its own, so whichever foot the figure has
+    // down there is one whose feet match. A transition into any of them
+    // enters where the feet match best (transition_match): a stop within
+    // half a stride of where the distance left puts it, a stand anywhere
+    // in its loop.
+    starting = captured(a, gait_path(g, GAIT_START))
+    if starting == null { return false }
+    clips.straighten(starting, r, true)
+    start_t = cut_about(a, starting, 0.0 - 0.3, 1.6, true)
+    c.start = animator.add_state(a, "start", start_t, false)
+    animator.clock_by(a, c.start, "travelled", false)
+    c.start_m = animator.add_state(a, "start", animator.add_take(a, clips.mirror(start_t, r), false), false)
+    animator.clock_by(a, c.start_m, "travelled", false)
+    stopping = captured(a, gait_path(g, GAIT_STOP))
+    if stopping == null { return false }
+    clips.straighten(stopping, r, true)
+    stop_t = cut_about(a, stopping, 0.0 - 1.6, STOP_AFTER, false)
+    c.stop = animator.add_state(a, "stop", stop_t, false)
+    animator.clock_by(a, c.stop, "rest", true)
+    c.stop_m = animator.add_state(a, "stop", animator.add_take(a, clips.mirror(stop_t, r), false), false)
+    animator.clock_by(a, c.stop_m, "rest", true)
+    c.idle_m = animator.add_state(a, "idle", animator.add_take(a, clips.mirror(idle_t, r), false), true)
+    stands = [c.idle, c.idle_m]
+    starts = [c.start, c.start_m]
+    stops = [c.stop, c.stop_m]
+    k = 0
+    while k < 2 {
+        go = animator.add_transition(a, stands[k], c.start, 0.2)
+        animator.transition_when(a, go, "go", animator.IS, 0.0)
+        animator.transition_or(a, go, c.start_m)
+        animator.transition_match(a, go, START_WINDOW)
+        on = animator.add_transition(a, starts[k], c.walk, 0.3)
+        animator.transition_when(a, on, "", animator.ENDED, 0.0)
+        animator.transition_synced(a, on, true)
+        rested = animator.add_transition(a, stops[k], c.idle, 0.3)
+        animator.transition_when(a, rested, "", animator.ENDED, 0.0)
+        animator.transition_or(a, rested, c.idle_m)
+        animator.transition_match(a, rested, STOP_WINDOW)
+        // A stop asked for while it starts.
+        early = animator.add_transition(a, starts[k], c.idle, 0.3)
+        animator.transition_when(a, early, "go", animator.IS_NOT, 0.0)
+        animator.transition_when(a, early, "speed", animator.BELOW, 0.1)
+        animator.transition_or(a, early, c.idle_m)
+        animator.transition_match(a, early, STOP_WINDOW)
+        k = k + 1
+    }
+    halt = animator.add_transition(a, c.walk, c.stop, 0.25)
+    animator.transition_when(a, halt, "go", animator.IS_NOT, 0.0)
+    animator.transition_when(a, halt, "rest", animator.BELOW, clips.travel_length(stop_t))
+    animator.transition_or(a, halt, c.stop_m)
+    animator.transition_match(a, halt, STOP_WINDOW)
+    return true
+}
+
+// A person on a graph of states read from a file (ae3d.animgraph): the
+// figure in the glTF file at `path` named `name`, its takes, states, blends
+// and transitions as the file at `graph` declares them (its own clips, or
+// another file's retargeted), driven by the parameters its mover writes
+// ("speed", "vx" and "vz", "go", "moving", "turning", "travelled",
+// "rest"): a runner's walk, jog and sprint blended by speed. Its stand is
+// the graph's state "idle", its moving one "move"; its feet, eyes, aim,
+// capsule and use are humanoid's. Null when either file cannot be read
+// (error() says which, and where in the graph).
+graphed(e: *Engine, name: string, path: string, graph: string) -> *Character {
+    c = humanoid(e, name, path, null as *Gaits)
+    if c == null { return null }
+    a = c.animator as *Animator
+    gr = animgraph.load(a, graph)
+    if gr == null {
+        g_error = "${graph}: ${animgraph.error()}"
+        character_free(c)
+        return null
+    }
+    c.graph = gr as ptr
+    c.idle = animgraph.state_of(gr, "idle")
+    c.walk = animgraph.state_of(gr, "move")
+    if c.idle >= 0 && animator.current(a) != c.idle { animator.play(a, c.idle, 0.0) }
+    return c
+}
+
+// Its capsule taken off: the figure stands and goes where its mover and its
+// takes put it, through anything. One stood with a foot up on a block its
+// capsule would put it on top of, or one a game moves itself.
+capsule_off(c: *Character) {
+    if c.capsule == null { return }
+    physics.character_free(c.capsule as *CharacterController)
+    c.capsule = null
+}
+
+// A blow (#903): `impulse` (newton seconds) at `point` on the body named
+// `bone` (physanim's: "Hips", "Spine", "Chest", "Neck", "ShoulderL",
+// "ElbowL", "ThighL", "KneeL" and the right's; "" the body nearest
+// `point`, as a ray's hit gives it). The figure's ragdoll (ae3d.physanim,
+// put on it at its first blow where the engine has physics) takes the blow
+// and is drawn from where it goes, then eased back onto the animation, the
+// figure walking on as it was; and where its graph has a flinch for the
+// part struck, a layer "hit_head" (the neck), "hit_legs" (a thigh or a
+// knee) or "hit_chest" (the rest), that is played from its start over
+// the figure, the others eased out. A hit reaction in Unreal is the same
+// two: a physical blend on the struck bodies and an additive hit take.
+// False when nothing could take it: no physics and no flinch.
+hit(c: *Character, bone: string, point: Vec3, impulse: Vec3) -> bool {
+    if c == null { return false }
+    e = c.engine as *Engine
+    a = c.animator as *Animator
+    if c.physanim == null && physics.of(e) != null { c.physanim = physanim.attach(e, a) as ptr }
+    struck = ""
+    if c.physanim != null {
+        pa = c.physanim as *Physanim
+        k = physanim.nearest(pa, point)
+        if bone != "" { k = physanim.bone_named(pa, bone) }
+        if k >= 0 {
+            physanim.hit(pa, k, point, impulse)
+            struck = physics.humanoid_bone(k)
+        }
+    } else {
+        struck = bone
+    }
+    return flinch(c, struck) || struck != ""
+}
+
+// The figure's physical animation, null before its first blow (hit) or
+// where the engine has no physics.
+physanim_of(c: *Character) -> *Physanim { return c.physanim as *Physanim }
+
+const FLINCH_OUT = 0.2
+
+// The graph's flinch for body `struck` played from its start, the other
+// flinches eased out. False when the graph has none for it.
+flinch(c: *Character, struck: string) -> bool {
+    gr = c.graph as *Graph
+    if gr == null { return false }
+    a = c.animator as *Animator
+    wanted = "hit_chest"
+    if string.equals(struck, "Neck") == 1 { wanted = "hit_head" }
+    if string.starts_with(struck, "Thigh") == 1 || string.starts_with(struck, "Knee") == 1 { wanted = "hit_legs" }
+    names = ["hit_chest", "hit_head", "hit_legs"]
+    played = false
+    i = 0
+    while i < 3 {
+        layer = animgraph.layer_of(gr, names[i])
+        if layer >= 0 {
+            if string.equals(names[i], wanted) == 1 {
+                animator.layer_restart(a, layer)
+                animator.layer_weight(a, layer, 1.0, 0.0)
+                played = true
+            } else {
+                animator.layer_weight(a, layer, 0.0, FLINCH_OUT)
+            }
+        }
+        i = i + 1
+    }
+    return played
+}
+
+// The graph a graphed character was read from, its parts by name; null for
+// one on gaits or a database.
+graph_of(c: *Character) -> *Graph { return c.graph as *Graph }
+
+failed(c: *Character) -> *Character {
+    if g_error == "" { g_error = "a capture could not be read" }
+    character_free(c)
+    return null
+}
+
+// The capture at `path` retargeted onto `a`'s figure, its feet kept and its
+// root motion taken out; the animator's. Null (and error() says which)
+// when it cannot be read.
+captured(a: *Animator, path: string) -> *Take {
+    c = bvh.load(path, 0.0)
+    if c == null {
+        g_error = "cannot read ${path}: ${bvh.error()}"
+        return null
+    }
+    made = bvh.take(c, path, 0, 0 - 1)
+    t = animator.add_take(a, retarget.retarget(bvh.rig(c), made, animator.rig(a)), true)
+    clips.take_free(made)
+    bvh.capture_free(c)
+    return t
+}
+
+// Take `t` cut from `from` to `to` seconds about its root's first move (or,
+// not `around_move`, its first stand after its fastest).
+cut_about(a: *Animator, t: *Take, from: float, to: float, around_move: bool) -> *Take {
+    r = animator.rig(a)
+    mark = clips.moving_at(t, 0.1)
+    if !around_move { mark = clips.still_at(t, 0.1) }
+    a0 = ((mark + from) * clips.rate(t)) as int
+    b0 = ((mark + to) * clips.rate(t)) as int
+    if a0 < 0 { a0 = 0 }
+    if b0 > clips.frames(t) - 1 { b0 = clips.frames(t) - 1 }
+    return animator.add_take(a, clips.crop(t, r, a0, b0, false), false)
+}
+
+// How tall the figure stands: its head joint's height in its rest pose over
+// its feet, and HEAD_TOP.
+standing_height(r: *pose.Rig, o: *GameObject) -> float {
+    w = pose.new(r)
+    pose.rest_world(r, w)
+    high = clips.ground_point(r, pose.translation(w, pose.human(r, pose.HEAD))).y - behaviour.object_position(o).y
+    pose.release(w)
+    return high + HEAD_TOP
+}
+
+character_free(c: *Character) {
+    if c == null { return }
+    // Out of the engine's loop first, as an animator is: freed while the
+    // engine runs, its step would read freed memory.
+    if c.stepper != null {
+        engine.engine_remove_behaviour(c.engine as *Engine, c.stepper as *Behaviour)
+        heap.free(c.stepper as *Behaviour)
+    }
+    // Its physical animation before the animator it steps after.
+    if c.physanim != null { physanim.physanim_free(c.physanim as *Physanim) }
+    if c.capsule != null { physics.character_free(c.capsule as *CharacterController) }
+    k = 0
+    while k < c.use_count {
+        string.release_kept((c.use_names as ptr[])[k])
+        k = k + 1
+    }
+    free(c.use_names)
+    free(c.use_states)
+    if c.use_source != null { string.release_kept(c.use_source) }
+    if c.mover != null { mover.mover_free(c.mover as *Mover) }
+    if c.graph != null { animgraph.graph_free(c.graph as *Graph) }
+    // The animator it attached, with the feet, hands and look it set on it.
+    if c.animator != null { animator.animator_free(c.animator as *Animator) }
+    heap.free(c)
+}
+
+// --- moving by a database (#906) --------------------------------------------------------------------
+
+// The capture at `path` (BVH, gzip'd or not) read whole into the character's
+// database, and its mirror when `mirrored`: motion matching, as UE5's Pose
+// Search database under its Motion Matching node. Once it has one, the
+// character moves by the frame of it whose pose and way ahead best match
+// the mover's (animator.add_matcher), the figure carried by the takes' own
+// root motion (mover.set_follow), in place of its gaits' blend, starts and
+// stops; its look, aim and use are the same. Built at its first step after
+// the last is added. False when the file cannot be read (error() says why).
+match_add(c: *Character, path: string, mirrored: bool) -> bool {
+    a = c.animator as *Animator
+    t = captured(a, path)
+    if t == null { return false }
+    if c.matcher < 0 { c.matcher = animator.add_matcher(a, "match") }
+    animator.matcher_add(a, c.matcher, t)
+    if mirrored { animator.matcher_add(a, c.matcher, animator.add_take(a, clips.mirror(t, animator.rig(a)), false)) }
+    c.match_built = false
+    return true
+}
+
+// Whether it moves by a database (match_add).
+matching(c: *Character) -> bool { return c.matcher >= 0 }
+
+// The database built and played, the mover asking it for the way ahead.
+match_start(c: *Character) {
+    a = c.animator as *Animator
+    m = c.mover as *Mover
+    animator.matcher_build(a, c.matcher)
+    mover.set_matcher(m, c.matcher)
+    mover.set_follow(m, true)
+    mover.settle(m)
+    if c.use_phase == USE_NONE { animator.play(a, c.matcher, 0.3) }
+    c.match_built = true
+}
+
+// What it stands and moves in when it does nothing else: its database, or
+// its stand.
+rest_state(c: *Character) -> int {
+    if c.matcher >= 0 { return c.matcher }
+    return c.idle
+}
+
+// --- asking -----------------------------------------------------------------------------------------
+
+// Go at `velocity` (the world's, over the ground, metres a second), facing
+// `facing` (level; zero to face the way it goes). Every frame, from the game.
+move(c: *Character, velocity: Vec3, facing: Vec3) {
+    c.asked = core.vec3(velocity.x, 0.0, velocity.z)
+    c.facing = core.vec3(facing.x, 0.0, facing.z)
+}
+
+// Eyes on `point` (the world's) until look_ahead.
+look(c: *Character, point: Vec3) {
+    c.eyes_free = false
+    c.looking = true
+    c.look_at = point
+}
+
+// Eyes ahead where it goes again.
+look_ahead(c: *Character) {
+    c.looking = false
+    c.eyes_free = false
+}
+
+// No look at all, until look or look_ahead: the head as the take has it.
+// Struck, a head goes where the blow sends it; held on what it watched, a
+// head hit tipped the head back 16 degrees where its take tips it 80.
+look_free(c: *Character) {
+    c.looking = false
+    c.eyes_free = true
+}
+
+// The pistol aims of the file at `path` (named `neutral`, `up` and `down`,
+// level and 0.7 rad up and down) retargeted onto the figure as its aim
+// offset over the spine, the level one also its ready pose. False when the
+// file has none of them.
+aims(c: *Character, e: *Engine, path: string, neutral: string, up: string, down: string) -> bool {
+    a = c.animator as *Animator
+    r = animator.rig(a)
+    source_o = figure.figure(e, "aims", path)
+    if source_o == null { return false }
+    behaviour.object_set_position(source_o, core.vec3(0.0, 0.0 - 60.0, 0.0))
+    source_f = figure.figure_of(source_o)
+    source = pose.of_skeleton(figure.skeleton(source_f))
+    c.aim = animator.add_aim(a, pose.human(r, pose.SPINE_01))
+    names = [neutral, up, down]
+    pitches = [0.0, 0.7, 0.0 - 0.7]
+    good = true
+    k = 0
+    while k < 3 {
+        made = clips.from_scene(source, figure.scene(source_f), names[k], 0.0)
+        if made == null {
+            good = false
+        } else {
+            aimed = animator.add_take(a, retarget.retarget(source, made, r), false)
+            animator.aim_add(a, c.aim, aimed, 0.0, pitches[k])
+            if k == 0 { c.ready = animator.add_layer(a, aimed, pose.human(r, pose.SPINE_01), false, true) }
+            clips.take_free(made)
+        }
+        k = k + 1
+    }
+    pose.rig_free(source)
+    animator.set_aim(a, c.aim, 0.0, 0.0, 0.0)
+    return good
+}
+
+// Aim at `target` (the world's): the ready pose over the upper body, the
+// aim offset pitched at it, the trunk turned to it, the eyes on it.
+aim(c: *Character, target: Vec3) {
+    c.aiming = true
+    c.target = target
+}
+
+aim_off(c: *Character) { c.aiming = false }
+
+// --- using things (#908) ----------------------------------------------------------------------------
+
+// What it is doing with a slot.
+const USE_NONE = 0
+const USE_GO = 1                   // walking to the slot's approach point
+const USE_TURN = 2                 // turning on the spot to face the slot's way
+const USE_ENTER = 3                // its enter take, warped onto the slot
+const USE_LOOP = 4                 // its loop take, until it leaves
+const USE_EXIT = 5                 // its exit take, and the slot let go
+// Metres from the approach point it starts to turn at, and how near facing
+// the slot's way (radians) it must be to enter.
+const ARRIVED = 0.3
+const FACED = 0.17
+// Metres a second it walks to a slot at.
+const USE_WALK = 0.9
+// Seconds a hand's IK eases onto a slot's point before its take's contact,
+// and off it after.
+const REACH_IN = 0.25
+const REACH_OUT = 0.35
+// And how long before the contact it is all on: the hands' weight follows on
+// a spring, and eased in to the contact itself it was still short of whole
+// there, the hand 2.2 cm off the tool.
+const REACH_HELD = 0.25
+// The most takes a character's slots make states of.
+const USE_TAKES = 32
+
+// The file a slot's takes are read from when the figure's own has none of
+// them (UAL1's sitting takes for the UE5 mannequin), retargeted onto it.
+use_takes(c: *Character, path: string) {
+    if c.use_source != null { string.release_kept(c.use_source) }
+    c.use_source = string.keep(path)
+}
+
+// Use slot `slot` of `u`: walk to its approach point, turn there to face its
+// way, enter it (the enter take warped so its part lands on the slot at the
+// take's contact: animator.warp), then play its loop until leave. False if
+// another holds the slot or it is using one already.
+use(c: *Character, u: *Usables, slot: int) -> bool {
+    if c.use_phase != USE_NONE { return false }
+    if !usable.claim(u, slot, c as ptr) { return false }
+    c.use_u = u as ptr
+    c.use_slot = slot
+    c.use_phase = USE_GO
+    c.use_t = 0.0
+    return true
+}
+
+// Leave the slot in use: its exit take, then the slot let go and the figure
+// standing.
+leave(c: *Character) { c.leaving = true }
+
+using(c: *Character) -> bool { return c.use_phase != USE_NONE }
+seated(c: *Character) -> bool { return c.use_phase == USE_LOOP }
+use_phase(c: *Character) -> int { return c.use_phase }
+// The enter take's time its part lands at, for the slot in use.
+use_contact(c: *Character) -> float { return c.use_contact }
+use_enter_state(c: *Character) -> int { return c.use_enter }
+
+// The state playing the take named `title`, made the first time: from the
+// figure's own file, or from use_takes' retargeted. -1 when neither has it.
+take_state(c: *Character, title: string, loop: bool) -> int {
+    a = c.animator as *Animator
+    k = 0
+    while k < c.use_count {
+        if string.equals(name_of_use(c, k), title) == 1 { return (c.use_states as int[])[k] }
+        k = k + 1
+    }
+    if string.length(title) == 0 { return 0 - 1 }
+    r = animator.rig(a)
+    t = animator.take(a, title, true)
+    if t == null && c.use_source != null {
+        src, _why = string.from_ptr(c.use_source)
+        e = c.engine as *Engine
+        so = figure.figure(e, "takes", src)
+        if so != null {
+            behaviour.object_set_position(so, core.vec3(0.0, 0.0 - 80.0, 0.0))
+            sf = figure.figure_of(so)
+            source = pose.of_skeleton(figure.skeleton(sf))
+            made = clips.from_scene(source, figure.scene(sf), title, 0.0)
+            if made != null {
+                t = animator.add_take(a, retarget.retarget(source, made, r), true)
+                clips.take_free(made)
+            }
+            pose.rig_free(source)
+        }
+    }
+    if t == null { return 0 - 1 }
+    s = animator.add_state(a, title, t, loop)
+    if c.use_count >= USE_TAKES { return s }
+    (c.use_names as ptr[])[c.use_count] = string.keep(title)
+    (c.use_states as int[])[c.use_count] = s
+    c.use_count = c.use_count + 1
+    return s
+}
+
+name_of_use(c: *Character, k: int) -> string {
+    text, _why = string.from_ptr((c.use_names as ptr[])[k])
+    return text
+}
+
+// When take `t`'s part `lands` (usable.LANDS_*) lands: a pelvis when it
+// first comes within 1 cm of its height at the take's end (sat down); a
+// hand when it has gone furthest from where it was at the take's start (its
+// reach: measured from the pelvis, a hand hanging at the side counted as
+// reaching at the take's first frame); the feet at the end.
+contact_of(t: *Take, r: *pose.Rig, lands: int) -> float {
+    if lands == usable.LANDS_FEET { return clips.duration(t) }
+    w = pose.new(r)
+    pelvis = pose.human(r, pose.PELVIS)
+    found = clips.duration(t)
+    if lands == usable.LANDS_PELVIS {
+        pose.world(r, clips.frame(t, clips.frames(t) - 1), w)
+        last = clips.ground_point(r, pose.translation(w, pelvis)).y
+        f = 0
+        while f < clips.frames(t) {
+            pose.world(r, clips.frame(t, f), w)
+            if core.abs_of(clips.ground_point(r, pose.translation(w, pelvis)).y - last) < 0.01 {
+                found = (f as float) / clips.rate(t)
+                f = clips.frames(t)
+            }
+            f = f + 1
+        }
+    } else {
+        hand = pose.human(r, pose.HAND_R)
+        if lands == usable.LANDS_HAND_L { hand = pose.human(r, pose.HAND_L) }
+        most = 0.0 - 1.0
+        pose.world(r, clips.frame(t, 0), w)
+        start = core.v3_sub(clips.ground_point(r, pose.translation(w, hand)), clips.ground_point(r, pose.translation(w, pelvis)))
+        f = 0
+        while f < clips.frames(t) {
+            pose.world(r, clips.frame(t, f), w)
+            d = core.v3_sub(clips.ground_point(r, pose.translation(w, hand)), clips.ground_point(r, pose.translation(w, pelvis)))
+            reach = core.v3_len(core.v3_sub(d, start))
+            if reach > most {
+                most = reach
+                found = (f as float) / clips.rate(t)
+            }
+            f = f + 1
+        }
+    }
+    pose.release(w)
+    return found
+}
+
+// A step of using a slot (see use). True while the figure is the slot's.
+use_step(c: *Character, dt: float) -> bool {
+    if c.use_phase == USE_NONE { return false }
+    a = c.animator as *Animator
+    m = c.mover as *Mover
+    o = c.object as *GameObject
+    u = c.use_u as *Usables
+    at = behaviour.object_position(o)
+    c.use_t = c.use_t + dt
+    if c.use_phase == USE_GO {
+        to = core.v3_sub(usable.slot_approach(u, c.use_slot), at)
+        to = core.vec3(to.x, 0.0, to.z)
+        d = core.v3_len(to)
+        ask = core.vec3(0.0, 0.0, 0.0)
+        // Asked on until the springs would bring it to rest there.
+        if d > ARRIVED && mover.rest_distance(m) < d { ask = core.v3_mul(core.v3_normalize(to), USE_WALK) }
+        mover.face(m, 0.0, false)
+        mover.ask(m, ask)
+        mover.step(m, dt)
+        now = animator.current(a)
+        // Stood: not in a stop, nor, moving by a database, still carried by a
+        // frame that walks.
+        still = now != c.stop && now != c.stop_m
+        if c.matcher >= 0 { still = animator.ground_speed(a) < STOOD }
+        if d <= ARRIVED && core.v3_len(mover.velocity(m)) < 0.05 && still {
+            c.use_phase = USE_TURN
+            c.use_t = 0.0
+        }
+        return true
+    }
+    if c.use_phase == USE_TURN {
+        way = usable.slot_facing(u, c.use_slot)
+        yaw = core.atan2_of(way.x, way.z)
+        mover.face(m, yaw, true)
+        mover.ask(m, core.vec3(0.0, 0.0, 0.0))
+        mover.step(m, dt)
+        ahead = core.quat_apply(behaviour.object_rotation(o), core.vec3(0.0, 0.0, 1.0))
+        off = core.abs_of(wrap_angle(yaw - core.atan2_of(ahead.x, ahead.z)))
+        if off < FACED && c.use_t > 0.3 {
+            // Entered: the take's own root motion moves it, warped onto the slot.
+            c.use_enter = take_state(c, usable.slot_enter(u, c.use_slot), false)
+            c.use_loop = take_state(c, usable.slot_loop(u, c.use_slot), true)
+            c.use_exit = take_state(c, usable.slot_exit(u, c.use_slot), false)
+            if c.use_enter < 0 {
+                usable.release(u, c.use_slot, c as ptr)
+                c.use_phase = USE_NONE
+                return false
+            }
+            lands = usable.slot_lands(u, c.use_slot)
+            enter_t = animator.state_take(a, c.use_enter)
+            c.use_contact = contact_of(enter_t, animator.rig(a), lands)
+            animator.set_root_motion(a, true)
+            animator.play(a, c.use_enter, 0.3)
+            part = pose.PELVIS
+            if lands == usable.LANDS_HAND_R { part = pose.HAND_R }
+            if lands == usable.LANDS_HAND_L { part = pose.HAND_L }
+            if lands != usable.LANDS_FEET { animator.warp(a, c.use_enter, c.use_contact, usable.slot_at(u, c.use_slot), way, part) }
+            c.use_phase = USE_ENTER
+            c.use_t = 0.0
+        }
+        return true
+    }
+    if c.use_phase == USE_ENTER {
+        // A hand's slot: the hand drawn onto it about the take's contact by the
+        // whole body (ikrig's full-body reach, the feet held where the take has
+        // them), eased in over REACH_IN to REACH_HELD before it and out over
+        // REACH_OUT after, as a reach is fitted to what it reaches for. The warp
+        // moves the body over the ground only: by it alone, a hand fell 3.2 cm
+        // short of a bench's tool; by the arm alone, its reach near full
+        // stretch, 1.3 cm.
+        lands = usable.slot_lands(u, c.use_slot)
+        if lands == usable.LANDS_HAND_L || lands == usable.LANDS_HAND_R {
+            side = 1
+            if lands == usable.LANDS_HAND_L { side = 0 }
+            b = animator.body(a)
+            if b == null {
+                b = ikrig.body_new(animator.rig(a))
+                ikrig.body_hold_feet(b, true)
+                animator.set_body(a, b)
+            }
+            now = animator.state_time(a)
+            w = 0.0
+            if now < c.use_contact {
+                u_in = core.clampf(1.0 - (c.use_contact - REACH_HELD - now) / REACH_IN, 0.0, 1.0)
+                w = u_in * u_in * (3.0 - 2.0 * u_in)
+            } else {
+                u_out = core.clampf(1.0 - (now - c.use_contact) / REACH_OUT, 0.0, 1.0)
+                w = u_out * u_out * (3.0 - 2.0 * u_out)
+            }
+            which = ikrig.BODY_HAND_R
+            if side == 0 { which = ikrig.BODY_HAND_L }
+            if b != null { ikrig.body_set(b, which, usable.slot_at(u, c.use_slot), w) }
+        }
+        if animator.current(a) == c.use_enter && animator.state_time(a) >= clips.duration(animator.state_take(a, c.use_enter)) - 0.0001 {
+            if c.use_loop >= 0 { animator.play(a, c.use_loop, 0.3) }
+            c.use_phase = USE_LOOP
+            c.use_t = 0.0
+        }
+        return true
+    }
+    if c.use_phase == USE_LOOP {
+        if c.leaving {
+            c.leaving = false
+            animator.lift_to(a, 0.0, 0.6)
+            if c.use_exit >= 0 {
+                animator.play(a, c.use_exit, 0.3)
+                c.use_phase = USE_EXIT
+            } else {
+                done_using(c)
+            }
+            c.use_t = 0.0
+        }
+        return true
+    }
+    if c.use_phase == USE_EXIT {
+        if animator.current(a) != c.use_exit || animator.state_time(a) >= clips.duration(animator.state_take(a, c.use_exit)) - 0.0001 {
+            done_using(c)
+        }
+        return true
+    }
+    return false
+}
+
+// The slot let go, the figure standing on its own again, the mover's
+// springs where it is.
+done_using(c: *Character) {
+    a = c.animator as *Animator
+    usable.release(c.use_u as *Usables, c.use_slot, c as ptr)
+    animator.set_root_motion(a, false)
+    animator.lift_to(a, 0.0, 0.3)
+    animator.play(a, rest_state(c), 0.4)
+    mover.settle(c.mover as *Mover)
+    c.use_phase = USE_NONE
+}
+
+wrap_angle(x: float) -> float {
+    y = x
+    while y > 3.141592653589793 { y = y - 6.283185307179586 }
+    while y < 0.0 - 3.141592653589793 { y = y + 6.283185307179586 }
+    return y
+}
+
+// --- each step --------------------------------------------------------------------------------------
+
+character_fixed(state: ptr, e: *Engine, dt: float) {
+    c = state as *Character
+    a = c.animator as *Animator
+    m = c.mover as *Mover
+    o = c.object as *GameObject
+    at = behaviour.object_position(o)
+    if c.matcher >= 0 && !c.match_built { match_start(c) }
+    using_now = use_step(c, dt)
+    if !using_now {
+        if core.v3_len(c.facing) > 0.0001 {
+            mover.face(m, core.atan2_of(c.facing.x, c.facing.z), true)
+        } else {
+            mover.face(m, 0.0, false)
+        }
+        mover.ask(m, c.asked)
+        mover.step(m, dt)
+    }
+    ahead = core.quat_apply(behaviour.object_rotation(o), core.vec3(0.0, 0.0, 1.0))
+    eyes = core.vec3(at.x + ahead.x * LOOK_AHEAD, at.y + EYE_HIGH, at.z + ahead.z * LOOK_AHEAD)
+    if c.looking { eyes = c.look_at }
+    if c.aiming { eyes = c.target }
+    // Eyes ahead lightly; on what it is told to look at or aim at, fully.
+    weight = 0.8
+    if c.looking || c.aiming { weight = 1.0 }
+    if c.eyes_free && !c.aiming { weight = 0.0 }
+    animator.look_at(a, eyes, weight)
+    if c.aim >= 0 {
+        w = 0.0
+        pitch = 0.0
+        if c.aiming {
+            w = 1.0
+            to = core.v3_sub(c.target, core.vec3(at.x, at.y + EYE_HIGH, at.z))
+            pitch = core.atan2_of(to.y, core.v3_len(core.vec3(to.x, 0.0, to.z)))
+        }
+        animator.set_aim(a, c.aim, 0.0, pitch, w)
+        animator.layer_weight(a, c.ready, w, EASE)
+    }
+}
+
+// --- underneath -------------------------------------------------------------------------------------
+
+animator_of(c: *Character) -> *Animator { return c.animator as *Animator }
+mover_of(c: *Character) -> *Mover { return c.mover as *Mover }
+feet_of(c: *Character) -> *Feet { return c.feet as *Feet }
+object_of(c: *Character) -> *GameObject { return c.object as *GameObject }
+idle_state(c: *Character) -> int { return c.idle }
+// Whether it stands: in either stand (the stand or its mirror), or, moving
+// by a database, on a frame that hardly goes anywhere, nor asked to.
+standing(c: *Character) -> bool {
+    now = animator.current(c.animator as *Animator)
+    if c.matcher >= 0 { return now == c.matcher && animator.ground_speed(c.animator as *Animator) < STOOD && core.v3_len(c.asked) < 0.05 }
+    return now == c.idle || now == c.idle_m
+}
+move_state(c: *Character) -> int { return c.walk }

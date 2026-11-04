@@ -1,0 +1,526 @@
+// ci: optimised -- it times a figure's ragdoll step and drawing against a budget
+// Physical animation (#858, ae3d.physanim), held to numbers: the UE5
+// mannequin made a person (ae3d.character) walking at 1 m/s in a world with
+// physics, its ragdoll following its animated pose, beside a twin with none
+// asked the same in an engine of its own. No window; stepped at 60 Hz.
+//
+//   - every body's weight 0: every joint drawn within 1e-6 of the twin's
+//     (the animation exactly);
+//   - struck in the chest from behind, still walking: the chest drawn off
+//     the twin's (over 3 degrees), back on it (within half a degree) once
+//     the hit has eased out; on its walk all the while (its legs on the
+//     animation), where the twin walks (its object within 1 mm of the
+//     twin's), its toes not skating 5 mm;
+//   - easing back, no joint turns faster than the takes' own fastest plus
+//     what the easing itself needs;
+//   - a measured cost a figure a step: the physics' step and the drawing,
+//     for eight figures, under 0.5 ms each;
+//   - profiles read from a file (tests/fixtures/physanim/people.profiles):
+//     applied, a profile's modes, anchor strengths and weights are the
+//     bodies'; eased onto loose arms, no joint turns faster than the walk's
+//     own fastest plus the easing's; kinematic arms are exactly where the
+//     step's animation puts them (the animator at the fixed step, before
+//     the physics); a soft trunk is carried further by the same blow than
+//     the anchors' own strength lets it, and comes back;
+//   - through the character (character.hit), the mannequin on the struck
+//     graph (its hit_head and hit_chest flinches): struck at a point, its
+//     ragdoll put on at the blow, the nearest body taken, the head flinch
+//     played from its start; struck by name, the chest flinch, and once
+//     eased out the figure drawn as its graph has it.
+
+import std.os
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.physics
+import ae3d.figure
+import ae3d.pose
+import ae3d.animator
+import ae3d.character
+import ae3d.mover
+import ae3d.metrics
+import ae3d.physanim
+import ae3d.animgraph
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+const STEP = 0.016666666666666666
+const MANNEQUIN = "tests/fixtures/people/mannequin.glb"
+const GAITS = "tests/fixtures/people/100style/neutral"
+const STOP = "tests/fixtures/people/100style/neutral_arrive.bvh"
+const START = "tests/fixtures/people/100style/startstop_start.bvh"
+const STRUCK = "tests/fixtures/graphs/struck.graph"
+const PROFILES = "tests/fixtures/physanim/people.profiles"
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+turned_by(a: Quat, b: Quat) -> float {
+    la = core.sqrt_of(a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w)
+    lb = core.sqrt_of(b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w)
+    if la < 0.000001 || lb < 0.000001 { return 0.0 }
+    d = core.abs_of(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w) / (la * lb)
+    if d > 1.0 { d = 1.0 }
+    return 2.0 * core.acos_of(d)
+}
+
+// The most any joint of `p` is off `q`'s, turned (radians) or moved (the
+// rig's units), local poses of one rig.
+apart(r: *pose.Rig, p: ptr, q: ptr) -> float {
+    most = 0.0
+    j = 0
+    while j < pose.count(r) {
+        d = turned_by(pose.rotation(p, j), pose.rotation(q, j))
+        if d > most { most = d }
+        t = core.v3_len(core.v3_sub(pose.translation(p, j), pose.translation(q, j)))
+        if t > most { most = t }
+        j = j + 1
+    }
+    return most
+}
+
+// A joint's turn in the rig's space, `w` a pose's worlds.
+joint_off(r: *pose.Rig, p: ptr, q: ptr, wp: ptr, wq: ptr, j: int) -> float {
+    pose.world(r, p, wp)
+    pose.world(r, q, wq)
+    return turned_by(pose.rotation(wp, j), pose.rotation(wq, j))
+}
+
+fastest_turn(r: *pose.Rig, p: ptr, q: ptr, dt: float) -> float {
+    most = 0.0
+    j = 0
+    while j < pose.count(r) {
+        t = turned_by(pose.rotation(p, j), pose.rotation(q, j)) / dt
+        if t > most { most = t }
+        j = j + 1
+    }
+    return most
+}
+
+// Body `k`'s place and turn in a ragdoll pose (physics.POSE_STRIDE floats a body).
+place_of(p: ptr, k: int) -> Vec3 {
+    f = p as float[]
+    at = k * physics.POSE_STRIDE
+    return core.vec3(f[at + 4], f[at + 5], f[at + 6])
+}
+
+turn_of(p: ptr, k: int) -> Quat {
+    f = p as float[]
+    at = k * physics.POSE_STRIDE
+    return core.quat(f[at], f[at + 1], f[at + 2], f[at + 3])
+}
+
+person(e: *Engine, name: string, x: float, g: *Gaits) -> *Character {
+    c = character.humanoid(e, name, MANNEQUIN, g)
+    if c == null { return null }
+    behaviour.object_set_position(character.object_of(c), core.vec3(x, 0.0, 0.0))
+    mover.settle(character.mover_of(c))
+    return c
+}
+
+main() {
+    println("physanim: physical animation, body by body (#858)")
+    e = engine.engine_new()
+    engine.engine_set_fixed_step(e, STEP)
+    physics.attach(e)
+    floor = engine.object(e, "Floor", null)
+    behaviour.object_set_position(floor, core.vec3(0.0, 0.0 - 0.5, 0.0))
+    physics.box_collider(floor, core.vec3(60.0, 0.5, 60.0), physics.material(0.8, 0.0))
+    g = character.gaits(GAITS)
+    character.gaits_set(g, character.GAIT_STOP, STOP)
+    character.gaits_set(g, character.GAIT_START, START)
+    c = person(e, "Struck", 0.0, g)
+    // The twin in an engine of its own, where the figure is: beside it, its
+    // feet's sums rounded otherwise, 0.00009 off.
+    e_t = engine.engine_new()
+    engine.engine_set_fixed_step(e_t, STEP)
+    physics.attach(e_t)
+    floor_t = engine.object(e_t, "Floor", null)
+    behaviour.object_set_position(floor_t, core.vec3(0.0, 0.0 - 0.5, 0.0))
+    physics.box_collider(floor_t, core.vec3(60.0, 0.5, 60.0), physics.material(0.8, 0.0))
+    twin = person(e_t, "Twin", 0.0, g)
+    check("two people made: ${character.error()}", c != null && twin != null)
+    if c == null || twin == null { exit(1) }
+    a = character.animator_of(c)
+    ta = character.animator_of(twin)
+    r = animator.rig(a)
+    pa = physanim.attach(e, a)
+    check("its ragdoll on its figure, a body a ragdoll bone", pa != null && physanim.bones(pa) >= 12)
+    if pa == null { exit(1) }
+    m = metrics.meter_new(r, character.object_of(c))
+    metrics.meter_ground_physics(m, physics.of(e))
+    ahead = core.vec3(0.0, 0.0, 1.0)
+    // Walking, every weight 0.
+    worst_zero = 0.0
+    k = 0
+    while k < 180 {
+        character.move(c, ahead, core.vec3(0.0, 0.0, 0.0))
+        character.move(twin, ahead, core.vec3(0.0, 0.0, 0.0))
+        engine.engine_update(e, STEP)
+        engine.engine_update(e_t, STEP)
+        metrics.meter_take(m, STEP)
+        d = apart(r, animator.pose_shown(a), animator.pose_shown(ta))
+        if d > worst_zero { worst_zero = d }
+        k = k + 1
+    }
+    println("  walking 3 s, every body's weight 0: every joint within ${worst_zero} of the twin's")
+    check("every weight 0, the figure is drawn as its animation, exactly (within 1e-6 of a twin with none)", worst_zero < 0.000001)
+    // Struck in the chest from behind.
+    chest = physanim.bone_named(pa, "Chest")
+    joint = pose.human(r, pose.SPINE_03)
+    at = behaviour.object_position(character.object_of(c))
+    physanim.hit(pa, chest, core.vec3(at.x, at.y + 1.35, at.z - 0.1), core.vec3(0.0, 0.0, 40.0))
+    wp = pose.new(r)
+    wq = pose.new(r)
+    before = pose.new(r)
+    most_off = 0.0
+    back = 1000.0
+    fastest_easing = 0.0
+    strayed = 0.0
+    walking = true
+    metrics.meter_reset(m)
+    steps = ((physanim.HIT_HOLD + physanim.HIT_RECOVER + 0.4) / STEP) as int
+    k = 0
+    while k < steps {
+        pose.copy(r, animator.pose_shown(a), before)
+        character.move(c, ahead, core.vec3(0.0, 0.0, 0.0))
+        character.move(twin, ahead, core.vec3(0.0, 0.0, 0.0))
+        engine.engine_update(e, STEP)
+        engine.engine_update(e_t, STEP)
+        metrics.meter_take(m, STEP)
+        off = joint_off(r, animator.pose_shown(a), animator.pose_shown(ta), wp, wq, joint)
+        if off > most_off { most_off = off }
+        now = (k as float) * STEP
+        if now > physanim.HIT_HOLD + 0.02 {
+            x = fastest_turn(r, before, animator.pose_shown(a), STEP)
+            if x > fastest_easing { fastest_easing = x }
+        }
+        if now > physanim.HIT_HOLD + physanim.HIT_RECOVER + 0.1 { back = off }
+        gone = core.v3_len(core.v3_sub(behaviour.object_position(character.object_of(c)), behaviour.object_position(character.object_of(twin))))
+        if gone > strayed { strayed = gone }
+        if animator.current(a) != character.move_state(c) { walking = false }
+        k = k + 1
+    }
+    skated = metrics.meter_worst(m, metrics.SKATE)
+    println("  struck in the chest (40 N s from behind) at a walk: the chest ${most_off * 57.29578} degrees off the twin's at most, ${back * 57.29578} once eased out; walking ${walking}, ${strayed * 1000.0} mm off the twin's place; a toe skated ${skated * 1000.0} mm")
+    check("struck in the chest, the chest is drawn off the animation (over 3 degrees) and back on it (within half a degree)", most_off > 0.0524 && back < 0.00873)
+    // Its place, not only its toes: the meter starts a stance only on a foot
+    // slower over the ground than a step's, and a figure carried off by its
+    // shoved hips at 18 m/s read 0 mm.
+    check("and it keeps walking where its twin walks (within 1 mm), its toes not skating 5 mm", walking && strayed < 0.001 && skated < 0.005)
+    // The takes' own fastest, from the twin walking alike.
+    own = 0.0
+    k = 0
+    while k < 60 {
+        pose.copy(r, animator.pose_shown(ta), before)
+        character.move(twin, ahead, core.vec3(0.0, 0.0, 0.0))
+        character.move(c, ahead, core.vec3(0.0, 0.0, 0.0))
+        engine.engine_update(e, STEP)
+        engine.engine_update(e_t, STEP)
+        x = fastest_turn(r, before, animator.pose_shown(ta), STEP)
+        if x > own { own = x }
+        k = k + 1
+    }
+    allowed = own + 1.875 * most_off / physanim.HIT_RECOVER
+    println("  easing back: the fastest joint turn ${fastest_easing} rad/s, the walk's own ${own} plus the easing's ${allowed}")
+    check("easing back, no joint turns faster than the takes' own fastest plus what the easing needs", fastest_easing <= allowed * 1.02)
+    pose.release(wp)
+    pose.release(wq)
+    pose.release(before)
+    metrics.meter_free(m)
+    physanim.physanim_free(pa)
+    character.character_free(c)
+    character.character_free(twin)
+    physics.physics_free(physics.of(e))
+    figure.figures_free(e)
+    engine.engine_free(e)
+    physics.physics_free(physics.of(e_t))
+    figure.figures_free(e_t)
+    engine.engine_free(e_t)
+    // The cost: eight people walking, each with its ragdoll, the step timed.
+    e2 = engine.engine_new()
+    engine.engine_set_fixed_step(e2, STEP)
+    physics.attach(e2)
+    floor2 = engine.object(e2, "Floor", null)
+    behaviour.object_set_position(floor2, core.vec3(0.0, 0.0 - 0.5, 0.0))
+    physics.box_collider(floor2, core.vec3(60.0, 0.5, 60.0), physics.material(0.8, 0.0))
+    people = [null as *Character, null as *Character, null as *Character, null as *Character, null as *Character, null as *Character, null as *Character, null as *Character]
+    rags = [null as *Physanim, null as *Physanim, null as *Physanim, null as *Physanim, null as *Physanim, null as *Physanim, null as *Physanim, null as *Physanim]
+    k = 0
+    while k < 8 {
+        people[k] = person(e2, "Crowd", (k as float) * 2.0, g)
+        rags[k] = physanim.attach(e2, character.animator_of(people[k]))
+        k = k + 1
+    }
+    k = 0
+    while k < 60 {
+        n = 0
+        while n < 8 {
+            character.move(people[n], ahead, core.vec3(0.0, 0.0, 0.0))
+            n = n + 1
+        }
+        engine.engine_update(e2, STEP)
+        k = k + 1
+    }
+    // Struck each, so their drawing runs too.
+    n = 0
+    while n < 8 {
+        p_at = behaviour.object_position(character.object_of(people[n]))
+        physanim.hit(rags[n], physanim.bone_named(rags[n], "ShoulderL"), core.vec3(p_at.x + 0.2, p_at.y + 1.3, p_at.z), core.vec3(0.0 - 10.0, 0.0, 0.0))
+        n = n + 1
+    }
+    started = os.now_monotonic_ns()
+    k = 0
+    while k < 60 {
+        n = 0
+        while n < 8 {
+            character.move(people[n], ahead, core.vec3(0.0, 0.0, 0.0))
+            n = n + 1
+        }
+        engine.engine_update(e2, STEP)
+        k = k + 1
+    }
+    with_rags = ((os.now_monotonic_ns() - started) as float) / 1000000.0 / 60.0
+    n = 0
+    while n < 8 {
+        physanim.physanim_free(rags[n])
+        n = n + 1
+    }
+    started = os.now_monotonic_ns()
+    k = 0
+    while k < 60 {
+        n = 0
+        while n < 8 {
+            character.move(people[n], ahead, core.vec3(0.0, 0.0, 0.0))
+            n = n + 1
+        }
+        engine.engine_update(e2, STEP)
+        k = k + 1
+    }
+    without = ((os.now_monotonic_ns() - started) as float) / 1000000.0 / 60.0
+    per = (with_rags - without) / 8.0
+    println("  eight people walking: a step ${with_rags} ms with their ragdolls, ${without} ms without: ${per} ms a figure")
+    check("a measured cost a figure a step, its ragdoll's step and its drawing: under 0.5 ms", per < 0.5)
+    n = 0
+    while n < 8 {
+        character.character_free(people[n])
+        n = n + 1
+    }
+    // Profiles (#858): every body's mode, anchor strength and weight by
+    // name, read from a file.
+    e4 = engine.engine_new()
+    engine.engine_set_fixed_step(e4, STEP)
+    physics.attach(e4)
+    floor4 = engine.object(e4, "Floor", null)
+    behaviour.object_set_position(floor4, core.vec3(0.0, 0.0 - 0.5, 0.0))
+    physics.box_collider(floor4, core.vec3(60.0, 0.5, 60.0), physics.material(0.8, 0.0))
+    firm = person(e4, "Firm", 0.0, g)
+    soft = person(e4, "Soft", 4.0, g)
+    pf = physanim.attach(e4, character.animator_of(firm))
+    ps = physanim.attach(e4, character.animator_of(soft))
+    read_ok = physanim.profiles_read(pf, PROFILES) && physanim.profiles_read(ps, PROFILES)
+    check("profiles read from a file (${physanim.error()}): animated and its three", read_ok && physanim.profile_count(pf) == 4 && physanim.profile_find(pf, "soft_trunk") == 3)
+    rf = physanim.ragdoll_of(pf)
+    rs = physanim.ragdoll_of(ps)
+    shoulder = physanim.bone_named(pf, "ShoulderL")
+    elbow = physanim.bone_named(pf, "ElbowL")
+    chest_f = physanim.bone_named(pf, "Chest")
+    k = 0
+    while k < 60 {
+        character.move(firm, ahead, core.vec3(0.0, 0.0, 0.0))
+        character.move(soft, ahead, core.vec3(0.0, 0.0, 0.0))
+        engine.engine_update(e4, STEP)
+        k = k + 1
+    }
+    // Eased onto loose arms over 0.3 s as it walks.
+    fa = character.animator_of(firm)
+    rig_f = animator.rig(fa)
+    shown_before = pose.new(rig_f)
+    physanim.apply_profile(pf, physanim.profile_find(pf, "loose_arms"), 0.3)
+    hertz_now, _force_now, _torque_now = physics.ragdoll_bone_pin(rf, shoulder)
+    check("a file's profile applied: below the shoulder driven at 2 Hz, eased toward 0.6, the chest left at 0", physanim.mode_of(pf, elbow) == physanim.MODE_DRIVEN && hertz_now == 2.0 && physanim.weight_of(pf, chest_f) == 0.0)
+    loose_fastest = 0.0
+    loose_off = 0.0
+    k = 0
+    while k < 60 {
+        pose.copy(rig_f, animator.pose_shown(fa), shown_before)
+        character.move(firm, ahead, core.vec3(0.0, 0.0, 0.0))
+        character.move(soft, ahead, core.vec3(0.0, 0.0, 0.0))
+        engine.engine_update(e4, STEP)
+        x = fastest_turn(rig_f, shown_before, animator.pose_shown(fa), STEP)
+        if x > loose_fastest { loose_fastest = x }
+        d = apart(rig_f, animator.pose_shown(fa), animator.pose_now(fa))
+        if d > loose_off { loose_off = d }
+        k = k + 1
+    }
+    loose_allowed = own + 1.875 * loose_off / 0.3
+    println("  onto loose arms over 0.3 s: the elbow's weight ${physanim.weight_of(pf, elbow)}, drawn up to ${loose_off * 57.29578} degrees off the graph's; the fastest joint ${loose_fastest} rad/s, the walk's own ${own} plus the easing's ${loose_allowed}")
+    check("eased onto a profile, no joint turns faster than the walk's own fastest plus what the easing needs", core.abs_of(physanim.weight_of(pf, elbow) - 0.6) < 0.000001 && loose_off > 0.0 && loose_fastest <= loose_allowed * 1.02)
+    // Kinematic arms: each arm body exactly where the animation put it.
+    physanim.apply_profile(ps, physanim.profile_find(ps, "stiff_arms"), 0.0)
+    physanim.apply_profile(pf, 0, 0.0)
+    n_bodies = physanim.bones(ps)
+    anim_s = calloc(n_bodies * physics.POSE_STRIDE, 8)
+    body_s = calloc(n_bodies * physics.POSE_STRIDE, 8)
+    anim_f = calloc(n_bodies * physics.POSE_STRIDE, 8)
+    body_f = calloc(n_bodies * physics.POSE_STRIDE, 8)
+    arms = [physanim.bone_named(ps, "ShoulderL"), physanim.bone_named(ps, "ElbowL"), physanim.bone_named(ps, "ShoulderR"), physanim.bone_named(ps, "ElbowR")]
+    kinematic_off = 0.0
+    driven_off = 0.0
+    k = 0
+    while k < 60 {
+        character.move(firm, ahead, core.vec3(0.0, 0.0, 0.0))
+        character.move(soft, ahead, core.vec3(0.0, 0.0, 0.0))
+        engine.engine_update(e4, STEP)
+        physics.ragdoll_animation_pose(rs, anim_s)
+        physics.ragdoll_body_pose(rs, body_s)
+        physics.ragdoll_animation_pose(rf, anim_f)
+        physics.ragdoll_body_pose(rf, body_f)
+        if k > 2 {
+            arm = 0
+            while arm < 4 {
+                ks = core.v3_len(core.v3_sub(place_of(body_s, arms[arm]), place_of(anim_s, arms[arm])))
+                if ks > kinematic_off { kinematic_off = ks }
+                kd = core.v3_len(core.v3_sub(place_of(body_f, arms[arm]), place_of(anim_f, arms[arm])))
+                if kd > driven_off { driven_off = kd }
+                arm = arm + 1
+            }
+        }
+        k = k + 1
+    }
+    println("  kinematic arms: each arm body ${kinematic_off * 1000.0} mm from where the step's animation puts it (driven at 5 Hz, ${driven_off * 1000.0} mm)")
+    check("kinematic, every arm body exactly where the animation put it (within 0.1 mm)", kinematic_off < 0.0001 && driven_off > 0.001)
+    // A soft trunk: the same blow carries the chest further, and it comes back.
+    physanim.apply_profile(ps, physanim.profile_find(ps, "soft_trunk"), 0.0)
+    chest_s = physanim.bone_named(ps, "Chest")
+    k = 0
+    while k < 30 {
+        character.move(firm, ahead, core.vec3(0.0, 0.0, 0.0))
+        character.move(soft, ahead, core.vec3(0.0, 0.0, 0.0))
+        engine.engine_update(e4, STEP)
+        k = k + 1
+    }
+    at_f = behaviour.object_position(character.object_of(firm))
+    at_s = behaviour.object_position(character.object_of(soft))
+    physanim.hit(pf, chest_f, core.vec3(at_f.x, at_f.y + 1.35, at_f.z - 0.1), core.vec3(0.0, 0.0, 30.0))
+    physanim.hit(ps, chest_s, core.vec3(at_s.x, at_s.y + 1.35, at_s.z - 0.1), core.vec3(0.0, 0.0, 30.0))
+    firm_off = 0.0
+    soft_off = 0.0
+    firm_end = 0.0
+    soft_end = 0.0
+    steps_hit = ((physanim.HIT_HOLD + physanim.HIT_RECOVER + 0.6) / STEP) as int
+    k = 0
+    while k < steps_hit {
+        character.move(firm, ahead, core.vec3(0.0, 0.0, 0.0))
+        character.move(soft, ahead, core.vec3(0.0, 0.0, 0.0))
+        engine.engine_update(e4, STEP)
+        physics.ragdoll_animation_pose(rs, anim_s)
+        physics.ragdoll_body_pose(rs, body_s)
+        physics.ragdoll_animation_pose(rf, anim_f)
+        physics.ragdoll_body_pose(rf, body_f)
+        now_t = (k as float) * STEP
+        tf = turned_by(turn_of(body_f, chest_f), turn_of(anim_f, chest_f))
+        ts = turned_by(turn_of(body_s, chest_s), turn_of(anim_s, chest_s))
+        if now_t > physanim.HIT_HOLD + 0.1 {
+            if tf > firm_off { firm_off = tf }
+            if ts > soft_off { soft_off = ts }
+        }
+        firm_end = tf
+        soft_end = ts
+        k = k + 1
+    }
+    println("  struck alike after the hold: the firm chest's body up to ${firm_off * 57.29578} degrees off its animation, the soft trunk's ${soft_off * 57.29578}; at the end ${firm_end * 57.29578} and ${soft_end * 57.29578}")
+    check("a softer anchor carries the body further from the same blow, and brings it back (within 3 degrees)", soft_off > firm_off * 1.3 && firm_end < 0.0524 && soft_end < 0.0524)
+    free(anim_s)
+    free(body_s)
+    free(anim_f)
+    free(body_f)
+    pose.release(shown_before)
+    physanim.physanim_free(pf)
+    physanim.physanim_free(ps)
+    character.character_free(firm)
+    character.character_free(soft)
+    physics.physics_free(physics.of(e4))
+    figure.figures_free(e4)
+    engine.engine_free(e4)
+    character.gaits_free(g)
+    physics.physics_free(physics.of(e2))
+    figure.figures_free(e2)
+    engine.engine_free(e2)
+    // Through the character (#903): a figure on a graph with flinches.
+    e3 = engine.engine_new()
+    engine.engine_set_fixed_step(e3, STEP)
+    physics.attach(e3)
+    floor3 = engine.object(e3, "Floor", null)
+    behaviour.object_set_position(floor3, core.vec3(0.0, 0.0 - 0.5, 0.0))
+    physics.box_collider(floor3, core.vec3(60.0, 0.5, 60.0), physics.material(0.8, 0.0))
+    gs = character.graphed(e3, "Standing", MANNEQUIN, STRUCK)
+    check("a figure on the struck graph made: ${character.error()}", gs != null)
+    if gs == null { exit(1) }
+    mover.settle(character.mover_of(gs))
+    ga = character.animator_of(gs)
+    gr = character.graph_of(gs)
+    head_layer = animgraph.layer_of(gr, "hit_head")
+    chest_layer = animgraph.layer_of(gr, "hit_chest")
+    k = 0
+    while k < 30 {
+        engine.engine_update(e3, STEP)
+        k = k + 1
+    }
+    at = behaviour.object_position(character.object_of(gs))
+    no_rag = character.physanim_of(gs) == null
+    took = character.hit(gs, "", core.vec3(at.x, at.y + 1.6, at.z - 0.1), core.vec3(0.0, 0.0, 15.0))
+    gp = character.physanim_of(gs)
+    neck = 0 - 1
+    if gp != null { neck = physanim.bone_named(gp, "Neck") }
+    engine.engine_update(e3, STEP)
+    head_t = animator.layer_time(ga, head_layer)
+    neck_w = 0.0
+    if gp != null { neck_w = physanim.weight_of(gp, neck) }
+    println("  struck at the head by where it lands: ragdoll put on at the blow ${no_rag && gp != null}, its neck's weight ${neck_w}, the head flinch ${head_t} s in")
+    check("character.hit at a point: its ragdoll put on at the first blow, the body nearest struck (the neck), its graph's head flinch played from its start", took && no_rag && gp != null && neck_w > 0.999 && head_t > 0.0 && head_t < 2.5 * STEP)
+    k = 0
+    while k < 60 {
+        engine.engine_update(e3, STEP)
+        k = k + 1
+    }
+    took = character.hit(gs, "Chest", core.vec3(at.x, at.y + 1.35, at.z - 0.1), core.vec3(0.0, 0.0, 15.0))
+    engine.engine_update(e3, STEP)
+    chest_t = animator.layer_time(ga, chest_layer)
+    k = 0
+    while k < ((physanim.HIT_HOLD + physanim.HIT_RECOVER + 0.2) / STEP) as int {
+        engine.engine_update(e3, STEP)
+        k = k + 1
+    }
+    still = 0.0
+    j = 0
+    while j < physanim.bones(gp) {
+        if physanim.weight_of(gp, j) > still { still = physanim.weight_of(gp, j) }
+        j = j + 1
+    }
+    rest = apart(animator.rig(ga), animator.pose_shown(ga), animator.pose_now(ga))
+    println("  struck in the chest by name: the chest flinch ${chest_t} s in; once eased out every weight ${still}, drawn ${rest} off the graph's pose")
+    check("character.hit by name: its chest flinch played, and once eased out the figure drawn as its graph has it", took && chest_t > 0.0 && chest_t < 2.5 * STEP && still == 0.0 && rest < 0.000001)
+    character.character_free(gs)
+    physics.physics_free(physics.of(e3))
+    figure.figures_free(e3)
+    engine.engine_free(e3)
+    if g_failures == 0 {
+        println("physanim: all checks passed (${g_checks})")
+        return
+    }
+    println("physanim: ${g_failures} failure(s) of ${g_checks}")
+    exit(1)
+}

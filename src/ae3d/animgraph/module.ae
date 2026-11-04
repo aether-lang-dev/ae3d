@@ -1,0 +1,774 @@
+// Animation graphs as data (#903): a figure's takes, states, blend spaces,
+// motion matching databases, transitions, layers and aim offsets declared in
+// a file and built on its animator, the way Unity's Animator Controller and
+// UE5's Animation Blueprint state machines are assets rather than code.
+// What a file builds is what the animator's own calls build, call for call;
+// the game drives it by the same parameters (animator.set_float, set_bool,
+// trigger) and finds its parts by their names here.
+//
+//     # A runner: a stand, its gaits blended by speed, a jump on a trigger.
+//     take idle Idle_Loop                  # the figure's own animation
+//     take walk Walk_Loop
+//     take sprint Sprint_Loop
+//     take jump Jump_Start root            # root: its root motion taken out
+//     take sit Sitting_Idle_Loop from people/ual1.glb    # another file's, retargeted
+//     capture fw people/fw.bvh root straighten cut_loop
+//                                          # a BVH capture (gzip'd or not)
+//                                          # retargeted onto the figure
+//     mirror fw_m fw                       # a take mirrored left for right
+//
+//     state idle idle loop                 # a state playing a take
+//     state jump jump once
+//     blend move speed                     # a blend along parameter speed
+//       walk measured                      # at the take's measured speed
+//       sprint 5.5                         # or at a value
+//     end
+//     blend2 strafe vx vz                  # over the ground's two ways
+//       fw measured                        # at its velocity over its length
+//     end
+//     matcher walker                       # motion matching over takes
+//       fw
+//       fw_m
+//     end
+//     transition idle move 0.2             # from (or any), to, seconds
+//       when speed above 0.1               # above, below, is, is_not,
+//     end                                  # triggered; or `when ended`
+//     transition any jump 0.1
+//       when jump triggered
+//       crossfade                          # also: synced, or <state>,
+//     end                                  # match <seconds>
+//     layer hit hit_head from spine_01 once    # also: additive, loop
+//     aim pistol from spine_01             # an aim offset over a chain
+//       aim_mid 0 0                        # a take at its yaw, pitch
+//     end
+//     play idle
+//
+//     g = animgraph.load(a, "assets/runner.graph")
+//     animator.set_float(a, "speed", 3.0)
+//     animator.layer_weight(a, animgraph.layer_of(g, "hit"), 1.0, 0.1)
+//
+// Each kind of part names its own: takes, states (blends and matchers are
+// states), layers and aims, a take and its state often sharing a name.
+// Joints are named as UE5's mannequin names them
+// (spine_01, hand_r), whatever the figure's own rig calls them, or by the
+// rig's own name. Paths are the program's, as every file the engine reads.
+
+import std.fs
+import std.heap
+import std.list
+import std.string
+import ae3d.core
+import ae3d.pose
+import ae3d.clips
+import ae3d.animator
+import ae3d.retarget
+import ae3d.bvh
+import ae3d.gltf
+
+exports (
+    Graph, load, graph_free, state_of, take_of, layer_of, aim_of, error
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+// What a name is.
+const NAME_TAKE = 0
+const NAME_STATE = 1
+const NAME_LAYER = 2
+const NAME_AIM = 3
+
+struct Entry {
+    name: string
+    kind: int
+    index: int                     // a state's, a layer's or an aim's index
+    take: ptr                      // a take's *Take
+}
+
+struct Graph {
+    animator: ptr                  // *Animator
+    names: ptr                     // list of *Entry
+    sources: ptr                   // list of *Source: other figures' files read for takes, while loading
+}
+
+var g_error: string = ""
+var g_text: string = ""
+var g_at = 0
+var g_length = 0
+var g_number: ptr = null
+
+// What the last load that failed said: its line and why.
+error() -> string { return g_error }
+
+// The graph in the file at `path` built on `a`. Null when the file cannot be
+// read or says something that cannot be built (error() says where and why);
+// what it built before then stays on the animator.
+load(a: *Animator, path: string) -> *Graph {
+    g_error = ""
+    content, err = fs.read(path)
+    if err != "" {
+        g_error = "cannot read ${path}"
+        return null
+    }
+    if g_number == null { g_number = calloc(1, 8) }
+    g_text = content
+    g_at = 0
+    g_length = string.length(content)
+    g = heap.new(Graph)
+    g.animator = a as ptr
+    g.names = list.new()
+    g.sources = list.new()
+    good = true
+    while good {
+        word = next_token()
+        if string.length(word) == 0 {
+            string.free(word)
+            break
+        }
+        if string.starts_with(word, "#") == 1 {
+            skip_line()
+        } else {
+            // A number that was not one fails the statement it was in.
+            good = statement(g, word) && g_error == ""
+            if good && !at_line_end() { good = fail("more on the line than `${word}` takes") }
+            if good { skip_line() }
+        }
+        string.free(word)
+    }
+    string.free(content)
+    sources_free(g)
+    g_text = ""
+    if !good {
+        graph_free(g)
+        return null
+    }
+    return g
+}
+
+graph_free(g: *Graph) {
+    if g == null { return }
+    i = 0
+    while i < list.size(g.names) {
+        en = list.get_raw(g.names, i) as *Entry
+        string.free(en.name)
+        heap.free(en)
+        i = i + 1
+    }
+    list.free(g.names)
+    sources_free(g)
+    list.free(g.sources)
+    heap.free(g)
+}
+
+// The state (a take's, a blend's, a matcher's) named `name`, -1 for none.
+state_of(g: *Graph, name: string) -> int { return index_of(g, name, NAME_STATE) }
+// The layer named `name`, -1 for none.
+layer_of(g: *Graph, name: string) -> int { return index_of(g, name, NAME_LAYER) }
+// The aim offset named `name`, -1 for none.
+aim_of(g: *Graph, name: string) -> int { return index_of(g, name, NAME_AIM) }
+// The take named `name`, null for none.
+take_of(g: *Graph, name: string) -> *Take {
+    en = entry(g, name, NAME_TAKE)
+    if en == null { return null }
+    return en.take as *Take
+}
+
+index_of(g: *Graph, name: string, kind: int) -> int {
+    if g == null { return 0 - 1 }
+    en = entry(g, name, kind)
+    if en == null { return 0 - 1 }
+    return en.index
+}
+
+entry(g: *Graph, name: string, kind: int) -> *Entry {
+    i = 0
+    while i < list.size(g.names) {
+        en = list.get_raw(g.names, i) as *Entry
+        if en.kind == kind && string.equals(en.name, name) == 1 { return en }
+        i = i + 1
+    }
+    return null as *Entry
+}
+
+// Name `name` given to a part; false (and why) when it is taken.
+named(g: *Graph, name: string, kind: int, index: int, t: @keep ptr) -> bool {
+    if entry(g, name, kind) != null { return fail("`${name}` is named twice") }
+    en = heap.new(Entry)
+    en.name = string.copy(name)
+    en.kind = kind
+    en.index = index
+    en.take = t
+    list.add_raw(g.names, en as ptr)
+    return true
+}
+
+// --- statements ----------------------------------------------------------------------------------
+
+// One statement, its first word read.
+statement(g: *Graph, word: string) -> bool {
+    if string.equals(word, "take") == 1 { return take_line(g) }
+    if string.equals(word, "capture") == 1 { return capture_line(g) }
+    if string.equals(word, "mirror") == 1 { return mirror_line(g) }
+    if string.equals(word, "state") == 1 { return state_line(g) }
+    if string.equals(word, "blend") == 1 { return blend_block(g, false) }
+    if string.equals(word, "blend2") == 1 { return blend_block(g, true) }
+    if string.equals(word, "matcher") == 1 { return matcher_block(g) }
+    if string.equals(word, "transition") == 1 { return transition_block(g) }
+    if string.equals(word, "layer") == 1 { return layer_line(g) }
+    if string.equals(word, "aim") == 1 { return aim_block(g) }
+    if string.equals(word, "play") == 1 {
+        s = state_named(g)
+        if s < 0 { return false }
+        animator.play(g.animator as *Animator, s, 0.0)
+        return true
+    }
+    return fail("no statement `${word}`")
+}
+
+// take <name> <animation> [from <file>] [root]: the figure's own animation,
+// or another figure's file's retargeted onto it (a library of takes on
+// another skeleton: UAL's on the UE5 mannequin), its root motion taken out
+// with `root`.
+take_line(g: *Graph) -> bool {
+    a = g.animator as *Animator
+    name = next_token()
+    animation = next_token()
+    root = false
+    from = string.copy("")
+    good = string.length(animation) > 0
+    if !good { good = fail("a take names its animation") }
+    while good && !at_line_end() {
+        option = next_token()
+        if string.equals(option, "root") == 1 {
+            root = true
+        } else if string.equals(option, "from") == 1 {
+            string.free(from)
+            from = next_token()
+        } else {
+            good = fail("a take takes from and root, not `${option}`")
+        }
+        string.free(option)
+    }
+    if good {
+        t = null as *Take
+        if string.length(from) == 0 {
+            t = animator.take(a, animation, root)
+            if t == null { good = fail("the figure's file has no animation `${animation}`") }
+        } else {
+            s = source_of(g, from)
+            if s == null {
+                good = fail("cannot read the figure's file ${from}")
+            } else {
+                made = clips.from_scene(s.rig as *pose.Rig, s.scene as *GltfScene, animation, 0.0)
+                if made == null {
+                    good = fail("${from} has no animation `${animation}`")
+                } else {
+                    t = animator.add_take(a, retarget.retarget(s.rig as *pose.Rig, made, animator.rig(a)), root)
+                    clips.take_free(made)
+                }
+            }
+        }
+        if good { good = named(g, name, NAME_TAKE, 0, t as ptr) }
+    }
+    string.free(name)
+    string.free(animation)
+    string.free(from)
+    return good
+}
+
+// Another figure's file a take is retargeted from: read once a load, its
+// skeleton's rig made once.
+struct Source {
+    path: string
+    scene: ptr                     // *GltfScene
+    rig: ptr                       // *pose.Rig
+}
+
+source_of(g: *Graph, path: string) -> *Source {
+    i = 0
+    while i < list.size(g.sources) {
+        s = list.get_raw(g.sources, i) as *Source
+        if string.equals(s.path, path) == 1 { return s }
+        i = i + 1
+    }
+    scene = gltf.load(path)
+    if scene == null { return null as *Source }
+    if gltf.skeleton_count(scene) == 0 {
+        gltf.scene_destroy(scene)
+        return null as *Source
+    }
+    s = heap.new(Source)
+    s.path = string.copy(path)
+    s.scene = scene as ptr
+    s.rig = pose.of_skeleton(gltf.skeleton(scene, 0)) as ptr
+    list.add_raw(g.sources, s as ptr)
+    return s
+}
+
+sources_free(g: *Graph) {
+    i = 0
+    while i < list.size(g.sources) {
+        s = list.get_raw(g.sources, i) as *Source
+        pose.rig_free(s.rig as *pose.Rig)
+        gltf.scene_destroy(s.scene as *GltfScene)
+        string.free(s.path)
+        heap.free(s)
+        i = i + 1
+    }
+    list.free(g.sources)
+    g.sources = list.new()
+}
+
+// capture <name> <path> [root] [straighten] [cut_loop]: a BVH capture
+// retargeted onto the figure, its root motion taken out (root), its path
+// turned onto the nearest of the ground's four ways (straighten), cut to a
+// loop (cut_loop).
+capture_line(g: *Graph) -> bool {
+    a = g.animator as *Animator
+    r = animator.rig(a)
+    name = next_token()
+    path = next_token()
+    root = false
+    straight = false
+    looped = false
+    good = true
+    while good && !at_line_end() {
+        option = next_token()
+        if string.equals(option, "root") == 1 {
+            root = true
+        } else if string.equals(option, "straighten") == 1 {
+            straight = true
+        } else if string.equals(option, "cut_loop") == 1 {
+            looped = true
+        } else {
+            good = fail("a capture takes root, straighten or cut_loop, not `${option}`")
+        }
+        string.free(option)
+    }
+    if good {
+        c = bvh.load(path, 0.0)
+        if c == null {
+            good = fail("cannot read the capture ${path}: ${bvh.error()}")
+        } else {
+            made = bvh.take(c, path, 0, 0 - 1)
+            t = animator.add_take(a, retarget.retarget(bvh.rig(c), made, r), root)
+            clips.take_free(made)
+            bvh.capture_free(c)
+            if straight { clips.straighten(t, r, true) }
+            if looped {
+                t = animator.add_take(a, clips.loop_cut(t, r), false)
+                if straight { clips.straighten(t, r, true) }
+            }
+            good = named(g, name, NAME_TAKE, 0, t as ptr)
+        }
+    }
+    string.free(name)
+    string.free(path)
+    return good
+}
+
+// mirror <name> <take>: a take mirrored, left for right.
+mirror_line(g: *Graph) -> bool {
+    a = g.animator as *Animator
+    name = next_token()
+    t = take_named(g)
+    good = t != null
+    if good { good = named(g, name, NAME_TAKE, 0, animator.add_take(a, clips.mirror(t, animator.rig(a)), false) as ptr) }
+    string.free(name)
+    return good
+}
+
+// state <name> <take> loop|once [by <param> [left]]: a state playing a take,
+// looping or once; by a parameter, played by the distance it names gone
+// (or, `left`, left to go: animator.clock_by).
+state_line(g: *Graph) -> bool {
+    a = g.animator as *Animator
+    name = next_token()
+    t = take_named(g)
+    good = t != null
+    loop = false
+    if good {
+        how = next_token()
+        if string.equals(how, "loop") == 1 {
+            loop = true
+        } else if string.equals(how, "once") != 1 {
+            good = fail("a state plays loop or once, not `${how}`")
+        }
+        string.free(how)
+    }
+    if good {
+        s = animator.add_state(a, name, t, loop)
+        good = named(g, name, NAME_STATE, s, null)
+        if good && !at_line_end() {
+            by = next_token()
+            if string.equals(by, "by") == 1 {
+                param = next_token()
+                left = flag("left")
+                animator.clock_by(a, s, param, left)
+                string.free(param)
+            } else {
+                good = fail("after a state's loop or once comes `by`, not `${by}`")
+            }
+            string.free(by)
+        }
+    }
+    string.free(name)
+    return good
+}
+
+// blend <name> <param> ... end, each line <take> measured|<value>; blend2
+// <name> <param_x> <param_z> ... end, each line <take> measured|<x> <z>.
+blend_block(g: *Graph, two: bool) -> bool {
+    a = g.animator as *Animator
+    name = next_token()
+    across = next_token()
+    ahead = ""
+    if two { ahead = next_token() }
+    s = 0 - 1
+    if two {
+        s = animator.add_blend2(a, name)
+        animator.bind2(a, s, across, ahead)
+    } else {
+        s = animator.add_blend(a, name)
+        animator.bind(a, s, across)
+    }
+    good = named(g, name, NAME_STATE, s, null)
+    string.free(name)
+    string.free(across)
+    if two { string.free(ahead) }
+    while good {
+        good = block_line()
+        if !good { break }
+        word = next_token()
+        if string.equals(word, "end") == 1 {
+            string.free(word)
+            break
+        }
+        t = take_of(g, word)
+        if t == null { good = fail("no take `${word}`") }
+        string.free(word)
+        if good {
+            at = next_token()
+            measured = string.equals(at, "measured") == 1
+            if !measured { g_at = g_at - string.length(at) }
+            string.free(at)
+            if two {
+                x = 0.0
+                z = 0.0
+                if measured {
+                    went = clips.travel(t, clips.duration(t))
+                    x = went.x / clips.duration(t)
+                    z = went.y / clips.duration(t)
+                } else {
+                    x = next_number()
+                    z = next_number()
+                }
+                animator.blend_add2(a, s, t, x, z)
+            } else {
+                v = clips.speed(t)
+                if !measured { v = next_number() }
+                animator.blend_add(a, s, t, v)
+            }
+            if !at_line_end() { good = fail("more on a blend's line than a take and where it is") }
+            skip_line()
+        }
+    }
+    return good
+}
+
+// matcher <name> ... end, each line a take: motion matching over them,
+// built at its end.
+matcher_block(g: *Graph) -> bool {
+    a = g.animator as *Animator
+    name = next_token()
+    s = animator.add_matcher(a, name)
+    good = named(g, name, NAME_STATE, s, null)
+    string.free(name)
+    count = 0
+    while good {
+        good = block_line()
+        if !good { break }
+        word = next_token()
+        if string.equals(word, "end") == 1 {
+            string.free(word)
+            break
+        }
+        t = take_of(g, word)
+        if t == null {
+            good = fail("no take `${word}`")
+        } else {
+            animator.matcher_add(a, s, t)
+            count = count + 1
+        }
+        string.free(word)
+        if good && !at_line_end() { good = fail("more on a matcher's line than a take") }
+        skip_line()
+    }
+    if good && count == 0 { good = fail("a matcher with no takes") }
+    if good { animator.matcher_build(a, s) }
+    return good
+}
+
+// transition <from|any> <to> <seconds> ... end, each line a condition (when
+// <param> above|below <value>, when <param> is|is_not|triggered, when
+// ended) or an option (crossfade, synced, or <state>, match <seconds>).
+transition_block(g: *Graph) -> bool {
+    a = g.animator as *Animator
+    from = animator.ANY
+    first = next_token()
+    good = true
+    if string.equals(first, "any") != 1 {
+        g_at = g_at - string.length(first)
+        from = state_named(g)
+        good = from >= 0
+    }
+    string.free(first)
+    if !good { return false }
+    to = state_named(g)
+    if to < 0 { return false }
+    seconds = next_number()
+    tr = animator.add_transition(a, from, to, seconds)
+    while good {
+        good = block_line()
+        if !good { break }
+        word = next_token()
+        if string.equals(word, "end") == 1 {
+            string.free(word)
+            break
+        }
+        if string.equals(word, "when") == 1 {
+            good = condition(a, tr)
+        } else if string.equals(word, "crossfade") == 1 {
+            animator.transition_crossfade(a, tr, true)
+        } else if string.equals(word, "synced") == 1 {
+            animator.transition_synced(a, tr, true)
+        } else if string.equals(word, "or") == 1 {
+            other = state_named(g)
+            good = other >= 0
+            if good { animator.transition_or(a, tr, other) }
+        } else if string.equals(word, "match") == 1 {
+            animator.transition_match(a, tr, next_number())
+        } else {
+            good = fail("a transition takes when, crossfade, synced, or and match, not `${word}`")
+        }
+        string.free(word)
+        if good && !at_line_end() { good = fail("more on a transition's line than it takes") }
+        skip_line()
+    }
+    return good
+}
+
+condition(a: *Animator, tr: int) -> bool {
+    param = next_token()
+    if string.equals(param, "ended") == 1 {
+        string.free(param)
+        animator.transition_when(a, tr, "", animator.ENDED, 0.0)
+        return true
+    }
+    test = next_token()
+    good = true
+    if string.equals(test, "above") == 1 {
+        animator.transition_when(a, tr, param, animator.ABOVE, next_number())
+    } else if string.equals(test, "below") == 1 {
+        animator.transition_when(a, tr, param, animator.BELOW, next_number())
+    } else if string.equals(test, "is") == 1 {
+        animator.transition_when(a, tr, param, animator.IS, 0.0)
+    } else if string.equals(test, "is_not") == 1 {
+        animator.transition_when(a, tr, param, animator.IS_NOT, 0.0)
+    } else if string.equals(test, "triggered") == 1 {
+        animator.transition_when(a, tr, param, animator.TRIGGERED, 0.0)
+    } else {
+        good = fail("a condition is above, below, is, is_not or triggered, not `${test}`")
+    }
+    string.free(param)
+    string.free(test)
+    return good
+}
+
+// layer <name> <take> [from <joint>] [additive] [loop|once]: a layer over
+// the joints under one (the whole figure when none is named), blended over
+// the state or added to it, at weight 0 until the game raises it.
+layer_line(g: *Graph) -> bool {
+    a = g.animator as *Animator
+    name = next_token()
+    t = take_named(g)
+    good = t != null
+    from = 0 - 1
+    additive = false
+    loop = false
+    while good && !at_line_end() {
+        option = next_token()
+        if string.equals(option, "from") == 1 {
+            from = joint_named(g)
+            good = from >= 0
+        } else if string.equals(option, "additive") == 1 {
+            additive = true
+        } else if string.equals(option, "loop") == 1 {
+            loop = true
+        } else if string.equals(option, "once") != 1 {
+            good = fail("a layer takes from, additive, loop or once, not `${option}`")
+        }
+        string.free(option)
+    }
+    if good { good = named(g, name, NAME_LAYER, animator.add_layer(a, t, from, additive, loop), null) }
+    string.free(name)
+    return good
+}
+
+// aim <name> [from <joint>] ... end, each line <take> <yaw> <pitch>: an aim
+// offset over the joints under one, each take's first frame the aim at its
+// yaw and pitch (radians).
+aim_block(g: *Graph) -> bool {
+    a = g.animator as *Animator
+    name = next_token()
+    from = 0 - 1
+    good = true
+    if !at_line_end() {
+        word = next_token()
+        if string.equals(word, "from") == 1 {
+            from = joint_named(g)
+            good = from >= 0
+        } else {
+            good = fail("an aim takes from, not `${word}`")
+        }
+        string.free(word)
+    }
+    m = 0 - 1
+    if good {
+        m = animator.add_aim(a, from)
+        good = named(g, name, NAME_AIM, m, null)
+    }
+    string.free(name)
+    while good {
+        good = block_line()
+        if !good { break }
+        word = next_token()
+        if string.equals(word, "end") == 1 {
+            string.free(word)
+            break
+        }
+        t = take_of(g, word)
+        if t == null { good = fail("no take `${word}`") }
+        string.free(word)
+        if good {
+            yaw = next_number()
+            pitch = next_number()
+            animator.aim_add(a, m, t, yaw, pitch)
+            if !at_line_end() { good = fail("more on an aim's line than a take, its yaw and its pitch") }
+            skip_line()
+        }
+    }
+    return good
+}
+
+// --- names ---------------------------------------------------------------------------------------
+
+take_named(g: *Graph) -> *Take {
+    word = next_token()
+    t = take_of(g, word)
+    if t == null { fail("no take `${word}`") }
+    string.free(word)
+    return t
+}
+
+state_named(g: *Graph) -> int {
+    word = next_token()
+    s = state_of(g, word)
+    if s < 0 { fail("no state `${word}`") }
+    string.free(word)
+    return s
+}
+
+// A joint by UE5's mannequin's name for it, or the rig's own.
+joint_named(g: *Graph) -> int {
+    r = animator.rig(g.animator as *Animator)
+    word = next_token()
+    j = 0 - 1
+    k = 0
+    while k < pose.FINGERS && j < 0 {
+        known = pose.slot_name(pose.SCHEME_UE5, k)
+        if string.equals(known, word) == 1 { j = pose.human(r, k) }
+        string.free(known)
+        k = k + 1
+    }
+    if j < 0 { j = pose.find(r, word) }
+    if j < 0 { fail("the figure has no joint `${word}`") }
+    string.free(word)
+    return j
+}
+
+// --- reading -------------------------------------------------------------------------------------
+
+// False, the error set to `why` at the line being read.
+fail(why: string) -> bool {
+    line = 1
+    i = 0
+    while i < g_at && i < g_length {
+        if string.char_at(g_text, i) == 10 { line = line + 1 }
+        i = i + 1
+    }
+    if g_error == "" { g_error = "line ${line}: ${why}" }
+    return false
+}
+
+// The block's next line begun, past blank and comment lines; false at the
+// file's end, which a block may not reach.
+block_line() -> bool {
+    while g_at < g_length {
+        if !at_line_end() { return true }
+        skip_line()
+    }
+    return fail("a block with no `end`")
+}
+
+// Whether the line's next word is `word`: read when it is.
+flag(word: string) -> bool {
+    if at_line_end() { return false }
+    start = g_at
+    next = next_token()
+    found = string.equals(next, word) == 1
+    string.free(next)
+    if !found { g_at = start }
+    return found
+}
+
+is_blank(ch: int) -> bool { return ch == 32 || ch == 9 || ch == 10 || ch == 13 }
+
+next_token() -> string {
+    while g_at < g_length && is_blank(string.char_at(g_text, g_at)) { g_at = g_at + 1 }
+    start = g_at
+    while g_at < g_length && !is_blank(string.char_at(g_text, g_at)) { g_at = g_at + 1 }
+    if g_at == start { return string.copy("") }
+    return string.substring(g_text, start, g_at)
+}
+
+next_number() -> float {
+    word = next_token()
+    value = 0.0
+    if string.length(word) > 0 && string.to_double_raw(word, g_number) != 0 {
+        value = (g_number as float[])[0]
+    } else {
+        fail("`${word}` is not a number")
+    }
+    string.free(word)
+    return value
+}
+
+// Whether only spaces, tabs or a comment are left before the line's end.
+at_line_end() -> bool {
+    while g_at < g_length {
+        ch = string.char_at(g_text, g_at)
+        if ch == 35 {
+            while g_at < g_length && string.char_at(g_text, g_at) != 10 { g_at = g_at + 1 }
+            return true
+        }
+        if ch != 32 && ch != 9 && ch != 13 { return ch == 10 }
+        g_at = g_at + 1
+    }
+    return true
+}
+
+skip_line() {
+    while g_at < g_length && string.char_at(g_text, g_at) != 10 { g_at = g_at + 1 }
+    if g_at < g_length { g_at = g_at + 1 }
+}
