@@ -183,3 +183,12 @@
   `act_stop` and `acting` with it. UAL2's knock-down moves the mannequin
   its take's 3 m; a wall behind it stops it at its capsule.
 - A landed foot's sole is laid on the ground while it is held (#932).
+- **Gait loops sealed whatever their gap** (#962): five of 100STYLE's six
+  gait loops had wrapped with a seam, the forward run's hands jumping 5 cm
+  at it; a held axe's second arm no longer pops there (26 rad/s, 77
+  before). A toe rolling off a slope is put back over its lock until it is
+  there (the ramp's planted toe 2.9 mm, 4.5 before).
+- **A limb's cut names its own skin's joints** (#963): a figure whose
+  meshes are skinned apart lost its head when its arm was cut.
+- **`character.act` holds a pose** (a snapshot) until the next act: knocked
+  down, out and up again are three acts.
