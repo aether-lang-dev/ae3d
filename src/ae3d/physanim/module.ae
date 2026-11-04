@@ -1,0 +1,405 @@
+// Physical animation (#858): a figure's ragdoll following its animated pose
+// body by body, each with a weight: 0 its body carried on the animation
+// (anchored to where the animation has it) and the figure drawn as the
+// animation has it, exactly; between, the figure drawn that share of the
+// way toward its body; 1 the body let go (simulated, no anchor) and drawn
+// as it falls. As Unreal's Physical Animation component and PuppetMaster's
+// pin weights read: the animation drives the bodies, and the bodies are
+// drawn as much as the game asks.
+//
+//     pa = physanim.attach(e, animator)          // every body animated
+//     physanim.hit(pa, physanim.bone_named(pa, "Chest"), point, impulse)
+//     physanim.set_weight(pa, bone, 1.0, 0.3)    // a body let go over 0.3 s
+//
+// A hit: the body struck and those next to it let go, pushed, and drawn from
+// their bodies at once; after HIT_HOLD they are anchored again where they
+// are and eased back onto the animation over HIT_RECOVER. A walking figure
+// struck in the chest keeps walking: its legs stay on the animation.
+//
+// The order: the animator's graph poses the figure; this, a step after the
+// graph (animator.add_post), reads the animated pose and the bodies' and
+// draws the blend, shown as the animator's pose_shown, which what follows
+// the figure as it is seen reads (its held items, a meter). The graph goes
+// on from its own pose (pose_now). The physics steps in the fixed step, the
+// bodies following the animated pose.
+
+import std.heap
+import std.string
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.physics
+import ae3d.figure
+import ae3d.pose
+import ae3d.animator
+
+exports (
+    Physanim, attach, physanim_free, ragdoll_of, bones, bone_named, parent_of, nearest,
+    set_weight, weight_of, hit, hit_count, set_hit_times, HIT_HOLD, HIT_RECOVER
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+// Seconds a body struck is let go, and how long it eases back.
+const HIT_HOLD = 0.15
+const HIT_RECOVER = 0.6
+
+struct Physanim {
+    engine: ptr                    // *Engine
+    animator: ptr                  // *Animator
+    ragdoll: ptr                   // *Ragdoll
+    count: int                     // its bodies
+    weights: ptr                   // float[count]: each body's weight now
+    froms: ptr                     // float[count]: where its easing began
+    goals: ptr                     // float[count]: where it is going
+    times: ptr                     // float[count]: seconds the easing takes (0 at once)
+    gone: ptr                      // float[count]: seconds into it
+    holds: ptr                     // float[count]: seconds a hit keeps it let go, 0 none
+    parents: ptr                   // int[count]: the body above it, -1 the pelvis's
+    order: ptr                     // int[count]: the bodies, each after the one above it
+    anim: ptr                      // float[count * POSE_STRIDE]: the animated pose
+    body: ptr                      // float[count * POSE_STRIDE]: the bodies'
+    shown: ptr                     // float[count * POSE_STRIDE]: what is drawn
+    hold: float                    // a hit's HIT_HOLD and HIT_RECOVER, the game's to set
+    recover: float
+    hits: int
+    stepper: ptr                   // *Behaviour
+}
+
+// A figure's ragdoll on animator `a`'s figure, every body on the animation
+// (weight 0). Null when the figure's rig is no humanoid the engine knows.
+attach(e: *Engine, a: *Animator) -> *Physanim {
+    o = animator.figure_object(a)
+    f = figure.figure_of(o)
+    if f == null { return null }
+    sk = figure.skeleton(f)
+    if sk == null || physics.humanoid_scheme(sk) < 0 { return null }
+    if physics.of(e) == null { physics.attach(e) }
+    group = behaviour.object_model(o)
+    at = behaviour.object_position(o)
+    if group != null {
+        core.model_sync_transform(group)
+        at = group.world_position
+    }
+    r = physics.ragdoll(e, core.text(o.name), at, 8.0, 8.0, 1.0)
+    if r == null { return null }
+    if !physics.ragdoll_dress_humanoid_in_place(r, sk) {
+        physics.ragdoll_free(r)
+        return null
+    }
+    physics.ragdoll_set_object(r, o)
+    physics.ragdoll_follow(r)
+    pa = heap.new(Physanim)
+    pa.engine = e as ptr
+    pa.animator = a as ptr
+    pa.ragdoll = r as ptr
+    n = physics.ragdoll_bone_count(r)
+    pa.count = n
+    pa.weights = calloc(n, 8)
+    pa.froms = calloc(n, 8)
+    pa.goals = calloc(n, 8)
+    pa.times = calloc(n, 8)
+    pa.gone = calloc(n, 8)
+    pa.holds = calloc(n, 8)
+    pa.parents = calloc(n, 4)
+    pa.order = calloc(n, 4)
+    pa.anim = calloc(n * physics.POSE_STRIDE, 8)
+    pa.body = calloc(n * physics.POSE_STRIDE, 8)
+    pa.shown = calloc(n * physics.POSE_STRIDE, 8)
+    pa.hold = HIT_HOLD
+    pa.recover = HIT_RECOVER
+    find_parents(pa)
+    find_order(pa)
+    b = engine.behaviour_new("physanim", pa as ptr)
+    b.fixed_update = physanim_step
+    engine.engine_add_behaviour(e, b)
+    pa.stepper = b as ptr
+    animator.add_post(a, physanim_post, pa as ptr)
+    return pa
+}
+
+physanim_free(pa: *Physanim) {
+    if pa == null { return }
+    animator.remove_post(pa.animator as *Animator, pa as ptr)
+    if pa.stepper != null {
+        engine.engine_remove_behaviour(pa.engine as *Engine, pa.stepper as *Behaviour)
+        heap.free(pa.stepper as *Behaviour)
+    }
+    physics.ragdoll_free(pa.ragdoll as *Ragdoll)
+    free(pa.weights)
+    free(pa.froms)
+    free(pa.goals)
+    free(pa.times)
+    free(pa.gone)
+    free(pa.holds)
+    free(pa.parents)
+    free(pa.order)
+    free(pa.anim)
+    free(pa.body)
+    free(pa.shown)
+    heap.free(pa)
+}
+
+ragdoll_of(pa: *Physanim) -> *Ragdoll { return pa.ragdoll as *Ragdoll }
+bones(pa: *Physanim) -> int { return pa.count }
+hit_count(pa: *Physanim) -> int { return pa.hits }
+
+// The body named `name` (physics.humanoid_bone's names: "Hips", "Spine",
+// "Chest", "Neck", "ShoulderL", "ElbowL", "ThighL", "KneeL"), or -1.
+bone_named(pa: *Physanim, name: string) -> int {
+    k = 0
+    while k < pa.count {
+        if string.equals(physics.humanoid_bone(k), name) == 1 { return k }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+// The body above body `k` in the figure's hierarchy, -1 for the pelvis.
+parent_of(pa: *Physanim, k: int) -> int { return (pa.parents as int[])[k] }
+
+// The body nearest `point`: the one whose bone, from its joint to its far
+// end as the bodies stand now, passes closest. What a blow known only by
+// where it landed strikes (a ray's hit point).
+nearest(pa: *Physanim, point: Vec3) -> int {
+    r = pa.ragdoll as *Ragdoll
+    physics.ragdoll_body_pose(r, pa.body)
+    best = 0 - 1
+    best_d = 1000000.0
+    k = 0
+    while k < pa.count {
+        _q, head = bone_at(pa.body, k)
+        tail = physics.ragdoll_pose_end(r, pa.body, k)
+        d = core.v3_len(core.v3_sub(point, closest_on(head, tail, point)))
+        if d < best_d {
+            best_d = d
+            best = k
+        }
+        k = k + 1
+    }
+    return best
+}
+
+// The point of segment `a` `b` nearest `p`.
+closest_on(a: Vec3, b: Vec3, p: Vec3) -> Vec3 {
+    ab = core.v3_sub(b, a)
+    len2 = core.v3_dot(ab, ab)
+    if len2 < 0.0000001 { return a }
+    t = core.clampf(core.v3_dot(core.v3_sub(p, a), ab) / len2, 0.0, 1.0)
+    return core.v3_add(a, core.v3_mul(ab, t))
+}
+
+// Each body's parent: the nearest of the ragdoll's bones up the figure's own
+// joints from the one it follows.
+find_parents(pa: *Physanim) {
+    r = pa.ragdoll as *Ragdoll
+    parents = pa.parents as int[]
+    k = 0
+    while k < pa.count {
+        parents[k] = 0 - 1
+        m = core.model_parent(physics.ragdoll_rig_bone(r, k))
+        while m != null && parents[k] < 0 {
+            j = 0
+            while j < pa.count {
+                if j != k && physics.ragdoll_rig_bone(r, j) == m { parents[k] = j }
+                j = j + 1
+            }
+            m = core.model_parent(m)
+        }
+        k = k + 1
+    }
+}
+
+// Body `k`'s weight toward `w` (0 on the animation, 1 let go), over `seconds`
+// (0: at once), eased (a smooth step from where it is).
+set_weight(pa: *Physanim, k: int, w: float, seconds: float) {
+    if k < 0 || k >= pa.count { return }
+    (pa.froms as float[])[k] = (pa.weights as float[])[k]
+    (pa.goals as float[])[k] = core.clampf(w, 0.0, 1.0)
+    (pa.times as float[])[k] = seconds
+    (pa.gone as float[])[k] = 0.0
+    (pa.holds as float[])[k] = 0.0
+    if seconds <= 0.0 { (pa.weights as float[])[k] = core.clampf(w, 0.0, 1.0) }
+    limp_by(pa, k)
+}
+
+weight_of(pa: *Physanim, k: int) -> float { return (pa.weights as float[])[k] }
+
+// A hit's let go and its easing back (HIT_HOLD and HIT_RECOVER by default).
+set_hit_times(pa: *Physanim, hold: float, recover: float) {
+    pa.hold = hold
+    pa.recover = recover
+}
+
+// A blow: `impulse` (newton seconds) at `point` on body `k`. That body and
+// the ones above and below it are let go and drawn from their bodies at once;
+// held so for the hit's hold, then anchored where they are and eased back
+// onto the animation over its recovery. The pelvis is struck and pushed but
+// never let go: the figure stays on its feet.
+hit(pa: *Physanim, k: int, point: Vec3, impulse: Vec3) {
+    if k < 0 || k >= pa.count { return }
+    pelvis = bone_named(pa, "Hips")
+    r = pa.ragdoll as *Ragdoll
+    parents = pa.parents as int[]
+    j = 0
+    while j < pa.count {
+        near = j == k || parents[k] == j || parents[j] == k
+        if near && j != pelvis {
+            (pa.weights as float[])[j] = 1.0
+            (pa.goals as float[])[j] = 1.0
+            (pa.froms as float[])[j] = 1.0
+            (pa.times as float[])[j] = 0.0
+            (pa.holds as float[])[j] = pa.hold
+            limp_by(pa, j)
+        }
+        j = j + 1
+    }
+    physics.ragdoll_apply_impulse(r, k, impulse, point)
+    pa.hits = pa.hits + 1
+}
+
+// Its body let go while its weight is whole, anchored again under it.
+limp_by(pa: *Physanim, k: int) {
+    r = pa.ragdoll as *Ragdoll
+    limp = (pa.weights as float[])[k] >= 0.999 || (pa.holds as float[])[k] > 0.0
+    if physics.ragdoll_bone_is_limp(r, k) != limp { physics.ragdoll_set_bone_limp(r, k, limp) }
+}
+
+smooth(u: float) -> float {
+    v = core.clampf(u, 0.0, 1.0)
+    return v * v * (3.0 - 2.0 * v)
+}
+
+// A fixed step: the hits' holds run out, and the weights ease.
+physanim_step(state: ptr, e: *Engine, dt: float) {
+    pa = state as *Physanim
+    w = pa.weights as float[]
+    froms = pa.froms as float[]
+    goals = pa.goals as float[]
+    times = pa.times as float[]
+    gone = pa.gone as float[]
+    holds = pa.holds as float[]
+    k = 0
+    while k < pa.count {
+        if holds[k] > 0.0 {
+            holds[k] = holds[k] - dt
+            if holds[k] <= 0.0 {
+                // Anchored again as its weight leaves 1, and eased back onto
+                // the animation as its anchor carries the body there. Left
+                // limp until it was drawn no more, the chest went on falling
+                // as it eased, 64 degrees off the twin's rather than 38, and
+                // its fastest joint turned 18.9 rad/s, not 14.8 (the walk's
+                // own 15.8).
+                holds[k] = 0.0
+                froms[k] = 1.0
+                goals[k] = 0.0
+                times[k] = pa.recover
+                gone[k] = 0.0
+                limp_by(pa, k)
+            }
+        } else if w[k] != goals[k] {
+            gone[k] = gone[k] + dt
+            if times[k] <= 0.0 {
+                w[k] = goals[k]
+            } else {
+                w[k] = froms[k] + (goals[k] - froms[k]) * smooth(gone[k] / times[k])
+                if gone[k] >= times[k] { w[k] = goals[k] }
+            }
+            limp_by(pa, k)
+        }
+        k = k + 1
+    }
+}
+
+// After the graph (animator.add_post): the figure drawn between its
+// animated pose and its bodies, body by body down the figure from its hips,
+// each its own turn and place off the body above it blended by its weight
+// (the hips in the world's), and shown (animator.show). So a body at 0 keeps
+// the bend the animation gives it under a body above it that is thrown: a
+// forearm stays bent at the elbow as animated under a struck upper arm, where
+// blended in the world's it would hold the world's turn the animation gives
+// it and its elbow bend by however far the arm above it went. The graph goes
+// on from its own pose. With every weight 0 it is left as the graph drew it.
+physanim_post(state: ptr, a: *Animator) {
+    pa = state as *Physanim
+    w = pa.weights as float[]
+    any = false
+    k = 0
+    while k < pa.count {
+        if w[k] > 0.0 { any = true }
+        k = k + 1
+    }
+    if !any { return }
+    r = pa.ragdoll as *Ragdoll
+    if !physics.ragdoll_animation_pose(r, pa.anim) { return }
+    physics.ragdoll_body_pose(r, pa.body)
+    parents = pa.parents as int[]
+    order = pa.order as int[]
+    n = 0
+    while n < pa.count {
+        k = order[n]
+        up = parents[k]
+        qa, pa_at = bone_at(pa.anim, k)
+        qb, pb_at = bone_at(pa.body, k)
+        if up < 0 {
+            put(pa.shown, k, core.quat_slerp(qa, qb, w[k]), core.v3_lerp(pa_at, pb_at, w[k]))
+        } else {
+            uqa, upa = bone_at(pa.anim, up)
+            uqb, upb = bone_at(pa.body, up)
+            uqs, ups = bone_at(pa.shown, up)
+            // Its own off the body above it, in the animation and in the bodies.
+            la_q = core.quat_mul(core.quat_conjugate(uqa), qa)
+            la_p = core.quat_apply(core.quat_conjugate(uqa), core.v3_sub(pa_at, upa))
+            lb_q = core.quat_mul(core.quat_conjugate(uqb), qb)
+            lb_p = core.quat_apply(core.quat_conjugate(uqb), core.v3_sub(pb_at, upb))
+            lq = core.quat_slerp(la_q, lb_q, w[k])
+            lp = core.v3_lerp(la_p, lb_p, w[k])
+            put(pa.shown, k, core.quat_normalize(core.quat_mul(uqs, lq)), core.v3_add(ups, core.quat_apply(uqs, lp)))
+        }
+        n = n + 1
+    }
+    physics.ragdoll_show_pose(r, pa.shown, true)
+    animator.show(a)
+}
+
+// Body `k` of a ragdoll pose: its turn and its place.
+bone_at(p: ptr, k: int) -> (Quat, Vec3) {
+    f = p as float[]
+    at = k * physics.POSE_STRIDE
+    return core.quat(f[at], f[at + 1], f[at + 2], f[at + 3]), core.vec3(f[at + 4], f[at + 5], f[at + 6])
+}
+
+put(p: ptr, k: int, q: Quat, at: Vec3) {
+    f = p as float[]
+    i = k * physics.POSE_STRIDE
+    f[i] = q.x
+    f[i + 1] = q.y
+    f[i + 2] = q.z
+    f[i + 3] = q.w
+    f[i + 4] = at.x
+    f[i + 5] = at.y
+    f[i + 6] = at.z
+}
+
+// The bodies in an order that has each after the one above it.
+find_order(pa: *Physanim) {
+    parents = pa.parents as int[]
+    order = pa.order as int[]
+    placed = calloc(pa.count, 4) as int[]
+    n = 0
+    passes = 0
+    while n < pa.count && passes <= pa.count {
+        passes = passes + 1
+        k = 0
+        while k < pa.count {
+            if placed[k] == 0 && (parents[k] < 0 || placed[parents[k]] == 1) {
+                order[n] = k
+                placed[k] = 1
+                n = n + 1
+            }
+            k = k + 1
+        }
+    }
+    free(placed as ptr)
+}
