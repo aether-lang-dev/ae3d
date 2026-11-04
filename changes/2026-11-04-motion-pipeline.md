@@ -111,3 +111,7 @@
   and `graphed` take a `scale`, the figure's object scaled before anything is
   made from it; at 0.9 and 1.1 its capsule is that share of its own, tall
   and round, and it walks without a toe skating 5 mm.
+- **A slot's takes from a file it names** (#950): `enter Interact from
+  people/ual1.glb`, so one person takes slots whose takes are in different
+  files (UAL1's at a workbench, its own UAL2 chop at a block). A slot naming
+  no enter plays its loop where it holds the figure.
