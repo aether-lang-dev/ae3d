@@ -115,3 +115,19 @@
   people/ual1.glb`, so one person takes slots whose takes are in different
   files (UAL1's at a workbench, its own UAL2 chop at a block). A slot naming
   no enter plays its loop where it holds the figure.
+
+### A seated figure stands up without its pelvis dropping (#953, #954)
+
+- **Transitions ease out of the graph's own pose.** `play_at` and the
+  matcher inertialized from the pose drawn, with its lift and feet already
+  on it, and the lift was laid on again. A seated figure's pelvis moved
+  28.7 cm in a frame at its loop's start or its exit's (Siltreach measured
+  15 to 18 cm on a 0.38 m log). The graph's pose is kept before the layers,
+  aims, lift and feet go on, as UE5 inertializes ahead of its foot
+  placement. Sitting on and standing up from a log, a stool and a doorstep
+  from eight ways each, the drawn pelvis moves 2.5 cm in a frame at the
+  most (`tests/test_use`).
+- **A step comes down on the heading it got to**, as it comes down where
+  it got to. Turned with a fading clip as it came down, a foot's toe swung
+  9 mm round its held ankle on the floor. The stool's eight ways now skate
+  0 mm.
