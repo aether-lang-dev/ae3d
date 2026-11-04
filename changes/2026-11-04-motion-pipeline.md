@@ -91,3 +91,19 @@
   - test_humanoid's stairs and ramp read as before.
   - A point is in a solid only 1 mm or more under its surface. A heel
     standing on the floor had read 600 mm into it.
+
+### Characters a game can drive (#940, #942, #944, #949)
+
+- **`character.physical(c)`** puts a figure's bodies on at once, not at its
+  first blow: unhurt, it had none, and ae3d.items' edge passed through it.
+  test_items: a person standing where a sword's edge passes is hit once
+  physical.
+- **`character.pause(c)` and `resume(c, at, facing)`**: held by something
+  else, the character leaves its object, mover and capsule alone, and is
+  put where the body was left on resuming. A paused character asked to walk
+  moves 0 mm (it walked on under the body before).
+- **Takes shared** by every character of one figure on one set of gaits,
+  made once and kept by the gaits: 20 mannequins, the first made in 227 ms
+  and the others in 72 ms each, all walking alike within 6e-8 rad.
+- **A slot that names no takes** is held as it is reached, facing its way,
+  until the figure leaves (it was refused).
