@@ -1138,11 +1138,23 @@ the bloom and the tone curve. Three things follow from that:
 - Text writes no depth, as the water and the glass do not, so depth of field
   blurs it by the depth under it, not its own, and the pick pass does not see it
   (text is not picked: the click lands on what is behind).
-- The atlas is read at one level, as the HUD reads it: far away and small a
-  label is blurred rather than sharp (the field's width grows with the
-  minification) and can shimmer in motion. Mips would sharpen it but make the
-  two APIs' frames differ by the driver's mip filter, so it stays one level;
-  a label sized in pixels does not shrink, and does not shimmer.
+- The atlas is read at one level, as the HUD reads it: mips would make the two
+  APIs' frames differ by the driver's mip filter. Far away and small, a pixel
+  spans many of the atlas's texels, and a field read at one point a pixel
+  finds a stroke one frame and the gap beside it the next: the label shimmered
+  as the camera moved (#892). Where a pixel spans more than a texel the shader
+  reads the field over the pixel's footprint on the atlas instead (`dFdx` and
+  `dFdy` of the atlas place), a grid of up to 4 by 4 reads, each a pixel's
+  share of the width wide, and covers the pixel by their mean, faded in from
+  one texel a pixel to two. The grid is symmetric about the pixel's centre, so
+  OpenGL's y running up turns it into itself and the two renderers agree.
+  `test_world_text` moves the camera a fifth of a unit a frame past a label 5
+  and one 9 pixels to the em and holds the coverage of every frame (read in the
+  scene's light) to 2% of its mean and of the frame before: read a point a
+  pixel they were 4.2% and 6.7% (the far one) and 1.9% and 3.6%, now 1.3% and
+  1.5%, 0.74% and 0.76%, on both renderers, the two renderers' frames the same
+  to the channel. A label sized in pixels does not shrink, and does not
+  shimmer.
 - With nothing asked for nothing runs: the frame is the frame it was.
 
 What a frame pays (`benchmarks/bench_world_text`, 1280x720, 24 spheres, an
