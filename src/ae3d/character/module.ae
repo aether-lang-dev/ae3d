@@ -32,6 +32,7 @@
 // modules; through this it is the three above.
 
 import std.heap
+import std.list
 import std.string
 import ae3d.core
 import ae3d.engine
@@ -57,7 +58,7 @@ exports (
     Character, Gaits, gaits, gaits_set, gaits_free, GAIT_FW, GAIT_BW, GAIT_SW, GAIT_FR, GAIT_BR, GAIT_SR, GAIT_START, GAIT_STOP, GAIT_STAND,
     humanoid, graphed, graph_of, character_free, capsule_off, match_add, matching, use_takes, use, leave, using, pause, resume, paused, seated, use_phase, use_contact, use_enter_state,
     USE_NONE, USE_GO, USE_TURN, USE_ENTER, USE_LOOP, USE_EXIT, move, look, look_ahead, look_free, aim, aim_off, aims,
-    act, act_stop, acting, ACT_OUT, swing, hit, physical, physanim_of, animator_of, mover_of, feet_of, object_of, idle_state, move_state, standing, error
+    act, act_stop, acting, ACT_OUT, swing, set_avoidance, avoiding, hit, physical, physanim_of, animator_of, mover_of, feet_of, object_of, idle_state, move_state, standing, error
 )
 
 // Seconds a character's look and aim ease on and off.
@@ -127,6 +128,10 @@ struct Character {
     matcher: int                   // its database's matcher state (match_add), -1 none
     match_built: bool
     capsule: ptr                   // *CharacterController it made itself, or null
+    avoid_off: bool                // it does not steer round others (set_avoidance)
+    avoid_weight: float            // how much of a meeting it takes on (1: half, as each of two does)
+    steered: Vec3                  // the velocity it steered to last step
+    steered_known: bool
     physanim: ptr                  // *Physanim put on at its first blow (hit), or null
     graph: ptr                     // *Graph read from a file (graphed), or null
     stepper: ptr                   // *Behaviour: its step in the engine's loop
@@ -426,6 +431,8 @@ humanoid(e: *Engine, name: string, path: string, g: *Gaits, scale: float = 1.0) 
     b.fixed_update = character_fixed
     engine.engine_add_behaviour(e, b)
     c.stepper = b as ptr
+    c.avoid_weight = 1.0
+    people_add(c)
     return c
 }
 
@@ -682,6 +689,7 @@ standing_height(r: *pose.Rig, o: *GameObject) -> float {
 
 character_free(c: *Character) {
     if c == null { return }
+    people_remove(c)
     // Out of the engine's loop first, as an animator is: freed while the
     // engine runs, its step would read freed memory.
     if c.stepper != null {
@@ -1245,7 +1253,7 @@ character_fixed(state: ptr, e: *Engine, dt: float) {
         } else {
             mover.face(m, 0.0, false)
         }
-        mover.ask(m, c.asked)
+        mover.ask(m, steer(c, c.asked))
         mover.step(m, dt)
     }
     ahead = core.quat_apply(behaviour.object_rotation(o), core.vec3(0.0, 0.0, 1.0))
@@ -1285,3 +1293,163 @@ standing(c: *Character) -> bool {
     return now == c.idle || now == c.idle_m
 }
 move_state(c: *Character) -> int { return c.walk }
+
+// --- avoidance (#956) ---------------------------------------------------------------------------------
+
+// Seconds ahead a meeting is looked for, metres round a character its
+// neighbours are, and the room kept between two capsules beyond their radii.
+const AVOID_HORIZON = 2.5
+const AVOID_NEAR = 5.0
+const AVOID_ROOM = 0.06
+// What turning off the way asked costs (a whole turn of the asked speed: 1),
+// what a meeting `t` seconds ahead costs (AVOID_MEET / t), and the small lean
+// to the right two walkers meeting head on share so they pass, not mirror.
+const AVOID_TURN = 1.0
+const AVOID_MEET = 1.2
+const AVOID_RIGHT = 0.02
+// And what leaving the way it chose last step costs (a whole turn: AVOID_KEEP).
+const AVOID_KEEP = 0.6
+// The share of the way to its new choice a steered velocity goes each step.
+const AVOID_EASE = 0.12
+
+var g_people: ptr = null                // list of *Character: every character, for avoidance
+
+// Whether it steers round the other solid characters near it, and how much
+// of a meeting it takes on (1: half, as each of two does; 0: none), as UE's
+// CharacterMovementComponent's RVO avoidance (bUseRVOAvoidance, its weight).
+// On by default for a character whose capsule is solid.
+set_avoidance(c: *Character, on: bool, weight: float) {
+    if c == null { return }
+    c.avoid_off = !on
+    c.avoid_weight = core.clampf(weight, 0.0, 4.0)
+}
+
+avoiding(c: *Character) -> bool { return c != null && !c.avoid_off }
+
+people_add(c: *Character) {
+    if g_people == null { g_people = list.new() }
+    list.add_raw(g_people, c as ptr)
+}
+
+people_remove(c: *Character) {
+    if g_people == null { return }
+    i = 0
+    while i < list.size(g_people) {
+        if list.get_raw(g_people, i) == c as ptr {
+            list.remove(g_people, i)
+            return
+        }
+        i = i + 1
+    }
+}
+
+// The velocity asked, steered round the other solid characters near it
+// (#956): a velocity sampled near the one asked, up to 90 degrees off it and
+// no faster, scored by how far it turns and by how soon it would meet each
+// neighbour's capsule, the meeting read reciprocally (RVO: the relative
+// velocity 2v - v_mine - v_theirs, as if each takes half the turn), the
+// lowest kept. Two solid walkers asked straight at each other walked into
+// each other and stopped 0.56 m apart.
+steer(c: *Character, asked: Vec3) -> Vec3 {
+    speed = core.sqrt_of(asked.x * asked.x + asked.z * asked.z)
+    if c.avoid_off || c.avoid_weight <= 0.0 || speed < 0.05 || g_people == null || c.capsule == null { return asked }
+    mine = c.capsule as *CharacterController
+    if !physics.character_solid(mine) { return asked }
+    o = c.object as *GameObject
+    here = behaviour.object_position(o)
+    v_mine = physics.character_velocity(mine)
+    r_mine = physics.character_radius(mine)
+    // Its neighbours, read once.
+    n = 0
+    near = list.new()
+    i = 0
+    while i < list.size(g_people) {
+        other = list.get_raw(g_people, i) as *Character
+        if other != c && other.engine == c.engine && other.capsule != null && !other.paused {
+            cap = other.capsule as *CharacterController
+            there = behaviour.object_position(other.object as *GameObject)
+            dx = there.x - here.x
+            dz = there.z - here.z
+            if physics.character_solid(cap) && dx * dx + dz * dz < AVOID_NEAR * AVOID_NEAR {
+                list.add_raw(near, other as ptr)
+                n = n + 1
+            }
+        }
+        i = i + 1
+    }
+    if n == 0 {
+        list.free(near)
+        c.steered_known = false
+        return asked
+    }
+    best = asked
+    best_cost = 1000000000.0
+    angles = [0.0, -0.2618, 0.2618, -0.5236, 0.5236, -0.7854, 0.7854, -1.0472, 1.0472, -1.309, 1.309, -1.5708, 1.5708]
+    shares = [1.0, 0.6]
+    a = 0
+    while a < 13 {
+        cs = core.cos_of(angles[a])
+        sn = core.sin_of(angles[a])
+        s = 0
+        while s < 2 {
+            vx = (asked.x * cs + asked.z * sn) * shares[s]
+            vz = (asked.z * cs - asked.x * sn) * shares[s]
+            ox = vx - asked.x
+            oz = vz - asked.z
+            cost = AVOID_TURN * core.sqrt_of(ox * ox + oz * oz) / speed
+            if angles[a] > 0.0 { cost = cost + AVOID_RIGHT }
+            // Kept to the way it chose last step, as a person commits to a side:
+            // chosen afresh every step, a heading flipping between two samples
+            // skated a toe 5.3 mm through four crossing.
+            if c.steered_known {
+                kx = vx - c.steered.x
+                kz = vz - c.steered.z
+                cost = cost + AVOID_KEEP * core.sqrt_of(kx * kx + kz * kz) / speed
+            }
+            k = 0
+            while k < n {
+                other = list.get_raw(near, k) as *Character
+                cap = other.capsule as *CharacterController
+                there = behaviour.object_position(other.object as *GameObject)
+                v_other = physics.character_velocity(cap)
+                t = meet_in(there.x - here.x, there.z - here.z, 2.0 * vx - v_mine.x - v_other.x, 2.0 * vz - v_mine.z - v_other.z, r_mine + physics.character_radius(cap) + AVOID_ROOM)
+                if t < 0.05 { t = 0.05 }
+                if t < AVOID_HORIZON { cost = cost + c.avoid_weight * AVOID_MEET / t }
+                k = k + 1
+            }
+            if cost < best_cost {
+                best_cost = cost
+                best = core.vec3(vx, 0.0, vz)
+            }
+            s = s + 1
+        }
+        a = a + 1
+    }
+    list.free(near)
+    // Eased toward what it chose, a share AVOID_EASE a step: taken at once,
+    // a fifteen degree turn as a meeting began skated a toe 5.3 mm.
+    if c.steered_known { best = core.v3_lerp(c.steered, best, AVOID_EASE) }
+    c.steered = best
+    c.steered_known = true
+    return best
+}
+
+// Seconds until a circle `radius` round a point (px, pz) off is reached going
+// at (wx, wz); AVOID_HORIZON and more when it is not (moving apart, passing).
+meet_in(px: float, pz: float, wx: float, wz: float, radius: float) -> float {
+    c0 = px * px + pz * pz - radius * radius
+    toward = px * wx + pz * wz
+    if c0 <= 0.0 {
+        // Already within: a meeting now, unless going apart.
+        if toward > 0.0 { return 0.0 }
+        return AVOID_HORIZON * 2.0
+    }
+    a0 = wx * wx + wz * wz
+    if a0 < 0.000001 { return AVOID_HORIZON * 2.0 }
+    b0 = 0.0 - 2.0 * toward
+    disc = b0 * b0 - 4.0 * a0 * c0
+    if disc < 0.0 { return AVOID_HORIZON * 2.0 }
+    t = (0.0 - b0 - core.sqrt_of(disc)) / (2.0 * a0)
+    if t < 0.0 { return AVOID_HORIZON * 2.0 }
+    return t
+}
