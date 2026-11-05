@@ -200,3 +200,8 @@
 - **A swing over the gait** (#945): `items.swing_over` plays a held item's
   swing on the upper body over whatever the legs play, at a move's own
   rate; `items.swing_at` for a whole-body one.
+- **A hit says what a damage model needs** (#946): the bone met, the edge's
+  speed and depth, the static world and other items met (a parry), with
+  `items.swing_stop`.
+- **Graph files crop captures, give them events and a rate, and read CMU's
+  ASF/AMC** (#948).
