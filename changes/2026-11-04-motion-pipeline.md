@@ -192,3 +192,11 @@
   meshes are skinned apart lost its head when its arm was cut.
 - **`character.act` holds a pose** (a snapshot) until the next act: knocked
   down, out and up again are three acts.
+- **A standing figure asked off to its side turns first, then starts**
+  (#964): walking off along a log it had sat on, its feet no longer cross
+  (110 mm before) and a toe skates 0.6 mm (11.8).
+- **A state played backward** ends at its start, its events passed going
+  back (#947).
+- **A swing over the gait** (#945): `items.swing_over` plays a held item's
+  swing on the upper body over whatever the legs play, at a move's own
+  rate; `items.swing_at` for a whole-body one.
