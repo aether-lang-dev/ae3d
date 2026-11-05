@@ -1523,6 +1523,34 @@ the two halves the scene pass is drawn in, the nearest of the samples a
 pixel. Both are the depth of what was drawn -- the near figure's real
 silhouette, the picture of a far one -- and neither draws anything twice.
 
+### What a frame's draw count is
+
+The draw count (`backend_draw_calls`, `engine_draw_calls`, `frame.stats`' draw
+calls, the `draw_calls` a `*.budget.json` holds) is the scene's draws: each
+draw of scene geometry, on either renderer. That is the models' draws (the
+opaque and transparent passes, the depth prepass, a crowd's), the shadow
+work's casters, the water, the sky's dome and the world's text. A pass of
+the frame's own is not one: the scene's depth resolved or copied for the
+passes that read it, the occlusion, the sky's capture and light, the
+temporal pass, the reflections, depth of field, the bloom, FXAA, the
+upscaler, the composite, a view's blit into the window, the HUD over the
+finished picture and the pick pass. Those are counted on neither (#882):
+on Vulkan a quoted pass (`vkframe.draw_quoted_with`) does not count, on
+OpenGL the post passes do not. Until then each counted some of them: OpenGL
+the reflections' pass, the temporal pass and the HUD, Vulkan the depth's
+resolve and the occlusion's pass, which happen inside the scene, so each
+renderer disagreed with the other by the screen passes that were on, and
+zombie_street's 88 on both was two different 88s (OpenGL's reflections,
+Vulkan's resolve). `tests/test_backend_parity` holds the count of a scene
+with the occlusion, the temporal pass, the reflections and depth of field
+each on and all on to its count with none, on both renderers, and the two
+renderers to each other (7, a scene no renderer merges).
+
+The count is of draws, not of work: OpenGL merges models a Vulkan frame draws
+one by one (`test_backend_parity`'s merging case), so in a scene with such
+models the two counts differ by the merging, and each renderer keeps a budget
+of its own.
+
 ### What is at a pixel
 
 `core.backend_pick(backend, camera, light, x, y, width, height)` answers what
