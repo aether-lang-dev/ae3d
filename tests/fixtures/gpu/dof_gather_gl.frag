@@ -5,6 +5,10 @@ uniform float max_radius;
 uniform vec2 texel;
 uniform sampler2D coc;
 
+float ae3d_shaders_ssao_dither(vec2 pixel) {
+    return fract(52.9829189 * fract(dot(pixel, vec2(0.06711056, 0.00583715))));
+}
+
 float ae3d_shaders_dof_tap_weight(float tap, float dist, float own) {
     float reach = clamp(abs(tap) - dist + 0.5, 0.0, 1.0);
     if (tap > 0.0) {
@@ -23,11 +27,15 @@ void main() {
     float total = 1.0;
     float near = 0.0;
     float widest = 0.0;
+    vec2 fc = gl_FragCoord.xy;
+    vec2 size = vec2(textureSize(coc, 0));
+    vec2 pixel = 1.0 < 0.0 ? vec2(fc.x, size.y - fc.y) : fc;
+    float turn = ae3d_shaders_ssao_dither(pixel) * 6.2831853;
     int i = 0;
-    while (i < 32) {
+    while (i < 48) {
         float k = float(i);
-        float a = k * 2.3999632;
-        float reach = sqrt((k + 0.5) / 32.0) * max_radius;
+        float a = turn + k * 2.3999632;
+        float reach = sqrt((k + 0.5) / 48.0) * max_radius;
         vec4 tap = texture(coc, uv + vec2(cos(a), sin(a) * 1.0) * reach * texel);
         float w = ae3d_shaders_dof_tap_weight(tap.w, reach, own);
         sum = sum + tap.rgb * w;
@@ -38,7 +46,7 @@ void main() {
         }
         i = i + 1;
     }
-    float ring = max(16.0 * widest * widest / (max_radius * max_radius), 1.0);
+    float ring = max(24.0 * widest * widest / (max_radius * max_radius), 1.0);
     float blend = max(clamp(own, 0.0, 1.0), clamp(near / ring, 0.0, 1.0));
     FragColor = vec4(sum / total, blend);
 }

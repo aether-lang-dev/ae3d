@@ -735,8 +735,11 @@ then a composite that mixes them in beside the bloom:
   focus kept. The view depth is `1 / w` of the depth taken back through the
   camera's inverse, whatever the dialect's clip depth, so it is the planar
   distance and not the radial.
-- **`dof_gather`**: 32 taps on a golden-angle spiral out to `max_radius`, each
-  weighed by how far its own disc reaches this texel (scatter as gather): a
+- **`dof_gather`**: 48 taps on a golden-angle spiral out to `max_radius`, the
+  spiral turned at each texel by an interleaved-gradient noise of the texel
+  (the occlusion's `dither`, counted from the same corner on both renderers;
+  #881), so the blur of a wide disc is grain rather than the spiral's own
+  pattern repeated at every texel, each tap weighed by how far its own disc reaches this texel (scatter as gather): a
   near thing's blur spreads over the sharp ground behind it, up to its disc,
   and the far ground's does not spread over what is in focus (a far tap is
   weighed by the texel's own radius). The alpha is how much of the texel is
@@ -758,10 +761,13 @@ with the engine's settings over its own camera's depth; a capture channel is
 data and is not blurred. The engine's settings are not part of a scene file.
 
 `tests/test_gpu_dof` runs the passes on the CPU over pictures with known
-answers; `tests/test_backend_parity` draws a ball in focus with a sphere near
+answers, among them an edge under a disc wider than the gather reaches, whose
+rows must differ (the spiral turned) and average to an even disc's blur of it
+within 0.015 (0.008 turned; unturned, 32 taps were 0.029 out and 48 0.026);
+`tests/test_backend_parity` draws a ball in focus with a sphere near
 and a box far (both blurred, the ball not; focused on the box, the box is the
 one least changed) on both backends: 0 of 147,456 channels differ at one
-sample, 1.3% at 4x (the depth at silhouettes differs by a sample).
+sample, 1.4% at 4x (the depth at silhouettes differs by a sample).
 
 ### Ray-traced shadows
 
