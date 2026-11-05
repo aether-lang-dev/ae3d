@@ -72,7 +72,6 @@ animator.blend_add2(a, move, step_left, 0.51, 0.0)
 animator.bind2(a, move, "vx", "vz")                  // the mover writes these
 start = animator.add_state(a, "start", start_take, false)
 animator.clock_by(a, start, "travelled", false)      // played by the way come
-animator.clock_most(a, start, 1.25)                  // at most 1.25 times its own pace
 stop = animator.add_state(a, "stop", stop_take, false)
 animator.clock_by(a, stop, "rest", true)             // played by the way left to rest
 go = animator.add_transition(a, idle, start, 0.2)
@@ -80,9 +79,6 @@ animator.transition_when(a, go, "go", animator.IS, 0.0)
 on = animator.add_transition(a, start, move, 0.3)
 animator.transition_when(a, on, "", animator.ENDED, 0.0)
 animator.transition_synced(a, on, true)              // the gaits take over in step
-late = animator.add_transition(a, start, move, 0.3)
-animator.transition_when(a, late, "", animator.BEHIND, 0.25)   // or once it falls behind
-animator.transition_synced(a, late, true)
 halt = animator.add_transition(a, move, stop, 0.25)
 animator.transition_when(a, halt, "go", animator.IS_NOT, 0.0)
 animator.transition_when(a, halt, "rest", animator.BELOW, clips.travel_length(stop_take))
@@ -95,7 +91,7 @@ mover.step(m, dt)
 ```
 
 - **Blend spaces in two directions** are weighted by polar gradient bands (Johansen 2009, Unity's freeform directional): between two samples of a speed, a direction blends them at that speed. The takes play in step by their footfalls, paced so their blended velocity is the one asked.
-- **Starts and stops by distance** (Paragon, GDC 2016). A start is played by the way the figure has come since it stood, a stop by the way left to where the mover brings it to rest, so its feet plant where the clip planted them whatever the braking. The mover brakes at the stop take's own deceleration, so the stop enters with its feet where the walk's are in the stride; of a stop and its mirror, the transition takes the one whose feet match. A start slower than the figure is held to `clock_most` times its own pace, on by the distance gone each step once behind so its planted feet keep to the ground, and a `BEHIND` transition hands it to the gaits once it trails its distance by that many seconds: clocked by the distance alone, a start raced up to 28 times its pace. `clips.moving_at` reads a take that begins on the move from where it first stands.
+- **Starts and stops by distance** (Paragon, GDC 2016). A start is played by the way the figure has come since it stood, a stop by the way left to where the mover brings it to rest, so its feet plant where the clip planted them whatever the braking. The mover brakes at the stop take's own deceleration, so the stop enters with its feet where the walk's are in the stride; of a stop and its mirror, the transition takes the one whose feet match.
 - **Turning on the spot in steps** (`ikrig.feet_set_steps`, #827). A planted foot keeps its heading over the ground as the body turns above it; when it is twisted or moved too far, it is lifted off the ground and set down where the clip has it, one foot at a time, begun on the twist it will have half a step on.
 - **Motion matching** (`add_matcher`; Clavet, GDC 2016; Holden). Every frame of its takes is known by its feet's places and velocities, its hips' velocity, and where its root will be and face a third, two thirds and a whole second on; every 0.1 s the frame nearest the pose drawn and the way ahead the mover predicts is played, changing only for a clear gain and only to a frame that keeps each planted foot planted. With `mover.set_follow`, the figure goes by its clips' root motion and the mover's springs are a simulation it is eased toward.
 - **Aim offsets** (`add_aim`): poses aiming at their yaw and pitch, blended at the aim asked and added over the spine.
