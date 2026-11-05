@@ -808,7 +808,7 @@ export SUITE_CFLAGS=-O0
 # The two showcases a person watches run as the examples do: the motion
 # showcase crashed on its first frame for 43 commits while every suite
 # passed, its people's shared takes freed under them.
-showcases="tools/anim_showcase.ae tools/plaza_showcase.ae"
+showcases="tools/anim_showcase.ae tools/plaza_showcase.ae tools/people_plaza.ae"
 build_together examples/*.ae $showcases $scene_tools
 unset SUITE_CFLAGS
 for example in examples/*.ae $showcases; do
