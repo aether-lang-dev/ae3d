@@ -14,6 +14,7 @@ the pommel) at the origin, its front (the edge's way, the muzzle's) +z.
 | `bat.item` | a baseball bat, two-handed | 0.84 | 0.9 |
 | `pistol.item` | a 9 mm pistol, its grip raked 18 degrees, a trigger | 0.19 | 0.85 |
 | `rifle.item` | an assault rifle: a pistol grip, a fore-end for the other hand, a trigger | 0.95 | 3.6 |
+| `bowl.item` | a soup bowl, 26 cm across, cradled from under its sides in both hands, a carry pose | 0.26 | 0.8 |
 
 A kind declares:
 - `mass`, and `centre` (of mass);
@@ -24,11 +25,17 @@ A kind declares:
   the stretch the second hand is free to slide along; a `grip off` on
   another part with its own `radius`, `segment <a> <b>` and `front` (the
   way that hand's knuckles face: a rifle's fore-end, held from under it);
+  and `mirrored` where the second hand mirrors the main across the item
+  (a bowl's, a tray's) rather than stacking on the handle with it (an
+  axe's);
 - `trigger <x y z>`, for the index;
 - `edge <from> <to>`: a blade's edge or a club's striking face;
 - `socket <name> <joint> <offset> <up> <front>`: where it is carried, by a
   joint named as UE5's mannequin names it, offset from the joint and turned
   in the body's frame (x to its left, y up, z ahead), its handle along `up`
   and its front along `front`;
+- `hold <animation>`: the pose its arms are held in while it is held
+  between swings, that take's first frame (a sword's ready guard), on the
+  main arm, and on both for a two-handed kind (a bowl's carry);
 - `swing <animation>`: a take that swings it (its strike where the main
   hand goes fastest).
