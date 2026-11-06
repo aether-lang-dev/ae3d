@@ -805,9 +805,13 @@ fi
 # the eight that build a world at start-up (2 to 5 times slower so) are
 # marked `// ci: optimised`.
 export SUITE_CFLAGS=-O0
-build_together examples/*.ae $scene_tools
+# The two showcases a person watches run as the examples do: the motion
+# showcase crashed on its first frame for 43 commits while every suite
+# passed, its people's shared takes freed under them.
+showcases="tools/anim_showcase.ae tools/plaza_showcase.ae tools/people_plaza.ae"
+build_together examples/*.ae $showcases $scene_tools
 unset SUITE_CFLAGS
-for example in examples/*.ae; do
+for example in examples/*.ae $showcases; do
     name="$(basename "$example" .ae)"
     if ! built_ok "$name"; then
         fail "$name (build)"
