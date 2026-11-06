@@ -735,8 +735,11 @@ then a composite that mixes them in beside the bloom:
   focus kept. The view depth is `1 / w` of the depth taken back through the
   camera's inverse, whatever the dialect's clip depth, so it is the planar
   distance and not the radial.
-- **`dof_gather`**: 32 taps on a golden-angle spiral out to `max_radius`, each
-  weighed by how far its own disc reaches this texel (scatter as gather): a
+- **`dof_gather`**: 48 taps on a golden-angle spiral out to `max_radius`, the
+  spiral turned at each texel by an interleaved-gradient noise of the texel
+  (the occlusion's `dither`, counted from the same corner on both renderers;
+  #881), so the blur of a wide disc is grain rather than the spiral's own
+  pattern repeated at every texel, each tap weighed by how far its own disc reaches this texel (scatter as gather): a
   near thing's blur spreads over the sharp ground behind it, up to its disc,
   and the far ground's does not spread over what is in focus (a far tap is
   weighed by the texel's own radius). The alpha is how much of the texel is
@@ -758,10 +761,13 @@ with the engine's settings over its own camera's depth; a capture channel is
 data and is not blurred. The engine's settings are not part of a scene file.
 
 `tests/test_gpu_dof` runs the passes on the CPU over pictures with known
-answers; `tests/test_backend_parity` draws a ball in focus with a sphere near
+answers, among them an edge under a disc wider than the gather reaches, whose
+rows must differ (the spiral turned) and average to an even disc's blur of it
+within 0.015 (0.008 turned; unturned, 32 taps were 0.029 out and 48 0.026);
+`tests/test_backend_parity` draws a ball in focus with a sphere near
 and a box far (both blurred, the ball not; focused on the box, the box is the
 one least changed) on both backends: 0 of 147,456 channels differ at one
-sample, 1.3% at 4x (the depth at silhouettes differs by a sample).
+sample, 1.4% at 4x (the depth at silhouettes differs by a sample).
 
 ### Ray-traced shadows
 
@@ -1132,11 +1138,23 @@ the bloom and the tone curve. Three things follow from that:
 - Text writes no depth, as the water and the glass do not, so depth of field
   blurs it by the depth under it, not its own, and the pick pass does not see it
   (text is not picked: the click lands on what is behind).
-- The atlas is read at one level, as the HUD reads it: far away and small a
-  label is blurred rather than sharp (the field's width grows with the
-  minification) and can shimmer in motion. Mips would sharpen it but make the
-  two APIs' frames differ by the driver's mip filter, so it stays one level;
-  a label sized in pixels does not shrink, and does not shimmer.
+- The atlas is read at one level, as the HUD reads it: mips would make the two
+  APIs' frames differ by the driver's mip filter. Far away and small, a pixel
+  spans many of the atlas's texels, and a field read at one point a pixel
+  finds a stroke one frame and the gap beside it the next: the label shimmered
+  as the camera moved (#892). Where a pixel spans more than a texel the shader
+  reads the field over the pixel's footprint on the atlas instead (`dFdx` and
+  `dFdy` of the atlas place), a grid of up to 4 by 4 reads, each a pixel's
+  share of the width wide, and covers the pixel by their mean, faded in from
+  one texel a pixel to two. The grid is symmetric about the pixel's centre, so
+  OpenGL's y running up turns it into itself and the two renderers agree.
+  `test_world_text` moves the camera a fifth of a unit a frame past a label 5
+  and one 9 pixels to the em and holds the coverage of every frame (read in the
+  scene's light) to 2% of its mean and of the frame before: read a point a
+  pixel they were 4.2% and 6.7% (the far one) and 1.9% and 3.6%, now 1.3% and
+  1.5%, 0.74% and 0.76%, on both renderers, the two renderers' frames the same
+  to the channel. A label sized in pixels does not shrink, and does not
+  shimmer.
 - With nothing asked for nothing runs: the frame is the frame it was.
 
 What a frame pays (`benchmarks/bench_world_text`, 1280x720, 24 spheres, an
@@ -1516,6 +1534,34 @@ frame's multisampled depth is resolved into a one-sample target between
 the two halves the scene pass is drawn in, the nearest of the samples a
 pixel. Both are the depth of what was drawn -- the near figure's real
 silhouette, the picture of a far one -- and neither draws anything twice.
+
+### What a frame's draw count is
+
+The draw count (`backend_draw_calls`, `engine_draw_calls`, `frame.stats`' draw
+calls, the `draw_calls` a `*.budget.json` holds) is the scene's draws: each
+draw of scene geometry, on either renderer. That is the models' draws (the
+opaque and transparent passes, the depth prepass, a crowd's), the shadow
+work's casters, the water, the sky's dome and the world's text. A pass of
+the frame's own is not one: the scene's depth resolved or copied for the
+passes that read it, the occlusion, the sky's capture and light, the
+temporal pass, the reflections, depth of field, the bloom, FXAA, the
+upscaler, the composite, a view's blit into the window, the HUD over the
+finished picture and the pick pass. Those are counted on neither (#882):
+on Vulkan a quoted pass (`vkframe.draw_quoted_with`) does not count, on
+OpenGL the post passes do not. Until then each counted some of them: OpenGL
+the reflections' pass, the temporal pass and the HUD, Vulkan the depth's
+resolve and the occlusion's pass, which happen inside the scene, so each
+renderer disagreed with the other by the screen passes that were on, and
+zombie_street's 88 on both was two different 88s (OpenGL's reflections,
+Vulkan's resolve). `tests/test_backend_parity` holds the count of a scene
+with the occlusion, the temporal pass, the reflections and depth of field
+each on and all on to its count with none, on both renderers, and the two
+renderers to each other (7, a scene no renderer merges).
+
+The count is of draws, not of work: OpenGL merges models a Vulkan frame draws
+one by one (`test_backend_parity`'s merging case), so in a scene with such
+models the two counts differ by the merging, and each renderer keeps a budget
+of its own.
 
 ### What is at a pixel
 
