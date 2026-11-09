@@ -1,0 +1,1281 @@
+// ae3d.netanim -- a character over the network (#911).
+//
+// A figure is not sent a pose at a time. Each peer runs the same graph
+// (ae3d.character: its mover, animator, feet, look and aim) from the same
+// inputs, so what crosses the wire is what the game asked of the character,
+// as Unreal's character movement sends its moves and Unity's Netcode its
+// input commands, not the bones it drew:
+//
+//   - its inputs, a tick at a time: the velocity and facing asked
+//     (character.move), the look (ahead, at a point, free) and the aim.
+//     Quantised before the owner's own character takes them (velocities to
+//     a millimetre a second, facings to a ten-thousandth, points to a
+//     millimetre), so the owner evaluates exactly what every other peer
+//     does;
+//   - its events, each stamped with the tick it happened at: a blow
+//     (character.hit), a knockdown (the full ragdoll, LIMP, the blow on a
+//     body: what test_knockdowns does by hand), a get-up (character.get_up)
+//     and an act (character.act). Their numbers go as 32-bit floats, and
+//     the owner takes them rounded so;
+//   - a compact state every STATE_EVERY ticks to find drift: where its
+//     object is, its mover's velocity and facing, its graph's state and the
+//     time in it. A peer compares it with what it had at that tick, and
+//     where they part past CORRECT_ABOVE, eases its figure onto the owner's
+//     place over CORRECT_HALF_LIFE (inertialized: never snapped);
+//   - while a figure is down, its ragdoll as physics state every
+//     RAGDOLL_EVERY ticks: each body's place (a tenth of a millimetre about
+//     the first body) and turn (the three smallest of its quaternion in 15
+//     bits each), compared with the peer's own ragdoll at that tick.
+//
+// Everything goes on the session's stream (net.send_stream: unreliable),
+// a block every SEND_EVERY ticks for every figure the side owns. Each block
+// carries the inputs of the last CARRY ticks as runs (a walk held is one
+// run: two bytes) and every event of the last EVENT_CARRY ticks, so a lost
+// block costs nothing while one of the next ones arrives in time.
+//
+// A remote figure plays a tick when its time has come: the owner's time of
+// that tick (the earliest arrival seen, less its tick's time: the link's
+// fastest way) and a buffer for the jitter, the send interval and a lost
+// block or two (set_buffer). A tick whose inputs never came in time is
+// played with the last inputs it had (extrapolated: a walk held walks on),
+// and counted; the state finds what that cost, and eases it back.
+//
+// A tick on each side: the owner asks (move, look, aim, the events), its
+// engine steps, then `sent` closes the tick and streams it. A peer: while
+// `due`, `play` hands the next tick's inputs and events to its characters,
+// its engine steps, then `played` records and compares the tick. Both
+// sides make their figures in the same order (`add`), as they mark objects
+// networked.
+
+import std.heap
+import std.list
+import std.mem
+import ae3d.core
+import ae3d.behaviour
+import ae3d.engine
+import ae3d.net
+import ae3d.physics
+import ae3d.animator
+import ae3d.mover
+import ae3d.physanim
+import ae3d.motion
+import ae3d.character
+
+exports (
+    NetAnim, NetFigure,
+    netanim_new, netanim_free, add, figure_count, figure_at, character_of, is_local,
+    move, look, look_ahead, look_free, aim, aim_off, hit, knock, get_up, act, knocked, down,
+    sent, due, play, played, tick, playing,
+    set_buffer, set_carry, set_send_every, set_state_every, set_ragdoll_every, set_blind,
+    blocks_sent, blocks_received, ticks_missed, events_late, corrections, correction_left,
+    state_checks, states_parted, worst_place, worst_facing, ragdoll_checks, worst_ragdoll,
+    SEND_EVERY, CARRY, STATE_EVERY, RAGDOLL_EVERY
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern exp(x: float) -> float
+
+const STEP = 0.016666666666666666   // a tick: the engine's fixed step
+const SEND_EVERY = 2                 // ticks between blocks: 30 a second
+const CARRY = 12                     // ticks of inputs each block carries: the last 0.2 s
+const EVENT_CARRY = 30               // ticks an event is carried for: half a second
+const STATE_EVERY = 30               // ticks between states: twice a second
+const RAGDOLL_EVERY = 6              // ticks between a downed figure's ragdolls: ten a second
+const BUFFER = 0.12                  // seconds a peer plays behind the owner's time over the link's fastest way
+const RING = 256                     // ticks of inputs and history kept
+const STATES = 16                    // states and ragdolls kept waiting for their tick
+const BLOCK = 8192                   // bytes a block at most
+const CORRECT_ABOVE = 0.002          // metres a peer's figure is off the owner's state before it is eased back
+const CORRECT_TURN = 0.005           // radians its facing is
+const CORRECT_TIME = 0.003           // seconds (a blend's phase) its graph's time in its state is: three of the state's steps
+const CORRECT_HALF_LIFE = 0.1        // seconds the easing halves what is left over
+const CORRECT_MOST = 0.5             // metres a second it eases a place at most
+const CORRECT_BLEND = 0.2            // seconds a graph put back on the owner's state is inertialized over
+
+// A tick's input, whole numbers in steps.
+const INPUT = 12
+const I_VX = 0                       // the velocity asked, millimetres a second
+const I_VZ = 1
+const I_FX = 2                       // the facing asked, ten-thousandths (0, 0: the way it goes)
+const I_FZ = 3
+const I_LOOK = 4                     // LOOK_*
+const I_LX = 5                       // the point looked at, millimetres
+const I_LY = 6
+const I_LZ = 7
+const I_AIM = 8                      // 1 aiming
+const I_AX = 9                       // the target, millimetres
+const I_AY = 10
+const I_AZ = 11
+const LOOK_AHEAD = 0
+const LOOK_AT = 1
+const LOOK_FREE = 2
+const VELOCITY_STEPS = 1000.0
+const FACING_STEPS = 10000.0
+const POINT_STEPS = 1000.0
+// A run's mask: the groups that changed from the run before.
+const M_VX = 1
+const M_VZ = 2
+const M_FX = 4
+const M_FZ = 8
+const M_LOOK = 16
+const M_AIM = 32
+
+// Events.
+const EV_HIT = 1                     // [u8 body][f32 point x y z][f32 impulse x y z]
+const EV_KNOCK = 2                   // [u8 body][f32 impulse x y z]
+const EV_GET_UP = 3                  // [f32 blend]
+const EV_ACT = 4                     // [varint state][f32 blend]
+
+// A block's flags, a figure each.
+const HAS_STATE = 1
+const HAS_RAGDOLL = 2
+
+// A state: x y z (tenths of a millimetre), velocity x z (millimetres a
+// second), facing (radians in 65536ths of a turn), the graph's state, its
+// time (milliseconds).
+const STATE = 8
+const PLACE_STEPS = 10000.0
+const TURN_STEPS = 65536.0
+const TIME_STEPS = 1000.0
+const HIST = 8                       // floats a tick of a peer's history: x y z, facing, state, time, and 2 spare
+const RAG_MOST = 32                  // bodies a ragdoll at most
+const ROTATION_STEPS = 16383.0       // a component of the three smallest in 15 bits
+const HALF_ROOT_TWO = 0.7071067811865476
+const PI = 3.141592653589793
+
+struct AnimEvent {
+    tick: int
+    seq: int
+    kind: int
+    body: int
+    a: Vec3
+    b: Vec3
+    value: float
+    state: int
+    done: bool
+}
+
+struct NetFigure {
+    owner: ptr                       // *NetAnim
+    index: int                       // its place among the session's figures, the same on every peer
+    character: ptr                   // *Character
+    engine: ptr                      // *Engine
+    local: bool                      // this side's to ask; else played from the stream
+    asking: ptr                      // int[INPUT]: the owner's input for the tick being built
+    ring: ptr                        // int[RING * INPUT]: inputs by tick
+    have: ptr                        // int[RING]: the tick + 1 each slot holds, 0 none
+    events: ptr                      // list of *AnimEvent
+    next_seq: int                    // the owner's next event number
+    motion: ptr                      // *Motion while it is down
+    // A peer's.
+    last: ptr                        // int[INPUT]: the inputs it last played
+    history: ptr                     // float[RING * HIST]
+    states: ptr                      // float[STATES * (STATE + 1)]: tick, then the state; tick -1 none
+    ragdolls: ptr                    // float[STATES * (1 + 1 + RAG_MOST * 7)]: tick, count, then each body's x y z qx qy qz qw
+    blind_from: int                  // inputs of these ticks taken as never come (a test's loss of every copy)
+    blind_to: int
+    missed: int                      // ticks played before their inputs came
+    forgot: int                      // a peer's: events numbered below this are let go of, never taken again
+    late: int                        // events that came after their tick was played
+    checks: int
+    parted: int                      // states whose graph state differed
+    worst_place: float
+    worst_facing: float
+    rag_checks: int
+    worst_rag: float
+    corrections: int
+    left: Vec3                       // the correction still to ease in
+    left_turn: float                 // and of the facing, radians
+}
+
+struct NetAnim {
+    session: *Net
+    figures: ptr                     // list of *NetFigure
+    building: int                    // the owner's tick being built
+    playing: int                     // a peer's newest tick played; -1 none
+    newest: int                      // a peer's newest tick heard of; -1 none
+    offset: float                    // a peer's: the least of a block's arrival less its newest tick's time
+    heard: bool
+    buffer: float
+    carry: int
+    send_every: int
+    state_every: int
+    ragdoll_every: int
+    blocks_sent: int
+    blocks_received: int
+    block: ptr                       // BLOCK bytes
+    scratch: ptr                     // 8 bytes: a number rounded through f32
+}
+
+struct Writer {
+    data: ptr
+    at: int
+}
+
+struct Reader {
+    data: ptr
+    length: int
+    at: int
+    ok: bool
+}
+
+// --- making ------------------------------------------------------------------------------------
+
+// Figures over `session`, both sides alike; registers the "anim.stream"
+// event, so both make it at the same point among their registrations.
+netanim_new(session: *Net) -> *NetAnim {
+    if session == null { return null }
+    na = heap.new(NetAnim)
+    na.session = session
+    na.figures = list.new()
+    na.playing = 0 - 1
+    na.newest = 0 - 1
+    na.buffer = BUFFER
+    na.carry = CARRY
+    na.send_every = SEND_EVERY
+    na.state_every = STATE_EVERY
+    na.ragdoll_every = RAGDOLL_EVERY
+    na.block = calloc(BLOCK, 1)
+    na.scratch = calloc(1, 8)
+    net.on_event(session, "anim.stream", on_stream, na as ptr)
+    return na
+}
+
+netanim_free(na: *NetAnim) {
+    if na == null { return }
+    i = 0
+    while i < list.size(na.figures) {
+        f = list.get_raw(na.figures, i) as *NetFigure
+        k = 0
+        while k < list.size(f.events) {
+            free(list.get_raw(f.events, k))
+            k = k + 1
+        }
+        list.free(f.events)
+        free(f.asking)
+        free(f.ring)
+        free(f.have)
+        free(f.last)
+        free(f.history)
+        free(f.states)
+        free(f.ragdolls)
+        heap.free(f)
+        i = i + 1
+    }
+    list.free(na.figures)
+    free(na.block)
+    free(na.scratch)
+    heap.free(na)
+}
+
+// Character `c` of engine `e` among the figures: this side's to ask
+// (`local`), or a peer's, played from what it streams. Every side adds the
+// same figures in the same order.
+add(na: *NetAnim, e: *Engine, c: *Character, local: bool) -> *NetFigure {
+    if na == null || c == null { return null }
+    f = heap.new(NetFigure)
+    f.owner = na as ptr
+    f.index = list.size(na.figures)
+    f.character = c as ptr
+    f.engine = e as ptr
+    f.local = local
+    f.asking = calloc(INPUT, 8)
+    f.ring = calloc(RING * INPUT, 8)
+    f.have = calloc(RING, 8)
+    f.events = list.new()
+    f.last = calloc(INPUT, 8)
+    f.history = calloc(RING * HIST, 8)
+    f.states = calloc(STATES * (STATE + 1), 8)
+    f.ragdolls = calloc(STATES * (2 + RAG_MOST * 7), 8)
+    k = 0
+    while k < STATES {
+        (f.states as float[])[k * (STATE + 1)] = 0.0 - 1.0
+        (f.ragdolls as float[])[k * (2 + RAG_MOST * 7)] = 0.0 - 1.0
+        k = k + 1
+    }
+    f.blind_from = 0 - 1
+    f.blind_to = 0 - 1
+    list.add_raw(na.figures, f as ptr)
+    return f
+}
+
+figure_count(na: *NetAnim) -> int { return list.size(na.figures) }
+figure_at(na: *NetAnim, i: int) -> *NetFigure { return list.get_raw(na.figures, i) as *NetFigure }
+character_of(f: *NetFigure) -> *Character { return f.character as *Character }
+is_local(f: *NetFigure) -> bool { return f.local }
+
+// Seconds a peer plays behind the owner's time over the link's fastest
+// way: at least the link's jitter and a send interval, and what a lost
+// block or two adds (SEND_EVERY ticks each).
+set_buffer(na: *NetAnim, seconds: float) { na.buffer = seconds }
+set_carry(na: *NetAnim, ticks: int) { if ticks > 0 && ticks < 128 { na.carry = ticks } }
+set_send_every(na: *NetAnim, ticks: int) { if ticks > 0 { na.send_every = ticks } }
+set_state_every(na: *NetAnim, ticks: int) { if ticks > 0 { na.state_every = ticks } }
+set_ragdoll_every(na: *NetAnim, ticks: int) { if ticks > 0 { na.ragdoll_every = ticks } }
+
+// A peer's figure takes the inputs of ticks `from` to `to` as never come,
+// as when every block carrying them is lost: what a test of the drift's
+// correction makes happen.
+set_blind(f: *NetFigure, from: int, to: int) {
+    f.blind_from = from
+    f.blind_to = to
+}
+
+// The owner's tick being built; a peer's newest played (-1 none).
+tick(na: *NetAnim) -> int { return na.building }
+playing(na: *NetAnim) -> int { return na.playing }
+
+// --- numbers ---------------------------------------------------------------------------------------
+
+steps(x: float, per: float) -> int { return (core.floor_of(x * per + 0.5)) as int }
+
+f32(na: *NetAnim, x: float) -> float {
+    mem.set_float32(na.scratch, 0, x)
+    return mem.get_float32(na.scratch, 0)
+}
+
+f32v(na: *NetAnim, v: Vec3) -> Vec3 { return core.vec3(f32(na, v.x), f32(na, v.y), f32(na, v.z)) }
+
+put_u8(w: *Writer, v: int) {
+    if w.at >= BLOCK { return }
+    mem.set_byte(w.data, w.at, v)
+    w.at = w.at + 1
+}
+
+put_u16(w: *Writer, v: int) {
+    put_u8(w, v % 256)
+    put_u8(w, (v / 256) % 256)
+}
+
+put_f32(w: *Writer, v: float) {
+    if w.at + 4 > BLOCK { return }
+    mem.set_float32(w.data, w.at, v)
+    w.at = w.at + 4
+}
+
+put_varint(w: *Writer, value: long) {
+    v = value
+    while v >= (128 as long) {
+        put_u8(w, ((v % (128 as long)) as int) + 128)
+        v = v / (128 as long)
+    }
+    put_u8(w, v as int)
+}
+
+put_signed(w: *Writer, value: int) {
+    v = value as long
+    if v >= (0 as long) {
+        put_varint(w, v * (2 as long))
+    } else {
+        put_varint(w, (0 as long) - v * (2 as long) - (1 as long))
+    }
+}
+
+get_u8(r: *Reader) -> int {
+    if r.at + 1 > r.length { r.ok = false ; return 0 }
+    v = mem.get_byte(r.data, r.at)
+    r.at = r.at + 1
+    return v
+}
+
+get_u16(r: *Reader) -> int {
+    lo = get_u8(r)
+    hi = get_u8(r)
+    return lo + hi * 256
+}
+
+get_f32(r: *Reader) -> float {
+    if r.at + 4 > r.length { r.ok = false ; return 0.0 }
+    v = mem.get_float32(r.data, r.at)
+    r.at = r.at + 4
+    return v
+}
+
+// Three 32-bit floats, read in order (a call's arguments are not).
+get_vec3(r: *Reader) -> Vec3 {
+    x = get_f32(r)
+    y = get_f32(r)
+    z = get_f32(r)
+    return core.vec3(x, y, z)
+}
+
+get_varint(r: *Reader) -> long {
+    value = 0 as long
+    scale = 1 as long
+    k = 0
+    while k < 10 {
+        octet = get_u8(r)
+        if !r.ok { return 0 as long }
+        value = value + ((octet % 128) as long) * scale
+        if octet < 128 { return value }
+        scale = scale * (128 as long)
+        k = k + 1
+    }
+    r.ok = false
+    return 0 as long
+}
+
+get_signed(r: *Reader) -> int {
+    v = get_varint(r)
+    if v % (2 as long) == (0 as long) { return (v / (2 as long)) as int }
+    return ((0 as long) - (v + (1 as long)) / (2 as long)) as int
+}
+
+// A unit quaternion in 47 bits: the index of its largest component (2
+// bits) and the other three, its sign made positive, in 15 bits each.
+put_rotation(w: *Writer, q: Quat) {
+    c = [q.x, q.y, q.z, q.w]
+    big = 0
+    k = 1
+    while k < 4 {
+        if core.abs_of(c[k]) > core.abs_of(c[big]) { big = k }
+        k = k + 1
+    }
+    sign = 1.0
+    if c[big] < 0.0 { sign = 0.0 - 1.0 }
+    k = 0
+    n = 0
+    while k < 4 {
+        if k != big {
+            v = steps(c[k] * sign / HALF_ROOT_TWO, ROTATION_STEPS) + 16384
+            if v < 0 { v = 0 }
+            if v > 32767 { v = 32767 }
+            top = 0
+            if n == 0 { top = (big % 2) * 32768 }
+            if n == 1 { top = (big / 2) * 32768 }
+            put_u16(w, v + top)
+            n = n + 1
+        }
+        k = k + 1
+    }
+}
+
+get_rotation(r: *Reader) -> Quat {
+    a = get_u16(r)
+    b = get_u16(r)
+    d = get_u16(r)
+    big = a / 32768 + (b / 32768) * 2
+    small = [((a % 32768) - 16384) as float, ((b % 32768) - 16384) as float, ((d % 32768) - 16384) as float]
+    c = [0.0, 0.0, 0.0, 0.0]
+    sum = 0.0
+    n = 0
+    k = 0
+    while k < 4 {
+        if k != big {
+            c[k] = small[n] / ROTATION_STEPS * HALF_ROOT_TWO
+            sum = sum + c[k] * c[k]
+            n = n + 1
+        }
+        k = k + 1
+    }
+    rest = 1.0 - sum
+    if rest < 0.0 { rest = 0.0 }
+    c[big] = core.sqrt_of(rest)
+    return core.quat_normalize(Quat { x: c[0], y: c[1], z: c[2], w: c[3] })
+}
+
+// --- asking: the owner's side ---------------------------------------------------------------------
+
+// What `f` is asked this tick, as character.move: quantised, taken by the
+// owner's character at once, and streamed.
+move(f: *NetFigure, velocity: Vec3, facing: Vec3) {
+    if f == null || !f.local { return }
+    i = f.asking as int[]
+    i[I_VX] = steps(velocity.x, VELOCITY_STEPS)
+    i[I_VZ] = steps(velocity.z, VELOCITY_STEPS)
+    i[I_FX] = steps(facing.x, FACING_STEPS)
+    i[I_FZ] = steps(facing.z, FACING_STEPS)
+    take_move(f, i)
+}
+
+look(f: *NetFigure, point: Vec3) {
+    if f == null || !f.local { return }
+    i = f.asking as int[]
+    i[I_LOOK] = LOOK_AT
+    i[I_LX] = steps(point.x, POINT_STEPS)
+    i[I_LY] = steps(point.y, POINT_STEPS)
+    i[I_LZ] = steps(point.z, POINT_STEPS)
+    take_look(f, i)
+}
+
+look_ahead(f: *NetFigure) {
+    if f == null || !f.local { return }
+    i = f.asking as int[]
+    i[I_LOOK] = LOOK_AHEAD
+    i[I_LX] = 0
+    i[I_LY] = 0
+    i[I_LZ] = 0
+    take_look(f, i)
+}
+
+look_free(f: *NetFigure) {
+    if f == null || !f.local { return }
+    i = f.asking as int[]
+    i[I_LOOK] = LOOK_FREE
+    i[I_LX] = 0
+    i[I_LY] = 0
+    i[I_LZ] = 0
+    take_look(f, i)
+}
+
+aim(f: *NetFigure, target: Vec3) {
+    if f == null || !f.local { return }
+    i = f.asking as int[]
+    i[I_AIM] = 1
+    i[I_AX] = steps(target.x, POINT_STEPS)
+    i[I_AY] = steps(target.y, POINT_STEPS)
+    i[I_AZ] = steps(target.z, POINT_STEPS)
+    take_aim(f, i)
+}
+
+aim_off(f: *NetFigure) {
+    if f == null || !f.local { return }
+    i = f.asking as int[]
+    i[I_AIM] = 0
+    i[I_AX] = 0
+    i[I_AY] = 0
+    i[I_AZ] = 0
+    take_aim(f, i)
+}
+
+// A blow, as character.hit: `body` physanim's index (physanim.bone_named),
+// the point and impulse as 32-bit floats.
+hit(f: *NetFigure, body: int, point: Vec3, impulse: Vec3) -> bool {
+    if f == null || !f.local { return false }
+    na = f.owner as *NetAnim
+    ev = new_event(f, EV_HIT, na.building)
+    ev.body = body
+    ev.a = f32v(na, point)
+    ev.b = f32v(na, impulse)
+    return take_event(f, ev)
+}
+
+// Knocked down: the character paused, its ragdoll let go LIMP to
+// ae3d.motion and `impulse` put on body `body` where it is.
+knock(f: *NetFigure, body: int, impulse: Vec3) -> bool {
+    if f == null || !f.local || f.motion != null { return false }
+    na = f.owner as *NetAnim
+    ev = new_event(f, EV_KNOCK, na.building)
+    ev.body = body
+    ev.b = f32v(na, impulse)
+    return take_event(f, ev)
+}
+
+// Up from where it lies (character.get_up), eased in over `blend`.
+get_up(f: *NetFigure, blend: float) -> bool {
+    if f == null || !f.local || f.motion == null { return false }
+    na = f.owner as *NetAnim
+    ev = new_event(f, EV_GET_UP, na.building)
+    ev.value = f32(na, blend)
+    return take_event(f, ev)
+}
+
+// Graph state `state` played once (character.act).
+act(f: *NetFigure, state: int, blend: float) -> bool {
+    if f == null || !f.local { return false }
+    na = f.owner as *NetAnim
+    ev = new_event(f, EV_ACT, na.building)
+    ev.state = state
+    ev.value = f32(na, blend)
+    return take_event(f, ev)
+}
+
+// Whether it lies knocked down, and whether its body has come to rest.
+knocked(f: *NetFigure) -> bool { return f != null && f.motion != null }
+down(f: *NetFigure) -> bool { return f != null && f.motion != null && motion.down(f.motion as *Motion) }
+
+new_event(f: *NetFigure, kind: int, at: int) -> *AnimEvent {
+    ev = calloc(1, sizeof(AnimEvent)) as *AnimEvent
+    ev.kind = kind
+    ev.tick = at
+    ev.seq = f.next_seq
+    f.next_seq = f.next_seq + 1
+    list.add_raw(f.events, ev as ptr)
+    return ev
+}
+
+take_event(f: *NetFigure, ev: *AnimEvent) -> bool {
+    ev.done = true
+    return apply_event(f, ev)
+}
+
+// --- taking: both sides ---------------------------------------------------------------------------
+
+take_move(f: *NetFigure, i: int[]) {
+    c = f.character as *Character
+    v = core.vec3((i[I_VX] as float) / VELOCITY_STEPS, 0.0, (i[I_VZ] as float) / VELOCITY_STEPS)
+    w = core.vec3((i[I_FX] as float) / FACING_STEPS, 0.0, (i[I_FZ] as float) / FACING_STEPS)
+    character.move(c, v, w)
+}
+
+take_look(f: *NetFigure, i: int[]) {
+    c = f.character as *Character
+    if i[I_LOOK] == LOOK_AT {
+        character.look(c, core.vec3((i[I_LX] as float) / POINT_STEPS, (i[I_LY] as float) / POINT_STEPS, (i[I_LZ] as float) / POINT_STEPS))
+    } else if i[I_LOOK] == LOOK_FREE {
+        character.look_free(c)
+    } else {
+        character.look_ahead(c)
+    }
+}
+
+take_aim(f: *NetFigure, i: int[]) {
+    c = f.character as *Character
+    if i[I_AIM] == 1 {
+        character.aim(c, core.vec3((i[I_AX] as float) / POINT_STEPS, (i[I_AY] as float) / POINT_STEPS, (i[I_AZ] as float) / POINT_STEPS))
+    } else {
+        character.aim_off(c)
+    }
+}
+
+apply_event(f: *NetFigure, ev: *AnimEvent) -> bool {
+    c = f.character as *Character
+    if ev.kind == EV_HIT {
+        return character.hit(c, physics.humanoid_bone(ev.body), ev.a, ev.b)
+    }
+    if ev.kind == EV_KNOCK {
+        if f.motion != null || !character.physical(c) { return false }
+        pa = character.physanim_of(c)
+        character.pause(c)
+        animator.pause(character.animator_of(c))
+        physanim.release(pa)
+        rag = physanim.ragdoll_of(pa)
+        m = motion.active_ragdoll(rag)
+        if m == null { return false }
+        motion.attach(f.engine as *Engine, m)
+        motion.set_mode(m, motion.LIMP)
+        at = behaviour.object_position(physics.ragdoll_bone(rag, ev.body))
+        physics.ragdoll_apply_impulse(rag, ev.body, ev.b, at)
+        f.motion = m as ptr
+        return true
+    }
+    if ev.kind == EV_GET_UP {
+        if f.motion == null { return false }
+        state = character.get_up(c, f.motion as *Motion, ev.value)
+        f.motion = null
+        return state >= 0
+    }
+    if ev.kind == EV_ACT {
+        return character.act(c, ev.state, ev.value)
+    }
+    return false
+}
+
+// --- the owner's tick ------------------------------------------------------------------------------
+
+// The owner's tick closed, after its engine stepped it: its inputs kept,
+// and every SEND_EVERY ticks a block streamed to every peer.
+sent(na: *NetAnim, now: float) {
+    if na == null { return }
+    t = na.building
+    slot = t % RING
+    i = 0
+    while i < list.size(na.figures) {
+        f = list.get_raw(na.figures, i) as *NetFigure
+        if f.local {
+            k = 0
+            while k < INPUT {
+                (f.ring as int[])[slot * INPUT + k] = (f.asking as int[])[k]
+                k = k + 1
+            }
+            (f.have as int[])[slot] = t + 1
+            forget_events(f, t)
+        }
+        i = i + 1
+    }
+    if (t + 1) % na.send_every == 0 { stream(na, t, now) }
+    na.building = t + 1
+}
+
+// Events past carrying, let go of: the owner's once no block carries them;
+// a peer's, taken, once no block could (and none numbered below the newest
+// let go of is taken again, as a block that came very late carries it).
+forget_events(f: *NetFigure, t: int) {
+    k = 0
+    while k < list.size(f.events) {
+        ev = list.get_raw(f.events, k) as *AnimEvent
+        if ev.tick + EVENT_CARRY < t && (f.local || ev.done) {
+            if ev.seq + 1 > f.forgot { f.forgot = ev.seq + 1 }
+            free(ev as ptr)
+            list.remove(f.events, k)
+        } else {
+            k = k + 1
+        }
+    }
+}
+
+// The block for tick `t`: [u16 t's low bits][u8 figures], then a figure
+// each: [u8 index][u8 ticks carried][u8 runs], each run [u8 ticks][u8 mask]
+// and its groups' changes as zigzag varints; [u8 events], each [varint
+// seq][u8 ticks before t][u8 kind] and its numbers; [u8 flags], the state
+// (HAS_STATE) and the ragdoll (HAS_RAGDOLL) that follow.
+stream(na: *NetAnim, t: int, now: float) {
+    w = Writer { data: na.block, at: 0 }
+    put_u16(&w, t % 65536)
+    owned = 0
+    i = 0
+    while i < list.size(na.figures) {
+        if (list.get_raw(na.figures, i) as *NetFigure).local { owned = owned + 1 }
+        i = i + 1
+    }
+    if owned == 0 { return }
+    put_u8(&w, owned)
+    i = 0
+    while i < list.size(na.figures) {
+        f = list.get_raw(na.figures, i) as *NetFigure
+        if f.local { put_figure(na, &w, f, t) }
+        i = i + 1
+    }
+    if w.at >= BLOCK { return }
+    if net.send_stream(na.session, "anim.stream", net.EVERYONE, now, na.block, w.at) { na.blocks_sent = na.blocks_sent + 1 }
+}
+
+put_figure(na: *NetAnim, w: *Writer, f: *NetFigure, t: int) {
+    put_u8(w, f.index)
+    first = t - na.carry + 1
+    if first < 0 { first = 0 }
+    put_u8(w, t - first + 1)
+    // The runs: counted first, then written.
+    runs = 0
+    k = first
+    while k <= t {
+        if k == first || !same_input(f, k, k - 1) { runs = runs + 1 }
+        k = k + 1
+    }
+    put_u8(w, runs)
+    prev = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    k = first
+    while k <= t {
+        length = 1
+        while k + length <= t && same_input(f, k + length, k) { length = length + 1 }
+        put_u8(w, length)
+        at = (k % RING) * INPUT
+        now_i = f.ring as int[]
+        mask = 0
+        if now_i[at + I_VX] != prev[I_VX] { mask = mask + M_VX }
+        if now_i[at + I_VZ] != prev[I_VZ] { mask = mask + M_VZ }
+        if now_i[at + I_FX] != prev[I_FX] { mask = mask + M_FX }
+        if now_i[at + I_FZ] != prev[I_FZ] { mask = mask + M_FZ }
+        if now_i[at + I_LOOK] != prev[I_LOOK] || now_i[at + I_LX] != prev[I_LX] || now_i[at + I_LY] != prev[I_LY] || now_i[at + I_LZ] != prev[I_LZ] { mask = mask + M_LOOK }
+        if now_i[at + I_AIM] != prev[I_AIM] || now_i[at + I_AX] != prev[I_AX] || now_i[at + I_AY] != prev[I_AY] || now_i[at + I_AZ] != prev[I_AZ] { mask = mask + M_AIM }
+        put_u8(w, mask)
+        if (mask & M_VX) != 0 { put_signed(w, now_i[at + I_VX] - prev[I_VX]) }
+        if (mask & M_VZ) != 0 { put_signed(w, now_i[at + I_VZ] - prev[I_VZ]) }
+        if (mask & M_FX) != 0 { put_signed(w, now_i[at + I_FX] - prev[I_FX]) }
+        if (mask & M_FZ) != 0 { put_signed(w, now_i[at + I_FZ] - prev[I_FZ]) }
+        if (mask & M_LOOK) != 0 {
+            put_u8(w, now_i[at + I_LOOK])
+            put_signed(w, now_i[at + I_LX] - prev[I_LX])
+            put_signed(w, now_i[at + I_LY] - prev[I_LY])
+            put_signed(w, now_i[at + I_LZ] - prev[I_LZ])
+        }
+        if (mask & M_AIM) != 0 {
+            put_u8(w, now_i[at + I_AIM])
+            put_signed(w, now_i[at + I_AX] - prev[I_AX])
+            put_signed(w, now_i[at + I_AY] - prev[I_AY])
+            put_signed(w, now_i[at + I_AZ] - prev[I_AZ])
+        }
+        j = 0
+        while j < INPUT {
+            prev[j] = now_i[at + j]
+            j = j + 1
+        }
+        k = k + length
+    }
+    // The events of the last EVENT_CARRY ticks.
+    count = 0
+    k = 0
+    while k < list.size(f.events) {
+        ev = list.get_raw(f.events, k) as *AnimEvent
+        if ev.tick <= t && t - ev.tick <= EVENT_CARRY { count = count + 1 }
+        k = k + 1
+    }
+    put_u8(w, count)
+    k = 0
+    while k < list.size(f.events) {
+        ev = list.get_raw(f.events, k) as *AnimEvent
+        if ev.tick <= t && t - ev.tick <= EVENT_CARRY {
+            put_varint(w, ev.seq as long)
+            put_u8(w, t - ev.tick)
+            put_u8(w, ev.kind)
+            if ev.kind == EV_HIT {
+                put_u8(w, ev.body)
+                put_f32(w, ev.a.x)
+                put_f32(w, ev.a.y)
+                put_f32(w, ev.a.z)
+                put_f32(w, ev.b.x)
+                put_f32(w, ev.b.y)
+                put_f32(w, ev.b.z)
+            } else if ev.kind == EV_KNOCK {
+                put_u8(w, ev.body)
+                put_f32(w, ev.b.x)
+                put_f32(w, ev.b.y)
+                put_f32(w, ev.b.z)
+            } else if ev.kind == EV_GET_UP {
+                put_f32(w, ev.value)
+            } else {
+                put_varint(w, ev.state as long)
+                put_f32(w, ev.value)
+            }
+        }
+        k = k + 1
+    }
+    flags = 0
+    if (t + 1) % na.state_every == 0 { flags = flags + HAS_STATE }
+    if f.motion != null && (t + 1) % na.ragdoll_every == 0 { flags = flags + HAS_RAGDOLL }
+    put_u8(w, flags)
+    if (flags & HAS_STATE) != 0 { put_state(w, f) }
+    if (flags & HAS_RAGDOLL) != 0 { put_ragdoll(w, f) }
+}
+
+same_input(f: *NetFigure, a: int, b: int) -> bool {
+    r = f.ring as int[]
+    x = (a % RING) * INPUT
+    y = (b % RING) * INPUT
+    k = 0
+    while k < INPUT {
+        if r[x + k] != r[y + k] { return false }
+        k = k + 1
+    }
+    return true
+}
+
+// The figure's state now, as STATE numbers in steps.
+state_now(f: *NetFigure, out: float[]) {
+    c = f.character as *Character
+    o = character.object_of(c)
+    m = character.mover_of(c)
+    a = character.animator_of(c)
+    p = behaviour.object_position(o)
+    v = mover.velocity(m)
+    out[0] = p.x
+    out[1] = p.y
+    out[2] = p.z
+    out[3] = v.x
+    out[4] = v.z
+    out[5] = mover.facing_of(m)
+    out[6] = animator.current(a) as float
+    out[7] = animator.state_time(a)
+}
+
+wrap_turn(x: float) -> float {
+    y = x
+    while y > PI { y = y - 2.0 * PI }
+    while y < 0.0 - PI { y = y + 2.0 * PI }
+    return y
+}
+
+put_state(w: *Writer, f: *NetFigure) {
+    s = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    state_now(f, s)
+    put_signed(w, steps(s[0], PLACE_STEPS))
+    put_signed(w, steps(s[1], PLACE_STEPS))
+    put_signed(w, steps(s[2], PLACE_STEPS))
+    put_signed(w, steps(s[3], VELOCITY_STEPS))
+    put_signed(w, steps(s[4], VELOCITY_STEPS))
+    put_u16(w, (steps(wrap_turn(s[5]) / (2.0 * PI), TURN_STEPS) + 65536) % 65536)
+    put_varint(w, (s[6] as int) as long)
+    put_varint(w, (steps(s[7], TIME_STEPS)) as long)
+}
+
+put_ragdoll(w: *Writer, f: *NetFigure) {
+    rag = physanim.ragdoll_of(character.physanim_of(f.character as *Character))
+    count = physics.ragdoll_bone_count(rag)
+    if count > RAG_MOST { count = RAG_MOST }
+    put_u8(w, count)
+    base = behaviour.object_position(physics.ragdoll_bone(rag, 0))
+    put_signed(w, steps(base.x, PLACE_STEPS))
+    put_signed(w, steps(base.y, PLACE_STEPS))
+    put_signed(w, steps(base.z, PLACE_STEPS))
+    bx = (steps(base.x, PLACE_STEPS) as float) / PLACE_STEPS
+    by = (steps(base.y, PLACE_STEPS) as float) / PLACE_STEPS
+    bz = (steps(base.z, PLACE_STEPS) as float) / PLACE_STEPS
+    k = 0
+    while k < count {
+        b = physics.ragdoll_bone(rag, k)
+        p = behaviour.object_position(b)
+        if k > 0 {
+            put_signed(w, steps(p.x - bx, PLACE_STEPS))
+            put_signed(w, steps(p.y - by, PLACE_STEPS))
+            put_signed(w, steps(p.z - bz, PLACE_STEPS))
+        }
+        put_rotation(w, behaviour.object_rotation(b))
+        k = k + 1
+    }
+}
+
+// --- a peer's side ---------------------------------------------------------------------------------
+
+on_stream(context: ptr, call: *NetCall) {
+    na = context as *NetAnim
+    r = Reader { data: call.data, length: call.length, at: 0, ok: true }
+    low = get_u16(&r)
+    figures = get_u8(&r)
+    if !r.ok { return }
+    // The tick its low bits name, nearest the newest heard of.
+    t = low
+    if na.newest >= 0 {
+        t = (na.newest / 65536) * 65536 + low
+        if t - na.newest > 32768 { t = t - 65536 }
+        if na.newest - t > 32768 { t = t + 65536 }
+    }
+    if t < 0 { return }
+    na.blocks_received = na.blocks_received + 1
+    if t > na.newest { na.newest = t }
+    since = call.now - (t as float) * STEP
+    if !na.heard || since < na.offset { na.offset = since }
+    na.heard = true
+    k = 0
+    while k < figures && r.ok {
+        index = get_u8(&r)
+        if !r.ok || index >= list.size(na.figures) { return }
+        f = list.get_raw(na.figures, index) as *NetFigure
+        if f.local { return }
+        take_figure(na, &r, f, t)
+        k = k + 1
+    }
+}
+
+take_figure(na: *NetAnim, r: *Reader, f: *NetFigure, t: int) {
+    carried = get_u8(r)
+    runs = get_u8(r)
+    first = t - carried + 1
+    v = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    at = first
+    n = 0
+    while n < runs && r.ok {
+        length = get_u8(r)
+        mask = get_u8(r)
+        if (mask & M_VX) != 0 { v[I_VX] = v[I_VX] + get_signed(r) }
+        if (mask & M_VZ) != 0 { v[I_VZ] = v[I_VZ] + get_signed(r) }
+        if (mask & M_FX) != 0 { v[I_FX] = v[I_FX] + get_signed(r) }
+        if (mask & M_FZ) != 0 { v[I_FZ] = v[I_FZ] + get_signed(r) }
+        if (mask & M_LOOK) != 0 {
+            v[I_LOOK] = get_u8(r)
+            v[I_LX] = v[I_LX] + get_signed(r)
+            v[I_LY] = v[I_LY] + get_signed(r)
+            v[I_LZ] = v[I_LZ] + get_signed(r)
+        }
+        if (mask & M_AIM) != 0 {
+            v[I_AIM] = get_u8(r)
+            v[I_AX] = v[I_AX] + get_signed(r)
+            v[I_AY] = v[I_AY] + get_signed(r)
+            v[I_AZ] = v[I_AZ] + get_signed(r)
+        }
+        if !r.ok { return }
+        j = 0
+        while j < length {
+            tk = at + j
+            // Kept where it is still to be played, and not already held.
+            if tk > na.playing && tk >= 0 && !(tk >= f.blind_from && tk <= f.blind_to) && (f.have as int[])[tk % RING] != tk + 1 {
+                slot = (tk % RING) * INPUT
+                q = 0
+                while q < INPUT {
+                    (f.ring as int[])[slot + q] = v[q]
+                    q = q + 1
+                }
+                (f.have as int[])[tk % RING] = tk + 1
+            }
+            j = j + 1
+        }
+        at = at + length
+        n = n + 1
+    }
+    events = get_u8(r)
+    e = 0
+    while e < events && r.ok {
+        seq = (get_varint(r)) as int
+        back = get_u8(r)
+        kind = get_u8(r)
+        ev = AnimEvent { tick: t - back, seq: seq, kind: kind, body: 0, a: core.vec3(0.0, 0.0, 0.0), b: core.vec3(0.0, 0.0, 0.0), value: 0.0, state: 0, done: false }
+        if kind == EV_HIT {
+            ev.body = get_u8(r)
+            ev.a = get_vec3(r)
+            ev.b = get_vec3(r)
+        } else if kind == EV_KNOCK {
+            ev.body = get_u8(r)
+            ev.b = get_vec3(r)
+        } else if kind == EV_GET_UP {
+            ev.value = get_f32(r)
+        } else {
+            ev.state = (get_varint(r)) as int
+            ev.value = get_f32(r)
+        }
+        if r.ok && seq >= f.forgot && !event_known(f, seq) {
+            kept = calloc(1, sizeof(AnimEvent)) as *AnimEvent
+            kept.tick = ev.tick
+            kept.seq = ev.seq
+            kept.kind = ev.kind
+            kept.body = ev.body
+            kept.a = ev.a
+            kept.b = ev.b
+            kept.value = ev.value
+            kept.state = ev.state
+            list.add_raw(f.events, kept as ptr)
+        }
+        e = e + 1
+    }
+    flags = get_u8(r)
+    if (flags & HAS_STATE) != 0 { take_state(r, f, t) }
+    if (flags & HAS_RAGDOLL) != 0 { take_ragdoll(r, f, t) }
+}
+
+event_known(f: *NetFigure, seq: int) -> bool {
+    k = 0
+    while k < list.size(f.events) {
+        if (list.get_raw(f.events, k) as *AnimEvent).seq == seq { return true }
+        k = k + 1
+    }
+    return false
+}
+
+take_state(r: *Reader, f: *NetFigure, t: int) {
+    x = (get_signed(r) as float) / PLACE_STEPS
+    y = (get_signed(r) as float) / PLACE_STEPS
+    z = (get_signed(r) as float) / PLACE_STEPS
+    vx = (get_signed(r) as float) / VELOCITY_STEPS
+    vz = (get_signed(r) as float) / VELOCITY_STEPS
+    turn = (get_u16(r) as float) / TURN_STEPS * 2.0 * PI
+    state = (get_varint(r)) as int
+    time = ((get_varint(r)) as float) / TIME_STEPS
+    if !r.ok { return }
+    s = f.states as float[]
+    at = (t % STATES) * (STATE + 1)
+    s[at] = t as float
+    s[at + 1] = x
+    s[at + 2] = y
+    s[at + 3] = z
+    s[at + 4] = vx
+    s[at + 5] = vz
+    s[at + 6] = turn
+    s[at + 7] = state as float
+    s[at + 8] = time
+}
+
+take_ragdoll(r: *Reader, f: *NetFigure, t: int) {
+    count = get_u8(r)
+    if count > RAG_MOST { r.ok = false ; return }
+    bx = (get_signed(r) as float) / PLACE_STEPS
+    by = (get_signed(r) as float) / PLACE_STEPS
+    bz = (get_signed(r) as float) / PLACE_STEPS
+    g = f.ragdolls as float[]
+    at = (t % STATES) * (2 + RAG_MOST * 7)
+    k = 0
+    while k < count && r.ok {
+        p = core.vec3(bx, by, bz)
+        if k > 0 {
+            dx = (get_signed(r) as float) / PLACE_STEPS
+            dy = (get_signed(r) as float) / PLACE_STEPS
+            dz = (get_signed(r) as float) / PLACE_STEPS
+            p = core.vec3(bx + dx, by + dy, bz + dz)
+        }
+        q = get_rotation(r)
+        b = at + 2 + k * 7
+        g[b] = p.x
+        g[b + 1] = p.y
+        g[b + 2] = p.z
+        g[b + 3] = q.x
+        g[b + 4] = q.y
+        g[b + 5] = q.z
+        g[b + 6] = q.w
+        k = k + 1
+    }
+    if !r.ok { return }
+    g[at] = t as float
+    g[at + 1] = count as float
+}
+
+// Whether a peer's next tick is due at `now`: the owner's time of it, by
+// the link's fastest way, and the buffer, have passed.
+due(na: *NetAnim, now: float) -> bool {
+    if na == null || !na.heard { return false }
+    return ((na.playing + 1) as float) * STEP + na.offset + na.buffer <= now
+}
+
+// The next tick handed to every peer's figure: its inputs (the last ones
+// again where they have not come, counted) and the events stamped with it,
+// and any that came after their tick was played (late, counted). Returns
+// the tick; the engine steps it next.
+play(na: *NetAnim) -> int {
+    t = na.playing + 1
+    i = 0
+    while i < list.size(na.figures) {
+        f = list.get_raw(na.figures, i) as *NetFigure
+        if !f.local { play_figure(na, f, t) }
+        i = i + 1
+    }
+    na.playing = t
+    return t
+}
+
+play_figure(na: *NetAnim, f: *NetFigure, t: int) {
+    last = f.last as int[]
+    if (f.have as int[])[t % RING] == t + 1 {
+        at = (t % RING) * INPUT
+        k = 0
+        while k < INPUT {
+            last[k] = (f.ring as int[])[at + k]
+            k = k + 1
+        }
+    } else {
+        f.missed = f.missed + 1
+    }
+    take_move(f, last)
+    take_look(f, last)
+    take_aim(f, last)
+    // Its events, in the order they were made.
+    more = true
+    while more {
+        more = false
+        best = 0 - 1
+        k = 0
+        while k < list.size(f.events) {
+            ev = list.get_raw(f.events, k) as *AnimEvent
+            if !ev.done && ev.tick <= t && (best < 0 || ev.seq < (list.get_raw(f.events, best) as *AnimEvent).seq) { best = k }
+            k = k + 1
+        }
+        if best >= 0 {
+            ev = list.get_raw(f.events, best) as *AnimEvent
+            if ev.tick < t { f.late = f.late + 1 }
+            ev.done = true
+            _taken = apply_event(f, ev)
+            more = true
+        }
+    }
+    // The correction still to ease in, a share of it this tick, and no
+    // faster than CORRECT_MOST.
+    share = 1.0 - exp(0.0 - STEP * 0.6931471805599453 / CORRECT_HALF_LIFE)
+    c = f.character as *Character
+    if core.v3_len(f.left) > 0.0 {
+        move_by = core.v3_mul(f.left, share)
+        most = CORRECT_MOST * STEP
+        if core.v3_len(move_by) > most { move_by = core.v3_mul(move_by, most / core.v3_len(move_by)) }
+        if core.v3_len(f.left) < 0.0001 { move_by = f.left }
+        o = character.object_of(c)
+        if f.motion == null { behaviour.object_set_position(o, core.v3_add(behaviour.object_position(o), move_by)) }
+        f.left = core.v3_sub(f.left, move_by)
+    }
+    if f.left_turn != 0.0 {
+        turn_by = f.left_turn * share
+        if core.abs_of(f.left_turn) < 0.0001 { turn_by = f.left_turn }
+        m = character.mover_of(c)
+        if f.motion == null { mover.correct(m, mover.velocity(m), mover.facing_of(m) + turn_by) }
+        f.left_turn = f.left_turn - turn_by
+    }
+}
+
+// A peer's tick closed, after its engine stepped it: its figures' states
+// kept, and held to the owner's where one came for the tick: the place,
+// the facing and the graph's state compared, and a place off by more than
+// CORRECT_ABOVE eased back; and a downed figure's bodies against the
+// owner's.
+played(na: *NetAnim) {
+    t = na.playing
+    if t < 0 { return }
+    i = 0
+    while i < list.size(na.figures) {
+        f = list.get_raw(na.figures, i) as *NetFigure
+        if !f.local {
+            s = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            state_now(f, s)
+            h = f.history as float[]
+            at = (t % RING) * HIST
+            k = 0
+            while k < STATE {
+                h[at + k] = s[k]
+                k = k + 1
+            }
+            hold_state(f, t)
+            hold_ragdoll(f, t)
+            forget_events(f, t)
+        }
+        i = i + 1
+    }
+}
+
+// The owner's states for ticks played, against this side's history.
+hold_state(f: *NetFigure, t: int) {
+    s = f.states as float[]
+    h = f.history as float[]
+    k = 0
+    while k < STATES {
+        at = k * (STATE + 1)
+        st = s[at] as int
+        if s[at] >= 0.0 && st <= t && t - st < RING {
+            ha = (st % RING) * HIST
+            off = core.vec3(s[at + 1] - h[ha], s[at + 2] - h[ha + 1], s[at + 3] - h[ha + 2])
+            place = core.v3_len(off)
+            turn = core.abs_of(wrap_turn(s[at + 6] - h[ha + 5]))
+            f.checks = f.checks + 1
+            if place > f.worst_place { f.worst_place = place }
+            if turn > f.worst_facing { f.worst_facing = turn }
+            other = (s[at + 7] as int) != (h[ha + 6] as int)
+            if other { f.parted = f.parted + 1 }
+            late = core.abs_of(s[at + 8] - h[ha + 7])
+            // Parted, and its own (not down, nor playing an act): put back
+            // on the owner's. Its place and facing eased in from the next
+            // tick; its springs' velocity taken now; its graph, where it is
+            // in another state or another time in it, played there,
+            // inertialized from what it draws.
+            c = f.character as *Character
+            if st == t && (place > CORRECT_ABOVE || turn > CORRECT_TURN || other || late > CORRECT_TIME) && f.motion == null && !character.acting(c) && !character.paused(c) {
+                f.left = off
+                f.left_turn = wrap_turn(s[at + 6] - h[ha + 5])
+                m = character.mover_of(c)
+                mover.correct(m, core.vec3(s[at + 4], 0.0, s[at + 5]), mover.facing_of(m))
+                if other || late > CORRECT_TIME { animator.play_at(character.animator_of(c), s[at + 7] as int, s[at + 8], CORRECT_BLEND) }
+                f.corrections = f.corrections + 1
+            }
+            s[at] = 0.0 - 1.0
+        }
+        k = k + 1
+    }
+}
+
+hold_ragdoll(f: *NetFigure, t: int) {
+    g = f.ragdolls as float[]
+    k = 0
+    while k < STATES {
+        at = k * (2 + RAG_MOST * 7)
+        if g[at] >= 0.0 && (g[at] as int) == t {
+            if f.motion != null {
+                rag = physanim.ragdoll_of(character.physanim_of(f.character as *Character))
+                count = g[at + 1] as int
+                if count > physics.ragdoll_bone_count(rag) { count = physics.ragdoll_bone_count(rag) }
+                b = 0
+                while b < count {
+                    p = behaviour.object_position(physics.ragdoll_bone(rag, b))
+                    x = at + 2 + b * 7
+                    d = core.v3_len(core.v3_sub(p, core.vec3(g[x], g[x + 1], g[x + 2])))
+                    if d > f.worst_rag { f.worst_rag = d }
+                    b = b + 1
+                }
+                f.rag_checks = f.rag_checks + 1
+            }
+            g[at] = 0.0 - 1.0
+        } else if g[at] >= 0.0 && (g[at] as int) < t - RING {
+            g[at] = 0.0 - 1.0
+        }
+        k = k + 1
+    }
+}
+
+// --- what it did -----------------------------------------------------------------------------------
+
+blocks_sent(na: *NetAnim) -> int { return na.blocks_sent }
+blocks_received(na: *NetAnim) -> int { return na.blocks_received }
+// Ticks a peer's figure played before their inputs came (extrapolated).
+ticks_missed(f: *NetFigure) -> int { return f.missed }
+// Events that came after the tick they were stamped with had been played.
+events_late(f: *NetFigure) -> int { return f.late }
+corrections(f: *NetFigure) -> int { return f.corrections }
+correction_left(f: *NetFigure) -> float { return core.v3_len(f.left) }
+// States compared, and those whose graph state differed from this side's.
+state_checks(f: *NetFigure) -> int { return f.checks }
+states_parted(f: *NetFigure) -> int { return f.parted }
+// The most this side's figure was off the owner's states: metres, radians.
+worst_place(f: *NetFigure) -> float { return f.worst_place }
+worst_facing(f: *NetFigure) -> float { return f.worst_facing }
+ragdoll_checks(f: *NetFigure) -> int { return f.rag_checks }
+worst_ragdoll(f: *NetFigure) -> float { return f.worst_rag }

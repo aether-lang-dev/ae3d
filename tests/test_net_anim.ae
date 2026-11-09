@@ -1,0 +1,656 @@
+// ci: optimised -- two characters stepped side by side through a 25 s script three times over, CPU work -O0 makes several times slower
+// Animation over the network (#911, ae3d.netanim): a figure's inputs and
+// events cross the wire, not its poses, and every peer evaluates the same
+// graph from them. The UE5 mannequin made a character (ae3d.character, on
+// 100STYLE's gaits) in a world with physics, once on a host and once on a
+// client, each in an engine of its own over a loopback hub on a virtual
+// clock (seeded: the same run every time). No window; stepped at 60 Hz.
+//
+// The script the host's figure is asked through: a stand, a walk, a run, a
+// turn (the way it walks swung half round), a stop with its eyes on a
+// point, a knockdown (the full ragdoll, a blow on the chest) and, once its
+// body has come to rest, a get-up (character.get_up), then a walk on and a
+// stand. The client's figure is asked nothing by its game: netanim plays it
+// from the stream, a tick behind the host's by the link and its buffer, and
+// each tick it plays is held to the host's at the same tick.
+//
+//   - bit for bit: over a link with no latency, jitter or loss (the same
+//     input stream, as soon as it can be), every joint of the client's
+//     figure, its object's place and turn, the same as the host's to the
+//     bit at every tick; the trail of their hashes, a line a tick, written
+//     to AE3D_ANIM_TRAIL where set, for another platform's to be compared
+//     with;
+//   - under 150 ms of latency, 30 ms of jitter and 5% loss, the client's
+//     feet and hands within 2 cm and 2 degrees of the host's at every tick
+//     of every part of the script, over seeds 1 to 3 of the hub (AE3D_SEED
+//     for one);
+//   - drift found and eased out: the client's inputs of a stretch of ticks
+//     around the walk's start taken as never come (every block carrying
+//     them lost), so it stands on where the host set off; the states
+//     streamed find it, and it is eased back onto the host's place (never
+//     snapped: no step of the easing over a centimetre), its object within
+//     2 mm of the host's and its graph in the host's state once caught up
+//     (its feet and hands printed: the feet's locks are not in the state,
+//     so a foot planted a tick apart from the host's shows for a step);
+//   - the bytes a figure streams a second, walking and over the whole
+//     script, printed, and the walk's held under 1 kB/s;
+//   - what a remote figure costs a frame: netanim's own work, and the
+//     figure's whole frame (its graph, mover, feet, physics), printed.
+
+import std.fs
+import std.os
+import std.string
+import std.strbuilder
+import std.mem
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.physics
+import ae3d.figure
+import ae3d.pose
+import ae3d.clips
+import ae3d.animator
+import ae3d.character
+import ae3d.physanim
+import ae3d.net
+import ae3d.netanim
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+const STEP = 0.016666666666666666
+const MANNEQUIN = "tests/fixtures/people/mannequin.glb"
+const GAITS = "tests/fixtures/people/100style/neutral"
+const STOP = "tests/fixtures/people/100style/neutral_arrive.bvh"
+const START = "tests/fixtures/people/100style/startstop_start.bvh"
+const GET_UP = "LayToIdle"
+
+// The script, by tick.
+const STAND_END = 60
+const WALK_END = 300                 // 4 s at 1.2 m/s
+const RUN_END = 480                  // 3 s at 3.5 m/s
+const TURN_END = 720                 // 4 s at 1.4 m/s, the way swung half round over the first 3
+const STOP_END = 840                 // 2 s stood, eyes on a point
+const DOWN_MOST = 600                // ticks it may lie before it is up
+const WALK_ON = 120
+const STAND_ON = 60
+const TICKS_MOST = 2400
+
+// The parts of the script, by what the figure does.
+const P_STAND = 0
+const P_WALK = 1
+const P_RUN = 2
+const P_TURN = 3
+const P_STOP = 4
+const P_DOWN = 5
+const P_GET_UP = 6
+const P_WALK_ON = 7
+const PARTS = 8
+
+// What is measured of a tick: the object's place (3) and turn (4), every
+// joint's local translation (3) and rotation (4), and the feet's and
+// hands' places (3) and turns (4) in the world.
+const ENDS = 4
+const BOUND_PLACE = 0.02             // metres
+const BOUND_TURN = 2.0               // degrees
+const LATENCY = 0.15
+const JITTER = 0.03
+const LOSS = 0.05
+const WALK_BYTES = 1000.0            // a walking figure's bytes a second at most
+const BLIND_FROM = 52                // the drift run: inputs of these ticks never come (a sixth of a second lost whole)
+const BLIND_TO = 62
+const EASE_STEP = 0.01               // metres an easing moves a figure a tick at most
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+part_name(p: int) -> string {
+    names = ["stand", "walk", "run", "turn", "stop", "down", "get-up", "walk on"]
+    return names[p]
+}
+
+// --- the world --------------------------------------------------------------------------------------
+
+world(g: *Gaits) -> (*Engine, *Character) {
+    e = engine.engine_new()
+    engine.engine_set_fixed_step(e, STEP)
+    physics.attach(e)
+    ground = engine.object(e, "Floor", null)
+    behaviour.object_set_position(ground, core.vec3(0.0, 0.0 - 0.5, 0.0))
+    physics.box_collider(ground, core.vec3(60.0, 0.5, 60.0), physics.material(0.8, 0.0))
+    c = character.humanoid(e, "Walker", MANNEQUIN, g)
+    if c != null {
+        _bodied = character.physical(c)
+        _got_up = character.get_up_add(c, GET_UP)
+    }
+    return e, c
+}
+
+world_free(e: *Engine, c: *Character) {
+    character.character_free(c)
+    physics.physics_free(physics.of(e))
+    figure.figures_free(e)
+    engine.engine_free(e)
+}
+
+// --- measuring --------------------------------------------------------------------------------------
+
+ends_slot(i: int) -> int {
+    slots = [pose.FOOT_L, pose.FOOT_R, pose.HAND_L, pose.HAND_R]
+    return slots[i]
+}
+
+record_size(r: *pose.Rig) -> int { return 7 + pose.count(r) * 7 + ENDS * 7 }
+
+// Character `c` as it is drawn now, into `out` from `at`; `p` and `w`
+// poses to work in.
+capture(c: *Character, p: ptr, w: ptr, out: float[], at: int) {
+    a = character.animator_of(c)
+    r = animator.rig(a)
+    o = character.object_of(c)
+    op = behaviour.object_position(o)
+    oq = behaviour.object_rotation(o)
+    out[at] = op.x
+    out[at + 1] = op.y
+    out[at + 2] = op.z
+    out[at + 3] = oq.x
+    out[at + 4] = oq.y
+    out[at + 5] = oq.z
+    out[at + 6] = oq.w
+    pose.read(r, p)
+    n = pose.count(r)
+    j = 0
+    while j < n {
+        t = pose.translation(p, j)
+        q = pose.rotation(p, j)
+        b = at + 7 + j * 7
+        out[b] = t.x
+        out[b + 1] = t.y
+        out[b + 2] = t.z
+        out[b + 3] = q.x
+        out[b + 4] = q.y
+        out[b + 5] = q.z
+        out[b + 6] = q.w
+        j = j + 1
+    }
+    pose.world(r, p, w)
+    k = 0
+    while k < ENDS {
+        joint = pose.human(r, ends_slot(k))
+        place = clips.ground_point(r, pose.translation(w, joint))
+        turn = core.quat_mul(oq, pose.rotation(w, joint))
+        b = at + 7 + n * 7 + k * 7
+        out[b] = place.x
+        out[b + 1] = place.y
+        out[b + 2] = place.z
+        out[b + 3] = turn.x
+        out[b + 4] = turn.y
+        out[b + 5] = turn.z
+        out[b + 6] = turn.w
+        k = k + 1
+    }
+}
+
+// FNV-1a over a record's 64-bit words.
+hash_of(x: float[], at: int, size: int) -> long {
+    h = 1469598103934665603 as long
+    k = 0
+    while k < size {
+        h = (h ^ mem.bits_of_float(x[at + k])) * (1099511628211 as long)
+        k = k + 1
+    }
+    return h
+}
+
+// --- the script -------------------------------------------------------------------------------------
+
+struct Script {
+    part: int
+    knocked_at: int
+    up_at: int
+    walk_from: int
+    ended: int                       // the last tick, once known; -1 before
+    failed: bool
+}
+
+// What the host's game asks of its figure at tick `t`, through netanim.
+ask(s: *Script, f: *NetFigure, t: int) {
+    c = netanim.character_of(f)
+    if t < STAND_END {
+        s.part = P_STAND
+        netanim.move(f, core.vec3(0.0, 0.0, 0.0), core.vec3(0.0, 0.0, 0.0))
+    } else if t < WALK_END {
+        s.part = P_WALK
+        netanim.move(f, core.vec3(0.0, 0.0, 1.2), core.vec3(0.0, 0.0, 0.0))
+    } else if t < RUN_END {
+        s.part = P_RUN
+        netanim.move(f, core.vec3(0.0, 0.0, 3.5), core.vec3(0.0, 0.0, 0.0))
+    } else if t < TURN_END {
+        s.part = P_TURN
+        swung = ((t - RUN_END) as float) / 180.0
+        if swung > 1.0 { swung = 1.0 }
+        way = swung * 3.141592653589793
+        netanim.move(f, core.vec3(1.4 * core.sin_of(way), 0.0, 1.4 * core.cos_of(way)), core.vec3(0.0, 0.0, 0.0))
+    } else if t < STOP_END {
+        s.part = P_STOP
+        netanim.move(f, core.vec3(0.0, 0.0, 0.0), core.vec3(0.0, 0.0, 0.0))
+        if t == TURN_END + 20 { netanim.look(f, core.vec3(3.0, 1.6, 2.0)) }
+        if t == STOP_END - 20 { netanim.look_ahead(f) }
+    } else if s.part == P_STOP {
+        s.part = P_DOWN
+        s.knocked_at = t
+        pa = character.physanim_of(c)
+        body = physanim.bone_named(pa, "Chest")
+        side = 1.0
+        if !netanim.knock(f, body, core.v3_mul(core.vec3(core.sin_of(side), 0.15, core.cos_of(side)), 80.0)) { s.failed = true }
+    } else if s.part == P_DOWN {
+        if t > s.knocked_at + 30 && netanim.down(f) {
+            s.part = P_GET_UP
+            s.up_at = t
+            if !netanim.get_up(f, 0.4) { s.failed = true }
+        } else if t > s.knocked_at + DOWN_MOST {
+            s.failed = true
+            s.ended = t
+        }
+    } else if s.part == P_GET_UP {
+        if !character.acting(c) {
+            s.part = P_WALK_ON
+            s.walk_from = t
+            netanim.move(f, core.vec3(0.0, 0.0, 1.2), core.vec3(0.0, 0.0, 0.0))
+        }
+    } else if s.part == P_WALK_ON {
+        if t < s.walk_from + WALK_ON {
+            netanim.move(f, core.vec3(0.0, 0.0, 1.2), core.vec3(0.0, 0.0, 0.0))
+        } else {
+            netanim.move(f, core.vec3(0.0, 0.0, 0.0), core.vec3(0.0, 0.0, 0.0))
+            if t >= s.walk_from + WALK_ON + STAND_ON { s.ended = t }
+        }
+    }
+    if t >= TICKS_MOST - 1 { s.ended = t }
+}
+
+// --- a run ------------------------------------------------------------------------------------------
+
+struct Run {
+    ticks: int                       // ticks the host played
+    played: int                      // ticks the client played and held to the host's
+    bitwise: int                     // of those, the same to the bit
+    first_apart: int                 // the first that was not; -1 none
+    place: ptr                       // float[PARTS]: the most the ends were apart, metres
+    turn: ptr                        // float[PARTS]: degrees
+    after_place: float               // the drift run: the most apart once caught up
+    after_turn: float
+    after_object: float              // and its object's place
+    ease_step: float                 // the most a tick of easing moved the client's object
+    walk_bytes: float                // bytes a second, walking
+    all_bytes: float                 // bytes a second over the script
+    down_bytes: float                // bytes a second while down
+    blocks: int
+    missed: int
+    late: int
+    checks: int
+    parted: int
+    corrections: int
+    worst_state: float
+    rag_checks: int
+    worst_rag: float
+    own_us: float                    // netanim's work a remote frame, microseconds
+    frame_us: float                  // the remote figure's whole frame
+    host_trail: ptr                  // long[TICKS_MOST]
+    client_trail: ptr
+    failed: bool
+    knocked_at: int
+    up_at: int
+}
+
+run_new() -> *Run {
+    r = calloc(1, sizeof(Run)) as *Run
+    r.place = calloc(PARTS, 8)
+    r.turn = calloc(PARTS, 8)
+    r.host_trail = calloc(TICKS_MOST, 8)
+    r.client_trail = calloc(TICKS_MOST, 8)
+    r.first_apart = 0 - 1
+    return r
+}
+
+run_free(r: *Run) {
+    free(r.place)
+    free(r.turn)
+    free(r.host_trail)
+    free(r.client_trail)
+    free(r as ptr)
+}
+
+// The script played on the host and streamed to the client over a hub of
+// these conditions; `blind` the drift run's.
+run(g: *Gaits, latency: float, jitter: float, loss: float, seed: int, buffer: float, blind: bool) -> *Run {
+    out = run_new()
+    he, hc = world(g)
+    ce, cc = world(g)
+    if hc == null || cc == null {
+        println("  no character: ${character.error()}")
+        exit(1)
+    }
+    hub = net.hub_new()
+    net.hub_set_seed(hub, seed as long)
+    host = net.host_loopback(hub)
+    client = net.join_loopback(hub)
+    net.hub_set_conditions(hub, latency, jitter, loss)
+    nh = netanim.netanim_new(host)
+    nc = netanim.netanim_new(client)
+    netanim.set_buffer(nc, buffer)
+    fh = netanim.add(nh, he, hc, true)
+    fc = netanim.add(nc, ce, cc, false)
+    if blind { netanim.set_blind(fc, BLIND_FROM, BLIND_TO) }
+    r = animator.rig(character.animator_of(hc))
+    size = record_size(r)
+    joints = pose.count(r)
+    hp = pose.new(r)
+    hw = pose.new(r)
+    cp = pose.new(r)
+    cw = pose.new(r)
+    host_records = calloc(TICKS_MOST * size, 8) as float[]
+    client_record = calloc(size, 8) as float[]
+    parts = calloc(TICKS_MOST, 8) as int[]
+    places = out.place as float[]
+    turns = out.turn as float[]
+    hashes_h = out.host_trail as long[]
+    hashes_c = out.client_trail as long[]
+    s = Script { part: P_STAND, knocked_at: 0 - 1, up_at: 0 - 1, walk_from: 0 - 1, ended: 0 - 1, failed: false }
+    now = 0.0
+    // Joined before the script starts.
+    k = 0
+    while k < 600 && !net.connected(client) {
+        net.step(host, now)
+        net.step(client, now)
+        now = now + STEP
+        k = k + 1
+    }
+    if !net.connected(client) {
+        println("  the client never joined")
+        exit(1)
+    }
+    t = 0
+    walk_from_bytes = 0 as long
+    walk_to_bytes = 0 as long
+    down_from_bytes = 0 as long
+    down_to_bytes = 0 as long
+    own_ns = 0 as long
+    frame_ns = 0 as long
+    frames = 0
+    caught_up = 0 - 1
+    trace = core.env_int("AE3D_NET_ANIM_TRACE", 0) == 1
+    last_place = behaviour.object_position(character.object_of(cc))
+    done = false
+    while !done {
+        if s.ended < 0 {
+            ask(&s, fh, t)
+            engine.engine_update(he, STEP)
+            parts[t] = s.part
+            capture(hc, hp, hw, host_records, t * size)
+            hashes_h[t] = hash_of(host_records, t * size, size)
+            netanim.sent(nh, now)
+            if t == STAND_END { walk_from_bytes = net.link_bytes(host, 1, net.SENT, net.TRAFFIC_STREAMS) }
+            if t == WALK_END { walk_to_bytes = net.link_bytes(host, 1, net.SENT, net.TRAFFIC_STREAMS) }
+            if t == s.knocked_at { down_from_bytes = net.link_bytes(host, 1, net.SENT, net.TRAFFIC_STREAMS) }
+            if t == s.up_at { down_to_bytes = net.link_bytes(host, 1, net.SENT, net.TRAFFIC_STREAMS) }
+            t = t + 1
+        }
+        net.step(host, now)
+        net.step(client, now)
+        while netanim.due(nc, now) && netanim.playing(nc) + 1 < t {
+            began = os.now_monotonic_ns()
+            at = netanim.play(nc)
+            mid = os.now_monotonic_ns()
+            engine.engine_update(ce, STEP)
+            end_update = os.now_monotonic_ns()
+            netanim.played(nc)
+            ended = os.now_monotonic_ns()
+            own_ns = own_ns + (mid - began) + (ended - end_update)
+            frame_ns = frame_ns + (ended - began)
+            frames = frames + 1
+            capture(cc, cp, cw, client_record, 0)
+            hashes_c[at] = hash_of(client_record, 0, size)
+            whole = true
+            k = 0
+            while k < size {
+                if host_records[at * size + k] != client_record[k] { whole = false }
+                k = k + 1
+            }
+            if whole { out.bitwise = out.bitwise + 1 } else if out.first_apart < 0 { out.first_apart = at }
+            place, turn = ends_apart_at(host_records, at * size, client_record, joints)
+            part = parts[at]
+            if place > places[part] { places[part] = place }
+            if turn > turns[part] { turns[part] = turn }
+            out.played = out.played + 1
+            // The drift run: what the easing moved the object a tick (its
+            // own walk taken off, as the host's object went this tick), and
+            // the ends once the graph has caught up.
+            now_place = behaviour.object_position(character.object_of(cc))
+            if blind && at > 0 {
+                was_h = (at - 1) * size
+                went_h = core.vec3(host_records[at * size] - host_records[was_h], 0.0, host_records[at * size + 2] - host_records[was_h + 2])
+                went_c = core.v3_sub(now_place, last_place)
+                step_off = core.v3_len(core.vec3(went_c.x - went_h.x, 0.0, went_c.z - went_h.z))
+                if at > BLIND_TO && step_off > out.ease_step { out.ease_step = step_off }
+                if caught_up < 0 && at > BLIND_TO && netanim.correction_left(fc) < 0.001 && place < BOUND_PLACE { caught_up = at }
+                if trace && at % 5 == 0 && at > BLIND_FROM && at < STOP_END {
+                    off = core.v3_len(core.vec3(host_records[at * size] - client_record[0], host_records[at * size + 1] - client_record[1], host_records[at * size + 2] - client_record[2]))
+                    println("    ${at} ${part_name(part)}: ends ${place * 1000.0} mm ${turn} deg, object ${off * 1000.0} mm, easing left ${netanim.correction_left(fc) * 1000.0} mm")
+                }
+                if caught_up >= 0 && at > caught_up + 60 && at < STOP_END {
+                    off_object = core.v3_len(core.vec3(host_records[at * size] - client_record[0], host_records[at * size + 1] - client_record[1], host_records[at * size + 2] - client_record[2]))
+                    if off_object > out.after_object { out.after_object = off_object }
+                    if place > out.after_place { out.after_place = place }
+                    if turn > out.after_turn { out.after_turn = turn }
+                }
+            }
+            last_place = now_place
+        }
+        now = now + STEP
+        if s.ended >= 0 && netanim.playing(nc) + 1 >= t { done = true }
+        if now > 120.0 { done = true }
+    }
+    out.ticks = t
+    out.failed = s.failed
+    out.knocked_at = s.knocked_at
+    out.up_at = s.up_at
+    out.walk_bytes = ((walk_to_bytes - walk_from_bytes) as float) / ((WALK_END - STAND_END) as float * STEP)
+    out.all_bytes = (net.link_bytes(host, 1, net.SENT, net.TRAFFIC_STREAMS) as float) / ((t as float) * STEP)
+    if s.up_at > s.knocked_at && s.knocked_at >= 0 { out.down_bytes = ((down_to_bytes - down_from_bytes) as float) / (((s.up_at - s.knocked_at) as float) * STEP) }
+    out.blocks = netanim.blocks_received(nc)
+    out.missed = netanim.ticks_missed(fc)
+    out.late = netanim.events_late(fc)
+    out.checks = netanim.state_checks(fc)
+    out.parted = netanim.states_parted(fc)
+    out.corrections = netanim.corrections(fc)
+    out.worst_state = netanim.worst_place(fc)
+    out.rag_checks = netanim.ragdoll_checks(fc)
+    out.worst_rag = netanim.worst_ragdoll(fc)
+    if frames > 0 {
+        out.own_us = ((own_ns as float) / (frames as float)) / 1000.0
+        out.frame_us = ((frame_ns as float) / (frames as float)) / 1000.0
+    }
+    if blind && caught_up < 0 {
+        out.after_place = 1.0
+        out.after_object = 1.0
+    }
+    pose.release(hp)
+    pose.release(hw)
+    pose.release(cp)
+    pose.release(cw)
+    free(host_records as ptr)
+    free(client_record as ptr)
+    free(parts as ptr)
+    netanim.netanim_free(nh)
+    netanim.netanim_free(nc)
+    net.net_free(client)
+    net.net_free(host)
+    net.hub_free(hub)
+    world_free(he, hc)
+    world_free(ce, cc)
+    return out
+}
+
+// The most the feet and hands of the host's record at `at` and the
+// client's are apart: metres, and degrees.
+ends_apart_at(host: float[], at: int, client: float[], joints: int) -> (float, float) {
+    place = 0.0
+    turn = 0.0
+    k = 0
+    while k < ENDS {
+        b = 7 + joints * 7 + k * 7
+        d = core.v3_len(core.vec3(host[at + b] - client[b], host[at + b + 1] - client[b + 1], host[at + b + 2] - client[b + 2]))
+        if d > place { place = d }
+        dot = core.abs_of(host[at + b + 3] * client[b + 3] + host[at + b + 4] * client[b + 4] + host[at + b + 5] * client[b + 5] + host[at + b + 6] * client[b + 6])
+        if dot > 1.0 { dot = 1.0 }
+        angle = 2.0 * core.acos_of(dot) * 57.29577951308232
+        if angle > turn { turn = angle }
+        k = k + 1
+    }
+    return place, turn
+}
+
+report(name: string, r: *Run) {
+    places = r.place as float[]
+    turns = r.turn as float[]
+    println("  ${name}: ${r.played} of ${r.ticks} ticks played, ${r.bitwise} the same to the bit; ${r.blocks} blocks, ${r.missed} ticks played before their inputs came, ${r.late} events late; states ${r.checks} (${r.parted} in another graph state, the most off ${r.worst_state} m, ${r.corrections} eased back); ragdolls ${r.rag_checks} (the most a body off ${r.worst_rag} m); knocked at ${r.knocked_at}, up at ${r.up_at}")
+    p = 0
+    while p < PARTS {
+        println("    ${part_name(p)}: feet and hands within ${places[p] * 1000.0} mm and ${turns[p]} degrees")
+        p = p + 1
+    }
+}
+
+worst_of(r: *Run) -> (float, float) {
+    places = r.place as float[]
+    turns = r.turn as float[]
+    place = 0.0
+    turn = 0.0
+    p = 0
+    while p < PARTS {
+        if places[p] > place { place = places[p] }
+        if turns[p] > turn { turn = turns[p] }
+        p = p + 1
+    }
+    return place, turn
+}
+
+write_trail(path: string, r: *Run) {
+    b = strbuilder.new(65536)
+    words = r.host_trail as long[]
+    t = 0
+    while t < r.ticks {
+        strbuilder.append(b, "anim ")
+        strbuilder.append_int(b, t)
+        strbuilder.append(b, " ")
+        strbuilder.append_hex(b, words[t], 16)
+        strbuilder.append(b, "\n")
+        t = t + 1
+    }
+    text = strbuilder.finish(b)
+    err = fs.write(path, text)
+    if err != "" { println("  could not write the trail to ${path}: ${err}") }
+    string.free(text)
+}
+
+main() {
+    println("net_anim: a figure's inputs and events over the network, not its poses (#911)")
+    g = character.gaits(GAITS)
+    character.gaits_set(g, character.GAIT_STOP, STOP)
+    character.gaits_set(g, character.GAIT_START, START)
+
+    // The same input stream, as soon as it can be: a block every two ticks,
+    // so the client plays two ticks behind.
+    twin = run(g, 0.0, 0.0, 0.0, 1, 2.0 * STEP, false)
+    report("no latency, jitter or loss", twin)
+    check("the script ran: knocked down, up again, walked on and stood", !twin.failed && twin.up_at > twin.knocked_at && twin.knocked_at > 0)
+    check("the client played every tick the host did", twin.played == twin.ticks && twin.missed == 0)
+    check("every joint, the object's place and turn, the feet and hands the same to the bit as the host's at every tick (the same graph from the same inputs)", twin.bitwise == twin.played && twin.first_apart < 0)
+    same_trail = true
+    hosts = twin.host_trail as long[]
+    clients = twin.client_trail as long[]
+    t = 0
+    while t < twin.ticks {
+        if hosts[t] != clients[t] { same_trail = false }
+        t = t + 1
+    }
+    check("the client's trail of hashes the same as the host's, a line a tick", same_trail)
+    path_raw = os.getenv("AE3D_ANIM_TRAIL")
+    if path_raw != null {
+        path = string.copy(path_raw)
+        write_trail(path, twin)
+        println("  the trail written to ${path}: ${twin.ticks} ticks")
+        string.free(path)
+        string.free(path_raw)
+    }
+    check("the downed figure's ragdoll streamed and held to the host's (every body within a millimetre)", twin.rag_checks > 5 && twin.worst_rag < 0.001)
+
+    // Over a link of 150 ms, 30 ms of jitter, 5% lost, seeds 1 to 3.
+    from = core.env_int("AE3D_SEED", 1)
+    to = 3
+    if core.env_int("AE3D_SEED", 0) > 0 { to = from }
+    worst_place = 0.0
+    worst_turn = 0.0
+    walk_bytes = 0.0
+    all_bytes = 0.0
+    down_bytes = 0.0
+    own_us = 0.0
+    frame_us = 0.0
+    everything = true
+    seed = from
+    while seed <= to {
+        lossy = run(g, LATENCY, JITTER, LOSS, seed, 0.12, false)
+        report("150 ms, 30 ms jitter, 5% lost, seed ${seed}", lossy)
+        place, turn = worst_of(lossy)
+        if place > worst_place { worst_place = place }
+        if turn > worst_turn { worst_turn = turn }
+        if lossy.walk_bytes > walk_bytes { walk_bytes = lossy.walk_bytes }
+        if lossy.all_bytes > all_bytes { all_bytes = lossy.all_bytes }
+        if lossy.down_bytes > down_bytes { down_bytes = lossy.down_bytes }
+        if lossy.own_us > own_us { own_us = lossy.own_us }
+        if lossy.frame_us > frame_us { frame_us = lossy.frame_us }
+        if lossy.failed || lossy.played != lossy.ticks { everything = false }
+        run_free(lossy)
+        seed = seed + 1
+    }
+    println("  the worst over the seeds: feet and hands within ${worst_place * 1000.0} mm and ${worst_turn} degrees of the host's")
+    println("  bytes a figure streams a second: ${walk_bytes} walking, ${down_bytes} while down (its ragdoll), ${all_bytes} over the whole script")
+    println("  a remote figure a frame: netanim's own ${own_us} us, the figure's whole frame (graph, mover, feet, physics) ${frame_us} us")
+    check("under 150 ms of latency, 30 ms of jitter and 5% loss the client played every tick of the script", everything)
+    check("and its feet and hands within 2 cm of the host's at every tick of every part, over every seed", worst_place <= BOUND_PLACE)
+    check("and within 2 degrees", worst_turn <= BOUND_TURN)
+    check("a walking figure streams under 1 kB a second", walk_bytes > 0.0 && walk_bytes < WALK_BYTES)
+
+    // Drift: the inputs of ticks around the walk's start never come.
+    drift = run(g, LATENCY, JITTER, LOSS, 1, 0.12, true)
+    report("the inputs of ticks ${BLIND_FROM} to ${BLIND_TO} never come", drift)
+    // Measured, not held: the feet's locks are not in the state (#911's
+    // "foot locks if needed"), so a foot planted a tick apart from the
+    // host's shows for that step.
+    println("  drift: the most a tick of easing moved the figure ${drift.ease_step * 1000.0} mm; once caught up, its object within ${drift.after_object * 1000.0} mm of the host's, its feet and hands within ${drift.after_place * 1000.0} mm and ${drift.after_turn} degrees")
+    check("a figure that missed its inputs is found off by the states and eased back", drift.corrections > 0 && drift.worst_state > BOUND_PLACE)
+    check("never snapped: no tick of the easing moves it over a centimetre", drift.ease_step <= EASE_STEP)
+    check("and once caught up, its object back within 2 mm of the host's (the correction's threshold) and its graph in the host's state at every state compared", drift.after_object <= 0.002 && drift.parted == 0)
+    run_free(drift)
+    run_free(twin)
+    character.gaits_free(g)
+
+    if g_failures == 0 {
+        println("net_anim: all checks passed (${g_checks})")
+    } else {
+        println("net_anim: ${g_failures} failure(s) of ${g_checks}")
+        exit(1)
+    }
+}
