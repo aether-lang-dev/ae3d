@@ -1,0 +1,359 @@
+// Morph targets (#910): a mesh's blend shapes, the offsets each vertex
+// moves by when a target is weighed in, as glTF, FBX and every DCC tool
+// keep them -- a face's smile, a blink, a jaw open; a muscle's bulge.
+//
+//   set = morph.set_new(vertex_count)
+//   t = morph.add_target(set, "eyeBlinkLeft", 0.0)
+//   morph.set_delta(set, t, v, dpx, dpy, dpz, dnx, dny, dnz)
+//   core.model_set_morph(model, set)          // the model owns it then
+//   core.model_set_morph_weight(model, t, 0.8)
+//
+// A vertex morphed is its bind-pose vertex plus every target's offset times
+// that target's weight, positions and normals alike, the normal made unit
+// again after: p' = p + sum(w_t * dp_t), n' = normalize(n + sum(w_t * dn_t)).
+// Morphing comes before skinning, in the mesh's bind space, so the bones
+// carry a smile as they carry the face (glTF 2.0 section 3.7.2.2, and what
+// UE5 and Unity do).
+//
+// The offsets are kept dense, eight floats a vertex a target -- the
+// position's three and a zero, the normal's three and a zero, two vec4s,
+// the layout the GPU passes read them in -- so a target is one run of
+// memory a pass reads front to back. Tangent offsets, which glTF also
+// carries, are kept beside them where a file gives them (four floats a
+// vertex a target), for a renderer with a tangent stream; neither of this
+// engine's has one (both take a pixel's tangent frame from its
+// derivatives), so they are imported and held, not drawn.
+//
+// Which targets a draw pays for is the active list: the targets whose
+// weight is not zero, in order, with their weights (active). A pass costs
+// one read of a vertex's offsets per active target; a model whose every
+// weight is zero costs nothing at all -- the renderers skip it and draw the
+// mesh as uploaded.
+//
+// No imports beyond the standard library and the stores: ae3d.core keeps a
+// model's set and its weights, and core is what a script links.
+import std.heap
+import std.list
+import std.string
+import ae3d.geometry
+
+exports (
+    MorphSet, DELTA_FLOATS, TANGENT_FLOATS, ACTIVE_EPSILON,
+    set_new, set_free, set_clone, add_target, count, vertex_count, name, find, default_weight, set_default_weight,
+    set_delta, set_tangent, delta, tangent, has_normals, has_tangents, data, tangent_data, stamp, data_bytes,
+    active, apply, apply_into, matches
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern realloc(p: ptr, size: long) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+extern memset(dst: ptr, value: int, n: long) -> ptr
+extern sqrt(x: float) -> float
+
+// A vertex's offsets in one target: position xyz 0, normal xyz 0.
+const DELTA_FLOATS = 8
+const TANGENT_FLOATS = 4
+// A weight at or under this in size weighs nothing: its target is not in
+// the active list. A hundred-thousandth of a target's full offset is a
+// hundredth of a millimetre on a centimetre's smile.
+const ACTIVE_EPSILON = 0.00001
+
+struct MorphName {
+    text: string
+}
+
+struct MorphSet {
+    targets: int
+    capacity: int                  // targets the arrays have room for
+    vertices: int                  // the mesh's vertex count the offsets are for
+    deltas: ptr                    // f32[capacity * vertices * DELTA_FLOATS]
+    tangents: ptr                  // f32[capacity * vertices * TANGENT_FLOATS], or null
+    defaults: ptr                  // f32[capacity]: each target's weight before anything sets one
+    names: ptr                     // list of *MorphName
+    normals: bool                  // whether any target moves a normal
+    // Bumped by every write, so a renderer that uploaded the offsets
+    // knows when they are not what it has.
+    changed: int
+}
+
+set_new(vertex_count: int) -> *MorphSet {
+    s = heap.new(MorphSet)
+    s.targets = 0
+    s.capacity = 0
+    s.vertices = vertex_count
+    if s.vertices < 0 { s.vertices = 0 }
+    s.names = list.new()
+    s.changed = 1
+    return s
+}
+
+set_free(s: *MorphSet) {
+    if s == null { return }
+    if s.deltas != null { free(s.deltas) }
+    if s.tangents != null { free(s.tangents) }
+    if s.defaults != null { free(s.defaults) }
+    i = 0
+    while i < list.size(s.names) {
+        heap.free(list.get_raw(s.names, i) as *MorphName)
+        i = i + 1
+    }
+    list.free(s.names)
+    heap.free(s)
+}
+
+set_clone(s: *MorphSet) -> *MorphSet {
+    if s == null { return null }
+    c = set_new(s.vertices)
+    i = 0
+    while i < s.targets {
+        t = add_target(c, name(s, i), default_weight(s, i))
+        memcpy(c.deltas + t * target_bytes(c), s.deltas + i * target_bytes(s), target_bytes(s) as long)
+        if s.tangents != null {
+            ensure_tangents(c)
+            memcpy(c.tangents + t * tangent_bytes(c), s.tangents + i * tangent_bytes(s), tangent_bytes(s) as long)
+        }
+        i = i + 1
+    }
+    c.normals = s.normals
+    return c
+}
+
+target_bytes(s: *MorphSet) -> int { return s.vertices * DELTA_FLOATS * 4 }
+tangent_bytes(s: *MorphSet) -> int { return s.vertices * TANGENT_FLOATS * 4 }
+
+// Room for one more target: the arrays doubled, the new room zeroed.
+grow(s: *MorphSet) -> bool {
+    if s.targets < s.capacity { return true }
+    wanted = s.capacity * 2
+    if wanted < 4 { wanted = 4 }
+    deltas = realloc(s.deltas, (wanted as long) * (target_bytes(s) as long))
+    if deltas == null { return false }
+    memset(deltas + s.capacity * target_bytes(s), 0, ((wanted - s.capacity) as long) * (target_bytes(s) as long))
+    s.deltas = deltas
+    defaults = realloc(s.defaults, (wanted * 4) as long)
+    if defaults == null { return false }
+    memset(defaults + s.capacity * 4, 0, ((wanted - s.capacity) * 4) as long)
+    s.defaults = defaults
+    if s.tangents != null {
+        tangents = realloc(s.tangents, (wanted as long) * (tangent_bytes(s) as long))
+        if tangents == null { return false }
+        memset(tangents + s.capacity * tangent_bytes(s), 0, ((wanted - s.capacity) as long) * (tangent_bytes(s) as long))
+        s.tangents = tangents
+    }
+    s.capacity = wanted
+    return true
+}
+
+ensure_tangents(s: *MorphSet) -> bool {
+    if s.tangents != null { return true }
+    if s.capacity <= 0 { return false }
+    s.tangents = calloc(s.capacity, tangent_bytes(s))
+    return s.tangents != null
+}
+
+// A target added with no offsets yet, named (the file's targetNames, or
+// "" for none) and with the weight it takes before anything sets one (a
+// glTF mesh's `weights`). Its index, or -1 when there was no memory.
+add_target(s: *MorphSet, target_name: string, weight: float) -> int {
+    if s == null || !grow(s) { return 0 - 1 }
+    n = heap.new(MorphName)
+    n.text = string.copy(target_name)
+    list.add_raw(s.names, n as ptr)
+    (s.defaults as f32[])[s.targets] = weight as f32
+    s.targets = s.targets + 1
+    s.changed = s.changed + 1
+    return s.targets - 1
+}
+
+count(s: *MorphSet) -> int {
+    if s == null { return 0 }
+    return s.targets
+}
+
+vertex_count(s: *MorphSet) -> int {
+    if s == null { return 0 }
+    return s.vertices
+}
+
+name(s: *MorphSet, t: int) -> string {
+    if s == null || t < 0 || t >= s.targets { return "" }
+    return (list.get_raw(s.names, t) as *MorphName).text
+}
+
+// The target of that name, -1 for none.
+find(s: *MorphSet, wanted: string) -> int {
+    if s == null { return 0 - 1 }
+    i = 0
+    while i < s.targets {
+        if name(s, i) == wanted { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+default_weight(s: *MorphSet, t: int) -> float {
+    if s == null || t < 0 || t >= s.targets { return 0.0 }
+    return (s.defaults as f32[])[t] as float
+}
+
+set_default_weight(s: *MorphSet, t: int, weight: float) {
+    if s == null || t < 0 || t >= s.targets { return }
+    (s.defaults as f32[])[t] = weight as f32
+}
+
+// Vertex v's offsets in target t: its position's and its normal's.
+set_delta(s: *MorphSet, t: int, v: int, px: float, py: float, pz: float, nx: float, ny: float, nz: float) {
+    if s == null || t < 0 || t >= s.targets || v < 0 || v >= s.vertices { return }
+    d = s.deltas as f32[]
+    at = (t * s.vertices + v) * DELTA_FLOATS
+    d[at] = px as f32
+    d[at + 1] = py as f32
+    d[at + 2] = pz as f32
+    d[at + 4] = nx as f32
+    d[at + 5] = ny as f32
+    d[at + 6] = nz as f32
+    if nx != 0.0 || ny != 0.0 || nz != 0.0 { s.normals = true }
+    s.changed = s.changed + 1
+}
+
+set_tangent(s: *MorphSet, t: int, v: int, x: float, y: float, z: float) {
+    if s == null || t < 0 || t >= s.targets || v < 0 || v >= s.vertices { return }
+    if !ensure_tangents(s) { return }
+    d = s.tangents as f32[]
+    at = (t * s.vertices + v) * TANGENT_FLOATS
+    d[at] = x as f32
+    d[at + 1] = y as f32
+    d[at + 2] = z as f32
+    s.changed = s.changed + 1
+}
+
+// Component k of vertex v's offsets in target t: 0 to 2 the position's,
+// 4 to 6 the normal's.
+delta(s: *MorphSet, t: int, v: int, k: int) -> float {
+    if s == null || t < 0 || t >= s.targets || v < 0 || v >= s.vertices || k < 0 || k >= DELTA_FLOATS { return 0.0 }
+    return (s.deltas as f32[])[(t * s.vertices + v) * DELTA_FLOATS + k] as float
+}
+
+tangent(s: *MorphSet, t: int, v: int, k: int) -> float {
+    if s == null || s.tangents == null || t < 0 || t >= s.targets || v < 0 || v >= s.vertices || k < 0 || k > 2 { return 0.0 }
+    return (s.tangents as f32[])[(t * s.vertices + v) * TANGENT_FLOATS + k] as float
+}
+
+has_normals(s: *MorphSet) -> bool { return s != null && s.normals }
+has_tangents(s: *MorphSet) -> bool { return s != null && s.tangents != null }
+
+// The offsets as the GPU passes read them: target after target, vertex
+// after vertex, two vec4s each.
+data(s: *MorphSet) -> ptr {
+    if s == null { return null }
+    return s.deltas
+}
+
+data_bytes(s: *MorphSet) -> int {
+    if s == null { return 0 }
+    return s.targets * target_bytes(s)
+}
+
+tangent_data(s: *MorphSet) -> ptr {
+    if s == null { return null }
+    return s.tangents
+}
+
+stamp(s: *MorphSet) -> int {
+    if s == null { return 0 }
+    return s.changed
+}
+
+// Whether the set's offsets are for this mesh: the same vertex count. A
+// mesh whose vertices were remade under it is drawn unmorphed.
+matches(s: *MorphSet, mesh: ptr) -> bool {
+    if s == null || mesh == null || s.targets <= 0 { return false }
+    return geometry.mesh_vertex_count(mesh) == s.vertices
+}
+
+// The active list of `weights` (f32[weight_count], one a target): each
+// target whose weight is over ACTIVE_EPSILON in size, its index into
+// `targets` (int[]) and its weight into `out_weights` (f32[]), both with
+// room for every target. How many there are; 0 is a mesh drawn as it is.
+active(s: *MorphSet, weights: ptr, weight_count: int, targets: ptr, out_weights: ptr) -> int {
+    if s == null || weights == null { return 0 }
+    n = weight_count
+    if n > s.targets { n = s.targets }
+    w = weights as f32[]
+    ti = targets as int[]
+    tw = out_weights as f32[]
+    found = 0
+    i = 0
+    while i < n {
+        x = w[i] as float
+        if x > ACTIVE_EPSILON || x < 0.0 - ACTIVE_EPSILON {
+            ti[found] = i
+            tw[found] = x as f32
+            found = found + 1
+        }
+        i = i + 1
+    }
+    return found
+}
+
+// The CPU's morph, the reference the GPU passes are held to: the mesh's
+// vertices (nine floats each, as geometry lays them out) with the
+// weighted offsets added, into `out` (f32[vertices * 9]), in the order
+// and the precision the passes add them -- active targets in index order,
+// single-precision sums -- so the two agree to the last bits a GPU's
+// fused multiply-add leaves. Returns how many targets were active.
+apply(s: *MorphSet, mesh: ptr, weights: ptr, weight_count: int, out: ptr) -> int {
+    if !matches(s, mesh) || out == null { return 0 }
+    n = s.vertices
+    memcpy(out, geometry.mesh_vertex_data(mesh), (n * geometry.VERTEX_FLOATS * 4) as long)
+    targets = calloc(s.targets + 1, 4)
+    tw = calloc(s.targets + 1, 4)
+    k = active(s, weights, weight_count, targets, tw)
+    apply_into(s, out, targets, tw, k)
+    free(targets)
+    free(tw)
+    return k
+}
+
+// The active list `targets`/`tw` (k of them) added onto `out`, the mesh's
+// vertices already copied there.
+apply_into(s: *MorphSet, out: ptr, targets: ptr, tw: ptr, k: int) {
+    if k <= 0 { return }
+    o = out as f32[]
+    d = s.deltas as f32[]
+    ti = targets as int[]
+    ww = tw as f32[]
+    stride = geometry.VERTEX_FLOATS
+    v = 0
+    while v < s.vertices {
+        f32 px = o[v * stride]
+        f32 py = o[v * stride + 1]
+        f32 pz = o[v * stride + 2]
+        f32 nx = o[v * stride + 5]
+        f32 ny = o[v * stride + 6]
+        f32 nz = o[v * stride + 7]
+        a = 0
+        while a < k {
+            at = (ti[a] * s.vertices + v) * DELTA_FLOATS
+            f32 w = ww[a]
+            px = px + w * d[at]
+            py = py + w * d[at + 1]
+            pz = pz + w * d[at + 2]
+            nx = nx + w * d[at + 4]
+            ny = ny + w * d[at + 5]
+            nz = nz + w * d[at + 6]
+            a = a + 1
+        }
+        o[v * stride] = px
+        o[v * stride + 1] = py
+        o[v * stride + 2] = pz
+        length = sqrt((nx * nx + ny * ny + nz * nz) as float)
+        if length > 0.0 {
+            o[v * stride + 5] = ((nx as float) / length) as f32
+            o[v * stride + 6] = ((ny as float) / length) as f32
+            o[v * stride + 7] = ((nz as float) / length) as f32
+        }
+        v = v + 1
+    }
+}

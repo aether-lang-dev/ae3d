@@ -48,6 +48,7 @@ import ae3d.skylight
 import ae3d.skin
 import ae3d.posing
 import ae3d.geometry
+import ae3d.morph
 import ae3d.glapi
 import ae3d.offscreen
 import ae3d.picture
@@ -61,7 +62,7 @@ exports (
     skybox_create, skybox_free,
     renderer_new, renderer_free, backend, gl_version,
     renderer_add_light, renderer_remove_light, renderer_light_count, renderer_light, renderer_model_count, renderer_model,
-    renderer_draw_calls, renderer_instance_count,
+    renderer_draw_calls, renderer_instance_count, renderer_morph_stats, renderer_read_vertices,
     renderer_set_clear_color, renderer_set_fxaa, renderer_set_bloom, renderer_set_msaa, renderer_set_taa, renderer_taa,
     renderer_set_upscaler, renderer_upscaler, renderer_upscale_targets, renderer_upscale_sharpness, renderer_set_dof, renderer_dof, renderer_set_environment, renderer_set_environment_look, renderer_environment,
     renderer_set_render_scale, renderer_render_scale,
@@ -1569,6 +1570,246 @@ gl_buffer_delete(buffer: int) {
     (names as int[])[0] = buffer
     glapi.glDeleteBuffers(1, names)
     free(names)
+}
+
+// --- morph targets (#910) --------------------------------------------------------------------
+//
+// A model with morph targets keeps its bind-pose vertices in a buffer of
+// their own (morph_base_vbo) and its offsets in a buffer texture
+// (morph_delta_texture, two RGBA32F texels a vertex a target). Each frame
+// a weight is not zero, a transform-feedback pass (shaders.
+// VERTEX_MORPH_FEEDBACK, the rasteriser off) writes the bind pose plus the
+// active targets' weighted offsets into the model's own vertex buffer,
+// which every draw of it then reads as it would the mesh as uploaded: the
+// scene, the shadows, the depth, skinned after as the vertex shader skins
+// any vertex. A frame whose weights are all zero costs nothing, and the
+// first such frame after a morphed one copies the bind pose back.
+
+var g_morph_program = 0
+var g_morph_failed = false
+var g_morph_vao = 0
+var g_morph_actives_vbo = 0
+var g_morph_actives_texture = 0
+var g_morph_actives: ptr = null    // f32[g_morph_room * 2]: a target, its weight
+var g_morph_targets: ptr = null    // int[g_morph_room]
+var g_morph_weights: ptr = null    // f32[g_morph_room]
+var g_morph_room = 0
+var g_morph_vertex_count_slot = 0 - 1
+var g_morph_active_count_slot = 0 - 1
+var g_morph_deltas_slot = 0 - 1
+var g_morph_actives_slot = 0 - 1
+var g_morph_passes = 0
+var g_morph_vertices = 0
+
+// The texture units the pass reads its two buffer textures from: past
+// every unit a draw binds, so the pass disturbs no draw's bindings.
+const MORPH_DELTA_UNIT = 30
+const MORPH_ACTIVE_UNIT = 31
+
+// The feedback program, made once: its vertex shader alone, its four
+// outputs captured interleaved, nine floats a vertex.
+gl_morph_program() -> bool {
+    if g_morph_program != 0 { return true }
+    if g_morph_failed { return false }
+    vertex = compile_stage(glapi.VERTEX_SHADER, shaders.VERTEX_MORPH_FEEDBACK, "morph")
+    if vertex == 0 {
+        println("ae3d: the morph program failed: ${g_program_log}")
+        g_morph_failed = true
+        return false
+    }
+    program = (glapi.glCreateProgram()) as int
+    glapi.glAttachShader(program as uint32, vertex as uint32)
+    names = calloc(4, 8)
+    (names as ptr[])[0] = glapi.cstr("morphPosition")
+    (names as ptr[])[1] = glapi.cstr("morphTexCoord")
+    (names as ptr[])[2] = glapi.cstr("morphNormal")
+    (names as ptr[])[3] = glapi.cstr("morphOcclusion")
+    glapi.glTransformFeedbackVaryings(program as uint32, 4, names, glapi.INTERLEAVED_ATTRIBS as uint32)
+    free(names)
+    glapi.glLinkProgram(program as uint32)
+    glapi.glDetachShader(program as uint32, vertex as uint32)
+    glapi.glDeleteShader(vertex as uint32)
+    if object_integer(program, glapi.LINK_STATUS, false) == glapi.FALSE {
+        length = object_integer(program, glapi.INFO_LOG_LENGTH, false)
+        println("ae3d: the morph program would not link: ${info_log(program, length, false)}")
+        glapi.glDeleteProgram(program as uint32)
+        g_morph_failed = true
+        return false
+    }
+    g_morph_program = program
+    g_morph_vertex_count_slot = gl_uniform_location(program, "uVertexCount")
+    g_morph_active_count_slot = gl_uniform_location(program, "uActiveCount")
+    g_morph_deltas_slot = gl_uniform_location(program, "uDeltas")
+    g_morph_actives_slot = gl_uniform_location(program, "uActives")
+    vao = calloc(1, 4)
+    glapi.glGenVertexArrays(1, vao)
+    g_morph_vao = (vao as int[])[0]
+    free(vao)
+    g_morph_actives_vbo = gl_buffer_create()
+    g_morph_actives_texture = new_texture(glapi.TEXTURE_BUFFER)
+    glapi.glBindTexture(glapi.TEXTURE_BUFFER as uint32, 0)
+    return true
+}
+
+// Room for an active list of `targets`.
+gl_morph_room(targets: int) {
+    if targets <= g_morph_room { return }
+    if g_morph_actives != null { free(g_morph_actives) }
+    if g_morph_targets != null { free(g_morph_targets) }
+    if g_morph_weights != null { free(g_morph_weights) }
+    g_morph_room = targets
+    g_morph_actives = calloc(targets * 2 + 2, 4)
+    g_morph_targets = calloc(targets + 1, 4)
+    g_morph_weights = calloc(targets + 1, 4)
+}
+
+// The model's bind pose and offsets on the GPU, made the first time it
+// morphs and again when its offsets change.
+gl_morph_upload(m: *Model, set: *MorphSet) {
+    if m.morph_base_vbo == 0 {
+        m.morph_base_vbo = gl_buffer_create()
+        buffer_data(glapi.ARRAY_BUFFER, m.morph_base_vbo, morph.vertex_count(set) * STRIDE_BYTES,
+                    geometry.mesh_vertex_data(m.mesh), glapi.STATIC_DRAW)
+    }
+    if m.morph_uploaded == morph.stamp(set) && m.morph_delta_vbo != 0 { return }
+    if m.morph_delta_vbo == 0 { m.morph_delta_vbo = gl_buffer_create() }
+    buffer_data(glapi.TEXTURE_BUFFER, m.morph_delta_vbo, morph.data_bytes(set), morph.data(set), glapi.STATIC_DRAW)
+    glapi.glBindBuffer(glapi.TEXTURE_BUFFER as uint32, 0)
+    if m.morph_delta_texture == 0 { m.morph_delta_texture = new_texture(glapi.TEXTURE_BUFFER) }
+    glapi.glBindTexture(glapi.TEXTURE_BUFFER as uint32, m.morph_delta_texture as uint32)
+    glapi.glTexBuffer(glapi.TEXTURE_BUFFER as uint32, RGBA32F as uint32, m.morph_delta_vbo as uint32)
+    glapi.glBindTexture(glapi.TEXTURE_BUFFER as uint32, 0)
+    m.morph_uploaded = morph.stamp(set)
+}
+
+// The model's vertex buffer morphed by its weights this frame: how many
+// targets were active (0: it holds the bind pose, and cost nothing when it
+// already did).
+gl_morph_model(m: *Model) -> int {
+    if m == null || m.morph == null || m.vbo == 0 || m.shares_geometry { return 0 }
+    set = m.morph as *MorphSet
+    if !morph.matches(set, m.mesh) { return 0 }
+    weights, n = core.model_morph_weights(m)
+    gl_morph_room(morph.count(set))
+    k = morph.active(set, weights, n, g_morph_targets, g_morph_weights)
+    vertices = morph.vertex_count(set)
+    if k == 0 {
+        if m.morph_live && m.morph_base_vbo != 0 {
+            glapi.glBindBuffer(glapi.COPY_READ_BUFFER as uint32, m.morph_base_vbo as uint32)
+            glapi.glBindBuffer(glapi.COPY_WRITE_BUFFER as uint32, m.vbo as uint32)
+            glapi.glCopyBufferSubData(glapi.COPY_READ_BUFFER as uint32, glapi.COPY_WRITE_BUFFER as uint32,
+                                      0 as long, 0 as long, (vertices * STRIDE_BYTES) as long)
+            glapi.glBindBuffer(glapi.COPY_READ_BUFFER as uint32, 0)
+            glapi.glBindBuffer(glapi.COPY_WRITE_BUFFER as uint32, 0)
+        }
+        m.morph_live = false
+        return 0
+    }
+    if !gl_morph_program() { return 0 }
+    gl_morph_upload(m, set)
+    a = g_morph_actives as f32[]
+    ti = g_morph_targets as int[]
+    tw = g_morph_weights as f32[]
+    i = 0
+    while i < k {
+        a[i * 2] = ti[i] as f32
+        a[i * 2 + 1] = tw[i]
+        i = i + 1
+    }
+    // The active list, a new store each frame: the last frame's pass may
+    // still be reading the one before.
+    buffer_data(glapi.TEXTURE_BUFFER, g_morph_actives_vbo, k * 8, g_morph_actives, glapi.STREAM_DRAW)
+    glapi.glBindBuffer(glapi.TEXTURE_BUFFER as uint32, 0)
+    glapi.glActiveTexture((glapi.TEXTURE0 + MORPH_ACTIVE_UNIT) as uint32)
+    glapi.glBindTexture(glapi.TEXTURE_BUFFER as uint32, g_morph_actives_texture as uint32)
+    glapi.glTexBuffer(glapi.TEXTURE_BUFFER as uint32, glapi.RG32F as uint32, g_morph_actives_vbo as uint32)
+    glapi.glActiveTexture((glapi.TEXTURE0 + MORPH_DELTA_UNIT) as uint32)
+    glapi.glBindTexture(glapi.TEXTURE_BUFFER as uint32, m.morph_delta_texture as uint32)
+    glapi.glActiveTexture(glapi.TEXTURE0 as uint32)
+
+    glapi.glUseProgram(g_morph_program as uint32)
+    glapi.glUniform1i(g_morph_deltas_slot, MORPH_DELTA_UNIT)
+    glapi.glUniform1i(g_morph_actives_slot, MORPH_ACTIVE_UNIT)
+    glapi.glUniform1i(g_morph_vertex_count_slot, vertices)
+    glapi.glUniform1i(g_morph_active_count_slot, k)
+    glapi.glBindVertexArray(g_morph_vao as uint32)
+    glapi.glBindBuffer(glapi.ARRAY_BUFFER as uint32, m.morph_base_vbo as uint32)
+    gl_setup_vertex_attribs()
+    glapi.glEnable(glapi.RASTERIZER_DISCARD as uint32)
+    glapi.glBindBufferBase(glapi.TRANSFORM_FEEDBACK_BUFFER as uint32, 0, m.vbo as uint32)
+    glapi.glBeginTransformFeedback(glapi.POINTS as uint32)
+    glapi.glDrawArrays(glapi.POINTS as uint32, 0, vertices)
+    glapi.glEndTransformFeedback()
+    glapi.glBindBufferBase(glapi.TRANSFORM_FEEDBACK_BUFFER as uint32, 0, 0)
+    glapi.glDisable(glapi.RASTERIZER_DISCARD as uint32)
+    glapi.glBindVertexArray(0)
+    glapi.glBindBuffer(glapi.ARRAY_BUFFER as uint32, 0)
+    glapi.glUseProgram(0)
+    m.morph_live = true
+    g_morph_passes = g_morph_passes + 1
+    g_morph_vertices = g_morph_vertices + vertices
+    return k
+}
+
+// What a model's morph held on the GPU, let go of with the model.
+gl_morph_release(m: *Model) {
+    if m == null { return }
+    if m.morph_base_vbo != 0 { gl_buffer_delete(m.morph_base_vbo) }
+    if m.morph_delta_vbo != 0 { gl_buffer_delete(m.morph_delta_vbo) }
+    if m.morph_delta_texture != 0 { gl_texture_delete(m.morph_delta_texture) }
+    m.morph_base_vbo = 0
+    m.morph_delta_vbo = 0
+    m.morph_delta_texture = 0
+    m.morph_uploaded = 0
+    m.morph_live = false
+}
+
+// The pass's own objects, with the context.
+gl_morph_shutdown() {
+    if g_morph_program != 0 { glapi.glDeleteProgram(g_morph_program as uint32) }
+    if g_morph_vao != 0 { gl_vao_delete(g_morph_vao) }
+    gl_buffer_delete(g_morph_actives_vbo)
+    gl_texture_delete(g_morph_actives_texture)
+    if g_morph_actives != null { free(g_morph_actives) }
+    if g_morph_targets != null { free(g_morph_targets) }
+    if g_morph_weights != null { free(g_morph_weights) }
+    g_morph_program = 0
+    g_morph_failed = false
+    g_morph_vao = 0
+    g_morph_actives_vbo = 0
+    g_morph_actives_texture = 0
+    g_morph_actives = null
+    g_morph_targets = null
+    g_morph_weights = null
+    g_morph_room = 0
+}
+
+// Every model's morph for the frame, before the first pass draws anything:
+// the morph passes made and the vertices they wrote (renderer_morph_stats).
+morph_models(r: *GLRenderer) {
+    g_morph_passes = 0
+    g_morph_vertices = 0
+    count = list.size(r.models)
+    i = 0
+    while i < count {
+        m = list.get_raw(r.models, i) as *Model
+        if m != null && m.morph != null && m.visible { gl_morph_model(m) }
+        i = i + 1
+    }
+}
+
+// The frame's morph passes and the vertices they morphed.
+renderer_morph_stats() -> (int, int) { return g_morph_passes, g_morph_vertices }
+
+// `bytes` of the model's vertex buffer as the GPU holds it, into `out`: what
+// a test holds the morph to.
+renderer_read_vertices(m: *Model, out: ptr, bytes: int) -> bool {
+    if m == null || m.vbo == 0 || out == null { return false }
+    glapi.glFinish()
+    glapi.glBindBuffer(glapi.ARRAY_BUFFER as uint32, m.vbo as uint32)
+    glapi.glGetBufferSubData(glapi.ARRAY_BUFFER as uint32, 0 as long, bytes as long, out)
+    glapi.glBindBuffer(glapi.ARRAY_BUFFER as uint32, 0)
+    return true
 }
 
 const MAX_FBO_DIMENSION = 8192
@@ -4109,7 +4350,9 @@ renderer_add_model(r: *GLRenderer, m: *Model) {
     // other's. A skinned mesh takes its own, which costs nothing worth having
     // -- a cache exists for repeated props, and a figure is not one.
     skinned = core.mesh_is_skinned(m.mesh)
-    if m.is_instanced || skinned {
+    // A model with morph targets (#910) is morphed into its own vertex
+    // buffer each frame, which no other model may draw from.
+    if m.is_instanced || skinned || m.morph != null {
         m.vao = gl_vao_create()
         gl_vao_bind(m.vao)
         m.vbo = gl_buffer_create()
@@ -4277,6 +4520,7 @@ renderer_remove_model(r: *GLRenderer, m: *Model) {
         renderer_release_texture(r, m.material.texture_id)
     }
 
+    gl_morph_release(m)
     if m.shares_geometry {
         forget_batches(r, m.vao)
         gl_geometry_release(m.vao)
@@ -6459,6 +6703,9 @@ renderer_render(r: *GLRenderer, cam: *Camera, light: *Light) {
     if r.pass_timer == null { r.pass_timer = gl_passtimer_create() }
     gl_passtimer_frame(r.pass_timer)
 
+    // The morphs (#910) before any pass reads a morphed model's vertices.
+    morph_models(r)
+
     gl_passtimer_begin(r.pass_timer, PASS_SHADOW)
     render_shadow_pass(r, active_light, cam)
     gl_passtimer_end(r.pass_timer)
@@ -7499,6 +7746,9 @@ refresh_geometry(r: *GLRenderer, m: *Model) {
         gl_vao_bind(m.vao)
         gl_upload_mesh(m.mesh, m.vbo, m.ebo)
     }
+    // The morph's bind pose is the mesh's old one: made again from the new
+    // the next time it morphs (#910).
+    gl_morph_release(m)
     geometry.mesh_clear_dirty(m.mesh)
     core.model_recalculate_bounds(m)
 }
@@ -8409,10 +8659,12 @@ renderer_cleanup(r: *GLRenderer) {
                 m.instance_phase_vbo = 0
             }
             if m.depth_proxy_vao != 0 { gl_vao_delete(m.depth_proxy_vao) ; m.depth_proxy_vao = 0 }
+            gl_morph_release(m)
         }
         i = i + 1
     }
     list.clear(r.models)
+    gl_morph_shutdown()
 
     count = list.size(r.textures)
     i = 0
