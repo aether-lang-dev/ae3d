@@ -1,0 +1,442 @@
+// ae3d.animlod -- a figure's animation at levels of detail (#862, M8).
+//
+// The full figure is ae3d.animator's graph (ae3d.character's humanoid on
+// it): states, blends, transitions, feet on the ground, eyes and aim. A
+// crowd of thousands cannot run one a figure, so the same clip data serves
+// three levels:
+//
+//   - the graph every frame, for the figures that matter most;
+//   - the graph one frame in 2, 4 or 8 (animator.set_every), each frame
+//     drawn between its last two evaluations, for the ones further off. A
+//     budget (Budget, as Unreal's animation budget allocator) picks the rate
+//     of each from its significance (its distance, more off the view) so
+//     the frame's graph evaluations fit a number of milliseconds;
+//   - a crowd instance: a position, a heading and a phase, posed on the GPU
+//     from a pose bank (ae3d.crowd's, the posing layout gltf_crowd and the
+//     horde draw). The bank is baked here from a state of the figure's own
+//     graph (bake): its takes, sampled by its own blend at the parameter it
+//     plays at, so a crowd figure is the cheap level of the very motion the
+//     full figure plays, not a clip imported a second time.
+//
+// A figure goes between the crowd and its graph by pose snapshot: handed
+// to the graph (enter), the graph takes over from the bank's two poses
+// about the instance's phase and eases the difference out as a transition
+// does; handed back (leave), the pose it draws is matched against the
+// bank's frames for the phase the instance goes on from.
+
+import std.heap
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.figure
+import ae3d.pose
+import ae3d.skin
+import ae3d.posing
+import ae3d.animator
+import ae3d.mover
+import ae3d.character
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+exports (
+    Bank, bake, bank_free, bank_posebank, bank_frames, bank_state, bank_cycle, bank_speed, bank_pose,
+    enter, enter_character, leave, nearest_phase, pose_apart,
+    Budget, budget_new, budget_free, budget_add, budget_remove, budget_view, budget_count,
+    budget_every, budget_planned, budget_seconds, budget_set_seconds, budget_plan,
+    MOST_EVERY
+)
+
+// The slowest rate the budget gives a figure: its graph one frame in this
+// many. At 60 Hz, 7.5 evaluations a second, about a walk's every footfall.
+const MOST_EVERY = 8
+// A figure out of the view counts as this many times as far.
+const OFF_VIEW = 4.0
+// Seconds a graph evaluation is taken to cost before it has been timed.
+const UNTIMED = 0.00005
+
+// A pose bank baked from a state of a figure's graph.
+struct Bank {
+    posebank: ptr                  // posing's bank: a bone palette a frame, what the crowd is drawn with
+    poses: ptr                     // float[frames * count * FLOATS]: each frame's local pose on the rig
+    frames: int
+    count: int                     // the rig's joints
+    state: int                     // the graph's state it was baked from
+    cycle: float                   // seconds a cycle of it took, at the parameter it was baked at
+    speed: float                   // metres a second it went over the ground so
+    rig: ptr                       // *pose.Rig, the animator's: its figures' rig, borrowed
+}
+
+// --- the bank -------------------------------------------------------------------------------------
+
+// State `state` of `a`'s graph, as it plays at its parameters now (a gait
+// blend at the velocity set), baked into `frames` poses evenly over one
+// cycle of it: each frame its takes sampled at that phase and blended as
+// the graph blends them, struck on the figure's own skeleton for its bone
+// palette. The figure is struck at the origin facing +z (its scale kept),
+// where a crowd instance's position and heading put it, then put back as
+// it was. The bank travels at the state's speed, so a crowd walking it at
+// that speed plants its feet as the full figure does. Null for a state
+// with no cycle (a pose held) or a figure with no skin.
+bake(a: *Animator, state: int, frames: int) -> *Bank {
+    if a == null || frames <= 0 { return null }
+    o = animator.figure_object(a)
+    f = figure.figure_of(o)
+    if f == null { return null }
+    skel = figure.skeleton(f)
+    cycle = animator.state_cycle(a, state)
+    if skel == null || cycle <= 0.0 { return null }
+    r = animator.rig(a)
+    bones = skin.skeleton_count(skel)
+    banked = posing.posebank_create(frames, bones)
+    if banked == null { return null }
+    b = heap.new(Bank)
+    b.posebank = banked
+    b.frames = frames
+    b.count = pose.count(r)
+    b.poses = calloc(frames * b.count * pose.FLOATS, 8)
+    b.state = state
+    b.cycle = cycle
+    b.speed = animator.state_speed(a, state)
+    b.rig = r as ptr
+    stood = behaviour.object_position(o)
+    faced = behaviour.object_rotation(o)
+    behaviour.object_set_position(o, core.vec3(0.0, 0.0, 0.0))
+    behaviour.object_set_rotation(o, core.quat_ident())
+    k = 0
+    while k < frames {
+        phase = (k as float) / (frames as float)
+        p = frame_pose(b, k)
+        animator.state_sample(a, state, animator.cycle_time(a, state, phase), p)
+        pose.apply(r, p)
+        skin.skeleton_update(skel)
+        posing.posebank_capture(banked, k, skin.skeleton_palette(skel))
+        posing.posebank_set_travel(banked, k, b.speed * cycle * phase)
+        k = k + 1
+    }
+    posing.posebank_set_travel(banked, frames, b.speed * cycle)
+    behaviour.object_set_position(o, stood)
+    behaviour.object_set_rotation(o, faced)
+    pose.apply(r, animator.pose_shown(a))
+    skin.skeleton_update(skel)
+    return b
+}
+
+bank_free(b: *Bank) {
+    if b == null { return }
+    posing.posebank_destroy(b.posebank)
+    free(b.poses)
+    heap.free(b)
+}
+
+// Posing's bank, for the crowd's draw (crowd.device_crowd_rays, a model's
+// instanced skinning) and its step (crowd.crowd_step_out's `bank`).
+bank_posebank(b: *Bank) -> ptr { return b.posebank }
+bank_frames(b: *Bank) -> int { return b.frames }
+bank_state(b: *Bank) -> int { return b.state }
+bank_cycle(b: *Bank) -> float { return b.cycle }
+bank_speed(b: *Bank) -> float { return b.speed }
+
+frame_pose(b: *Bank, k: int) -> ptr {
+    return b.poses + k * b.count * pose.FLOATS * 8
+}
+
+wrap(x: float) -> float {
+    w = x - ((x as int) as float)
+    if w < 0.0 { w = w + 1.0 }
+    if w >= 1.0 { w = 0.0 }
+    return w
+}
+
+// The bank's pose at `phase` (0 to 1, wrapping) into `out`: the frames
+// either side blended, as the GPU's draw of an instance between frames.
+bank_pose(b: *Bank, phase: float, out: ptr) {
+    x = wrap(phase) * (b.frames as float)
+    k = x as int
+    if k >= b.frames { k = b.frames - 1 }
+    next = k + 1
+    if next >= b.frames { next = 0 }
+    pose.blend(b.rig as *pose.Rig, frame_pose(b, k), frame_pose(b, next), x - (k as float), out)
+}
+
+// --- hand-over by pose snapshot ------------------------------------------------------------------
+
+// A crowd instance at `phase` of the bank handed to the full graph of `a`
+// (a figure stood where the instance is, facing as it faces): the graph
+// takes over from the bank's poses at the phase and `dt` seconds of the
+// cycle before it (animator.take_over), and plays the bank's state from
+// that phase, the difference easing out over `seconds`. Drawn the next
+// frame, the figure goes on from the instance's last pose at the speed the
+// instance's was moving.
+enter(b: *Bank, a: *Animator, phase: float, dt: float, seconds: float) {
+    if b == null || a == null { return }
+    r = b.rig as *pose.Rig
+    now = pose.new(r)
+    before = pose.new(r)
+    bank_pose(b, phase, now)
+    bank_pose(b, phase - dt / b.cycle, before)
+    animator.take_over(a, now, before, dt, b.state, animator.cycle_time(a, b.state, wrap(phase)), seconds)
+    pose.release(now)
+    pose.release(before)
+}
+
+// The same for a character (ae3d.character's humanoid): its mover settled
+// going at the instance's `velocity` (the world's), so its graph's
+// parameters say it walks on, and its graph handed the instance's pose.
+enter_character(b: *Bank, c: *Character, phase: float, velocity: Vec3, dt: float, seconds: float) {
+    if b == null || c == null { return }
+    mover.settle_moving(character.mover_of(c), velocity)
+    character.move(c, velocity, core.vec3(0.0, 0.0, 0.0))
+    enter(b, character.animator_of(c), phase, dt, seconds)
+}
+
+// The full figure of `a` handed back to the crowd: the phase of the bank
+// whose pose is nearest the pose it draws now (nearest_phase), for its
+// instance to go on from.
+leave(b: *Bank, a: *Animator) -> float {
+    if b == null || a == null { return 0.0 }
+    return nearest_phase(b, animator.pose_shown(a))
+}
+
+// How far two poses on the bank's rig are apart: every joint's turn from
+// one to the other, as 1 - |cos| of half of it, summed (zero for one pose).
+pose_apart(b: *Bank, p: ptr, q: ptr) -> float {
+    fp = p as float[]
+    fq = q as float[]
+    sum = 0.0
+    j = 0
+    while j < b.count {
+        at = j * pose.FLOATS + 3
+        d = fp[at] * fq[at] + fp[at + 1] * fq[at + 1] + fp[at + 2] * fq[at + 2] + fp[at + 3] * fq[at + 3]
+        sum = sum + 1.0 - core.abs_of(d)
+        j = j + 1
+    }
+    return sum
+}
+
+// The phase of the bank whose pose is nearest `p`: the nearest frame, then
+// the parabola through it and its neighbours for between them.
+nearest_phase(b: *Bank, p: ptr) -> float {
+    best = 0
+    least = 0.0
+    k = 0
+    while k < b.frames {
+        d = pose_apart(b, p, frame_pose(b, k))
+        if k == 0 || d < least {
+            least = d
+            best = k
+        }
+        k = k + 1
+    }
+    lo = pose_apart(b, p, frame_pose(b, (best + b.frames - 1) % b.frames))
+    hi = pose_apart(b, p, frame_pose(b, (best + 1) % b.frames))
+    shift = 0.0
+    bend = lo - 2.0 * least + hi
+    if bend > 0.000000001 { shift = 0.5 * (lo - hi) / bend }
+    shift = core.clampf(shift, 0.0 - 0.5, 0.5)
+    return wrap(((best as float) + shift) / (b.frames as float))
+}
+
+// --- the budget -----------------------------------------------------------------------------------
+
+// The frame's animation budget over a set of figures' graphs: each frame,
+// before the pose phase, every figure ranked by significance (its distance
+// from the eye, OFF_VIEW times that off the view) and given the fastest
+// rate (1, 2, 4 or 8 frames an evaluation) that keeps the frame's graph
+// evaluations, at each one's own measured cost (animator.graph_cost),
+// within `seconds`: the nearest first, each no faster than one nearer, the
+// rest kept their room at the slowest rate. A budget too small for every
+// figure at the slowest rate gives them all the slowest, and says what it
+// planned (budget_planned). The ranking is kept from frame to frame and
+// insertion-sorted, near linear as a crowd moves.
+struct Budget {
+    engine: ptr
+    figures: ptr                   // ptr[room]: *Animator
+    order: ptr                     // int[room]: the figures by significance, most first
+    key: ptr                       // float[room]: each figure's distance, as ranked
+    count: int
+    room: int
+    seconds: float
+    eye: Vec3
+    ahead: Vec3                    // the view's way, zero for no view (distance alone)
+    view_cos: float                // the cosine of the view's half angle
+    planned: float                 // the seconds the last plan spends a frame
+    stepper: ptr
+}
+
+budget_new(e: *Engine, seconds: float) -> *Budget {
+    b = heap.new(Budget)
+    b.engine = e as ptr
+    b.seconds = seconds
+    b.room = 16
+    b.figures = calloc(b.room, 8)
+    b.order = calloc(b.room, 4)
+    b.key = calloc(b.room, 8)
+    if e != null {
+        s = engine.behaviour_new("AnimationBudget", b as ptr)
+        s.update = budget_update
+        engine.engine_add_behaviour(e, s)
+        b.stepper = s as ptr
+    }
+    return b
+}
+
+// Its figures go back to every frame; freed before the engine.
+budget_free(b: *Budget) {
+    if b == null { return }
+    if b.stepper != null {
+        engine.engine_remove_behaviour(b.engine as *Engine, b.stepper as *Behaviour)
+        heap.free(b.stepper as *Behaviour)
+    }
+    figures = b.figures as ptr[]
+    i = 0
+    while i < b.count {
+        animator.set_every(figures[i] as *Animator, 1, 0)
+        i = i + 1
+    }
+    free(b.figures)
+    free(b.order)
+    free(b.key)
+    heap.free(b)
+}
+
+budget_add(b: *Budget, a: *Animator) {
+    if b == null || a == null { return }
+    if b.count == b.room {
+        room = b.room * 2
+        figures = calloc(room, 8)
+        order = calloc(room, 4)
+        key = calloc(room, 8)
+        i = 0
+        while i < b.count {
+            (figures as ptr[])[i] = (b.figures as ptr[])[i]
+            (order as int[])[i] = (b.order as int[])[i]
+            (key as float[])[i] = (b.key as float[])[i]
+            i = i + 1
+        }
+        free(b.figures)
+        free(b.order)
+        free(b.key)
+        b.figures = figures
+        b.order = order
+        b.key = key
+        b.room = room
+    }
+    (b.figures as ptr[])[b.count] = a as ptr
+    (b.order as int[])[b.count] = b.count
+    b.count = b.count + 1
+}
+
+// `a` out of the budget, back to every frame: before it is freed.
+budget_remove(b: *Budget, a: *Animator) {
+    if b == null || a == null { return }
+    figures = b.figures as ptr[]
+    order = b.order as int[]
+    i = 0
+    while i < b.count {
+        if figures[i] == a as ptr {
+            animator.set_every(a, 1, 0)
+            last = b.count - 1
+            figures[i] = figures[last]
+            // The ranking: the removed one's place dropped, the last's index renamed.
+            w = 0
+            k = 0
+            while k < b.count {
+                if order[k] != i {
+                    if order[k] == last { order[w] = i } else { order[w] = order[k] }
+                    w = w + 1
+                }
+                k = k + 1
+            }
+            b.count = last
+            return
+        }
+        i = i + 1
+    }
+}
+
+// The eye the figures' significance is measured from, the way it looks,
+// and the half angle of its view (radians); `ahead` zero ranks by distance
+// alone.
+budget_view(b: *Budget, eye: Vec3, ahead: Vec3, half_angle: float) {
+    b.eye = eye
+    b.ahead = ahead
+    b.view_cos = core.cos_of(half_angle)
+}
+
+budget_count(b: *Budget) -> int { return b.count }
+budget_seconds(b: *Budget) -> float { return b.seconds }
+budget_set_seconds(b: *Budget, seconds: float) { b.seconds = seconds }
+budget_planned(b: *Budget) -> float { return b.planned }
+
+// The rate the budget gave figure `i` (in the order added).
+budget_every(b: *Budget, i: int) -> int {
+    if i < 0 || i >= b.count { return 1 }
+    return animator.update_every((b.figures as ptr[])[i] as *Animator)
+}
+
+budget_update(state: ptr, _e: *Engine, _dt: float) { budget_plan(state as *Budget) }
+
+// Each figure's distance, then the ranking re-sorted.
+rank(b: *Budget) {
+    figures = b.figures as ptr[]
+    key = b.key as float[]
+    order = b.order as int[]
+    look = core.v3_len(b.ahead)
+    i = 0
+    while i < b.count {
+        at = behaviour.object_position(animator.figure_object(figures[i] as *Animator))
+        d = core.v3_sub(at, b.eye)
+        far = core.v3_len(d)
+        if look > 0.000001 && far > 0.000001 && core.v3_dot(d, b.ahead) < b.view_cos * far * look { far = far * OFF_VIEW }
+        key[i] = far
+        i = i + 1
+    }
+    i = 1
+    while i < b.count {
+        moving = order[i]
+        k = i - 1
+        while k >= 0 && key[order[k]] > key[moving] {
+            order[k + 1] = order[k]
+            k = k - 1
+        }
+        order[k + 1] = moving
+        i = i + 1
+    }
+}
+
+// A figure's cost a graph evaluation, as timed, or UNTIMED before it is.
+cost_of(a: *Animator) -> float {
+    c = animator.graph_cost(a)
+    if c <= 0.0 { return UNTIMED }
+    return c
+}
+
+// The plan: ranked, then each figure the fastest rate that fits.
+budget_plan(b: *Budget) {
+    if b == null || b.count == 0 { return }
+    rank(b)
+    figures = b.figures as ptr[]
+    order = b.order as int[]
+    most = MOST_EVERY as float
+    reserve = 0.0
+    i = 0
+    while i < b.count {
+        reserve = reserve + cost_of(figures[i] as *Animator) / most
+        i = i + 1
+    }
+    spent = 0.0
+    rate = 1
+    k = 0
+    while k < b.count {
+        a = figures[order[k]] as *Animator
+        c = cost_of(a)
+        reserve = reserve - c / most
+        while rate < MOST_EVERY && spent + c / (rate as float) + reserve > b.seconds { rate = rate * 2 }
+        spent = spent + c / (rate as float)
+        // Its place in the ranking staggers it against the others at its rate.
+        animator.set_every(a, rate, k)
+        k = k + 1
+    }
+    b.planned = spent
+}

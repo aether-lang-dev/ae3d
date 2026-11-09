@@ -31,6 +31,7 @@
 import std.heap
 import std.list
 import std.string
+import std.os
 import ae3d.core
 import ae3d.engine
 import ae3d.behaviour
@@ -50,7 +51,8 @@ exports (
     root_moved, ground_speed, add_layer, layer_weight, layer_restart, layer_time, layer_rate, layer_done,
     set_feet, feet, set_hands, hands, look_at, look_off, aim_at, aim_off, trunk_aim, set_body, body, evaluate, pose_now, pose_graph, pose_unheld, pose_shown, add_post, remove_post, show, set_fixed, fixed,
     contact_weight, plant_weight, figure_object, update_now,
-    event_count, event_name, fired
+    event_count, event_name, fired,
+    take_over, set_every, update_every, graph_cost, state_sample, state_cycle, state_speed, cycle_time, cycle_phase
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -229,6 +231,20 @@ struct Animator {
     shown: ptr                     // the pose a step after the graph drew (show)
     showing: bool                  // shown is this frame's
     fixed: bool                    // its graph evaluated at the fixed step (set_fixed), its posts in the pose phase
+    // Update-rate LOD (set_every): the graph evaluated one frame in `every`,
+    // ahead of the frame, and the frames between drawn between its last two
+    // evaluations.
+    every: int                     // frames an evaluation serves, 1 every frame
+    lod_phase: int                 // frames the first evaluation at a new rate serves instead, 0 none
+    ahead: float                   // seconds the pose evaluated last (out) is ahead of the frame
+    span: float                    // and ahead of the one before it (before)
+    lod_moved: Vec3                // the last evaluation's root motion a second, spread over the frames it serves
+    lod_at: Vec3                   // where the object stood at the last evaluation
+    lod_yaw: float                 // and the way it faced, radians about up from +z
+    lod_turned: Quat               // its rotation then
+    lod_elapsed: float             // seconds since
+    lod_known: bool                // lod_at and lod_yaw are an evaluation's at this rate
+    cost: float                    // seconds an evaluation of the graph takes, averaged
 }
 
 // A step after the graph, and what it steps with (add_post).
@@ -354,6 +370,7 @@ attach(e: *Engine, o: *GameObject) -> *Animator {
     a.blend_work = pose.new(rig)
     a.posts = list.new()
     a.shown = pose.new(rig)
+    a.every = 1
     b = engine.behaviour_new("Animator", a as ptr)
     b.pose = animator_pose
     engine.engine_add_behaviour(e, b)
@@ -1929,26 +1946,147 @@ animator_pose(state: ptr, e: *Engine) {
 // pose phase calls it; a program stepping its engine by hand calls
 // update_now after engine_update for what the frame drew.
 evaluate(a: *Animator, dt: float) {
-    r = a.rig as *pose.Rig
     a.showing = false
-    // Paused: the figure is another writer's (pause). Nothing is written;
-    // what that writer drew is read back, the last two frames kept, so
-    // resume eases out of it at the speed it was moving.
     if a.paused {
-        pose.copy(r, a.out, a.before)
-        pose.read(r, a.out)
-        if !a.drawn { pose.copy(r, a.out, a.before) }
-        pose.copy(r, a.graph_out, a.graph_before)
-        pose.copy(r, a.out, a.graph_out)
-        if !a.drawn { pose.copy(r, a.out, a.graph_before) }
-        a.drawn = true
-        if dt > 0.0 { a.dt_before = dt }
+        read_paused(a, dt)
         return
     }
+    // Every frame, as by default: the graph carried on by the frame and its
+    // pose drawn.
+    if (a.every <= 1 && a.ahead <= 0.0) || !a.evaluated {
+        if !graph_timed(a, dt, dt, false) { return }
+        a.ahead = 0.0
+        a.span = dt
+        a.lod_moved = core.vec3(0.0, 0.0, 0.0)
+        // Where it stands, for the speed a first evaluation at a slower rate
+        // places it ahead by (lod_place_ahead).
+        o = a.object as *GameObject
+        a.lod_at = behaviour.object_position(o)
+        a.lod_yaw = yaw_of(behaviour.object_rotation(o))
+        a.lod_elapsed = 0.0
+        a.lod_known = true
+        pose.apply(a.rig as *pose.Rig, a.out)
+        if !a.fixed { run_posts(a) }
+        return
+    }
+    // One frame in `every` (set_every): the graph evaluated ahead to the
+    // last frame its pose serves, and each frame drawn between the pose
+    // evaluated for the frame before this one and that. The frame is drawn
+    // at its own time, not an interval late as Unreal's update-rate
+    // optimisation draws it; a figure taken back to every frame finishes
+    // the interval it is in first, so the rate changes without a jump.
+    a.ahead = a.ahead - dt
+    a.lod_elapsed = a.lod_elapsed + dt
+    if a.ahead < 0.0 - 0.5 * dt {
+        serves = a.every
+        if a.lod_phase > 0 {
+            serves = a.lod_phase
+            a.lod_phase = 0
+        }
+        if serves < 1 { serves = 1 }
+        step = ((serves - 1) as float) * dt - a.ahead
+        // Its feet and eyes solved where the figure will stand when the
+        // pose is drawn. Solved where it stood, a walker at 1.2 m/s one
+        // frame in 4 bent a knee 0.16 rad off the same walker's every frame
+        // (its planted foot reached for from 6 cm behind).
+        lod_place_ahead(a, ((serves - 1) as float) * dt)
+        // And the feet on the ground as the clip sets them down, not locked
+        // where they land, as Unreal's foot IK is turned off on its lower
+        // LODs: sampled one frame in 8, a foot was locked where the clip had
+        // it up to 133 ms after it landed, and the knee reaching for that
+        // spot was 1.0 rad off the walker's every frame.
+        locks = a.feet != null && serves > 1 && (a.feet as *Feet).lock
+        if locks { ikrig.feet_set_lock(a.feet as *Feet, false) }
+        drew = graph_timed(a, step, dt, true)
+        if locks { ikrig.feet_set_lock(a.feet as *Feet, true) }
+        lod_place_back(a)
+        if !drew { return }
+        a.ahead = ((serves - 1) as float) * dt
+        a.span = step
+    }
+    if a.root_motion { move_object(a, core.v3_mul(a.lod_moved, dt), dt) }
+    draw_between(a)
+}
+
+// The figure's object put where it will be `lead` seconds on, at the speed
+// and turn it has gone at since the evaluation before; where it stood kept
+// for lod_place_back.
+lod_place_ahead(a: *Animator, lead: float) {
+    o = a.object as *GameObject
+    at = behaviour.object_position(o)
+    q = behaviour.object_rotation(o)
+    yaw = yaw_of(q)
+    v = core.vec3(0.0, 0.0, 0.0)
+    turn = 0.0
+    if a.lod_known && a.lod_elapsed > 0.0 {
+        v = core.v3_mul(core.vec3(at.x - a.lod_at.x, 0.0, at.z - a.lod_at.z), 1.0 / a.lod_elapsed)
+        turn = wrap_turn(yaw - a.lod_yaw) / a.lod_elapsed
+    }
+    a.lod_at = at
+    a.lod_yaw = yaw
+    a.lod_turned = q
+    a.lod_elapsed = 0.0
+    a.lod_known = true
+    if lead <= 0.0 { return }
+    behaviour.object_set_position(o, core.v3_add(at, core.v3_mul(v, lead)))
+    behaviour.object_set_rotation(o, core.quat_normalize(core.quat_mul(core.quat_rotate(turn * lead, core.vec3(0.0, 1.0, 0.0)), q)))
+}
+
+lod_place_back(a: *Animator) {
+    o = a.object as *GameObject
+    behaviour.object_set_position(o, a.lod_at)
+    behaviour.object_set_rotation(o, a.lod_turned)
+}
+
+// The pose drawn between two evaluations: the one before turned toward the
+// last by how far the frame has come between them.
+draw_between(a: *Animator) {
+    r = a.rig as *pose.Rig
+    u = 1.0
+    if a.span > 0.0 { u = 1.0 - a.ahead / a.span }
+    pose.blend(r, a.before, a.out, u, a.shown)
+    a.showing = true
+    pose.apply(r, a.shown)
+    if !a.fixed { run_posts(a) }
+}
+
+// The graph evaluated over `step` seconds, timed into `cost` (an average
+// over about ten evaluations): what an allocator of the frame's animation
+// budget (ae3d.animlod) spends.
+graph_timed(a: *Animator, step: float, frame: float, spread: bool) -> bool {
+    began = os.now_monotonic_ns()
+    drew = evaluate_graph(a, step, frame, spread)
+    took = ((os.now_monotonic_ns() - began) as float) * 0.000000001
+    if a.cost <= 0.0 { a.cost = took } else { a.cost = a.cost * 0.9 + took * 0.1 }
+    return drew
+}
+
+// Paused: the figure is another writer's (pause). Nothing is written;
+// what that writer drew is read back, the last two frames kept, so
+// resume eases out of it at the speed it was moving.
+read_paused(a: *Animator, dt: float) {
+    r = a.rig as *pose.Rig
+    pose.copy(r, a.out, a.before)
+    pose.read(r, a.out)
+    if !a.drawn { pose.copy(r, a.out, a.before) }
+    pose.copy(r, a.graph_out, a.graph_before)
+    pose.copy(r, a.out, a.graph_out)
+    if !a.drawn { pose.copy(r, a.out, a.graph_before) }
+    a.drawn = true
+    a.ahead = 0.0
+    if dt > 0.0 { a.dt_before = dt }
+}
+
+// The graph carried on `dt` seconds: its pose into `out`, not drawn.
+// `spread`: its root motion moved a frame of `frame` seconds at a time over
+// the frames the evaluation serves (set_every), not at once.
+// False with no state to play: nothing evaluated, and nothing to draw.
+evaluate_graph(a: *Animator, dt: float, frame: float, spread: bool) -> bool {
+    r = a.rig as *pose.Rig
     apply_bindings(a)
     if a.evaluated { take_transitions(a) }
     s = state_at(a, a.current)
-    if s == null { return }
+    if s == null { return false }
     // A matcher searches before the frame moves on, from the two poses drawn last.
     if s.kind == STATE_MATCH { match_due(a, s, dt) }
     pose.copy(r, a.out, a.before)
@@ -1991,7 +2129,14 @@ evaluate(a: *Animator, dt: float) {
     apply_layers(a, dt)
     apply_aims(a)
     apply_lift(a, a.out, dt)
-    if a.root_motion { move_object(a, moved, dt) } else { a.moved = core.vec3(0.0, 0.0, 0.0) }
+    if !a.root_motion {
+        a.moved = core.vec3(0.0, 0.0, 0.0)
+    } else if spread && dt > 0.0 {
+        // Moved a frame at a time by evaluate, from where the figure stands.
+        a.lod_moved = core.v3_mul(moved, 1.0 / dt)
+    } else {
+        move_object(a, moved, dt)
+    }
     if a.feet != null {
         // What the feet are given, kept: a transition eases out of it (#966).
         // As much as the trunk stands (ikrig.trunk_upright): a foot is not
@@ -2025,10 +2170,9 @@ evaluate(a: *Animator, dt: float) {
         pose.copy(r, a.out, a.unheld)
         ikrig.hands_solve(a.hands as *Hands, r, a.out, a.worlds, dt)
     }
-    pose.apply(r, a.out)
-    if !a.fixed { run_posts(a) }
     if dt > 0.0 { a.dt_before = dt }
     a.evaluated = true
+    return true
 }
 
 update_now(a: *Animator, dt: float) { evaluate(a, dt) }
@@ -2074,6 +2218,148 @@ read_drawn(a: *Animator) {
     pose.copy(r, a.out, a.graph_out)
     pose.copy(r, a.out, a.graph_before)
     a.drawn = true
+}
+
+// The figure taken over from another drawer by a snapshot of what it drew:
+// `now` this frame and `before` the frame `dt` seconds earlier (poses on
+// this rig). `state` plays from `at` (its clock, cycle_time) and the
+// difference between the snapshot and it, and the speed that difference was
+// changing at, ease out over `seconds` as a transition's do. A crowd
+// figure handed to its full graph (ae3d.animlod) is drawn from the bank's
+// two poses about its phase, so the first frame the graph draws goes on
+// from the crowd's last at the speed the crowd's was moving.
+take_over(a: *Animator, now: ptr, before: ptr, dt: float, state: int, at: float, seconds: float) {
+    if a == null || now == null || before == null { return }
+    r = a.rig as *pose.Rig
+    pose.copy(r, now, a.out)
+    pose.copy(r, before, a.before)
+    pose.copy(r, now, a.graph_out)
+    pose.copy(r, before, a.graph_before)
+    if dt > 0.0 { a.dt_before = dt }
+    a.paused = false
+    a.ahead = 0.0
+    a.span = 0.0
+    a.blend_t = 0.0
+    a.blend_time = 0.0
+    a.fade_from = 0 - 1
+    a.lod_known = false
+    if a.feet != null { ikrig.feet_reset(a.feet as *Feet) }
+    a.evaluated = true
+    // The state eased into at the parameters it will play at (a gait blend's
+    // velocity), not the ones it last played at.
+    apply_bindings(a)
+    play_at(a, state, at, seconds)
+}
+
+// --- the cost of a figure -------------------------------------------------------------------
+
+// The graph evaluated one frame in `every` (1 every frame, the default), as
+// Unreal's update-rate optimisation and its animation budget allocator run
+// a distant figure's: evaluated ahead to the last frame it serves, each
+// frame drawn between that and the pose before, so the frame is drawn at its
+// own time. `phase` (0 to every - 1) puts this figure's evaluations on other
+// frames than another's of the same rate: N figures at every 4 are N / 4
+// evaluations a frame, not N every fourth frame. The rate changes without a
+// jump either way (the interval under way is finished first).
+set_every(a: *Animator, every: int, phase: int) {
+    if a == null { return }
+    n = every
+    if n < 1 { n = 1 }
+    if n == a.every { return }
+    a.every = n
+    a.lod_phase = 0
+    if n > 1 {
+        p = phase
+        while p < 0 { p = p + n }
+        a.lod_phase = p - (p / n) * n
+    }
+}
+
+update_every(a: *Animator) -> int {
+    if a == null { return 1 }
+    return a.every
+}
+
+// Seconds an evaluation of the graph has taken, averaged over about the last
+// ten (its feet's ground rays, aims, look and hands among them).
+graph_cost(a: *Animator) -> float {
+    if a == null { return 0.0 }
+    return a.cost
+}
+
+// --- a state's cycle --------------------------------------------------------------------------
+
+// State `state`'s pose at `at` on its clock (a take's seconds, a blend's
+// phase) into `out`, the graph's own: no layers, aims or feet, and its
+// clock left where it is. What a crowd's pose bank is baked from.
+state_sample(a: *Animator, state: int, at: float, out: ptr) {
+    s = state_at(a, state)
+    if s == null || out == null { return }
+    keep = s.time
+    s.time = at
+    sample_state(a, s, out)
+    s.time = keep
+}
+
+// The take a take's or a matcher's state plays now.
+cycle_take(s: *State) -> *Take {
+    if s.kind == STATE_MATCH { return matched_take(s) }
+    return list.get_raw(s.takes, 0) as *Take
+}
+
+// Seconds a cycle of `state` takes as it would play now: a take's length at
+// its rate, a blend's cycle at the pace its parameter sets.
+state_cycle(a: *Animator, state: int) -> float {
+    s = state_at(a, state)
+    if s == null { return 0.0 }
+    rate = core.abs_of(s.rate)
+    if rate < 0.000001 { return 0.0 }
+    if s.kind == STATE_TAKE || s.kind == STATE_MATCH {
+        return clips.duration(cycle_take(s)) / rate
+    }
+    if s.kind != STATE_BLEND && s.kind != STATE_BLEND2 { return 0.0 }
+    blend_weights(s)
+    cycle = blend_cycle(s)
+    if cycle <= 0.0 { return 0.0 }
+    return cycle / (blend_pace(s, cycle) * rate)
+}
+
+// Its speed over the ground as it would play now, metres a second.
+state_speed(a: *Animator, state: int) -> float {
+    s = state_at(a, state)
+    if s == null { return 0.0 }
+    if s.kind == STATE_TAKE || s.kind == STATE_MATCH {
+        return clips.speed(cycle_take(s)) * core.abs_of(s.rate)
+    }
+    if s.kind != STATE_BLEND && s.kind != STATE_BLEND2 { return 0.0 }
+    blend_weights(s)
+    cycle = blend_cycle(s)
+    if cycle <= 0.0 { return 0.0 }
+    return blend_speed(s, cycle) * blend_pace(s, cycle) * core.abs_of(s.rate)
+}
+
+// The clock of `state` (play_at's `at`) at `phase` of its cycle, 0 to 1
+// from the clock's zero; and the phase its clock is at now.
+cycle_time(a: *Animator, state: int, phase: float) -> float {
+    s = state_at(a, state)
+    if s == null { return 0.0 }
+    if s.kind == STATE_TAKE || s.kind == STATE_MATCH {
+        return phase * clips.duration(cycle_take(s))
+    }
+    return phase
+}
+
+cycle_phase(a: *Animator, state: int) -> float {
+    s = state_at(a, state)
+    if s == null { return 0.0 }
+    if s.kind == STATE_TAKE || s.kind == STATE_MATCH {
+        length = clips.duration(cycle_take(s))
+        if length <= 0.0 { return 0.0 }
+        p = s.time / length
+        return p - floor_of(p)
+    }
+    if s.kind == STATE_POSE { return 0.0 }
+    return s.time - floor_of(s.time)
 }
 
 // A take its owner keeps, used by this animator too and not freed with it.
