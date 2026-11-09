@@ -24,8 +24,18 @@
   rig's poses carry them after the joints; takes sample them from a weights
   channel (`clips.from_scene`), blends lerp them, additives add them, and
   the animator inertializes them as it does the joints.
-- **Measured** (`bench_morph`, RTX 4070 Ti): 0.075 to 0.096 ns a vertex an
-  active target on the device (262,144 vertices, 16 targets), 0.07 to 0.15
-  ns a vertex for the pass itself; MorphStressTest imports in 0.76 ms.
+  Drawn morphed and skinned, the column's frame is the frame of the CPU's
+  morph baked in and skinned, 0 channels apart on both renderers. Mirrored,
+  a pose gives each side's curve to the other (eyeBlinkLeft to Right).
+- **A face set and blinks** (`ae3d.face`): ARKit's 52 shapes mapped onto a
+  head's targets by name, whatever its tool writes ("Face.eye_Blink_L",
+  "mouthSmile.L", "JAW_OPEN"); procedural blinks at human timing, measured
+  over ten minutes: 16.6 a minute, closing 100 ms (117 to the 60 Hz frame),
+  opening 180 ms (197 to the frame), irregular intervals, deterministic
+  from a seed.
+- **Measured** (`bench_morph`, RTX 4070 Ti, a shared machine): about 0.05
+  to 0.1 ns a vertex an active target on the device (262,144 vertices, 16
+  targets: 1.3 ns a vertex with all 16 active) on Vulkan and on OpenGL;
+  MorphStressTest imports in 0.7 to 1.1 ms.
 - `generate_shaders` reads glslang's Windows output (CR LF lines), so the
   SPIR-V is made and checked with Khronos' Windows build of 16.6.0 as well.
