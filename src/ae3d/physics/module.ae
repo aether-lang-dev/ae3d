@@ -73,6 +73,7 @@ exports (
     ragdoll_park, ragdoll_unpark, ragdoll_is_parked, ragdoll_to_rig,
     CharacterController, character_controller, character_ignore, character_set_solid, character_solid, character_reach, character_reach_from, character_of, character_feet, character_move, character_grounded, character_height, character_radius, character_velocity,
     character_ground_normal, character_free, character_set_slope_limit, character_set_step_height, STEP_HEIGHT, character_overlap, character_overlap_world,
+    character_set_ledges, character_walks_off, character_ground_at, character_ledge, character_ledge_share, character_project,
     spec_of, apply_spec, attachments
 )
 
@@ -5823,6 +5824,13 @@ struct CharacterController {
     solid: bool
     near: ptr                      // *CharacterController[CHARACTER_PLANES]: the solid ones near, this move
     near_count: int
+    // Whether a walk takes it over a ledge (character_set_ledges), as UE's
+    // CharacterMovement's bCanWalkOffLedges; and, this move, the ledges it
+    // keeps to: each edge's point and its way out, level.
+    walk_off: bool
+    ledges: ptr                    // float[LEDGES_MOST * 6]: x, y, z of a point on the edge, then its way out
+    ledge_count: int
+    ledge_from: Vec3               // the feet the move started from
 }
 
 // A character controller on `o`, whose position is the feet: a capsule of
@@ -5844,6 +5852,8 @@ character_controller(o: *GameObject, radius: float, height: float) -> *Character
     c.pushed = calloc(CHARACTER_PLANES, sizeof(BodyId))
     c.push_force = 400.0
     c.solid = false
+    c.walk_off = true
+    c.ledges = calloc(LEDGES_MOST * 6, 8)
     c.near = calloc(CHARACTER_PLANES, 8)
     if p != null {
         list.add_raw(p.characters, c as ptr)
@@ -5872,6 +5882,7 @@ character_free(c: *CharacterController) {
 }
 
 character_release(c: *CharacterController) {
+    free(c.ledges)
     free(c.near)
     free(c.planes)
     free(c.pushed)
@@ -6083,7 +6094,312 @@ character_reach_from(c: *CharacterController, feet: Vec3, offset: Vec3) -> Vec3 
         }
     }
     if fraction < 0.0 { fraction = 0.0 }
+    // A ledge it does not walk off is met as a wall is (character_set_ledges).
+    if !c.walk_off && fraction > 0.0 {
+        share, _y = ledge_share(c, feet, core.v3_mul(move, fraction), true)
+        fraction = fraction * share
+    }
     return core.v3_mul(move, fraction)
+}
+
+// --- ledges (#981) ---------------------------------------------------------------------------------
+//
+// A ledge is where the ground a character walks on ends: past it the
+// controller's ground ray (a step height over the feet down to a step height
+// under them) finds nothing walkable, and the capsule falls. The people
+// plaza's runners, curving round to goals behind them, ran over its floor's
+// edge, fell 40 m still playing a run, and a foot turned 70 rad/s. A
+// controller told not to walk off ledges (character_set_ledges, UE's
+// bCanWalkOffLedges off; ae3d.character's people are) keeps its axis
+// LEDGE_KEEP of its radius back from one: the edge is a plane its move
+// slides along, as a wall's is, so the mover reads it as a wall (mover.slid)
+// and what is asked goes along the edge. A jump, and a capsule already off
+// the ground, are not held.
+
+// Its radius's share the axis keeps back from an edge: the body over the
+// ground it stands on, its feet beside its axis on it.
+const LEDGE_KEEP = 1.0
+// Halvings an edge is found to along a move (a 4 cm move's to 0.2 mm).
+const LEDGE_HALVINGS = 8
+// Metres round an edge's point its way out is read at, and the ways read.
+const LEDGE_PROBE = 0.05
+const LEDGE_WAYS = 8
+
+// Whether a walk takes it over a ledge (true, the default) or it keeps to
+// the ground it stands on, stopping at an edge or sliding along it.
+character_set_ledges(c: *CharacterController, walk_off: bool) {
+    if c != null { c.walk_off = walk_off }
+}
+
+character_walks_off(c: *CharacterController) -> bool { return c == null || c.walk_off }
+
+// Whether the capsule with its feet at `feet` stands on walkable ground:
+// what its move's ground ray finds there (from a step height over the feet
+// to a step height under them, flatter than its slope limit), and the
+// ground's height (the feet's own where there is none).
+character_ground_at(c: *CharacterController, feet: Vec3) -> (bool, float) {
+    p = c.physics as *Physics
+    hit = ground_under(p, core.v3_add(feet, core.vec3(0.0, c.step_height, 0.0)), c.step_height * 2.0, shape.default_query_filter())
+    if hit.hit && hit.normal.y >= c.slope_cos { return true, hit.point.y }
+    return false, feet.y
+}
+
+// The share of a level `move` from `feet` the capsule may walk before its
+// axis comes within LEDGE_KEEP of its radius of an edge ahead (1: none
+// met), and the ground's height at the move's far end (the feet's where
+// there is none). Where there is no ground under the feet themselves, there
+// is no ground to keep to and the whole move is allowed (`under` false: the
+// feet are known to stand on ground, not tried).
+character_ledge_share(c: *CharacterController, feet: Vec3, move: Vec3, under: bool) -> (float, float) {
+    return ledge_share(c, feet, move, under)
+}
+
+ledge_share(c: *CharacterController, feet: Vec3, move: Vec3, under: bool) -> (float, float) {
+    level = core.vec3(move.x, 0.0, move.z)
+    far = core.v3_len(level)
+    if far < 0.000001 { return 1.0, feet.y }
+    if under {
+        stands, _y = character_ground_at(c, feet)
+        if !stands { return 1.0, feet.y }
+    }
+    way = core.v3_mul(level, 1.0 / far)
+    keep = c.radius * LEDGE_KEEP
+    edge, y = ledge_along(c, feet, way, far + keep)
+    if edge < 0.0 { return 1.0, y }
+    share = (edge - keep) / far
+    if share < 0.0 { share = 0.0 }
+    return share, feet.y
+}
+
+// Metres along `way` (level, unit) from `feet`, out to `reach`, at which the
+// ground ends, -1 if there is ground all the way, and then the ground's
+// height at `reach` (the feet's otherwise). Halved to LEDGE_HALVINGS between
+// the last ground and the first none.
+ledge_along(c: *CharacterController, feet: Vec3, way: Vec3, reach: float) -> (float, float) {
+    ok, y = character_ground_at(c, core.v3_add(feet, core.v3_mul(way, reach)))
+    if ok { return 0.0 - 1.0, y }
+    lo = 0.0
+    hi = reach
+    k = 0
+    while k < LEDGE_HALVINGS {
+        mid = (lo + hi) * 0.5
+        on, _h = character_ground_at(c, core.v3_add(feet, core.v3_mul(way, mid)))
+        if on { lo = mid } else { hi = mid }
+        k = k + 1
+    }
+    return lo, feet.y
+}
+
+// The way out over the edge at `at` (on the ground, by it), level and unit:
+// the ways round it with no ground under them, averaged; `fallback` where
+// none are found.
+ledge_way_out(c: *CharacterController, at: Vec3, fallback: Vec3) -> Vec3 {
+    sum = core.vec3(0.0, 0.0, 0.0)
+    k = 0
+    while k < LEDGE_WAYS {
+        angle = (k as float) * 6.283185307179586 / (LEDGE_WAYS as float)
+        d = core.vec3(core.sin_of(angle), 0.0, core.cos_of(angle))
+        on, _y = character_ground_at(c, core.v3_add(at, core.v3_mul(d, LEDGE_PROBE)))
+        if !on { sum = core.v3_add(sum, d) }
+        k = k + 1
+    }
+    if core.v3_len(sum) < 0.000001 { return fallback }
+    return core.v3_normalize(sum)
+}
+
+// The ledge a level `move` from `feet` meets: the share of the move the
+// capsule may walk (character_ledge_share's, 1 for none) and the edge's way
+// out (zero for none). What a steering reads ahead of a walk.
+character_ledge(c: *CharacterController, feet: Vec3, move: Vec3) -> (float, Vec3) {
+    level = core.vec3(move.x, 0.0, move.z)
+    far = core.v3_len(level)
+    if far < 0.000001 { return 1.0, core.vec3(0.0, 0.0, 0.0) }
+    stands, _y = character_ground_at(c, feet)
+    if !stands { return 1.0, core.vec3(0.0, 0.0, 0.0) }
+    way = core.v3_mul(level, 1.0 / far)
+    keep = c.radius * LEDGE_KEEP
+    edge, _y = ledge_along(c, feet, way, far + keep)
+    if edge < 0.0 { return 1.0, core.vec3(0.0, 0.0, 0.0) }
+    share = (edge - keep) / far
+    if share < 0.0 { share = 0.0 }
+    return share, ledge_way_out(c, core.v3_add(feet, core.v3_mul(way, edge)), way)
+}
+
+// The most ledges a move keeps to.
+const LEDGES_MOST = 6
+
+// This move's ledges (c.ledges): the edge a walk of `move` from `feet` meets
+// ahead, and every edge within the keep round where it ends, LEDGE_WAYS ways
+// round. Ahead alone, a walk nearly along an edge drifted out toward it
+// unseen, its axis 7 cm from the edge, as the point ahead stayed on the
+// ground.
+ledge_find(c: *CharacterController, feet: Vec3, move: Vec3) {
+    c.ledge_count = 0
+    c.ledge_from = feet
+    level = core.vec3(move.x, 0.0, move.z)
+    far = core.v3_len(level)
+    if far < 0.000001 { return }
+    way = core.v3_mul(level, 1.0 / far)
+    keep = c.radius * LEDGE_KEEP
+    end = core.v3_add(feet, level)
+    edge, _y = ledge_along(c, feet, way, far + keep)
+    if edge >= 0.0 {
+        at = core.v3_add(feet, core.v3_mul(way, edge))
+        ledge_add(c, at, ledge_way_out(c, at, way))
+        short = edge - keep
+        if short < 0.0 { short = 0.0 }
+        end = core.v3_add(feet, core.v3_mul(way, short))
+    }
+    stands, _h = character_ground_at(c, end)
+    if !stands { return }
+    k = 0
+    while k < LEDGE_WAYS {
+        angle = (k as float) * 6.283185307179586 / (LEDGE_WAYS as float)
+        d = core.vec3(core.sin_of(angle), 0.0, core.cos_of(angle))
+        s, _sy = ledge_along(c, end, d, keep)
+        if s >= 0.0 {
+            at = core.v3_add(end, core.v3_mul(d, s))
+            ledge_add(c, at, ledge_way_out(c, at, d))
+        }
+        k = k + 1
+    }
+}
+
+ledge_add(c: *CharacterController, at: Vec3, out: Vec3) {
+    if c.ledge_count >= LEDGES_MOST { return }
+    l = c.ledges as float[]
+    i = c.ledge_count * 6
+    l[i] = at.x
+    l[i + 1] = at.y
+    l[i + 2] = at.z
+    l[i + 3] = out.x
+    l[i + 4] = out.y
+    l[i + 5] = out.z
+    c.ledge_count = c.ledge_count + 1
+}
+
+// A move from the feet the ledges were found from (c.ledge_from) cut to
+// keep to them: what of it goes past each edge's keep taken off along that
+// edge's way out, so it slides along the edge. Cut before the capsule is
+// cast, not pushed back after: a walk's overshoot in a step (4.6 mm) is
+// under the plane solver's slop (5 mm), which let it stand, and a walker
+// crept over the line a step at a time.
+ledge_clip(c: *CharacterController, move: Vec3) -> Vec3 {
+    l = c.ledges as float[]
+    from = c.ledge_from
+    m = core.vec3(move.x, 0.0, move.z)
+    pass = 0
+    while pass < 2 {
+        k = 0
+        while k < c.ledge_count {
+            i = k * 6
+            ox = l[i + 3]
+            oz = l[i + 5]
+            allowed = ox * (l[i] - from.x) + oz * (l[i + 2] - from.z) - c.radius * LEDGE_KEEP
+            if allowed < 0.0 { allowed = 0.0 }
+            over = ox * m.x + oz * m.z - allowed
+            if over > 0.0 { m = core.vec3(m.x - ox * over, 0.0, m.z - oz * over) }
+            k = k + 1
+        }
+        pass = pass + 1
+    }
+    return core.vec3(m.x, move.y, m.z)
+}
+
+// The ledges as planes the capsule's move keeps to, from feet at `feet`:
+// level, facing back from each edge, its axis held LEDGE_KEEP of its radius
+// short of it (or where it started the move, if nearer already: a plane
+// never pulls it back past that), the move cut to them already
+// (ledge_clip): what keeps it there as the world's planes are solved. The
+// allowance is the move's start's: read from where the cast had carried the
+// feet, a capsule cast past the line would be let stay there. A mover's
+// plane is a constraint (character_plane_visitor).
+ledge_plane(c: *CharacterController, feet: Vec3) {
+    planes = c.planes as CollisionPlane[]
+    l = c.ledges as float[]
+    from = c.ledge_from
+    k = 0
+    while k < c.ledge_count && c.plane_count < CHARACTER_PLANES {
+        i = k * 6
+        ox = l[i + 3]
+        oz = l[i + 5]
+        allowed = ox * (l[i] - from.x) + oz * (l[i + 2] - from.z) - c.radius * LEDGE_KEEP
+        if allowed < 0.0 { allowed = 0.0 }
+        gap = allowed - (ox * (feet.x - from.x) + oz * (feet.z - from.z))
+        planes[c.plane_count] = mover.collision_plane(math.plane(core.vec3(0.0 - ox, 0.0, 0.0 - oz), 0.0 - gap), math.MAX_FLOAT, true)
+        c.plane_count = c.plane_count + 1
+        k = k + 1
+    }
+}
+
+// The nearest point to `point`, within `reach` of it level, the capsule may
+// stand at kept off any edge: ground under its axis and under it LEDGE_KEEP
+// of its radius out each way, looked for from its height over the point to
+// its height under it. UE's ProjectPointToNavigation: a goal put past a
+// floor's edge is brought back onto it. False, and the point, where there
+// is none within reach.
+character_project(c: *CharacterController, point: Vec3, reach: float) -> (bool, Vec3) {
+    ok, at = stand_point(c, point)
+    if ok { return true, at }
+    // Rings out from it, a quarter of a metre apart, sixteen ways round: on
+    // the first ring with ground, each way that has it brought back toward
+    // the point to its edge, and the nearest of them kept.
+    ring = 0.25
+    while ring <= reach + 0.0001 {
+        found = false
+        best = point
+        nearest = 0.0
+        k = 0
+        while k < 16 {
+            angle = (k as float) * 6.283185307179586 / 16.0
+            d = core.vec3(core.sin_of(angle), 0.0, core.cos_of(angle))
+            on, there = stand_point(c, core.v3_add(point, core.v3_mul(d, ring)))
+            if on {
+                // Halved toward the point, between the ring before and this.
+                lo = ring
+                hi = ring - 0.25
+                h = 0
+                while h < LEDGE_HALVINGS {
+                    mid = (lo + hi) * 0.5
+                    on_mid, at_mid = stand_point(c, core.v3_add(point, core.v3_mul(d, mid)))
+                    if on_mid {
+                        lo = mid
+                        there = at_mid
+                    } else {
+                        hi = mid
+                    }
+                    h = h + 1
+                }
+                if !found || lo < nearest {
+                    found = true
+                    nearest = lo
+                    best = there
+                }
+            }
+            k = k + 1
+        }
+        if found { return true, best }
+        ring = ring + 0.25
+    }
+    return false, point
+}
+
+// Whether the capsule stands at `point` kept off any edge
+// (character_project), and the point on the ground.
+stand_point(c: *CharacterController, point: Vec3) -> (bool, Vec3) {
+    p = c.physics as *Physics
+    hit = ground_under(p, core.v3_add(point, core.vec3(0.0, c.height, 0.0)), c.height * 2.0, shape.default_query_filter())
+    if !hit.hit || hit.normal.y < c.slope_cos { return false, point }
+    at = hit.point
+    keep = c.radius * LEDGE_KEEP
+    k = 0
+    while k < 4 {
+        angle = (k as float) * 1.5707963267948966
+        on, _y = character_ground_at(c, core.v3_add(at, core.vec3(core.sin_of(angle) * keep, 0.0, core.cos_of(angle) * keep)))
+        if !on { return false, point }
+        k = k + 1
+    }
+    return true, at
 }
 
 // Along `move` from `from`, the share of it at which an axis comes within
@@ -6277,6 +6593,16 @@ character_step(c: *CharacterController, walk: Vec3, jump: float, delta: float) {
     c.step_seconds = delta
     c.pushed_count = 0
     gather_near(c, feet, core.v3_len(remaining))
+    // A walk on the ground that keeps to it (character_set_ledges): the edge
+    // it would go over, a plane it keeps to below.
+    c.ledge_count = 0
+    if !c.walk_off && stood_on && jump <= 0.0 {
+        ledge_find(c, feet, remaining)
+        if c.ledge_count > 0 {
+            remaining = ledge_clip(c, remaining)
+            c.velocity = core.vec3(remaining.x / delta, c.velocity.y, remaining.z / delta)
+        }
+    }
     iteration = 0
     while iteration < CHARACTER_ITERATIONS {
         fraction = physics_world.cast_mover(p.world_id, feet, capsule, remaining, filter, true, character_cast_filter, c as ptr)
@@ -6287,6 +6613,7 @@ character_step(c: *CharacterController, walk: Vec3, jump: float, delta: float) {
         physics_world.collide_mover(p.world_id, feet, capsule, filter, character_plane_visitor, c as ptr)
         c.pushing = false
         near_planes(c, feet)
+        ledge_plane(c, feet)
         solved = mover.solve_planes(core.vec3(0.0, 0.0, 0.0), c.planes as CollisionPlane[], c.plane_count)
         feet = core.v3_add(feet, solved.delta)
         remaining = mover.clip_vector(core.v3_mul(remaining, 1.0 - fraction), c.planes as CollisionPlane[], c.plane_count)
@@ -6349,6 +6676,7 @@ character_step(c: *CharacterController, walk: Vec3, jump: float, delta: float) {
     c.plane_count = 0
     physics_world.collide_mover(p.world_id, feet, capsule, filter, character_plane_visitor, c as ptr)
     near_planes(c, feet)
+    ledge_plane(c, feet)
     out = mover.solve_planes(core.vec3(0.0, 0.0, 0.0), c.planes as CollisionPlane[], c.plane_count)
     feet = core.v3_add(feet, out.delta)
     behaviour.object_set_position(o, core.vec3(feet.x, feet.y + c.lift, feet.z))
