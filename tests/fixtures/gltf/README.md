@@ -11,6 +11,6 @@ Three of Khronos' glTF sample models, committed as test fixtures only (`tests/te
 | `MorphStressTest.glb` | Eight morph targets a primitive, named (`extras.targetNames`), with weights animations. | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/): "Morph Stress Test" by Ed Mackey, © 2021 Analytical Graphics, Inc. `Models/MorphStressTest` | `005f1d9dd938c553a506d6bf3d21830fc3f2ec3a199d9332e9a625baf7342bef` |
 | `morph_sparse.gltf` | A quad with two sparse POSITION targets -- one with no buffer view (zeros, two vertices substituted), one substituted over its view -- named `lift` and `bulge`, default weights 0.5 and 0.25, and a CUBICSPLINE weights animation. Its buffer is a base64 `data:` URI. | Written for ae3d's tests; the repository's licence. | |
 
-No face with blend shapes is committed: none of these is a face, and a CC0 face with an ARKit-like set of shapes (#910's face set) is still to be found. The repository ships importers, not character assets (#342); a face would come in under the same test-only exception as `../people/`.
+None of these is a face. The face fixture, a CC0 VRoid figure with eye joints and its own set of blend shapes, is in `../people/` with its terms; no face with ARKit's 52 shapes under CC0 or CC BY was found.
 
 The other files here (`Fox.glb`, `arm.*`, `embedded.glb`, `humanoid.glb`, `ik_man.glb`, `sparse_*.gltf`) predate this README.

@@ -12,6 +12,23 @@ All three files are by Quaternius and are dedicated to the public domain under [
 
 Each archive's `License.txt` reads: "CC0 1.0 Universal (CC0 1.0) Public Domain Dedication. Models by @Quaternius."
 
+## A face: VRoid Studio's base female (`vroid_base_female.vrm`)
+
+The face tests (`tests/test_face.ae`, #910) are judged on a figure with eye joints and blend shapes. It is VRoid Studio's base female model by pixiv's VRoid project, which VRoid released under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/): VRoid's own page on its sample models' conditions of use (https://vroid.pixiv.help/hc/en-us/articles/4402614652569-Do-VRoid-Studio-s-sample-models-come-with-conditions-of-use) lists the base models among its "CC0 license models" ("Copyright is waived, and there is no particular limit when using them"). The file's own VRM metadata says the same: `"licenseName":"CC0"`, author "VRoidプロジェクト", redistribution and modification allowed. It is a VRM 0.x file, a glTF 2.0 binary, which `gltf.load` reads as any `.glb`.
+
+| file | what it is | source | sha256 |
+|---|---|---|---|
+| `vroid_base_female.vrm` | A figure of 83 joints on VRoid's skeleton (`J_Bip_C_Hips`, `J_Bip_L_UpperArm`... mapped as `pose.SCHEME_VROID`), with eye joints (`J_Adj_L_FaceEye`, `J_Adj_R_FaceEye`) and a face of 56 blend shapes in VRoid's own set (`Fcl_EYE_Close_L`, `Fcl_MTH_A`, `Fcl_ALL_Joy`...), not ARKit's 52: its eyes' closing is taken as ARKit's blinks (`face.shape_of`). Stripped of its pictures, 1.1 MB of the original's 16 MB (below). | `Base_Female.vrm` in https://opengameart.org/sites/default/files/base_female.zip (from https://opengameart.org/content/vroid-studio-cc0-models; zip sha256 `bf2717cff70b40a278df56e137dbb699c6499551096fa4c005e9aeca1de68eb3`; `Base_Female.vrm` sha256 `1995f174f6c8f2211f3c56c9e5fe4f9daf27ee5e648f129479582a259238149b`, 16,323,872 bytes) | `711313f9de3cc3bc84f73da56cad19e4dead20b2f87261b10aaacaefe258b8c1` (1,142,864 bytes) |
+
+The committed file is the original made smaller by `tools/gltf_strip.ae`, with nothing the tests read changed:
+
+    ./build.sh tools/gltf_strip.ae
+    ./build/gltf_strip Base_Female.vrm tests/fixtures/people/vroid_base_female.vrm --sparse
+
+It takes out the images, textures and samplers, the materials' and the VRM extension's references to them (the meta's thumbnail, MToon's texture properties) and the buffer views only the images used, and writes every morph target that moves fewer than three quarters of its vertices as a sparse accessor (the vertices it moves, their indices and values). The VRM metadata, the CC0 licence among it, is kept as it was. Loaded, the stripped file and the original agree on every vertex's place, normal, joints and weights and every morph target's offsets: 9,292,633 numbers, none different.
+
+No face with ARKit's 52 blend shapes under CC0 or CC BY was found (2026-11-09): heads with the 52 offered for download are commercial or carry other terms (study-only, editorial-only), and the free ones in use in examples (three.js's `facecap.glb`) state no licence.
+
 ## 100STYLE: motion capture (`100style/`)
 
 Cuts of the Neutral style of [the 100STYLE dataset](https://ianxmason.github.io/100style/) by Ian Mason, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/): "The 100STYLE Dataset - Ian Mason" (Mason, Starke and Komura, *Real-Time Style Modelling of Human Locomotion via Feature-Wise Transformations and Local Motion Phases*, 2022). The takes are Xsens inertial captures at 60 frames a second, in centimetres, of one actor walking and running around a capture volume for minutes at a time. Each locomotion file here is whole strides of one take, from a left footfall to a left footfall, where both the figure's travel and its hips keep their direction best (the stop and the start are where it comes to a stand and leaves it), cut by `tools/bvh_cut.ae`: the skeleton and the frames exactly as the dataset has them, and nothing else changed. The retargeter is held to them (`tests/test_anim_pipeline.ae`), and the blend spaces, starts, stops and turns are made from them.
