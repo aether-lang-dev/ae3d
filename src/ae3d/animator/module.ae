@@ -43,6 +43,7 @@ import ae3d.face
 import ae3d.visemes
 import ae3d.gltf
 import ae3d.physics
+import ae3d.jobs
 
 exports (
     Animator, STATE_TAKE, STATE_BLEND, STATE_BLEND2, STATE_POSE, add_blend2, blend_add2, set_velocity, blend_weight,
@@ -57,7 +58,7 @@ exports (
     contact_weight, plant_weight, figure_object, update_now,
     event_count, event_name, fired,
     take_over, set_every, update_every, graph_cost, state_sample,
-    profile, profile_reset, profile_now, profile_add, profile_seconds, profile_name, PROF_SECTIONS, PROF_MOVER, PROF_STEER, PROF_CHARACTER, state_cycle, state_speed, cycle_time, cycle_phase
+    on_pool, profile, profile_reset, profile_now, profile_add, profile_seconds, profile_name, PROF_SECTIONS, PROF_MOVER, PROF_STEER, PROF_CHARACTER, state_cycle, state_speed, cycle_time, cycle_phase
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -264,6 +265,12 @@ struct Animator {
     lod_known: bool                // lod_at and lod_yaw are an evaluation's at this rate
     cost: float                    // seconds an evaluation of the graph takes, averaged
     shaper: ptr                    // *Shaper: a change drawn by its owner in place of the inertialization (play_shaped), or null
+    // Evaluated with the engine's other animators on its job pool
+    // (evaluate_all) this frame: what its slot in the pose phase has left
+    // to do (its posts).
+    batched: bool
+    batch_drawn: bool
+    batch_frame: int
 }
 
 // A step after the graph, and what it steps with (add_post).
@@ -417,11 +424,20 @@ attach(e: *Engine, o: *GameObject) -> *Animator {
     b.pose = animator_pose
     engine.engine_add_behaviour(e, b)
     a.stepper = b as ptr
+    if g_animators == null { g_animators = list.new() }
+    list.add_raw(g_animators, a as ptr)
     return a
 }
 
 animator_free(a: *Animator) {
     if a == null { return }
+    if g_animators != null {
+        k = list.size(g_animators) - 1
+        while k >= 0 {
+            if list.get_raw(g_animators, k) == a as ptr { list.remove(g_animators, k) }
+            k = k - 1
+        }
+    }
     // Out of the engine's loop first: freed while the engine ran, the pose
     // phase went on calling it on freed memory (Siltreach, 2026-11-01).
     if a.stepper != null {
@@ -2179,22 +2195,131 @@ animator_pose(state: ptr, e: *Engine) {
         if !a.paused { run_posts(a) }
         return
     }
+    // The engine's animators evaluated together at the first one's turn
+    // (evaluate_all), each one's steps after the graph left for its own.
+    frame = engine.engine_frame_count(e)
+    if g_batch_engine != e as ptr || g_batch_frame != frame { evaluate_all(e, frame) }
+    if a.batched && a.batch_frame == frame {
+        a.batched = false
+        if a.batch_drawn { evaluate_posts(a) }
+        return
+    }
+    a.batched = false
     evaluate(a, engine.engine_delta_time(e))
+}
+
+// --- the pose phase on the job pool ------------------------------------------------------------------
+
+// The engine's animators evaluated on its job pool (ae3d.jobs), as UE5's
+// and Unity's animation runs on worker threads: each figure's graph, its
+// IK and its pose written to its own joints are its own, and its feet read
+// the static world by rays that only read it (no step runs in the pose
+// phase). Its steps after the graph (add_post: a ragdoll driven, an item
+// carried) still run at its own turn, in the engine's order, on this
+// thread. Evaluated here at the first animator's turn in the frame:
+//   - not one evaluated at the fixed step (set_fixed), nor one paused
+//     (another writer's), which keep their turns;
+//   - nor one moved by its root motion, whose capsule moves in the physics
+//     world as its graph is evaluated, before its feet are solved.
+// Every figure's evaluation reads only its own state and the static world,
+// so the poses are the same to the bit whatever the pool's size, and the
+// same with no pool (the loop then runs here, in order).
+var g_animators: ptr = null        // list of every *Animator attached
+var g_batch_engine: ptr = null     // the engine and frame evaluate_all last ran for
+var g_batch_frame = 0 - 1
+var g_batch: ptr = null            // ptr[g_batch_room]: the frame's animators
+var g_batch_room = 0
+var g_on_pool = true               // on_pool
+
+struct BatchPass {
+    animators: ptr                 // ptr[count]
+    dt: float
+    frame: int
+}
+
+batched_now(a: *Animator, e: *Engine) -> bool {
+    if a.engine != e as ptr || a.fixed || a.paused || a.root_motion { return false }
+    b = a.stepper as *Behaviour
+    return b != null && b.enabled && b.started
+}
+
+evaluate_all(e: *Engine, frame: int) {
+    g_batch_engine = e as ptr
+    g_batch_frame = frame
+    if g_animators == null { return }
+    count = list.size(g_animators)
+    if count > g_batch_room {
+        if g_batch != null { free(g_batch) }
+        g_batch_room = count * 2
+        g_batch = calloc(g_batch_room, 8)
+    }
+    chosen = g_batch as ptr[]
+    n = 0
+    k = 0
+    while k < count {
+        a = list.get_raw(g_animators, k) as *Animator
+        if batched_now(a, e) {
+            chosen[n] = a as ptr
+            n = n + 1
+        }
+        k = k + 1
+    }
+    if n == 0 { return }
+    pass = BatchPass { animators: g_batch, dt: engine.engine_delta_time(e), frame: frame }
+    if g_on_pool {
+        jobs.parallel_for(evaluate_block, n, 1, (&pass) as ptr)
+    } else {
+        evaluate_block(0, n, 0, (&pass) as ptr)
+    }
+}
+
+// Off, the frame's animators are evaluated together on this thread alone,
+// in the same order to the same poses: what a profile (profile) is taken
+// on, and what the pool is measured against. On by default.
+on_pool(on: bool) { g_on_pool = on }
+
+evaluate_block(start: int, end: int, worker: int, context: ptr) {
+    pass = context as *BatchPass
+    chosen = pass.animators as ptr[]
+    k = start
+    while k < end {
+        a = chosen[k] as *Animator
+        a.batch_drawn = evaluate_pose(a, pass.dt)
+        a.batch_frame = pass.frame
+        a.batched = true
+        k = k + 1
+    }
 }
 
 // The frame's pose after `dt` seconds, written to the figure's joints. The
 // pose phase calls it; a program stepping its engine by hand calls
 // update_now after engine_update for what the frame drew.
 evaluate(a: *Animator, dt: float) {
-    a.showing = false
     if a.paused {
+        a.showing = false
         read_paused(a, dt)
         return
     }
+    if evaluate_pose(a, dt) { evaluate_posts(a) }
+}
+
+// The steps after the graph, where the graph draws them (not at the fixed
+// step: set_fixed's run them in the pose phase).
+evaluate_posts(a: *Animator) {
+    if a.fixed { return }
+    clock = profile_now()
+    run_posts(a)
+    profile_add(PROF_POSTS, clock)
+}
+
+// The graph evaluated and its pose written to the joints: all of the frame
+// but its steps after the graph. False when nothing was drawn.
+evaluate_pose(a: *Animator, dt: float) -> bool {
+    a.showing = false
     // Every frame, as by default: the graph carried on by the frame and its
     // pose drawn.
     if (a.every <= 1 && a.ahead <= 0.0) || !a.evaluated {
-        if !graph_timed(a, dt, dt, false) { return }
+        if !graph_timed(a, dt, dt, false) { return false }
         a.ahead = 0.0
         a.span = dt
         a.lod_moved = core.vec3(0.0, 0.0, 0.0)
@@ -2207,10 +2332,8 @@ evaluate(a: *Animator, dt: float) {
         a.lod_known = true
         clock = profile_now()
         pose.apply(a.rig as *pose.Rig, a.out)
-        clock = profile_add(PROF_APPLY, clock)
-        if !a.fixed { run_posts(a) }
-        profile_add(PROF_POSTS, clock)
-        return
+        profile_add(PROF_APPLY, clock)
+        return true
     }
     // One frame in `every` (set_every): the graph evaluated ahead to the
     // last frame its pose serves, and each frame drawn between the pose
@@ -2243,12 +2366,13 @@ evaluate(a: *Animator, dt: float) {
         drew = graph_timed(a, step, dt, true)
         if locks { ikrig.feet_set_lock(a.feet as *Feet, true) }
         lod_place_back(a)
-        if !drew { return }
+        if !drew { return false }
         a.ahead = ((serves - 1) as float) * dt
         a.span = step
     }
     if a.root_motion { move_object(a, core.v3_mul(a.lod_moved, dt), dt) }
     draw_between(a)
+    return true
 }
 
 // The figure's object put where it will be `lead` seconds on, at the speed
@@ -2291,9 +2415,7 @@ draw_between(a: *Animator) {
     pose.blend(r, a.before, a.out, u, a.shown)
     a.showing = true
     pose.apply(r, a.shown)
-    clock = profile_add(PROF_APPLY, clock)
-    if !a.fixed { run_posts(a) }
-    profile_add(PROF_POSTS, clock)
+    profile_add(PROF_APPLY, clock)
 }
 
 // The graph evaluated over `step` seconds, timed into `cost` (an average
