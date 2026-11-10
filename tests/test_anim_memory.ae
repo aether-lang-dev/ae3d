@@ -12,7 +12,14 @@
 //     the rig's space, against the same take uncompressed; at under a fifth
 //     of its bytes; a still track holds no frames;
 //   - compressed twice, a take decodes to the same bits; and a program that
-//     writes its frames (clips.frame) has them back within the bound.
+//     writes its frames (clips.frame) has them back within the bound;
+//   - the rest (#992): a file held is not parsed again, a second scene of
+//     it its own nodes and skeletons over the first's meshes, shared, a
+//     morphed mesh each scene's own; the frames the skin does not need
+//     dropped from a compressed take, within the same bound; and figures on
+//     one graph file (character.graphed) playing its takes, made once and
+//     compressed, the figure file parsed once, each past the first holding
+//     under 2 MB of its own.
 
 import ae3d.core
 import ae3d.engine
@@ -25,10 +32,24 @@ import ae3d.bvh
 import ae3d.retarget
 import ae3d.animator
 import ae3d.character
+import ae3d.animgraph
+import ae3d.skin
+import std.mem
 
 extern exit(code: int)
+extern clock_ns() -> long
+extern calloc(count: int, size: int) -> ptr
+extern free(block: ptr)
 
 const MANNEQUIN = "tests/fixtures/people/mannequin.glb"
+const VRM = "tests/fixtures/people/vroid_base_female.vrm"
+const RIGIFY = "tests/fixtures/people/ual1_rigify.glb"
+const RUNNER_GRAPH = "tests/fixtures/graphs/runner.graph"
+// Graph-driven figures made in a row (bench_animlod makes 100).
+const GRAPHED = 12
+// The walk's frames held still for key reduction.
+const HOLD_FROM = 40
+const HOLD_TO = 100
 const GAITS = "tests/fixtures/people/100style/neutral"
 const STOP = "tests/fixtures/people/100style/neutral_arrive.bvh"
 const START = "tests/fixtures/people/100style/startstop_start.bvh"
@@ -164,15 +185,188 @@ same_bits(r: *pose.Rig, a: *Take, b: *Take) -> bool {
     return same
 }
 
+mib(bytes: long) -> float { return (bytes as float) / 1048576.0 }
+
+// Whether scene `b` of a file holds its own nodes and skeletons (its bones
+// its own nodes) and draws `a`'s meshes, shared, where they are not
+// morphed.
+shares_meshes(a: *GltfScene, b: *GltfScene) -> bool {
+    if gltf.primitive_count(a) == 0 || gltf.primitive_count(a) != gltf.primitive_count(b) || gltf.model_count(a) != gltf.model_count(b) { return false }
+    k = 0
+    while k < gltf.model_count(a) {
+        if gltf.model(a, k) == gltf.model(b, k) { return false }
+        k = k + 1
+    }
+    k = 0
+    while k < gltf.primitive_count(a) {
+        pa = gltf.primitive(a, k)
+        pb = gltf.primitive(b, k)
+        if pa.morph == null && (pa.mesh != pb.mesh || core.model_mesh_users(pb) < 3) { return false }
+        k = k + 1
+    }
+    if gltf.skeleton_count(a) == 0 || gltf.skeleton_count(a) != gltf.skeleton_count(b) { return false }
+    k = 0
+    while k < gltf.skeleton_count(a) {
+        sa = gltf.skeleton(a, k)
+        sb = gltf.skeleton(b, k)
+        if sa == sb || skin.skeleton_count(sa) != skin.skeleton_count(sb) || skin.skeleton_bone(sa, 0) == skin.skeleton_bone(sb, 0) { return false }
+        k = k + 1
+    }
+    return true
+}
+
+// Of two scenes of one file: its morphed meshes, how many of them are each
+// scene's own, and how many of the rest are shared.
+morph_meshes(a: *GltfScene, b: *GltfScene) -> (int, int, int) {
+    morphed = 0
+    own = 0
+    shared = 0
+    k = 0
+    while k < gltf.primitive_count(a) && k < gltf.primitive_count(b) {
+        pa = gltf.primitive(a, k)
+        pb = gltf.primitive(b, k)
+        if pa.morph != null {
+            morphed = morphed + 1
+            if pb.morph != null && pb.morph != pa.morph && pa.mesh != pb.mesh && core.model_mesh_users(pb) == 1 { own = own + 1 }
+        } else if pa.mesh == pb.mesh {
+            shared = shared + 1
+        }
+        k = k + 1
+    }
+    return morphed, own, shared
+}
+
+// Whether `b`'s springs have their joints on `b`'s nodes, not `a`'s.
+own_springs(a: *GltfScene, b: *GltfScene) -> bool {
+    if gltf.spring_count(a) == 0 || gltf.spring_count(a) != gltf.spring_count(b) { return false }
+    ja = gltf.spring_joint(gltf.spring(a, 0), 0)
+    jb = gltf.spring_joint(gltf.spring(b, 0), 0)
+    return ja.node != null && jb.node != null && ja.node != jb.node && gltf.find(b, (jb.node as *Model).name) == jb.node as *Model
+}
+
+// Take `t`'s frames `from` to `to` all frame `from`'s pose.
+hold_frames(r: *pose.Rig, t: *Take, from: int, to: int) {
+    f = from + 1
+    while f <= to {
+        pose.copy(r, clips.frame(t, from), clips.frame(t, f))
+        f = f + 1
+    }
+}
+
+// Over the takes animator `a`'s states play, each once: their frames, the
+// keys kept of them, the bytes the dropped frames' records held less the
+// keys' index, and the bytes they hold.
+key_saving(a: *Animator) -> (int, int, long, long) {
+    seen = calloc(256, 8) as ptr[]
+    count = 0
+    frames = 0
+    kept = 0
+    long saved = 0
+    long held = 0
+    s = 0
+    while s < animator.state_count(a) {
+        j = 0
+        while j < animator.state_take_count(a, s) {
+            t = animator.state_take_at(a, s, j)
+            known = false
+            k = 0
+            while k < count {
+                if seen[k] == t as ptr { known = true }
+                k = k + 1
+            }
+            if !known && count < 256 && clips.compressed(t) {
+                seen[count] = t as ptr
+                count = count + 1
+                n, record = clips.keys_kept(t)
+                frames = frames + clips.frames(t)
+                kept = kept + n
+                if n < clips.frames(t) { saved = saved + (((clips.frames(t) - n) * record - (n + clips.frames(t)) * 4) as long) }
+                held = held + clips.take_bytes(t)
+            }
+            j = j + 1
+        }
+        s = s + 1
+    }
+    free(seen as ptr)
+    return frames, kept, saved, held
+}
+
+// GRAPHED figures on one graph file (#992): its takes made once, compressed
+// and shared; the figure file parsed once; each figure's own bytes, from the
+// heap's count, past the first (which made what is shared).
+graph_figures(e: *Engine) {
+    people = calloc(GRAPHED, 8) as ptr[]
+    parsed = gltf.parses()
+    long first = 0
+    long last_bytes = 0
+    last_ms = 0.0
+    long after_first = 0
+    i = 0
+    while i < GRAPHED {
+        before = mem.heap_in_use()
+        began = clock_ns()
+        c = character.graphed(e, "Runner", RIGIFY, RUNNER_GRAPH)
+        took = ((clock_ns() - began) as float) / 1000000.0
+        if c == null {
+            println("  no runner: ${character.error()}")
+            exit(1)
+        }
+        people[i] = c as ptr
+        if i == 0 {
+            first = mem.heap_in_use() - before
+            after_first = mem.heap_in_use()
+        }
+        if i == GRAPHED - 1 {
+            last_bytes = mem.heap_in_use() - before
+            last_ms = took
+        }
+        i = i + 1
+    }
+    own = (mem.heap_in_use() - after_first) / ((GRAPHED - 1) as long)
+    g1 = character.graph_of(people[0] as *Character)
+    gn = character.graph_of(people[GRAPHED - 1] as *Character)
+    names = ["idle", "walk", "jump", "fw", "fw_m"]
+    same = true
+    k = 0
+    while k < 5 {
+        t1 = animgraph.take_of(g1, names[k])
+        tn = animgraph.take_of(gn, names[k])
+        if t1 == null || t1 != tn || !clips.compressed(t1) || clips.compress_error(t1) > clips.COMPRESS_ERROR { same = false }
+        k = k + 1
+    }
+    println("  ${GRAPHED} runners on ${RUNNER_GRAPH}: the first ${mib(first)} MB (the file's parse and the graph's takes among it); each after ${mib(own)} MB of its own; the last made in ${last_ms} ms and ${mib(last_bytes)} MB; files parsed ${gltf.parses() - parsed}")
+    gf, gk, gs, gh = key_saving(character.animator_of(people[0] as *Character))
+    println("  the graph's state takes: ${gk} keys kept of ${gf} frames; ${gs} bytes saved by dropping the rest, of ${gh + gs}")
+    check("figures on one graph file play its takes, made once and compressed", same)
+    check("the figure file parsed once for all of them: the last figure parses no file", gltf.parses() - parsed == 1)
+    check("each figure past the first holds under 2 MB of its own", own < (2097152 as long))
+    i = 0
+    while i < GRAPHED {
+        character.character_free(people[i] as *Character)
+        i = i + 1
+    }
+    free(people as ptr)
+}
+
 main() {
-    println("anim_memory: a figure's animation shared and compressed (#990)")
-    // A file's animations read once.
+    println("anim_memory: a figure's animation shared and compressed (#990, #992)")
+    // A file's animations read once, and the file parsed once (#992).
+    parsed = gltf.parses()
+    began = clock_ns()
     s1 = gltf.load(MANNEQUIN)
+    first_ms = ((clock_ns() - began) as float) / 1000000.0
+    heap_before = mem.heap_in_use()
+    began = clock_ns()
     s2 = gltf.load(MANNEQUIN)
+    again_ms = ((clock_ns() - began) as float) / 1000000.0
+    again_bytes = mem.heap_in_use() - heap_before
     if s1 == null || s2 == null {
         println("  cannot read ${MANNEQUIN}")
         exit(1)
     }
+    println("  the file loaded in ${first_ms} ms; again, while held, in ${again_ms} ms and ${mib(again_bytes)} MB of its own; parses ${gltf.parses() - parsed}")
+    check("a file held is not parsed again: two scenes, one parse", gltf.parses() - parsed == 1)
+    check("and the second scene's own nodes, skeletons and meshes' models over the first's meshes, shared", shares_meshes(s1, s2))
     clips_same = gltf.clip_count(s1) == gltf.clip_count(s2) && gltf.clip_count(s1) > 100
     own_nodes = true
     i = 0
@@ -194,7 +388,20 @@ main() {
     gltf.scene_destroy(s2)
     s3 = gltf.load(MANNEQUIN)
     check("read again after both are freed, it holds them alone", s3 != null && gltf.anims_users(s3) == 1 && gltf.clip_count(s3) > 100)
+    check("and, its parse gone with them, parsed again", gltf.parses() - parsed == 2)
     gltf.scene_destroy(s3)
+    // A morphed mesh is each scene's own: its targets reshape it per figure.
+    v1 = gltf.load(VRM)
+    v2 = gltf.load(VRM)
+    if v1 == null || v2 == null {
+        println("  cannot read ${VRM}")
+        exit(1)
+    }
+    morphed, own, shared = morph_meshes(v1, v2)
+    println("  the VRM's ${gltf.primitive_count(v1)} meshes: ${morphed} morphed, each scene's own (${own}); ${shared} shared; ${gltf.spring_count(v2)} springs")
+    check("a scene's morphed meshes are its own, the rest shared, and its springs on its own nodes", morphed > 0 && own == morphed && shared == gltf.primitive_count(v1) - morphed && own_springs(v1, v2))
+    gltf.scene_destroy(v1)
+    gltf.scene_destroy(v2)
 
     // One copy of each take: two characters of one figure on one set of gaits.
     e = engine.engine_new()
@@ -238,6 +445,28 @@ main() {
     check("compressed, it moves no point of the skin more than 0.1 mm (its own measure)", err >= 0.0 && err <= clips.COMPRESS_ERROR)
     check("sampled between its frames, every joint and its virtual vertices within 0.1 mm of the take's own", apart <= clips.COMPRESS_ERROR)
     check("at under a fifth of its bytes", after * (5 as long) < before)
+    // Key reduction (#992): a frame dropped where the blend of the keys
+    // either side holds the skin within the bound. A capture's walk, its
+    // stand and its starts and stops keep every frame: dropping one frame
+    // of the walk moves the skin 6 to 25 mm, of a stand 0.2 to 0.4 mm.
+    kept, record = clips.keys_kept(packed)
+    println("  the walk's keys: ${kept} of ${clips.frames(packed)} frames kept (${record} bytes a key)")
+    frames_all, kept_all, saved_all, held_all = key_saving(a1)
+    println("  the gaits' takes: ${kept_all} keys kept of ${frames_all} frames; ${saved_all} bytes saved by dropping the rest, ${(saved_all as float) * 100.0 / ((held_all + saved_all) as float)}% of what they held with every frame")
+    // A stretch of the walk held still (a stand within a take, as a stop's
+    // rest): its frames the blend of its ends, dropped.
+    still_raw = captured(r, WALK)
+    still_packed = captured(r, WALK)
+    hold_frames(r, still_raw, HOLD_FROM, HOLD_TO)
+    hold_frames(r, still_packed, HOLD_FROM, HOLD_TO)
+    still_before = clips.take_bytes(still_packed)
+    still_err = clips.compress(still_packed, r)
+    still_kept, still_record = clips.keys_kept(still_packed)
+    still_apart = sampled_apart(r, still_raw, still_packed, d)
+    println("  the walk with frames ${HOLD_FROM} to ${HOLD_TO} held: ${still_kept} keys kept of ${clips.frames(still_packed)} (${still_record} bytes a key), ${still_before} bytes compressed to ${clips.take_bytes(still_packed)}; the skin within ${still_err * 1000.0} mm over its frames, ${still_apart * 1000.0} mm sampled between them")
+    check("frames the skin does not need dropped (a stretch held), within the same bound at the skin, sampled anywhere", still_kept <= clips.frames(still_packed) - (HOLD_TO - HOLD_FROM - 1) && still_err >= 0.0 && still_err <= clips.COMPRESS_ERROR && still_apart <= clips.COMPRESS_ERROR)
+    clips.take_free(still_raw)
+    clips.take_free(still_packed)
     check("its still tracks hold no frames (some of every joint's tracks are still)", still > 0 && still + q16 + f32s + f64s == pose.count(r) * 3)
     check("compressed twice, it decodes to the same bits", same_bits(r, packed, again))
     // Written back: a program that writes its frames has them as decoded.
@@ -250,6 +479,7 @@ main() {
     character.character_free(c1)
     character.character_free(c2)
     character.gaits_free(g)
+    graph_figures(e)
     figure.figures_free(e)
     engine.engine_free(e)
     if g_failures == 0 {

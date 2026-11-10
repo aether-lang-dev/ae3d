@@ -36,7 +36,7 @@ exports (
     frame, sample, sample_frame, extract_root, root_under_pelvis, root_joint, travel, root_delta, has_root_motion,
     contact, planted, find_contacts, contacts_like, speed, even_root, foot_down, phase_of, time_at_phase, time_of, ground_point, up_of, heading,
     ground_carry,
-    compress, compressed, compress_error, take_bytes, track_kinds, COMPRESS_ERROR
+    compress, compressed, compress_error, take_bytes, track_kinds, keys_kept, COMPRESS_ERROR
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -1681,6 +1681,11 @@ braking_from(t: *Take) -> (float, float) {
 // shared out along the longest chain. Then the whole take is decoded, frame
 // by frame, and every joint's points measured against the take's own in
 // the rig's space; a chain past the bound is made finer until none is.
+// Then the frames the skin does not need are dropped (#992, ACL's keyframe
+// stripping): a frame between two kept keys is their blend, kept out only
+// where that blend holds every frame between, and every point halfway
+// between two, within the bound; sampling looks its keys up by the frame
+// (each frame's key at or before it), so it costs what it did.
 // A take compressed is the same take: sample and sample_frame decode it as
 // they read it, and a program that writes its frames (frame) has them back
 // as they were decoded.
@@ -1707,7 +1712,20 @@ struct Packed {
     still_blend: ptr               // and as a blend between two frames gives them: each still turn over its length, as an nlerp of it with itself
     moving: ptr                    // int[]: the tracks that move, decoded over it
     moving_count: int
+    // Key reduction (#992): the frames whose records are kept, in order, the
+    // first and the last always; a frame between two is their blend. Null
+    // with every frame kept (`bytes` a record a frame).
+    keys: ptr                      // int[key_count]: each key's frame
+    key_of: ptr                    // int[frames]: each frame's key at or before it
+    key_count: int
 }
+
+// How close to the bound a frame dropped between two keys may put the skin:
+// the measure is at the frames and halfway between them, and a sample
+// anywhere between keeps under the bound with this to spare.
+const KEY_SHARE = 0.9
+// The most frames one pair of keys spans, so the search stays linear.
+const KEY_SPAN = 64
 
 // How many numbers a joint's track `part` has (0 its translation, 1 its
 // rotation, 2 its scale), and where they start in the joint's pose.
@@ -1767,6 +1785,12 @@ compress(t: *Take, rig: *Rig) -> float {
         pack_fill(t, pk)
         err, worst = pack_measure(t, rig, pk, shell)
         rounds = rounds + 1
+    }
+    // Then the frames the skin does not need, dropped: each the blend of
+    // the keys either side of it (ACL's keyframe stripping), within the
+    // bound, measured again over every frame.
+    if err <= COMPRESS_ERROR && pack_reduce(t, rig, pk, shell) {
+        err, _w = pack_measure(t, rig, pk, shell)
     }
     pk.error = err
     free(shell as ptr)
@@ -2105,13 +2129,30 @@ track_read(pk: *Packed, rec: ptr, k: int) -> (float, float, float, float) {
     return s64[0], s64[1], s64[2], 0.0
 }
 
-// Frame `f` of a compressed take decoded into pose `out`.
+// Frame `f` of a compressed take decoded into pose `out`: its record, or,
+// a frame dropped (pack_reduce), the blend of the keys either side of it.
 packed_frame(t: *Take, f: int, out: ptr) {
     pk = t.packed as *Packed
     k0 = f
     if k0 < 0 { k0 = 0 }
     if k0 >= t.frames { k0 = t.frames - 1 }
-    rec = pk.bytes + k0 * pk.record
+    if pk.keys == null {
+        record_decode(t, pk, pk.bytes + k0 * pk.record, out)
+    } else {
+        keys = pk.keys as int[]
+        ka = (pk.key_of as int[])[k0]
+        if keys[ka] == k0 {
+            record_decode(t, pk, pk.bytes + ka * pk.record, out)
+        } else {
+            ra = pk.bytes + ka * pk.record
+            records_blend(t, pk, ra, ra + pk.record, ((k0 - keys[ka]) as float) / ((keys[ka + 1] - keys[ka]) as float), out)
+        }
+    }
+    packed_curves(t, k0, k0, 0.0, out)
+}
+
+// Record `rec`'s pose (the take's tracks; not its curves) into `out`.
+record_decode(t: *Take, pk: *Packed, rec: ptr, out: ptr) {
     o = out as float[]
     memcpy(out, pk.still, ((t.count * pose.FLOATS) as long) * (8 as long))
     moving = pk.moving as int[]
@@ -2126,7 +2167,6 @@ packed_frame(t: *Take, f: int, out: ptr) {
         if k % 3 == 1 { o[at + 3] = w }
         m = m + 1
     }
-    packed_curves(t, k0, k0, 0.0, out)
 }
 
 // The curves `u` of the way from frame `f0` to frame `f1`, lerped as
@@ -2167,11 +2207,28 @@ packed_blend(t: *Take, f0: int, u: float, out: ptr) {
         return
     }
     pk = t.packed as *Packed
+    ra = pk.bytes + f0 * pk.record
+    w = u
+    if pk.keys != null {
+        // Between the keys either side (pack_reduce): the last frame is
+        // one, so a frame before it has one after it.
+        keys = pk.keys as int[]
+        ka = (pk.key_of as int[])[f0]
+        ra = pk.bytes + ka * pk.record
+        w = (((f0 - keys[ka]) as float) + u) / ((keys[ka + 1] - keys[ka]) as float)
+    }
+    records_blend(t, pk, ra, ra + pk.record, w, out)
+    packed_curves(t, f0, f0 + 1, u, out)
+}
+
+// Records `ra` and `rb` blended `u` of the way (0 < u < 1) into `out`, the
+// take's tracks (not its curves): each track decoded at the two and blended
+// as pose.blend blends two poses, places and scales lerped and turns
+// nlerped the short way; a still track written once.
+records_blend(t: *Take, pk: *Packed, ra: ptr, rb: ptr, u: float, out: ptr) {
     kinds = pk.kinds as int[]
     offsets = pk.at as int[]
     v = pk.values as float[]
-    ra = pk.bytes + f0 * pk.record
-    rb = ra + pk.record
     o = out as float[]
     memcpy(out, pk.still_blend, ((t.count * pose.FLOATS) as long) * (8 as long))
     moving = pk.moving as int[]
@@ -2205,7 +2262,6 @@ packed_blend(t: *Take, f0: int, u: float, out: ptr) {
         }
         m = m + 1
     }
-    packed_curves(t, f0, f0 + 1, u, out)
 }
 
 // Two turns nlerped `u` of the way the short way, into `o` at `at`, as
@@ -2308,6 +2364,112 @@ pack_finer(rig: *Rig, pk: *Packed, j: int) {
     }
 }
 
+// The keys `pk` (every frame a record) keeps: from each key, the next is the
+// farthest frame (at most KEY_SPAN on) whose blend with it puts every frame
+// between, and every point halfway between two frames, within KEY_SHARE of
+// the bound at the skin of the take's own, in the rig's space (each joint
+// and its virtual vertices `shell` along its axes). The records not kept
+// go. Whether any frame was dropped.
+pack_reduce(t: *Take, rig: *Rig, pk: *Packed, shell: float[]) -> bool {
+    frames = t.frames
+    if frames < 3 { return false }
+    size = pose.size(rig)
+    bound = COMPRESS_ERROR * KEY_SHARE
+    // The take's own poses in the rig's space, at its frames and halfway.
+    at_frames = calloc(frames * size + 1, 8)
+    halves = calloc(frames * size + 1, 8)
+    raw = pose.new(rig)
+    mid = pose.new(rig)
+    f = 0
+    while f < frames {
+        pose.copy(rig, t.data + f * t.stride * 8, raw)
+        pose.world(rig, raw, at_frames + f * size * 8)
+        if f + 1 < frames {
+            pose.blend(rig, t.data + f * t.stride * 8, t.data + (f + 1) * t.stride * 8, 0.5, mid)
+            pose.world(rig, mid, halves + f * size * 8)
+        }
+        f = f + 1
+    }
+    got = pose.new(rig)
+    wb = pose.new(rig)
+    keys = calloc(frames + 1, 4) as int[]
+    count = 1
+    keys[0] = 0
+    a = 0
+    while a < frames - 1 {
+        b = a + 1
+        // The farthest b whose span holds; a span of one always does.
+        while b + 1 < frames && b + 1 - a <= KEY_SPAN && span_holds(t, rig, pk, a, b + 1, at_frames, halves, got, wb, shell, bound) { b = b + 1 }
+        keys[count] = b
+        count = count + 1
+        a = b
+    }
+    pose.release(raw)
+    pose.release(mid)
+    pose.release(got)
+    pose.release(wb)
+    free(at_frames)
+    free(halves)
+    if count >= frames {
+        free(keys as ptr)
+        return false
+    }
+    // The kept records, in order, and each frame's key.
+    bytes = calloc(count * pk.record + 8, 1)
+    key_of = calloc(frames + 1, 4) as int[]
+    k = 0
+    while k < count {
+        memcpy(bytes + k * pk.record, pk.bytes + keys[k] * pk.record, pk.record as long)
+        f = keys[k]
+        last = frames
+        if k + 1 < count { last = keys[k + 1] }
+        while f < last {
+            key_of[f] = k
+            f = f + 1
+        }
+        k = k + 1
+    }
+    free(pk.bytes)
+    pk.bytes = bytes
+    pk.keys = keys as ptr
+    pk.key_of = key_of as ptr
+    pk.key_count = count
+    return true
+}
+
+// Whether keys at frames `a` and `b` (records as every frame has one now)
+// blended put every frame between them, and every point halfway between
+// two frames, within `bound` of the take's own (`at_frames` and `halves`,
+// rig space). `got` and `wb` scratch.
+span_holds(t: *Take, rig: *Rig, pk: *Packed, a: int, b: int, at_frames: ptr, halves: ptr, got: ptr, wb: ptr, shell: float[], bound: float) -> bool {
+    size = pose.size(rig)
+    ra = pk.bytes + a * pk.record
+    rb = pk.bytes + b * pk.record
+    span = (b - a) as float
+    i = a
+    while i < b {
+        // Frame i (a's own is exact) and halfway on to the next.
+        h = 0
+        while h < 2 {
+            if i > a || h == 1 {
+                x = (i as float) + 0.5 * (h as float)
+                records_blend(t, pk, ra, rb, (x - (a as float)) / span, got)
+                pose.world(rig, got, wb)
+                want = at_frames + i * size * 8
+                if h == 1 { want = halves + i * size * 8 }
+                j = 0
+                while j < t.count {
+                    if pack_point_error(want, wb, j, shell[j]) > bound { return false }
+                    j = j + 1
+                }
+            }
+            h = h + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
 // The frames written back from their records: a program that writes a
 // take's frames has them as they were decoded, the take no longer
 // compressed.
@@ -2335,7 +2497,19 @@ packed_free(pk: *Packed) {
     if pk.still != null { free(pk.still) }
     if pk.still_blend != null { free(pk.still_blend) }
     if pk.moving != null { free(pk.moving) }
+    if pk.keys != null { free(pk.keys) }
+    if pk.key_of != null { free(pk.key_of) }
     heap.free(pk)
+}
+
+// How many of compressed take `t`'s frames are kept as keys (the rest
+// blended from them, #992), and the bytes a key's record holds; its frames
+// and 0 for a take that is not compressed.
+keys_kept(t: *Take) -> (int, int) {
+    if t == null || t.packed == null { return t.frames, 0 }
+    pk = t.packed as *Packed
+    if pk.keys == null { return t.frames, pk.record }
+    return pk.key_count, pk.record
 }
 
 // Whether take `t` is compressed, and the most its compression moves a
@@ -2355,7 +2529,13 @@ take_bytes(t: *Take) -> long {
     if t.packed != null {
         pk = t.packed as *Packed
         // Its records; each track's kind, place, numbers and listing; its two still poses.
-        total = total + (t.frames as long) * (pk.record as long) + ((t.count * 3) as long) * (76 as long) + ((t.count * pose.FLOATS) as long) * (16 as long)
+        records = t.frames
+        if pk.keys != null {
+            // A record a key, and each key's frame and each frame's key.
+            records = pk.key_count
+            total = total + ((pk.key_count + t.frames) as long) * (4 as long)
+        }
+        total = total + (records as long) * (pk.record as long) + ((t.count * 3) as long) * (76 as long) + ((t.count * pose.FLOATS) as long) * (16 as long)
         if pk.curves != null { total = total + ((t.frames * (t.stride - t.count * pose.FLOATS)) as long) * (8 as long) }
     } else if t.data != null {
         total = total + ((t.frames * t.stride) as long) * (8 as long)
