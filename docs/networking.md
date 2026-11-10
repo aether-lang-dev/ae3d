@@ -348,6 +348,7 @@ netanim.look(f, point)                                 // look_ahead, look_free,
 netanim.knock(f, body, impulse)                        // the full ragdoll, LIMP, the blow on a body
 netanim.get_up(f, 0.4)                                 // character.get_up; also hit and act
 netanim.sent(na, now)                                  // after the engine's step: the tick closed and streamed
+netanim.flush(na, now)                                 // as the figures stop: the last ticks streamed now
 
 while netanim.due(na, now) {                           // a peer
     netanim.play(na)                                   // the next tick's inputs and events to its figures
