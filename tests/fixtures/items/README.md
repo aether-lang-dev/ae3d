@@ -34,6 +34,11 @@ A kind declares:
   joint named as UE5's mannequin names it, offset from the joint and turned
   in the body's frame (x to its left, y up, z ahead), its handle along `up`
   and its front along `front`;
+- `aim <joint> <offset> <up> <front>`: where it is held aimed
+  (`items.aim`), read as a socket is: a rifle on the chest, its butt at the
+  right shoulder, bladed across it. Aimed, it rides on that joint, the
+  trunk turns the line from its main grip along its front onto the point,
+  and both hands go on their grips;
 - `hold <animation>`: the pose its arms are held in while it is held
   between swings, that take's first frame (a sword's ready guard), on the
   main arm, and on both for a two-handed kind (a bowl's carry);
