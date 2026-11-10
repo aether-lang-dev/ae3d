@@ -1,0 +1,469 @@
+// The generic pieces fighting is built on (#907), held to numbers on the UE5
+// mannequin. Which moves a fight has, their order, timing and damage are
+// the game's; these are the mechanisms it builds them on. No window; the
+// engine stepped by hand at 60 Hz.
+//
+//   - mocap fight takes onto the mannequin: UAL1's cross punch and jab
+//     (Rigify): every humanoid bone points where the source's does and
+//     turns as it turns, within 2 degrees, every frame; with the feet kept
+//     on their contacts, the spine, arms, hands and head still within 2
+//     degrees and a planted toe sliding under 5 mm a stance (the legs bend
+//     off the source's as far as keeping the feet on a body of other
+//     proportions takes, printed). CMU's subject 02 punching and striking
+//     (02_05) reads from its gzip'd AMC, and CMU's BVH conversion maps its
+//     slots onto the ASF's bones (pose.SCHEME_CMU). CMU's take with its
+//     feet kept is not held here yet: its front foot creeps 6 cm through
+//     15 s counted as one stance, and held there its toe slid 11 mm and
+//     its legs bent 14 degrees off the capture's (#907);
+//   - changes between fight takes: from every fight take present (guard,
+//     strike, block, recover, the mannequin's own and those retargeted) into
+//     every other, from three places in the first, inertialized, no joint
+//     faster than the two takes' own plus what the easing needs.
+import std.string
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.figure
+import ae3d.pose
+import ae3d.clips
+import ae3d.animator
+import ae3d.ikrig
+import ae3d.retarget
+import ae3d.bvh
+import ae3d.metrics
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+const STEP = 0.016666666666666666
+const RIGIFY = "tests/fixtures/people/ual1_rigify.glb"
+const MANNEQUIN = "tests/fixtures/people/mannequin.glb"
+const CMU = "tests/fixtures/people/cmu/"
+const SLIDE = 0.005
+// Two degrees, one degree.
+const TWO_DEGREES = 0.034906585
+const ONE_DEGREE = 0.017453293
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+fresh() -> *Engine {
+    e = engine.engine_new()
+    engine.engine_set_fixed_step(e, STEP)
+    return e
+}
+
+flat_distance(a: Vec3, b: Vec3) -> float {
+    dx = a.x - b.x
+    dz = a.z - b.z
+    return core.sqrt_of(dx * dx + dz * dz)
+}
+
+// The angle of turn `q`, radians, 0 to pi.
+angle_of(q: Quat) -> float {
+    w = core.abs_of(q.w)
+    if w > 1.0 { w = 1.0 }
+    return 2.0 * core.acos_of(w)
+}
+
+// --- mocap fight takes onto the mannequin -------------------------------------------------------
+
+// A joint's turn in the ground's space.
+ground_turn(r: *pose.Rig, w: ptr, j: int) -> Quat {
+    base = pose.base_model(r)
+    q = pose.rotation(w, j)
+    if base == null { return q }
+    core.model_sync_transform(base)
+    return core.quat_normalize(core.quat_mul(base.world_rotation, q))
+}
+
+// How the take `tt` on `target` follows `ts` on `source` (the source turned
+// by `yaw` to the target's facing), over every frame: the worst angle
+// between their bones (each humanoid joint to the next down its chain,
+// `pairs`), and the worst angle between their joints' turns since the
+// take's first frame (every humanoid body slot both map), the ground's
+// space; the legs apart from the rest (`legs_from` the first leg pair, and
+// the slots from THIGH_L on).
+struct Follow {
+    bones: float
+    bones_slot: int
+    legs: float
+    turns: float
+    turns_slot: int
+    leg_turns: float
+    skipped: int
+}
+
+follows(source: *pose.Rig, ts: *Take, target: *pose.Rig, tt: *Take, yaw: Quat) -> Follow {
+    pairs = [pose.PELVIS, pose.SPINE_01, pose.SPINE_01, pose.SPINE_02, pose.SPINE_02, pose.SPINE_03, pose.SPINE_03, pose.NECK, pose.NECK, pose.HEAD,
+             pose.UPPERARM_L, pose.LOWERARM_L, pose.LOWERARM_L, pose.HAND_L, pose.UPPERARM_R, pose.LOWERARM_R, pose.LOWERARM_R, pose.HAND_R,
+             pose.THIGH_L, pose.CALF_L, pose.CALF_L, pose.FOOT_L, pose.FOOT_L, pose.BALL_L,
+             pose.THIGH_R, pose.CALF_R, pose.CALF_R, pose.FOOT_R, pose.FOOT_R, pose.BALL_R]
+    count = 30
+    legs_from = 18
+    out = Follow { bones: 0.0, bones_slot: 0 - 1, legs: 0.0, turns: 0.0, turns_slot: 0 - 1, leg_turns: 0.0, skipped: 0 }
+    ws = pose.new(source)
+    wt = pose.new(target)
+    firsts_s = pose.new(source)
+    firsts_t = pose.new(target)
+    pose.world(source, clips.frame(ts, 0), firsts_s)
+    pose.world(target, clips.frame(tt, 0), firsts_t)
+    unyaw = core.quat_conjugate(yaw)
+    fr = 0
+    while fr < clips.frames(ts) && fr < clips.frames(tt) {
+        pose.world(source, clips.frame(ts, fr), ws)
+        pose.world(target, clips.frame(tt, fr), wt)
+        k = 0
+        while k < count {
+            // A bone: a joint and its own child. The ASF's root and upper
+            // back have its lower back between them, whose turn rides into
+            // the upper back (pose.SCHEME_ASF): no bone to point.
+            if pose.parent(source, pose.human(source, pairs[k + 1])) != pose.human(source, pairs[k]) {
+                if fr == 0 { out.skipped = out.skipped + 1 }
+                k = k + 2
+                continue
+            }
+            a1 = clips.ground_point(source, pose.translation(ws, pose.human(source, pairs[k])))
+            b1 = clips.ground_point(source, pose.translation(ws, pose.human(source, pairs[k + 1])))
+            a2 = clips.ground_point(target, pose.translation(wt, pose.human(target, pairs[k])))
+            b2 = clips.ground_point(target, pose.translation(wt, pose.human(target, pairs[k + 1])))
+            d1 = core.quat_apply(yaw, core.v3_normalize(core.v3_sub(b1, a1)))
+            d = core.acos_of(core.clampf(core.v3_dot(d1, core.v3_normalize(core.v3_sub(b2, a2))), 0.0 - 1.0, 1.0))
+            if k >= legs_from {
+                if d > out.legs { out.legs = d }
+            } else if d > out.bones {
+                out.bones = d
+                out.bones_slot = pairs[k]
+            }
+            k = k + 2
+        }
+        slot = pose.PELVIS
+        while slot < pose.FINGERS {
+            js = pose.human(source, slot)
+            jt = pose.human(target, slot)
+            if js >= 0 && jt >= 0 {
+                since_s = core.quat_mul(ground_turn(source, ws, js), core.quat_conjugate(ground_turn(source, firsts_s, js)))
+                since_s = core.quat_mul(yaw, core.quat_mul(since_s, unyaw))
+                since_t = core.quat_mul(ground_turn(target, wt, jt), core.quat_conjugate(ground_turn(target, firsts_t, jt)))
+                d = angle_of(core.quat_mul(since_t, core.quat_conjugate(since_s)))
+                if slot >= pose.THIGH_L {
+                    if d > out.leg_turns { out.leg_turns = d }
+                } else if d > out.turns {
+                    out.turns = d
+                    out.turns_slot = slot
+                }
+            }
+            slot = slot + 1
+        }
+        fr = fr + 1
+    }
+    pose.release(ws)
+    pose.release(wt)
+    pose.release(firsts_s)
+    pose.release(firsts_t)
+    return out
+}
+
+// The worst a planted toe's tip slides over the ground through one of the
+// take's stances (the take's own planted frames). `probe` finds the tips
+// (null: the ball's child joint, a capture's End Site).
+worst_stance_slide(r: *pose.Rig, t: *Take, probe: *Feet) -> float {
+    w = pose.new(r)
+    from = [core.vec3(0.0, 0.0, 0.0), core.vec3(0.0, 0.0, 0.0)]
+    was = [false, false]
+    worst = 0.0
+    fr = 0
+    while fr < clips.frames(t) {
+        pose.world(r, clips.frame(t, fr), w)
+        side = 0
+        while side < 2 {
+            tip = core.vec3(0.0, 0.0, 0.0)
+            if probe != null {
+                tip = ikrig.toe_tip(probe, r, w, side)
+            } else {
+                ball = pose.human(r, pose.BALL_L)
+                if side == 1 { ball = pose.human(r, pose.BALL_R) }
+                end = pose.find(r, "${pose.name(r, ball)}_end")
+                tip = clips.ground_point(r, pose.translation(w, end))
+            }
+            planted = clips.planted(t, side, (fr as float) / clips.rate(t), false)
+            if planted && !was[side] { from[side] = tip }
+            if planted {
+                d = flat_distance(tip, from[side])
+                if d > worst { worst = d }
+            }
+            was[side] = planted
+            side = side + 1
+        }
+        fr = fr + 1
+    }
+    pose.release(w)
+    return worst
+}
+
+// Frames of take `t` with either foot planted.
+stance_frames(t: *Take) -> int {
+    n = 0
+    fr = 0
+    while fr < clips.frames(t) {
+        at = (fr as float) / clips.rate(t)
+        if clips.planted(t, 0, at, false) || clips.planted(t, 1, at, false) { n = n + 1 }
+        fr = fr + 1
+    }
+    return n
+}
+
+// Take `ts` of `source` onto the mannequin with its feet kept, held to the
+// bounds; the retargeted take (the caller frees it).
+fight_onto(title: string, source: *pose.Rig, ts: *Take, probe_s: *Feet, target: *pose.Rig, probe: *Feet) -> *Take {
+    fs = retarget.facing(source)
+    ft = retarget.facing(target)
+    yaw = core.quat_rotate(core.atan2_of(fs.z * ft.x - fs.x * ft.z, fs.x * ft.x + fs.z * ft.z), core.vec3(0.0, 1.0, 0.0))
+    kept = retarget.retarget(source, ts, target)
+    f = follows(source, ts, target, kept, yaw)
+    own = worst_stance_slide(source, ts, probe_s)
+    slid = worst_stance_slide(target, kept, probe)
+    stances = stance_frames(kept)
+    // Turned bone by bone alone, every bone, legs too.
+    turned = retarget.retarget_with(source, ts, target, false)
+    u = follows(source, ts, target, turned, yaw)
+    clips.take_free(turned)
+    worst_u = u.bones
+    if u.legs > worst_u { worst_u = u.legs }
+    if u.turns > worst_u { worst_u = u.turns }
+    if u.leg_turns > worst_u { worst_u = u.leg_turns }
+    worst_kept = f.bones
+    if f.turns > worst_kept { worst_kept = f.turns }
+    worst_legs = f.legs
+    if f.leg_turns > worst_legs { worst_legs = f.leg_turns }
+    println("  ${title}: ${clips.frames(ts)} frames at ${clips.rate(ts)}/s onto the mannequin; turned bone by bone, its ${15 - u.skipped} bones and every joint's turn within ${worst_u * 57.29578} degrees of the source's")
+    println("    with its feet kept: spine, arms and head within ${f.bones * 57.29578} degrees (${pose.name(target, pose.human(target, f.bones_slot))}), their turns ${f.turns * 57.29578} (${pose.name(target, pose.human(target, f.turns_slot))}); the legs bent ${worst_legs * 57.29578} off the source's to keep the feet")
+    println("    a planted toe slides ${slid * 1000.0} mm a stance at most over ${stances} planted frames (the source's own ${own * 1000.0} mm)")
+    check("${title}: onto the UE5 mannequin, every bone points where the source's does and turns as it turns, within 2 degrees, every frame", worst_u < TWO_DEGREES)
+    check("${title}: with its feet kept, spine, arms, hands and head still within 2 degrees of the source's, every frame", worst_kept < TWO_DEGREES)
+    check("${title}: and a planted toe slides under 5 mm a stance (${stances} frames planted)", slid < SLIDE && stances > 0)
+    return kept
+}
+
+fight_takes() {
+    e = fresh()
+    o = figure.figure(e, "Fighter", MANNEQUIN)
+    target = pose.of_skeleton(figure.skeleton(figure.figure_of(o)))
+    probe = ikrig.feet_new(target, o)
+    // CMU's subject 02 punching and striking, from its own ASF/AMC.
+    c = bvh.load_asf("${CMU}02.asf", "${CMU}02_05.amc.gz", 120.0, 0.0)
+    check("CMU's punch and strike take (02_05) reads from its ASF and its gzip'd AMC: ${bvh.error()}", c != null && bvh.frames(c) == 1854)
+    if c == null { exit(1) }
+    // Its BVH conversion's names (cgspeed's): every body slot on the ASF's
+    // bone, renamed.
+    conv = bvh.load("${CMU}02_01.bvh", bvh.unit(c))
+    rb = bvh.rig(conv)
+    source = bvh.rig(c)
+    same = pose.scheme(rb) == pose.SCHEME_CMU
+    filled = 0
+    asf_names = ["lowerback", "upperback", "thorax", "lowerneck", "upperneck", "head",
+                 "lclavicle", "lhumerus", "lradius", "lwrist", "rclavicle", "rhumerus", "rradius", "rwrist",
+                 "lfemur", "ltibia", "lfoot", "ltoes", "rfemur", "rtibia", "rfoot", "rtoes"]
+    bvh_names = ["LowerBack", "Spine", "Spine1", "Neck", "Neck1", "Head",
+                 "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand", "RightShoulder", "RightArm", "RightForeArm", "RightHand",
+                 "LeftUpLeg", "LeftLeg", "LeftFoot", "LeftToeBase", "RightUpLeg", "RightLeg", "RightFoot", "RightToeBase"]
+    slot = pose.PELVIS
+    while slot < pose.FINGERS {
+        ja = pose.human(source, slot)
+        jb = pose.human(rb, slot)
+        if jb >= 0 { filled = filled + 1 }
+        if slot == pose.PELVIS {
+            same = same && jb == pose.find(rb, "Hips")
+        } else if ja >= 0 {
+            k = 0
+            while k < 22 {
+                if string.equals(pose.name(source, ja), asf_names[k]) == 1 { same = same && jb == pose.find(rb, bvh_names[k]) }
+                k = k + 1
+            }
+        } else {
+            same = same && jb < 0
+        }
+        slot = slot + 1
+    }
+    println("  CMU's BVH conversion: ${filled} body slots in its own naming (scheme ${pose.scheme(rb)}), each on the ASF's bone: ${same}")
+    check("CMU's BVH conversion maps its 22 body slots onto the ASF's bones (Spine1 the thorax, Neck and Neck1 the lower and upper neck), not as Mixamo's", same && filled == 22)
+    bvh.capture_free(conv)
+    bvh.capture_free(c)
+    // UAL1's melee: its sword attack and its cross punch, on Rigify.
+    so = figure.figure(e, "Source", RIGIFY)
+    sf = figure.figure_of(so)
+    behaviour.object_set_position(so, core.vec3(4.0, 0.0, 0.0))
+    rig_s = pose.of_skeleton(figure.skeleton(sf))
+    probe_u = ikrig.feet_new(rig_s, so)
+    // Its punches: the sword attack has no stance to keep (its lunge slides
+    // both feet, made in place and with its root motion alike).
+    names = ["Punch_Cross", "Punch_Jab"]
+    titles = ["UAL1's cross punch", "UAL1's jab"]
+    k = 0
+    while k < 2 {
+        t = clips.from_scene(rig_s, figure.scene(sf), names[k], 0.0)
+        if t == null {
+            check("${titles[k]} is in the file", false)
+        } else {
+            kept_u = fight_onto(titles[k], rig_s, t, probe_u, target, probe)
+            clips.take_free(kept_u)
+            clips.take_free(t)
+        }
+        k = k + 1
+    }
+    ikrig.feet_free(probe_u)
+    pose.rig_free(rig_s)
+    ikrig.feet_free(probe)
+    pose.rig_free(target)
+    figure.figures_free(e)
+    engine.engine_free(e)
+}
+
+// --- changes between fight takes -----------------------------------------------------------------
+
+// Seconds a change between fight takes eases over.
+const CHANGE = 0.15
+// Where in the take it changes from: a quarter, half and three quarters in.
+const PHASES = 3
+
+// Every fight take present on the mannequin, its own and those retargeted
+// onto it, as a state each: from each into every other, at three places in
+// the first, inertialized over CHANGE, no joint turning faster than the
+// faster of the two takes' own plus what the easing needs (its quintics'
+// steepest, animator.transition_need).
+fight_changes() {
+    e = fresh()
+    o = figure.figure(e, "Fighter", MANNEQUIN)
+    a = animator.attach(e, o)
+    animator.set_root_motion(a, false)
+    r = animator.rig(a)
+    own_names = ["Idle_Shield_Loop", "Sword_Block", "Sword_Regular_A", "Sword_Regular_A_Rec", "Sword_Regular_B", "Sword_Regular_B_Rec",
+                 "Sword_Regular_C", "Sword_Regular_Combo", "Melee_Hook", "Melee_Hook_Rec", "Shield_OneShot", "Idle_Shield_Break"]
+    found = 0
+    k = 0
+    while k < 12 {
+        t = animator.take(a, own_names[k], true)
+        if t != null {
+            _s = animator.add_state(a, own_names[k], t, false)
+            found = found + 1
+        }
+        k = k + 1
+    }
+    // UAL1's guard, punches and sword guard, and CMU's boxer, retargeted.
+    so = figure.figure(e, "Source", RIGIFY)
+    behaviour.object_set_position(so, core.vec3(4.0, 0.0, 0.0))
+    sf = figure.figure_of(so)
+    rig_s = pose.of_skeleton(figure.skeleton(sf))
+    ual_names = ["Punch_Enter", "Punch_Jab", "Punch_Cross", "Sword_Idle"]
+    k = 0
+    while k < 4 {
+        t = clips.from_scene(rig_s, figure.scene(sf), ual_names[k], 0.0)
+        if t != null {
+            made = animator.add_take(a, retarget.retarget(rig_s, t, r), true)
+            _s = animator.add_state(a, ual_names[k], made, false)
+            found = found + 1
+            clips.take_free(t)
+        }
+        k = k + 1
+    }
+    c = bvh.load_asf("${CMU}02.asf", "${CMU}02_05.amc.gz", 120.0, 0.0)
+    if c != null {
+        punch = bvh.take(c, "CMU 02_05", 0, 0 - 1)
+        made = animator.add_take(a, retarget.retarget(bvh.rig(c), punch, r), true)
+        _s = animator.add_state(a, "CMU 02_05", made, false)
+        found = found + 1
+        clips.take_free(punch)
+        bvh.capture_free(c)
+    }
+    states = animator.state_count(a)
+    owns = calloc_floats(states)
+    k = 0
+    while k < states {
+        owns[k] = metrics.take_fastest(animator.state_take(a, k), r)
+        k = k + 1
+    }
+    m = metrics.meter_new(r, o)
+    worst_ratio = 0.0
+    worst_from = 0
+    worst_to = 0
+    worst_pop = 0.0
+    worst_bound = 0.0
+    changes = 0
+    i = 0
+    while i < states {
+        j = 0
+        while j < states {
+            if i != j {
+                p = 1
+                while p <= PHASES {
+                    at = clips.duration(animator.state_take(a, i)) * (p as float) / ((PHASES + 1) as float)
+                    // Into take i where the change is from: cut there, then
+                    // a frame of its own.
+                    animator.play_at(a, i, at - STEP, 0.0)
+                    engine.engine_update(e, STEP)
+                    metrics.meter_moved(m)
+                    metrics.meter_take(m, STEP)
+                    metrics.meter_reset(m)
+                    animator.play(a, j, CHANGE)
+                    ease = animator.transition_need(a)
+                    n = 0
+                    while n < ((CHANGE + 0.1) / STEP) as int {
+                        engine.engine_update(e, STEP)
+                        metrics.meter_take(m, STEP)
+                        n = n + 1
+                    }
+                    own = owns[i]
+                    if owns[j] > own { own = owns[j] }
+                    pop = metrics.meter_worst(m, metrics.POP)
+                    ratio = pop / (own + ease)
+                    if ratio > 1.0 { println("    over: ${animator.state_name(a, i)} at ${at} s into ${animator.state_name(a, j)}: ${pop} rad/s (${pose.name(r, metrics.meter_joint(m, metrics.POP))} at ${metrics.meter_when(m, metrics.POP)} s) against own ${owns[i]} and ${owns[j]}, offset ${animator.transition_offset(a)} rad (ease ${ease})") }
+                    if ratio > worst_ratio {
+                        worst_ratio = ratio
+                        worst_from = i
+                        worst_to = j
+                        worst_pop = pop
+                        worst_bound = own + ease
+                    }
+                    changes = changes + 1
+                    p = p + 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    println("  ${found} fight takes on the mannequin (its own guard, blocks, strikes and recoveries, UAL1's guard, punches and sword guard, CMU's boxer); ${changes} changes between them, each pair from three places")
+    println("  the fastest joint ${worst_ratio * 100.0}% of the takes' own plus the easing's at worst: ${animator.state_name(a, worst_from)} into ${animator.state_name(a, worst_to)}, ${worst_pop} rad/s against ${worst_bound}")
+    check("a change between any two fight takes, inertialized, turns no joint faster than the two takes' own plus what the easing needs", found == 17 && worst_ratio <= 1.0)
+    free_floats(owns)
+    metrics.meter_free(m)
+    pose.rig_free(rig_s)
+    animator.animator_free(a)
+    figure.figures_free(e)
+    engine.engine_free(e)
+}
+
+calloc_floats(n: int) -> float[] { return calloc(n, 8) as float[] }
+free_floats(v: float[]) { free(v as ptr) }
+
+main() {
+    println("combat_takes: the generic pieces fighting is built on, on the UE5 mannequin (#907)")
+    fight_takes()
+    fight_changes()
+    if g_failures > 0 {
+        println("combat_takes: ${g_failures} of ${g_checks} checks failed")
+        exit(1)
+    }
+    println("combat_takes: all checks passed (${g_checks})")
+}

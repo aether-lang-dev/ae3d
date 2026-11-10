@@ -76,3 +76,6 @@ The BVH is Bruce Hahne's conversion of the database (the cgspeed release, made w
 | `02.asf` | subject 02's skeleton: 30 bones, VICON BodyBuilder's layout | `http://mocap.cs.cmu.edu/subjects/02/02.asf` | `c9f5ff45b4437b279f58b95dacf017afd3135373096274df69436a9354d796cf` |
 | `02_01.amc` | subject 02 walking, 343 frames | `http://mocap.cs.cmu.edu/subjects/02/02_01.amc` | `1503c481f4726e640c77888f0c841dd3be0694684bcd32296cf53685c6fc1492` |
 | `02_01.bvh` | the same take converted to BVH, 344 frames | `data/002/02_01.bvh` in https://github.com/meshula/cmu-mocap | `cf56db43157acc3d200b3d4215523f54d354a8926bea67e1f6c8031bd335ba7e` |
+| `02_05.amc.gz` | subject 02 punching and striking ("punch/strike"), 1854 frames, as the database has it, gzip'd (`gzip -9 -n`; `bvh.load_asf` inflates a `.gz`): the fight take the combat suite retargets (`tests/test_combat_takes.ae`, #907) | `http://mocap.cs.cmu.edu/subjects/02/02_05.amc` (sha256 `b370aae1972be9bf73d49a6c94ca74dda01a5cb5ab2f4cce7f61d4d08ca9a611`, 1,484,013 bytes) | `7526c82f7f8fcf2c9fafd6b47c7751dc057a4e31643c8d2d3129e5639bb1071e` |
+
+The BVH conversion's names map onto the humanoid slots as the ASF's bones do (`pose.SCHEME_CMU`): `Spine` is the upper back, `Spine1` the thorax, `Neck` and `Neck1` the lower and upper neck, `LowerBack` and the hip joints left out as the ASF's are.
