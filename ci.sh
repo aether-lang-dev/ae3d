@@ -118,7 +118,7 @@ in_tier() {   # in_tier <tier>...: whether this run covers any of them
 }
 PLATFORM_SUITES="test_net test_net_authority test_net_budget test_net_delta
     test_net_events test_net_fields test_net_handover test_net_horde
-    test_net_sight test_net_udp test_net_anim test_players test_agent test_agent_net
+    test_net_sight test_net_udp test_net_anim test_fdlibm test_players test_agent test_agent_net
     test_jobs test_assets test_obj_cache test_image_decode test_gltf
     test_loader test_scene_io test_font test_determinism test_gmath
     test_script"
