@@ -1,0 +1,553 @@
+// ci: optimised -- deaths and hits on the mannequin, each a figure's ragdoll stepped for seconds, CPU work -O0 makes several times slower
+// Deaths and partial ragdolls (#859, L5), held to numbers: the UE5 mannequin
+// made a character (ae3d.character, on 100STYLE's gaits) in a world with
+// physics. Each in an engine of its own; no window; stepped at 60 Hz.
+//
+// Deaths (character.die), from a walk and a run, killed at a seeded moment
+// of the stride by a blow from a seeded side and strength:
+//
+//   - at the change, every body moves as the animation moved it: its
+//     velocity (its origin's, and its spin) within 5% of what the
+//     animation's last two poses give it (bodies the animation hardly moves
+//     within 5 mm/s and 0.05 rad/s), the struck body pushed on by the blow;
+//   - no joint drawn turning faster, over the quarter second from the change,
+//     than the fastest the figure was drawn turning over the second before
+//     it plus the blow's share: the turn the blow's speed on the struck body
+//     (the impulse over its mass) gives it about its joint (over its length);
+//   - it comes to rest (physanim.at_rest) within REST_MOST;
+//   - it never stands: its pelvis body goes under half its standing height
+//     and never rises over it again, and get_up and act refuse it;
+//   - no body through the ground: no body's axis (its joint to its far end)
+//     under the floor at any step, and at rest no body's capsules more than
+//     THROUGH into it; how deep a capsule was pressed into it landing is
+//     printed.
+//
+// Partial ragdolls (character.hit, physanim's chain) while walking, struck
+// on an arm, the chest and the head from seeded sides:
+//
+//   - the struck body moves with the blow: its body's far end carried along
+//     the blow off where the animation has it (over 1 cm), and its joint
+//     drawn off the graph's (over 3 degrees);
+//   - back on the pose within its recovery time: once the hold and the
+//     recovery are over, every joint drawn within half a degree of the
+//     graph's;
+//   - the feet planted: no toe skating 5 mm (metrics.SKATE);
+//   - no joint drawn turning faster than the graph's own fastest over the
+//     same frames plus the hit's share: the blow's (as a death's) and what
+//     the easing back needs (1.875 times the most the figure was drawn off
+//     over the recovery);
+//   - a stronger blow takes a longer chain: on the arm, 4 N s takes fewer
+//     bodies than 16.
+
+import std.string
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.physics
+import ae3d.figure
+import ae3d.pose
+import ae3d.clips
+import ae3d.animator
+import ae3d.character
+import ae3d.metrics
+import ae3d.physanim
+import ae3d.motion
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+const STEP = 0.016666666666666666
+const MANNEQUIN = "tests/fixtures/people/mannequin.glb"
+const GAITS = "tests/fixtures/people/100style/neutral"
+const STOP = "tests/fixtures/people/100style/neutral_arrive.bvh"
+const START = "tests/fixtures/people/100style/startstop_start.bvh"
+
+const DEATHS = 8                     // seeded deaths a gait (AE3D_DEATHS for fewer)
+const WALK = 1.2                     // m/s
+const RUN = 3.5
+const CHANGE = 15                    // steps after the change the pop is measured over
+const REST_MOST = 480                // steps it may take to come to rest
+const STOOD_UP = 0.5                 // of its standing pelvis height: standing again
+const THROUGH = 0.02                 // m a body's capsules may go under the floor
+const SHARE = 0.05                   // of the animation's velocity the bodies' may be off
+const STILL_SPEED = 0.005            // m/s, and rad/s times 10, under which a body hardly moves
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+// A number 0 to 1 from a seed and a salt.
+hashed(seed: int, salt: int) -> float {
+    x = core.sin_of((seed as float) * 12.9898 + (salt as float) * 78.233) * 43758.5453
+    x = core.abs_of(x)
+    return x - ((x as int) as float)
+}
+
+world(g: *Gaits, name: string) -> (*Engine, *Character) {
+    e = engine.engine_new()
+    engine.engine_set_fixed_step(e, STEP)
+    physics.attach(e)
+    floor = engine.object(e, "Floor", null)
+    behaviour.object_set_position(floor, core.vec3(0.0, 0.0 - 0.5, 0.0))
+    physics.box_collider(floor, core.vec3(60.0, 0.5, 60.0), physics.material(0.8, 0.0))
+    c = character.humanoid(e, name, MANNEQUIN, g)
+    if c != null { character.physical(c) }
+    return e, c
+}
+
+world_free(e: *Engine, c: *Character) {
+    character.character_free(c)
+    physics.physics_free(physics.of(e))
+    figure.figures_free(e)
+    engine.engine_free(e)
+}
+
+place_of(p: ptr, k: int) -> Vec3 {
+    f = p as float[]
+    at = k * physics.POSE_STRIDE
+    return core.vec3(f[at + 4], f[at + 5], f[at + 6])
+}
+
+turn_of(p: ptr, k: int) -> Quat {
+    f = p as float[]
+    at = k * physics.POSE_STRIDE
+    return core.quat(f[at], f[at + 1], f[at + 2], f[at + 3])
+}
+
+// The spin that turns `a` into `b` over `dt`, radians a second about the
+// world's axes.
+spin_between(a: Quat, b: Quat, dt: float) -> Vec3 {
+    d = core.quat_mul(b, core.quat_conjugate(a))
+    if d.w < 0.0 { d = core.quat(0.0 - d.x, 0.0 - d.y, 0.0 - d.z, 0.0 - d.w) }
+    s = core.sqrt_of(d.x * d.x + d.y * d.y + d.z * d.z)
+    if s < 0.0000001 { return core.vec3(0.0, 0.0, 0.0) }
+    angle = 2.0 * core.atan2_of(s, d.w)
+    return core.v3_mul(core.vec3(d.x / s, d.y / s, d.z / s), angle / dt)
+}
+
+turned_by(a: Quat, b: Quat) -> float {
+    d = core.abs_of(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w)
+    if d > 1.0 { d = 1.0 }
+    return 2.0 * core.acos_of(d)
+}
+
+// The most any joint of local pose `p` is turned off `q`'s.
+apart(r: *pose.Rig, p: ptr, q: ptr) -> float {
+    most = 0.0
+    j = 0
+    while j < pose.count(r) {
+        d = turned_by(pose.rotation(p, j), pose.rotation(q, j))
+        if d > most { most = d }
+        j = j + 1
+    }
+    return most
+}
+
+fastest_joint(r: *pose.Rig, p: ptr, q: ptr) -> int {
+    most = 0.0
+    which = 0 - 1
+    j = 0
+    while j < pose.count(r) {
+        d = turned_by(pose.rotation(p, j), pose.rotation(q, j))
+        if d > most {
+            most = d
+            which = j
+        }
+        j = j + 1
+    }
+    return which
+}
+
+fastest_turn(r: *pose.Rig, p: ptr, q: ptr, dt: float) -> float {
+    return apart(r, p, q) / dt
+}
+
+// The turn a blow gives the body it strikes about its joint: its speed (the
+// impulse over the body's mass) over its length from its joint.
+blow_share(rag: *Ragdoll, k: int, impulse: Vec3, bodies: ptr) -> float {
+    m = physics.ragdoll_bone_mass(rag, k)
+    length = core.v3_len(core.v3_sub(physics.ragdoll_pose_end(rag, bodies, k), place_of(bodies, k)))
+    if m <= 0.0 || length <= 0.0 { return 0.0 }
+    return core.v3_len(impulse) / m / length
+}
+
+// --- deaths ----------------------------------------------------------------------------------------
+
+// The worst over the deaths: velocity off (share), spin off, pop past, rest
+// steps, highest pelvis once down (share of standing), deepest under the floor.
+struct Worst {
+    speed_off: float
+    spin_off: float
+    pop_past: float
+    rest: int
+    risen: float
+    under: float
+    axis_under: float
+    rest_under: float
+    died: int
+    rested: int
+    refused: int
+    pushed: int
+    pop_seed: int
+    speed_seed: int
+    under_seed: int
+}
+
+death(g: *Gaits, seed: int, speed: float, wo: *Worst) {
+    e, c = world(g, "Dying")
+    if c == null || character.physanim_of(c) == null {
+        println("  no character: ${character.error()}")
+        return
+    }
+    a = character.animator_of(c)
+    o = character.object_of(c)
+    r = animator.rig(a)
+    pa = character.physanim_of(c)
+    rag = physanim.ragdoll_of(pa)
+    n = physanim.bones(pa)
+    was = calloc(n * physics.POSE_STRIDE, 8)
+    now = calloc(n * physics.POSE_STRIDE, 8)
+    bodies = calloc(n * physics.POSE_STRIDE, 8)
+    meter = metrics.meter_new(r, o)
+    // Walked or run for a second and a seeded part of another, the moment
+    // of its stride the seed's.
+    steps = 60 + ((hashed(seed, 3) * 60.0) as int)
+    standing = 0.0
+    k = 0
+    while k < steps {
+        character.move(c, core.vec3(0.0, 0.0, speed), core.vec3(0.0, 0.0, 0.0))
+        engine.engine_update(e, STEP)
+        if k == steps - 60 { metrics.meter_reset(meter) }
+        if k >= steps - 60 { metrics.meter_take(meter, STEP) }
+        tmp = was
+        was = now
+        now = tmp
+        physics.ragdoll_animation_pose(rag, now)
+        h = place_of(now, physanim.bone_named(pa, "Hips")).y
+        if h > standing { standing = h }
+        k = k + 1
+    }
+    own = metrics.meter_worst(meter, metrics.POP)
+    side = hashed(seed, 1) * 6.2831853
+    strength = 20.0 + hashed(seed, 2) * 60.0
+    way = core.vec3(core.sin_of(side), 0.1, core.cos_of(side))
+    impulse = core.v3_mul(way, strength)
+    names = ["Chest", "Neck", "Spine"]
+    aimed = physanim.bone_named(pa, names[seed % 3])
+    physics.ragdoll_body_pose(rag, bodies)
+    at = place_of(bodies, aimed)
+    died = character.die(c, impulse, at)
+    if died { wo.died = wo.died + 1 }
+    // The bodies moving as the animation moved them, the struck one pushed on.
+    struck = physanim.nearest(pa, at)
+    physics.ragdoll_body_pose(rag, bodies)
+    share = blow_share(rag, struck, impulse, bodies)
+    speed_off = 0.0
+    spin_off = 0.0
+    j = 0
+    while j < n {
+        v_anim = core.v3_mul(core.v3_sub(place_of(now, j), place_of(was, j)), 1.0 / STEP)
+        s_anim = spin_between(turn_of(was, j), turn_of(now, j), STEP)
+        v, s = physics.ragdoll_bone_velocity(rag, j)
+        if j == struck {
+            if core.v3_dot(core.v3_sub(v, v_anim), way) > 0.0 { wo.pushed = wo.pushed + 1 }
+        } else {
+            dv = core.v3_len(core.v3_sub(v, v_anim))
+            ds = core.v3_len(core.v3_sub(s, s_anim))
+            // Off as a share of the animation's, or of the least speed that
+            // counts as moving.
+            off_v = dv / maxf(core.v3_len(v_anim), STILL_SPEED / SHARE)
+            off_s = ds / maxf(core.v3_len(s_anim), 10.0 * STILL_SPEED / SHARE)
+            if core.env_int("AE3D_DEATH_TRACE", 0) == 1 { println("    seed ${seed} body ${physics.humanoid_bone(j)}: v ${core.v3_len(v)} anim ${core.v3_len(v_anim)} off ${off_v}; spin ${core.v3_len(s)} anim ${core.v3_len(s_anim)} off ${off_s}") }
+            if off_v > speed_off { speed_off = off_v }
+            if off_s > spin_off { spin_off = off_s }
+        }
+        j = j + 1
+    }
+    if speed_off > wo.speed_off {
+        wo.speed_off = speed_off
+        wo.speed_seed = seed
+    }
+    if spin_off > wo.spin_off { wo.spin_off = spin_off }
+    // The change: the quarter second on.
+    metrics.meter_reset(meter)
+    metrics.meter_take(meter, STEP)
+    rest_at = 0 - 1
+    // The highest its pelvis rose once it had gone under STOOD_UP of its
+    // standing height (1 when it never went under), and where it lay at rest.
+    risen = 1.0
+    gone_down = false
+    // The deepest any body's capsules went under the floor, any body's axis
+    // (its joint to its far end: through it, past its own thickness), and
+    // the capsules' deepest once at rest.
+    under = 0.0
+    axis_under = 0.0 - 1.0
+    rest_under = 0.0
+    k = 0
+    while k < REST_MOST + 60 && (rest_at < 0 || k < 120) {
+        character.move(c, core.vec3(0.0, 0.0, speed), core.vec3(0.0, 0.0, 0.0))
+        engine.engine_update(e, STEP)
+        if k < CHANGE {
+            metrics.meter_take(meter, STEP)
+            if core.env_int("AE3D_DEATH_TRACE", 0) == 2 { println("    seed ${seed} step ${k}: pop ${metrics.meter_last(meter, metrics.POP)} joint ${pose.name(r, metrics.meter_joint(meter, metrics.POP))}") }
+        }
+        if rest_at < 0 && physanim.at_rest(pa) { rest_at = k }
+        physics.ragdoll_body_pose(rag, bodies)
+        h = place_of(bodies, physanim.bone_named(pa, "Hips")).y / standing
+        if !gone_down && h < STOOD_UP {
+            gone_down = true
+            risen = h
+        }
+        if gone_down && h > risen { risen = h }
+        low = 0.0 - physics.ragdoll_pose_lowest(rag, null)
+        if low > under { under = low }
+        rest_under = low
+        j = 0
+        while j < n {
+            deep = 0.0 - minf(place_of(bodies, j).y, physics.ragdoll_pose_end(rag, bodies, j).y)
+            if deep > axis_under { axis_under = deep }
+            j = j + 1
+        }
+        if core.env_int("AE3D_DEATH_TRACE", 0) == 4 && low > 0.01 {
+            j = 0
+            while j < n {
+                if 0.0 - physics.ragdoll_pose_bone_lowest(rag, null, j) > 0.01 { println("    seed ${seed} step ${k}: ${physics.humanoid_bone(j)} ${physics.ragdoll_pose_bone_lowest(rag, null, j)} under, speed ${physics.ragdoll_bone_speed(rag, j)}") }
+                j = j + 1
+            }
+        }
+        k = k + 1
+    }
+    pop = metrics.meter_worst(meter, metrics.POP)
+    past = pop - (own + share)
+    if core.env_int("AE3D_DEATH_TRACE", 0) == 1 { println("  seed ${seed} at ${speed} m/s: ${strength} N s on ${physics.humanoid_bone(struck)}; velocity off ${speed_off}, spin off ${spin_off}; pop ${pop} joint ${pose.name(r, metrics.meter_joint(meter, metrics.POP))} at ${metrics.meter_when(meter, metrics.POP)}, own ${own}, blow ${share}; rest at ${rest_at}; pelvis ${risen} of standing; under ${under}") }
+    if wo.died == 1 || past > wo.pop_past {
+        wo.pop_past = past
+        wo.pop_seed = seed
+    }
+    if rest_at < 0 { rest_at = 1000000 }
+    if rest_at > wo.rest { wo.rest = rest_at }
+    if rest_at < 1000000 { wo.rested = wo.rested + 1 }
+    if risen > wo.risen { wo.risen = risen }
+    if under > wo.under {
+        wo.under = under
+        wo.under_seed = seed
+    }
+    if axis_under > wo.axis_under { wo.axis_under = axis_under }
+    if rest_under > wo.rest_under { wo.rest_under = rest_under }
+    if character.get_up(c, null as *Motion, 0.4) < 0 && character.dead(c) && !character.act(c, character.idle_state(c), 0.2) { wo.refused = wo.refused + 1 }
+    free(was)
+    free(now)
+    free(bodies)
+    metrics.meter_free(meter)
+    world_free(e, c)
+}
+
+deaths(g: *Gaits, speed: float, gait: string) {
+    count = core.env_int("AE3D_DEATHS", DEATHS)
+    wo = Worst { speed_off: 0.0, spin_off: 0.0, pop_past: 0.0, rest: 0, risen: 0.0, under: 0.0, axis_under: 0.0 - 1.0, rest_under: 0.0, died: 0, rested: 0, refused: 0, pushed: 0, pop_seed: 0, speed_seed: 0, under_seed: 0 }
+    seed = 1
+    while seed <= count {
+        death(g, seed, speed, &wo)
+        seed = seed + 1
+    }
+    println("  ${gait}: ${wo.died} of ${count} died; velocities off the animation's at most ${wo.speed_off * 100.0}% (seed ${wo.speed_seed}), spins ${wo.spin_off * 100.0}%; the struck body pushed on by the blow ${wo.pushed} of ${count}")
+    println("  ${gait}: a joint past the drawn walk's fastest plus the blow's share at most ${wo.pop_past} rad/s (seed ${wo.pop_seed}); at rest within ${(wo.rest as float) * STEP} s (${wo.rested} of ${count}); the pelvis at most ${wo.risen * 100.0}% of standing once down")
+    println("  ${gait}: a body's capsules ${wo.under * 1000.0} mm under the floor at most (seed ${wo.under_seed}), ${wo.rest_under * 1000.0} mm at rest; a body's axis ${wo.axis_under * 1000.0} mm under it at most (under 0: never)")
+    check("${gait}: died every time, the struck body pushed on by the blow", wo.died == count && wo.pushed == count)
+    check("${gait}: at the change every body moves as the animation moved it, within 5%", wo.speed_off <= SHARE && wo.spin_off <= SHARE)
+    check("${gait}: no joint at the change faster than the animation's plus the blow's share", wo.pop_past <= 0.0)
+    check("${gait}: comes to rest within ${(REST_MOST as float) * STEP} s", wo.rested == count)
+    check("${gait}: never stands (its pelvis under half its standing height), and refuses a get-up and an act", wo.risen < STOOD_UP && wo.refused == count)
+    // Landing, a body caught under the trunk is pressed into the floor for a
+    // few steps by the world's soft contacts (a forearm 29 mm under a walker
+    // falling on it, seed 8), and pushed back out: printed above, not a body
+    // through the ground. Through it is a body's axis under it.
+    check("${gait}: no body through the ground (no body's axis ever under it, and at rest no capsule ${THROUGH * 1000.0} mm into it)", wo.axis_under < 0.0 && wo.rest_under <= THROUGH)
+}
+
+// --- partial ragdolls --------------------------------------------------------------------------------
+
+// Struck on body `name` with `strength` N s from a seeded side while
+// walking: the checks' numbers.
+struck_walk(g: *Gaits, name: string, strength: float, seed: int) -> bool {
+    e, c = world(g, "Struck")
+    if c == null || character.physanim_of(c) == null { return false }
+    a = character.animator_of(c)
+    o = character.object_of(c)
+    r = animator.rig(a)
+    pa = character.physanim_of(c)
+    rag = physanim.ragdoll_of(pa)
+    n = physanim.bones(pa)
+    anim = calloc(n * physics.POSE_STRIDE, 8)
+    bodies = calloc(n * physics.POSE_STRIDE, 8)
+    meter = metrics.meter_new(r, o)
+    metrics.meter_ground_physics(meter, physics.of(e))
+    ahead = core.vec3(0.0, 0.0, WALK)
+    steps = 90 + ((hashed(seed, 5) * 40.0) as int)
+    k = 0
+    while k < steps {
+        character.move(c, ahead, core.vec3(0.0, 0.0, 0.0))
+        engine.engine_update(e, STEP)
+        k = k + 1
+    }
+    k_body = physanim.bone_named(pa, name)
+    physics.ragdoll_body_pose(rag, bodies)
+    side = hashed(seed, 6) * 6.2831853
+    way = core.vec3(core.sin_of(side), 0.0, core.cos_of(side))
+    impulse = core.v3_mul(way, strength)
+    share = blow_share(rag, k_body, impulse, bodies)
+    joint = pose.human(r, pose.SPINE_03)
+    if string_is(name, "Neck") { joint = pose.human(r, pose.HEAD) }
+    if string_is(name, "ElbowL") { joint = pose.human(r, pose.LOWERARM_L) }
+    // Where its body trailed the animation along the blow before it, and
+    // struck halfway along it.
+    physics.ragdoll_animation_pose(rag, anim)
+    end_before = physics.ragdoll_pose_end(rag, bodies, k_body)
+    along_before = core.v3_dot(core.v3_sub(end_before, physics.ragdoll_pose_end(rag, anim, k_body)), way)
+    took = character.hit(c, name, core.v3_lerp(place_of(bodies, k_body), end_before, 0.5), impulse)
+    chain = 0
+    j = 0
+    while j < n {
+        if physanim.share_of(pa, j) > 0.0 { chain = chain + 1 }
+        j = j + 1
+    }
+    metrics.meter_reset(meter)
+    shown_before = pose.new(r)
+    graph_before = pose.new(r)
+    wp = pose.new(r)
+    wq = pose.new(r)
+    pose.copy(r, animator.pose_shown(a), shown_before)
+    pose.copy(r, animator.pose_now(a), graph_before)
+    carried = 0.0
+    off_most = 0.0
+    off_recover = 0.0
+    fastest = 0.0
+    graph_fastest = 0.0
+    back = 0.0
+    over = physanim.HIT_HOLD + physanim.HIT_RECOVER
+    total = ((over + 0.3) / STEP) as int
+    k = 0
+    while k < total {
+        character.move(c, ahead, core.vec3(0.0, 0.0, 0.0))
+        engine.engine_update(e, STEP)
+        metrics.meter_take(meter, STEP)
+        t = ((k + 1) as float) * STEP
+        physics.ragdoll_animation_pose(rag, anim)
+        physics.ragdoll_body_pose(rag, bodies)
+        // Its far end's: a body's place is its joint's, which the body above
+        // it holds (a head swung about its neck hardly moves its joint).
+        along = core.v3_dot(core.v3_sub(physics.ragdoll_pose_end(rag, bodies, k_body), physics.ragdoll_pose_end(rag, anim, k_body)), way)
+        if t <= physanim.HIT_HOLD + 0.05 && along - along_before > carried { carried = along - along_before }
+        pose.world(r, animator.pose_shown(a), wp)
+        pose.world(r, animator.pose_now(a), wq)
+        off = turned_by(pose.rotation(wp, joint), pose.rotation(wq, joint))
+        if off > off_most { off_most = off }
+        whole = apart(r, animator.pose_shown(a), animator.pose_now(a))
+        if t > physanim.HIT_HOLD && whole > off_recover { off_recover = whole }
+        x = fastest_turn(r, shown_before, animator.pose_shown(a), STEP)
+        if x > fastest { fastest = x }
+        if core.env_int("AE3D_DEATH_TRACE", 0) == 3 && k < 30 { println("    ${name} step ${k}: fastest ${x} at ${pose.name(r, fastest_joint(r, shown_before, animator.pose_shown(a)))}") }
+        y = fastest_turn(r, graph_before, animator.pose_now(a), STEP)
+        if y > graph_fastest { graph_fastest = y }
+        if t >= over + STEP { back = maxf(back, apart(r, animator.pose_shown(a), animator.pose_now(a))) }
+        pose.copy(r, animator.pose_shown(a), shown_before)
+        pose.copy(r, animator.pose_now(a), graph_before)
+        k = k + 1
+    }
+    skated = metrics.meter_worst(meter, metrics.SKATE)
+    allowed = graph_fastest + share + 1.875 * off_recover / physanim.HIT_RECOVER
+    println("  ${name}, ${strength} N s (seed ${seed}): ${chain} bodies taken; carried ${carried * 100.0} cm along the blow, its joint ${off_most * 57.29578} degrees off the graph's; ${back * 57.29578} degrees off once recovered; a toe skated ${skated * 1000.0} mm; the fastest joint ${fastest} rad/s against the graph's ${graph_fastest} plus the blow's ${share} and the easing's ${1.875 * off_recover / physanim.HIT_RECOVER}")
+    ok = took
+    check("${name} ${strength} N s seed ${seed}: the struck body moves with the blow (over 1 cm along it, its joint over 3 degrees off the graph's)", took && carried > 0.01 && off_most > 0.0524)
+    check("${name} ${strength} N s seed ${seed}: back on the pose within its recovery time (within half a degree)", back < 0.00873)
+    check("${name} ${strength} N s seed ${seed}: the feet planted (no toe skating 5 mm)", skated < 0.005)
+    check("${name} ${strength} N s seed ${seed}: no joint faster than the graph's own plus the hit's share", fastest <= allowed)
+    pose.release(shown_before)
+    pose.release(graph_before)
+    pose.release(wp)
+    pose.release(wq)
+    free(anim)
+    free(bodies)
+    metrics.meter_free(meter)
+    world_free(e, c)
+    return ok
+}
+
+string_is(a: string, b: string) -> bool { return string.equals(a, b) == 1 }
+
+minf(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+maxf(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// How many bodies a blow of `strength` on `name` takes.
+chain_of(g: *Gaits, name: string, strength: float) -> int {
+    e, c = world(g, "Chain")
+    if c == null || character.physanim_of(c) == null { return 0 }
+    pa = character.physanim_of(c)
+    rag = physanim.ragdoll_of(pa)
+    k = 0
+    while k < 30 {
+        character.move(c, core.vec3(0.0, 0.0, 0.0), core.vec3(0.0, 0.0, 0.0))
+        engine.engine_update(e, STEP)
+        k = k + 1
+    }
+    b = physanim.bone_named(pa, name)
+    at = behaviour.object_position(physics.ragdoll_bone(rag, b))
+    character.hit(c, name, at, core.vec3(strength, 0.0, 0.0))
+    chain = 0
+    j = 0
+    while j < physanim.bones(pa) {
+        if physanim.share_of(pa, j) > 0.0 { chain = chain + 1 }
+        j = j + 1
+    }
+    world_free(e, c)
+    return chain
+}
+
+main() {
+    println("deaths: full ragdolls on death and partial ragdolls for hits (#859)")
+    g = character.gaits(GAITS)
+    character.gaits_set(g, character.GAIT_STOP, STOP)
+    character.gaits_set(g, character.GAIT_START, START)
+    deaths(g, WALK, "walking")
+    deaths(g, RUN, "running")
+    parts = ["ElbowL", "Chest", "Neck"]
+    strengths = [8.0, 30.0, 8.0]
+    seeds = core.env_int("AE3D_HIT_SEEDS", 3)
+    i = 0
+    while i < 3 {
+        s = 1
+        while s <= seeds {
+            struck_walk(g, parts[i], strengths[i], s)
+            s = s + 1
+        }
+        i = i + 1
+    }
+    weak = chain_of(g, "ElbowL", 4.0)
+    strong = chain_of(g, "ElbowL", 16.0)
+    println("  on the arm: 4 N s takes ${weak} bodies, 16 N s ${strong}")
+    check("a stronger blow takes a longer chain", strong > weak && weak >= 1)
+    character.gaits_free(g)
+    if g_failures == 0 {
+        println("deaths: all checks passed (${g_checks})")
+        return
+    }
+    println("deaths: ${g_failures} failure(s) of ${g_checks}")
+    exit(1)
+}
