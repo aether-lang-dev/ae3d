@@ -32,12 +32,17 @@
 //     than RAG_ABOVE is moved onto it over the next RAG_BLEND ticks, a
 //     share a tick, as a puppet is drawn to its target: the bodies keep
 //     their velocities, so nothing is thrown;
-//   - a snapshot of everything a figure is, sent once, reliably, to a peer
-//     that joins after its owner's first tick (late join): its object, its
-//     mover, its graph's state and time, its last inputs, its feet's locks,
-//     what it is doing (an act, knocked down, dead) and its ragdoll whole
-//     where it lies. The peer lays its figure so at the snapshot's tick and
-//     plays on from there by the inputs streamed.
+//   - a snapshot of everything a figure is, sent reliably: its object, and
+//     each part's whole state (mover.state_write, character.state_write,
+//     animator.state_write with the feet, look, aims and springs it
+//     solves, physanim.state_write, every body of its ragdoll), its last
+//     inputs and the first event still to come. To a peer that joins after
+//     its owner's first tick (late join), which lays its figure so at the
+//     snapshot's tick and plays on from there by the inputs streamed; and
+//     to a peer whose figure a state found parted (resync), which puts it
+//     back on the owner's whole at the snapshot's tick, its place and
+//     facing eased in and its pose inertialized. A ragdoll goes every block
+//     while it falls (a body faster than RAG_MOVING).
 //
 // Everything streamed goes on the session's stream (net.send_stream:
 // unreliable), a block every SEND_EVERY ticks for every figure the side
@@ -76,6 +81,7 @@ import ae3d.behaviour
 import ae3d.engine
 import ae3d.net
 import ae3d.physics
+import ae3d.pose
 import ae3d.animator
 import ae3d.mover
 import ae3d.ikrig
@@ -110,7 +116,7 @@ const BUFFER = 0.12                  // seconds a peer plays behind the owner's 
 const RING = 256                     // ticks of inputs and history kept
 const STATES = 16                    // states and ragdolls kept waiting for their tick
 const BLOCK = 8192                   // bytes a block at most
-const SNAP = 65536                   // bytes a snapshot at most
+const SNAP = 1048576                 // bytes a snapshot at most
 const CLIENTS_MOST = 256             // clients a host relays to at most
 const CORRECT_ABOVE = 0.002          // metres a peer's figure is off the owner's state before it is eased back
 const CORRECT_TURN = 0.005           // radians its facing is
@@ -124,7 +130,8 @@ const LOCK_HALF_LIFE = 0.03          // seconds a lock's easing halves what is l
 const RAG_ABOVE = 0.001              // metres a body of a peer's ragdoll is off the owner's before it is drawn onto it
 const RAG_TURN = 0.005               // radians it is turned off
 const RAG_BLEND = 6                  // ticks a ragdoll is drawn onto the owner's over: until the next one comes
-const RAG_STEP_MOST = 0.01           // metres a body is drawn a tick at most (0.6 m/s): never thrown
+const RAG_STEP_MOST = 0.01           // metres a body is drawn a tick at least as far as it may go (0.6 m/s), more as it is further off
+const RAG_MOVING = 0.3               // metres a second a body of a fall goes past which its ragdoll goes every block
 
 // A tick's input, whole numbers in steps.
 const INPUT = 12
@@ -220,6 +227,11 @@ struct Source {
     snap: ptr                        // a snapshot to start from (SNAP bytes), null none
     snap_length: int
     snap_tick: int
+    want: bool                       // a figure parted from its owner's: a resync to ask for
+    asked: bool                      // and asked for, not yet come
+    resync: ptr                      // a resync come (SNAP bytes), laid at its tick; null none
+    resync_length: int
+    resync_tick: int
 }
 
 struct NetFigure {
@@ -254,8 +266,12 @@ struct NetFigure {
     worst_rag: float
     rag_corrections: int
     rag_left: int                    // ticks of the ragdoll's drawing still to go
+    rag_ticks: int                   // and all of them
+    rag_cap: float                   // metres a body is drawn a tick at most in it
+    rag_last: int                    // the tick of the last ragdoll compared; -1 none
     rag_off: ptr                     // float[RAG_MOST * 7]: each body's place and turn off the owner's, as found
     corrections: int
+    resyncs: int                     // corrections made whole from a resync (the owner's snapshot)
     left: Vec3                       // the correction still to ease in
     left_turn: float                 // and of the facing, radians
     lock_left: ptr                   // float[6]: each planted foot's lock still to ease in: x, heading, z
@@ -359,6 +375,7 @@ netanim_free(na: *NetAnim) {
     while i < list.size(na.sources) {
         s = list.get_raw(na.sources, i) as *Source
         if s.snap != null { free(s.snap) }
+        if s.resync != null { free(s.resync) }
         heap.free(s)
         i = i + 1
     }
@@ -420,6 +437,7 @@ figure_new(na: *NetAnim, e: *Engine, c: *Character, owner: int, local: bool) -> 
     }
     f.blind_from = 0 - 1
     f.blind_to = 0 - 1
+    f.rag_last = 0 - 1
     if !f.local { f.source = source_of(na, owner) as ptr }
     list.add_raw(na.figures, f as ptr)
     return f
@@ -826,6 +844,15 @@ lay_ragdoll(f: *NetFigure, data: ptr, length: int) {
         }
         k = k + 1
     }
+    // The rig drawn from the bodies laid: the get-up plans from the pose
+    // the rig shows (character.get_up reads it), and shown from where the
+    // bodies were before, a peer whose ragdoll had been drawn back onto the
+    // owner's planned its arms from its own and swung them 14 cm off the
+    // owner's as its get-up ended.
+    shown = calloc(physics.ragdoll_bone_count(rag) * physics.POSE_STRIDE + 1, 8)
+    physics.ragdoll_body_pose(rag, shown)
+    physics.ragdoll_show_pose(rag, shown)
+    free(shown)
 }
 
 // Graph state `state` played once (character.act).
@@ -1153,11 +1180,26 @@ put_event(w: *Writer, ev: *AnimEvent) {
 // ticks while it is knocked down or dead and moving, every RESTING_EVERY
 // once dead and at rest.
 ragdoll_due(na: *NetAnim, f: *NetFigure, t: int) -> bool {
-    if f.motion != null { return (t + 1) % na.ragdoll_every == 0 }
     c = f.character as *Character
-    if !character.dead(c) { return false }
+    if f.motion == null && !character.dead(c) { return false }
+    // Falling (a body faster than RAG_MOVING): every block, as a chaotic
+    // fall parts in a tenth of a second.
+    if ragdoll_moving(f) { return true }
+    if f.motion != null { return (t + 1) % na.ragdoll_every == 0 }
     if physanim.at_rest(character.physanim_of(c)) { return (t + 1) % RESTING_EVERY == 0 }
     return (t + 1) % na.ragdoll_every == 0
+}
+
+ragdoll_moving(f: *NetFigure) -> bool {
+    pa = character.physanim_of(f.character as *Character)
+    if pa == null { return false }
+    rag = physanim.ragdoll_of(pa)
+    k = 0
+    while k < physics.ragdoll_bone_count(rag) {
+        if physics.ragdoll_bone_speed(rag, k) > RAG_MOVING { return true }
+        k = k + 1
+    }
+    return false
 }
 
 same_input(f: *NetFigure, a: int, b: int) -> bool {
@@ -1283,7 +1325,7 @@ on_joined(context: ptr, client: int, now: float) {
     while i < list.size(na.figures) {
         f = list.get_raw(na.figures, i) as *NetFigure
         if !f.local && f.owner_id != client && !asked_before(na, i, f.owner_id) {
-            _asked = net.send_event(na.session, "anim.want", f.owner_id, now, client as float)
+            _asked = net.send_event(na.session, "anim.want", f.owner_id, now, client as float, f.owner_id as float)
         }
         i = i + 1
     }
@@ -1314,11 +1356,19 @@ on_left(context: ptr, client: int, _now: float) {
     }
 }
 
-// A client's: the host asks for its figures' snapshot for client `a`.
+// A snapshot of owner `b`'s figures asked for side `a` (a client's id, the
+// host's 0): a client that joined, or a peer whose figure parted from its
+// owner's. The owner sends it; the host passes an ask for a client's
+// figures on to that client.
 on_want(context: ptr, call: *NetCall) {
     na = context as *NetAnim
-    if net.hosting(na.session) { return }
-    send_snap(na, call.a as int, call.now)
+    target = call.a as int
+    owner = call.b as int
+    if owner == net.client_id(na.session) {
+        send_snap(na, target, call.now)
+    } else if net.hosting(na.session) {
+        _passed = net.send_event(na.session, "anim.want", owner, call.now, call.a, call.b)
+    }
 }
 
 // This side's own figures as they are after the last tick closed, for
@@ -1365,38 +1415,11 @@ put_snap(na: *NetAnim, w: *Writer, f: *NetFigure) {
         put_signed(w, i[k])
         k = k + 1
     }
-    o = character.object_of(c)
-    put_v3(w, behaviour.object_position(o))
-    put_quat(w, behaviour.object_rotation(o))
-    m = character.mover_of(c)
-    springs = calloc(mover.STATE_FLOATS, 8) as float[]
-    mover.state_write(m, springs)
-    k = 0
-    while k < mover.STATE_FLOATS {
-        put_f64(w, springs[k])
-        k = k + 1
-    }
-    free(springs as ptr)
-    a = character.animator_of(c)
-    put_varint(w, (animator.current(a)) as long)
-    put_f64(w, animator.state_time(a))
     flags = 0
     if character.acting(c) { flags = flags + SNAP_ACTING }
     if f.motion != null { flags = flags + SNAP_KNOCKED }
     if character.dead(c) { flags = flags + SNAP_DEAD }
     put_u8(w, flags)
-    feet = character.feet_of(c)
-    side = 0
-    while side < 2 {
-        held, place, yaw, on = ikrig.feet_lock_of(feet, side)
-        hold = 0
-        if held { hold = on as int }
-        put_u8(w, hold)
-        put_f64(w, place.x)
-        put_f64(w, place.z)
-        put_f64(w, yaw)
-        side = side + 1
-    }
     // Events after the snapshot's tick still to come by the blocks.
     first = f.next_seq
     k = 0
@@ -1406,22 +1429,81 @@ put_snap(na: *NetAnim, w: *Writer, f: *NetFigure) {
         k = k + 1
     }
     put_varint(w, first as long)
-    if (flags & (SNAP_KNOCKED + SNAP_DEAD)) != 0 {
-        rag = physanim.ragdoll_of(character.physanim_of(c))
-        count = physics.ragdoll_bone_count(rag)
-        if count > RAG_MOST { count = RAG_MOST }
-        put_u8(w, count)
-        k = 0
-        while k < count {
-            b = physics.ragdoll_bone(rag, k)
-            put_v3(w, behaviour.object_position(b))
-            put_quat(w, behaviour.object_rotation(b))
-            linear, spin = physics.ragdoll_bone_velocity(rag, k)
-            put_v3(w, linear)
-            put_v3(w, spin)
-            k = k + 1
-        }
+    // The figure whole, as 64-bit floats: [u32 count] and the floats.
+    out = calloc(figure_state_size(f), 8) as float[]
+    n = figure_state_write(f, out)
+    put_u16(w, n % 65536)
+    put_u16(w, n / 65536)
+    k = 0
+    while k < n {
+        put_f64(w, out[k])
+        k = k + 1
     }
+    free(out as ptr)
+}
+
+figure_state_size(f: *NetFigure) -> int {
+    c = f.character as *Character
+    n = 64 + mover.STATE_FLOATS + character.STATE_FLOATS + animator.state_size(character.animator_of(c)) + RAG_MOST * 13
+    pa = character.physanim_of(c)
+    if pa != null { n = n + physanim.state_size(pa) }
+    return n
+}
+
+// Everything figure `f` is, into `out`: its object's place and turn, its
+// mover, its character, its animator (graph, poses, feet, look, aims,
+// springs), its physical animation and every body of its ragdoll (place,
+// turn, velocities). Returns how many floats.
+figure_state_write(f: *NetFigure, out: float[]) -> int {
+    c = f.character as *Character
+    o = character.object_of(c)
+    p = behaviour.object_position(o)
+    q = behaviour.object_rotation(o)
+    v = [p.x, p.y, p.z, q.x, q.y, q.z, q.w]
+    k = 0
+    while k < 7 {
+        out[k] = v[k]
+        k = k + 1
+    }
+    m = character.mover_of(c)
+    springs = calloc(mover.STATE_FLOATS, 8) as float[]
+    mover.state_write(m, springs)
+    k = 0
+    while k < mover.STATE_FLOATS {
+        out[7 + k] = springs[k]
+        k = k + 1
+    }
+    free(springs as ptr)
+    n = 7 + mover.STATE_FLOATS
+    n = character.state_write(c, out, n)
+    n = animator.state_write(character.animator_of(c), out, n)
+    pa = character.physanim_of(c)
+    out[n] = 0.0
+    if pa != null { out[n] = 1.0 }
+    n = n + 1
+    if pa == null { return n }
+    n = physanim.state_write(pa, out, n)
+    rag = physanim.ragdoll_of(pa)
+    count = physics.ragdoll_bone_count(rag)
+    if count > RAG_MOST { count = RAG_MOST }
+    out[n] = count as float
+    n = n + 1
+    k = 0
+    while k < count {
+        b = physics.ragdoll_bone(rag, k)
+        bp = behaviour.object_position(b)
+        bq = behaviour.object_rotation(b)
+        linear, spin = physics.ragdoll_bone_velocity(rag, k)
+        body = [bp.x, bp.y, bp.z, bq.x, bq.y, bq.z, bq.w, linear.x, linear.y, linear.z, spin.x, spin.y, spin.z]
+        j = 0
+        while j < 13 {
+            out[n + j] = body[j]
+            j = j + 1
+        }
+        n = n + 13
+        k = k + 1
+    }
+    return n
 }
 
 // A snapshot come: the host relays one for another client on; a client
@@ -1444,18 +1526,32 @@ on_snap(context: ptr, call: *NetCall) {
     f = list.get_raw(na.figures, first) as *NetFigure
     if f.local || f.source == null { return }
     s = f.source as *Source
-    if s.started { return }
+    na.snaps_taken = na.snaps_taken + 1
+    if s.started {
+        // A resync asked for (hold_state): laid at its tick (play).
+        if s.resync == null { s.resync = calloc(SNAP, 1) }
+        memcpy(s.resync, call.data, call.length as long)
+        s.resync_length = call.length
+        s.resync_tick = snap_tick
+        s.asked = false
+        return
+    }
     if s.snap == null { s.snap = calloc(SNAP, 1) }
     memcpy(s.snap, call.data, call.length as long)
     s.snap_length = call.length
     s.snap_tick = snap_tick
-    na.snaps_taken = na.snaps_taken + 1
 }
 
 // A source started from its snapshot: each figure laid as it was at the
 // snapshot's tick.
-start_from_snap(na: *NetAnim, s: *Source) {
-    r = Reader { data: s.snap, length: s.snap_length, at: 0, ok: true }
+start_from_snap(na: *NetAnim, s: *Source) { lay_snap(na, s.snap, s.snap_length, 0.0) }
+
+// Snapshot `data` laid on its figures: whole (`blend` 0, a figure not yet
+// seen), or as a resync of figures that parted from their owner's, their
+// place and facing eased in and their graph's pose inertialized over
+// `blend` seconds.
+lay_snap(na: *NetAnim, data: ptr, length: int, blend: float) {
+    r = Reader { data: data, length: length, at: 0, ok: true }
     _target = get_varint(&r)
     _tick = get_varint(&r)
     count = get_u8(&r)
@@ -1464,45 +1560,58 @@ start_from_snap(na: *NetAnim, s: *Source) {
         index = get_u8(&r)
         if !r.ok || index >= list.size(na.figures) { return }
         f = list.get_raw(na.figures, index) as *NetFigure
-        take_snap(&r, f)
+        take_snap(&r, f, blend)
         k = k + 1
     }
 }
 
-take_snap(r: *Reader, f: *NetFigure) {
+take_snap(r: *Reader, f: *NetFigure, blend: float) {
     c = f.character as *Character
+    inputs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    k = 0
+    while k < INPUT {
+        inputs[k] = get_signed(r)
+        k = k + 1
+    }
+    flags = get_u8(r)
+    first = (get_varint(r)) as int
+    lo = get_u16(r)
+    n = lo + get_u16(r) * 65536
+    if !r.ok || n < 0 || r.at + n * 8 > r.length { return }
+    saved = calloc(n + 1, 8) as float[]
+    k = 0
+    while k < n {
+        saved[k] = get_f64(r)
+        k = k + 1
+    }
+    knocked = (flags & SNAP_KNOCKED) != 0
+    dead = (flags & SNAP_DEAD) != 0
+    if blend > 0.0 {
+        // A resync: of a figure doing what its owner's does (both up, both
+        // down, both dead), else left to the events still to come.
+        if knocked == (f.motion != null) && dead == character.dead(c) { resync_figure(f, saved, blend) }
+        free(saved as ptr)
+        return
+    }
     last = f.last as int[]
     k = 0
     while k < INPUT {
-        last[k] = get_signed(r)
+        last[k] = inputs[k]
         k = k + 1
     }
-    place = get_v3(r)
-    turn = get_quat(r)
-    springs = calloc(mover.STATE_FLOATS, 8) as float[]
-    k = 0
-    while k < mover.STATE_FLOATS {
-        springs[k] = get_f64(r)
-        k = k + 1
+    // Down or dead as the owner's is, before its state is laid over it.
+    if dead {
+        _died = character.die(c, core.vec3(0.0, 0.0, 0.0), core.vec3(saved[0], saved[1], saved[2]), 0.0)
+    } else if knocked {
+        _knocked = knock_now(f, 0, core.vec3(0.0, 0.0, 0.0))
     }
-    state = (get_varint(r)) as int
-    time = get_f64(r)
-    flags = get_u8(r)
-    holds = [0, 0]
-    locks = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    side = 0
-    while side < 2 {
-        holds[side] = get_u8(r)
-        locks[side * 3] = get_f64(r)
-        locks[side * 3 + 1] = get_f64(r)
-        locks[side * 3 + 2] = get_f64(r)
-        side = side + 1
-    }
-    first = (get_varint(r)) as int
-    if !r.ok {
-        free(springs as ptr)
-        return
-    }
+    o = character.object_of(c)
+    behaviour.object_set_position(o, core.vec3(saved[0], saved[1], saved[2]))
+    behaviour.object_set_rotation(o, Quat { x: saved[3], y: saved[4], z: saved[5], w: saved[6] })
+    // Drawn where it is laid, not swept there from where it stood.
+    core.model_reset_interpolation(behaviour.object_model(o))
+    figure_state_read(f, saved, 0.0)
+    free(saved as ptr)
     // The events it has in it let go of; those after it come by the blocks.
     f.forgot = first
     k = 0
@@ -1515,52 +1624,75 @@ take_snap(r: *Reader, f: *NetFigure) {
             k = k + 1
         }
     }
-    o = character.object_of(c)
-    behaviour.object_set_position(o, place)
-    behaviour.object_set_rotation(o, turn)
+}
+
+// Figure `f` laid as figure_state_write wrote another copy of it, its
+// object placed already: its mover, its character, its animator (its
+// graph's change inertialized over `blend`, 0 whole), its physical
+// animation, and its ragdoll's bodies where they are knocked down or dead
+// (standing, the bodies follow the animation from its anchors) or where
+// the figure is laid whole.
+figure_state_read(f: *NetFigure, saved: float[], blend: float) {
+    c = f.character as *Character
     m = character.mover_of(c)
-    mover.settle(m)
+    springs = calloc(mover.STATE_FLOATS, 8) as float[]
+    k = 0
+    while k < mover.STATE_FLOATS {
+        springs[k] = saved[7 + k]
+        k = k + 1
+    }
+    if blend <= 0.0 { mover.settle(m) }
     mover.state_read(m, springs)
     free(springs as ptr)
-    take_move(f, last)
-    take_look(f, last)
-    take_aim(f, last)
-    a = character.animator_of(c)
-    if (flags & (SNAP_KNOCKED + SNAP_DEAD)) == 0 {
-        if (flags & SNAP_ACTING) != 0 { _acted = character.act(c, state, 0.0) }
-        animator.play_at(a, state, time, 0.0)
-        feet = character.feet_of(c)
-        ikrig.feet_reset(feet)
-        side = 0
-        while side < 2 {
-            if holds[side] > 0 { ikrig.feet_set_lock_at(feet, side, core.vec3(locks[side * 3], 0.0, locks[side * 3 + 1]), locks[side * 3 + 2], holds[side] as float) }
-            side = side + 1
-        }
-        return
-    }
-    // Down or dead: its ragdoll laid where the owner's lies, moving as it
-    // moves.
-    if (flags & SNAP_DEAD) != 0 {
-        _died = character.die(c, core.vec3(0.0, 0.0, 0.0), place, 0.0)
-    } else {
-        _knocked = knock_now(f, 0, core.vec3(0.0, 0.0, 0.0))
-    }
-    count = get_u8(r)
+    n = 7 + mover.STATE_FLOATS
+    n = character.state_read(c, saved, n)
+    n = animator.state_read(character.animator_of(c), saved, n, blend)
+    if saved[n] < 0.5 { return }
+    n = n + 1
     pa = character.physanim_of(c)
     if pa == null { return }
+    n = physanim.state_read(pa, saved, n)
     rag = physanim.ragdoll_of(pa)
+    count = saved[n] as int
+    n = n + 1
+    if blend <= 0.0 {
+        // Laid whole: the rig in the pose drawn and every body and its
+        // anchor put on it (where they stood, the anchors pulled the bodies
+        // across the world to them), then the bodies where the owner's are.
+        a = character.animator_of(c)
+        pose.apply(animator.rig(a), animator.pose_now(a))
+        physics.ragdoll_to_rig(rag)
+    }
+    lay = blend <= 0.0 || f.motion != null || character.dead(c)
     k = 0
-    while k < count && r.ok {
-        p = get_v3(r)
-        q = get_quat(r)
-        linear = get_v3(r)
-        spin = get_v3(r)
-        if r.ok && k < physics.ragdoll_bone_count(rag) {
-            physics.ragdoll_set_bone_place(rag, k, p, q)
-            physics.ragdoll_set_bone_velocity(rag, k, linear, spin)
+    while k < count {
+        if lay && k < physics.ragdoll_bone_count(rag) {
+            x = n + k * 13
+            physics.ragdoll_set_bone_place(rag, k, core.vec3(saved[x], saved[x + 1], saved[x + 2]), Quat { x: saved[x + 3], y: saved[x + 4], z: saved[x + 5], w: saved[x + 6] })
+            physics.ragdoll_set_bone_velocity(rag, k, core.vec3(saved[x + 7], saved[x + 8], saved[x + 9]), core.vec3(saved[x + 10], saved[x + 11], saved[x + 12]))
         }
         k = k + 1
     }
+}
+
+// A figure that parted from its owner's put back on it whole: every part
+// of its state its owner's, its object's place and facing eased in from
+// where they are (never snapped) and its pose inertialized from what it
+// drew over `blend`.
+resync_figure(f: *NetFigure, saved: float[], blend: float) {
+    c = f.character as *Character
+    o = character.object_of(c)
+    m = character.mover_of(c)
+    here = behaviour.object_position(o)
+    facing = mover.facing_of(m)
+    turn = behaviour.object_rotation(o)
+    figure_state_read(f, saved, blend)
+    f.left = core.v3_sub(core.vec3(saved[0], saved[1], saved[2]), here)
+    f.left_turn = wrap_turn(mover.facing_of(m) - facing)
+    mover.correct(m, mover.velocity(m), facing)
+    behaviour.object_set_rotation(o, turn)
+    f.corrections = f.corrections + 1
+    f.resyncs = f.resyncs + 1
 }
 
 // --- a peer's side ---------------------------------------------------------------------------------
@@ -1815,6 +1947,13 @@ due(na: *NetAnim, now: float) -> bool {
     i = 0
     while i < list.size(na.sources) {
         s = list.get_raw(na.sources, i) as *Source
+        // A resync asked of the owner (through the host, for a client's).
+        if s.want && !s.asked && s.started {
+            to = net.HOST
+            if net.hosting(na.session) { to = s.owner }
+            if net.send_event(na.session, "anim.want", to, now, net.client_id(na.session) as float, s.owner as float) { s.asked = true }
+            s.want = false
+        }
         next = next_of(s)
         s.ready = s.heard && next >= 0 && (next as float) * STEP + s.offset + na.buffer <= now
         if s.ready { any = true }
@@ -1842,6 +1981,15 @@ play(na: *NetAnim) -> int {
                 start_from_snap(na, s)
             }
             s.started = true
+        }
+        if s.started && s.resync != null {
+            // A resync laid on the tick it was taken after; one come after
+            // that tick was played is too late, and let go of.
+            if s.resync_tick == s.playing { lay_snap(na, s.resync, s.resync_length, CORRECT_BLEND) }
+            if s.resync_tick <= s.playing {
+                free(s.resync)
+                s.resync = null
+            }
         }
         if s.started {
             t = s.playing + 1
@@ -1966,14 +2114,14 @@ draw_ragdoll(f: *NetFigure) {
     rag = physanim.ragdoll_of(pa)
     count = physics.ragdoll_bone_count(rag)
     if count > RAG_MOST { count = RAG_MOST }
-    share = 1.0 / (RAG_BLEND as float)
+    share = 1.0 / (f.rag_ticks as float)
     off = f.rag_off as float[]
     k = 0
     while k < count {
         b = physics.ragdoll_bone(rag, k)
         x = k * 7
         by = core.v3_mul(core.vec3(off[x], off[x + 1], off[x + 2]), share)
-        if core.v3_len(by) > RAG_STEP_MOST { by = core.v3_mul(by, RAG_STEP_MOST / core.v3_len(by)) }
+        if core.v3_len(by) > f.rag_cap { by = core.v3_mul(by, f.rag_cap / core.v3_len(by)) }
         p = core.v3_add(behaviour.object_position(b), by)
         part = core.quat_slerp(core.quat_ident(), Quat { x: off[x + 3], y: off[x + 4], z: off[x + 5], w: off[x + 6] }, share)
         q = core.quat_normalize(core.quat_mul(part, behaviour.object_rotation(b)))
@@ -2047,6 +2195,10 @@ hold_state(f: *NetFigure, t: int, now: float[]) {
                 mover.correct(m, core.vec3(s[at + 4], 0.0, s[at + 5]), mover.facing_of(m))
                 if other || late > CORRECT_TIME { animator.play_at(character.animator_of(c), s[at + 7] as int, s[at + 8], CORRECT_BLEND) }
                 f.corrections = f.corrections + 1
+                // And the rest of what it carries (its feet's steps and
+                // peels, its look, its springs) put back whole: the owner
+                // asked for its snapshot.
+                if f.source != null { (f.source as *Source).want = true }
             }
             // A foot planted on both sides, on the same point of it, held
             // elsewhere: eased onto the owner's lock.
@@ -2123,9 +2275,19 @@ hold_ragdoll(f: *NetFigure, t: int) {
                 f.rag_checks = f.rag_checks + 1
                 // Parted: drawn onto the owner's from the next tick (what
                 // was left of a drawing before is in what it is off now).
+                // Over the ticks until the next one comes (every block while
+                // it falls), a tick's step at most RAG_STEP_MOST or what it
+                // takes to close the gap in that time, whichever is more.
                 f.rag_left = 0
+                ticks = t - f.rag_last
+                if f.rag_last < 0 || ticks > RAG_BLEND { ticks = RAG_BLEND }
+                if ticks < 1 { ticks = 1 }
+                f.rag_last = t
                 if worst > RAG_ABOVE || worst_turn > RAG_TURN {
-                    f.rag_left = RAG_BLEND
+                    f.rag_left = ticks
+                    f.rag_ticks = ticks
+                    f.rag_cap = RAG_STEP_MOST
+                    if worst / (ticks as float) > f.rag_cap { f.rag_cap = worst / (ticks as float) }
                     f.rag_corrections = f.rag_corrections + 1
                 }
             }
