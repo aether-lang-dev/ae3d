@@ -1,0 +1,1797 @@
+// ae3d.stance (#988): stances and cover for a character (ae3d.character),
+// the game choosing which, as UE5's crouch (bIsCrouched, its capsule's
+// crouched half height) and a cover system's take-cover, move, peek and
+// leave read together.
+//
+//     s = stance.stances(hero, "people/ual1_rigify.glb")
+//     stance.stance_set(s, stance.CROUCH)          // or STAND, PRONE
+//     character.move(hero, velocity, facing)       // as before: crouch-walks, crawls
+//     stance.cover_probe(s, way, 2.0)              // or cover_take(s, a, b, height, out)
+//     stance.cover_move(s, 0.6)                    // along the wall, its back to it
+//     stance.cover_peek(s, target)                 // out past the end, or up over it
+//
+// What it puts on the character's graph (ae3d.animator), driven by the
+// parameter "stance" (0 stand, 1 crouch, 2 prone) beside the mover's:
+//   - a crouch idle and a crouch move, a 2D blend by velocity, from a file's
+//     takes where it has them (`Crouch_Idle_Loop`, `Crouch_Fwd_Loop`:
+//     Universal Animation Library's), retargeted onto the figure; the ways
+//     the file has no take for (back, to either side) made from the
+//     standing gaits by lowering the pelvis with leg IK and leaning the
+//     trunk forward (crouched), by as much as the file's crouch is lower and
+//     leant than its stand: measured, not guessed;
+//   - a prone idle and a crawl, made from the stand (no take of either is
+//     at hand): the body laid on its front, its head raised, forearms on
+//     the ground, toes tucked; the crawl's toes and hands planted in turn
+//     while the body goes over them (in place, its pace from its planted
+//     feet, as a capture's in-place loop);
+//   - the changes: stand and crouch cross-faded, the crouch idle stood on
+//     the feet as drawn and both feet planted there by leg IK through the
+//     change (plant), the feet's own IK eased back in after; crouch to
+//     prone and back by a take made from the figure as drawn when the
+//     change begins (refit): the hips going ahead onto the knees and then
+//     down onto the front, kept within the legs' reach, each ball of the
+//     foot held where it is as the foot rolls onto its toes, the figure's
+//     object carried to the prone body at its end.
+// The capsule follows the stance (physics.character_set_shape): a crouch's
+// head height, a prone figure's lowest; raised only where there is room
+// (physics.character_room): under a low ceiling the figure stays down, and
+// stands up once out from under it.
+//
+// Cover is generic data, the game's or found by a probe: a wall's face along
+// the ground (its two ends), its height and the way out from it. High cover
+// (COVER_HIGH and up) is taken standing, low crouched. In cover the figure
+// faces out, its back to the wall: its capsule thinner than any back, the
+// back as the skin has it laid on the wall each frame by moving the hips
+// (cover_lean), and the mover keeping the object where that leaves it. It
+// moves along the face (cover_move), round a corner where the wall turns
+// (found by probe), and stops at an end it cannot go round. A peek steps out
+// past the end on the target's side of high cover, or stands up over low
+// cover, and aims the trunk at the target (ikrig's aim); cover_peek_off goes
+// back. cover_leave lets it go.
+//
+// Free the stances (stances_free) before the character: its step after the
+// graph is on the character's animator.
+
+import std.heap
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.physics
+import ae3d.figure
+import ae3d.pose
+import ae3d.clips
+import ae3d.animator
+import ae3d.retarget
+import ae3d.ikrig
+import ae3d.mover
+import ae3d.character
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+exports (
+    Stances, STAND, CROUCH, PRONE, stances, stances_free, stance_set, stance_asked, stance_now, stance_waiting, stance_changing,
+    stance_height, crouch_pace, crawl_pace, crouch_idle_state, crouch_move_state, prone_idle_state, crawl_state, down_state, up_state,
+    crouched, crouch_drop, crouch_lean, change_steepest,
+    cover_take, cover_probe, cover_move, cover_peek, cover_peek_off, cover_leave, in_cover, cover_high, cover_back_gap, cover_out, peeking, aim_error,
+    CHANGE, COVER_HIGH
+)
+
+const STAND = 0
+const CROUCH = 1
+const PRONE = 2
+
+// Seconds a change between stand and crouch is cross-faded over, from a
+// stand or a crouch idle and from either move.
+const CHANGE = 0.5
+const MOVE_CHANGE = 0.4
+// Seconds either side a change into a stand or a crouch idle looks for the
+// entry whose feet match (animator.transition_match): anywhere in a loop.
+const MATCH_WINDOW = 1.0
+// Seconds the feet stay planted by the stance after a change has eased in.
+const PLANT_AFTER = 0.1
+// Seconds the feet's own IK is eased back in over after it.
+const PLANT_EASE = 0.4
+// Seconds between the crouch's idle and its move, and the crawl's.
+const GAIT_CHANGE = 0.3
+// Seconds the take between the crouch and the prone lasts, and the share
+// of it the body is held where the crouch has it before it goes down.
+const DOWN_SECONDS = 1.4
+// The hips on the way down (hips_at): the share of the way ahead they have
+// gone at the kneel, and the share of the way down that is; and from what
+// share they go down.
+const KNEEL_AHEAD = 0.45
+const KNEEL_AT = 0.5
+const DOWN_FROM = 0.4
+// The crawl: seconds a cycle (each limb planted half of it), and metres a
+// second it goes: a soldier's low crawl.
+const CRAWL_CYCLE = 2.0
+const CRAWL_PACE = 0.3
+// Metres a crawling toe and hand are lifted at the most as they come forward.
+const LEG_LIFT = 0.06
+const ARM_LIFT = 0.05
+// The prone pelvis's height over the ground, a share of the stand's: the
+// joint inside the front of the hips lying on the ground.
+const PRONE_PELVIS = 0.13
+// Radians the neck and head raise the face off the ground, lying.
+const NECK_RAISE = 0.85
+const HEAD_RAISE = 0.35
+// Radians a prone thigh is turned out about itself, so a crawling knee bends
+// out to the side along the ground, as a crawl's does, not into it; and an
+// upper arm, so the elbow comes down on the ground.
+const THIGH_OUT = 1.3
+const ARM_TURN = 1.4
+// Metres a prone foot and hand stand out to the side of the hips and the
+// shoulders, and the hands ahead of the shoulders.
+const FOOT_OUT = 0.08
+const HAND_OUT = 0.06
+const HAND_AHEAD = 0.28
+const HAND_HIGH = 0.04
+// Of a straight leg's length, how far a crawl's extended leg reaches, and
+// metres its foot rests in from there: a quarter of the crawl's stride, so
+// its push goes back to the reach and no further.
+const LEG_REACH = 0.88
+const LEG_IN = 0.15
+// Metres a capsule reaches over the top of the head, as character's.
+const HEAD_TOP = 0.12
+// Metres a prone capsule's bottom floats over the feet: a figure lying
+// steps up nothing.
+const STEP_PRONE = 0.05
+// Metres high a cover is high cover from: taken standing.
+const COVER_HIGH = 1.3
+// Metres a cover keeps the figure short of its end, and how far a high
+// cover's peek steps out past it.
+const END_MARGIN = 0.3
+const PEEK_OUT = 0.55
+// Metres a second a peek steps out and back at the most: a side walk's.
+const PEEK_SPEED = 0.6
+// Of the gap to the wall's line, the share closed a second, and the most a
+// back is let off the wall before it is drawn back faster.
+const COVER_PULL = 6.0
+const PULL_MOST = 0.8
+// Metres a back is taken to be behind the object until its skin's is learnt,
+// and how squarely (the cosine) the figure faces out when it is learnt.
+const BACK_GUESS = 0.15
+const FACING_OUT = 0.985
+// Metres round a capsule is in cover: thinner than any back, so the back
+// meets the wall, not the capsule.
+const COVER_RADIUS = 0.05
+// Metres the hips are moved to lay the back on the wall at the most, and the
+// share of the way a step its object's place off the wall is followed by.
+const LEAN_MOST = 0.08
+const BACK_EASE = 0.1
+// Metres the probes for a cover's height and ends step by, and the
+// heights a face is looked for at.
+const PROBE_STEP = 0.1
+const PROBE_LOW = 0.5
+const PROBE_FAR = 12.0
+
+struct Stances {
+    character: ptr                 // *Character
+    engine: ptr                    // *Engine
+    stepper: ptr                   // *Behaviour
+    asked: int                     // the stance the game asked
+    now: int                       // the stance the graph is in ("stance")
+    waiting: bool                  // asked higher, no room
+    changing: int                  // 0 none, 1 going down, 2 coming up (the take between crouch and prone)
+    crouch_idle: int               // its states
+    crouch_move: int
+    down: int
+    prone_idle: int
+    crawl: int
+    up: int
+    stand_height: float            // its capsule's height in each stance, and its own radius and step
+    crouch_height: float
+    prone_height: float
+    radius: float
+    step: float
+    crouch_speed: float            // the crouch walk's own pace
+    drop: float                    // metres the crouch's pelvis is lower than the stand's
+    lean: float                    // radians its trunk is leant further forward
+    shift: Vec3                    // the prone body's place from the crouch's at the down's end, the rig's space
+    crouch_idle_m: int             // the crouch idle on the stand's mirror's feet, -1 none
+    down_take: ptr                 // *Take: the way down, its legs fitted to the feet as drawn at its start (refit)
+    up_take: ptr                   // *Take: the way up, the same
+    prone_take: ptr                // *Take: the prone idle, fitted to where the way down left the feet
+    prone_shifted: ptr             // the prone body (local) moved onto the crouch idle's feet: where the way down ends
+    turn_c0: Quat                  // the crouch idle's feet's turns and the prone's, the rig's space
+    turn_c1: Quat
+    turn_p0: Quat
+    turn_p1: Quat
+    going: Vec3                  // the shift of the way down under way
+    // Cover.
+    covering: bool
+    cover_a: Vec3                  // the face's two ends, on the ground
+    cover_b: Vec3
+    cover_out: Vec3                // level, unit: out from the face
+    cover_h: float                 // its height, metres
+    along: float                   // metres a second asked along it, toward cover_b
+    back_est: float                // metres off the wall's line its object stands when its back is on the wall, followed
+    feet_back: float               // seconds left of the feet's IK easing back in after a plant
+    planting: float               // seconds the feet are still planted by the stance (plant)
+    planted: ptr                   // float[22]: each ankle's place (the world's), its turn and its toes' (the rig's) held
+    leg_l: ptr                     // *Limb: each leg, for the plant
+    leg_r: ptr
+    work_p: ptr                    // poses to read the drawn figure into
+    work_w: ptr
+    peeking: bool
+    peek_at: Vec3
+    stance_before: int             // asked before the cover
+}
+
+// Its stances on character `c`: its crouch from file `takes` (the takes
+// named Crouch_Idle_Loop and Crouch_Fwd_Loop, retargeted onto the figure),
+// its prone made, the graph's states and transitions added, and its step
+// in the engine's loop after the character's. Null when the file has no
+// crouch.
+stances(c: *Character, takes: string) -> *Stances {
+    if c == null { return null }
+    a = character.animator_of(c)
+    o = character.object_of(c)
+    r = animator.rig(a)
+    e = engine.of(o)
+    ci = file_take(e, a, takes, "Crouch_Idle_Loop")
+    cw = file_take(e, a, takes, "Crouch_Fwd_Loop")
+    if ci == null || cw == null { return null }
+    stand_t = animator.state_take(a, character.idle_state(c))
+    if stand_t == null { return null }
+    s = heap.new(Stances)
+    s.character = c as ptr
+    s.engine = e as ptr
+    b = bake_frame(r, o)
+    // How much lower and leant the file's crouch is than the figure's stand.
+    p = pose.new(r)
+    w = pose.new(r)
+    clips.sample_frame(stand_t, r, 0, p)
+    pose.world(r, p, w)
+    stand_pelvis = height_of(b, pose.translation(w, pose.human(r, pose.PELVIS)))
+    stand_tilt = trunk_tilt(b, r, w)
+    clips.sample_frame(ci, r, 0, p)
+    pose.world(r, p, w)
+    s.drop = stand_pelvis - height_of(b, pose.translation(w, pose.human(r, pose.PELVIS)))
+    s.lean = trunk_tilt(b, r, w) - stand_tilt
+    if s.drop < 0.0 { s.drop = 0.0 }
+    // The crouch: its idle, and its move by velocity, the file's forward
+    // walk and the stand's other ways crouched.
+    // Its idle on the stand's own feet, and its mirror on the stand's
+    // mirror's: a change between them moves no foot.
+    ci_fit = animator.add_take(a, fit_feet(r, o, ci, stand_t), false)
+    s.crouch_idle = animator.add_state(a, "crouch", ci_fit, true)
+    s.crouch_idle_m = 0 - 1
+    stand_m = animator.state_take(a, c.idle_m)
+    ci_m = null as *Take
+    if stand_m != null {
+        flipped = clips.mirror(ci, r)
+        ci_m = animator.add_take(a, fit_feet(r, o, flipped, stand_m), false)
+        clips.take_free(flipped)
+        s.crouch_idle_m = animator.add_state(a, "crouch", ci_m, true)
+    }
+    s.crouch_move = animator.add_blend2(a, "crouch move")
+    s.crouch_speed = clips.speed(cw)
+    animator.blend_add2(a, s.crouch_move, cw, 0.0, s.crouch_speed)
+    walk = character.move_state(c)
+    // The stand's back walk and side walks (character's gaits: fw, bw, sw,
+    // its mirror, then the runs).
+    k = 1
+    while k <= 3 && k < animator.state_take_count(a, walk) {
+        t = animator.state_take_at(a, walk, k)
+        made = animator.add_take(a, crouched(r, o, t, s.drop, s.lean), false)
+        went = clips.travel(t, clips.duration(t))
+        animator.blend_add2(a, s.crouch_move, made, went.x / clips.duration(t), went.y / clips.duration(t))
+        k = k + 1
+    }
+    animator.bind2(a, s.crouch_move, "vx", "vz")
+    // The prone, the take between it and the crouch, and its idle: where
+    // that take ends, the feet where the crouch had them, the body put back
+    // over the object.
+    prone = pose.new(r)
+    lay(b, r, stand_t, prone)
+    down_t = down_take(b, r, ci_fit, prone, s, false)
+    up_t = down_take(b, r, ci_fit, prone, s, true)
+    s.down = animator.add_state(a, "going prone", animator.add_take(a, down_t, false), false)
+    s.up = animator.add_state(a, "rising from prone", animator.add_take(a, up_t, false), false)
+    s.down_take = down_t as ptr
+    s.up_take = up_t as ptr
+    pi_t = clips.from_frames(r, "Prone_Idle_Loop", 2, 30.0)
+    s.prone_take = pi_t as ptr
+    pose.copy(r, clips.frame(down_t, clips.frames(down_t) - 1), prone)
+    pose.world(r, prone, w)
+    ikrig.move_joint(r, prone, w, pose.human(r, pose.PELVIS), core.v3_mul(s.shift, 0.0 - 1.0))
+    pose.copy(r, prone, clips.frame(pi_t, 0))
+    pose.copy(r, prone, clips.frame(pi_t, 1))
+    clips.set_looping(pi_t, true)
+    clips.find_contacts(pi_t, r)
+    s.prone_idle = animator.add_state(a, "prone", animator.add_take(a, pi_t, false), true)
+    crawl_t = crawl_take(b, r, stand_t)
+    s.crawl = animator.add_blend2(a, "crawl")
+    // At the pace it was made at: its limbs go back under it at that.
+    animator.blend_add2(a, s.crawl, animator.add_take(a, crawl_t, false), 0.0, CRAWL_PACE)
+    animator.bind2(a, s.crawl, "vx", "vz")
+    // Heights: the stand's capsule, the crouch's head (over both its takes)
+    // and the prone's.
+    cap = physics.character_of(o)
+    s.stand_height = 1.8
+    s.radius = 0.3
+    s.step = physics.STEP_HEIGHT
+    if cap != null {
+        s.stand_height = physics.character_height(cap)
+        s.radius = physics.character_radius(cap)
+    }
+    s.crouch_height = take_top(b, r, ci, p, w)
+    alt = take_top(b, r, cw, p, w)
+    if alt > s.crouch_height { s.crouch_height = alt }
+    s.crouch_height = s.crouch_height + HEAD_TOP
+    pose.world(r, prone, w)
+    s.prone_height = pose_top(b, r, w) + HEAD_TOP
+    least = STEP_PRONE + 2.0 * s.radius
+    if s.prone_height < least { s.prone_height = least }
+    pose.release(prone)
+    pose.release(p)
+    pose.release(w)
+    graph(s, a, c)
+    animator.set_float(a, "stance", 0.0)
+    s.asked = STAND
+    s.now = STAND
+    s.stance_before = STAND
+    s.work_p = pose.new(r)
+    s.work_w = pose.new(r)
+    s.planted = calloc(22, 8)
+    s.leg_l = ikrig.leg_limb(r, 0) as ptr
+    s.leg_r = ikrig.leg_limb(r, 1) as ptr
+    animator.add_post(a, stance_post, s as ptr)
+    st = engine.behaviour_new("stances", s as ptr)
+    st.fixed_update = stance_fixed
+    engine.engine_add_behaviour(e, st)
+    s.stepper = st as ptr
+    return s
+}
+
+stances_free(s: *Stances) {
+    if s == null { return }
+    if s.stepper != null {
+        engine.engine_remove_behaviour(s.engine as *Engine, s.stepper as *Behaviour)
+        heap.free(s.stepper as *Behaviour)
+    }
+    pose.release(s.prone_shifted)
+    c = s.character as *Character
+    if c != null { animator.remove_post(character.animator_of(c), s as ptr) }
+    ikrig.limb_free(s.leg_l as *Limb)
+    ikrig.limb_free(s.leg_r as *Limb)
+    free(s.planted)
+    pose.release(s.work_p)
+    pose.release(s.work_w)
+    heap.free(s)
+}
+
+// Take `title` of the file at `path` retargeted onto the animator's figure,
+// kept by the animator; null when the file has none.
+file_take(e: *Engine, a: *Animator, path: string, title: string) -> *Take {
+    have = animator.take(a, title, false)
+    if have != null { return have }
+    so = figure.figure(e, "stance takes", path)
+    if so == null { return null }
+    behaviour.object_set_position(so, core.vec3(0.0, 0.0 - 80.0, 0.0))
+    sf = figure.figure_of(so)
+    source = pose.of_skeleton(figure.skeleton(sf))
+    made = clips.from_scene(source, figure.scene(sf), title, 0.0)
+    t = null as *Take
+    if made != null {
+        t = animator.add_take(a, retarget.retarget(source, made, animator.rig(a)), true)
+        clips.take_free(made)
+    }
+    pose.rig_free(source)
+    return t
+}
+
+// The graph's states for the stances: every transition it had made one of
+// the stand's ("stance" below a half), and the crouch's and the prone's
+// own added.
+graph(s: *Stances, a: *Animator, c: *Character) {
+    n = animator.transition_count(a)
+    froms = calloc(n + 2, 4) as int[]
+    nf = 0
+    i = 0
+    while i < n {
+        animator.transition_when(a, i, "stance", animator.BELOW, 0.5)
+        f = animator.transition_from(a, i)
+        if f >= 0 && !has(froms, nf, f) {
+            froms[nf] = f
+            nf = nf + 1
+        }
+        i = i + 1
+    }
+    idle = character.idle_state(c)
+    walk = character.move_state(c)
+    if idle >= 0 && !has(froms, nf, idle) {
+        froms[nf] = idle
+        nf = nf + 1
+    }
+    if walk >= 0 && !has(froms, nf, walk) {
+        froms[nf] = walk
+        nf = nf + 1
+    }
+    k = 0
+    while k < nf {
+        down = animator.add_transition(a, froms[k], s.crouch_idle, CHANGE)
+        animator.transition_when(a, down, "stance", animator.ABOVE, 0.5)
+        animator.transition_when(a, down, "go", animator.IS_NOT, 0.0)
+        animator.transition_crossfade(a, down, true)
+        either_idle(s, a, down)
+        on = animator.add_transition(a, froms[k], s.crouch_move, MOVE_CHANGE)
+        animator.transition_when(a, on, "stance", animator.ABOVE, 0.5)
+        animator.transition_when(a, on, "go", animator.IS, 0.0)
+        animator.transition_crossfade(a, on, true)
+        k = k + 1
+    }
+    free(froms as ptr)
+    crouches = [s.crouch_idle, s.crouch_move, s.crouch_idle_m]
+    nc = 2
+    if s.crouch_idle_m >= 0 { nc = 3 }
+    k = 0
+    while k < nc {
+        stood = animator.add_transition(a, crouches[k], idle, CHANGE)
+        animator.transition_when(a, stood, "stance", animator.BELOW, 0.5)
+        animator.transition_when(a, stood, "go", animator.IS_NOT, 0.0)
+        animator.transition_crossfade(a, stood, true)
+        if c.idle_m >= 0 {
+            animator.transition_or(a, stood, c.idle_m)
+            animator.transition_match(a, stood, MATCH_WINDOW)
+        }
+        walked = animator.add_transition(a, crouches[k], walk, MOVE_CHANGE)
+        animator.transition_when(a, walked, "stance", animator.BELOW, 0.5)
+        animator.transition_when(a, walked, "go", animator.IS, 0.0)
+        animator.transition_crossfade(a, walked, true)
+        if k != 1 {
+            go = animator.add_transition(a, crouches[k], s.crouch_move, GAIT_CHANGE)
+            animator.transition_when(a, go, "go", animator.IS, 0.0)
+            animator.transition_crossfade(a, go, true)
+        }
+        k = k + 1
+    }
+    halt = animator.add_transition(a, s.crouch_move, s.crouch_idle, GAIT_CHANGE)
+    animator.transition_when(a, halt, "go", animator.IS_NOT, 0.0)
+    animator.transition_when(a, halt, "speed", animator.BELOW, 0.1)
+    animator.transition_crossfade(a, halt, true)
+    either_idle(s, a, halt)
+    creep = animator.add_transition(a, s.prone_idle, s.crawl, GAIT_CHANGE)
+    animator.transition_when(a, creep, "go", animator.IS, 0.0)
+    animator.transition_crossfade(a, creep, true)
+    lie = animator.add_transition(a, s.crawl, s.prone_idle, GAIT_CHANGE)
+    animator.transition_when(a, lie, "go", animator.IS_NOT, 0.0)
+    animator.transition_when(a, lie, "speed", animator.BELOW, 0.05)
+    animator.transition_crossfade(a, lie, true)
+}
+
+// Transition `tr` into the crouch idle made one into whichever of it and its
+// mirror has its feet where the figure's are (animator.transition_match).
+either_idle(s: *Stances, a: *Animator, tr: int) {
+    if s.crouch_idle_m < 0 { return }
+    animator.transition_or(a, tr, s.crouch_idle_m)
+    animator.transition_match(a, tr, MATCH_WINDOW)
+}
+
+has(v: int[], n: int, x: int) -> bool {
+    i = 0
+    while i < n {
+        if v[i] == x { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// --- asking -----------------------------------------------------------------------------------------
+
+// The stance the game asks for: STAND, CROUCH or PRONE. It is taken as
+// soon as there is room for it (going up), through the crouch between the
+// stand and the prone.
+stance_set(s: *Stances, which: int) {
+    if s == null { return }
+    s.asked = which
+    if which < STAND { s.asked = STAND }
+    if which > PRONE { s.asked = PRONE }
+}
+
+stance_asked(s: *Stances) -> int { return s.asked }
+// The stance it is in (the graph's), and whether it waits for room to rise
+// to the one asked, or is going down to or up from the prone.
+stance_now(s: *Stances) -> int { return s.now }
+stance_waiting(s: *Stances) -> bool { return s.waiting }
+stance_changing(s: *Stances) -> bool { return s.changing != 0 }
+
+// Its capsule's height in stance `which`.
+stance_height(s: *Stances, which: int) -> float {
+    if which == CROUCH { return s.crouch_height }
+    if which == PRONE { return s.prone_height }
+    return s.stand_height
+}
+
+// The crouch walk's own pace and the crawl's, metres a second.
+crouch_pace(s: *Stances) -> float { return s.crouch_speed }
+crawl_pace(s: *Stances) -> float { return CRAWL_PACE }
+crouch_idle_state(s: *Stances) -> int { return s.crouch_idle }
+crouch_move_state(s: *Stances) -> int { return s.crouch_move }
+prone_idle_state(s: *Stances) -> int { return s.prone_idle }
+crawl_state(s: *Stances) -> int { return s.crawl }
+down_state(s: *Stances) -> int { return s.down }
+up_state(s: *Stances) -> int { return s.up }
+// The steepest the way down's easing goes (its hips' and its blend's), a
+// share of the way a second of its length: what a joint's turn between the
+// crouch and the prone is drawn at, at the most, over the way's seconds.
+change_steepest() -> float {
+    most = 1.5
+    if 1.5 / KNEEL_AT > most { most = 1.5 / KNEEL_AT }
+    if 1.5 / (1.0 - KNEEL_AT) > most { most = 1.5 / (1.0 - KNEEL_AT) }
+    if 1.5 / (1.0 - DOWN_FROM) > most { most = 1.5 / (1.0 - DOWN_FROM) }
+    return most
+}
+
+// Metres lower and radians further leant the crouch is than the stand.
+crouch_drop(s: *Stances) -> float { return s.drop }
+crouch_lean(s: *Stances) -> float { return s.lean }
+
+// --- each step --------------------------------------------------------------------------------------
+
+stance_fixed(state: ptr, _e: *Engine, dt: float) {
+    s = state as *Stances
+    c = s.character as *Character
+    a = character.animator_of(c)
+    o = character.object_of(c)
+    cap = physics.character_of(o)
+    plant_step(s, dt)
+    if s.changing != 0 {
+        change_step(s, c, a, o)
+        shape(s, cap)
+        return
+    }
+    if character.paused(c) || character.acting(c) || character.dead(c) { return }
+    want = s.asked
+    if s.covering && s.peeking && s.cover_h < COVER_HIGH { want = STAND }
+    // No higher than there is room for, from where it is.
+    target = want
+    if target < s.now && cap != null {
+        if !room_for(s, c, o, cap, target) {
+            target = s.now
+            if want == STAND && s.now == PRONE && room_for(s, c, o, cap, CROUCH) { target = CROUCH }
+        }
+    }
+    s.waiting = target != want
+    if target != s.now {
+        cur = animator.current(a)
+        settled = !animator.transitioning(a) && a.fade_from < 0
+        if s.now == STAND {
+            set_now(s, a, CROUCH)
+        } else if s.now == CROUCH && target == STAND {
+            set_now(s, a, STAND)
+        } else if s.now == CROUCH && target == PRONE {
+            // From either crouch idle or its move: the way down begins on
+            // the crouch idle's feet (from its mirror's, eased onto them).
+            if settled && (cur == s.crouch_idle || cur == s.crouch_move || cur == s.crouch_idle_m) {
+                character.pause(c)
+                s.going = s.shift
+                refit(s, a, s.down_take as *Take, false, core.vec3(0.0, 0.0, 0.0))
+                ikrig.feet_set_weight(character.feet_of(c), 0.0)
+                animator.play(a, s.down, 0.0)
+                s.changing = 1
+                set_now(s, a, PRONE)
+            }
+        } else if s.now == PRONE && target < PRONE {
+            if cur == s.prone_idle || cur == s.crawl {
+                // The body drawn where it lies, its object put back over
+                // the feet the take rises onto.
+                at = behaviour.object_position(o)
+                back = ikrig.dir_to_ground(animator.rig(a), s.shift)
+                character.pause(c)
+                refit(s, a, s.up_take as *Take, true, s.shift)
+                ikrig.feet_set_weight(character.feet_of(c), 0.0)
+                behaviour.object_set_position(o, core.vec3(at.x - back.x, at.y, at.z - back.z))
+                animator.play(a, s.up, 0.0)
+                s.changing = 2
+                set_now(s, a, CROUCH)
+            }
+        }
+    }
+    shape(s, cap)
+    if s.covering { cover_step(s, c, a, o) }
+}
+
+set_now(s: *Stances, a: *Animator, which: int) {
+    // Between the stand and the crouch the feet are planted where they are
+    // drawn for the change's length (plant).
+    // (Not while it goes: a change between the moves is the gaits' own.)
+    still = animator.float_param(a, "go") < 0.5
+    if still && ((s.now == STAND && which == CROUCH) || (s.now == CROUCH && which == STAND)) { plant(s, a, CHANGE + PLANT_AFTER) }
+    // Crouching where it stands, the crouch idle stood on its feet as they
+    // are: the locks set again at the plant's end hold what the take has.
+    if still && s.now == STAND && which == CROUCH {
+        fit_drawn(s, a, animator.state_take(a, s.crouch_idle))
+        if s.crouch_idle_m >= 0 { fit_drawn(s, a, animator.state_take(a, s.crouch_idle_m)) }
+    }
+    s.now = which
+    animator.set_float(a, "stance", which as float)
+}
+
+// Both feet planted where they are drawn now for `seconds`: each step after
+// the graph and its IK (an animator post), each leg bent by IK so its
+// ankle stays where it was, turned as it was, the feet's own locks off
+// meanwhile (a cross-fade between a stand and a crouch on the same feet
+// moved them up to 37 mm under the locks, which took the change's
+// mid-blend feet for a step). The feet's locks are set again where the
+// feet are at its end.
+plant(s: *Stances, a: *Animator, seconds: float) {
+    r = animator.rig(a)
+    c = s.character as *Character
+    p = s.work_p
+    w = s.work_w
+    pose.read(r, p)
+    pose.world(r, p, w)
+    held = s.planted as float[]
+    feet = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    balls = [pose.human(r, pose.BALL_L), pose.human(r, pose.BALL_R)]
+    k = 0
+    while k < 2 {
+        at = ikrig.to_ground(r, pose.translation(w, feet[k]))
+        q = pose.rotation(w, feet[k])
+        held[k * 11] = at.x
+        held[k * 11 + 1] = at.y
+        held[k * 11 + 2] = at.z
+        held[k * 11 + 3] = q.x
+        held[k * 11 + 4] = q.y
+        held[k * 11 + 5] = q.z
+        held[k * 11 + 6] = q.w
+        // The toes as drawn: bent by the feet's IK onto the floor, which
+        // the take has not (let go with the IK, the toe's tip moved 5 mm).
+        t = q
+        if balls[k] >= 0 { t = pose.rotation(w, balls[k]) }
+        held[k * 11 + 7] = t.x
+        held[k * 11 + 8] = t.y
+        held[k * 11 + 9] = t.z
+        held[k * 11 + 10] = t.w
+        k = k + 1
+    }
+    s.planting = seconds
+    ikrig.feet_set_weight(character.feet_of(c), 0.0)
+}
+
+// The stances' step after the graph and its IK: the plant (plant), then in
+// cover the back laid on the wall (cover_lean).
+stance_post(state: ptr, a: *Animator) {
+    s = state as *Stances
+    plant_post(s, a)
+    cover_lean(s, a)
+}
+
+// In cover, facing out, the hips moved square to the wall as far as the back
+// is off it as drawn (pose.flesh_extreme of the pelvis's and the spine's
+// flesh; LEAN_MOST at the most), the legs bent by IK so the feet stay: the
+// back on the wall whatever the take does with the trunk (a side walk's hips
+// swing 4 cm back and forth). How far off the wall the object stands with
+// its back on it is followed (s.back_est), and the mover keeps it there.
+cover_lean(s: *Stances, a: *Animator) {
+    if !s.covering || s.peeking || s.changing != 0 { return }
+    c = s.character as *Character
+    o = character.object_of(c)
+    ahead = core.quat_apply(behaviour.object_rotation(o), core.vec3(0.0, 0.0, 1.0))
+    if core.v3_dot(ahead, s.cover_out) < FACING_OUT { return }
+    gap = cover_back_gap(s)
+    at = behaviour.object_position(o)
+    off = core.v3_dot(core.v3_sub(at, s.cover_a), s.cover_out)
+    s.back_est = s.back_est + (off - gap - s.back_est) * BACK_EASE
+    by = core.clampf(gap, 0.0 - LEAN_MOST, LEAN_MOST)
+    if core.abs_of(by) < 0.0005 { return }
+    r = animator.rig(a)
+    p = s.work_p
+    w = s.work_w
+    pose.read(r, p)
+    pose.world(r, p, w)
+    feet = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    ankles = [pose.translation(w, feet[0]), pose.translation(w, feet[1])]
+    turns = [pose.rotation(w, feet[0]), pose.rotation(w, feet[1])]
+    ikrig.move_joint(r, p, w, pose.human(r, pose.PELVIS), ikrig.dir_to_rig(r, core.v3_mul(s.cover_out, 0.0 - by)))
+    legs = [s.leg_l as *Limb, s.leg_r as *Limb]
+    k = 0
+    while k < 2 {
+        ikrig.limb_solve(legs[k], r, p, w, ankles[k], turns[k])
+        pose.world(r, p, w)
+        k = k + 1
+    }
+    pose.apply(r, p)
+}
+
+// The plant's part of the step after the graph (plant).
+plant_post(s: *Stances, a: *Animator) {
+    if s.planting <= 0.0 { return }
+    r = animator.rig(a)
+    p = s.work_p
+    w = s.work_w
+    pose.read(r, p)
+    pose.world(r, p, w)
+    held = s.planted as float[]
+    legs = [s.leg_l as *Limb, s.leg_r as *Limb]
+    balls = [pose.human(r, pose.BALL_L), pose.human(r, pose.BALL_R)]
+    k = 0
+    while k < 2 {
+        at = ikrig.to_rig(r, core.vec3(held[k * 11], held[k * 11 + 1], held[k * 11 + 2]))
+        q = Quat { x: held[k * 11 + 3], y: held[k * 11 + 4], z: held[k * 11 + 5], w: held[k * 11 + 6] }
+        ikrig.limb_solve(legs[k], r, p, w, at, q)
+        pose.world(r, p, w)
+        if balls[k] >= 0 {
+            t = Quat { x: held[k * 11 + 7], y: held[k * 11 + 8], z: held[k * 11 + 9], w: held[k * 11 + 10] }
+            pose.set_rotation(p, balls[k], pose.local_rotation_of(r, w, balls[k], t))
+            pose.world(r, p, w)
+        }
+        k = k + 1
+    }
+    pose.apply(r, p)
+}
+
+// The plant run down by `dt`; at its end the feet's locks set again where
+// the feet are.
+plant_step(s: *Stances, dt: float) {
+    c = s.character as *Character
+    ft = character.feet_of(c)
+    if s.feet_back > 0.0 {
+        // The feet's IK eased back in over PLANT_EASE: set back at once, it
+        // laid each foot flat on the floor in a frame, the toes bent 10
+        // rad/s and the heel moved 5 mm.
+        s.feet_back = s.feet_back - dt
+        ikrig.feet_set_weight(ft, eased(1.0 - s.feet_back / PLANT_EASE))
+        return
+    }
+    if s.planting <= 0.0 { return }
+    s.planting = s.planting - dt
+    if s.planting > 0.0 { return }
+    ikrig.feet_reset(ft)
+    s.feet_back = PLANT_EASE
+    ikrig.feet_set_weight(ft, 0.0001)
+}
+
+// Whether its capsule has room to be stance `which`'s height where it is
+// (rising from the prone: where the crouch it rises to will stand).
+room_for(s: *Stances, c: *Character, o: *GameObject, cap: *CharacterController, which: int) -> bool {
+    h = stance_height(s, which)
+    if s.now == PRONE {
+        a = character.animator_of(c)
+        back = ikrig.dir_to_ground(animator.rig(a), s.shift)
+        at = physics.character_feet(cap)
+        return physics.capsule_clear(physics.of(engine.of(o)), core.vec3(at.x - back.x, at.y, at.z - back.z), physics.character_radius(cap), h)
+    }
+    return physics.character_room(cap, h)
+}
+
+// The take between the crouch and the prone played on: at its end the
+// figure is its own again, in the stance it went to.
+change_step(s: *Stances, c: *Character, a: *Animator, o: *GameObject) {
+    cur = animator.current(a)
+    t = animator.state_take(a, cur)
+    if t != null && animator.state_time(a) < clips.duration(t) - 0.0001 { return }
+    at = behaviour.object_position(o)
+    ahead = core.quat_apply(behaviour.object_rotation(o), core.vec3(0.0, 0.0, 1.0))
+    if s.changing == 1 {
+        // Down: the object carried to the prone body, drawn as it lies.
+        on = ikrig.dir_to_ground(animator.rig(a), s.going)
+        prone_from_down(s, a)
+        character.resume(c, core.vec3(at.x + on.x, at.y, at.z + on.z), ahead)
+        animator.play(a, s.prone_idle, 0.0)
+        // Lying, the feet are the takes' own: the feet's IK is a standing
+        // figure's (its clearance and its drop slid a crawling ball 13 mm
+        // as it lifted it).
+        ikrig.feet_set_weight(character.feet_of(c), 0.0)
+    } else {
+        // Up: the crouch idle stood on the feet as the way up left them, so
+        // the feet's locks set again there hold what the take has.
+        fit_drawn(s, a, animator.state_take(a, s.crouch_idle))
+        character.resume(c, at, ahead)
+        animator.play(a, s.crouch_idle, 0.0)
+        // The feet's IK eased back in, as after a plant (set back at once,
+        // it laid a foot flat in a frame at 80 rad/s).
+        s.feet_back = PLANT_EASE
+        ikrig.feet_set_weight(character.feet_of(c), 0.0001)
+    }
+    s.changing = 0
+}
+
+// Its capsule as the stance has it: never taller than there was room for.
+shape(s: *Stances, cap: *CharacterController) {
+    if cap == null { return }
+    h = stance_height(s, s.now)
+    if s.changing == 1 { h = stance_height(s, CROUCH) }
+    rad = s.radius
+    if s.covering { rad = COVER_RADIUS }
+    physics.character_set_shape(cap, rad, h)
+    if s.now == PRONE && s.changing == 0 {
+        physics.character_set_step_height(cap, STEP_PRONE)
+    } else {
+        physics.character_set_step_height(cap, s.step)
+    }
+}
+
+// --- making the takes --------------------------------------------------------------------------------
+
+// The ground's frame in the rig's space at the figure as it stands: up, its
+// forward, its left (cross(up, forward): a turn about it by a positive angle
+// pitches forward), the ground under the object, and rig units a metre.
+struct Bake {
+    up: Vec3
+    ahead: Vec3
+    left: Vec3
+    ground: Vec3
+    unit: float
+}
+
+bake_frame(r: *pose.Rig, o: *GameObject) -> Bake {
+    u = ikrig.dir_to_rig(r, core.vec3(0.0, 1.0, 0.0))
+    unit = core.v3_len(u)
+    if unit < 0.000001 { unit = 1.0 }
+    up = core.v3_normalize(u)
+    fwd = ikrig.dir_to_rig(r, core.quat_apply(behaviour.object_rotation(o), core.vec3(0.0, 0.0, 1.0)))
+    fwd = core.v3_sub(fwd, core.v3_mul(up, core.v3_dot(fwd, up)))
+    ahead = core.v3_normalize(fwd)
+    return Bake { up: up, ahead: ahead, left: core.v3_normalize(core.v3_cross(up, ahead)), ground: ikrig.to_rig(r, behaviour.object_position(o)), unit: unit }
+}
+
+// A point's height over the ground, metres.
+height_of(b: Bake, p: Vec3) -> float { return core.v3_dot(core.v3_sub(p, b.ground), b.up) / b.unit }
+
+// The point `p` with its height made `h` metres.
+at_height(b: Bake, p: Vec3, h: float) -> Vec3 { return core.v3_add(p, core.v3_mul(b.up, (h - height_of(b, p)) * b.unit)) }
+
+// A place `ahead` metres forward, `left` to the left and `high` up from
+// the ground point under `p`.
+place(b: Bake, p: Vec3, ahead: float, left: float, high: float) -> Vec3 {
+    g = at_height(b, p, 0.0)
+    return core.v3_add(g, core.v3_add(core.v3_mul(b.ahead, ahead * b.unit), core.v3_add(core.v3_mul(b.left, left * b.unit), core.v3_mul(b.up, high * b.unit))))
+}
+
+// Radians the line from the pelvis to the chest leans forward of up.
+trunk_tilt(b: Bake, r: *pose.Rig, w: ptr) -> float {
+    line = core.v3_sub(pose.translation(w, pose.human(r, pose.SPINE_03)), pose.translation(w, pose.human(r, pose.PELVIS)))
+    return core.atan2_of(core.v3_dot(line, b.ahead), core.v3_dot(line, b.up))
+}
+
+// Joint `j` of pose `p` turned by `q` (the rig's space) about itself;
+// `w` made again.
+turn_joint(r: *pose.Rig, p: ptr, w: ptr, j: int, q: Quat) {
+    if j < 0 { return }
+    wanted = core.quat_normalize(core.quat_mul(q, pose.rotation(w, j)))
+    pose.set_rotation(p, j, pose.local_rotation_of(r, w, j, wanted))
+    pose.world(r, p, w)
+}
+
+// The highest any joint of `w` is, metres, and over a take's frames.
+pose_top(b: Bake, r: *pose.Rig, w: ptr) -> float {
+    top = 0.0
+    j = 0
+    while j < pose.count(r) {
+        h = height_of(b, pose.translation(w, j))
+        if h > top { top = h }
+        j = j + 1
+    }
+    return top
+}
+
+take_top(b: Bake, r: *pose.Rig, t: *Take, p: ptr, w: ptr) -> float {
+    top = 0.0
+    f = 0
+    while f < clips.frames(t) {
+        clips.sample_frame(t, r, f, p)
+        pose.world(r, p, w)
+        head = pose.human(r, pose.HEAD)
+        if head >= 0 {
+            h = height_of(b, pose.translation(w, head))
+            if h > top { top = h }
+        }
+        f = f + 1
+    }
+    return top
+}
+
+// Take `t` (an idle) stood on the feet of `stand`'s first frame, made for
+// this call and owned by the caller: each frame's body moved level as far
+// as the take's first frame's ankles are from the stand's, and the legs
+// bent by IK so each ankle is where the stand has it, turned as it has it.
+// A change between the two then moves no foot: a crouch from a file whose
+// feet stand 38 cm from the stand's (UAL's crouch on 100STYLE's stand) slid
+// them that far through the change.
+fit_feet(r: *pose.Rig, o: *GameObject, t: *Take, stand: *Take) -> *Take {
+    b = bake_frame(r, o)
+    out = clips.crop(t, r, 0, clips.frames(t) - 1, clips.looping(t))
+    w = pose.new(r)
+    sp = pose.new(r)
+    legs = [ikrig.leg_limb(r, 0), ikrig.leg_limb(r, 1)]
+    feet = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    pelvis = pose.human(r, pose.PELVIS)
+    clips.sample_frame(stand, r, 0, sp)
+    pose.world(r, sp, w)
+    goal_l = pose.translation(w, feet[0])
+    goal_r = pose.translation(w, feet[1])
+    turn_l = pose.rotation(w, feet[0])
+    turn_r = pose.rotation(w, feet[1])
+    balls = [pose.human(r, pose.BALL_L), pose.human(r, pose.BALL_R)]
+    toes = [core.quat_ident(), core.quat_ident()]
+    k = 0
+    while k < 2 {
+        if balls[k] >= 0 { toes[k] = pose.rotation(w, balls[k]) }
+        k = k + 1
+    }
+    clips.sample_frame(t, r, 0, sp)
+    pose.world(r, sp, w)
+    by = core.v3_sub(core.v3_mul(core.v3_add(goal_l, goal_r), 0.5), core.v3_mul(core.v3_add(pose.translation(w, feet[0]), pose.translation(w, feet[1])), 0.5))
+    by = core.v3_sub(by, core.v3_mul(b.up, core.v3_dot(by, b.up)))
+    f = 0
+    while f < clips.frames(out) {
+        p = clips.frame(out, f)
+        pose.world(r, p, w)
+        ikrig.move_joint(r, p, w, pelvis, by)
+        ikrig.limb_solve(legs[0], r, p, w, goal_l, turn_l)
+        pose.world(r, p, w)
+        ikrig.limb_solve(legs[1], r, p, w, goal_r, turn_r)
+        pose.world(r, p, w)
+        // The toes as the stand bends them: the feet's locks hold a toe's
+        // tip, and a take bending its toes about it slid the ball of the
+        // foot 7 mm in two seconds of the crouch.
+        k = 0
+        while k < 2 {
+            if balls[k] >= 0 {
+                pose.set_rotation(p, balls[k], pose.local_rotation_of(r, w, balls[k], toes[k]))
+                pose.world(r, p, w)
+            }
+            k = k + 1
+        }
+        f = f + 1
+    }
+    ikrig.limb_free(legs[0])
+    ikrig.limb_free(legs[1])
+    pose.release(w)
+    pose.release(sp)
+    return out
+}
+
+// Take `t` crouched, made for this call and owned by the caller: each
+// frame's pelvis lowered `drop` metres and its trunk leant `lean` radians
+// further forward from the hips, the legs bent by IK so each ankle stays
+// where the take has it, turned as it has it. Its root motion, contacts and
+// pace are the take's: the feet go where they went. What a game does for a
+// stance it has no take of (UE5's crouch on a stand's gaits, its pelvis
+// lowered by the crouched half height).
+crouched(r: *pose.Rig, o: *GameObject, t: *Take, drop: float, lean: float) -> *Take {
+    b = bake_frame(r, o)
+    out = clips.crop(t, r, 0, clips.frames(t) - 1, clips.looping(t))
+    w = pose.new(r)
+    legs = [ikrig.leg_limb(r, 0), ikrig.leg_limb(r, 1)]
+    feet = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    pelvis = pose.human(r, pose.PELVIS)
+    spine = pose.human(r, pose.SPINE_01)
+    tilt = core.quat_rotate(lean, b.left)
+    f = 0
+    while f < clips.frames(out) {
+        p = clips.frame(out, f)
+        pose.world(r, p, w)
+        ankle_l = pose.translation(w, feet[0])
+        ankle_r = pose.translation(w, feet[1])
+        turn_l = pose.rotation(w, feet[0])
+        turn_r = pose.rotation(w, feet[1])
+        ikrig.move_joint(r, p, w, pelvis, core.v3_mul(b.up, 0.0 - drop * b.unit))
+        turn_joint(r, p, w, spine, tilt)
+        ikrig.limb_solve(legs[0], r, p, w, ankle_l, turn_l)
+        pose.world(r, p, w)
+        ikrig.limb_solve(legs[1], r, p, w, ankle_r, turn_r)
+        f = f + 1
+    }
+    ikrig.limb_free(legs[0])
+    ikrig.limb_free(legs[1])
+    pose.release(w)
+    return out
+}
+
+// The stand's first frame laid on its front into `out` (local), before its
+// limbs are placed: the whole body pitched forward onto the ground about
+// its pelvis, the pelvis PRONE_PELVIS of its standing height over the
+// ground where it stood, the face raised off the ground, the thighs turned
+// out and the upper arms turned so the knees bend out along the ground and
+// the elbows come down onto it, the toes bent level under the feet.
+laid_body(b: Bake, r: *pose.Rig, stand_t: *Take, out: ptr, w: ptr) {
+    clips.sample_frame(stand_t, r, 0, out)
+    pose.world(r, out, w)
+    pelvis = pose.human(r, pose.PELVIS)
+    stood = height_of(b, pose.translation(w, pelvis))
+    turn_joint(r, out, w, pelvis, core.quat_rotate(1.5707963267948966, b.left))
+    p = pose.translation(w, pelvis)
+    ikrig.move_joint(r, out, w, pelvis, core.v3_sub(at_height(b, p, stood * PRONE_PELVIS), p))
+    pose.world(r, out, w)
+    turn_joint(r, out, w, pose.human(r, pose.NECK), core.quat_rotate(0.0 - NECK_RAISE, b.left))
+    turn_joint(r, out, w, pose.human(r, pose.HEAD), core.quat_rotate(0.0 - HEAD_RAISE, b.left))
+    sides = [1.0, 0.0 - 1.0]
+    thighs = [pose.human(r, pose.THIGH_L), pose.human(r, pose.THIGH_R)]
+    knees = [pose.human(r, pose.CALF_L), pose.human(r, pose.CALF_R)]
+    feet = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    arms = [pose.human(r, pose.UPPERARM_L), pose.human(r, pose.UPPERARM_R)]
+    elbows = [pose.human(r, pose.LOWERARM_L), pose.human(r, pose.LOWERARM_R)]
+    hands = [pose.human(r, pose.HAND_L), pose.human(r, pose.HAND_R)]
+    balls = [pose.human(r, pose.BALL_L), pose.human(r, pose.BALL_R)]
+    base = pose.translation(w, pelvis)
+    k = 0
+    while k < 2 {
+        // Each turned the way that, bent, puts the knee out to its side on
+        // the ground, the elbow down on it: tried both ways round, on a
+        // bend as deep as the crawl's.
+        hip = pose.translation(w, thighs[k])
+        leg_long = (core.v3_len(core.v3_sub(pose.translation(w, knees[k]), hip)) + core.v3_len(core.v3_sub(pose.translation(w, feet[k]), pose.translation(w, knees[k])))) / b.unit
+        bent = place(b, base, core.v3_dot(core.v3_sub(hip, base), b.ahead) / b.unit - 0.55 * leg_long, core.v3_dot(core.v3_sub(hip, base), b.left) / b.unit + sides[k] * FOOT_OUT, 0.15)
+        leg = ikrig.leg_limb(r, k)
+        turn_out(r, out, w, thighs[k], knees[k], feet[k], leg, bent, core.v3_mul(b.left, sides[k]), THIGH_OUT)
+        ikrig.limb_free(leg)
+        shoulder = pose.translation(w, arms[k])
+        reach = place(b, base, core.v3_dot(core.v3_sub(shoulder, base), b.ahead) / b.unit + HAND_AHEAD, core.v3_dot(core.v3_sub(shoulder, base), b.left) / b.unit + sides[k] * HAND_OUT, HAND_HIGH)
+        arm = ikrig.arm_limb(r, k)
+        if arm != null && hands[k] >= 0 {
+            down = core.v3_normalize(core.v3_add(core.v3_mul(b.up, 0.0 - 1.0), core.v3_mul(b.left, sides[k] * 0.5)))
+            turn_out(r, out, w, arms[k], elbows[k], hands[k], arm, reach, down, ARM_TURN)
+            ikrig.limb_free(arm)
+        }
+        // The toes bent level, pointing ahead under the foot.
+        if balls[k] >= 0 { turn_joint(r, out, w, balls[k], core.quat_rotate(0.0 - 1.5707963267948966, b.left)) }
+        k = k + 1
+    }
+}
+
+// Upper joint `upper` of pose `p` (its world `w`) turned `angle` radians
+// about its own line, the way round that puts the middle joint furthest
+// along `want` once the limb `l` is bent to reach `target`: tried both ways.
+turn_out(r: *pose.Rig, p: ptr, w: ptr, upper: int, middle: int, end: int, l: *Limb, target: Vec3, want: Vec3, angle: float) {
+    if l == null || upper < 0 || middle < 0 || end < 0 { return }
+    axis = core.v3_normalize(core.v3_sub(pose.translation(w, middle), pose.translation(w, upper)))
+    trial = pose.new(r)
+    tw = pose.new(r)
+    best = 0.0
+    best_along = 0.0 - 1000.0
+    signs = [1.0, 0.0 - 1.0]
+    k = 0
+    while k < 2 {
+        pose.copy(r, p, trial)
+        pose.world(r, trial, tw)
+        turn_joint(r, trial, tw, upper, core.quat_rotate(angle * signs[k], axis))
+        ikrig.limb_solve(l, r, trial, tw, target, pose.rotation(tw, end))
+        pose.world(r, trial, tw)
+        h = pose.translation(tw, upper)
+        e = pose.translation(tw, end)
+        mid = core.v3_mul(core.v3_add(h, e), 0.5)
+        along = core.v3_dot(core.v3_sub(pose.translation(tw, middle), mid), want)
+        if along > best_along {
+            best_along = along
+            best = angle * signs[k]
+        }
+        k = k + 1
+    }
+    pose.release(trial)
+    pose.release(tw)
+    turn_joint(r, p, w, upper, core.quat_rotate(best, axis))
+}
+
+// The prone pose: the body laid (laid_body), then its legs and arms put by
+// IK at rest on the ground: the legs reaching back, toes tucked, the
+// forearms on the ground ahead of the shoulders.
+lay(b: Bake, r: *pose.Rig, stand_t: *Take, out: ptr) {
+    w = pose.new(r)
+    laid_body(b, r, stand_t, out, w)
+    limbs_at(b, r, out, w, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    pose.release(w)
+}
+
+// The four limbs of a laid body (laid_body, `p` and its world `w`) put by
+// IK: each leg's foot `fl` and `fr` metres ahead of where it reaches at
+// rest and lifted `hl`, `hr`; each hand `al`, `ar` ahead of its rest place
+// and lifted `gl`, `gr`. A foot keeps the turn it was laid with, its ball
+// on the ground; a hand keeps its own.
+limbs_at(b: Bake, r: *pose.Rig, p: ptr, w: ptr, fl: float, fr: float, hl: float, hr: float, al: float, ar: float, gl: float, gr: float) {
+    feet_ahead = [fl, fr]
+    feet_up = [hl, hr]
+    hands_ahead = [al, ar]
+    hands_up = [gl, gr]
+    sides = [1.0, 0.0 - 1.0]
+    thighs = [pose.human(r, pose.THIGH_L), pose.human(r, pose.THIGH_R)]
+    knees = [pose.human(r, pose.CALF_L), pose.human(r, pose.CALF_R)]
+    feet = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    balls = [pose.human(r, pose.BALL_L), pose.human(r, pose.BALL_R)]
+    arms = [pose.human(r, pose.UPPERARM_L), pose.human(r, pose.UPPERARM_R)]
+    hands = [pose.human(r, pose.HAND_L), pose.human(r, pose.HAND_R)]
+    pelvis = pose.human(r, pose.PELVIS)
+    base = pose.translation(w, pelvis)
+    k = 0
+    while k < 2 {
+        leg = ikrig.leg_limb(r, k)
+        hip = pose.translation(w, thighs[k])
+        length = core.v3_len(core.v3_sub(pose.translation(w, knees[k]), hip)) + core.v3_len(core.v3_sub(pose.translation(w, feet[k]), pose.translation(w, knees[k])))
+        length = length / b.unit
+        turn = pose.rotation(w, feet[k])
+        ankle = pose.translation(w, feet[k])
+        ball = ankle
+        if balls[k] >= 0 { ball = pose.translation(w, balls[k]) }
+        // The ankle's height that puts the ball on the ground, at the ball's
+        // standing height.
+        foot_down = height_of(b, ankle) - height_of(b, ball)
+        ankle_high = foot_down + BALL_HIGH + feet_up[k]
+        hip_high = height_of(b, hip)
+        dh = ankle_high - hip_high
+        reach = LEG_REACH * length
+        flat = reach * reach - dh * dh
+        if flat < 0.01 { flat = 0.01 }
+        back = core.sqrt_of(flat)
+        hip_ahead = core.v3_dot(core.v3_sub(hip, base), b.ahead) / b.unit
+        hip_left = core.v3_dot(core.v3_sub(hip, base), b.left) / b.unit
+        // At its furthest back (a crawl's push at its end) the leg reaches
+        // LEG_REACH of its length: never past it, where the foot would be
+        // dragged after the hip.
+        target = place(b, base, hip_ahead - back + LEG_IN + feet_ahead[k], hip_left + sides[k] * FOOT_OUT, ankle_high)
+        ikrig.limb_solve(leg, r, p, w, target, turn)
+        pose.world(r, p, w)
+        ikrig.limb_free(leg)
+        arm = ikrig.arm_limb(r, k)
+        if arm != null && hands[k] >= 0 {
+            shoulder = pose.translation(w, arms[k])
+            s_ahead = core.v3_dot(core.v3_sub(shoulder, base), b.ahead) / b.unit
+            s_left = core.v3_dot(core.v3_sub(shoulder, base), b.left) / b.unit
+            hand_at = place(b, base, s_ahead + HAND_AHEAD + hands_ahead[k], s_left + sides[k] * HAND_OUT, HAND_HIGH + hands_up[k])
+            // The hand carried round with the forearm, as it lies on it:
+            // solved once to find the forearm's way, then with the hand
+            // turned as far.
+            was = core.v3_sub(pose.translation(w, hands[k]), pose.translation(w, pose.parent(r, hands[k])))
+            held = pose.rotation(w, hands[k])
+            ikrig.limb_solve(arm, r, p, w, hand_at, held)
+            pose.world(r, p, w)
+            now = core.v3_sub(pose.translation(w, hands[k]), pose.translation(w, pose.parent(r, hands[k])))
+            ikrig.limb_solve(arm, r, p, w, hand_at, core.quat_normalize(core.quat_mul(core.quat_from_to(was, now), held)))
+            pose.world(r, p, w)
+            ikrig.limb_free(arm)
+        }
+        k = k + 1
+    }
+}
+
+// Metres a ball joint stands over the ground, toes tucked under it.
+const BALL_HIGH = 0.035
+
+// The crawl: CRAWL_CYCLE seconds at 30 frames a second, made in place on
+// the laid body. Each limb is planted half the cycle, going back under the
+// body at the crawl's pace as the ground does, and brought forward the
+// other half, lifted: the left leg with the right arm, then the right leg
+// with the left arm. Its contacts and pace found from its feet, as a
+// capture's in-place loop's.
+crawl_take(b: Bake, r: *pose.Rig, stand_t: *Take) -> *Take {
+    rate = 30.0
+    n = (CRAWL_CYCLE * rate + 0.5) as int + 1
+    t = clips.from_frames(r, "Crawl_Fwd_Loop", n, rate)
+    laid = pose.new(r)
+    w = pose.new(r)
+    laid_body(b, r, stand_t, laid, w)
+    stride = CRAWL_PACE * CRAWL_CYCLE
+    f = 0
+    while f < n {
+        u = (f as float) / ((n - 1) as float)
+        p = clips.frame(t, f)
+        pose.copy(r, laid, p)
+        pose.world(r, p, w)
+        fl, hl = limb_phase(u, 0.0, stride, LEG_LIFT)
+        fr, hr = limb_phase(u, 0.5, stride, LEG_LIFT)
+        al, gl = limb_phase(u, 0.5, stride, ARM_LIFT)
+        ar, gr = limb_phase(u, 0.0, stride, ARM_LIFT)
+        limbs_at(b, r, p, w, fl, fr, hl, hr, al, ar, gl, gr)
+        f = f + 1
+    }
+    clips.set_looping(t, true)
+    clips.find_contacts(t, r)
+    pose.release(laid)
+    pose.release(w)
+    return t
+}
+
+// A limb's place ahead of its middle and its lift `u` of the way through
+// the cycle, `offset` of a cycle late: planted for the first half, going
+// back half the stride as the body goes over it; then lifted and brought
+// forward a whole stride over the ground, eased from rest to rest there:
+// under the body, which goes on at its pace, that is the stride's half
+// forward. (Eased from rest to rest under the body, the foot left the
+// ground and came down at the body's pace, and slid 3 cm before it was
+// lifted 1 cm.)
+limb_phase(u: float, offset: float, stride: float, lift: float) -> (float, float) {
+    ph = u + offset
+    if ph >= 1.0 { ph = ph - 1.0 }
+    if ph < 0.5 { return stride * 0.25 - (ph / 0.5) * stride * 0.5, 0.0 }
+    v = (ph - 0.5) / 0.5
+    // Smoother than the lift at its ends: off the ground before it goes.
+    e = v * v * v * (v * (v * 6.0 - 15.0) + 10.0)
+    return 0.0 - stride * 0.25 + e * stride - v * stride * 0.5, lift * core.sin_of(3.141592653589793 * v)
+}
+
+// The take from the crouch idle's first frame down to `prone`, DOWN_SECONDS
+// long (`up`: the same, backward): the body eased from the one to the other
+// with the prone's moved so its balls of the feet are where the crouch's
+// are, and the legs held by IK so each ball stays there as the foot turns
+// from flat to tucked. The prone body's place from the crouch's is kept
+// (s.shift): its object is carried there at the take's end.
+down_take(b: Bake, r: *pose.Rig, ci: *Take, prone: ptr, s: *Stances, up: bool) -> *Take {
+    rate = 30.0
+    n = (DOWN_SECONDS * rate + 0.5) as int + 1
+    title = "Prone_Down"
+    if up { title = "Prone_Up" }
+    t = clips.from_frames(r, title, n, rate)
+    crouch = pose.new(r)
+    shifted = pose.new(r)
+    w = pose.new(r)
+    wc = pose.new(r)
+    clips.sample_frame(ci, r, 0, crouch)
+    pose.world(r, crouch, wc)
+    pose.copy(r, prone, shifted)
+    pose.world(r, shifted, w)
+    feet = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    balls = [pose.human(r, pose.BALL_L), pose.human(r, pose.BALL_R)]
+    // The prone's balls onto the crouch's, level.
+    mid_c = core.v3_mul(core.v3_add(pose.translation(wc, balls[0]), pose.translation(wc, balls[1])), 0.5)
+    mid_p = core.v3_mul(core.v3_add(pose.translation(w, balls[0]), pose.translation(w, balls[1])), 0.5)
+    by = core.v3_sub(mid_c, mid_p)
+    by = core.v3_sub(by, core.v3_mul(b.up, core.v3_dot(by, b.up)))
+    pelvis = pose.human(r, pose.PELVIS)
+    ikrig.move_joint(r, shifted, w, pelvis, by)
+    s.shift = by
+    legs = [ikrig.leg_limb(r, 0), ikrig.leg_limb(r, 1)]
+    ball_c = [pose.translation(wc, balls[0]), pose.translation(wc, balls[1])]
+    ankle_c = [pose.translation(wc, feet[0]), pose.translation(wc, feet[1])]
+    turn_c = [pose.rotation(wc, feet[0]), pose.rotation(wc, feet[1])]
+    turn_p = [pose.rotation(w, feet[0]), pose.rotation(w, feet[1])]
+    s.turn_c0 = turn_c[0]
+    s.turn_c1 = turn_c[1]
+    s.turn_p0 = turn_p[0]
+    s.turn_p1 = turn_p[1]
+    if s.prone_shifted == null { s.prone_shifted = pose.new(r) }
+    pose.copy(r, shifted, s.prone_shifted)
+    // The hips go down over the feet first, onto the knees, and then ahead
+    // onto the front: eased together, the hips went ahead of what the legs
+    // reach, and the feet were dragged 3 cm after them.
+    pose.world(r, shifted, w)
+    hips_c = pose.translation(wc, pelvis)
+    hips_way = core.v3_sub(pose.translation(w, pelvis), hips_c)
+    hips_down = core.v3_mul(b.up, core.v3_dot(hips_way, b.up))
+    hips_ahead = core.v3_sub(hips_way, hips_down)
+    f = 0
+    while f < n {
+        u = (f as float) / ((n - 1) as float)
+        if up { u = 1.0 - u }
+        e = u * u * (3.0 - 2.0 * u)
+        p = clips.frame(t, f)
+        pose.blend(r, crouch, shifted, e, p)
+        pose.world(r, p, w)
+        ikrig.move_joint(r, p, w, pelvis, core.v3_sub(hips_at(hips_c, hips_ahead, hips_down, u), pose.translation(w, pelvis)))
+        pose.world(r, p, w)
+        k = 0
+        while k < 2 {
+            turn = core.quat_slerp(turn_c[k], turn_p[k], e)
+            off = core.quat_apply(core.quat_mul(turn, core.quat_conjugate(turn_c[k])), core.v3_sub(ball_c[k], ankle_c[k]))
+            ikrig.limb_solve(legs[k], r, p, w, core.v3_sub(ball_c[k], off), turn)
+            pose.world(r, p, w)
+            k = k + 1
+        }
+        f = f + 1
+    }
+    clips.set_looping(t, false)
+    clips.find_contacts(t, r)
+    ikrig.limb_free(legs[0])
+    ikrig.limb_free(legs[1])
+    pose.release(crouch)
+    pose.release(shifted)
+    pose.release(w)
+    pose.release(wc)
+    return t
+}
+
+// The way down (`up` false) or up made again from the figure as it is
+// drawn now, so its first frame is what is drawn and it is played from it
+// with no easing: the body eased from the drawn crouch to the prone (down),
+// or from the drawn prone to the crouch idle's first frame (up), the hips
+// down over the feet first and ahead onto the front after; each leg bent by
+// IK so its ball of the foot stays where it is drawn, the foot turning from
+// the turn it is drawn with to the prone's tucked one (down), or from the
+// prone's as drawn to the crouch's (up). Played with the feet's own IK off,
+// the take alone keeps them. `by` (the rig's space) is how far the drawn
+// figure is from the object the take plays about: the way up's object is
+// put back from the prone body first.
+refit(s: *Stances, a: *Animator, t: *Take, up: bool, by: Vec3) {
+    r = animator.rig(a)
+    if t == null { return }
+    b = bake_frame(r, character.object_of(s.character as *Character))
+    drawn = pose.new(r)
+    w = pose.new(r)
+    pose.read(r, drawn)
+    pose.world(r, drawn, w)
+    pelvis = pose.human(r, pose.PELVIS)
+    if up { ikrig.move_joint(r, drawn, w, pelvis, by) }
+    feet = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    balls = [pose.human(r, pose.BALL_L), pose.human(r, pose.BALL_R)]
+    drawn_b = [pose.translation(w, balls[0]), pose.translation(w, balls[1])]
+    drawn_a = [pose.translation(w, feet[0]), pose.translation(w, feet[1])]
+    drawn_q = [pose.rotation(w, feet[0]), pose.rotation(w, feet[1])]
+    crouched_p = drawn
+    lying_p = s.prone_shifted
+    if up {
+        crouched_p = pose.new(r)
+        clips.sample_frame(animator.state_take(a, s.crouch_idle), r, 0, crouched_p)
+        lying_p = drawn
+    }
+    pose.world(r, crouched_p, w)
+    hips_c = pose.translation(w, pelvis)
+    crouch_q = [pose.rotation(w, feet[0]), pose.rotation(w, feet[1])]
+    poles_c = [knee_side(r, w, 0), knee_side(r, w, 1)]
+    pose.world(r, lying_p, w)
+    poles_p = [knee_side(r, w, 0), knee_side(r, w, 1)]
+    hips_way = core.v3_sub(pose.translation(w, pelvis), hips_c)
+    hips_down = core.v3_mul(b.up, core.v3_dot(hips_way, b.up))
+    hips_ahead = core.v3_sub(hips_way, hips_down)
+    prone_q = [s.turn_p0, s.turn_p1]
+    n = clips.frames(t)
+    f = 0
+    while f < n {
+        u = (f as float) / ((n - 1) as float)
+        if up { u = 1.0 - u }
+        e = u * u * (3.0 - 2.0 * u)
+        q = clips.frame(t, f)
+        pose.blend(r, crouched_p, lying_p, e, q)
+        pose.world(r, q, w)
+        ikrig.move_joint(r, q, w, pelvis, core.v3_sub(hips_at(hips_c, hips_ahead, hips_down, u), pose.translation(w, pelvis)))
+        turns = [drawn_q[0], drawn_q[1]]
+        goals = [drawn_a[0], drawn_a[1]]
+        k = 0
+        while k < 2 {
+            turns[k] = core.quat_slerp(drawn_q[k], prone_q[k], e)
+            if up { turns[k] = core.quat_slerp(crouch_q[k], drawn_q[k], e) }
+            off = core.quat_apply(core.quat_mul(turns[k], core.quat_conjugate(drawn_q[k])), core.v3_sub(drawn_b[k], drawn_a[k]))
+            goals[k] = core.v3_sub(drawn_b[k], off)
+            k = k + 1
+        }
+        hips_reach(r, q, w, goals[0], goals[1])
+        k = 0
+        while k < 2 {
+            // The knee turned from where the crouch has it to where the
+            // prone has it, out to the side: left to the leg's IK, its
+            // plane went from the hinge's to the knee's as the blended knee
+            // crossed the line to the foot, and the thigh flipped at 91 rad/s.
+            pole = core.v3_add(core.v3_mul(poles_c[k], 1.0 - e), core.v3_mul(poles_p[k], e))
+            leg_toward(r, q, w, k, goals[k], turns[k], pole)
+            k = k + 1
+        }
+        f = f + 1
+    }
+    if up { pose.release(crouched_p) }
+    pose.release(drawn)
+    pose.release(w)
+}
+
+// Take `t` (an idle in place) stood on the feet as drawn now: each frame's
+// legs bent by IK so each ankle is where it is drawn, turned as it is, the
+// toes as they are.
+fit_drawn(s: *Stances, a: *Animator, t: *Take) {
+    if t == null { return }
+    r = animator.rig(a)
+    p = s.work_p
+    w = s.work_w
+    pose.read(r, p)
+    pose.world(r, p, w)
+    feet = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    balls = [pose.human(r, pose.BALL_L), pose.human(r, pose.BALL_R)]
+    ankles = [pose.translation(w, feet[0]), pose.translation(w, feet[1])]
+    turns = [pose.rotation(w, feet[0]), pose.rotation(w, feet[1])]
+    toes = [core.quat_ident(), core.quat_ident()]
+    k = 0
+    while k < 2 {
+        if balls[k] >= 0 { toes[k] = pose.rotation(w, balls[k]) }
+        k = k + 1
+    }
+    legs = [s.leg_l as *Limb, s.leg_r as *Limb]
+    // Each frame's legs begun from the drawn ones, so the IK bends them
+    // only as far as the frame's hips differ: solved from the take's own,
+    // a shin came out twisted 80 degrees from the drawn one, and turned so
+    // in a frame as the take came in (#988).
+    chain = [pose.human(r, pose.THIGH_L), pose.human(r, pose.CALF_L), pose.human(r, pose.FOOT_L), pose.human(r, pose.BALL_L),
+             pose.human(r, pose.THIGH_R), pose.human(r, pose.CALF_R), pose.human(r, pose.FOOT_R), pose.human(r, pose.BALL_R)]
+    f = 0
+    while f < clips.frames(t) {
+        q = clips.frame(t, f)
+        j = 0
+        while j < 8 {
+            if chain[j] >= 0 { pose.set_rotation(q, chain[j], pose.rotation(p, chain[j])) }
+            j = j + 1
+        }
+        pose.world(r, q, w)
+        k = 0
+        while k < 2 {
+            ikrig.limb_solve(legs[k], r, q, w, ankles[k], turns[k])
+            pose.world(r, q, w)
+            if balls[k] >= 0 {
+                pose.set_rotation(q, balls[k], pose.local_rotation_of(r, w, balls[k], toes[k]))
+                pose.world(r, q, w)
+            }
+            k = k + 1
+        }
+        f = f + 1
+    }
+}
+
+// The prone idle made the way down's last frame, its body put back over
+// the object it is carried to (s.going).
+prone_from_down(s: *Stances, a: *Animator) {
+    r = animator.rig(a)
+    t = s.down_take as *Take
+    pi_t = s.prone_take as *Take
+    p = pose.new(r)
+    w = pose.new(r)
+    pose.copy(r, clips.frame(t, clips.frames(t) - 1), p)
+    pose.world(r, p, w)
+    ikrig.move_joint(r, p, w, pose.human(r, pose.PELVIS), core.v3_mul(s.going, 0.0 - 1.0))
+    pose.copy(r, p, clips.frame(pi_t, 0))
+    pose.copy(r, p, clips.frame(pi_t, 1))
+    pose.release(p)
+    pose.release(w)
+}
+
+// The way leg `side`'s knee stands off the line from its hip to its ankle
+// in world pose `w` (the rig's space), unit; or ahead of the rest pose's
+// line where it is on it.
+knee_side(r: *pose.Rig, w: ptr, side: int) -> Vec3 {
+    hips = [pose.human(r, pose.THIGH_L), pose.human(r, pose.THIGH_R)]
+    knees = [pose.human(r, pose.CALF_L), pose.human(r, pose.CALF_R)]
+    feet = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    h = pose.translation(w, hips[side])
+    axis = core.v3_normalize(core.v3_sub(pose.translation(w, feet[side]), h))
+    off = core.v3_sub(pose.translation(w, knees[side]), h)
+    off = core.v3_sub(off, core.v3_mul(axis, core.v3_dot(off, axis)))
+    if core.v3_len(off) < 0.000001 { return core.v3_cross(axis, core.vec3(1.0, 0.0, 0.0)) }
+    return core.v3_normalize(off)
+}
+
+// Leg `side` of pose `p` (its world `w`) bent so its ankle is at `goal`,
+// turned `turn` (both the rig's space), its knee out along `pole` off the
+// line to it: two bones by the law of cosines, each turned the least way
+// onto its new line (a knee goes where it is asked, not where a hinge or the
+// pose has it). `w` kept.
+leg_toward(r: *pose.Rig, p: ptr, w: ptr, side: int, goal: Vec3, turn: Quat, pole: Vec3) {
+    hips = [pose.human(r, pose.THIGH_L), pose.human(r, pose.THIGH_R)]
+    knees = [pose.human(r, pose.CALF_L), pose.human(r, pose.CALF_R)]
+    feet = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    hj = hips[side]
+    kj = knees[side]
+    fj = feet[side]
+    h = pose.translation(w, hj)
+    upper = core.v3_len(core.v3_sub(pose.translation(w, kj), h))
+    lower = core.v3_len(core.v3_sub(pose.translation(w, fj), pose.translation(w, kj)))
+    to = core.v3_sub(goal, h)
+    d = core.clampf(core.v3_len(to), core.abs_of(upper - lower) + 0.0001, upper + lower - 0.0001)
+    axis = core.v3_normalize(to)
+    along = (upper * upper - lower * lower + d * d) / (2.0 * d)
+    rise = core.sqrt_of(core.clampf(upper * upper - along * along, 0.0, upper * upper))
+    side_way = core.v3_sub(pole, core.v3_mul(axis, core.v3_dot(pole, axis)))
+    if core.v3_len(side_way) < 0.000001 { side_way = knee_side(r, w, side) }
+    side_way = core.v3_normalize(side_way)
+    knee = core.v3_add(h, core.v3_add(core.v3_mul(axis, along), core.v3_mul(side_way, rise)))
+    turn_onto(r, p, w, hj, core.v3_sub(pose.translation(w, kj), h), core.v3_sub(knee, h))
+    turn_onto(r, p, w, kj, core.v3_sub(pose.translation(w, fj), pose.translation(w, kj)), core.v3_sub(goal, pose.translation(w, kj)))
+    pose.set_rotation(p, fj, pose.local_rotation_of(r, w, fj, turn))
+    pose.world(r, p, w)
+}
+
+// Joint `j` of pose `p` turned the least way taking direction `from` onto
+// `to` (the rig's space); `w` made again.
+turn_onto(r: *pose.Rig, p: ptr, w: ptr, j: int, from: Vec3, to: Vec3) {
+    if core.v3_len(from) < 0.000001 || core.v3_len(to) < 0.000001 { return }
+    turn_joint(r, p, w, j, core.quat_from_to(from, to))
+}
+
+// The pelvis of pose `p` (its world `w`) held back toward the ankles' goals
+// `goal_l` and `goal_r` as far as either leg would have to reach past
+// LEG_HOLD of its length: a body going down over its feet is held by its
+// legs, which the feet would otherwise be dragged after.
+hips_reach(r: *pose.Rig, p: ptr, w: ptr, goal_l: Vec3, goal_r: Vec3) {
+    pelvis = pose.human(r, pose.PELVIS)
+    thighs = [pose.human(r, pose.THIGH_L), pose.human(r, pose.THIGH_R)]
+    calves = [pose.human(r, pose.CALF_L), pose.human(r, pose.CALF_R)]
+    feet = [pose.human(r, pose.FOOT_L), pose.human(r, pose.FOOT_R)]
+    goals = [goal_l, goal_r]
+    rested = pose.new(r)
+    pose.rest_world(r, rested)
+    lengths = [0.0, 0.0]
+    k = 0
+    while k < 2 {
+        lengths[k] = core.v3_len(core.v3_sub(pose.translation(rested, calves[k]), pose.translation(rested, thighs[k]))) + core.v3_len(core.v3_sub(pose.translation(rested, feet[k]), pose.translation(rested, calves[k])))
+        k = k + 1
+    }
+    pose.release(rested)
+    tries = 0
+    while tries < 4 {
+        worst = 0.0
+        by = core.vec3(0.0, 0.0, 0.0)
+        k = 0
+        while k < 2 {
+            line = core.v3_sub(pose.translation(w, thighs[k]), goals[k])
+            d = core.v3_len(line)
+            over = d - LEG_HOLD * lengths[k]
+            if over > worst && d > 0.000001 {
+                worst = over
+                by = core.v3_mul(line, 0.0 - over / d)
+            }
+            // Nor folded past what a knee bends (ikrig.KNEE_MOST).
+            under = LEG_FOLD * lengths[k] - d
+            if under > worst && d > 0.000001 {
+                worst = under
+                by = core.v3_mul(line, under / d)
+            }
+            k = k + 1
+        }
+        if worst <= 0.0 { return }
+        ikrig.move_joint(r, p, w, pelvis, by)
+        tries = tries + 1
+    }
+}
+
+// Of a leg's length, the most a change between stances lets it reach, and
+// the least it folds it to (a knee bent its most, 150 degrees, folds a leg
+// to about a quarter of its length).
+const LEG_HOLD = 0.95
+const LEG_FOLD = 0.35
+
+// Where the hips are `u` of the way down from the crouch's (`from`) to the
+// prone's (`ahead` and `down` from there, level and up): ahead first at the
+// crouch's height, the knees going down onto the ground, to a kneel
+// (KNEEL_AHEAD of the way ahead by KNEEL_AT of the way), then down and on
+// ahead onto the front. Going down first, onto the heels, a leg folded past
+// what a knee bends, and the hips were pushed off it.
+hips_at(from: Vec3, ahead: Vec3, down: Vec3, u: float) -> Vec3 {
+    a = KNEEL_AHEAD * eased(u / KNEEL_AT)
+    if u > KNEEL_AT { a = KNEEL_AHEAD + (1.0 - KNEEL_AHEAD) * eased((u - KNEEL_AT) / (1.0 - KNEEL_AT)) }
+    d = eased((u - DOWN_FROM) / (1.0 - DOWN_FROM))
+    return core.v3_add(from, core.v3_add(core.v3_mul(ahead, a), core.v3_mul(down, d)))
+}
+
+// `x` clamped to 0 to 1 and eased in and out.
+eased(x: float) -> float {
+    u = core.clampf(x, 0.0, 1.0)
+    return u * u * (3.0 - 2.0 * u)
+}
+
+// --- cover ------------------------------------------------------------------------------------------
+
+// Cover along a wall's face from `a` to `b` (on the ground), `height` high,
+// `out` the way out from it (level): taken where the figure is along it,
+// standing for high cover and crouched for low, facing out with its back
+// to the wall.
+cover_take(s: *Stances, a: Vec3, b: Vec3, height: float, out: Vec3) {
+    if s == null { return }
+    if !s.covering { s.stance_before = s.asked }
+    s.covering = true
+    s.cover_a = a
+    s.cover_b = b
+    s.cover_h = height
+    level = core.vec3(out.x, 0.0, out.z)
+    s.cover_out = core.v3_normalize(level)
+    s.along = 0.0
+    s.peeking = false
+    s.back_est = BACK_GUESS
+    if height >= COVER_HIGH {
+        s.asked = STAND
+    } else {
+        s.asked = CROUCH
+    }
+}
+
+// A cover found by probe: a ray from the figure's chest along `way` (level)
+// within `reach` metres meets a wall's face; its height is the highest a
+// ray toward it still meets it, its ends where rays along it stop meeting
+// it. False when the ray meets nothing, or there is no physics.
+cover_probe(s: *Stances, way: Vec3, reach: float) -> bool {
+    c = s.character as *Character
+    o = character.object_of(c)
+    p = physics.of(engine.of(o))
+    if p == null { return false }
+    at = behaviour.object_position(o)
+    dir = core.v3_normalize(core.vec3(way.x, 0.0, way.z))
+    found, a, b, h, out = probe_face(p, at, dir, reach)
+    if !found { return false }
+    cover_take(s, a, b, h, out)
+    return true
+}
+
+// The face a level ray from `at` along `dir` meets at PROBE_LOW up: its ends
+// on the ground, its height and the way out from it.
+probe_face(p: *Physics, at: Vec3, dir: Vec3, reach: float) -> (bool, Vec3, Vec3, float, Vec3) {
+    zero = core.vec3(0.0, 0.0, 0.0)
+    from = core.vec3(at.x, at.y + PROBE_LOW, at.z)
+    hit = physics.ray_static_hit(p, from, dir, reach)
+    if !hit.hit { return false, zero, zero, 0.0, zero }
+    out = core.v3_normalize(core.vec3(hit.normal.x, 0.0, hit.normal.z))
+    wall = hit.point
+    // Its height: the highest a ray toward it still meets it near there.
+    gap = core.v3_len(core.vec3(wall.x - at.x, 0.0, wall.z - at.z))
+    h = PROBE_LOW
+    up = PROBE_LOW + PROBE_STEP
+    while up < 3.0 {
+        if !physics.ray_static_hits(p, core.vec3(at.x, at.y + up, at.z), dir, gap + 0.2) { up = 10.0 } else {
+            h = up
+            up = up + PROBE_STEP
+        }
+    }
+    // Its ends: along the face either way until a ray toward it misses.
+    side = core.v3_cross(core.vec3(0.0, 1.0, 0.0), out)
+    a = end_of(p, at, dir, gap, side)
+    b = end_of(p, at, dir, gap, core.v3_mul(side, 0.0 - 1.0))
+    ground = at.y
+    ea = core.v3_add(core.vec3(wall.x, ground, wall.z), core.v3_mul(side, a))
+    eb = core.v3_sub(core.vec3(wall.x, ground, wall.z), core.v3_mul(side, b))
+    return true, ea, eb, h + PROBE_STEP * 0.5, out
+}
+
+// How far the face goes along `side` from the ray's line: the last offset
+// whose ray toward it still meets it.
+end_of(p: *Physics, at: Vec3, dir: Vec3, gap: float, side: Vec3) -> float {
+    d = 0.0
+    while d < PROBE_FAR {
+        nxt = d + PROBE_STEP
+        o = core.v3_add(core.vec3(at.x, at.y + PROBE_LOW, at.z), core.v3_mul(side, nxt))
+        if !physics.ray_static_hits(p, o, dir, gap + 0.2) { return d }
+        d = nxt
+    }
+    return d
+}
+
+// Go along the cover at `speed` metres a second (toward its second end;
+// below 0, its first), every frame from the game, in place of
+// character.move.
+cover_move(s: *Stances, speed: float) { if s != null { s.along = speed } }
+
+// Peek at `target` (the world's): out past the nearest end of high cover,
+// up over low cover, the trunk aimed at it.
+cover_peek(s: *Stances, target: Vec3) {
+    if s == null || !s.covering { return }
+    s.peeking = true
+    s.peek_at = target
+}
+
+cover_peek_off(s: *Stances) {
+    if s == null { return }
+    s.peeking = false
+    c = s.character as *Character
+    animator.aim_off(character.animator_of(c))
+}
+
+// Out of cover: its capsule round again, the stance asked before it.
+cover_leave(s: *Stances) {
+    if s == null || !s.covering { return }
+    cover_peek_off(s)
+    s.covering = false
+    s.asked = s.stance_before
+    c = s.character as *Character
+    character.move(c, core.vec3(0.0, 0.0, 0.0), core.vec3(0.0, 0.0, 0.0))
+}
+
+in_cover(s: *Stances) -> bool { return s != null && s.covering }
+cover_high(s: *Stances) -> bool { return s != null && s.covering && s.cover_h >= COVER_HIGH }
+cover_out(s: *Stances) -> Vec3 { return s.cover_out }
+peeking(s: *Stances) -> bool { return s != null && s.peeking }
+
+// How far the trunk's back is off the wall's face, metres (below 0: into
+// it), as drawn now: the flesh of the pelvis and spine nearest the wall.
+cover_back_gap(s: *Stances) -> float {
+    c = s.character as *Character
+    r = animator.rig(character.animator_of(c))
+    toward = core.v3_mul(s.cover_out, 0.0 - 1.0)
+    least = 1000.0
+    slots = [pose.PELVIS, pose.SPINE_01, pose.SPINE_02, pose.SPINE_03]
+    k = 0
+    while k < 4 {
+        j = pose.human(r, slots[k])
+        x = pose.flesh_extreme(r, j, toward)
+        if x.found {
+            d = core.v3_dot(core.v3_sub(x.at, s.cover_a), s.cover_out)
+            if d < least { least = d }
+        }
+        k = k + 1
+    }
+    return least
+}
+
+// The cover's step: along the face at the speed asked, drawn onto the line
+// its back meets the wall at, facing out; round a corner the wall turns at,
+// held at an end it cannot go round; a peek out or up and aimed.
+cover_step(s: *Stances, c: *Character, a: *Animator, o: *GameObject) {
+    at = behaviour.object_position(o)
+    side = core.v3_sub(s.cover_b, s.cover_a)
+    side = core.vec3(side.x, 0.0, side.z)
+    length = core.v3_len(side)
+    if length < 0.0001 { return }
+    dir = core.v3_mul(side, 1.0 / length)
+    rel = core.v3_sub(at, s.cover_a)
+    pos = core.v3_dot(rel, dir)
+    off = core.v3_dot(rel, s.cover_out)
+    speed = s.along
+    if s.peeking && s.cover_h >= COVER_HIGH {
+        // Out past the end on the target's side.
+        goal = length + PEEK_OUT
+        if core.v3_dot(core.v3_sub(s.peek_at, s.cover_a), dir) < length * 0.5 { goal = 0.0 - PEEK_OUT }
+        speed = core.clampf((goal - pos) * 2.0, 0.0 - PEEK_SPEED, PEEK_SPEED)
+    } else {
+        // Held short of an end, unless the wall turns a corner there.
+        if speed > 0.0 && pos > length - END_MARGIN {
+            if !corner(s, at, dir, 1.0) { speed = 0.0 }
+        } else if speed < 0.0 && pos < END_MARGIN {
+            if !corner(s, at, dir, 0.0 - 1.0) { speed = 0.0 }
+        }
+    }
+    // Its back drawn onto the wall (past an end, onto the line it goes on
+    // along out there): by the back as the skin has it once learnt, until
+    // then by a back BACK_GUESS behind the object.
+    pull = core.clampf((s.back_est - off) * COVER_PULL, 0.0 - PULL_MOST, PULL_MOST)
+    v = core.v3_add(core.v3_mul(dir, speed), core.v3_mul(s.cover_out, pull))
+    facing = s.cover_out
+    if s.peeking {
+        to = core.v3_sub(s.peek_at, at)
+        facing = core.v3_normalize(core.vec3(to.x, 0.0, to.z))
+        animator.aim_at(a, s.peek_at, 1.0)
+    }
+    character.move(c, v, facing)
+}
+
+// Round the corner at the end the figure goes toward (`way` 1 toward the
+// second end, -1 the first), where the wall turns: away from the figure
+// (the face beyond, found by a ray back along the wall from past the
+// corner) or toward it (a face across its way). The cover taken there.
+corner(s: *Stances, at: Vec3, dir: Vec3, way: float) -> bool {
+    c = s.character as *Character
+    o = character.object_of(c)
+    p = physics.of(engine.of(o))
+    if p == null { return false }
+    go = core.v3_mul(dir, way)
+    // A face across its way: an inside corner.
+    f1, a1, b1, h1, out1 = probe_face(p, at, go, END_MARGIN + s.radius + 0.4)
+    if f1 && core.v3_dot(out1, go) < 0.0 - 0.7 {
+        cover_turn(s, a1, b1, h1, out1)
+        return true
+    }
+    // An outside corner: from past the end and behind the face's line, back
+    // along the wall.
+    edge = s.cover_b
+    if way < 0.0 { edge = s.cover_a }
+    beyond = core.v3_add(core.v3_add(edge, core.v3_mul(go, BACK_GUESS + 0.4)), core.v3_mul(s.cover_out, 0.0 - 0.3))
+    from = core.vec3(beyond.x, at.y, beyond.z)
+    f2, a2, b2, h2, out2 = probe_face(p, from, core.v3_mul(go, 0.0 - 1.0), 1.0)
+    if f2 && core.v3_dot(out2, go) > 0.7 {
+        cover_turn(s, a2, b2, h2, out2)
+        return true
+    }
+    return false
+}
+
+cover_turn(s: *Stances, a: Vec3, b: Vec3, h: float, out: Vec3) {
+    peek = s.peeking
+    target = s.peek_at
+    before = s.stance_before
+    cover_take(s, a, b, h, out)
+    s.stance_before = before
+    s.peeking = peek
+    s.peek_at = target
+}
+
+// Radians the trunk's aim (ikrig's: the chest's line) is off `target`, as
+// drawn now.
+aim_error(s: *Stances, target: Vec3) -> float {
+    c = s.character as *Character
+    a = character.animator_of(c)
+    r = animator.rig(a)
+    aim = animator.trunk_aim(a)
+    p = pose.new(r)
+    w = pose.new(r)
+    pose.read(r, p)
+    pose.world(r, p, w)
+    chest = pose.human(r, pose.SPINE_03)
+    q = pose.rotation(w, chest)
+    origin = ikrig.to_ground(r, core.v3_add(pose.translation(w, chest), core.quat_apply(q, aim.offset)))
+    line = core.v3_normalize(ikrig.dir_to_ground(r, core.quat_apply(q, aim.axis)))
+    to = core.v3_normalize(core.v3_sub(target, origin))
+    pose.release(p)
+    pose.release(w)
+    d = core.clampf(core.v3_dot(line, to), 0.0 - 1.0, 1.0)
+    return core.acos_of(d)
+}
