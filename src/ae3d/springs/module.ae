@@ -1,0 +1,841 @@
+// Secondary motion (#989): spring chains and jiggle for what a skeleton
+// carries but its takes do not drive -- hair, a ponytail, a tail, straps, a
+// skirt, a pouch, a sword on a belt, a held lantern.
+//
+//     sp = animator.springs(a)                     // the animator's, made on first use
+//     p = springs.params(150.0, 3.0, 1.0)          // stiffness 1/s^2, damping 1/s, drag 1/s
+//     springs.set_gravity(p, core.vec3(0.0, 0.0 - 9.81, 0.0))
+//     springs.chain_add(sp, joints, n, p)          // joints parents first
+//     springs.collider_add(sp, head, core.vec3(0.0, 0.08, 0.0), core.vec3(0.0, 0.08, 0.0), 0.1, 0)
+//     springs.from_scene(sp, figure.scene(f))       // a VRM file's own spring bones
+//
+// As UE5's AnimDynamics and VRM's spring bones: each joint of a chain aims
+// at a point mass, its tail, carried through the world by the figure and
+// pulled back toward where the pose puts it. Per fixed step, from the root
+// of each chain to its tip:
+//   - the joint's head is where its parent (the pose's, or the chain's own
+//     joint above, as this step turned it) puts it; its goal is where the
+//     pose puts its tail, as the animation has every joint above it;
+//   - the tail is moved by semi-implicit Euler: a spring of `stiffness` to
+//     the goal, `damping` against its speed relative to the goal's, `drag`
+//     against its speed relative to the air (the wind), and gravity; the
+//     damping and the drag taken implicitly, so no setting is unstable.
+//     Pulled toward its parent's turned frame instead, as VRM's are, a
+//     chain is that many resonators in series, each shaken by the one
+//     above at its own frequency: a ponytail of four rang 10 cm five
+//     seconds after a stop at a time constant of 0.5 s. Pulled to the pose,
+//     with its damping in proportion to its mass, every mode of a chain
+//     dies down at (damping + drag) / 2;
+//   - held at the joint's length from its head, then put out of every
+//     collider of the chain's groups (spheres and capsules on the body's
+//     joints, grown by the joint's hit radius): exactly, onto the cone of
+//     directions from the head that clear it (for a capsule about its
+//     nearest point, a few times over);
+//   - its velocity taken from where it ended (position based), and the
+//     joint turned from the pose's way to its tail's.
+// A free chain's tail swings about its goal as a damped spring: it comes
+// within e^-1 of rest in a time constant of 2 / (damping + drag) seconds.
+// Jiggle is a chain of one joint.
+//
+// The animator runs it after the IK, in its fixed step, on the job pool with
+// the figure's graph; the frames between steps draw between the steps'
+// poses as the rest of the figure is drawn. In the world: a figure run,
+// turned or stopped swings its chains. Each figure's chains read only its
+// own pose and its base's transform, so they are the same to the bit run to
+// run and whatever the pool's size; their math is core's (fdlibm's), so the
+// same on every platform. At a slower rate (animator.set_every, ae3d.animlod
+// 1 in N) they are off: each tail follows its pose, at rest, so a figure
+// brought back to every step starts them from where it is drawn.
+
+import std.heap
+import std.list
+import std.os
+import ae3d.core
+import ae3d.pose
+import ae3d.gltf
+
+exports (
+    Springs, SpringParams, springs_new, springs_free, params, set_gravity, set_wind_drag, set_radius, set_groups,
+    chain_add, chain_add_tree, chain_count, chain_first, chain_size, node_count, node_joint, node_chain,
+    collider_add, collider_count, collider_joint, collider_radius, collider_world, collider_group, collider_local, node_tail, node_radius, node_mask,
+    set_wind, set_on, is_on, reset, solve, tail_world, head_world, goal_world, node_length,
+    from_scene, vrm_chains, solve_nanos, solve_steps
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+
+// Joints a rig's chain of parents may be deep, at most.
+const DEPTH = 64
+// The passes a tail is put out of its colliders in (a capsule's nearest
+// point moves as the tail does).
+const COLLIDE_PASSES = 4
+// Metres a tail is put clear of a collider by, past its surface: what is
+// left is rounding.
+const CLEAR = 0.0000001
+// VRM's spring bones step once a frame of a 60 Hz display, and their
+// numbers are a step's: their stiffness a step's pull toward rest, their
+// drag the share of the speed a step loses.
+const VRM_STEP = 0.016666666666666666
+
+// A chain's settings (params): per joint, as its tail is moved.
+struct SpringParams {
+    stiffness: float               // 1/s^2: the pull to the goal a metre off, a metre a second squared
+    damping: float                 // 1/s: against the tail's speed relative to the goal's
+    drag: float                    // 1/s: against its speed relative to the air
+    gravity: Vec3                  // m/s^2, the world's
+    radius: float                  // metres: the tail's hit radius against the colliders
+    groups: int                    // the collider groups it is held out of, a bit each (-1 all)
+}
+
+struct Springs {
+    rig: ptr                       // *pose.Rig, borrowed
+    count: int                     // nodes: a joint and its tail each
+    room: int
+    joints: ptr                    // int[room]: the joint each node turns
+    ups: ptr                       // int[room]: the node above (-1: the joint's parent in the pose)
+    tails: ptr                     // float[room * 3]: the tail in the joint's own frame (the rig's units)
+    chain_of: ptr                  // int[room]
+    stiff: ptr                     // float[room]
+    damp: ptr                      // float[room]
+    drags: ptr                     // float[room]
+    gravs: ptr                     // float[room * 3]
+    radii: ptr                     // float[room]
+    masks: ptr                     // int[room]
+    xs: ptr                        // float[room * 3]: each tail, the world's
+    vs: ptr                        // float[room * 3]: and its velocity
+    goals: ptr                     // float[room * 3]: its goal at the last step
+    heads: ptr                     // float[room * 3]: the joint's place this step, the rig's space
+    turns: ptr                     // float[room * 4]: and its rotation, as turned
+    scales: ptr                    // float[room * 3]
+    heads_w: ptr                   // float[room * 3]: the head this step, the world's
+    aheads: ptr                    // float[room * 3]: the joint's place as the pose has it, the rig's space
+    aturns: ptr                    // float[room * 4]: and its rotation
+    chains: int
+    chain_firsts: ptr              // list of int as ptr-sized slots: int[chain_room]
+    chain_sizes: ptr
+    chain_room: int
+    // Colliders: a sphere (a == b) or a capsule (a to b) on a joint, in its
+    // frame, in a group.
+    colliders: int
+    collider_room: int
+    c_joints: ptr                  // int[]
+    c_a: ptr                       // float[* 3]
+    c_b: ptr                       // float[* 3]
+    c_radii: ptr                   // float[]
+    c_groups: ptr                  // int[]
+    cw_a: ptr                      // float[* 3]: placed this step, the world's
+    cw_b: ptr
+    cw_r: ptr                      // float[]
+    stack: ptr                     // int[DEPTH]
+    wind: Vec3                     // m/s, the air's
+    on: bool
+    known: bool                    // the tails are a step's (else they start at their goals)
+    nanos: long                    // spent solving, for the cost a joint
+    steps: long                    // node steps solved
+}
+
+// --- making ---------------------------------------------------------------------------------------
+
+springs_new(r: *pose.Rig) -> *Springs {
+    sp = heap.new(Springs)
+    sp.rig = r as ptr
+    sp.on = true
+    sp.wind = core.vec3(0.0, 0.0, 0.0)
+    sp.stack = calloc(DEPTH, 8)
+    grow(sp, 8)
+    grow_chains(sp, 4)
+    grow_colliders(sp, 4)
+    return sp
+}
+
+springs_free(sp: *Springs) {
+    if sp == null { return }
+    free(sp.joints)
+    free(sp.ups)
+    free(sp.tails)
+    free(sp.chain_of)
+    free(sp.stiff)
+    free(sp.damp)
+    free(sp.drags)
+    free(sp.gravs)
+    free(sp.radii)
+    free(sp.masks)
+    free(sp.xs)
+    free(sp.vs)
+    free(sp.goals)
+    free(sp.heads)
+    free(sp.turns)
+    free(sp.scales)
+    free(sp.heads_w)
+    free(sp.aheads)
+    free(sp.aturns)
+    free(sp.chain_firsts)
+    free(sp.chain_sizes)
+    free(sp.c_joints)
+    free(sp.c_a)
+    free(sp.c_b)
+    free(sp.c_radii)
+    free(sp.c_groups)
+    free(sp.cw_a)
+    free(sp.cw_b)
+    free(sp.cw_r)
+    free(sp.stack)
+    heap.free(sp)
+}
+
+// A block of `n` slots of `width` 8-byte values with the first `used`
+// copied from `old` (freed).
+regrow(old: ptr, used: int, n: int, width: int) -> ptr {
+    p = calloc(n * width, 8)
+    if old != null {
+        if used > 0 { memcpy(p, old, (used * width * 8) as long) }
+        free(old)
+    }
+    return p
+}
+
+grow(sp: *Springs, n: int) {
+    c = sp.count
+    sp.joints = regrow(sp.joints, c, n, 1)
+    sp.ups = regrow(sp.ups, c, n, 1)
+    sp.tails = regrow(sp.tails, c, n, 3)
+    sp.chain_of = regrow(sp.chain_of, c, n, 1)
+    sp.stiff = regrow(sp.stiff, c, n, 1)
+    sp.damp = regrow(sp.damp, c, n, 1)
+    sp.drags = regrow(sp.drags, c, n, 1)
+    sp.gravs = regrow(sp.gravs, c, n, 3)
+    sp.radii = regrow(sp.radii, c, n, 1)
+    sp.masks = regrow(sp.masks, c, n, 1)
+    sp.xs = regrow(sp.xs, c, n, 3)
+    sp.vs = regrow(sp.vs, c, n, 3)
+    sp.goals = regrow(sp.goals, c, n, 3)
+    sp.heads = regrow(sp.heads, c, n, 3)
+    sp.turns = regrow(sp.turns, c, n, 4)
+    sp.scales = regrow(sp.scales, c, n, 3)
+    sp.heads_w = regrow(sp.heads_w, c, n, 3)
+    sp.aheads = regrow(sp.aheads, c, n, 3)
+    sp.aturns = regrow(sp.aturns, c, n, 4)
+    sp.room = n
+}
+
+grow_chains(sp: *Springs, n: int) {
+    sp.chain_firsts = regrow(sp.chain_firsts, sp.chains, n, 1)
+    sp.chain_sizes = regrow(sp.chain_sizes, sp.chains, n, 1)
+    sp.chain_room = n
+}
+
+grow_colliders(sp: *Springs, n: int) {
+    c = sp.colliders
+    sp.c_joints = regrow(sp.c_joints, c, n, 1)
+    sp.c_a = regrow(sp.c_a, c, n, 3)
+    sp.c_b = regrow(sp.c_b, c, n, 3)
+    sp.c_radii = regrow(sp.c_radii, c, n, 1)
+    sp.c_groups = regrow(sp.c_groups, c, n, 1)
+    sp.cw_a = regrow(sp.cw_a, c, n, 3)
+    sp.cw_b = regrow(sp.cw_b, c, n, 3)
+    sp.cw_r = regrow(sp.cw_r, c, n, 1)
+    sp.collider_room = n
+}
+
+// A chain's settings: no gravity, no hit radius, held out of every group.
+params(stiffness: float, damping: float, drag: float) -> SpringParams {
+    return SpringParams { stiffness: stiffness, damping: damping, drag: drag, gravity: core.vec3(0.0, 0.0, 0.0), radius: 0.0, groups: 0 - 1 }
+}
+
+set_gravity(p: SpringParams, g: Vec3) -> SpringParams {
+    return SpringParams { stiffness: p.stiffness, damping: p.damping, drag: p.drag, gravity: g, radius: p.radius, groups: p.groups }
+}
+
+set_wind_drag(p: SpringParams, drag: float) -> SpringParams {
+    return SpringParams { stiffness: p.stiffness, damping: p.damping, drag: drag, gravity: p.gravity, radius: p.radius, groups: p.groups }
+}
+
+set_radius(p: SpringParams, radius: float) -> SpringParams {
+    return SpringParams { stiffness: p.stiffness, damping: p.damping, drag: p.drag, gravity: p.gravity, radius: radius, groups: p.groups }
+}
+
+// The collider groups the chain is held out of, a bit each (bit g for
+// group g; -1 every group, 0 none).
+set_groups(p: SpringParams, groups: int) -> SpringParams {
+    return SpringParams { stiffness: p.stiffness, damping: p.damping, drag: p.drag, gravity: p.gravity, radius: p.radius, groups: groups }
+}
+
+// The node for joint `j` hung from node `up` (-1: the joint's own parent in
+// the pose), its tail at `tail` in the joint's frame. Its index.
+node_add(sp: *Springs, j: int, up: int, tail: Vec3, p: SpringParams) -> int {
+    if sp.count >= sp.room { grow(sp, sp.room * 2) }
+    i = sp.count
+    (sp.joints as int[])[i] = j
+    (sp.ups as int[])[i] = up
+    t = sp.tails as float[]
+    t[i * 3] = tail.x
+    t[i * 3 + 1] = tail.y
+    t[i * 3 + 2] = tail.z
+    (sp.chain_of as int[])[i] = sp.chains
+    (sp.stiff as float[])[i] = p.stiffness
+    (sp.damp as float[])[i] = p.damping
+    (sp.drags as float[])[i] = p.drag
+    g = sp.gravs as float[]
+    g[i * 3] = p.gravity.x
+    g[i * 3 + 1] = p.gravity.y
+    g[i * 3 + 2] = p.gravity.z
+    (sp.radii as float[])[i] = p.radius
+    (sp.masks as int[])[i] = p.groups
+    sp.count = i + 1
+    sp.known = false
+    return i
+}
+
+// Where joint `j`'s tail is in its own frame at rest: its first child's
+// place (a joint the chain lists after it, else any), or past a leaf by
+// its own offset from its parent, as VRM's 7 cm tail is put on a leaf.
+rest_tail(r: *pose.Rig, j: int, next: int) -> Vec3 {
+    rest = pose.rest(r)
+    if next >= 0 && pose.parent(r, next) == j { return pose.translation(rest, next) }
+    k = 0
+    while k < pose.count(r) {
+        if pose.parent(r, k) == j { return pose.translation(rest, k) }
+        k = k + 1
+    }
+    own = pose.translation(rest, j)
+    l = core.v3_len(own)
+    if l < 0.000001 { return core.vec3(0.0, 0.07, 0.0) }
+    return core.v3_mul(own, 0.07 / l)
+}
+
+open_chain(sp: *Springs) -> int {
+    if sp.chains >= sp.chain_room { grow_chains(sp, sp.chain_room * 2) }
+    c = sp.chains
+    (sp.chain_firsts as int[])[c] = sp.count
+    (sp.chain_sizes as int[])[c] = 0
+    return c
+}
+
+close_chain(sp: *Springs, c: int) -> int {
+    (sp.chain_sizes as int[])[c] = sp.count - (sp.chain_firsts as int[])[c]
+    sp.chains = c + 1
+    return c
+}
+
+// A chain of `n` joints (`joints`, an int[n], each the next one's parent,
+// root first): each turned to aim its tail -- the next joint, the last's
+// child (or a tail past it) -- at a spring. One joint is a jiggle. Its index.
+chain_add(sp: *Springs, joints: ptr, n: int, p: SpringParams) -> int {
+    if sp == null || n <= 0 { return 0 - 1 }
+    r = sp.rig as *pose.Rig
+    js = joints as int[]
+    c = open_chain(sp)
+    first = sp.count
+    k = 0
+    while k < n {
+        j = js[k]
+        next = 0 - 1
+        if k + 1 < n { next = js[k + 1] }
+        up = 0 - 1
+        if k > 0 && pose.parent(r, j) == js[k - 1] { up = first + k - 1 }
+        node_add(sp, j, up, rest_tail(r, j, next), p)
+        k = k + 1
+    }
+    return close_chain(sp, c)
+}
+
+// Joint `top` and every joint under it as one chain (VRM's spring bones: a
+// branch's joints each aim at their first child). Its index.
+chain_add_tree(sp: *Springs, top: int, p: SpringParams) -> int {
+    if sp == null || top < 0 { return 0 - 1 }
+    r = sp.rig as *pose.Rig
+    c = open_chain(sp)
+    first = sp.count
+    // The rig's order puts parents first: the subtree in that order.
+    at = 0
+    while at < pose.count(r) {
+        j = pose.order(r, at)
+        if pose.subtree_contains(r, top, j) {
+            up = 0 - 1
+            if j != top {
+                k = first
+                while k < sp.count {
+                    if (sp.joints as int[])[k] == pose.parent(r, j) { up = k }
+                    k = k + 1
+                }
+            }
+            node_add(sp, j, up, rest_tail(r, j, 0 - 1), p)
+        }
+        at = at + 1
+    }
+    return close_chain(sp, c)
+}
+
+chain_count(sp: *Springs) -> int { return sp.chains }
+chain_first(sp: *Springs, c: int) -> int { return (sp.chain_firsts as int[])[c] }
+chain_size(sp: *Springs, c: int) -> int { return (sp.chain_sizes as int[])[c] }
+node_count(sp: *Springs) -> int { return sp.count }
+node_joint(sp: *Springs, i: int) -> int { return (sp.joints as int[])[i] }
+node_chain(sp: *Springs, i: int) -> int { return (sp.chain_of as int[])[i] }
+
+// A collider on joint `j`: a capsule from `a` to `b` (its frame, the rig's
+// units), `radius` round (the rig's units); a sphere when a and b are one
+// point. In group `group` (0 to 30). Its index.
+collider_add(sp: *Springs, j: int, a: Vec3, b: Vec3, radius: float, group: int) -> int {
+    if sp == null { return 0 - 1 }
+    if sp.colliders >= sp.collider_room { grow_colliders(sp, sp.collider_room * 2) }
+    i = sp.colliders
+    (sp.c_joints as int[])[i] = j
+    ca = sp.c_a as float[]
+    ca[i * 3] = a.x
+    ca[i * 3 + 1] = a.y
+    ca[i * 3 + 2] = a.z
+    cb = sp.c_b as float[]
+    cb[i * 3] = b.x
+    cb[i * 3 + 1] = b.y
+    cb[i * 3 + 2] = b.z
+    (sp.c_radii as float[])[i] = radius
+    (sp.c_groups as int[])[i] = group
+    sp.colliders = i + 1
+    return i
+}
+
+collider_count(sp: *Springs) -> int { return sp.colliders }
+collider_joint(sp: *Springs, i: int) -> int { return (sp.c_joints as int[])[i] }
+collider_group(sp: *Springs, i: int) -> int { return (sp.c_groups as int[])[i] }
+
+// Collider `i` as the last step placed it: its two ends and its radius, the
+// world's.
+collider_world(sp: *Springs, i: int) -> (Vec3, Vec3, float) {
+    a = sp.cw_a as float[]
+    b = sp.cw_b as float[]
+    return core.vec3(a[i * 3], a[i * 3 + 1], a[i * 3 + 2]), core.vec3(b[i * 3], b[i * 3 + 1], b[i * 3 + 2]), (sp.cw_r as float[])[i]
+}
+
+collider_radius(sp: *Springs, i: int) -> float { return (sp.c_radii as float[])[i] }
+
+// Collider `i`'s two ends in its joint's frame.
+collider_local(sp: *Springs, i: int) -> (Vec3, Vec3) { return v3_at(sp.c_a, i), v3_at(sp.c_b, i) }
+
+// Node `i`'s tail in its joint's frame, and its hit radius.
+node_tail(sp: *Springs, i: int) -> Vec3 { return v3_at(sp.tails, i) }
+node_radius(sp: *Springs, i: int) -> float { return (sp.radii as float[])[i] }
+node_mask(sp: *Springs, i: int) -> int { return (sp.masks as int[])[i] }
+
+// The air's velocity, the world's: what the drag pulls the tails along by.
+set_wind(sp: *Springs, w: Vec3) { if sp != null { sp.wind = w } }
+
+// Off, the chains are left as the pose has them (and start from it again).
+set_on(sp: *Springs, on: bool) {
+    if sp == null { return }
+    if !on { sp.known = false }
+    sp.on = on
+}
+
+is_on(sp: *Springs) -> bool { return sp != null && sp.on }
+
+// The tails let go of their motion: the next step starts them at their
+// goals, still (a figure put somewhere new, taken back from a ragdoll).
+reset(sp: *Springs) { if sp != null { sp.known = false } }
+
+v3_at(f: ptr, i: int) -> Vec3 {
+    a = f as float[]
+    return core.vec3(a[i * 3], a[i * 3 + 1], a[i * 3 + 2])
+}
+
+v3_put(f: ptr, i: int, v: Vec3) {
+    a = f as float[]
+    a[i * 3] = v.x
+    a[i * 3 + 1] = v.y
+    a[i * 3 + 2] = v.z
+}
+
+// Node `i`'s tail, head and goal at the last step, the world's; its length.
+tail_world(sp: *Springs, i: int) -> Vec3 { return v3_at(sp.xs, i) }
+head_world(sp: *Springs, i: int) -> Vec3 { return v3_at(sp.heads_w, i) }
+goal_world(sp: *Springs, i: int) -> Vec3 { return v3_at(sp.goals, i) }
+node_length(sp: *Springs, i: int) -> float { return core.v3_distance(v3_at(sp.xs, i), v3_at(sp.heads_w, i)) }
+
+// Seconds spent solving and node steps solved: the cost of a joint a step.
+solve_nanos(sp: *Springs) -> long { return sp.nanos }
+solve_steps(sp: *Springs) -> long { return sp.steps }
+
+// --- the step -------------------------------------------------------------------------------------
+
+mul3(a: Vec3, b: Vec3) -> Vec3 { return core.vec3(a.x * b.x, a.y * b.y, a.z * b.z) }
+
+// Joint `j` of pose `p` in the rig's space: its place, rotation and scale,
+// composed down from its top joint as pose.world composes them.
+joint_world(sp: *Springs, r: *pose.Rig, p: ptr, j: int) -> (Vec3, Quat, Vec3) {
+    stack = sp.stack as int[]
+    n = 0
+    k = j
+    while k >= 0 && n < DEPTH {
+        stack[n] = k
+        n = n + 1
+        k = pose.parent(r, k)
+    }
+    at = core.vec3(0.0, 0.0, 0.0)
+    turn = core.quat_ident()
+    sc = core.vec3(1.0, 1.0, 1.0)
+    i = n - 1
+    first = true
+    while i >= 0 {
+        jj = stack[i]
+        t = pose.translation(p, jj)
+        q = pose.rotation(p, jj)
+        s = pose.scale(p, jj)
+        if first {
+            at = t
+            turn = q
+            sc = s
+            first = false
+        } else {
+            at = core.v3_add(at, core.quat_apply(turn, mul3(sc, t)))
+            turn = core.quat_normalize(core.quat_mul(turn, q))
+            sc = mul3(sc, s)
+        }
+        i = i - 1
+    }
+    return at, turn, sc
+}
+
+// The colliders placed in the world for this step.
+place_colliders(sp: *Springs, r: *pose.Rig, p: ptr, bp: Vec3, bq: Quat, bs: Vec3) {
+    i = 0
+    while i < sp.colliders {
+        j = (sp.c_joints as int[])[i]
+        at, turn, sc = joint_world(sp, r, p, j)
+        a = core.v3_add(at, core.quat_apply(turn, mul3(sc, v3_at(sp.c_a, i))))
+        b = core.v3_add(at, core.quat_apply(turn, mul3(sc, v3_at(sp.c_b, i))))
+        v3_put(sp.cw_a, i, core.v3_add(bp, core.quat_apply(bq, mul3(bs, a))))
+        v3_put(sp.cw_b, i, core.v3_add(bp, core.quat_apply(bq, mul3(bs, b))))
+        (sp.cw_r as float[])[i] = (sp.c_radii as float[])[i] * sc.x * bs.x
+        i = i + 1
+    }
+}
+
+// The point of segment a-b nearest `x`.
+nearest_on(a: Vec3, b: Vec3, x: Vec3) -> Vec3 {
+    ab = core.v3_sub(b, a)
+    l2 = core.v3_dot(ab, ab)
+    if l2 <= 0.0 { return a }
+    u = core.v3_dot(core.v3_sub(x, a), ab) / l2
+    if u <= 0.0 { return a }
+    if u >= 1.0 { return b }
+    return core.v3_add(a, core.v3_mul(ab, u))
+}
+
+// `x`, `len` from `head`, turned about the head out of the sphere at `c`
+// of radius `rad`: onto the nearest direction of the cone that clears it
+// (the circle where the length's sphere meets the collider's). Left where
+// it is when it is clear, or when no direction clears it (the head's whole
+// sphere inside the collider).
+clear_sphere(head: Vec3, x: Vec3, len: float, c: Vec3, rad: float) -> Vec3 {
+    to_c = core.v3_sub(c, head)
+    d = core.v3_len(to_c)
+    if d <= 0.0000001 || len <= 0.0000001 { return x }
+    if core.v3_distance(x, c) >= rad { return x }
+    cos0 = (d * d + len * len - rad * rad) / (2.0 * len * d)
+    if cos0 >= 1.0 || cos0 <= 0.0 - 1.0 { return x }
+    u = core.v3_mul(to_c, 1.0 / d)
+    dir = core.v3_mul(core.v3_sub(x, head), 1.0 / len)
+    cd = core.v3_dot(dir, u)
+    side = core.v3_sub(dir, core.v3_mul(u, cd))
+    sl = core.v3_len(side)
+    if sl < 0.000000001 {
+        // Straight at the collider's middle: aside on a fixed axis.
+        side = core.v3_cross(u, core.vec3(1.0, 0.0, 0.0))
+        if core.v3_len(side) < 0.001 { side = core.v3_cross(u, core.vec3(0.0, 0.0, 1.0)) }
+        sl = core.v3_len(side)
+    }
+    side = core.v3_mul(side, 1.0 / sl)
+    sin0 = core.sqrt_of(1.0 - cos0 * cos0)
+    return core.v3_add(head, core.v3_mul(core.v3_add(core.v3_mul(u, cos0), core.v3_mul(side, sin0)), len))
+}
+
+// Tail `x` of node `i` (`len` from `head`) put out of its colliders.
+collide(sp: *Springs, i: int, head: Vec3, x_in: Vec3, len: float) -> Vec3 {
+    x = x_in
+    mask = (sp.masks as int[])[i]
+    if mask == 0 || sp.colliders == 0 { return x }
+    hit = (sp.radii as float[])[i]
+    groups = sp.c_groups as int[]
+    cr = sp.cw_r as float[]
+    pass = 0
+    while pass < COLLIDE_PASSES {
+        moved = false
+        k = 0
+        while k < sp.colliders {
+            g = groups[k]
+            if ((mask >> g) & 1) == 1 {
+                a = v3_at(sp.cw_a, k)
+                b = v3_at(sp.cw_b, k)
+                c = nearest_on(a, b, x)
+                rad = cr[k] + hit
+                if core.v3_distance(x, c) < rad {
+                    x = clear_sphere(head, x, len, c, rad + CLEAR)
+                    moved = true
+                }
+            }
+            k = k + 1
+        }
+        if !moved { return x }
+        pass = pass + 1
+    }
+    return x
+}
+
+// The chains stepped `dt` seconds and their joints turned in pose `p`
+// (after the IK). `simulate` false (a slower rate, a paused figure's
+// first step): each tail put on its goal, still, the pose as it is.
+solve(sp: *Springs, p: ptr, dt: float, simulate: bool) {
+    if sp == null || sp.count == 0 || !sp.on { return }
+    began = os.now_monotonic_ns()
+    r = sp.rig as *pose.Rig
+    bp, bq, bs = core.model_drawn_transform(pose.base_model(r))
+    bqc = core.quat_conjugate(bq)
+    live = simulate && sp.known && dt > 0.0
+    if live { place_colliders(sp, r, p, bp, bq, bs) }
+    joints = sp.joints as int[]
+    ups = sp.ups as int[]
+    stiff = sp.stiff as float[]
+    damp = sp.damp as float[]
+    drags = sp.drags as float[]
+    turns = sp.turns as float[]
+    aturns = sp.aturns as float[]
+    i = 0
+    while i < sp.count {
+        j = joints[i]
+        up = ups[i]
+        pw = core.vec3(0.0, 0.0, 0.0)
+        pq = core.quat_ident()
+        ps = core.vec3(1.0, 1.0, 1.0)
+        // The pose's own parent (as the animation has it) and the parent
+        // as this step turned it: one joint for a chain's root.
+        apw = pw
+        apq = pq
+        if up >= 0 {
+            pw = v3_at(sp.heads, up)
+            pq = core.quat(turns[up * 4], turns[up * 4 + 1], turns[up * 4 + 2], turns[up * 4 + 3])
+            ps = v3_at(sp.scales, up)
+            apw = v3_at(sp.aheads, up)
+            apq = core.quat(aturns[up * 4], aturns[up * 4 + 1], aturns[up * 4 + 2], aturns[up * 4 + 3])
+        } else if pose.parent(r, j) >= 0 {
+            jw, jq, js = joint_world(sp, r, p, pose.parent(r, j))
+            pw = jw
+            pq = jq
+            ps = js
+            apw = jw
+            apq = jq
+        }
+        local_t = mul3(ps, pose.translation(p, j))
+        head = core.v3_add(pw, core.quat_apply(pq, local_t))
+        turn = core.quat_normalize(core.quat_mul(pq, pose.rotation(p, j)))
+        sc = mul3(ps, pose.scale(p, j))
+        own_tail = mul3(sc, v3_at(sp.tails, i))
+        tail = core.v3_add(head, core.quat_apply(turn, own_tail))
+        ahead = core.v3_add(apw, core.quat_apply(apq, local_t))
+        aturn = core.quat_normalize(core.quat_mul(apq, pose.rotation(p, j)))
+        hw = core.v3_add(bp, core.quat_apply(bq, mul3(bs, head)))
+        // The tail where the parent as turned puts it (what the joint is
+        // turned from), and where the pose puts it (what it is pulled to).
+        gw = core.v3_add(bp, core.quat_apply(bq, mul3(bs, tail)))
+        aw = core.v3_add(bp, core.quat_apply(bq, mul3(bs, core.v3_add(ahead, core.quat_apply(aturn, own_tail)))))
+        len = core.v3_distance(gw, hw)
+        if !live || len <= 0.0000001 {
+            v3_put(sp.xs, i, gw)
+            v3_put(sp.vs, i, core.vec3(0.0, 0.0, 0.0))
+            v3_put(sp.goals, i, aw)
+        } else {
+            h = dt
+            x = v3_at(sp.xs, i)
+            v = v3_at(sp.vs, i)
+            vg = core.v3_mul(core.v3_sub(aw, v3_at(sp.goals, i)), 1.0 / h)
+            k = stiff[i]
+            c = damp[i]
+            dr = drags[i]
+            // The spring and gravity explicit, the damping and the drag
+            // implicit: v' = (v + h (k (g - x) + c vg + dr wind + grav)) / (1 + h (c + dr)).
+            push = core.v3_add(core.v3_add(core.v3_mul(core.v3_sub(aw, x), k), core.v3_mul(vg, c)), core.v3_add(core.v3_mul(sp.wind, dr), v3_at(sp.gravs, i)))
+            v = core.v3_mul(core.v3_add(v, core.v3_mul(push, h)), 1.0 / (1.0 + h * (c + dr)))
+            moved = core.v3_add(x, core.v3_mul(v, h))
+            d = core.v3_sub(moved, hw)
+            dl = core.v3_len(d)
+            if dl < 0.000000001 { moved = gw } else { moved = core.v3_add(hw, core.v3_mul(d, len / dl)) }
+            moved = collide(sp, i, hw, moved, len)
+            v3_put(sp.vs, i, core.v3_mul(core.v3_sub(moved, x), 1.0 / h))
+            v3_put(sp.xs, i, moved)
+            v3_put(sp.goals, i, aw)
+            // The joint turned from the pose's way to its tail's, the turn
+            // taken from the world into the rig's space.
+            delta = core.quat_from_to(core.v3_sub(gw, hw), core.v3_sub(moved, hw))
+            delta = core.quat_mul(core.quat_mul(bqc, delta), bq)
+            turn = core.quat_normalize(core.quat_mul(delta, turn))
+            local = turn
+            if up >= 0 || pose.parent(r, j) >= 0 { local = core.quat_normalize(core.quat_mul(core.quat_conjugate(pq), turn)) }
+            pose.set_rotation(p, j, local)
+        }
+        v3_put(sp.heads, i, head)
+        v3_put(sp.heads_w, i, hw)
+        turns[i * 4] = turn.x
+        turns[i * 4 + 1] = turn.y
+        turns[i * 4 + 2] = turn.z
+        turns[i * 4 + 3] = turn.w
+        v3_put(sp.scales, i, sc)
+        v3_put(sp.aheads, i, ahead)
+        aturns[i * 4] = aturn.x
+        aturns[i * 4 + 1] = aturn.y
+        aturns[i * 4 + 2] = aturn.z
+        aturns[i * 4 + 3] = aturn.w
+        i = i + 1
+    }
+    sp.known = true
+    sp.nanos = sp.nanos + (os.now_monotonic_ns() - began)
+    sp.steps = sp.steps + (sp.count as long)
+}
+
+// --- a file's own spring bones ------------------------------------------------------------------
+
+// The joint of `r` that is model `m`, -1 for none.
+joint_of(r: *pose.Rig, m: ptr) -> int {
+    if m == null { return 0 - 1 }
+    k = 0
+    while k < pose.count(r) {
+        if pose.joint(r, k) as ptr == m { return k }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+// A VRM's spring bones (VRM 0.x's secondaryAnimation, VRM 1.0's
+// VRMC_springBone, as gltf reads them) as chains and colliders on this
+// rig. Their numbers are a 60 Hz step's (UniVRM's): a step's stiffness s
+// pulls a tail s * step metres toward its rest way, which on a joint `l`
+// long is a spring of s / (step * l) per second squared; a drag d keeps
+// 1 - d of its speed a step, -ln(1 - d) / step per second; a gravity
+// power g moves it g * step a step, g / step metres a second squared.
+// The chains it added.
+from_scene(sp: *Springs, s: *GltfScene) -> int {
+    if sp == null || s == null { return 0 }
+    r = sp.rig as *pose.Rig
+    i = 0
+    while i < gltf.spring_collider_count(s) {
+        vc = gltf.spring_collider(s, i)
+        j = joint_of(r, vc.node)
+        if j >= 0 { collider_add(sp, j, vc.offset, vc.tail, vc.radius, vc.group) }
+        i = i + 1
+    }
+    added = 0
+    i = 0
+    while i < gltf.spring_count(s) {
+        g = gltf.spring(s, i)
+        mask = 0
+        k = 0
+        while k < g.collider_group_count {
+            cg = (g.collider_groups as int[])[k]
+            if cg >= 0 && cg < 31 { mask = mask | (1 << cg) }
+            k = k + 1
+        }
+        k = 0
+        while k < g.joint_count {
+            jt = gltf.spring_joint(g, k)
+            j = joint_of(r, jt.node)
+            if j >= 0 {
+                first = sp.count
+                c = 0 - 1
+                if g.tree {
+                    c = chain_add_tree(sp, j, params(0.0, 0.0, 0.0))
+                } else {
+                    // VRM 1.0: the joints listed, root first, as one chain.
+                    n = 1
+                    while k + n < g.joint_count && joint_of(r, gltf.spring_joint(g, k + n).node) >= 0 && pose.parent(r, joint_of(r, gltf.spring_joint(g, k + n).node)) == joint_of(r, gltf.spring_joint(g, k + n - 1).node) { n = n + 1 }
+                    js = calloc(n, 8)
+                    m = 0
+                    while m < n {
+                        (js as int[])[m] = joint_of(r, gltf.spring_joint(g, k + m).node)
+                        m = m + 1
+                    }
+                    c = chain_add(sp, js, n, params(0.0, 0.0, 0.0))
+                    free(js)
+                    k = k + n - 1
+                }
+                // Each node's numbers from its joint's (VRM 1.0's per joint,
+                // 0.x's one a group) and its length at rest.
+                node = first
+                while node < sp.count {
+                    src = jt
+                    if !g.tree {
+                        jn = (sp.joints as int[])[node]
+                        m = 0
+                        while m < g.joint_count {
+                            if joint_of(r, gltf.spring_joint(g, m).node) == jn { src = gltf.spring_joint(g, m) }
+                            m = m + 1
+                        }
+                    }
+                    l = rest_length(sp, r, node)
+                    stiff = 0.0
+                    if l > 0.000001 { stiff = src.stiffness / (VRM_STEP * l) }
+                    drag = 0.0
+                    if src.drag > 0.0 && src.drag < 1.0 { drag = ln_of(1.0 / (1.0 - src.drag)) / VRM_STEP }
+                    if src.drag >= 1.0 { drag = 1000.0 }
+                    (sp.stiff as float[])[node] = stiff
+                    (sp.damp as float[])[node] = 0.0
+                    (sp.drags as float[])[node] = drag
+                    v3_put(sp.gravs, node, core.v3_mul(src.gravity_dir, src.gravity_power / VRM_STEP))
+                    (sp.radii as float[])[node] = src.hit_radius
+                    (sp.masks as int[])[node] = mask
+                    node = node + 1
+                }
+                if c >= 0 { added = added + 1 }
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return added
+}
+
+// Node `i`'s tail's distance from its head at rest, the world's units (the
+// rig's, through the base's scale at load).
+rest_length(sp: *Springs, r: *pose.Rig, i: int) -> float {
+    j = (sp.joints as int[])[i]
+    worlds = pose.new(r)
+    pose.rest_world(r, worlds)
+    sc = pose.scale(worlds, j)
+    pose.release(worlds)
+    base = pose.base_model(r)
+    bs = core.vec3(1.0, 1.0, 1.0)
+    if base != null {
+        _p, _q, s = core.model_drawn_transform(base)
+        bs = s
+    }
+    return core.v3_len(mul3(bs, mul3(sc, v3_at(sp.tails, i))))
+}
+
+// The natural log of `x` (over 0), by Halley's steps on exp_of (fdlibm's):
+// the same bits on every platform, as core's other functions.
+ln_of(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    y = 0.0
+    k = 0
+    while k < 60 {
+        e = core.exp_of(y)
+        step = 2.0 * (x - e) / (x + e)
+        y = y + step
+        if step < 0.000000000000001 && step > 0.0 - 0.000000000000001 { return y }
+        k = k + 1
+    }
+    return y
+}
+
+// How many spring chains file `s` lists (VRM's: a 0.x group's roots each,
+// a 1.0 spring one), whether or not imported.
+vrm_chains(s: *GltfScene) -> int {
+    if s == null { return 0 }
+    n = 0
+    i = 0
+    while i < gltf.spring_count(s) {
+        g = gltf.spring(s, i)
+        if g.tree { n = n + g.joint_count } else { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
