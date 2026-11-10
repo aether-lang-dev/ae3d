@@ -35,11 +35,13 @@ exports (
     add_event, event_count, event_time, event_name, event_found, FOOT_LEFT, FOOT_RIGHT,
     frame, sample, sample_frame, extract_root, root_under_pelvis, root_joint, travel, root_delta, has_root_motion,
     contact, planted, find_contacts, contacts_like, speed, even_root, foot_down, phase_of, time_at_phase, time_of, ground_point, up_of, heading,
-    ground_carry
+    ground_carry,
+    compress, compressed, compress_error, take_bytes, track_kinds, COMPRESS_ERROR
 )
 
 extern calloc(count: int, size: int) -> ptr
 extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
 
 // Metres over its lowest a foot's sole may be and count as down.
 const CONTACT_UP = 0.03
@@ -97,6 +99,7 @@ struct Take {
     up: Vec3                       // the rig's up its root motion was taken about
     travels: bool                  // its root travels in its frames (see find_contacts)
     under_pelvis: bool             // its root motion taken from its pelvis (root_under_pelvis)
+    packed: ptr                    // *Packed: its frames compressed (compress), `data` null; or null
 }
 
 // --- making -------------------------------------------------------------------------------------
@@ -222,7 +225,8 @@ blank_take(rig: *Rig, title: string, count: int, per_second: float) -> *Take {
 
 take_free(t: *Take) {
     if t == null { return }
-    free(t.data)
+    if t.data != null { free(t.data) }
+    packed_free(t.packed as *Packed)
     free(t.motion)
     free(t.contacts)
     free(t.flat)
@@ -302,8 +306,12 @@ speed(t: *Take) -> float { return t.speed }
 root_joint(t: *Take) -> int { return t.root }
 has_root_motion(t: *Take) -> bool { return t.root >= 0 }
 
-// Frame `f`'s pose, in place in the take.
+// Frame `f`'s pose, in place in the take, to read or to write. A
+// compressed take has its frames back as they were decoded, and is no
+// longer compressed: what only reads a take's poses reads them through
+// sample and sample_frame.
 frame(t: *Take, f: int) -> ptr {
+    if t.packed != null { unpack(t) }
     k = f
     if k < 0 { k = 0 }
     if k >= t.frames { k = t.frames - 1 }
@@ -338,15 +346,25 @@ sample(t: *Take, rig: *Rig, at: float, loop: bool, out: ptr) {
     x = time_of(t, at, loop) * t.rate
     f0 = x as int
     if f0 >= t.frames - 1 {
-        pose.copy(rig, frame(t, t.frames - 1), out)
+        sample_frame(t, rig, t.frames - 1, out)
         return
     }
     u = x - (f0 as float)
+    if t.packed != null {
+        packed_blend(t, f0, u, out)
+        return
+    }
     pose.blend(rig, frame(t, f0), frame(t, f0 + 1), u, out)
 }
 
 // Frame `f`'s pose into `out`.
-sample_frame(t: *Take, rig: *Rig, f: int, out: ptr) { pose.copy(rig, frame(t, f), out) }
+sample_frame(t: *Take, rig: *Rig, f: int, out: ptr) {
+    if t.packed != null {
+        packed_frame(t, f, out)
+        return
+    }
+    pose.copy(rig, frame(t, f), out)
+}
 
 // The take's phase at `at` seconds, 0 to 1, by its feet: 0 as its left foot
 // first comes down, 0.5 as its right does, back to 1 at the left's next. A
@@ -1353,6 +1371,7 @@ crop_sealed(t: *Take, rig: *Rig, a: int, b: int, loop: bool, most: float) -> *Ta
     out = blank_take(rig, t.name, n, t.rate)
     out.looping = loop
     floats = t.stride
+    if t.packed != null { unpack(t) }
     src = t.data as float[]
     dst = out.data as float[]
     k = 0
@@ -1636,4 +1655,700 @@ braking_from(t: *Take) -> (float, float) {
         f = f + 1
     }
     return 0.9 * v0, left
+}
+
+// --- compression (#990) -------------------------------------------------------------------------
+
+// A take's frames compressed, as ACL compresses UE5's AnimSequences: each
+// joint's translation, rotation and scale is a track of its own, kept as
+// coarsely as the skin allows. A track that holds still keeps one value and
+// nothing a frame; one that moves keeps 16 bits a number over its own range
+// (a rotation its x, y and z, its w made from them, the quaternion's sign
+// made w's), or 32-bit floats, or, where nothing coarser will do, the
+// take's own 64-bit numbers. Each track is given the coarsest that keeps
+// its share of the error: how far it moves a point of the skin, at virtual
+// vertices a bone's length from each joint (ACL's measure), the bound
+// shared out along the longest chain. Then the whole take is decoded, frame
+// by frame, and every joint's points measured against the take's own in
+// the rig's space; a chain past the bound is made finer until none is.
+// A take compressed is the same take: sample and sample_frame decode it as
+// they read it, and a program that writes its frames (frame) has them back
+// as they were decoded.
+const PACK_CONST = 0
+const PACK_Q16 = 1
+const PACK_F32 = 2
+const PACK_F64 = 3
+// The most a compressed take moves a point of the skin, metres (0.1 mm).
+const COMPRESS_ERROR = 0.0001
+// The least distance of a virtual vertex from its joint, metres.
+const PACK_SHELL = 0.01
+// A 16-bit number's steps.
+const PACK_STEPS = 65535.0
+
+struct Packed {
+    kinds: ptr                     // int[count * 3]: each joint's translation, rotation and scale track's PACK_ kind
+    at: ptr                        // int[count * 3]: where its numbers are in a frame's record, bytes
+    values: ptr                    // float[count * 3 * 8]: a constant's numbers (4), or a Q16 track's least (4) and step (4)
+    record: int                    // bytes a frame
+    bytes: ptr                     // the records, frames * record
+    curves: ptr                    // float[frames * curves]: the curves as they were, or null for none
+    error: float                   // the most it moves a point of the skin, metres, over every frame
+    still: ptr                     // float[count * FLOATS]: a pose with every still track's numbers, laid down whole first
+    moving: ptr                    // int[]: the tracks that move, decoded over it
+    moving_count: int
+}
+
+// How many numbers a joint's track `part` has (0 its translation, 1 its
+// rotation, 2 its scale), and where they start in the joint's pose.
+track_width(part: int) -> int {
+    if part == 1 { return 4 }
+    return 3
+}
+
+track_offset(part: int) -> int {
+    if part == 0 { return 0 }
+    if part == 1 { return 3 }
+    return 7
+}
+
+// Bytes a frame of a track of kind `kind`.
+track_bytes(kind: int, part: int) -> int {
+    if kind == PACK_Q16 { return 6 }
+    if kind == PACK_F32 { return 4 * track_width(part) }
+    if kind == PACK_F64 { return 8 * track_width(part) }
+    return 0
+}
+
+// Take `t` compressed in place, its frames on rig `rig`, within
+// COMPRESS_ERROR of the skin. The most it moves a point of the skin,
+// metres; -1 for a take it leaves as it is (empty, already compressed, or
+// for a rig of another size).
+compress(t: *Take, rig: *Rig) -> float {
+    if t == null || t.packed != null || t.data == null || t.frames < 1 || t.count != pose.count(rig) { return 0.0 - 1.0 }
+    n = t.count
+    shell = calloc(n + 1, 8) as float[]
+    reach = calloc(n + 1, 8) as float[]
+    depth = pack_reach(rig, shell, reach)
+    // A track's share of the error: every joint of the longest chain moves
+    // the skin by its turn and by its place.
+    budget = COMPRESS_ERROR / ((depth * 2) as float)
+    kinds = calloc(n * 3 + 1, 4) as int[]
+    values = calloc(n * 3 * 8 + 1, 8) as float[]
+    hold = calloc(4, 4)
+    k = 0
+    while k < n * 3 {
+        kinds[k] = pack_choose(t, k, reach[k / 3], budget, values, hold)
+        k = k + 1
+    }
+    free(hold)
+    pk = heap.new(Packed)
+    pk.kinds = kinds as ptr
+    pk.values = values as ptr
+    pk.at = calloc(n * 3 + 1, 4)
+    pack_layout(pk, n)
+    pack_fill(t, pk)
+    err, worst = pack_measure(t, rig, pk, shell)
+    rounds = 0
+    while err > COMPRESS_ERROR && rounds < n * 3 {
+        pack_finer(rig, pk, worst)
+        free(pk.bytes)
+        pack_layout(pk, n)
+        pack_fill(t, pk)
+        err, worst = pack_measure(t, rig, pk, shell)
+        rounds = rounds + 1
+    }
+    pk.error = err
+    free(shell as ptr)
+    free(reach as ptr)
+    t.packed = pk as ptr
+    free(t.data)
+    t.data = null
+    return err
+}
+
+// Each joint's virtual vertices' distance from it into `shell`: a bone's
+// length, its longest child's (an end joint's own), at least PACK_SHELL.
+// How far its part of the skeleton reaches from it at rest, its
+// descendants' places and their vertices, into `reach`. The number of
+// joints on the longest chain.
+pack_reach(rig: *Rig, shell: float[], reach: float[]) -> int {
+    n = pose.count(rig)
+    rest = pose.new(rig)
+    worlds = pose.new(rig)
+    pose.world(rig, rest, worlds)
+    j = 0
+    while j < n {
+        shell[j] = PACK_SHELL
+        j = j + 1
+    }
+    ends = calloc(n + 1, 4) as int[]
+    j = 0
+    while j < n {
+        ends[j] = 1
+        j = j + 1
+    }
+    j = 0
+    while j < n {
+        length = core.v3_len(pose.translation(rest, j))
+        up = pose.parent(rig, j)
+        if up >= 0 {
+            ends[up] = 0
+            if length > shell[up] { shell[up] = length }
+        }
+        j = j + 1
+    }
+    j = 0
+    while j < n {
+        length = core.v3_len(pose.translation(rest, j))
+        if ends[j] == 1 && pose.parent(rig, j) >= 0 && length > shell[j] { shell[j] = length }
+        j = j + 1
+    }
+    free(ends as ptr)
+    deepest = 1
+    k = 0
+    while k < n {
+        p = pose.translation(worlds, k)
+        chain = 0
+        j = k
+        while j >= 0 {
+            d = core.v3_len(core.v3_sub(p, pose.translation(worlds, j))) + shell[k]
+            if d > reach[j] { reach[j] = d }
+            chain = chain + 1
+            j = pose.parent(rig, j)
+        }
+        if chain > deepest { deepest = chain }
+        k = k + 1
+    }
+    pose.release(rest)
+    pose.release(worlds)
+    return deepest
+}
+
+// The coarsest kind track `k` keeps within `budget` metres of the skin, a
+// part of the skeleton `reach` metres long under it; its constant, or its
+// range and step, into `values`. `hold` is room for four 32-bit floats.
+pack_choose(t: *Take, k: int, reach: float, budget: float, values: float[], hold: ptr) -> int {
+    j = k / 3
+    part = k % 3
+    width = track_width(part)
+    base = j * pose.FLOATS + track_offset(part)
+    at = k * 8
+    d = t.data as float[]
+    // Still: frame 0's numbers.
+    c = 0
+    while c < width {
+        values[at + c] = d[base + c]
+        c = c + 1
+    }
+    if pack_error(t, k, PACK_CONST, reach, values, at, hold) <= budget { return PACK_CONST }
+    // 16 bits a number over the track's own range.
+    c = 0
+    while c < 3 {
+        least = 0.0
+        most = 0.0
+        f = 0
+        while f < t.frames {
+            x = pack_number(d, f * t.stride + base, c, part)
+            if f == 0 || x < least { least = x }
+            if f == 0 || x > most { most = x }
+            f = f + 1
+        }
+        values[at + c] = least
+        values[at + 4 + c] = (most - least) / PACK_STEPS
+        c = c + 1
+    }
+    if pack_error(t, k, PACK_Q16, reach, values, at, hold) <= budget { return PACK_Q16 }
+    if pack_error(t, k, PACK_F32, reach, values, at, hold) <= budget { return PACK_F32 }
+    return PACK_F64
+}
+
+// Number `c` of a track's numbers at `at` in a pose: a rotation's signed so
+// its w is never negative.
+pack_number(d: float[], at: int, c: int, part: int) -> float {
+    x = d[at + c]
+    if part == 1 && d[at + 3] < 0.0 { return 0.0 - x }
+    return x
+}
+
+// A number as a count of `step`s over `least`.
+pack_q16(x: float, least: float, step: float) -> int {
+    if step <= 0.0 { return 0 }
+    q = ((x - least) / step + 0.5) as int
+    if q < 0 { q = 0 }
+    if q > 65535 { q = 65535 }
+    return q
+}
+
+// The most track `k` kept as `kind` moves a point of the skin over the
+// take, metres: a place by how far it is off, a turn by the chord it
+// sweeps at `reach`, a scale by how far it moves what is `reach` away.
+pack_error(t: *Take, k: int, kind: int, reach: float, v: float[], at: int, hold: ptr) -> float {
+    part = k % 3
+    base = (k / 3) * pose.FLOATS + track_offset(part)
+    d = t.data as float[]
+    worst = 0.0
+    f = 0
+    while f < t.frames {
+        src = f * t.stride + base
+        x, y, z, w = pack_value(d, src, part, kind, v, at, hold)
+        e = 0.0
+        if part == 1 {
+            ax = d[src]
+            ay = d[src + 1]
+            az = d[src + 2]
+            aw = d[src + 3]
+            la = core.sqrt_of(ax * ax + ay * ay + az * az + aw * aw)
+            lb = core.sqrt_of(x * x + y * y + z * z + w * w)
+            if la > 0.0 && lb > 0.0 {
+                dot = (ax * x + ay * y + az * z + aw * w) / (la * lb)
+                s = 1.0 - dot * dot
+                if s < 0.0 { s = 0.0 }
+                e = 2.0 * reach * core.sqrt_of(s)
+            }
+        } else {
+            dx = x - d[src]
+            dy = y - d[src + 1]
+            dz = z - d[src + 2]
+            e = core.sqrt_of(dx * dx + dy * dy + dz * dz)
+            if part == 2 { e = e * reach }
+        }
+        if e > worst { worst = e }
+        f = f + 1
+    }
+    return worst
+}
+
+// A track's numbers at `src` as kind `kind` would give them back.
+pack_value(d: float[], src: int, part: int, kind: int, v: float[], at: int, hold: ptr) -> (float, float, float, float) {
+    if kind == PACK_CONST { return v[at], v[at + 1], v[at + 2], v[at + 3] }
+    if kind == PACK_Q16 {
+        x = v[at] + (pack_q16(pack_number(d, src, 0, part), v[at], v[at + 4]) as float) * v[at + 4]
+        y = v[at + 1] + (pack_q16(pack_number(d, src, 1, part), v[at + 1], v[at + 5]) as float) * v[at + 5]
+        z = v[at + 2] + (pack_q16(pack_number(d, src, 2, part), v[at + 2], v[at + 6]) as float) * v[at + 6]
+        if part == 1 { return x, y, z, pack_w(x, y, z) }
+        return x, y, z, 0.0
+    }
+    if kind == PACK_F32 {
+        h = hold as f32[]
+        h[3] = 0.0
+        c = 0
+        while c < track_width(part) {
+            h[c] = d[src + c]
+            c = c + 1
+        }
+        return h[0] as float, h[1] as float, h[2] as float, h[3] as float
+    }
+    w = 0.0
+    if part == 1 { w = d[src + 3] }
+    return d[src], d[src + 1], d[src + 2], w
+}
+
+// A unit quaternion's w from its x, y and z, w not negative.
+pack_w(x: float, y: float, z: float) -> float {
+    s = 1.0 - x * x - y * y - z * z
+    if s <= 0.0 { return 0.0 }
+    return core.sqrt_of(s)
+}
+
+// Each track's place in a frame's record, the widest kinds first so every
+// number sits on its own size; and the record's bytes, on 8.
+pack_layout(pk: *Packed, n: int) {
+    kinds = pk.kinds as int[]
+    at = pk.at as int[]
+    offset = 0
+    kind = PACK_F64
+    while kind >= PACK_Q16 {
+        k = 0
+        while k < n * 3 {
+            if kinds[k] == kind {
+                at[k] = offset
+                offset = offset + track_bytes(kind, k % 3)
+            }
+            k = k + 1
+        }
+        kind = kind - 1
+    }
+    pk.record = ((offset + 7) / 8) * 8
+}
+
+// The records written from the take's frames, and its curves kept as they
+// are.
+pack_fill(t: *Take, pk: *Packed) {
+    n = t.count
+    pk.bytes = calloc(t.frames * pk.record + 8, 1)
+    kinds = pk.kinds as int[]
+    at = pk.at as int[]
+    v = pk.values as float[]
+    d = t.data as float[]
+    f = 0
+    while f < t.frames {
+        rec = pk.bytes + f * pk.record
+        k = 0
+        while k < n * 3 {
+            part = k % 3
+            src = f * t.stride + (k / 3) * pose.FLOATS + track_offset(part)
+            kind = kinds[k]
+            if kind == PACK_Q16 {
+                q = (rec + at[k]) as uint16[]
+                c = 0
+                while c < 3 {
+                    q[c] = pack_q16(pack_number(d, src, c, part), v[k * 8 + c], v[k * 8 + 4 + c])
+                    c = c + 1
+                }
+            } else if kind == PACK_F32 {
+                s = (rec + at[k]) as f32[]
+                c = 0
+                while c < track_width(part) {
+                    s[c] = d[src + c]
+                    c = c + 1
+                }
+            } else if kind == PACK_F64 {
+                s64 = (rec + at[k]) as float[]
+                c = 0
+                while c < track_width(part) {
+                    s64[c] = d[src + c]
+                    c = c + 1
+                }
+            }
+            k = k + 1
+        }
+        f = f + 1
+    }
+    // The still tracks laid in a pose once, and the moving ones listed.
+    if pk.still == null { pk.still = calloc(n * pose.FLOATS + 1, 8) }
+    if pk.moving == null { pk.moving = calloc(n * 3 + 1, 4) }
+    still = pk.still as float[]
+    moving = pk.moving as int[]
+    pk.moving_count = 0
+    k = 0
+    while k < n * 3 {
+        if kinds[k] == PACK_CONST {
+            base = (k / 3) * pose.FLOATS + track_offset(k % 3)
+            c = 0
+            while c < track_width(k % 3) {
+                still[base + c] = v[k * 8 + c]
+                c = c + 1
+            }
+        } else {
+            moving[pk.moving_count] = k
+            pk.moving_count = pk.moving_count + 1
+        }
+        k = k + 1
+    }
+    curves = t.stride - n * pose.FLOATS
+    if curves > 0 && pk.curves == null {
+        pk.curves = calloc(t.frames * curves + 1, 8)
+        cv = pk.curves as float[]
+        f = 0
+        while f < t.frames {
+            c = 0
+            while c < curves {
+                cv[f * curves + c] = d[f * t.stride + n * pose.FLOATS + c]
+                c = c + 1
+            }
+            f = f + 1
+        }
+    }
+}
+
+// Track `k`'s numbers in record `rec`.
+track_read(pk: *Packed, rec: ptr, k: int) -> (float, float, float, float) {
+    kind = (pk.kinds as int[])[k]
+    v = pk.values as float[]
+    at = k * 8
+    if kind == PACK_CONST { return v[at], v[at + 1], v[at + 2], v[at + 3] }
+    place = rec + (pk.at as int[])[k]
+    if kind == PACK_Q16 {
+        q = place as uint16[]
+        x = v[at] + (q[0] as float) * v[at + 4]
+        y = v[at + 1] + (q[1] as float) * v[at + 5]
+        z = v[at + 2] + (q[2] as float) * v[at + 6]
+        if k % 3 == 1 { return x, y, z, pack_w(x, y, z) }
+        return x, y, z, 0.0
+    }
+    if kind == PACK_F32 {
+        s = place as f32[]
+        if k % 3 == 1 { return s[0] as float, s[1] as float, s[2] as float, s[3] as float }
+        return s[0] as float, s[1] as float, s[2] as float, 0.0
+    }
+    s64 = place as float[]
+    if k % 3 == 1 { return s64[0], s64[1], s64[2], s64[3] }
+    return s64[0], s64[1], s64[2], 0.0
+}
+
+// Frame `f` of a compressed take decoded into pose `out`.
+packed_frame(t: *Take, f: int, out: ptr) {
+    pk = t.packed as *Packed
+    k0 = f
+    if k0 < 0 { k0 = 0 }
+    if k0 >= t.frames { k0 = t.frames - 1 }
+    rec = pk.bytes + k0 * pk.record
+    o = out as float[]
+    memcpy(out, pk.still, ((t.count * pose.FLOATS) as long) * (8 as long))
+    moving = pk.moving as int[]
+    m = 0
+    while m < pk.moving_count {
+        k = moving[m]
+        x, y, z, w = track_read(pk, rec, k)
+        at = (k / 3) * pose.FLOATS + track_offset(k % 3)
+        o[at] = x
+        o[at + 1] = y
+        o[at + 2] = z
+        if k % 3 == 1 { o[at + 3] = w }
+        m = m + 1
+    }
+    packed_curves(t, k0, k0, 0.0, out)
+}
+
+// The curves `u` of the way from frame `f0` to frame `f1`, lerped as
+// pose.blend lerps them.
+packed_curves(t: *Take, f0: int, f1: int, u: float, out: ptr) {
+    pk = t.packed as *Packed
+    if pk.curves == null { return }
+    curves = t.stride - t.count * pose.FLOATS
+    cv = pk.curves as float[]
+    o = out as float[]
+    base = t.count * pose.FLOATS
+    c = 0
+    while c < curves {
+        a = cv[f0 * curves + c]
+        b = cv[f1 * curves + c]
+        if u <= 0.0 {
+            o[base + c] = a
+        } else if u >= 1.0 {
+            o[base + c] = b
+        } else {
+            o[base + c] = a + (b - a) * u
+        }
+        c = c + 1
+    }
+}
+
+// A compressed take `u` of the way from frame `f0` to the next, into
+// `out`: each track decoded at the two and blended as pose.blend blends two
+// poses, places and scales lerped and turns nlerped the short way; a still
+// track written once.
+packed_blend(t: *Take, f0: int, u: float, out: ptr) {
+    if u <= 0.0 {
+        packed_frame(t, f0, out)
+        return
+    }
+    if u >= 1.0 {
+        packed_frame(t, f0 + 1, out)
+        return
+    }
+    pk = t.packed as *Packed
+    kinds = pk.kinds as int[]
+    offsets = pk.at as int[]
+    v = pk.values as float[]
+    ra = pk.bytes + f0 * pk.record
+    rb = ra + pk.record
+    o = out as float[]
+    memcpy(out, pk.still, ((t.count * pose.FLOATS) as long) * (8 as long))
+    moving = pk.moving as int[]
+    m = 0
+    while m < pk.moving_count {
+        k = moving[m]
+        part = k % 3
+        at = (k / 3) * pose.FLOATS + track_offset(part)
+        if kinds[k] == PACK_Q16 && part == 1 {
+            // A 16-bit turn, the commonest moving track, read in place.
+            qa = (ra + offsets[k]) as uint16[]
+            qb = (rb + offsets[k]) as uint16[]
+            vk = k * 8
+            ax = v[vk] + (qa[0] as float) * v[vk + 4]
+            ay = v[vk + 1] + (qa[1] as float) * v[vk + 5]
+            az = v[vk + 2] + (qa[2] as float) * v[vk + 6]
+            bx = v[vk] + (qb[0] as float) * v[vk + 4]
+            by = v[vk + 1] + (qb[1] as float) * v[vk + 5]
+            bz = v[vk + 2] + (qb[2] as float) * v[vk + 6]
+            pack_nlerp(ax, ay, az, pack_w(ax, ay, az), bx, by, bz, pack_w(bx, by, bz), u, o, at)
+        } else {
+            ax, ay, az, aw = track_read(pk, ra, k)
+            bx, by, bz, bw = track_read(pk, rb, k)
+            if part == 1 {
+                pack_nlerp(ax, ay, az, aw, bx, by, bz, bw, u, o, at)
+            } else {
+                o[at] = ax + (bx - ax) * u
+                o[at + 1] = ay + (by - ay) * u
+                o[at + 2] = az + (bz - az) * u
+            }
+        }
+        m = m + 1
+    }
+    packed_curves(t, f0, f0 + 1, u, out)
+}
+
+// Two turns nlerped `u` of the way the short way, into `o` at `at`, as
+// pose.blend blends a joint's.
+pack_nlerp(ax: float, ay: float, az: float, aw: float, bx: float, by: float, bz: float, bw: float, u: float, o: float[], at: int) {
+    d = ax * bx + ay * by + az * bz + aw * bw
+    sign = 1.0
+    if d < 0.0 { sign = 0.0 - 1.0 }
+    x = ax + (sign * bx - ax) * u
+    y = ay + (sign * by - ay) * u
+    z = az + (sign * bz - az) * u
+    w = aw + (sign * bw - aw) * u
+    length = core.sqrt_of(x * x + y * y + z * z + w * w)
+    if length < 0.000000001 { length = 1.0 }
+    o[at] = x / length
+    o[at + 1] = y / length
+    o[at + 2] = z / length
+    o[at + 3] = w / length
+}
+
+// The most the records `pk` move a point of the skin from where the take's
+// own frames put it, metres, over every frame in the rig's space (each
+// joint and its three virtual vertices `shell` away along its axes), and
+// the joint they move most.
+pack_measure(t: *Take, rig: *Rig, pk: *Packed, shell: float[]) -> (float, int) {
+    held = t.packed
+    t.packed = pk as ptr
+    raw = pose.new(rig)
+    got = pose.new(rig)
+    wa = pose.new(rig)
+    wb = pose.new(rig)
+    worst = 0.0
+    worst_j = 0
+    f = 0
+    while f < t.frames {
+        pose.copy(rig, t.data + f * t.stride * 8, raw)
+        packed_frame(t, f, got)
+        pose.world(rig, raw, wa)
+        pose.world(rig, got, wb)
+        j = 0
+        while j < t.count {
+            e = pack_point_error(wa, wb, j, shell[j])
+            if e > worst {
+                worst = e
+                worst_j = j
+            }
+            j = j + 1
+        }
+        f = f + 1
+    }
+    pose.release(raw)
+    pose.release(got)
+    pose.release(wa)
+    pose.release(wb)
+    t.packed = held
+    return worst, worst_j
+}
+
+// How far joint `j` and its virtual vertices `d` along its axes are apart
+// in two rig-space poses: the most of the four.
+pack_point_error(wa: ptr, wb: ptr, j: int, d: float) -> float {
+    pa = pose.translation(wa, j)
+    pb = pose.translation(wb, j)
+    qa = pose.rotation(wa, j)
+    qb = pose.rotation(wb, j)
+    sa = pose.scale(wa, j)
+    sb = pose.scale(wb, j)
+    worst = core.v3_len(core.v3_sub(pa, pb))
+    axis = 0
+    while axis < 3 {
+        e = core.vec3(d, 0.0, 0.0)
+        if axis == 1 { e = core.vec3(0.0, d, 0.0) }
+        if axis == 2 { e = core.vec3(0.0, 0.0, d) }
+        va = core.v3_add(pa, core.quat_apply(qa, core.vec3(e.x * sa.x, e.y * sa.y, e.z * sa.z)))
+        vb = core.v3_add(pb, core.quat_apply(qb, core.vec3(e.x * sb.x, e.y * sb.y, e.z * sb.z)))
+        x = core.v3_len(core.v3_sub(va, vb))
+        if x > worst { worst = x }
+        axis = axis + 1
+    }
+    return worst
+}
+
+// Every track of joint `j` and of the joints above it one kind finer (a
+// still one to 32-bit floats).
+pack_finer(rig: *Rig, pk: *Packed, j: int) {
+    kinds = pk.kinds as int[]
+    at = j
+    while at >= 0 {
+        p = 0
+        while p < 3 {
+            k = at * 3 + p
+            if kinds[k] == PACK_CONST {
+                kinds[k] = PACK_F32
+            } else if kinds[k] < PACK_F64 {
+                kinds[k] = kinds[k] + 1
+            }
+            p = p + 1
+        }
+        at = pose.parent(rig, at)
+    }
+}
+
+// The frames written back from their records: a program that writes a
+// take's frames has them as they were decoded, the take no longer
+// compressed.
+unpack(t: *Take) {
+    if t.packed == null { return }
+    pk = t.packed as *Packed
+    data = calloc(t.frames * t.stride + 1, 8)
+    f = 0
+    while f < t.frames {
+        packed_frame(t, f, data + f * t.stride * 8)
+        f = f + 1
+    }
+    t.data = data
+    t.packed = null
+    packed_free(pk)
+}
+
+packed_free(pk: *Packed) {
+    if pk == null { return }
+    free(pk.kinds)
+    free(pk.at)
+    free(pk.values)
+    free(pk.bytes)
+    if pk.curves != null { free(pk.curves) }
+    if pk.still != null { free(pk.still) }
+    if pk.moving != null { free(pk.moving) }
+    heap.free(pk)
+}
+
+// Whether take `t` is compressed, and the most its compression moves a
+// point of the skin, metres (0 for one that is not).
+compressed(t: *Take) -> bool { return t != null && t.packed != null }
+
+compress_error(t: *Take) -> float {
+    if t == null || t.packed == null { return 0.0 }
+    return (t.packed as *Packed).error
+}
+
+// The bytes take `t` holds: its frames, compressed or not, its root's
+// motion and its feet's contacts (eight numbers a frame), and its events.
+take_bytes(t: *Take) -> long {
+    if t == null { return 0 as long }
+    total = (t.frames as long) * (64 as long)
+    if t.packed != null {
+        pk = t.packed as *Packed
+        // Its records; each track's kind, place, numbers and listing; its still pose.
+        total = total + (t.frames as long) * (pk.record as long) + ((t.count * 3) as long) * (76 as long) + ((t.count * pose.FLOATS) as long) * (8 as long)
+        if pk.curves != null { total = total + ((t.frames * (t.stride - t.count * pose.FLOATS)) as long) * (8 as long) }
+    } else if t.data != null {
+        total = total + ((t.frames * t.stride) as long) * (8 as long)
+    }
+    return total + (list.size(t.events) as long) * (32 as long)
+}
+
+// How many of take `t`'s tracks are of each kind: still, 16-bit, 32-bit
+// and 64-bit.
+track_kinds(t: *Take) -> (int, int, int, int) {
+    if t == null || t.packed == null { return 0, 0, 0, 0 }
+    kinds = (t.packed as *Packed).kinds as int[]
+    still = 0
+    q16 = 0
+    f32s = 0
+    f64s = 0
+    k = 0
+    while k < t.count * 3 {
+        if kinds[k] == PACK_CONST { still = still + 1 }
+        if kinds[k] == PACK_Q16 { q16 = q16 + 1 }
+        if kinds[k] == PACK_F32 { f32s = f32s + 1 }
+        if kinds[k] == PACK_F64 { f64s = f64s + 1 }
+        k = k + 1
+    }
+    return still, q16, f32s, f64s
 }
