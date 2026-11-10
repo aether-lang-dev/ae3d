@@ -1122,6 +1122,89 @@ gl_geometry_release(vao: int) {
     free(e as ptr)
 }
 
+// A skinned mesh several models draw (#992: a glTF file's, read once and
+// drawn by every figure of it, core.model_share_mesh): its vertices,
+// indices and skin uploaded once, under one vertex array, and drawn by
+// each figure by its own palette. Keyed by the mesh itself: the same mesh
+// is the same skin, which the cache by bytes cannot see (it leaves skinned
+// meshes alone).
+struct GLSkinned {
+    mesh: ptr
+    vertex_count: int
+    vao: int
+    vbo: int
+    ebo: int
+    skin_vbo: int
+    refs: int
+}
+
+var g_skinned: ptr = null          // list of *GLSkinned
+
+// Model `m`, skinned and drawing a mesh other models draw too, on the
+// buffers made for that mesh (made now for the first): its vertex array
+// bound. False for none (no geometry).
+gl_skinned_acquire(m: *Model) -> bool {
+    vertex_count = geometry.mesh_vertex_count(m.mesh)
+    if vertex_count <= 0 || geometry.mesh_index_count(m.mesh) <= 0 { return false }
+    if g_skinned == null { g_skinned = list.new() }
+    e = null as *GLSkinned
+    i = 0
+    while i < list.size(g_skinned) && e == null {
+        s = list.get_raw(g_skinned, i) as *GLSkinned
+        if s.mesh == m.mesh && s.vertex_count == vertex_count && s.refs > 0 { e = s }
+        i = i + 1
+    }
+    if e == null {
+        e = calloc(1, sizeof(GLSkinned)) as *GLSkinned
+        e.mesh = m.mesh
+        e.vertex_count = vertex_count
+        e.vao = gl_vao_create()
+        gl_vao_bind(e.vao)
+        e.vbo = gl_buffer_create()
+        e.ebo = gl_buffer_create()
+        gl_upload_mesh(m.mesh, e.vbo, e.ebo)
+        gl_setup_vertex_attribs()
+        e.skin_vbo = gl_buffer_create()
+        gl_upload_skin(m.mesh, e.skin_vbo)
+        list.add_raw(g_skinned, e as ptr)
+    }
+    e.refs = e.refs + 1
+    m.vao = e.vao
+    m.vbo = e.vbo
+    m.ebo = e.ebo
+    m.skin_vbo = e.skin_vbo
+    gl_vao_bind(m.vao)
+    return true
+}
+
+// Model `m`'s hold on shared skinned buffers let go of (they go with the
+// last), its handles cleared; false when its buffers are its own.
+gl_skinned_release(m: *Model) -> bool {
+    if g_skinned == null || m.vao == 0 { return false }
+    i = 0
+    while i < list.size(g_skinned) {
+        e = list.get_raw(g_skinned, i) as *GLSkinned
+        if e.vao == m.vao && e.refs > 0 {
+            e.refs = e.refs - 1
+            if e.refs == 0 {
+                gl_vao_delete(e.vao)
+                gl_buffer_delete(e.vbo)
+                gl_buffer_delete(e.ebo)
+                gl_buffer_delete(e.skin_vbo)
+                list.remove(g_skinned, i)
+                free(e as ptr)
+            }
+            m.vao = 0
+            m.vbo = 0
+            m.ebo = 0
+            m.skin_vbo = 0
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
 // Only when nothing is holding geometry any more, so a second renderer in
 // the same process does not lose the buffers it is still drawing from.
 gl_geometry_shutdown() {
@@ -4374,9 +4457,15 @@ renderer_add_model(r: *GLRenderer, m: *Model) {
     // other's. A skinned mesh takes its own, which costs nothing worth having
     // -- a cache exists for repeated props, and a figure is not one.
     skinned = core.mesh_is_skinned(m.mesh)
+    // A skinned mesh is on buffers made once for it (gl_skinned_acquire),
+    // shared by every model drawing that mesh (#992), each skinned by its
+    // own palette.
+    shared_skin = skinned && !m.is_instanced && m.morph == null && gl_skinned_acquire(m)
     // A model with morph targets (#910) is morphed into its own vertex
     // buffer each frame, which no other model may draw from.
-    if m.is_instanced || skinned || m.morph != null {
+    if shared_skin {
+        m.shares_geometry = false
+    } else if m.is_instanced || skinned || m.morph != null {
         m.vao = gl_vao_create()
         gl_vao_bind(m.vao)
         m.vbo = gl_buffer_create()
@@ -4402,7 +4491,7 @@ renderer_add_model(r: *GLRenderer, m: *Model) {
         gl_vao_bind(m.vao)
     }
 
-    if skinned {
+    if skinned && !shared_skin {
         m.skin_vbo = gl_buffer_create()
         gl_upload_skin(m.mesh, m.skin_vbo)
     }
@@ -4554,9 +4643,14 @@ renderer_remove_model(r: *GLRenderer, m: *Model) {
         m.shares_geometry = false
     } else {
         forget_batches(r, m.vao)
-        if m.vao != 0 { gl_vao_delete(m.vao) ; m.vao = 0 }
-        if m.vbo != 0 { gl_buffer_delete(m.vbo) ; m.vbo = 0 }
-        if m.ebo != 0 { gl_buffer_delete(m.ebo) ; m.ebo = 0 }
+        if !gl_skinned_release(m) {
+            if m.vao != 0 { gl_vao_delete(m.vao) ; m.vao = 0 }
+            if m.vbo != 0 { gl_buffer_delete(m.vbo) ; m.vbo = 0 }
+            if m.ebo != 0 { gl_buffer_delete(m.ebo) ; m.ebo = 0 }
+            // A skinned model's joints and weights, its own: they were
+            // never let go of, a figure removed leaking its skin buffer.
+            if m.skin_vbo != 0 { gl_buffer_delete(m.skin_vbo) ; m.skin_vbo = 0 }
+        }
     }
     if m.instance_vbo != 0 {
         gl_buffer_delete(m.instance_vbo)
@@ -8667,10 +8761,11 @@ renderer_cleanup(r: *GLRenderer) {
                 m.vbo = 0
                 m.ebo = 0
                 m.shares_geometry = false
-            } else {
+            } else if !gl_skinned_release(m) {
                 if m.vao != 0 { gl_vao_delete(m.vao) ; m.vao = 0 }
                 if m.vbo != 0 { gl_buffer_delete(m.vbo) ; m.vbo = 0 }
                 if m.ebo != 0 { gl_buffer_delete(m.ebo) ; m.ebo = 0 }
+                if m.skin_vbo != 0 { gl_buffer_delete(m.skin_vbo) ; m.skin_vbo = 0 }
             }
             release_damage(r, m)
             if m.instance_vbo != 0 { gl_buffer_delete(m.instance_vbo) ; m.instance_vbo = 0 }
