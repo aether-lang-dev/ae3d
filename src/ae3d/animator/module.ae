@@ -249,7 +249,15 @@ struct Animator {
     posts: ptr                     // list of *Post
     shown: ptr                     // the pose a step after the graph drew (show)
     showing: bool                  // shown is this frame's
-    fixed: bool                    // its graph evaluated at the fixed step (set_fixed), its posts in the pose phase
+    fixed: bool                    // its graph evaluated before the step's physics (set_fixed), not after it
+    // The graph advances by the fixed steps (#985) and is drawn between the
+    // poses of the last two, by the frame's share of the next.
+    stepping: bool                 // evaluated by a step now: its posts wait for the pose phase
+    step_now: ptr                  // the pose the last step drew (pose_shown after it)
+    step_before: ptr               // and the one before it
+    steps_drawn: int               // steps it has drawn, up to 2: both above are a step's
+    frame_shown: ptr               // the pose shown this frame, between those two
+    framed: bool                   // frame_shown is this frame's
     // Update-rate LOD (set_every): the graph evaluated one frame in `every`,
     // ahead of the frame, and the frames between drawn between its last two
     // evaluations.
@@ -265,13 +273,10 @@ struct Animator {
     lod_known: bool                // lod_at and lod_yaw are an evaluation's at this rate
     cost: float                    // seconds an evaluation of the graph takes, averaged
     shaper: ptr                    // *Shaper: a change drawn by its owner in place of the inertialization (play_shaped), or null
-    // Evaluated with the engine's other animators on its job pool
-    // (evaluate_all) this frame: what its slot in the pose phase has left
-    // to do (its posts).
+    // Evaluated with its step group's other animators on the engine's job
+    // pool (evaluate_step_all) this step: what its own turn has left to do.
     batched: bool
-    batch_drawn: bool
-    batch_kind: int                // at the fixed step, what evaluate_write has left to write
-    batch_frame: int
+    batch_kind: int                // what evaluate_write has left to write
 }
 
 // A step after the graph, and what it steps with (add_post).
@@ -421,7 +426,15 @@ attach(e: *Engine, o: *GameObject) -> *Animator {
     a.posts = list.new()
     a.shown = pose.new(rig)
     a.every = 1
+    a.step_now = pose.new(rig)
+    a.step_before = pose.new(rig)
+    a.frame_shown = pose.new(rig)
+    // Its graph a step on at each fixed step, after the step's physics: posed
+    // where the step left its capsule and the ground under its feet, as the
+    // pose phase posed it on a fixed tick. Its posts in the pose phase.
     b = engine.behaviour_new("Animator", a as ptr)
+    b.fixed_update = animator_fixed
+    b.fixed_group = engine.FIXED_POSE
     b.pose = animator_pose
     engine.engine_add_behaviour(e, b)
     a.stepper = b as ptr
@@ -492,6 +505,9 @@ animator_free(a: *Animator) {
     pose.release(a.work2)
     pose.release(a.worlds)
     pose.release(a.shown)
+    pose.release(a.step_now)
+    pose.release(a.step_before)
+    pose.release(a.frame_shown)
     i = 0
     while i < list.size(a.posts) {
         heap.free(list.get_raw(a.posts, i) as *Post)
@@ -2187,115 +2203,46 @@ pass_events(a: *Animator, t: *Take, from: float, to: float, loop: bool, entered:
 
 // --- the frame ----------------------------------------------------------------------------------
 
-// The pose phase: the frame's pose, or, for an animator evaluated at the
-// fixed step (set_fixed), only its steps after the graph, which draw from
-// the bodies as the physics left them.
+// The pose phase: the graph has gone on at the frame's steps
+// (animator_fixed); here the pose shown this frame is taken between the
+// last two steps' by the frame's share of the next, as its joints are drawn
+// (core.interp_apply), and its steps after the graph run, drawing from the
+// bodies as the physics left them. A figure another writer has (pause) is
+// read back as that writer drew it this frame.
 animator_pose(state: ptr, e: *Engine) {
     a = state as *Animator
-    if a.fixed {
-        if !a.paused { run_posts(a) }
+    if a.paused {
+        if !a.fixed { evaluate(a, engine.engine_delta_time(e)) }
         return
     }
-    // The engine's animators evaluated together at the first one's turn
-    // (evaluate_all), each one's steps after the graph left for its own.
-    frame = engine.engine_frame_count(e)
-    if g_batch_engine != e as ptr || g_batch_frame != frame { evaluate_all(e, frame) }
-    if a.batched && a.batch_frame == frame {
-        a.batched = false
-        if a.batch_drawn { evaluate_posts(a) }
-        return
-    }
-    a.batched = false
-    evaluate(a, engine.engine_delta_time(e))
-}
-
-// --- the pose phase on the job pool ------------------------------------------------------------------
-
-// The engine's animators evaluated on its job pool (ae3d.jobs), as UE5's
-// and Unity's animation runs on worker threads: each figure's graph, its
-// IK and its pose written to its own joints are its own, and its feet read
-// the static world by rays that only read it (no step runs in the pose
-// phase). Its steps after the graph (add_post: a ragdoll driven, an item
-// carried) still run at its own turn, in the engine's order, on this
-// thread. Evaluated here at the first animator's turn in the frame:
-//   - not one evaluated at the fixed step (set_fixed), nor one paused
-//     (another writer's), which keep their turns;
-//   - nor one moved by its root motion, whose capsule moves in the physics
-//     world as its graph is evaluated, before its feet are solved.
-// Every figure's evaluation reads only its own state and the static world,
-// so the poses are the same to the bit whatever the pool's size, and the
-// same with no pool (the loop then runs here, in order).
-var g_animators: ptr = null        // list of every *Animator attached
-var g_batch_engine: ptr = null     // the engine and frame evaluate_all last ran for
-var g_batch_frame = 0 - 1
-var g_batch: ptr = null            // ptr[g_batch_room]: the frame's animators
-var g_batch_room = 0
-var g_on_pool = true               // on_pool
-
-struct BatchPass {
-    animators: ptr                 // ptr[count]
-    dt: float
-    frame: int
-}
-
-batched_now(a: *Animator, e: *Engine) -> bool {
-    if a.engine != e as ptr || a.fixed || a.paused || a.root_motion { return false }
-    b = a.stepper as *Behaviour
-    return b != null && b.enabled && b.started
-}
-
-evaluate_all(e: *Engine, frame: int) {
-    g_batch_engine = e as ptr
-    g_batch_frame = frame
-    if g_animators == null { return }
-    count = list.size(g_animators)
-    if count > g_batch_room {
-        if g_batch != null { free(g_batch) }
-        g_batch_room = count * 2
-        g_batch = calloc(g_batch_room, 8)
-    }
-    chosen = g_batch as ptr[]
-    n = 0
-    k = 0
-    while k < count {
-        a = list.get_raw(g_animators, k) as *Animator
-        if batched_now(a, e) {
-            chosen[n] = a as ptr
-            n = n + 1
+    // Made since the frame's steps: shown at its state's pose as it stands,
+    // not in its rest pose, and its graph left for the next step to begin,
+    // as it begins on a fixed tick. Evaluated here at no time on, a people
+    // plaza made in a frame that ran no step went another way than on the
+    // tick: its fastest joint 19.9 rad/s against 18.7.
+    if !a.evaluated {
+        s = state_at(a, a.current)
+        if s != null {
+            sample_state(a, s, a.work)
+            pose.apply(a.rig as *pose.Rig, a.work)
         }
-        k = k + 1
     }
-    if n == 0 { return }
-    pass = BatchPass { animators: g_batch, dt: engine.engine_delta_time(e), frame: frame }
-    if g_on_pool {
-        jobs.parallel_for(evaluate_block, n, 1, (&pass) as ptr)
-    } else {
-        evaluate_block(0, n, 0, (&pass) as ptr)
+    alpha = core.interp_frame()
+    if alpha >= 0.0 && a.steps_drawn >= 2 {
+        if alpha > 1.0 { alpha = 1.0 }
+        pose.blend(a.rig as *pose.Rig, a.step_before, a.step_now, alpha, a.frame_shown)
+        a.framed = true
     }
+    clock = profile_now()
+    run_posts(a)
+    profile_add(PROF_POSTS, clock)
 }
 
-// Off, the frame's animators are evaluated together on this thread alone,
-// in the same order to the same poses: what a profile (profile) is taken
-// on, and what the pool is measured against. On by default.
-on_pool(on: bool) { g_on_pool = on }
-
-evaluate_block(start: int, end: int, worker: int, context: ptr) {
-    pass = context as *BatchPass
-    chosen = pass.animators as ptr[]
-    k = start
-    while k < end {
-        a = chosen[k] as *Animator
-        a.batch_drawn = evaluate_pose(a, pass.dt)
-        a.batch_frame = pass.frame
-        a.batched = true
-        k = k + 1
-    }
-}
-
-// The frame's pose after `dt` seconds, written to the figure's joints. The
-// pose phase calls it; a program stepping its engine by hand calls
-// update_now after engine_update for what the frame drew.
+// The pose `dt` seconds on, written to the figure's joints. Each fixed step
+// calls it (animator_fixed); a program posing a figure with no engine
+// stepping it calls it (or update_now) itself, and its posts run with it.
 evaluate(a: *Animator, dt: float) {
+    a.framed = false
     if a.paused {
         a.showing = false
         read_paused(a, dt)
@@ -2304,10 +2251,10 @@ evaluate(a: *Animator, dt: float) {
     if evaluate_pose(a, dt) { evaluate_posts(a) }
 }
 
-// The steps after the graph, where the graph draws them (not at the fixed
-// step: set_fixed's run them in the pose phase).
+// The steps after the graph, where the graph draws them: not at the fixed
+// step, whose animators run them in the pose phase.
 evaluate_posts(a: *Animator) {
-    if a.fixed { return }
+    if a.fixed || a.stepping { return }
     clock = profile_now()
     run_posts(a)
     profile_add(PROF_POSTS, clock)
@@ -2668,11 +2615,12 @@ take_over(a: *Animator, now: ptr, before: ptr, dt: float, state: int, at: float,
 
 // --- the cost of a figure -------------------------------------------------------------------
 
-// The graph evaluated one frame in `every` (1 every frame, the default), as
-// Unreal's update-rate optimisation and its animation budget allocator run
-// a distant figure's: evaluated ahead to the last frame it serves, each
-// frame drawn between that and the pose before, so the frame is drawn at its
-// own time. `phase` (0 to every - 1) puts this figure's evaluations on other
+// The graph evaluated one fixed step in `every` (1 every step, the
+// default), as Unreal's update-rate optimisation and its animation budget
+// allocator run a distant figure's: evaluated ahead to the last step it
+// serves, each step drawn between that and the pose before, so the step is
+// drawn at its own time (and a frame between two steps between theirs).
+// "Frame" below is such a step. `phase` (0 to every - 1) puts this figure's evaluations on other
 // frames than another's of the same rate: N figures at every 4 are N / 4
 // evaluations a frame, not N every fourth frame. The rate changes without a
 // jump either way (the interval under way is finished first).
@@ -2709,7 +2657,7 @@ graph_cost(a: *Animator) -> float {
 // evaluated since profile_reset, while profile is on (off, a section costs a
 // branch). The sections of ae3d.character's own step are added here too
 // (profile_add), so one table holds the figure's frame. Read on one thread:
-// figures evaluated on workers (evaluate_all) are summed into the same
+// figures evaluated on workers (evaluate_step_all) are summed into the same
 // table without a lock, so a profile is taken on one.
 const PROF_GRAPH = 0               // bindings, transitions, the clocks, the states' samples and blends
 const PROF_INERTIA = 1             // a transition's offsets decayed
@@ -2872,68 +2820,111 @@ run_posts(a: *Animator) {
     }
 }
 
-// Its graph evaluated at the fixed step (`on`), in the step's animation
-// group (engine.FIXED_ANIMATION): after the game's scripts and before the
+// Its graph evaluated in the step's animation group (`on`,
+// engine.FIXED_ANIMATION): after the game's scripts and before the
 // physics, as Unity's animators that animate physics are, so the bodies a
 // figure's pose drives (ae3d.physanim) are stepped toward this step's pose,
-// not the last frame's. Its steps after the graph still run in the pose
-// phase, after the physics. Off, it is evaluated once a frame in the pose
-// phase, as by default: a figure drawn faster than the step is posed every
-// frame only so.
+// not the last step's; while another writer has it (pause), read back at
+// the step too. Off, as by default, it is evaluated after the step's
+// physics (engine.FIXED_POSE). At the fixed step either way; its steps
+// after the graph run in the pose phase, after the physics.
 set_fixed(a: *Animator, on: bool) {
     if a == null || a.fixed == on { return }
     a.fixed = on
     a.batched = false
     b = a.stepper as *Behaviour
     if b == null { return }
-    if on {
-        b.fixed_update = animator_fixed
-        b.fixed_group = engine.FIXED_ANIMATION
-    } else {
-        b.fixed_update = null
-        b.fixed_group = engine.FIXED_SCRIPTS
-    }
+    b.fixed_group = engine.FIXED_POSE
+    if on { b.fixed_group = engine.FIXED_ANIMATION }
 }
 
 fixed(a: *Animator) -> bool { return a != null && a.fixed }
 
+// The graph a fixed step on (#985): its clocks, transitions, root motion,
+// feet locks and solves in the steps' time, the time the capsule and the
+// mover move in. Posed once a frame with the frame's length, a figure on a
+// display that ran zero, one or two steps a frame had its pose and its
+// capsule disagree, and its toes skated up to 43 mm in the people plaza
+// (3 on a fixed tick). The pose each step draws is kept with the one before,
+// for the frames between (animator_pose).
 animator_fixed(state: ptr, e: *Engine, step: float) {
     a = state as *Animator
-    // The step's animators evaluated together on the job pool at the first
-    // one's turn, as the pose phase's are (evaluate_all): their graphs on
-    // the workers, each pose written at its own turn, on this thread (a
-    // joint moved in a fixed step is noted for drawing between steps, in
-    // one list).
-    if first_fixed(a) { evaluate_fixed_all(a.engine as *Engine, step) }
+    // Another writer's figure is read back as it draws it, in the pose phase.
+    if a.paused && !a.fixed { return }
+    // The step group's animators evaluated together on the job pool at the
+    // first one's turn: their graphs on the workers, each pose written at
+    // its own turn, on this thread (a joint moved in a fixed step is noted
+    // for drawing between steps, in one list).
+    if first_in_step(a) { evaluate_step_all(a.engine as *Engine, step, a.fixed) }
+    a.framed = false
+    a.stepping = true
     if a.batched {
         a.batched = false
         evaluate_write(a, a.batch_kind, step)
-        return
+    } else {
+        evaluate(a, step)
     }
-    evaluate(a, step)
+    a.stepping = false
+    r = a.rig as *pose.Rig
+    kept = a.step_before
+    a.step_before = a.step_now
+    a.step_now = kept
+    pose.copy(r, pose_shown(a), a.step_now)
+    if a.steps_drawn < 2 { a.steps_drawn = a.steps_drawn + 1 }
 }
 
-// Whether `a` is its engine's first animator evaluated at the fixed step.
-first_fixed(a: *Animator) -> bool {
+// --- the fixed step on the job pool ------------------------------------------------------------------
+
+// The engine's animators evaluated on its job pool (ae3d.jobs), as UE5's
+// and Unity's animation runs on worker threads: each figure's graph, its
+// IK and its pose are its own, and its feet read the static world by rays
+// that only read it (no physics runs while they are evaluated: the step's
+// physics is before the pose group and after the animation group). Each
+// step group's animators (set_fixed's before the physics, the rest after
+// it) at the first one's turn in the step, its pose written to its joints
+// at its own turn, on this thread. Not one:
+//   - paused (another writer's), which keeps its turn;
+//   - moved by its root motion, whose capsule moves in the physics world
+//     as its graph is evaluated, before its feet are solved;
+//   - between evaluations at a slower rate (set_every), which moves its
+//     object to where it will be drawn as it is evaluated.
+// Every figure's evaluation reads only its own state and the static world,
+// so the poses are the same to the bit whatever the pool's size, and the
+// same with no pool (the loop then runs here, in order).
+var g_animators: ptr = null        // list of every *Animator attached
+var g_batch: ptr = null            // ptr[g_batch_room]: the step group's animators
+var g_batch_room = 0
+var g_on_pool = true               // on_pool
+
+struct BatchPass {
+    animators: ptr                 // ptr[count]
+    dt: float
+}
+
+// Off, a step group's animators are evaluated together on this thread
+// alone, in the same order to the same poses: what a profile (profile) is
+// taken on, and what the pool is measured against. On by default.
+on_pool(on: bool) { g_on_pool = on }
+
+// Whether `a` is the first animator of its engine's step group (set_fixed's
+// or the rest) to take its turn.
+first_in_step(a: *Animator) -> bool {
     k = 0
     while k < list.size(g_animators) {
         o = list.get_raw(g_animators, k) as *Animator
-        if o.engine == a.engine && o.fixed && o.stepper != null && (o.stepper as *Behaviour).enabled { return o == a }
+        if o.engine == a.engine && o.fixed == a.fixed && (o.fixed || !o.paused) && o.stepper != null && (o.stepper as *Behaviour).enabled { return o == a }
         k = k + 1
     }
     return false
 }
 
-// At the fixed step: not paused, not moved by root motion, and on the
-// graph's every-frame path (one at a slower rate moves its object to where
-// it will be drawn as it is evaluated).
-fixed_batched_now(a: *Animator, e: *Engine) -> bool {
-    if a.engine != e as ptr || !a.fixed || a.paused || a.root_motion || !every_frame_now(a) { return false }
+step_batched_now(a: *Animator, e: *Engine, fixed: bool) -> bool {
+    if a.engine != e as ptr || a.fixed != fixed || a.paused || a.root_motion || !every_frame_now(a) { return false }
     b = a.stepper as *Behaviour
     return b != null && b.enabled
 }
 
-evaluate_fixed_all(e: *Engine, step: float) {
+evaluate_step_all(e: *Engine, step: float, fixed: bool) {
     count = list.size(g_animators)
     if count > g_batch_room {
         if g_batch != null { free(g_batch) }
@@ -2945,23 +2936,23 @@ evaluate_fixed_all(e: *Engine, step: float) {
     k = 0
     while k < count {
         a = list.get_raw(g_animators, k) as *Animator
-        if a.engine == e as ptr && a.fixed { a.batched = false }
-        if fixed_batched_now(a, e) {
+        if a.engine == e as ptr && a.fixed == fixed { a.batched = false }
+        if step_batched_now(a, e, fixed) {
             chosen[n] = a as ptr
             n = n + 1
         }
         k = k + 1
     }
     if n == 0 { return }
-    pass = BatchPass { animators: g_batch, dt: step, frame: 0 }
+    pass = BatchPass { animators: g_batch, dt: step }
     if g_on_pool {
-        jobs.parallel_for(evaluate_fixed_block, n, 1, (&pass) as ptr)
+        jobs.parallel_for(evaluate_step_block, n, 1, (&pass) as ptr)
     } else {
-        evaluate_fixed_block(0, n, 0, (&pass) as ptr)
+        evaluate_step_block(0, n, 0, (&pass) as ptr)
     }
 }
 
-evaluate_fixed_block(start: int, end: int, worker: int, context: ptr) {
+evaluate_step_block(start: int, end: int, worker: int, context: ptr) {
     pass = context as *BatchPass
     chosen = pass.animators as ptr[]
     k = start
@@ -2994,9 +2985,12 @@ pose_unheld(a: *Animator) -> ptr {
 }
 
 // The pose drawn this frame: the graph's (pose_now), or what a step after
-// it drew (show). What follows the figure as it is seen reads it: a held
-// item, a meter.
+// it drew (show); on a frame drawn between two steps, between their two
+// poses as the joints are drawn. What follows the figure as it is seen
+// reads it: a held item, a meter.
 pose_shown(a: *Animator) -> ptr {
+    // In the pose phase and after it: a step reads the steps' own pose.
+    if a.framed && core.interp_frame() >= 0.0 { return a.frame_shown }
     if a.showing { return a.shown }
     return a.out
 }
@@ -3037,6 +3031,7 @@ show(a: *Animator) {
     if a == null { return }
     pose.read(a.rig as *pose.Rig, a.shown)
     a.showing = true
+    a.framed = false
 }
 
 // The root's motion over the step put on the figure's object: its travel
