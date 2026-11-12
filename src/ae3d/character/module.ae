@@ -1462,12 +1462,14 @@ get_up_try(c: *Character, m: *Motion, blend: float, looking: bool) -> int {
     rooted_as(r, p, first)
     pose.apply(r, p)
     pose.copy(r, p, pl.snap)
+    unplan_free(pl, r, a)
     pl.turn = blend
     pl.fresh = true
     pl.lower = joint_ground(r, p, w, pose.PELVIS).y - joint_ground(r, first, w, pose.PELVIS).y
     pl.drop = get_up_blend(r, c.object as *GameObject, take, p, first, w, blend)
     began = os.now_monotonic_ns()
     plan_lift(pl, r, take)
+    if plan_free(pl, r, take) { plan_lift(pl, r, take) }
     plan_turn(pl, r, c.object as *GameObject, take, p, first, w, blend)
     pl.plan_s = ((os.now_monotonic_ns() - began) as float) * 0.000000001 + pl.score_s
     pl.step_s = 0.0
@@ -1497,7 +1499,8 @@ act_planned(c: *Character, state: int, pl: *Planned) -> bool {
     c.getting_up = true
     c.act_state = state
     animator.set_root_motion(a, true)
-    animator.play_shaped(a, state, pl.drop, plan_step, pl as ptr)
+    pl.state = state
+    animator.play_shaped(a, state, pl.free + pl.drop, plan_step, pl as ptr)
     return true
 }
 
@@ -1566,6 +1569,13 @@ struct Planned {
     turn: float                    // seconds the joints turn over
     drop: float                    // seconds the pelvis comes down over (get_up_blend)
     lower: float                   // metres the pelvis lay over the get-up's first frame's
+    from: ptr                      // the pose the hand-over turns from: the one it lay in, a hand in the way drawn out (plan_free)
+    free: float                    // seconds a hand is drawn out over before the hand-over, 0 none
+    free_on: ptr                   // int[2]: each arm drawn out (1) or not (0), the left first
+    free_path: ptr                 // float[2 * FREE_SAMPLES * 12]: each arm's shoulder's, elbow's and wrist's turns at each moment of the way out
+    state: int                     // the get-up's state (act_planned)
+    held: bool                     // its take held at its start while a hand is drawn out (hold_take), and the rate it had
+    held_rate: float
 }
 
 planned_of(c: *Character) -> *Planned {
@@ -1575,6 +1585,9 @@ planned_of(c: *Character) -> *Planned {
     pl.engine = c.engine
     pl.object = c.object
     pl.snap = pose.new(r)
+    pl.from = pose.new(r)
+    pl.free_on = calloc(2, 4)
+    pl.free_path = calloc(2 * FREE_SAMPLES * 12, 8)
     pl.clip = pose.new(r)
     pl.clip_w = pose.new(r)
     pl.worlds = pose.new(r)
@@ -1658,6 +1671,9 @@ world_under(r: *pose.Rig, p: ptr, w: ptr, list: int[], from: int, n: int) {
 planned_free(pl: *Planned) {
     if pl == null { return }
     pose.release(pl.snap)
+    pose.release(pl.from)
+    free(pl.free_path)
+    free(pl.free_on)
     pose.release(pl.clip)
     pose.release(pl.clip_w)
     pose.release(pl.worlds)
@@ -1681,6 +1697,358 @@ smoothest(x: float) -> float {
     return u * u * u * (u * (u * 6.0 - 15.0) + 10.0)
 }
 
+// --- a hand drawn out of the rise's way (#1001) -------------------------------------------------------
+
+// Metres a joint the hand-over's own plan, played back (plan_left), may
+// still leave under the floor; past it, the arm it is on is drawn out
+// first (plan_free). The plan leaves 0.95 cm at the most over
+// test_knockdowns' 100 knockdowns and 0.92 over its 300 landings.
+const PLAN_LEFT = 0.015
+// Or turns an arm's joint more than PLAN_FAST times as fast as the take's
+// own arms turn: lifted off the floor in a hurry, test_balance's seed 55
+// struck a step later turned a forearm at 168 rad/s against LayToIdle's
+// own 26.5, its plan leaving nothing under the floor.
+const PLAN_FAST = 2.0
+// The way out: over FREE_SECONDS, sampled at FREE_SAMPLES moments, to the
+// ground beside the chest, TRAP_OUT out from the line from the pelvis to
+// the neck on the shoulder's side, FREE_ALONG of the way up it (or where it
+// lay, for a hand trapped under the trunk: within TRAP_WIDE of the line and
+// under the trunk by TRAP_UNDER), FREE_UP over the ground, carried FREE_ARC
+// higher at its middle. As a person brings a hand under the shoulder to
+// push up. Planned as drawn (the hand-over's per-joint turn), an arm the
+// reach left overhead swung down through the floor as the trunk turned
+// over, a finger 25.8 cm under it (test_balance with the reach, seed 26);
+// lifted off it by the plan's own lifts (plan_check eight times, not two),
+// the forearm turned at 159 rad/s against LayToIdle's own 26.5.
+const FREE_SECONDS = 0.5
+const FREE_SAMPLES = 16
+const TRAP_OUT = 0.35
+const FREE_ALONG = 0.8
+const TRAP_WIDE = 0.15
+const TRAP_UNDER = 0.03
+const FREE_UP = 0.05
+const FREE_ARC = 0.15
+const FREE_TRIES = 3
+
+// No hand drawn out: the hand-over turns from the pose lying. A get-up cut
+// off while its take was held (hold_take) lets it go.
+unplan_free(pl: *Planned, r: *pose.Rig, a: *Animator) {
+    let_take_go(pl, a)
+    pose.copy(r, pl.snap, pl.from)
+    pl.free = 0.0
+    (pl.free_on as int[])[0] = 0
+    (pl.free_on as int[])[1] = 0
+}
+
+// The hand-over into take `t` as plan_lift planned it, played back at each
+// of its moments: how deep the deepest joint of its four limbs goes under
+// the floor, and which limb (plan_step's order: the left arm, the right,
+// the left leg, the right); and the arm whose joints it turns faster than
+// the take's own arms turn (both read at PLAN_RATE), -1 for none.
+plan_left(pl: *Planned, r: *pose.Rig, t: *Take) -> (float, int, int) {
+    scratch = pose.new(r)
+    before = pose.new(r)
+    deepest = 0.0
+    which = 0 - 1
+    count = pose.count(r)
+    list = pl.limb_list as int[]
+    own = arms_fastest(pl, r, t, scratch, before)
+    fast = 0 - 1
+    fastest = own * PLAN_FAST
+    i = 0
+    while i < pl.lift_n {
+        planned_trunk(pl, r, t, i, scratch, (pl.lift as float[])[i])
+        pl.last_t = (i as float) / PLAN_RATE
+        pose.world(r, scratch, pl.worlds)
+        k = 0
+        while k < 4 {
+            plan_limb(pl, r, scratch, k, false)
+            k = k + 1
+        }
+        k = 0
+        while k < 4 {
+            n = 0
+            while n < (pl.limb_n as int[])[k] {
+                j = list[k * count + n]
+                g = ikrig.to_ground(r, pose.translation(pl.worlds, j))
+                d = ground_under(pl, g, false) + GROUND_CLEAR - g.y
+                if d > deepest {
+                    deepest = d
+                    which = k
+                }
+                if k < 2 && i > 0 {
+                    x = turned(pose.rotation(scratch, j), pose.rotation(before, j)) * PLAN_RATE
+                    if x > fastest {
+                        fastest = x
+                        fast = k
+                    }
+                }
+                n = n + 1
+            }
+            k = k + 1
+        }
+        pose.copy(r, scratch, before)
+        i = i + 1
+    }
+    pl.fresh = true
+    pose.release(scratch)
+    pose.release(before)
+    return deepest, which, fast
+}
+
+// The fastest the take's arms turn over the hand-over's moments, read at
+// PLAN_RATE (`p` and `q` poses to work in).
+arms_fastest(pl: *Planned, r: *pose.Rig, t: *Take, p: ptr, q: ptr) -> float {
+    count = pose.count(r)
+    list = pl.limb_list as int[]
+    most = 0.0
+    i = 0
+    while i < pl.lift_n {
+        clips.sample(t, r, (i as float) / PLAN_RATE, false, p)
+        if i > 0 {
+            k = 0
+            while k < 2 {
+                n = 0
+                while n < (pl.limb_n as int[])[k] {
+                    j = list[k * count + n]
+                    x = turned(pose.rotation(p, j), pose.rotation(q, j)) * PLAN_RATE
+                    if x > most { most = x }
+                    n = n + 1
+                }
+                k = k + 1
+            }
+        }
+        pose.copy(r, p, q)
+        i = i + 1
+    }
+    return most
+}
+
+// The angle between two turns.
+turned(a: Quat, b: Quat) -> float {
+    d = core.abs_of(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w)
+    if d > 1.0 { d = 1.0 }
+    return 2.0 * core.acos_of(d)
+}
+
+// Whether a hand is drawn out before the hand-over (#1001): where the
+// hand-over's own plan still leaves an arm's joint PLAN_LEFT under the
+// floor, that arm carried out to the ground beside the chest (or out from
+// under the trunk) over FREE_SECONDS, its take held at its start meanwhile
+// (hold_take); the hand-over then turns from there (pl.from), its lifts to
+// be planned again. The way is solved at each of FREE_SAMPLES moments from
+// the moment before (ikrig.limb_solve), so the elbow keeps the side it
+// bends to all the way: solved each frame from the pose lying, it flipped
+// mid-way, a forearm at 188 rad/s. Eased off the pose lying, as the solve
+// bends an arm lying straight; the hand keeps the turn it lay with.
+plan_free(pl: *Planned, r: *pose.Rig, t: *Take) -> bool {
+    left, k, fast = plan_left(pl, r, t)
+    if core.env_int("AE3D_FREE_TRACE", 0) == 1 { println("    plan left ${left} m on limb ${k}, an arm past the take's own ${fast}") }
+    side = 0 - 1
+    if left > core.env_float("AE3D_PLAN_LEFT", PLAN_LEFT) && k >= 0 && k <= 1 { side = k }
+    if side < 0 && core.env_int("AE3D_FREE_FAST", 1) == 1 { side = fast }
+    if side < 0 || (pl.free_on as int[])[side] == 1 { return false }
+    pelvis = pose.human(r, pose.PELVIS)
+    neck = pose.human(r, pose.NECK)
+    upper = pose.human(r, limb_slot(side, 0))
+    middle = pose.human(r, limb_slot(side, 1))
+    hand = pose.human(r, limb_slot(side, 2))
+    l = ikrig.arm_limb(r, side)
+    if pelvis < 0 || neck < 0 || upper < 0 || middle < 0 || hand < 0 || l == null {
+        ikrig.limb_free(l)
+        return false
+    }
+    work = pose.new(r)
+    w = pose.new(r)
+    pose.copy(r, pl.snap, work)
+    pose.world(r, work, w)
+    p = ikrig.to_ground(r, pose.translation(w, pelvis))
+    n = ikrig.to_ground(r, pose.translation(w, neck))
+    h = ikrig.to_ground(r, pose.translation(w, hand))
+    s = ikrig.to_ground(r, pose.translation(w, upper))
+    u, along = level_along(p, n, h)
+    trapped = core.v3_len(flat_of(core.v3_sub(h, along))) < TRAP_WIDE && h.y < p.y + (n.y - p.y) * u - TRAP_UNDER
+    anchor = core.v3_lerp(p, n, FREE_ALONG)
+    if trapped { anchor = along }
+    _us, s_on = level_along(p, n, s)
+    out = flat_of(core.v3_sub(s, s_on))
+    if core.v3_len(out) < 0.02 { out = flat_of(core.v3_sub(h, along)) }
+    if core.v3_len(out) < 0.001 { out = core.v3_cross(core.vec3(0.0, 1.0, 0.0), flat_of(core.v3_sub(n, p))) }
+    if core.v3_len(out) < 0.001 {
+        ikrig.limb_free(l)
+        pose.release(work)
+        pose.release(w)
+        return false
+    }
+    goal = core.v3_add(flat_of(anchor), core.v3_mul(core.v3_normalize(out), TRAP_OUT))
+    goal = core.vec3(goal.x, ground_under(pl, goal, false) + FREE_UP, goal.z)
+    turn = pose.rotation(w, hand)
+    joints = [upper, middle, hand]
+    drawn = pose.new(r)
+    dw = pose.new(r)
+    // The way's arc raised, the whole way at once, by as much as its hand
+    // or fingers still go under the floor as drawn: raised sample by sample
+    // and solved again there, the way jumped between its moments and a
+    // forearm turned at 61 rad/s (seed 55 struck a step later).
+    arc = FREE_ARC
+    deepest = free_way(pl, r, l, work, w, drawn, dw, side, joints, h, goal, turn, arc)
+    tries = 0
+    while deepest > 0.0 && tries < FREE_TRIES {
+        arc = arc + deepest + CHECK_SPARE
+        deepest = free_way(pl, r, l, work, w, drawn, dw, side, joints, h, goal, turn, arc)
+        tries = tries + 1
+    }
+    ikrig.limb_free(l)
+    pose.release(work)
+    pose.release(w)
+    pose.release(drawn)
+    pose.release(dw)
+    (pl.free_on as int[])[side] = 1
+    pl.free = FREE_SECONDS
+    pose.copy(r, pl.snap, pl.from)
+    free_arm_at(pl, r, pl.from, 1.0)
+    return true
+}
+
+// Arm `side`'s way out (plan_free) from hand place `h` to `goal` (over the
+// ground), carried `arc` metres higher at its middle, into pl.free_path:
+// solved at each of FREE_SAMPLES moments from the moment before (`work`
+// from the pose lying, `w` its rig-space pose), the hand turned `turn`,
+// eased off the pose lying. How far its hand or fingers go under the floor
+// as drawn, at the deepest.
+free_way(pl: *Planned, r: *pose.Rig, l: *Limb, work: ptr, w: ptr, drawn: ptr, dw: ptr, side: int, joints: int[], h: Vec3, goal: Vec3, turn: Quat, arc: float) -> float {
+    pose.copy(r, pl.snap, work)
+    pose.world(r, work, w)
+    path = pl.free_path as float[]
+    deepest = 0.0
+    i = 0
+    while i < FREE_SAMPLES {
+        v = smoothest((i as float) / ((FREE_SAMPLES - 1) as float))
+        g = core.v3_lerp(h, goal, v)
+        g = core.vec3(g.x, g.y + arc * 4.0 * v * (1.0 - v), g.z)
+        _reached = ikrig.limb_solve(l, r, work, w, from_ground(r, g), turn)
+        pose.world(r, work, w)
+        under = free_drawn(pl, r, work, drawn, dw, side, joints, v)
+        if under > deepest { deepest = under }
+        j = 0
+        while j < 3 {
+            q = pose.rotation(drawn, joints[j])
+            at = (side * FREE_SAMPLES + i) * 12 + j * 4
+            path[at] = q.x
+            path[at + 1] = q.y
+            path[at + 2] = q.z
+            path[at + 3] = q.w
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return deepest
+}
+
+// The arm as drawn at a moment of its way out, into `drawn` (the pose lying
+// with it): its three joints eased `v` of the way from the pose lying to
+// the solve's (`work`). How far its hand or fingers are under the ground
+// there (`dw` a pose to work in).
+free_drawn(pl: *Planned, r: *pose.Rig, work: ptr, drawn: ptr, dw: ptr, side: int, joints: int[], v: float) -> float {
+    pose.copy(r, pl.snap, drawn)
+    j = 0
+    while j < 3 {
+        lay = pose.rotation(pl.snap, joints[j])
+        pose.set_rotation(drawn, joints[j], slerp_as_is(lay, kept_way(lay, pose.rotation(work, joints[j]), lay, true), v))
+        j = j + 1
+    }
+    pose.world(r, drawn, dw)
+    return hand_under(pl, r, dw, side)
+}
+
+// How far the deepest of arm `side`'s hand and what it carries is under the
+// ground in the rig-space pose `w`; 0 when none is.
+hand_under(pl: *Planned, r: *pose.Rig, w: ptr, side: int) -> float {
+    list = pl.end_list as int[]
+    from = side * pose.count(r)
+    deepest = 0.0
+    i = 0
+    while i < (pl.end_n as int[])[side] {
+        g = ikrig.to_ground(r, pose.translation(w, list[from + i]))
+        d = ground_under(pl, g, false) + GROUND_CLEAR - g.y
+        if d > deepest { deepest = d }
+        i = i + 1
+    }
+    return deepest
+}
+
+// Pose `out` with each arm drawn out (plan_free) `s` of its way: its three
+// joints' turns read between the way's moments.
+free_arm_at(pl: *Planned, r: *pose.Rig, out: ptr, s: float) {
+    x = core.clampf(s, 0.0, 1.0) * ((FREE_SAMPLES - 1) as float)
+    i = x as int
+    if i >= FREE_SAMPLES - 1 { i = FREE_SAMPLES - 2 }
+    f = x - (i as float)
+    path = pl.free_path as float[]
+    side = 0
+    while side < 2 {
+        if (pl.free_on as int[])[side] == 1 {
+            j = 0
+            while j < 3 {
+                joint = pose.human(r, limb_slot(side, j))
+                a_at = (side * FREE_SAMPLES + i) * 12 + j * 4
+                b_at = a_at + 12
+                qa = core.quat(path[a_at], path[a_at + 1], path[a_at + 2], path[a_at + 3])
+                qb = core.quat(path[b_at], path[b_at + 1], path[b_at + 2], path[b_at + 3])
+                if joint >= 0 { pose.set_rotation(out, joint, slerp_as_is(qa, kept_way(qa, qb, qa, true), f)) }
+                j = j + 1
+            }
+        }
+        side = side + 1
+    }
+}
+
+// The point of the line from `a` to `b`, over the ground, nearest `p`: how
+// far along it (0 to 1), and the point (its height the line's there).
+level_along(a: Vec3, b: Vec3, p: Vec3) -> (float, Vec3) {
+    ab = flat_of(core.v3_sub(b, a))
+    len2 = core.v3_dot(ab, ab)
+    if len2 < 0.000001 { return 0.0, a }
+    u = core.clampf(core.v3_dot(flat_of(core.v3_sub(p, a)), ab) / len2, 0.0, 1.0)
+    return u, core.v3_lerp(a, b, u)
+}
+
+// A point over the ground in the rig's space: ikrig.to_ground undone.
+from_ground(r: *pose.Rig, g: Vec3) -> Vec3 {
+    zero = ikrig.to_ground(r, core.vec3(0.0, 0.0, 0.0))
+    x = ikrig.dir_to_ground(r, core.vec3(1.0, 0.0, 0.0))
+    y = ikrig.dir_to_ground(r, core.vec3(0.0, 1.0, 0.0))
+    z = ikrig.dir_to_ground(r, core.vec3(0.0, 0.0, 1.0))
+    d = core.v3_sub(g, zero)
+    return core.vec3(core.v3_dot(d, x) / core.v3_dot(x, x), core.v3_dot(d, y) / core.v3_dot(y, y), core.v3_dot(d, z) / core.v3_dot(z, z))
+}
+
+// The get-up's take held at its start while a hand is drawn out (plan_free,
+// `t` seconds into the change, under pl.free), and let go on at its own rate
+// after: the hand-over begins from the take's first frame, as planned. Let
+// play through it, the take went on half a second, its root and pelvis with
+// it, and the hand-over began off where it was planned from: the pelvis
+// drawn at 3.8 m/s against LayToIdle's own 1.2.
+hold_take(pl: *Planned, a: *Animator, t: float) {
+    if t <= 0.0 || pl.free <= 0.0 || animator.current(a) != pl.state { return }
+    if t < pl.free {
+        if !pl.held {
+            pl.held_rate = animator.rate(a, pl.state)
+            animator.set_rate(a, pl.state, 0.0)
+            animator.set_time(a, pl.state, 0.0)
+            pl.held = true
+        }
+    } else {
+        let_take_go(pl, a)
+    }
+}
+
+let_take_go(pl: *Planned, a: *Animator) {
+    if !pl.held { return }
+    animator.set_rate(a, pl.state, pl.held_rate)
+    pl.held = false
+}
+
 // A get-up's hand-over (animator.play_shaped), `t` seconds in: the take's
 // pose `out` made the pose planned from the one the body lay in. Eased out
 // of the pose lying, joint by joint, the animator swept a body's limbs
@@ -1700,6 +2068,7 @@ smoothest(x: float) -> float {
 plan_step(st: ptr, a: *Animator, out: ptr, t: float) {
     pl = st as *Planned
     began = os.now_monotonic_ns()
+    hold_take(pl, a, t)
     plan_frame(pl, animator.rig(a), out, t)
     pl.step_s = pl.step_s + ((os.now_monotonic_ns() - began) as float) * 0.000000001
     pl.steps = pl.steps + 1
@@ -1716,14 +2085,28 @@ get_up_cost(c: *Character) -> (float, float) {
     return pl.plan_s, per
 }
 
-// plan_step's frame: `out` (the take's pose `t` seconds in) made the pose
-// planned.
-plan_frame(pl: *Planned, r: *pose.Rig, out: ptr, t: float) {
+// plan_step's frame: `out` (the take's pose `t_in` seconds in) made the pose
+// planned. A hand drawn out first (plan_free): for its seconds, the pose it
+// lay in with the arm on its way out, on the hand-over's first lifts.
+plan_frame(pl: *Planned, r: *pose.Rig, out: ptr, t_in: float) {
+    if t_in < pl.free {
+        pose.copy(r, pl.snap, out)
+        free_arm_at(pl, r, out, t_in / pl.free)
+        pl.last_t = 0.0
+        pose.world(r, out, pl.worlds)
+        k = 0
+        while k < 4 {
+            plan_limb(pl, r, out, k, false)
+            k = k + 1
+        }
+        return
+    }
+    t = t_in - pl.free
     u = smoothest(t / pl.turn)
     pl.last_t = t
     pose.copy(r, out, pl.clip)
     pose.world(r, pl.clip, pl.clip_w)
-    blend_locals(pl, r, pl.snap, pl.clip, u, out)
+    blend_locals(pl, r, pl.from, pl.clip, u, out)
     plan_drop(pl, r, out, smoothest(t / pl.drop), lift_at(pl, t))
     pose.world(r, out, pl.worlds)
     k = 0
@@ -1745,16 +2128,23 @@ plan_frame(pl: *Planned, r: *pose.Rig, out: ptr, t: float) {
 // 0.6 turned the forearm against the upper arm at 35 rad/s over the 0.4 s
 // turn, the turn alone at 13.8 (test_knockdowns' seed 40 struck 1.3 times
 // as hard, its side turned 0.5 rad), against LayToIdle's own 26.5.
-const TURN_TRIES = 3
+const TURN_TRIES = 5
 
 plan_turn(pl: *Planned, r: *pose.Rig, o: *GameObject, t: *Take, drawn: ptr, first: ptr, w: ptr, blend: float) {
     tries = 0
-    slower = plan_slower(pl, r, t)
-    while slower > 1.0 && tries < TURN_TRIES && pl.turn < EASE_MOST {
-        pl.turn = core.clampf(pl.turn * slower * TURN_MORE, blend, EASE_MOST)
-        pl.drop = get_up_blend(r, o, t, drawn, first, w, pl.turn)
-        plan_lift(pl, r, t)
-        slower = plan_slower(pl, r, t)
+    slower, raised = plan_slower(pl, r, t)
+    while (slower > 1.0 || raised) && tries < TURN_TRIES {
+        if slower > 1.0 && pl.turn < EASE_MOST {
+            pl.turn = core.clampf(pl.turn * slower * TURN_MORE, blend, EASE_MOST)
+            pl.drop = get_up_blend(r, o, t, drawn, first, w, pl.turn)
+            plan_lift(pl, r, t)
+        } else if raised {
+            lifts_eased(pl, pl.lift_n)
+        } else {
+            return
+        }
+        slower, raised = plan_slower(pl, r, t)
+        if core.env_int("AE3D_FREE_TRACE", 0) == 1 { println("    plan try ${tries}: slower ${slower}, raised ${raised}, turn ${pl.turn}, drop ${pl.drop}, free ${pl.free}") }
         tries = tries + 1
     }
 }
@@ -1768,10 +2158,15 @@ const TURN_MORE = 1.05
 // and the lifts): its fastest joint turn over the take's own fastest (both
 // in radians a second, each joint against its parent, as metrics reads a
 // pop). Over 1, the hand-over turns some joint faster than the take ever
-// does.
-plan_slower(pl: *Planned, r: *pose.Rig, t: *Take) -> float {
+// does. And whether a limb still went under the floor at one of those
+// frames, its lifts' needs there raised as plan_check raises them
+// (check_limb), at the plan's moment nearest: plan_check plays the plan at
+// its own 30 moments a second, on its trunks before the turn is lengthened
+// and a hand drawn out, and over the 600 knockdowns of test_knockdowns with
+// limp bodies untoned (#1002) a hand drawn so went up to 11 cm under it.
+plan_slower(pl: *Planned, r: *pose.Rig, t: *Take) -> (float, bool) {
     own = take_turn_fastest(r, t, pl.clip, pl.clip_w)
-    if own <= 0.0 { return 1.0 }
+    if own <= 0.0 { return 1.0, false }
     out = pose.new(r)
     was = pose.new(r)
     // From its first moment as planned, as get_up draws it before the
@@ -1780,21 +2175,33 @@ plan_slower(pl: *Planned, r: *pose.Rig, t: *Take) -> float {
     clips.sample(t, r, 0.0, false, was)
     plan_frame(pl, r, was, 0.0)
     most = 0.0
-    n = (pl.drop * 60.0) as int + 1
+    raised = false
+    n = ((pl.free + pl.drop) * 60.0) as int + 1
     f = 1
     while f <= n {
         at = (f as float) / 60.0
-        clips.sample(t, r, at, false, out)
+        // The take held at its start while a hand is drawn out (hold_take).
+        clips.sample(t, r, core.clampf(at - pl.free, 0.0, 1000.0), false, out)
         plan_frame(pl, r, out, at)
         x = joints_turned(r, was, out) * 60.0
         if x > most { most = x }
+        // The limbs as drawn this frame against the floor.
+        moment = ((pl.last_t * PLAN_RATE + 0.5) as int)
+        if moment < pl.lift_n - 1 {
+            pose.world(r, out, pl.worlds)
+            k = 0
+            while k < 4 {
+                if check_limb(pl, r, pl.worlds, k, pl.last_t, moment) { raised = true }
+                k = k + 1
+            }
+        }
         pose.copy(r, out, was)
         f = f + 1
     }
     pl.fresh = true
     pose.release(out)
     pose.release(was)
-    return most / own
+    return most / own, raised
 }
 
 // The most any joint of local pose `p` is turned off `q`'s, radians.
@@ -2116,7 +2523,7 @@ planned_trunk(pl: *Planned, r: *pose.Rig, t: *Take, i: int, out: ptr, lift: floa
     pl.fresh = i == 0
     clips.sample(t, r, at, false, pl.clip)
     pose.world(r, pl.clip, pl.clip_w)
-    blend_locals(pl, r, pl.snap, pl.clip, smoothest(at / pl.turn), out)
+    blend_locals(pl, r, pl.from, pl.clip, smoothest(at / pl.turn), out)
     pl.fresh = false
     plan_drop(pl, r, out, smoothest(at / pl.drop), lift)
 }
