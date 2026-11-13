@@ -1,0 +1,601 @@
+// ae3d.vkmorph -- morph targets on the Vulkan backend (#910).
+//
+// A mesh with morph targets is morphed on the device each frame one of its
+// weights is not zero, before any pass reads it: a compute pass
+// (morph_vk.comp, shaders.COMPUTE_MORPH) writes its bind pose plus every
+// active target's weighted offsets into the mesh's own vertex buffer, and
+// every draw of it -- the scene, its depth, its shadows, the pick, and the
+// rays' skinning of a skinned figure (vkrays.skin_pose) -- then reads that
+// buffer as it reads any mesh's. A skinned mesh is skinned after, by the
+// same vertex shader as ever, so morph and skin compose in glTF's order.
+// This is the shape UE5's GPU morph and Unity's GPU blend shapes take: the
+// offsets of every target resident on the device, a list of the active
+// ones and their weights written each frame, one pass over the vertices
+// before the skinning, the inactive targets never read.
+//
+// What a morphed mesh keeps here, made the first time it morphs: a copy of
+// its bind-pose vertices (the pass's source; its vertex buffer is the
+// pass's target), its offsets (two vec4s a vertex a target, ae3d.morph's
+// layout), and a mapped active list a frame in flight. A frame whose
+// weights are all zero dispatches nothing, and the first such frame after
+// a morphed one copies the bind pose back. The mesh's vkmesh handle is its
+// key; vkmesh lets go of its record with the mesh (forget).
+import contrib.vulkan.vk
+import ae3d.vkhost
+import ae3d.vkhost (HostBuffer)
+import ae3d.vkdevice
+import ae3d.vkspirv
+import ae3d.geometry
+import ae3d.morph
+
+exports (
+    morph, finish, reshaped, forget, stop, read_buffer, time_dispatch, morphed, slots_used
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memset(p: ptr, value: int, n: long) -> ptr
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+
+const FRAMES = 2
+const MAX_MORPHED = 256
+const GROUP = 64
+const PARAMS_BYTES = 8
+const VERTEX_BYTES = 36
+const BINDINGS = 4
+
+// A morphed mesh's record: its vkmesh handle and sizes, the offsets'
+// stamp it uploaded (ae3d.morph.stamp), its bind pose and offsets on the
+// device, its active list and set a frame in flight, and whether its
+// vertex buffer holds a morphed pose now.
+struct MorphGpu {
+    in_use: bool
+    mesh: int
+    vertex_count: int
+    targets: int
+    stamp: int
+    target_buffer: ptr             // the mesh's vertex buffer, borrowed (vkmesh's)
+    base: ptr
+    base_memory: ptr
+    deltas: ptr
+    deltas_memory: ptr
+    actives: ptr                   // *HostBuffer[FRAMES]
+    sets: ptr                      // VkDescriptorSet[FRAMES]
+    live: bool
+    touched: int                   // the frame (g_serial) its vertices last changed in
+}
+
+var g_slots: ptr = null            // MorphGpu[MAX_MORPHED]
+var g_set_layout: ptr = null
+var g_pool: ptr = null
+var g_layout: ptr = null
+var g_pipeline: ptr = null
+var g_failed = false
+var g_started = false              // this frame's first morph recorded (its barrier before)
+var g_serial = 0                   // frames finished
+var g_dispatched = 0               // meshes morphed this frame
+var g_vertices = 0                 // and the vertices they had
+var g_query_pool: ptr = null       // two timestamps, for time_dispatch
+var g_targets: ptr = null          // int[g_room]: the active list being made
+var g_weights: ptr = null          // f32[g_room]
+var g_room = 0
+
+slot_at(index: int) -> *MorphGpu { return (g_slots + index * sizeof(MorphGpu)) as *MorphGpu }
+
+cell_of() -> ptr { return calloc(1, 8) }
+taken_from(c: ptr) -> ptr {
+    h = (c as ptr[])[0]
+    free(c)
+    return h
+}
+
+// The pass's objects, made the first time a mesh morphs: four storage
+// buffers (the bind pose, the offsets, the active list, the vertex buffer
+// written), a pool their sets go back to, the push constants (the vertex
+// and active counts) and the pipeline. False, with the reason in the
+// backend's last error, when one would not make; a mesh then draws as
+// uploaded.
+pipeline() -> bool {
+    if g_pipeline != null { return true }
+    if g_failed { return false }
+    d = vkdevice.device()
+    if g_slots == null { g_slots = calloc(MAX_MORPHED, sizeof(MorphGpu)) }
+    bindings = calloc(BINDINGS, sizeof(VkDescriptorSetLayoutBinding))
+    i = 0
+    while i < BINDINGS {
+        b = (bindings + i * sizeof(VkDescriptorSetLayoutBinding)) as *VkDescriptorSetLayoutBinding
+        b.binding = i
+        b.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+        b.descriptorCount = 1
+        b.stageFlags = vk.SHADER_STAGE_COMPUTE_BIT
+        i = i + 1
+    }
+    layout = calloc(1, sizeof(VkDescriptorSetLayoutCreateInfo)) as *VkDescriptorSetLayoutCreateInfo
+    layout.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    layout.bindingCount = BINDINGS
+    layout.pBindings = bindings
+    out = cell_of()
+    r = vk.vkCreateDescriptorSetLayout(d, layout as ptr, null, out)
+    g_set_layout = taken_from(out)
+    free(layout as ptr)
+    free(bindings)
+    if r != vk.SUCCESS {
+        g_set_layout = null
+        return refuse("morph vkCreateDescriptorSetLayout failed")
+    }
+    size = calloc(1, sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
+    size.type = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+    size.descriptorCount = BINDINGS * MAX_MORPHED * FRAMES
+    pool = calloc(1, sizeof(VkDescriptorPoolCreateInfo)) as *VkDescriptorPoolCreateInfo
+    pool.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+    pool.flags = vk.DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+    pool.maxSets = MAX_MORPHED * FRAMES
+    pool.poolSizeCount = 1
+    pool.pPoolSizes = size as ptr
+    out = cell_of()
+    r = vk.vkCreateDescriptorPool(d, pool as ptr, null, out)
+    g_pool = taken_from(out)
+    free(pool as ptr)
+    free(size as ptr)
+    if r != vk.SUCCESS {
+        g_pool = null
+        return refuse("morph vkCreateDescriptorPool failed")
+    }
+    range = calloc(1, sizeof(VkPushConstantRange)) as *VkPushConstantRange
+    range.stageFlags = vk.SHADER_STAGE_COMPUTE_BIT
+    range.size = PARAMS_BYTES
+    layouts = cell_of()
+    (layouts as ptr[])[0] = g_set_layout
+    info = calloc(1, sizeof(VkPipelineLayoutCreateInfo)) as *VkPipelineLayoutCreateInfo
+    info.sType = vk.STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+    info.setLayoutCount = 1
+    info.pSetLayouts = layouts
+    info.pushConstantRangeCount = 1
+    info.pPushConstantRanges = range as ptr
+    out = cell_of()
+    r = vk.vkCreatePipelineLayout(d, info as ptr, null, out)
+    g_layout = taken_from(out)
+    free(info as ptr)
+    free(layouts)
+    free(range as ptr)
+    if r != vk.SUCCESS {
+        g_layout = null
+        return refuse("morph vkCreatePipelineLayout failed")
+    }
+    code = vkspirv.code(vkspirv.MORPH_COMP)
+    module_info = calloc(1, sizeof(VkShaderModuleCreateInfo)) as *VkShaderModuleCreateInfo
+    module_info.sType = vk.STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+    module_info.codeSize = vkspirv.bytes(vkspirv.MORPH_COMP)
+    module_info.pCode = code
+    out = cell_of()
+    r = vk.vkCreateShaderModule(d, module_info as ptr, null, out)
+    shader = taken_from(out)
+    free(module_info as ptr)
+    free(code)
+    if r != vk.SUCCESS { return refuse("morph vkCreateShaderModule failed") }
+    compute = calloc(1, sizeof(VkComputePipelineCreateInfo)) as *VkComputePipelineCreateInfo
+    compute.sType = vk.STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+    compute.stage.sType = vk.STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+    compute.stage.stage = vk.SHADER_STAGE_COMPUTE_BIT
+    compute.stage.module = shader
+    compute.stage.pName = "main"
+    compute.layout = g_layout
+    out = cell_of()
+    r = vk.vkCreateComputePipelines(d, null, 1, compute as ptr, null, out)
+    g_pipeline = taken_from(out)
+    free(compute as ptr)
+    vk.vkDestroyShaderModule(d, shader, null)
+    if r != vk.SUCCESS {
+        g_pipeline = null
+        return refuse("morph vkCreateComputePipelines failed")
+    }
+    return true
+}
+
+refuse(reason: string) -> bool {
+    vkdevice.fail(reason)
+    g_failed = true
+    return false
+}
+
+find(mesh: int) -> int {
+    if g_slots == null { return 0 - 1 }
+    i = 0
+    while i < MAX_MORPHED {
+        s = slot_at(i)
+        if s.in_use && s.mesh == mesh { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// A mesh's record made: its bind pose and offsets uploaded (one-off copies,
+// waited on: a mesh's first morph, not every frame's), its active lists
+// mapped, its sets written. Its index, or -1.
+record_new(mesh: int, mesh_data: ptr, set: *MorphSet, vertex_buffer: @keep ptr) -> int {
+    index = 0 - 1
+    i = 0
+    while i < MAX_MORPHED && index < 0 {
+        if !slot_at(i).in_use { index = i }
+        i = i + 1
+    }
+    if index < 0 { return 0 - 1 }
+    s = slot_at(index)
+    memset(s as ptr, 0, sizeof(MorphGpu) as long)
+    s.in_use = true
+    s.mesh = mesh
+    s.vertex_count = morph.vertex_count(set)
+    s.targets = morph.count(set)
+    s.stamp = morph.stamp(set)
+    s.target_buffer = vertex_buffer
+    s.actives = calloc(FRAMES, 8)
+    s.sets = calloc(FRAMES, 8)
+    usage = vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_TRANSFER_SRC_BIT
+    base = vkhost.upload(geometry.mesh_vertex_data(mesh_data), s.vertex_count * VERTEX_BYTES, usage)
+    s.base = base.buffer
+    s.base_memory = base.memory
+    deltas = vkhost.upload(morph.data(set), morph.data_bytes(set), vk.BUFFER_USAGE_STORAGE_BUFFER_BIT)
+    s.deltas = deltas.buffer
+    s.deltas_memory = deltas.memory
+    if s.base == null || s.deltas == null {
+        release(index)
+        return 0 - 1
+    }
+    f = 0
+    while f < FRAMES {
+        list_buffer = vkhost.mapped_buffer((s.targets + 1) * 8, vk.BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        (s.actives as ptr[])[f] = list_buffer as ptr
+        if list_buffer == null {
+            release(index)
+            return 0 - 1
+        }
+        f = f + 1
+    }
+    layouts = calloc(FRAMES, 8)
+    f = 0
+    while f < FRAMES {
+        (layouts as ptr[])[f] = g_set_layout
+        f = f + 1
+    }
+    alloc = calloc(1, sizeof(VkDescriptorSetAllocateInfo)) as *VkDescriptorSetAllocateInfo
+    alloc.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+    alloc.descriptorPool = g_pool
+    alloc.descriptorSetCount = FRAMES
+    alloc.pSetLayouts = layouts
+    r = vk.vkAllocateDescriptorSets(vkdevice.device(), alloc as ptr, s.sets)
+    free(alloc as ptr)
+    free(layouts)
+    if r != vk.SUCCESS {
+        memset(s.sets, 0, (FRAMES * 8) as long)
+        vkdevice.fail("morph vkAllocateDescriptorSets failed")
+        release(index)
+        return 0 - 1
+    }
+    write_sets(s)
+    return index
+}
+
+write_sets(s: *MorphGpu) {
+    buffers = calloc(BINDINGS, sizeof(VkDescriptorBufferInfo))
+    writes = calloc(BINDINGS, sizeof(VkWriteDescriptorSet))
+    f = 0
+    while f < FRAMES {
+        b = 0
+        while b < BINDINGS {
+            buffer_info = (buffers + b * sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+            if b == 0 { buffer_info.buffer = s.base }
+            if b == 1 { buffer_info.buffer = s.deltas }
+            if b == 2 { buffer_info.buffer = ((s.actives as ptr[])[f] as *HostBuffer).buffer }
+            if b == 3 { buffer_info.buffer = s.target_buffer }
+            buffer_info.offset = 0
+            buffer_info.range = vk.WHOLE_SIZE
+            w = (writes + b * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+            w.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+            w.dstSet = (s.sets as ptr[])[f]
+            w.dstBinding = b
+            w.descriptorCount = 1
+            w.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+            w.pBufferInfo = buffer_info as ptr
+            b = b + 1
+        }
+        vk.vkUpdateDescriptorSets(vkdevice.device(), BINDINGS, writes, 0, null)
+        f = f + 1
+    }
+    free(writes)
+    free(buffers)
+}
+
+// A record let go of, the device no longer reading it (the caller waited).
+release(index: int) {
+    s = slot_at(index)
+    d = vkdevice.device()
+    if d != null {
+        if s.sets != null && (s.sets as ptr[])[0] != null && g_pool != null {
+            vk.vkFreeDescriptorSets(d, g_pool, FRAMES, s.sets)
+        }
+        vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: s.base, memory: s.base_memory })
+        vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: s.deltas, memory: s.deltas_memory })
+    }
+    if s.actives != null {
+        f = 0
+        while f < FRAMES {
+            vkhost.host_buffer_free((s.actives as ptr[])[f] as *HostBuffer)
+            f = f + 1
+        }
+        free(s.actives)
+    }
+    if s.sets != null { free(s.sets) }
+    memset(s as ptr, 0, sizeof(MorphGpu) as long)
+}
+
+// Room for an active list of `targets`.
+room(targets: int) {
+    if targets <= g_room { return }
+    if g_targets != null { free(g_targets) }
+    if g_weights != null { free(g_weights) }
+    g_room = targets
+    g_targets = calloc(targets + 1, 4)
+    g_weights = calloc(targets + 1, 4)
+}
+
+// A barrier over everything, recorded into `commands`.
+barrier(commands: ptr, src_access: int, dst_access: int, src_stage: int, dst_stage: int) {
+    b = calloc(1, sizeof(VkMemoryBarrier)) as *VkMemoryBarrier
+    b.sType = vk.STRUCTURE_TYPE_MEMORY_BARRIER
+    b.srcAccessMask = src_access
+    b.dstAccessMask = dst_access
+    vk.vkCmdPipelineBarrier(commands, src_stage, dst_stage, 0, 1, b as ptr, 0, null, 0, null)
+    free(b as ptr)
+}
+
+// What the last frame read of a vertex buffer -- its draws, the rays'
+// skinning of it, a copy -- finished before this frame's morph writes it.
+// Recorded once, before the frame's first morph.
+before_first(commands: ptr) {
+    if g_started { return }
+    barrier(commands,
+            vk.ACCESS_VERTEX_ATTRIBUTE_READ_BIT | vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_TRANSFER_READ_BIT,
+            vk.ACCESS_SHADER_WRITE_BIT | vk.ACCESS_TRANSFER_WRITE_BIT,
+            vk.PIPELINE_STAGE_VERTEX_INPUT_BIT | vk.PIPELINE_STAGE_VERTEX_SHADER_BIT |
+            vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT | vk.PIPELINE_STAGE_TRANSFER_BIT,
+            vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT | vk.PIPELINE_STAGE_TRANSFER_BIT)
+    vk.vkCmdBindPipeline(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_pipeline)
+    g_started = true
+}
+
+// Mesh `mesh` (vkmesh's handle, its geometry `mesh_data` and its vertex
+// buffer `vertex_buffer`) morphed for this frame by `weights` (f32[count],
+// a target each) over its targets `set`: the dispatch recorded into the
+// frame's commands, before any pass. How many targets were active; 0 is a
+// mesh drawn as uploaded, which cost nothing where it already was. Outside
+// a pass only; finish() after the frame's last.
+morph(mesh: int, mesh_data: ptr, set: *MorphSet, weights: ptr, count: int, vertex_buffer: @keep ptr) -> int {
+    if !vkhost.recording() || vkhost.pass_open() || vertex_buffer == null { return 0 }
+    if !morph.matches(set, mesh_data) { return 0 }
+    room(morph.count(set))
+    k = morph.active(set, weights, count, g_targets, g_weights)
+    index = find(mesh)
+    if k == 0 && index < 0 { return 0 }
+    if !pipeline() { return 0 }
+    if index >= 0 {
+        was = slot_at(index)
+        // Offsets written since, a mesh remade under the handle, or its
+        // vertex buffer replaced: made again.
+        if was.stamp != morph.stamp(set) || was.vertex_count != morph.vertex_count(set) ||
+           was.targets != morph.count(set) || was.target_buffer != vertex_buffer {
+            vk.vkDeviceWaitIdle(vkdevice.device())
+            release(index)
+            index = 0 - 1
+        }
+    }
+    if k == 0 && index < 0 { return 0 }
+    if index < 0 { index = record_new(mesh, mesh_data, set, vertex_buffer) }
+    if index < 0 { return 0 }
+    s = slot_at(index)
+    commands = vkhost.frame_commands()
+    if k == 0 {
+        if s.live {
+            before_first(commands)
+            region = calloc(1, sizeof(VkBufferCopy)) as *VkBufferCopy
+            region.size = s.vertex_count * VERTEX_BYTES
+            vk.vkCmdCopyBuffer(commands, s.base, s.target_buffer, 1, region as ptr)
+            free(region as ptr)
+            g_dispatched = g_dispatched + 1
+            s.live = false
+            s.touched = g_serial + 1
+        }
+        return 0
+    }
+    frame = vkhost.frame_slot()
+    list_buffer = (s.actives as ptr[])[frame] as *HostBuffer
+    out = list_buffer.mapped as uint32[]
+    tw = g_weights as f32[]
+    ti = g_targets as int[]
+    // A target and its weight's bits, as the shader's Active reads them.
+    bits = calloc(1, 4)
+    a = 0
+    while a < k {
+        out[a * 2] = ti[a] as uint32
+        (bits as f32[])[0] = tw[a]
+        out[a * 2 + 1] = (bits as uint32[])[0]
+        a = a + 1
+    }
+    free(bits)
+    before_first(commands)
+    record(commands, s, frame, k)
+    s.live = true
+    s.touched = g_serial + 1
+    g_dispatched = g_dispatched + 1
+    g_vertices = g_vertices + s.vertex_count
+    return k
+}
+
+// The dispatch itself: the record's set for `frame`, its counts, a thread
+// a vertex.
+record(commands: ptr, s: *MorphGpu, frame: int, k: int) {
+    set_cell = cell_of()
+    (set_cell as ptr[])[0] = (s.sets as ptr[])[frame]
+    vk.vkCmdBindDescriptorSets(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_layout, 0, 1, set_cell, 0, null)
+    free(set_cell)
+    params = calloc(1, PARAMS_BYTES)
+    (params as uint32[])[0] = s.vertex_count as uint32
+    (params as uint32[])[1] = k as uint32
+    vk.vkCmdPushConstants(commands, g_layout, vk.SHADER_STAGE_COMPUTE_BIT, 0, PARAMS_BYTES, params)
+    free(params)
+    vk.vkCmdDispatch(commands, (s.vertex_count + GROUP - 1) / GROUP, 1, 1)
+}
+
+// The frame's morphs written, for every pass after to read: as vertices,
+// in a shader (the rays' skinning) or by a copy. Records nothing when no
+// mesh morphed. How many meshes were.
+finish() -> int {
+    done = g_dispatched
+    if g_started && vkhost.recording() && !vkhost.pass_open() {
+        barrier(vkhost.frame_commands(),
+                vk.ACCESS_SHADER_WRITE_BIT | vk.ACCESS_TRANSFER_WRITE_BIT,
+                vk.ACCESS_VERTEX_ATTRIBUTE_READ_BIT | vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_TRANSFER_READ_BIT,
+                vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT | vk.PIPELINE_STAGE_TRANSFER_BIT,
+                vk.PIPELINE_STAGE_VERTEX_INPUT_BIT | vk.PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT | vk.PIPELINE_STAGE_TRANSFER_BIT)
+    }
+    g_started = false
+    g_dispatched = 0
+    g_vertices = 0
+    g_serial = g_serial + 1
+    return done
+}
+
+// Whether mesh `mesh`'s vertices changed in the frame finish() closed last:
+// morphed, or put back to the bind pose. A figure's ray structure posed by
+// an unchanged palette is skinned again then (vkrays.skin_pose).
+reshaped(mesh: int) -> bool {
+    index = find(mesh)
+    if index < 0 { return false }
+    return slot_at(index).touched == g_serial
+}
+
+// The meshes the frame being recorded has morphed so far, and their
+// vertices.
+morphed() -> (int, int) { return g_dispatched, g_vertices }
+
+// How many meshes hold a record.
+slots_used() -> int {
+    if g_slots == null { return 0 }
+    n = 0
+    i = 0
+    while i < MAX_MORPHED {
+        if slot_at(i).in_use { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// Mesh `mesh` is going: its record goes first. Waits for the device, which
+// may still be morphing it.
+forget(mesh: int) {
+    index = find(mesh)
+    if index < 0 { return }
+    d = vkdevice.device()
+    if d != null { vk.vkDeviceWaitIdle(d) }
+    release(index)
+}
+
+// Every record gone and the pass's objects with them: the device idle
+// already.
+stop() {
+    d = vkdevice.device()
+    if g_slots != null {
+        i = 0
+        while i < MAX_MORPHED {
+            if slot_at(i).in_use { release(i) }
+            i = i + 1
+        }
+        free(g_slots)
+        g_slots = null
+    }
+    if d != null {
+        if g_pipeline != null { vk.vkDestroyPipeline(d, g_pipeline, null) }
+        if g_layout != null { vk.vkDestroyPipelineLayout(d, g_layout, null) }
+        if g_pool != null { vk.vkDestroyDescriptorPool(d, g_pool, null) }
+        if g_set_layout != null { vk.vkDestroyDescriptorSetLayout(d, g_set_layout, null) }
+        if g_query_pool != null { vk.vkDestroyQueryPool(d, g_query_pool, null) }
+    }
+    g_pipeline = null
+    g_layout = null
+    g_pool = null
+    g_set_layout = null
+    g_query_pool = null
+    g_failed = false
+    g_started = false
+    if g_targets != null { free(g_targets) }
+    if g_weights != null { free(g_weights) }
+    g_targets = null
+    g_weights = null
+    g_room = 0
+}
+
+// `bytes` of `buffer` (one the device copies from: a mesh's vertex buffer)
+// into `out`, the device idle first: what a test holds the morph to.
+read_buffer(buffer: @keep ptr, bytes: int, out: ptr) -> bool {
+    d = vkdevice.device()
+    if d == null || buffer == null || out == null || bytes <= 0 { return false }
+    vk.vkDeviceWaitIdle(d)
+    host = vkhost.host_buffer(bytes)
+    if host == null { return false }
+    commands = vkhost.once_begin()
+    region = calloc(1, sizeof(VkBufferCopy)) as *VkBufferCopy
+    region.size = bytes
+    vk.vkCmdCopyBuffer(commands, buffer, host.buffer, 1, region as ptr)
+    free(region as ptr)
+    vkhost.once_end(commands)
+    memcpy(out, host.mapped, bytes as long)
+    vkhost.host_buffer_free(host)
+    return true
+}
+
+// The device's time for `repeats` morphs of mesh `mesh` by its frame-0
+// active list of `k` targets (morph has recorded one for it), in one
+// command buffer between two timestamps: milliseconds, or -1 where the
+// queue keeps no time. What the benchmark measures a vertex's cost by.
+time_dispatch(mesh: int, k: int, repeats: int) -> float {
+    index = find(mesh)
+    d = vkdevice.device()
+    if index < 0 || d == null || g_pipeline == null || !vkdevice.timestamps_usable() { return 0.0 - 1.0 }
+    if g_query_pool == null {
+        info = calloc(1, sizeof(VkQueryPoolCreateInfo)) as *VkQueryPoolCreateInfo
+        info.sType = vk.STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO
+        info.queryType = vk.QUERY_TYPE_TIMESTAMP
+        info.queryCount = 2
+        out = cell_of()
+        r = vk.vkCreateQueryPool(d, info as ptr, null, out)
+        g_query_pool = taken_from(out)
+        free(info as ptr)
+        if r != vk.SUCCESS {
+            g_query_pool = null
+            return 0.0 - 1.0
+        }
+    }
+    vk.vkDeviceWaitIdle(d)
+    s = slot_at(index)
+    commands = vkhost.once_begin()
+    vk.vkCmdResetQueryPool(commands, g_query_pool, 0, 2)
+    vk.vkCmdBindPipeline(commands, vk.PIPELINE_BIND_POINT_COMPUTE, g_pipeline)
+    vk.vkCmdWriteTimestamp(commands, vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_query_pool, 0)
+    i = 0
+    while i < repeats {
+        record(commands, s, 0, k)
+        // Each morph after the last has written, as a frame's would be.
+        barrier(commands, vk.ACCESS_SHADER_WRITE_BIT, vk.ACCESS_SHADER_WRITE_BIT,
+                vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+        i = i + 1
+    }
+    vk.vkCmdWriteTimestamp(commands, vk.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_query_pool, 1)
+    vkhost.once_end(commands)
+    ticks = calloc(2, 8)
+    r = vk.vkGetQueryPoolResults(d, g_query_pool, 0, 2, 16, ticks, 8, vk.QUERY_RESULT_64_BIT | vk.QUERY_RESULT_WAIT_BIT)
+    t = ticks as long[]
+    elapsed = (t[1] - t[0]) as float
+    free(ticks)
+    if r != vk.SUCCESS { return 0.0 - 1.0 }
+    return elapsed * vkdevice.timestamp_period() / 1000000.0
+}

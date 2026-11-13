@@ -1,0 +1,534 @@
+// Strip a binary glTF (a .glb, or a VRM, which is one) of its pictures:
+// its images, textures and samplers, every material's and the VRM
+// extension's references to them, and the buffer views only the images
+// used. What is left is the figure as the tests read it -- its nodes,
+// skins, meshes, morph targets and animations, and its metadata (a VRM's
+// licence among it) -- in a binary chunk of only the views its accessors
+// read, packed in their order.
+//
+//     ./build.sh tools/gltf_strip.ae
+//     ./build/gltf_strip <in.glb|.vrm> <out> [--drop TANGENT,TEXCOORD_1]
+//
+// --drop takes the named attributes off every primitive and morph target
+// as well (a tangent stream neither renderer reads), and with them the
+// accessors nothing else reads; every reference to an accessor, a
+// primitive's, a skin's, an animation's, is renumbered onto those kept.
+//
+// Made for the face fixture (#910): VRoid Studio's base female is 16 MB,
+// most of it textures, which a test of eyes, skins and blend shapes does
+// not draw.
+import std.os
+import std.json
+import std.string
+import std.bytes
+import std.mem
+import ae3d.blob
+
+extern aether_string_data(s: string) -> ptr @c_import
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+extern fopen(path: string, mode: string) -> ptr
+extern fwrite(buffer: ptr, size: long, count: long, f: ptr) -> long
+extern fclose(f: ptr) -> int
+extern exit(code: int)
+
+const GLB_MAGIC = 0x46546C67
+const CHUNK_JSON = 0x4E4F534A
+const CHUNK_BIN = 0x004E4942
+
+// `from`'s members into a new object, but those named in `drop` (a
+// comma-separated list, each name between commas) and those whose name ends
+// with "Texture" when `textures` (a material's, a PBR block's).
+copy_without(from: ptr, drop: string, textures: bool) -> ptr {
+    out = json.obj()
+    n = json.json_object_size_raw(from)
+    i = 0
+    while i < n {
+        key = json.json_object_key_at(from, i)
+        listed = string.contains(drop, string.concat(",", string.concat(key, ","))) == 1
+        texture = textures && string.ends_with(key, "Texture") == 1
+        if !listed && !texture { json.json_object_set_raw(out, key, json.json_object_value_at(from, i)) }
+        i = i + 1
+    }
+    return out
+}
+
+int_of(node: ptr, name: string) -> int {
+    if node == null { return 0 - 1 }
+    f = json.json_object_get_raw(node, name)
+    if f == null { return 0 - 1 }
+    return json.json_get_int(f)
+}
+
+// The materials without their textures, a PBR block's too.
+strip_materials(root: ptr) -> ptr {
+    materials = json.json_object_get_raw(root, "materials")
+    out = json.arr()
+    if materials == null { return out }
+    i = 0
+    while i < json.json_array_size(materials) {
+        m = json.json_array_get_raw(materials, i)
+        copy = copy_without(m, ",", true)
+        pbr = json.json_object_get_raw(m, "pbrMetallicRoughness")
+        if pbr != null { json.json_object_set_raw(copy, "pbrMetallicRoughness", copy_without(pbr, ",", true)) }
+        json.json_array_add_raw(out, copy)
+        i = i + 1
+    }
+    return out
+}
+
+// The VRM extension without its pictures: the meta's thumbnail, and each
+// MToon material's texture properties.
+strip_vrm(extensions: ptr) -> ptr {
+    out = copy_without(extensions, ",VRM,", false)
+    vrm = json.json_object_get_raw(extensions, "VRM")
+    if vrm == null { return out }
+    copy = copy_without(vrm, ",meta,materialProperties,", false)
+    meta = json.json_object_get_raw(vrm, "meta")
+    if meta != null { json.json_object_set_raw(copy, "meta", copy_without(meta, ",texture,", false)) }
+    props = json.json_object_get_raw(vrm, "materialProperties")
+    if props != null {
+        list = json.arr()
+        i = 0
+        while i < json.json_array_size(props) {
+            p = copy_without(json.json_array_get_raw(props, i), ",textureProperties,", false)
+            json.json_object_set_raw(p, "textureProperties", json.obj())
+            json.json_array_add_raw(list, p)
+            i = i + 1
+        }
+        json.json_object_set_raw(copy, "materialProperties", list)
+    }
+    json.json_object_set_raw(out, "VRM", copy)
+    return out
+}
+
+// --- accessors ------------------------------------------------------------------------------------
+
+var g_marks: ptr = null            // int[accessors]: 1 for one something reads, 2 for a morph target's
+var g_map: ptr = null              // int[accessors]: its new index
+var g_target_pass = false          // marking a morph target's attributes
+
+mark(index: int) {
+    if index < 0 { return }
+    m = g_marks as int[]
+    if g_target_pass { m[index] = 2 } else if m[index] == 0 { m[index] = 1 }
+}
+
+// Each member of an attribute map (a primitive's, a target's) marked, or
+// left out of `kept` when its name is in `drop`; the map rewritten to `kept`.
+attributes(map: ptr, drop: string, renumber: bool) -> ptr {
+    kept = json.obj()
+    n = json.json_object_size_raw(map)
+    i = 0
+    while i < n {
+        key = json.json_object_key_at(map, i)
+        if string.contains(drop, string.concat(",", string.concat(key, ","))) == 0 {
+            index = json.json_get_int(json.json_object_value_at(map, i))
+            if renumber {
+                json.json_object_set_raw(kept, key, json.from_int((g_map as int[])[index] as long))
+            } else {
+                mark(index)
+                json.json_object_set_raw(kept, key, json.json_object_value_at(map, i))
+            }
+        }
+        i = i + 1
+    }
+    return kept
+}
+
+// Every accessor reference, marked (`renumber` false) or rewritten to the
+// kept accessors' new indices (true): the primitives' attributes, indices
+// and targets (with `drop`'s attributes taken off), the skins' inverse
+// binds, the animations' samplers.
+references(root: ptr, drop: string, renumber: bool) {
+    meshes = json.json_object_get_raw(root, "meshes")
+    m = 0
+    while meshes != null && m < json.json_array_size(meshes) {
+        prims = json.json_object_get_raw(json.json_array_get_raw(meshes, m), "primitives")
+        p = 0
+        while prims != null && p < json.json_array_size(prims) {
+            prim = json.json_array_get_raw(prims, p)
+            json.json_object_set_raw(prim, "attributes", attributes(json.json_object_get_raw(prim, "attributes"), drop, renumber))
+            reference(prim, "indices", renumber)
+            targets = json.json_object_get_raw(prim, "targets")
+            if targets != null {
+                list = json.arr()
+                t = 0
+                g_target_pass = true
+                while t < json.json_array_size(targets) {
+                    json.json_array_add_raw(list, attributes(json.json_array_get_raw(targets, t), drop, renumber))
+                    t = t + 1
+                }
+                g_target_pass = false
+                json.json_object_set_raw(prim, "targets", list)
+            }
+            p = p + 1
+        }
+        m = m + 1
+    }
+    skins = json.json_object_get_raw(root, "skins")
+    s = 0
+    while skins != null && s < json.json_array_size(skins) {
+        reference(json.json_array_get_raw(skins, s), "inverseBindMatrices", renumber)
+        s = s + 1
+    }
+    animations = json.json_object_get_raw(root, "animations")
+    a = 0
+    while animations != null && a < json.json_array_size(animations) {
+        samplers = json.json_object_get_raw(json.json_array_get_raw(animations, a), "samplers")
+        k = 0
+        while samplers != null && k < json.json_array_size(samplers) {
+            reference(json.json_array_get_raw(samplers, k), "input", renumber)
+            reference(json.json_array_get_raw(samplers, k), "output", renumber)
+            k = k + 1
+        }
+        a = a + 1
+    }
+}
+
+reference(node: ptr, name: string, renumber: bool) {
+    index = int_of(node, name)
+    if index < 0 { return }
+    if renumber {
+        json.json_object_set_raw(node, name, json.from_int((g_map as int[])[index] as long))
+    } else {
+        mark(index)
+    }
+}
+
+var g_is_target: ptr = null        // int[kept accessors]: 1 for a morph target's
+
+// --- sparse morph targets -------------------------------------------------------------------------
+
+// The extra binary sparsify writes (the sparse indices and values), its
+// views (offset, length pairs), and the sparse parts that name them, whose
+// views are numbered once the kept views are (number_extra).
+var g_extra: ptr = null
+var g_extra_size = 0
+var g_extra_views: ptr = null      // int[2 * room]
+var g_extra_count = 0
+const MADE_VIEWS = 1000000         // a made view's number until it has its place
+
+extra_view(data: ptr, length: int) {
+    while g_extra_size % 4 != 0 { g_extra_size = g_extra_size + 1 }
+    memcpy(g_extra + g_extra_size, data, length as long)
+    (g_extra_views as int[])[g_extra_count * 2] = g_extra_size
+    (g_extra_views as int[])[g_extra_count * 2 + 1] = length
+    g_extra_count = g_extra_count + 1
+    g_extra_size = g_extra_size + length
+}
+
+// Whether the three floats at `at` move a vertex: any of them not zero
+// (either sign of zero is zero).
+moves(bin: ptr, at: long) -> bool {
+    return (blob.u32(bin, at) & 0x7FFFFFFF) != 0 || (blob.u32(bin, at + 4) & 0x7FFFFFFF) != 0 ||
+           (blob.u32(bin, at + 8) & 0x7FFFFFFF) != 0
+}
+
+// Every morph target accessor of three floats that is mostly zero made a
+// sparse one with no buffer view: only the vertices it moves, their
+// indices and their values (glTF 2.0 section 3.6.2.3). The same numbers;
+// a face's targets each move a few hundred of its thousands of vertices.
+// How many were made sparse.
+sparsify(accessors: ptr, views: ptr, bin: ptr, bin_size: long) -> (ptr, int) {
+    n = json.json_array_size(accessors)
+    out = json.arr()
+    g_extra = calloc((bin_size as int) + 16, 1)
+    g_extra_views = calloc(n * 4 + 2, 4)
+    made = 0
+    i = 0
+    while i < n {
+        a = json.json_array_get_raw(accessors, i)
+        v = int_of(a, "bufferView")
+        kind = json.json_object_get_raw(a, "type")
+        vec3 = kind != null && json.json_get_string_raw(kind) == "VEC3"
+        if (g_is_target as int[])[i] == 1 && v >= 0 && json.json_object_get_raw(a, "sparse") == null &&
+           vec3 && int_of(a, "componentType") == 5126 {
+            view = json.json_array_get_raw(views, v)
+            stride = int_of(view, "byteStride")
+            if stride <= 0 { stride = 12 }
+            base = int_of(view, "byteOffset")
+            if base < 0 { base = 0 }
+            offset = int_of(a, "byteOffset")
+            if offset < 0 { offset = 0 }
+            count = int_of(a, "count")
+            moved = 0
+            e = 0
+            while e < count {
+                at = (base + offset + e * stride) as long
+                if moves(bin, at) { moved = moved + 1 }
+                e = e + 1
+            }
+            // A target that moves nothing keeps one element (its first,
+            // zeros): the format's sparse part has at least one.
+            force_first = moved == 0 && count > 0
+            if force_first { moved = 1 }
+            if moved * 16 < count * 12 {
+                wide = count > 65535
+                index_size = 2
+                if wide { index_size = 4 }
+                indices = calloc(moved * index_size + 4, 1)
+                values = calloc(moved * 12 + 4, 1)
+                k = 0
+                e = 0
+                while e < count {
+                    at = (base + offset + e * stride) as long
+                    if moves(bin, at) || (force_first && e == 0) {
+                        if wide { put32(indices, k * 4, e) } else {
+                            mem.set_uint8(indices, k * 2, e & 255)
+                            mem.set_uint8(indices, k * 2 + 1, (e >> 8) & 255)
+                        }
+                        memcpy(values + k * 12, bin + (at as int), 12 as long)
+                        k = k + 1
+                    }
+                    e = e + 1
+                }
+                copy = copy_without(a, ",bufferView,byteOffset,", false)
+                sparse = json.obj()
+                json.json_object_set_raw(sparse, "count", json.from_int(moved as long))
+                ind = json.obj()
+                component = 5123
+                if wide { component = 5125 }
+                json.json_object_set_raw(ind, "componentType", json.from_int(component as long))
+                // Their views by number past MADE_VIEWS until the kept views
+                // are counted (the accessors' renumbering puts them after).
+                json.json_object_set_raw(ind, "bufferView", json.from_int((MADE_VIEWS + g_extra_count) as long))
+                extra_view(indices, moved * index_size)
+                val = json.obj()
+                json.json_object_set_raw(val, "bufferView", json.from_int((MADE_VIEWS + g_extra_count) as long))
+                extra_view(values, moved * 12)
+                json.json_object_set_raw(sparse, "indices", ind)
+                json.json_object_set_raw(sparse, "values", val)
+                json.json_object_set_raw(copy, "sparse", sparse)
+                json.json_array_add_raw(out, copy)
+                free(indices)
+                free(values)
+                made = made + 1
+            } else {
+                json.json_array_add_raw(out, a)
+            }
+        } else {
+            json.json_array_add_raw(out, a)
+        }
+        i = i + 1
+    }
+    return out, made
+}
+
+// The accessors something still reads, in their order, every reference
+// rewritten onto them.
+keep_accessors(root: ptr, drop: string) -> ptr {
+    all = json.json_object_get_raw(root, "accessors")
+    n = json.json_array_size(all)
+    g_marks = calloc(n + 1, 4)
+    g_map = calloc(n + 1, 4)
+    references(root, drop, false)
+    kept = json.arr()
+    g_is_target = calloc(n + 1, 4)
+    count = 0
+    i = 0
+    while i < n {
+        (g_map as int[])[i] = 0 - 1
+        if (g_marks as int[])[i] >= 1 {
+            json.json_array_add_raw(kept, json.json_array_get_raw(all, i))
+            (g_map as int[])[i] = count
+            if (g_marks as int[])[i] == 2 { (g_is_target as int[])[count] = 1 }
+            count = count + 1
+        }
+        i = i + 1
+    }
+    references(root, drop, true)
+    println("gltf_strip: ${count} of ${n} accessors kept")
+    return kept
+}
+
+main() {
+    if os.args_count() < 3 {
+        println("usage: gltf_strip <in.glb|.vrm> <out> [--drop ATTRIBUTE,...]")
+        exit(2)
+    }
+    source = os.args_get(1)
+    target = os.args_get(2)
+    raw = blob.read(source)
+    size = blob.last_size()
+    if raw == null || size < 20 || blob.u32(raw, 0) != GLB_MAGIC {
+        println("gltf_strip: ${source} is not a binary glTF")
+        exit(1)
+    }
+    text = ""
+    bin = null
+    bin_size = 0 as long
+    at = 12 as long
+    while at + 8 <= size {
+        length = blob.u32(raw, at) as long
+        kind = blob.u32(raw, at + 4)
+        if kind == CHUNK_JSON { text = bytes.string_from_ptr(blob.slice(raw, at + 8), length as int) }
+        if kind == CHUNK_BIN {
+            bin = blob.slice(raw, at + 8)
+            bin_size = length
+        }
+        at = at + 8 + length
+    }
+    root = json.json_parse_raw(text)
+    if root == null || bin == null {
+        println("gltf_strip: ${source} has no JSON or no binary chunk")
+        exit(1)
+    }
+    // Attributes named after the files (`--drop TANGENT,TEXCOORD_0`): taken
+    // off every primitive and every morph target, and the accessors only
+    // they read with them.
+    drop = ","
+    sparse_on = false
+    arg = 3
+    while arg < os.args_count() {
+        if os.args_get(arg) == "--drop" && arg + 1 < os.args_count() {
+            drop = string.concat(",", string.concat(os.args_get(arg + 1), ","))
+            arg = arg + 1
+        }
+        if os.args_get(arg) == "--sparse" { sparse_on = true }
+        arg = arg + 1
+    }
+    accessors = keep_accessors(root, drop)
+    views = json.json_object_get_raw(root, "bufferViews")
+    if sparse_on {
+        sparse_list, made = sparsify(accessors, views, bin, bin_size)
+        accessors = sparse_list
+        println("gltf_strip: ${made} morph target accessors made sparse")
+    }
+    view_count = json.json_array_size(views)
+    // The views the accessors read, sparse ones' indices and values too.
+    used = calloc(view_count + 1, 4) as int[]
+    i = 0
+    while i < json.json_array_size(accessors) {
+        a = json.json_array_get_raw(accessors, i)
+        v = int_of(a, "bufferView")
+        if v >= 0 && v < MADE_VIEWS { used[v] = 1 }
+        sparse = json.json_object_get_raw(a, "sparse")
+        if sparse != null {
+            v = int_of(json.json_object_get_raw(sparse, "indices"), "bufferView")
+            if v >= 0 && v < MADE_VIEWS { used[v] = 1 }
+            v = int_of(json.json_object_get_raw(sparse, "values"), "bufferView")
+            if v >= 0 && v < MADE_VIEWS { used[v] = 1 }
+        }
+        i = i + 1
+    }
+    // The kept views packed in their order, each on four bytes.
+    remap = calloc(view_count + 1, 4) as int[]
+    packed = calloc((bin_size as int) + 16, 1)
+    out_views = json.arr()
+    kept = 0
+    written = 0
+    v = 0
+    while v < view_count {
+        remap[v] = 0 - 1
+        if used[v] == 1 {
+            view = json.json_array_get_raw(views, v)
+            offset = int_of(view, "byteOffset")
+            if offset < 0 { offset = 0 }
+            length = int_of(view, "byteLength")
+            while written % 4 != 0 { written = written + 1 }
+            memcpy(packed + written, bin + offset, length as long)
+            copy = copy_without(view, ",byteOffset,buffer,", false)
+            json.json_object_set_raw(copy, "buffer", json.from_int(0 as long))
+            json.json_object_set_raw(copy, "byteOffset", json.from_int(written as long))
+            json.json_array_add_raw(out_views, copy)
+            remap[v] = kept
+            kept = kept + 1
+            written = written + length
+        }
+        v = v + 1
+    }
+    // The sparse parts' views after the kept ones.
+    k = 0
+    while k < g_extra_count {
+        while written % 4 != 0 { written = written + 1 }
+        start = (g_extra_views as int[])[k * 2]
+        length = (g_extra_views as int[])[k * 2 + 1]
+        if written + length > (bin_size as int) + 16 {
+            println("gltf_strip: the sparse parts outgrew the binary")
+            exit(1)
+        }
+        memcpy(packed + written, g_extra + start, length as long)
+        view = json.obj()
+        json.json_object_set_raw(view, "buffer", json.from_int(0 as long))
+        json.json_object_set_raw(view, "byteOffset", json.from_int(written as long))
+        json.json_object_set_raw(view, "byteLength", json.from_int(length as long))
+        json.json_array_add_raw(out_views, view)
+        written = written + length
+        k = k + 1
+    }
+    while written % 4 != 0 { written = written + 1 }
+    // The accessors onto the kept views' new places.
+    i = 0
+    while i < json.json_array_size(accessors) {
+        a = json.json_array_get_raw(accessors, i)
+        v = int_of(a, "bufferView")
+        if v >= 0 { json.json_object_set_raw(a, "bufferView", json.from_int(new_view(v, remap, kept) as long)) }
+        sparse = json.json_object_get_raw(a, "sparse")
+        if sparse != null {
+            ind = json.json_object_get_raw(sparse, "indices")
+            v = int_of(ind, "bufferView")
+            if v >= 0 { json.json_object_set_raw(ind, "bufferView", json.from_int(new_view(v, remap, kept) as long)) }
+            val = json.json_object_get_raw(sparse, "values")
+            v = int_of(val, "bufferView")
+            if v >= 0 { json.json_object_set_raw(val, "bufferView", json.from_int(new_view(v, remap, kept) as long)) }
+        }
+        i = i + 1
+    }
+    out = copy_without(root, ",images,textures,samplers,bufferViews,buffers,materials,extensions,accessors,", false)
+    json.json_object_set_raw(out, "accessors", accessors)
+    json.json_object_set_raw(out, "bufferViews", out_views)
+    buffer = json.obj()
+    json.json_object_set_raw(buffer, "byteLength", json.from_int(written as long))
+    buffers = json.arr()
+    json.json_array_add_raw(buffers, buffer)
+    json.json_object_set_raw(out, "buffers", buffers)
+    if json.json_object_get_raw(root, "materials") != null { json.json_object_set_raw(out, "materials", strip_materials(root)) }
+    extensions = json.json_object_get_raw(root, "extensions")
+    if extensions != null { json.json_object_set_raw(out, "extensions", strip_vrm(extensions)) }
+    encoded = json.json_stringify_raw(out)
+    json_length = string.length(encoded)
+    json_padded = json_length
+    while json_padded % 4 != 0 { json_padded = json_padded + 1 }
+    total = 12 + 8 + json_padded + 8 + written
+    head = calloc(total + 4, 1)
+    put32(head, 0, GLB_MAGIC)
+    put32(head, 4, 2)
+    put32(head, 8, total)
+    put32(head, 12, json_padded)
+    put32(head, 16, CHUNK_JSON)
+    // The JSON's bytes as they are (UTF-8: a VRM's author is in Japanese),
+    // padded with spaces as the format asks.
+    memcpy(head + 20, aether_string_data(encoded), json_length as long)
+    k = json_length
+    while k < json_padded {
+        mem.set_uint8(head, 20 + k, 32)
+        k = k + 1
+    }
+    put32(head, 20 + json_padded, written)
+    put32(head, 24 + json_padded, CHUNK_BIN)
+    memcpy(head + 28 + json_padded, packed, written as long)
+    f = fopen(target, "wb")
+    if f == null {
+        println("gltf_strip: cannot write ${target}")
+        exit(1)
+    }
+    fwrite(head, 1 as long, total as long, f)
+    fclose(f)
+    println("gltf_strip: ${source} ${size} bytes to ${target} ${total} bytes: ${kept} of ${view_count} buffer views kept, ${g_extra_count} made, ${written} bytes of binary")
+}
+
+// A view's number in the stripped file: a kept one's place among the kept,
+// a made one's after them.
+new_view(v: int, remap: int[], kept: int) -> int {
+    if v >= MADE_VIEWS { return kept + v - MADE_VIEWS }
+    return remap[v]
+}
+
+put32(p: ptr, at: int, value: int) {
+    mem.set_uint8(p, at, value & 255)
+    mem.set_uint8(p, at + 1, (value >> 8) & 255)
+    mem.set_uint8(p, at + 2, (value >> 16) & 255)
+    mem.set_uint8(p, at + 3, (value >> 24) & 255)
+}

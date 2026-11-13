@@ -333,6 +333,38 @@ nethandover.kill(glue, index, point, impulse, now)      // the host: LIMP, and c
 - **Moved.** A kill's swap moves the last zombie into the dead one's index; the horde says so on every peer (`set_on_move`), and a figure handed that zombie follows it (`handover.renumber`).
 - **Joining mid-handover.** A client that joins while a zombie is out is sent the horde with its out flags, the bones alive (net's created objects), and the "horde.ragdoll" for each: it draws what everyone else does.
 
+### A character's animation: its inputs, not its poses
+
+A figure is not sent a pose at a time. Every peer runs the same graph (`ae3d.character`: its mover, animator, feet, look and aim) from the same inputs, so what crosses the wire is what the game asked of the character, as Unreal's character movement sends its moves and Unity's Netcode its input commands (`ae3d.netanim`, #911):
+
+```aether
+import ae3d.netanim
+
+na = netanim.netanim_new(session)                      // every side, at the same point among its registrations
+f = netanim.add(na, e, hero, true)                     // the owner's; a peer adds the same figure, false
+
+netanim.move(f, velocity, facing)                      // the owner, each tick, as character.move
+netanim.look(f, point)                                 // look_ahead, look_free, aim, aim_off
+netanim.knock(f, body, impulse)                        // the full ragdoll, LIMP, the blow on a body
+netanim.get_up(f, 0.4)                                 // character.get_up; also hit and act
+netanim.sent(na, now)                                  // after the engine's step: the tick closed and streamed
+netanim.flush(na, now)                                 // as the figures stop: the last ticks streamed now
+
+while netanim.due(na, now) {                           // a peer
+    netanim.play(na)                                   // the next tick's inputs and events to its figures
+    engine.engine_update(e, step)
+    netanim.played(na)                                 // the tick kept, and held to the owner's states
+}
+```
+
+- **Inputs, quantised before the owner takes them.** Velocities to a millimetre a second, facings to a ten-thousandth, points to a millimetre: the owner's character evaluates exactly what every peer does. Events (a blow, a knockdown, a get-up, an act) go stamped with their tick, their numbers as 32-bit floats the owner takes rounded too.
+- **A stream, not events.** `net.send_stream` sends a block of bytes unreliably (a stream, counted as `TRAFFIC_STREAMS`): a block every two ticks, each carrying the inputs of the last twelve as runs (a walk held is one run, two bytes) and every event of the last half second, so a lost block costs nothing while one of the next arrives in time.
+- **Played behind, never guessed past a buffer.** A peer plays a tick at the owner's time of it by the link's fastest way and a buffer (0.12 s by default: the jitter, the send interval and a lost block or two). A tick whose inputs never came is played with the last ones (a walk held walks on), and counted.
+- **Drift found and eased out.** Twice a second the stream carries a compact state: the object's place (a tenth of a millimetre), the mover's velocity and facing, the graph's state and its time in it. A peer compares it with what it had at that tick; parted, its place and facing are eased onto the owner's (a half-life of 0.1 s, at most 0.5 m/s: never snapped), its springs' velocity taken (`mover.correct`), and its graph played at the owner's state and time, inertialized over 0.2 s.
+- **A ragdoll as physics state.** While a figure is down, ten times a second its bodies' places (a tenth of a millimetre about the first) and turns (47 bits), compared with the peer's own.
+
+Measured (`tests/test_net_anim.ae`: the mannequin on 100STYLE's gaits standing, walking, running, turning, stopping with its eyes on a point, knocked down and up again, walking on): from the same input stream every joint of the client's figure is the host's to the bit at every tick, and its trail of hashes goes into the determinism trail; under 150 ms of latency, 30 ms of jitter and 5% loss, over three seeds of the hub, the client's feet and hands are the host's at every tick (the inputs came in time; 2 ticks of 1,212 played before theirs came on one seed, a walk held). A figure streams 538 bytes a second walking, 2 KB a second down (its ragdoll), 876 over the script; a remote figure costs netanim under a microsecond a frame, its whole frame (graph, mover, feet, physics) about 0.2 ms. A sixth of a second of a figure's inputs lost whole as it sets off leaves it 3 cm behind; the states find it and ease it back, its object within 0.6 mm of the host's. Its feet's locks are not in the state yet, so a foot planted a tick apart from the host's still shows for a step (up to 5 cm), and a peer's ragdoll is compared with the owner's but not yet put on it where they part.
+
 ### The same on every platform
 
 **What makes a tick the same everywhere.** A tick is `ae3d.horde`'s and `ae3d.nav`'s passes in a fixed order: the headings turned toward the field (`flow_steer`), the velocities along them (`wander`), the separation, and the step, by 1 / the tick rate, never a frame's delta, then the shoves, each moving only its own zombie. Each pass works a figure at a time over the pool and writes only that figure, so the pool's size and its timing change nothing. With one exception, found on the way: the separation with no pool visits each pair once and pushes both, which adds the same pushes in another order than the pool's gather, and 1,773 of the 4,500 velocity components of a knot of 1,500 differ in their last bits. `horde.separate_exact` gathers at any thread count, and is what the horde steps by. The flow field's headings were libm's `atan2`, which isn't the same function on every platform; a cell points one of eight ways, so they are eight constants now. What is left of libm is `sqrt`, `floor` and `fabs`, exact everywhere, beside the horde's own polynomial sine and arctangent. A figure's pose bank (`set_figure`, when the walk drives the step) has to be the same bytes on every side too: its travel table is in the step.

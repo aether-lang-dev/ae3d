@@ -27,15 +27,17 @@
 
 import std.heap
 import ae3d.core
+import ae3d.fdlibm
 import ae3d.behaviour
 import ae3d.physics
 import ae3d.animator
+import ae3d.ikrig
 
-extern exp(x: float) -> float
 
 exports (
     Mover, HALF_LIFE, FACING_HALF_LIFE, MOVING,
-    mover_new, mover_free, ask, face, step, velocity, facing_of, future, rest_distance, rest_point, set_half_lives, set_braking, set_matcher, set_follow, sim_at, settle
+    mover_new, mover_free, ask, face, step, velocity, facing_of, correct, STATE_FLOATS, state_write, state_read, future, rest_distance, rest_point, set_half_lives, set_braking, set_braking_below, set_start_pace, set_matcher, set_follow, sim_at, settle, settle_moving, path, path_on,
+    turning_on_spot, turn_goal, path_ways
 )
 
 // Seconds the springs halve their gap to the velocity and facing asked in.
@@ -43,6 +45,18 @@ const HALF_LIFE = 0.27
 const FACING_HALF_LIFE = 0.27
 // Metres a second over which a figure counts as moving.
 const MOVING = 0.1
+// Radians off its facing a way asked of a standing figure may be for it to
+// set off at once: further, it turns toward it where it stands first (its
+// feet step it round), then starts, as one turns before walking off to the
+// side. Started at once, a forward start played while the figure turned
+// 90 degrees to walk off along a log it had sat on, and its feet crossed
+// 110 mm.
+const START_ARC = 0.5236
+// The share of its speed a walker keeps through a curve past a right angle (#969).
+const CURVE_SLOW = 0.6
+// Radians a moving figure's way may be off the way it faces while it curves:
+// people going round a bend face where they go.
+const CURVE_ARC = 0.1745
 // Following its clips (set_follow): the figure eased toward the simulation
 // over this half-life, at most this many metres a second over its own
 // motion, and the simulation kept within CLAMP metres of it.
@@ -51,6 +65,20 @@ const ADJUST_HALF_LIFE = 0.3
 // at 0.5 m/s, a matched turn's stance drifted past the lock's slip.)
 const ADJUST_MOST = 0.2
 const CLAMP = 0.15
+// A standing figure asked to face a new way turns as a planned turn on the
+// spot (#976, ikrig.feet_turn_to) once the way is TURN_START off its facing:
+// its eyes, head and chest lead (its feet's turn_lead) for TURN_LEAD
+// seconds before the body turns, and the body turns no further than its
+// feet let it (ikrig.feet_turn_reach), so its yaw follows the steps. People
+// turning on the spot move the eyes and head first and the pelvis 100 to
+// 200 ms after (Hollands and Patla). Turned on its facing spring with its
+// feet chasing it, a figure shuffled half round in 10 small steps.
+const TURN_START = 0.03
+const TURN_LEAD = 0.15
+// The facing's half-life through a turn on the spot at the most: its pace
+// is the steps' (the feet hold the body back), and on a walker's 0.6 s
+// half-life a quarter turn took 3.1 s where people take about a second.
+const TURN_HALF_LIFE = 0.2
 
 struct Mover {
     animator: ptr                  // *Animator
@@ -62,13 +90,18 @@ struct Mover {
     facing_rate: float
     face_asked: float
     strafing: bool                 // facing held to face_asked; else it faces the way it goes
+    turning_first: bool            // standing, turning toward a way asked past START_ARC before it starts
     half_life: float
     facing_half_life: float
     travelled: float               // metres gone since it last stood still
     braking: float                 // m/s a second it slows at with nothing asked, 0 for the spring
+    brake_below: float             // and the speed it brakes from (set_braking_below); faster, the spring slows it to that first, 0 any
+    start_pace: float              // times a start's own pace it goes at most while one plays (set_start_pace), 0 any
     matcher: int                   // the animator's matcher state it asks the way ahead of, -1 none
     follow: bool                   // the figure moved by its clips' root motion, the springs a simulation (set_follow)
     sim: Vec3                      // the simulation's place, following
+    wall: Vec3                     // level, unit: the way into a wall its capsule is against (slid), zero for none
+    turn_t: float                  // seconds into a turn on the spot (TURN_LEAD), -1 when not turning so
 }
 
 // A mover for the figure on `o`, played by `a`. Its object starts where it
@@ -84,6 +117,7 @@ mover_new(a: *Animator, o: *GameObject) -> *Mover {
     m.facing = core.atan2_of(ahead.x, ahead.z)
     m.face_asked = m.facing
     m.matcher = 0 - 1
+    m.turn_t = 0.0 - 1.0
     return m
 }
 
@@ -117,7 +151,7 @@ spring(v: float, a: float, goal: float, half_life: float, t: float) -> (float, f
     y = damping(half_life) * 0.5
     j0 = v - goal
     j1 = a + j0 * y
-    e = exp(0.0 - y * t)
+    e = fdlibm.exp(0.0 - y * t)
     moved = e * ((0.0 - j1) / (y * y) + (0.0 - j0 - j1 * t) / y) + j1 / (y * y) + j0 / y + goal * t
     return e * (j0 + j1 * t) + goal, e * (a - j1 * y * t), moved
 }
@@ -131,11 +165,158 @@ wrap(x: float) -> float {
 
 // The facing wanted now: held, or the way the velocity asked goes (kept
 // where it is when nothing is asked).
-facing_goal(m: *Mover) -> float {
+// Moving (facing free, not matching), it faces where it goes, turned toward
+// the way asked by CURVE_ARC at most: turned toward the goal as fast as its
+// spring went, a body in a sharp turn faced 45 degrees off the way it was
+// still going, its gaits half a side step, and its feet crossed (#969).
+facing_goal(m: *Mover) -> float { return facing_toward(m, m.asked, m.velocity, m.facing) }
+
+// The same for `asked` asked of a figure going at `velocity`, facing `facing`.
+facing_toward(m: *Mover, asked: Vec3, velocity: Vec3, facing: float) -> float {
     if m.strafing { return m.face_asked }
-    if core.v3_len(m.asked) > MOVING { return core.atan2_of(m.asked.x, m.asked.z) }
-    return m.facing
+    if core.v3_len(asked) > MOVING {
+        way = core.atan2_of(asked.x, asked.z)
+        if m.matcher < 0 && core.v3_len(velocity) >= MOVING {
+            going = core.atan2_of(velocity.x, velocity.z)
+            off = core.clampf(wrap(way - going), 0.0 - CURVE_ARC, CURVE_ARC)
+            return going + off
+        }
+        return way
+    }
+    return facing
 }
+
+// The velocity its springs go toward when `asked` is asked of a figure going
+// at `velocity`, facing `facing`, and whether it turns where it stands first
+// (`was_turning`: it was): the start's and the curve's rules below.
+// `busy`: its feet are still turning it (ikrig.feet_turn_busy).
+toward(m: *Mover, asked: Vec3, velocity: Vec3, facing: float, was_turning: bool, busy: bool) -> (Vec3, bool) {
+    goal = asked
+    turning = false
+    // Standing and asked to go off its facing by more than START_ARC: it
+    // turns toward the way where it stands first, the velocity held at rest.
+    // Once turning, it turns on until it faces within CURVE_ARC of the way,
+    // and sets off straight: let off at START_ARC, its first steps were
+    // curved 20 degrees across at once, and a foot stepped past the hips'
+    // middle walking off a log.
+    if !m.strafing && m.matcher < 0 && core.v3_len(velocity) < MOVING && core.v3_len(asked) > MOVING {
+        off = wrap(core.atan2_of(asked.x, asked.z) - facing)
+        // And on until its feet have taken the turn's last step (#976).
+        if core.abs_of(off) > START_ARC || (was_turning && (core.abs_of(off) > CURVE_ARC || busy)) {
+            turning = true
+            goal = core.vec3(0.0, 0.0, 0.0)
+        }
+    }
+    // Moving and asked off its facing by more than CURVE_ARC: it walks a
+    // curve (#969), the way it goes held within CURVE_ARC of the way it
+    // faces as the facing turns after it, and slower for a turn past a right
+    // angle. Asked off at once, the gaits read a sharp turn as a side or a
+    // back step, and a walker turned to a new goal crossed its feet 169 mm;
+    // held 30 degrees off, a quarter of its gait was a side step under a
+    // turning body, and a runner slowing into the curve crossed 214 mm.
+    if !m.strafing && m.matcher < 0 && core.v3_len(velocity) >= MOVING && core.v3_len(goal) > MOVING {
+        off = wrap(core.atan2_of(goal.x, goal.z) - facing)
+        if core.abs_of(off) > CURVE_ARC {
+            way = facing + CURVE_ARC
+            if off < 0.0 { way = facing - CURVE_ARC }
+            speed = core.v3_len(goal)
+            if core.abs_of(off) > 1.5708 { speed = speed * CURVE_SLOW }
+            goal = core.vec3(core.sin_of(way) * speed, 0.0, core.cos_of(way) * speed)
+        }
+    }
+    return goal, turning
+}
+
+// Where the figure would go over the next `count` steps of `dt` were `v`
+// asked from now on: its offsets from where it is over the ground, x and z
+// pairs into `out` (2 * count floats), the springs, the start's and the
+// curve's rules run ahead and the figure left as it is. What a steering
+// weighs a way by (ae3d.character's avoidance, #956): the curve turns a
+// walker's way about 20 degrees a second, and a way 30 degrees off taken as
+// if at once had two walkers meet while it was still being turned to.
+path(m: *Mover, v: Vec3, dt: float, count: int, out: float[]) {
+    yaws = [0.0]
+    path_ways(m, v, dt, count, out, yaws, false)
+}
+
+// The same, and the way it faces after each step into `yaws` (count floats)
+// when `facing` says. A standing figure's turn on the spot is run ahead as
+// it will go (stand_turn): held TURN_LEAD while the head leads, then as far
+// as its feet's steps let it, the feet simulated by their own rules
+// (ikrig.feet_turn_sim_step), and it sets off once their last step is down.
+// Run ahead on its facing spring alone, a standing half turn was predicted
+// done in about a second where its steps take three (#976).
+path_ways(m: *Mover, v: Vec3, dt: float, count: int, out: float[], yaws: float[], facing: bool) {
+    asked = core.vec3(v.x, 0.0, v.z)
+    vel = m.velocity
+    acc = m.acceleration
+    f = m.facing
+    fr = m.facing_rate
+    turning = m.turning_first
+    tt = m.turn_t
+    feet = null
+    if m.animator != null { feet = animator.feet(m.animator as *Animator) }
+    sim = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    ikrig.feet_turn_sim_start(feet, sim)
+    x = 0.0
+    z = 0.0
+    k = 0
+    while k < count {
+        goal, now_turning = toward(m, asked, vel, f, turning, ikrig.feet_turn_sim_busy(sim))
+        turning = now_turning
+        speed = core.v3_len(vel)
+        if m.braking > 0.0 && core.v3_len(asked) <= MOVING && speed > 0.0 && (m.brake_below <= 0.0 || speed <= m.brake_below) {
+            slower = speed - m.braking * dt
+            if slower < 0.0 { slower = 0.0 }
+            went = (speed + slower) * 0.5 * dt
+            x = x + vel.x / speed * went
+            z = z + vel.z / speed * went
+            vel = core.v3_mul(vel, slower / speed)
+            acc = core.vec3(0.0, 0.0, 0.0)
+        } else {
+            vx, ax, mx = spring(vel.x, acc.x, goal.x, m.half_life, dt)
+            vz, az, mz = spring(vel.z, acc.z, goal.z, m.half_life, dt)
+            x = x + mx
+            z = z + mz
+            vel = core.vec3(vx, 0.0, vz)
+            acc = core.vec3(ax, 0.0, az)
+        }
+        aim = f + wrap(facing_toward(m, asked, vel, f) - f)
+        half_life = m.facing_half_life
+        // stand_turn, run on the simulated feet.
+        standing = feet != null && !m.follow && m.matcher < 0 && core.v3_len(vel) < MOVING && (turning || core.v3_len(asked) <= MOVING)
+        ikrig.feet_turn_sim_to(feet, sim, aim, standing)
+        if !standing || !ikrig.feet_turn_sim_on(sim) {
+            tt = 0.0 - 1.0
+        } else {
+            off = wrap(aim - f)
+            if tt < 0.0 && core.abs_of(off) > TURN_START { tt = 0.0 }
+            held = aim
+            if tt >= 0.0 {
+                if tt < TURN_LEAD { held = f }
+                tt = tt + dt
+                if core.abs_of(off) <= TURN_START && core.abs_of(fr) < 0.1 { tt = 0.0 - 1.0 }
+            }
+            aim = f + wrap(ikrig.feet_turn_sim_reach(sim, held) - f)
+            if tt >= 0.0 && half_life > TURN_HALF_LIFE { half_life = TURN_HALF_LIFE }
+        }
+        nf, nfr, _turned = spring_angle(f, fr, aim, half_life, dt)
+        f = wrap(nf)
+        fr = nfr
+        ikrig.feet_turn_sim_step(feet, sim, f, dt)
+        out[k * 2] = x
+        out[k * 2 + 1] = z
+        if facing { yaws[k] = f }
+        k = k + 1
+    }
+}
+
+// The same with the velocity asked last kept asked: where the figure goes
+// doing as it does, a walker in its curve to a new goal curving on. Read as
+// going straight on at its velocity, two walkers each curving round toward
+// the other were not seen to meet until 2.3 m apart, and their capsules
+// touched.
+path_on(m: *Mover, dt: float, count: int, out: float[]) { path(m, m.asked, dt, count, out) }
 
 // One step of `dt`: the springs on, the object moved and turned by them,
 // and the graph's parameters written.
@@ -144,6 +325,10 @@ step(m: *Mover, dt: float) {
     o = m.object as *GameObject
     dx = 0.0
     dz = 0.0
+    // The start's and the curve's rules (toward).
+    asked, turning = toward(m, m.asked, m.velocity, m.facing, m.turning_first, feet_busy(m))
+    m.turning_first = turning
+    asked = along_wall(m, asked)
     if braking_now(m) {
         // Braking at a constant deceleration along its way, to a stand.
         speed = core.v3_len(m.velocity)
@@ -157,16 +342,30 @@ step(m: *Mover, dt: float) {
         }
         m.acceleration = core.vec3(0.0, 0.0, 0.0)
     } else {
-        vx, ax, mx = spring(m.velocity.x, m.acceleration.x, m.asked.x, m.half_life, dt)
-        vz, az, mz = spring(m.velocity.z, m.acceleration.z, m.asked.z, m.half_life, dt)
+        vx, ax, mx = spring(m.velocity.x, m.acceleration.x, asked.x, m.half_life, dt)
+        vz, az, mz = spring(m.velocity.z, m.acceleration.z, asked.z, m.half_life, dt)
         dx = mx
         dz = mz
+        was = m.velocity
         m.velocity = core.vec3(vx, 0.0, vz)
         m.acceleration = core.vec3(ax, 0.0, az)
+        off_wall(m, dt)
+        most = start_most(m)
+        speed = core.v3_len(m.velocity)
+        if most >= 0.0 && speed > most {
+            // Kept to the start's pace: on at it, its spring going on from there.
+            m.velocity = core.v3_mul(m.velocity, most / speed)
+            m.acceleration = core.v3_mul(core.v3_sub(m.velocity, was), 1.0 / dt)
+            dx = (was.x + m.velocity.x) * 0.5 * dt
+            dz = (was.z + m.velocity.z) * 0.5 * dt
+        }
     }
-    // The facing: a spring on the angle, toward the nearer way round.
-    goal = m.facing + wrap(facing_goal(m) - m.facing)
-    f, fr, _turned = spring_angle(m.facing, m.facing_rate, goal, m.facing_half_life, dt)
+    // The facing: a spring on the angle, toward the nearer way round; a
+    // standing figure's as a planned turn on the spot (stand_turn).
+    goal = stand_turn(m, m.facing + wrap(facing_goal(m) - m.facing), dt)
+    half_life = m.facing_half_life
+    if m.turn_t >= 0.0 && half_life > TURN_HALF_LIFE { half_life = TURN_HALF_LIFE }
+    f, fr, _turned = spring_angle(m.facing, m.facing_rate, goal, half_life, dt)
     m.facing = wrap(f)
     m.facing_rate = fr
     // The way come since it last stood still, a start's distance.
@@ -187,6 +386,7 @@ step(m: *Mover, dt: float) {
         capsule = physics.character_of(o)
         if capsule != null && dt > 0.0 {
             physics.character_move(capsule, core.vec3(dx / dt, 0.0, dz / dt), 0.0, dt)
+            slid(m, core.vec3(dx, 0.0, dz), core.v3_sub(behaviour.object_position(o), at))
         } else {
             behaviour.object_set_position(o, core.vec3(at.x + dx, at.y, at.z + dz))
         }
@@ -194,6 +394,101 @@ step(m: *Mover, dt: float) {
     }
     feed(m)
 }
+
+// A wall (#977). The capsule's move against the springs' (`planned`, over
+// the ground), as it `went`: held back by more than SLID_OFF of the move
+// (and SLID_LEAST), by a wall or a solid neighbour, the way into what held
+// it is kept (m.wall), and while the capsule is still against it
+// (along_wall) what is asked goes along it, not into it, and the springs'
+// velocity into it eases off over WALL_HALF_LIFE (off_wall): the velocity
+// the graph plays is the one the capsule really has, as Unity's
+// CharacterController and UE's CharacterMovement give it. Kept at what was
+// asked, a walker run along a wall's face slid sideways at 2 m/s while its
+// graph played a run straight into the wall, its locked feet dragged across
+// under it: crossed 263 mm, a toe thrown 7.4 m/s past its clip. Cut at
+// once, the velocity into the wall dropped 1.6 m/s in a step, and a forearm
+// turned 55 rad/s.
+const SLID_OFF = 0.1
+const SLID_LEAST = 0.0005
+const WALL_HALF_LIFE = 0.08
+// Metres into the wall a capsule is tried at to find it still there.
+const WALL_PROBE = 0.02
+slid(m: *Mover, planned: Vec3, went: Vec3) {
+    blocked = core.vec3(planned.x - went.x, 0.0, planned.z - went.z)
+    gone = core.v3_len(blocked)
+    if gone < SLID_LEAST || gone < SLID_OFF * core.v3_len(planned) { return }
+    m.wall = core.v3_mul(blocked, 1.0 / gone)
+    pushing = core.v3_dot(m.acceleration, m.wall)
+    if pushing > 0.0 { m.acceleration = core.v3_sub(m.acceleration, core.v3_mul(m.wall, pushing)) }
+}
+
+// `asked` with nothing into the wall the capsule is against; the wall let
+// go of once a move WALL_PROBE into it is no longer held back.
+along_wall(m: *Mover, asked: Vec3) -> Vec3 {
+    if core.v3_len(m.wall) < 0.5 { return asked }
+    capsule = physics.character_of(m.object as *GameObject)
+    if capsule == null || m.follow {
+        m.wall = core.vec3(0.0, 0.0, 0.0)
+        return asked
+    }
+    free = physics.character_reach(capsule, core.v3_mul(m.wall, WALL_PROBE))
+    if core.v3_len(free) > WALL_PROBE * 0.5 {
+        m.wall = core.vec3(0.0, 0.0, 0.0)
+        return asked
+    }
+    into = core.v3_dot(asked, m.wall)
+    if into <= 0.0 { return asked }
+    return core.v3_sub(asked, core.v3_mul(m.wall, into))
+}
+
+// The springs' velocity into the wall eased off, `dt` seconds of it.
+off_wall(m: *Mover, dt: float) {
+    if core.v3_len(m.wall) < 0.5 { return }
+    into = core.v3_dot(m.velocity, m.wall)
+    if into <= 0.0 { return }
+    kept = fdlibm.exp(0.0 - 0.69314718056 * dt / WALL_HALF_LIFE)
+    m.velocity = core.v3_sub(m.velocity, core.v3_mul(m.wall, into * (1.0 - kept)))
+}
+
+// The facing a standing figure's spring goes toward this step on its way to
+// `goal` (#976): its feet (the animator's, if they step) are asked to turn
+// it on the spot (ikrig.feet_turn_to), the body held where it faces for
+// TURN_LEAD as the eyes, head and chest lead, then turned no further than
+// the feet let it (ikrig.feet_turn_reach). A figure that moves, follows its
+// clips or is matched turns on its spring as before, its feet asked nothing.
+stand_turn(m: *Mover, goal: float, dt: float) -> float {
+    if m.animator == null { return goal }
+    feet = animator.feet(m.animator as *Animator)
+    if feet == null { return goal }
+    standing = !m.follow && m.matcher < 0 && core.v3_len(m.velocity) < MOVING && (m.turning_first || core.v3_len(m.asked) <= MOVING)
+    ikrig.feet_turn_to(feet, goal, standing)
+    if !standing || !ikrig.feet_turns(feet) {
+        m.turn_t = 0.0 - 1.0
+        return goal
+    }
+    off = wrap(goal - m.facing)
+    if m.turn_t < 0.0 && core.abs_of(off) > TURN_START { m.turn_t = 0.0 }
+    aim = goal
+    if m.turn_t >= 0.0 {
+        if m.turn_t < TURN_LEAD { aim = m.facing }
+        m.turn_t = m.turn_t + dt
+        if core.abs_of(off) <= TURN_START && core.abs_of(m.facing_rate) < 0.1 { m.turn_t = 0.0 - 1.0 }
+    }
+    return m.facing + wrap(ikrig.feet_turn_reach(feet, aim) - m.facing)
+}
+
+// Whether the figure's feet are still turning it on the spot (a step under
+// way or still to take).
+feet_busy(m: *Mover) -> bool {
+    if m.animator == null { return false }
+    return ikrig.feet_turn_busy(animator.feet(m.animator as *Animator))
+}
+
+// Whether the figure is turning on the spot (stand_turn), and the way it is
+// to face then: what its eyes look along (ae3d.character's look), ahead of
+// the body.
+turning_on_spot(m: *Mover) -> bool { return m.turn_t >= 0.0 }
+turn_goal(m: *Mover) -> float { return wrap(facing_goal(m)) }
 
 // The figure moved by its clips' own root motion (the animator's), the
 // springs a simulation of where it should be (Holden's, for motion
@@ -215,7 +510,7 @@ adjust(m: *Mover, dt: float) {
     at = behaviour.object_position(o)
     dx = m.sim.x - at.x
     dz = m.sim.z - at.z
-    share = 1.0 - exp(0.0 - 0.69314718056 * dt / ADJUST_HALF_LIFE)
+    share = 1.0 - fdlibm.exp(0.0 - 0.69314718056 * dt / ADJUST_HALF_LIFE)
     mx = dx * share
     mz = dz * share
     far = core.sqrt_of(mx * mx + mz * mz)
@@ -240,6 +535,63 @@ adjust(m: *Mover, dt: float) {
     }
 }
 
+// The springs put on another peer's (ae3d.netanim, #911): its velocity
+// over the ground and its facing, where a figure played from the network
+// is found to have parted from the one it plays; the springs go on from
+// there, the object turned to the facing at the next step.
+correct(m: *Mover, velocity: Vec3, facing: float) {
+    m.velocity = core.vec3(velocity.x, 0.0, velocity.z)
+    m.facing = wrap(facing)
+}
+
+// Floats a mover's whole state takes (state_write).
+const STATE_FLOATS = 20
+
+// The springs' whole state, into `out` (float[STATE_FLOATS]): what a mover
+// on another peer needs to go on as this one does from here (ae3d.netanim's
+// snapshot for a peer that joins late, #911). Its object and its animator
+// are the figure's own.
+state_write(m: *Mover, out: float[]) {
+    out[0] = m.velocity.x
+    out[1] = m.velocity.z
+    out[2] = m.acceleration.x
+    out[3] = m.acceleration.z
+    out[4] = m.asked.x
+    out[5] = m.asked.z
+    out[6] = m.facing
+    out[7] = m.facing_rate
+    out[8] = m.face_asked
+    out[9] = 0.0
+    if m.strafing { out[9] = 1.0 }
+    out[10] = 0.0
+    if m.turning_first { out[10] = 1.0 }
+    out[11] = m.travelled
+    out[12] = m.sim.x
+    out[13] = m.sim.y
+    out[14] = m.sim.z
+    out[15] = m.wall.x
+    out[16] = m.wall.z
+    out[17] = m.turn_t
+    out[18] = 0.0
+    out[19] = 0.0
+}
+
+// A state state_write wrote, taken whole.
+state_read(m: *Mover, saved: float[]) {
+    m.velocity = core.vec3(saved[0], 0.0, saved[1])
+    m.acceleration = core.vec3(saved[2], 0.0, saved[3])
+    m.asked = core.vec3(saved[4], 0.0, saved[5])
+    m.facing = saved[6]
+    m.facing_rate = saved[7]
+    m.face_asked = saved[8]
+    m.strafing = saved[9] > 0.5
+    m.turning_first = saved[10] > 0.5
+    m.travelled = saved[11]
+    m.sim = core.vec3(saved[12], saved[13], saved[14])
+    m.wall = core.vec3(saved[15], 0.0, saved[16])
+    m.turn_t = saved[17]
+}
+
 // The springs at rest where the figure's object stands, facing as it
 // faces, asking nothing: after something else has moved it (a seat's
 // warped enter and exit, ae3d.character's use). Stepped on from where they
@@ -256,6 +608,28 @@ settle(m: *Mover) {
     m.asked = core.vec3(0.0, 0.0, 0.0)
     m.travelled = 0.0
     m.sim = behaviour.object_position(o)
+    m.wall = core.vec3(0.0, 0.0, 0.0)
+    m.turn_t = 0.0 - 1.0
+}
+
+// The springs at rest going at `velocity` (the world's, over the ground)
+// where the figure's object stands, facing the way it goes, and asked to go
+// on so: a figure handed over walking (a crowd's, ae3d.animlod) goes on at
+// the pace it had, where settled at a stand it would have stopped and
+// started again. The graph's parameters written at once, for the frame it
+// is handed over in.
+settle_moving(m: *Mover, velocity: Vec3) {
+    settle(m)
+    v = core.vec3(velocity.x, 0.0, velocity.z)
+    m.velocity = v
+    m.asked = v
+    if core.v3_len(v) > MOVING {
+        m.facing = core.atan2_of(v.x, v.z)
+        m.face_asked = m.facing
+        // Under way: well past any start's distance.
+        m.travelled = 1000.0
+    }
+    feed(m)
 }
 
 // Where the simulation is: the figure's object, unless the figure follows
@@ -270,7 +644,7 @@ spring_angle(x: float, v: float, goal: float, half_life: float, dt: float) -> (f
     y = damping(half_life) * 0.5
     j0 = x - goal
     j1 = v + j0 * y
-    e = exp(0.0 - y * dt)
+    e = fdlibm.exp(0.0 - y * dt)
     return e * (j0 + j1 * dt) + goal, e * (v - j1 * y * dt), 0.0
 }
 
@@ -286,11 +660,12 @@ feed(m: *Mover) {
     animator.set_float(a, "vx", across)
     animator.set_float(a, "vz", ahead)
     animator.set_float(a, "speed", speed)
-    animator.set_bool(a, "moving", speed > MOVING || core.v3_len(m.asked) > MOVING)
+    asking = core.v3_len(m.asked) > MOVING && !m.turning_first
+    animator.set_bool(a, "moving", speed > MOVING || asking)
     animator.set_float(a, "turning", m.facing_rate)
     animator.set_float(a, "rest", rest_distance(m))
     animator.set_float(a, "travelled", m.travelled)
-    animator.set_bool(a, "go", core.v3_len(m.asked) > MOVING)
+    animator.set_bool(a, "go", asking)
     if m.matcher >= 0 { ask_matcher(m) }
 }
 
@@ -310,8 +685,8 @@ future(m: *Mover, t: float) -> (Vec3, float) {
 // toward.
 rest_point(m: *Mover) -> Vec3 {
     at = sim_at(m)
-    if m.braking > 0.0 {
-        speed = core.v3_len(m.velocity)
+    speed = core.v3_len(m.velocity)
+    if m.braking > 0.0 && (m.brake_below <= 0.0 || speed <= m.brake_below) {
         if speed < 0.000001 { return at }
         far = speed * speed / (2.0 * m.braking)
         return core.vec3(at.x + m.velocity.x / speed * far, at.y, at.z + m.velocity.z / speed * far)
@@ -322,7 +697,16 @@ rest_point(m: *Mover) -> Vec3 {
     jz = m.velocity.z
     kx = m.acceleration.x + jx * y
     kz = m.acceleration.z + jz * y
-    return core.vec3(at.x + jx / y + kx / (y * y), at.y, at.z + jz / y + kz / (y * y))
+    rest = core.vec3(at.x + jx / y + kx / (y * y), at.y, at.z + jz / y + kz / (y * y))
+    // Faster than it brakes from: the spring down to that speed, then the
+    // braking, which goes further than the spring's last stretch (2 v / y,
+    // from rest acceleration) by what is between them.
+    if m.braking > 0.0 && speed > 0.000001 {
+        v = m.brake_below
+        more = v * v / (2.0 * m.braking) - 2.0 * v / y
+        if more > 0.0 { rest = core.vec3(rest.x + m.velocity.x / speed * more, rest.y, rest.z + m.velocity.z / speed * more) }
+    }
+    return rest
 }
 
 // The distance to rest_point over the ground.
@@ -341,7 +725,34 @@ rest_distance(m: *Mover) -> float {
 // actor took a metre, and the stop entered on its last half step.
 set_braking(m: *Mover, deceleration: float) { m.braking = deceleration }
 
-braking_now(m: *Mover) -> bool { return m.braking > 0.0 && core.v3_len(m.asked) <= MOVING && core.v3_len(m.velocity) > 0.0 }
+// And brake so only from `speed` down (0: from any speed); faster, the
+// velocity's spring slows it to that first, as a run slows to a walk before
+// it stops. A walk's stop's braking (0.41 m/s^2) taken from a run at 3 m/s
+// left a figure still going 1.35 m/s 4 s after it was let go.
+set_braking_below(m: *Mover, speed: float) { m.brake_below = speed }
+
+// While its animator plays a start by the distance come (animator.clock_by,
+// clock_pace), the figure goes no faster than `most` times that take's own
+// pace where it is (0: as the springs go): a start set off at its own pace,
+// as a stop brakes at its own (set_braking), so its distance clock keeps to
+// real time. On the springs alone the figure outran the people's StartStop
+// start from its move-off, its clock running up to twice its pace and a
+// ball turning 18 rad/s against the takes' own fastest 14.9 (#937).
+set_start_pace(m: *Mover, most: float) { m.start_pace = most }
+
+// The fastest the figure may go now (set_start_pace), -1 any.
+start_most(m: *Mover) -> float {
+    if m.start_pace <= 0.0 || m.animator == null { return 0.0 - 1.0 }
+    pace = animator.clock_pace(m.animator as *Animator)
+    if pace < 0.0 { return 0.0 - 1.0 }
+    return pace * m.start_pace
+}
+
+braking_now(m: *Mover) -> bool {
+    speed = core.v3_len(m.velocity)
+    if m.brake_below > 0.0 && speed > m.brake_below { return false }
+    return m.braking > 0.0 && core.v3_len(m.asked) <= MOVING && speed > 0.0
+}
 
 // The animator's matcher `state` asked, every step, for the way ahead the
 // springs predict (its place and facing a third, two thirds and a whole
