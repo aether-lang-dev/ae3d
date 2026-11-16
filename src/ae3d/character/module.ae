@@ -52,6 +52,7 @@ import ae3d.animgraph
 import ae3d.physanim
 import ae3d.motion
 import ae3d.items
+import ae3d.jobs
 
 extern calloc(count: int, size: int) -> ptr
 extern free(p: ptr)
@@ -1583,6 +1584,14 @@ struct Planned {
     state: int                     // the get-up's state (act_planned)
     held: bool                     // its take held at its start while a hand is drawn out (hold_take), and the rate it had
     held_rate: float
+    own_pelvis: float              // the get-up take's own fastest pelvis, m/s (plan_turn)
+    pelvis_most: float             // the playback's fastest pelvis, m/s (plan_slower)
+    kept_at: ptr                   // float[joints * 4]: each joint's way round this frame, chosen beforehand (play_ahead); null: chosen as it goes (kept_way)
+    marks: ptr                     // float[MARKS_MOST * 6]: this frame's floor checks' raises kept back (check_lift); null: made at once
+    mark_n: int
+    play: ptr                      // *Playback: plan_slower's frames and its workers' plans, made once
+    own_turn: float                // the take's own fastest joint turn, rad/s (take_turn_fastest), read once a take
+    own_turn_of: ptr               // and the take it is of
 }
 
 planned_of(c: *Character) -> *Planned {
@@ -1604,6 +1613,11 @@ planned_of(c: *Character) -> *Planned {
     pl.limb_lift = calloc(LIFTS * LIFT_MOST, 8)
     pl.limb_need = calloc(LIFTS * LIFT_MOST, 8)
     pl.limb_axes = calloc(LIFTS * LIFT_MOST * 3, 8)
+    pl.kept_at = null
+    pl.marks = null
+    pl.mark_n = 0
+    pl.play = null
+    pl.own_turn_of = null
     // Each limb's joints, and its end's, parents first (world_under).
     count = pose.count(r)
     pl.limb_list = calloc(4 * count, 4)
@@ -1694,6 +1708,7 @@ planned_free(pl: *Planned) {
     free(pl.limb_n)
     free(pl.end_list)
     free(pl.end_n)
+    playback_free(pl.play)
     heap.free(pl)
 }
 
@@ -2181,12 +2196,20 @@ plan_frame(pl: *Planned, r: *pose.Rig, out: ptr, t_in: float) {
 const TURN_TRIES = 5
 
 plan_turn(pl: *Planned, r: *pose.Rig, o: *GameObject, t: *Take, drawn: ptr, first: ptr, w: ptr, blend: float) {
+    pl.own_pelvis = take_pelvis_fastest(r, o, t, pl.clip, pl.clip_w)
     tries = 0
     slower, raised = plan_slower(pl, r, t)
-    while (slower > 1.0 || raised) && tries < TURN_TRIES {
+    while (slower > 1.0 || raised || pl.pelvis_most > pl.own_pelvis) && tries < TURN_TRIES {
         if slower > 1.0 && pl.turn < EASE_MOST {
             pl.turn = core.clampf(pl.turn * slower * TURN_MORE, blend, EASE_MOST)
             pl.drop = get_up_blend(r, o, t, drawn, first, w, pl.turn)
+            plan_lift(pl, r, t)
+        } else if pl.pelvis_most > pl.own_pelvis && pl.drop < EASE_MOST && pl.own_pelvis > 0.0 {
+            // The pelvis drawn faster than the take's own (seed 26: 1.27
+            // m/s against LayToIdle's 1.22, its body lying heaped on its
+            // knees, the hips' lift on top of the drop get_up_blend sizes):
+            // the drop lengthened as the turn is.
+            pl.drop = core.clampf(pl.drop * pl.pelvis_most / pl.own_pelvis * TURN_MORE, pl.drop, EASE_MOST)
             plan_lift(pl, r, t)
         } else if raised {
             lifts_eased(pl, pl.lift_n)
@@ -2213,43 +2236,324 @@ const TURN_MORE = 1.05
 // its own 30 moments a second, on its trunks before the turn is lengthened
 // and a hand drawn out, and over the 600 knockdowns of test_knockdowns with
 // limp bodies untoned (#1002) a hand drawn so went up to 11 cm under it.
+//
+// Its frames are drawn over the job pool (jobs.parallel_for), each on its own:
+// the take's pose at each and each joint's way round (kept_way, which goes
+// on from the frame before) made first, in order, on this thread
+// (play_ahead); then every frame planned and checked against the floor by
+// whichever worker takes it, on scratch poses of the worker's own, its
+// floor checks' raises kept back (check_lift); then, in order, the turns
+// frame to frame, the pelvis's speed and the raises (play_gather). Played
+// one frame after another on this thread, a get-up's planning took up to 42
+// ms (test_knockdowns), most of it here.
 plan_slower(pl: *Planned, r: *pose.Rig, t: *Take) -> (float, bool) {
-    own = take_turn_fastest(r, t, pl.clip, pl.clip_w)
+    if pl.own_turn_of != t as ptr {
+        pl.own_turn = take_turn_fastest(r, t, pl.clip, pl.clip_w)
+        pl.own_turn_of = t as ptr
+    }
+    own = pl.own_turn
     if own <= 0.0 { return 1.0, false }
-    out = pose.new(r)
-    was = pose.new(r)
-    // From its first moment as planned, as get_up draws it before the
-    // animator eases on.
+    n =((pl.free + pl.drop) * 60.0) as int + 1
+    pb = play_ahead(pl, r, t, n)
+    jobs.parallel_for(play_block, n + 1, PLAY_GRAIN, pb as ptr)
+    most, raised = play_gather(pl, r, pb)
     pl.fresh = true
-    clips.sample(t, r, 0.0, false, was)
-    plan_frame(pl, r, was, 0.0)
-    most = 0.0
-    raised = false
-    n = ((pl.free + pl.drop) * 60.0) as int + 1
-    f = 1
+    return most / own, raised
+}
+
+// The frames a worker takes at a time, and the most raises a frame keeps
+// back (four limbs, two lifts each).
+const PLAY_GRAIN = 4
+const MARKS_MOST = 8
+
+// plan_slower's playback: its frames and its workers', made once per figure
+// and grown as a longer one needs.
+struct Playback {
+    rig: ptr                       // *pose.Rig
+    take: ptr                      // *Take
+    n: int                         // frames 0 to n played
+    room: int                      // frames made room for
+    frames: ptr                    // ptr[room]: the take's pose at each frame, then the pose drawn there
+    kept: ptr                      // float[room * joints * 4]: each joint's way round at each frame (kept_way)
+    fresh: ptr                     // int[room]: 1 at a frame before the hand-over's first turned one, and that one
+    pelvis: ptr                    // float[room * 3]: the pelvis drawn at each frame (planned_pelvis)
+    marks: ptr                     // float[room * MARKS_MOST * 6]: each frame's raises kept back (check_lift)
+    mark_n: ptr                    // int[room]
+    workers: ptr                   // ptr[count]: a *Planned per worker, the plan read through it, the scratch its own
+    count: int
+}
+
+playback_of(pl: *Planned, r: *pose.Rig, n: int) -> *Playback {
+    pb = pl.play as *Playback
+    // A pool started since: made again, a plan for each of its workers.
+    if pb != null && pb.count < jobs.threads() {
+        playback_free(pl.play)
+        pl.play = null
+        pb = null
+    }
+    if pb == null {
+        pb = heap.new(Playback)
+        pb.room = 0
+        pb.frames = null
+        pb.count = jobs.threads()
+        pb.workers = calloc(pb.count, 8)
+        w = pb.workers as ptr[]
+        i = 0
+        while i < pb.count {
+            wk = heap.new(Planned)
+            wk.clip = pose.new(r)
+            wk.clip_w = pose.new(r)
+            wk.worlds = pose.new(r)
+            wk.kept = pose.new(r)
+            wk.lift_axes = calloc(LIFTS * 3, 8)
+            w[i] = wk as ptr
+            i = i + 1
+        }
+        pl.play = pb as ptr
+    }
+    if n + 1 > pb.room {
+        room = n + 1
+        frames = calloc(room, 8) as ptr[]
+        old = pb.frames as ptr[]
+        i = 0
+        while i < room {
+            if i < pb.room {
+                frames[i] = old[i]
+            } else {
+                frames[i] = pose.new(r)
+            }
+            i = i + 1
+        }
+        if pb.room > 0 {
+            free(pb.frames)
+            free(pb.kept)
+            free(pb.fresh)
+            free(pb.pelvis)
+            free(pb.marks)
+            free(pb.mark_n)
+        }
+        pb.frames = frames as ptr
+        pb.kept = calloc(room * pose.count(r) * 4, 8)
+        pb.fresh = calloc(room, 4)
+        pb.pelvis = calloc(room * 3, 8)
+        pb.marks = calloc(room * MARKS_MOST * 6, 8)
+        pb.mark_n = calloc(room, 4)
+        pb.room = room
+    }
+    pb.rig = r as ptr
+    pb.n = n
+    return pb
+}
+
+playback_free(p: ptr) {
+    if p == null { return }
+    pb = p as *Playback
+    w = pb.workers as ptr[]
+    i = 0
+    while i < pb.count {
+        wk = w[i] as *Planned
+        pose.release(wk.clip)
+        pose.release(wk.clip_w)
+        pose.release(wk.worlds)
+        pose.release(wk.kept)
+        free(wk.lift_axes)
+        heap.free(wk)
+        i = i + 1
+    }
+    free(pb.workers)
+    if pb.room > 0 {
+        frames = pb.frames as ptr[]
+        i = 0
+        while i < pb.room {
+            pose.release(frames[i])
+            i = i + 1
+        }
+        free(pb.frames)
+        free(pb.kept)
+        free(pb.fresh)
+        free(pb.pelvis)
+        free(pb.marks)
+        free(pb.mark_n)
+    }
+    heap.free(pb)
+}
+
+// The playback's `n` + 1 frames of take `t` made ready, in order: each
+// frame's take pose (held at its start while a hand is drawn out, as
+// hold_take holds it), each joint's way round as blend_locals would choose it
+// frame after frame, and the workers' plans read through pl as it stands.
+play_ahead(pl: *Planned, r: *pose.Rig, t: *Take, n: int) -> *Playback {
+    pb = playback_of(pl, r, n)
+    pb.take = t as ptr
+    frames = pb.frames as ptr[]
+    kept = pb.kept as float[]
+    fresh = pb.fresh as int[]
+    joints = pose.count(r)
+    first = true
+    f = 0
     while f <= n {
         at = (f as float) / 60.0
-        // The take held at its start while a hand is drawn out (hold_take).
-        clips.sample(t, r, core.clampf(at - pl.free, 0.0, 1000.0), false, out)
-        plan_frame(pl, r, out, at)
-        x = joints_turned(r, was, out) * 60.0
-        if x > most { most = x }
-        // The limbs as drawn this frame against the floor.
-        moment = ((pl.last_t * PLAN_RATE + 0.5) as int)
-        if moment < pl.lift_n - 1 {
-            pose.world(r, out, pl.worlds)
-            k = 0
-            while k < 4 {
-                if check_limb(pl, r, pl.worlds, k, pl.last_t, moment) { raised = true }                k = k + 1
+        clips.sample(t, r, core.clampf(at - pl.free, 0.0, 1000.0), false, frames[f])
+        fresh[f] = 0
+        if first { fresh[f] = 1 }
+        if at >= pl.free {
+            j = 0
+            while j < joints {
+                to = kept_way(pose.rotation(pl.from, j), pose.rotation(frames[f], j), pose.rotation(pl.kept, j), first)
+                pose.set_rotation(pl.kept, j, to)
+                at4 = (f * joints + j) * 4
+                kept[at4] = to.x
+                kept[at4 + 1] = to.y
+                kept[at4 + 2] = to.z
+                kept[at4 + 3] = to.w
+                j = j + 1
             }
+            first = false
         }
-        pose.copy(r, out, was)
         f = f + 1
     }
-    pl.fresh = true
-    pose.release(out)
-    pose.release(was)
-    return most / own, raised
+    // The figure's transforms brought up to date here, so the workers only
+    // read them.
+    _o = behaviour.object_position(pl.object as *GameObject)
+    _g = clips.ground_point(r, core.vec3(0.0, 0.0, 0.0))
+    w = pb.workers as ptr[]
+    i = 0
+    while i < pb.count {
+        play_sync(w[i] as *Planned, pl)
+        i = i + 1
+    }
+    return pb
+}
+
+// Worker plan `w` reading the plan `pl` as it stands: everything but its
+// scratch (clip, clip_w, worlds, kept, lift_axes) and the frame's own.
+play_sync(w: *Planned, pl: *Planned) {
+    w.engine = pl.engine
+    w.object = pl.object
+    w.snap = pl.snap
+    w.lift = pl.lift
+    w.lift_n = pl.lift_n
+    w.limb_lift = pl.limb_lift
+    w.limb_need = pl.limb_need
+    w.limb_list = pl.limb_list
+    w.limb_n = pl.limb_n
+    w.end_list = pl.end_list
+    w.end_n = pl.end_n
+    w.limb_axes = pl.limb_axes
+    w.recording = false
+    w.turn = pl.turn
+    w.drop = pl.drop
+    w.lower = pl.lower
+    w.from = pl.from
+    w.free = pl.free
+    w.free_on = pl.free_on
+    w.free_path = pl.free_path
+    w.play = null
+}
+
+// Frames `start` to `end` of the playback, on worker `worker`'s plan: each
+// drawn as plan_step draws it (into its frame's pose), checked against the
+// floor, and its pelvis read.
+play_block(start: int, end: int, worker: int, context: ptr) {
+    pb = context as *Playback
+    w = (pb.workers as ptr[])[worker] as *Planned
+    r = pb.rig as *pose.Rig
+    t = pb.take as *Take
+    frames = pb.frames as ptr[]
+    joints = pose.count(r)
+    f = start
+    while f < end {
+        at = (f as float) / 60.0
+        out = frames[f]
+        w.fresh = (pb.fresh as int[])[f] == 1
+        w.kept_at = pb.kept + f * joints * 4 * 8
+        w.marks = pb.marks + f * MARKS_MOST * 6 * 8
+        w.mark_n = 0
+        plan_frame(w, r, out, at)
+        if f > 0 {
+            // The limbs as drawn this frame against the floor.
+            moment = ((w.last_t * PLAN_RATE + 0.5) as int)
+            if moment < w.lift_n - 1 {
+                pose.world(r, out, w.worlds)
+                k = 0
+                while k < 4 {
+                    _raised = check_limb(w, r, w.worlds, k, w.last_t, moment)
+                    k = k + 1
+                }
+            }
+            // The pelvis drawn where the take's root carries it.
+            p = planned_pelvis(w, r, out, t, core.clampf(at - w.free, 0.0, 1000.0))
+            v = pb.pelvis as float[]
+            v[f * 3] = p.x
+            v[f * 3 + 1] = p.y
+            v[f * 3 + 2] = p.z
+        }
+        (pb.mark_n as int[])[f] = w.mark_n
+        f = f + 1
+    }
+    w.kept_at = null
+    w.marks = null
+}
+
+// The playback's frames, in order: the fastest joint turn from one to the
+// next (radians a second), the pelvis's fastest (pl.pelvis_most), and each
+// frame's floor checks' raises made (need_raised). Whether any was.
+play_gather(pl: *Planned, r: *pose.Rig, pb: *Playback) -> (float, bool) {
+    frames = pb.frames as ptr[]
+    v = pb.pelvis as float[]
+    marks = pb.marks as float[]
+    most = 0.0
+    raised = false
+    pl.pelvis_most = 0.0
+    f = 1
+    while f <= pb.n {
+        x = joints_turned(r, frames[f - 1], frames[f]) * 60.0
+        if x > most { most = x }
+        if f > 1 {
+            s = core.v3_len(core.vec3(v[f * 3] - v[f * 3 - 3], v[f * 3 + 1] - v[f * 3 - 2], v[f * 3 + 2] - v[f * 3 - 1])) * 60.0
+            if s > pl.pelvis_most { pl.pelvis_most = s }
+        }
+        i = 0
+        while i < (pb.mark_n as int[])[f] {
+            at = (f * MARKS_MOST + i) * 6
+            need_raised(pl, marks[at] as int, marks[at + 1] as int, marks[at + 2], core.vec3(marks[at + 3], marks[at + 4], marks[at + 5]))
+            raised = true
+            i = i + 1
+        }
+        f = f + 1
+    }
+    return most, raised
+}
+
+// The pelvis of local pose `p` (the hand-over drawn `at` seconds into take
+// `t`) where the take's root motion has carried it, about the object, in
+// its frame (as take_pelvis_at reads the take's own).
+planned_pelvis(pl: *Planned, r: *pose.Rig, p: ptr, t: *Take, at: float) -> Vec3 {
+    o = pl.object as *GameObject
+    went = clips.travel(t, at)
+    zero = clips.ground_point(r, core.vec3(0.0, 0.0, 0.0))
+    ground = core.v3_sub(clips.ground_point(r, core.vec3(went.x, 0.0, went.y)), zero)
+    carried = core.quat_apply(core.quat_conjugate(behaviour.object_rotation(o)), ground)
+    turned = core.quat_apply(core.quat_rotate(went.z, core.vec3(0.0, 1.0, 0.0)), joint_about(r, o, p, pl.worlds, pose.PELVIS))
+    return core.v3_add(carried, turned)
+}
+
+// Take `t`'s own fastest pelvis, m/s (take_pelvis_speeds); `w` and `p`
+// poses to work in.
+take_pelvis_fastest(r: *pose.Rig, o: *GameObject, t: *Take, w: ptr, p: ptr) -> float {
+    frames = clips.frames(t)
+    if frames < 2 { return 0.0 }
+    speeds = take_pelvis_speeds(r, o, t, w, p)
+    v = speeds as float[]
+    most = 0.0
+    f = 0
+    while f < frames - 1 {
+        s = core.v3_len(core.vec3(v[f * 3], v[f * 3 + 1], v[f * 3 + 2]))
+        if s > most { most = s }
+        f = f + 1
+    }
+    free(speeds)
+    return most
 }
 
 // The most any joint of local pose `p` is turned off `q`'s, radians.
@@ -2293,8 +2597,15 @@ blend_locals(pl: *Planned, r: *pose.Rig, a_pose: ptr, b_pose: ptr, u: float, out
     j = 0
     while j < pose.count(r) {
         from = pose.rotation(a_pose, j)
-        to = kept_way(from, pose.rotation(b_pose, j), pose.rotation(pl.kept, j), pl.fresh)
-        pose.set_rotation(pl.kept, j, to)
+        to = pose.rotation(b_pose, j)
+        if pl.kept_at != null {
+            // Chosen beforehand, in order (play_ahead).
+            k4 = pl.kept_at as float[]
+            to = core.quat(k4[j * 4], k4[j * 4 + 1], k4[j * 4 + 2], k4[j * 4 + 3])
+        } else {
+            to = kept_way(from, to, pose.rotation(pl.kept, j), pl.fresh)
+            pose.set_rotation(pl.kept, j, to)
+        }
         pose.set_rotation(out, j, slerp_as_is(from, to, u))
         pose.set_translation(out, j, core.v3_lerp(pose.translation(a_pose, j), pose.translation(b_pose, j), u))
         j = j + 1
@@ -2551,6 +2862,28 @@ check_lift(pl: *Planned, slot: int, pivot: Vec3, p: Vec3, least: float, t: float
     lack = ikrig.lift_about(pivot, p, least, axis)
     if lack <= 0.0 { return false }
     want = limb_lift_at(pl, slot, t) + lack
+    if pl.marks != null {
+        // Kept back, to be raised with the other frames', in order.
+        if pl.mark_n < MARKS_MOST {
+            k6 = pl.marks as float[]
+            at6 = pl.mark_n * 6
+            k6[at6] = slot as float
+            k6[at6 + 1] = m as float
+            k6[at6 + 2] = want
+            k6[at6 + 3] = axis.x
+            k6[at6 + 4] = axis.y
+            k6[at6 + 5] = axis.z
+            pl.mark_n = pl.mark_n + 1
+        }
+        return true
+    }
+    need_raised(pl, slot, m, want, axis)
+    return true
+}
+
+// Lift `slot`'s need at moment `m` raised to `want`, about `axis` where no
+// axis is planned there yet (check_lift).
+need_raised(pl: *Planned, slot: int, m: int, want: float, axis: Vec3) {
     need = pl.limb_need as float[]
     if want > need[slot * LIFT_MOST + m] { need[slot * LIFT_MOST + m] = want }
     axes = pl.limb_axes as float[]
@@ -2560,7 +2893,6 @@ check_lift(pl: *Planned, slot: int, pivot: Vec3, p: Vec3, least: float, t: float
         axes[at + 1] = axis.y
         axes[at + 2] = axis.z
     }
-    return true
 }
 
 // Moment `i` (PLAN_RATE a second) of the hand-over into take `t`, the
@@ -2817,9 +3149,12 @@ lift_least(pl: *Planned, p: Vec3, flat: bool) -> float {
 }
 
 // Lift `slot`'s axis last frame, held to (ikrig.lift_turn's `keep`); zero
-// for a take's own frame (`flat`) or the hand-over's first.
+// for a take's own frame (`flat`) or the hand-over's first. Played as
+// planned (not recording), the axis planned for the moment: each frame then
+// stands on its own, as plan_slower's playback over the job pool draws it.
 lift_kept(pl: *Planned, slot: int, flat: bool) -> Vec3 {
     if flat || pl.fresh { return core.vec3(0.0, 0.0, 0.0) }
+    if !pl.recording { return limb_axis_at(pl, slot, pl.last_t) }
     axes = pl.lift_axes as float[]
     return core.vec3(axes[slot * 3], axes[slot * 3 + 1], axes[slot * 3 + 2])
 }
