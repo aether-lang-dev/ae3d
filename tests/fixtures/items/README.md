@@ -27,7 +27,15 @@ A kind declares:
   way that hand's knuckles face: a rifle's fore-end, held from under it);
   and `mirrored` where the second hand mirrors the main across the item
   (a bowl's, a tray's) rather than stacking on the handle with it (an
-  axe's);
+  axe's); either grip may end `roll <radians>`, how far the hand may turn
+  round it to bring its elbow down with its wrist in its range (a rifle's
+  round fore-end; none for a pistol grip, held as shaped);
+- `butt <x y z>` and `sight <x y z>`: a shouldered weapon's butt plate's
+  middle and a point on its sight line (the line along its front). Aimed,
+  its butt goes in the main side's shoulder pocket, its sight line to the
+  eye on that side (the head brought down onto the stock), the trunk turning
+  that line onto the point (`items.aim`); at the ready it is pitched about
+  the butt, muzzle down or up, the head level (`items.ready`);
 - `trigger <x y z>`, for the index;
 - `edge <from> <to>`: a blade's edge or a club's striking face;
 - `socket <name> <joint> <offset> <up> <front>`: where it is carried, by a
