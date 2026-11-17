@@ -25,6 +25,11 @@ struct Cut {
     int joints0;
     int joints1;
     int joints2;
+    int joints3;
+    int joints4;
+    int joints5;
+    int joints6;
+    int joints7;
 };
 struct Eye {
     mat4 view_projection;
@@ -42,13 +47,14 @@ struct Eye {
     int ray_frame;
 };
 struct Skin {
-    mat4 bones[96];
-    vec4 prev_rows[288];
+    int base;
+    int prev_base;
 };
 uniform Draw draw;
 uniform Cut cut;
 uniform Skin skin;
 uniform Eye eye;
+uniform sampler2D skin_rows;
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec2 inTexCoord;
 layout(location = 2) in vec3 inNormal;
@@ -76,20 +82,34 @@ out vec3 FlipNext;
 
 float ae3d_shaders_lit_clip_joint_on(float joint) {
     int j = int((joint + 0.5));
-    int word = j < 32 ? cut.joints0 : (j < 64 ? cut.joints1 : cut.joints2);
+    int w = j >> 5;
+    int word = w < 4 ? (w < 2 ? (w == 0 ? cut.joints0 : cut.joints1) : (w == 2 ? cut.joints2 : cut.joints3)) : (w < 6 ? (w == 4 ? cut.joints4 : cut.joints5) : (w == 6 ? cut.joints6 : cut.joints7));
     return float((word >> (j & 31) & 1));
 }
 
 float ae3d_shaders_lit_clip_limb_of(vec4 joints, vec4 weights) {
-    if (draw.skinned == 0 || (cut.joints0 | cut.joints1 | cut.joints2) == 0) {
+    if (draw.skinned == 0 || (cut.joints0 | cut.joints1 | cut.joints2 | cut.joints3 | cut.joints4 | cut.joints5 | cut.joints6 | cut.joints7) == 0) {
         return 1.0;
     }
     return weights.x * ae3d_shaders_lit_clip_joint_on(joints.x) + weights.y * ae3d_shaders_lit_clip_joint_on(joints.y) + weights.z * ae3d_shaders_lit_clip_joint_on(joints.z) + weights.w * ae3d_shaders_lit_clip_joint_on(joints.w);
 }
 
+mat4 ae3d_shaders_lit_skin_bone(float joint) {
+    int j = skin.base + int((joint + 0.5)) * 4;
+    return mat4(texelFetch(skin_rows, ivec2(j % 1024, j / 1024), 0), texelFetch(skin_rows, ivec2((j + 1) % 1024, (j + 1) / 1024), 0), texelFetch(skin_rows, ivec2((j + 2) % 1024, (j + 2) / 1024), 0), texelFetch(skin_rows, ivec2((j + 3) % 1024, (j + 3) / 1024), 0));
+}
+
+mat4 ae3d_shaders_lit_skin_now_of() {
+    return ((((inWeights.x * ae3d_shaders_lit_skin_bone(inJoints.x)) + (inWeights.y * ae3d_shaders_lit_skin_bone(inJoints.y))) + (inWeights.z * ae3d_shaders_lit_skin_bone(inJoints.z))) + (inWeights.w * ae3d_shaders_lit_skin_bone(inJoints.w)));
+}
+
 mat4 ae3d_shaders_lit_prev_bone(float joint) {
-    int j = int((joint + 0.5)) * 3;
-    return transpose(mat4(skin.prev_rows[j], skin.prev_rows[j + 1], skin.prev_rows[j + 2], vec4(vec3(0.0, 0.0, 0.0), 1.0)));
+    int j = skin.prev_base + int((joint + 0.5)) * 3;
+    return transpose(mat4(texelFetch(skin_rows, ivec2(j % 1024, j / 1024), 0), texelFetch(skin_rows, ivec2((j + 1) % 1024, (j + 1) / 1024), 0), texelFetch(skin_rows, ivec2((j + 2) % 1024, (j + 2) / 1024), 0), vec4(vec3(0.0, 0.0, 0.0), 1.0)));
+}
+
+mat4 ae3d_shaders_lit_skin_prev_of() {
+    return ((((inWeights.x * ae3d_shaders_lit_prev_bone(inJoints.x)) + (inWeights.y * ae3d_shaders_lit_prev_bone(inJoints.y))) + (inWeights.z * ae3d_shaders_lit_prev_bone(inJoints.z))) + (inWeights.w * ae3d_shaders_lit_prev_bone(inJoints.w)));
 }
 
 void main() {
@@ -143,8 +163,8 @@ void main() {
     vec4 posed_prev = posed0;
     vec3 posed_normal = inNormal;
     if (draw.skinned != 0) {
-        mat4 skin_now = ((((inWeights.x * skin.bones[int(inJoints.x)]) + (inWeights.y * skin.bones[int(inJoints.y)])) + (inWeights.z * skin.bones[int(inJoints.z)])) + (inWeights.w * skin.bones[int(inJoints.w)]));
-        mat4 skin_prev = ((((inWeights.x * ae3d_shaders_lit_prev_bone(inJoints.x)) + (inWeights.y * ae3d_shaders_lit_prev_bone(inJoints.y))) + (inWeights.z * ae3d_shaders_lit_prev_bone(inJoints.z))) + (inWeights.w * ae3d_shaders_lit_prev_bone(inJoints.w)));
+        mat4 skin_now = ae3d_shaders_lit_skin_now_of();
+        mat4 skin_prev = ae3d_shaders_lit_skin_prev_of();
         posed_prev = (skin_prev * posed0);
         posed = (skin_now * posed0);
         posed_normal = (mat3(skin_now) * inNormal);
