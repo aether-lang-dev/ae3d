@@ -725,7 +725,7 @@ step "Vulkan under the validation layer, synchronization included"
 # the layer reports fails the suite. The loader names every layer it inserts
 # when asked (VK_LOADER_DEBUG=layer): a run it did not insert the layer into
 # would pass having checked nothing, so that is a skip, never a pass.
-for name in test_fog test_overlay test_hud_layout test_damage test_backend_parity test_gi test_pick test_pick_crowd test_view; do
+for name in test_fog test_overlay test_hud_layout test_damage test_backend_parity test_gi test_pick test_pick_crowd test_view test_skinned_render; do
     if ! built_ok "$name"; then
         skip "$name under the layer" "did not build"
         continue

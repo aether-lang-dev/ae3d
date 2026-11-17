@@ -50,7 +50,7 @@ exports (
     clusters_reserve, clusters_lights, clusters_words, clusters_buffer,
     start, stop, set_layout, view_layout, world_layout, frame_blocks, frame_sets, scene_sets,
     pool, reset, forget_all, forget_texture, forget_aux, texture_destroy,
-    program, set_program, block, set_float, set_int, set_vec3, set_mat4, set_mat4v, set_vec4v, set_mat4_floats, set_clip_mat4,
+    program, set_program, block, set_palette, set_float, set_int, set_vec3, set_mat4, set_mat4v, set_vec4v, set_mat4_floats, set_clip_mat4,
     set_inv_viewproj, set_float_array, set_vec3_array, offset, clip_correct, mat4_mul, mat4_invert,
     ring_begin, ring_push, ring_buffer, set_for, allocate, rewrite_shadow, set_sky_light, sky_view, sky_sampler,
     set_occlusion, set_probes,
@@ -75,9 +75,9 @@ const AUX_SCENE_DEPTH = 0 - 1
 // A cached set whose texture has been destroyed. Not zero: zero is a
 // texture handle nothing uses, and not -1 alone, which reads as an error.
 const SET_FREE = 0 - 2
-// The draw set's bindings: its block, colour, normal map, auxiliary image
-// and damage mask.
-const BINDINGS = 5
+// The draw set's bindings: its block, colour, normal map, auxiliary image,
+// damage mask and skin rows.
+const BINDINGS = 6
 // The camera set's where the device traces (6 elsewhere), and the world's (4).
 const VIEW_BINDINGS = 9
 const WORLD_BINDINGS = 5
@@ -93,6 +93,12 @@ const SCENE_SETS = 3
 const DRAWS_PER_FRAME = 4096
 // Rings a slot can have outgrown in one frame, kept until its fence passes.
 const RETIRED_MOST = 16
+// A ring is read as the draws' blocks (binding 0) and as the skin rows
+// their palettes are appended to (binding 10, #855).
+fn ring_usage() -> int { return vk.BUFFER_USAGE_UNIFORM_BUFFER_BIT | vk.BUFFER_USAGE_STORAGE_BUFFER_BIT }
+// A skinned draw's palettes in the skin rows, in vec4s a bone: this frame's
+// matrix, four columns, and last frame's top three rows (#639).
+const PALETTE_VEC4S = 7
 // What a slot's cluster buffers start at: enough for a street of lamps
 // without a regrow, a few kilobytes against the scene's megabytes.
 const CLUSTER_LIGHT_BYTES = 20480    // 256 lamps of five vec4s
@@ -125,6 +131,13 @@ var g_ring_gen: ptr = null         // int[FRAMES]: which ring of the slot this i
 var g_retired: ptr = null          // ptr[FRAMES * RETIRED_MOST * 3]: outgrown rings, buffer, memory, mapped
 var g_retired_count: ptr = null    // int[FRAMES]
 var g_stride = 0
+var g_align = 16                   // what a slice of the ring starts on
+// A skinned draw's palettes, staged per program as its block is (#855):
+// PALETTE_VEC4S vec4s a bone, this frame's columns for every bone and then
+// last frame's rows; appended to the ring after the draw's block.
+var g_palettes: ptr = null         // ptr[PROGRAM_COUNT]
+var g_palette_room: ptr = null     // int[PROGRAM_COUNT]: bones each holds
+var g_palette_bones: ptr = null    // int[PROGRAM_COUNT]: bones staged now
 // A draw that is not skinned takes this much of the ring, the block up to its
 // bone palettes, aligned (#726): its binding still spans the whole block, the
 // rest the next draw's, which a shader that poses nothing never reads.
@@ -231,10 +244,13 @@ start() -> bool {
 
     // The draw's set: its block, read by both stages, its colour and normal
     // map, the auxiliary image at 4 (the pose bank the crowd's vertex
-    // shader reads its bones from, so both stages), and its damage mask.
-    g_set_layout = set_layout_of([0, 1, 3, 4, 9], [vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+    // shader reads its bones from, so both stages), its damage mask, and at
+    // 10 the ring again as the skin rows a skinned draw's vertex shader
+    // reads its palettes from (#855).
+    g_set_layout = set_layout_of([0, 1, 3, 4, 9, 10], [vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                  vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                 vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER], [true, false, false, true, false], BINDINGS)
+                                 vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, vk.DESCRIPTOR_TYPE_STORAGE_BUFFER],
+                                 [true, false, false, true, false, true], BINDINGS)
     // The camera's: its block, the cascades' atlas, the clustered lamps and
     // the cells' lists (storage buffers), the lamps' atlas, the screen's
     // occlusion, and last what only a device that traces has, so it can be
@@ -273,14 +289,16 @@ start() -> bool {
 
     // Every draw gets its own slice of one mapped buffer, bound with a
     // dynamic offset.
+    // At least a vec4's: the skin rows after a block are read by the vec4.
     alignment = vkdevice.uniform_alignment()
-    if alignment == 0 { alignment = 1 }
-    g_stride = (vkscene.DRAW_SIZE + alignment - 1) / alignment * alignment
+    if alignment < 16 { alignment = 16 }
+    g_align = alignment
+    g_stride =(vkscene.DRAW_SIZE + alignment - 1) / alignment * alignment
     g_short = (vkscene.SCENE_SKIN_FROM + alignment - 1) / alignment * alignment
     host = vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT
     f = 0
     while f < FRAMES {
-        ring = vkhost.buffer_of(g_stride * DRAWS_PER_FRAME, vk.BUFFER_USAGE_UNIFORM_BUFFER_BIT, host)
+        ring = vkhost.buffer_of(g_stride * DRAWS_PER_FRAME, ring_usage(), host)
         (g_ring_buffer as ptr[])[f] = ring.buffer
         (g_ring_memory as ptr[])[f] = ring.memory
         if ring.buffer == null {
@@ -433,17 +451,20 @@ buffer_write(set: @keep ptr, binding: int, type: int, buffer: @keep ptr, range: 
 // when it would not make.
 make_pool() -> ptr {
     d = vkhost.device()
-    sizes = calloc(2, sizeof(VkDescriptorPoolSize))
+    sizes = calloc(3, sizeof(VkDescriptorPoolSize))
     s0 = sizes as *VkDescriptorPoolSize
     s0.type = vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
     s0.descriptorCount = FRAMES * MAX_SETS
     s1 = (sizes + sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
     s1.type = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
     s1.descriptorCount = FRAMES * MAX_SETS * 4
+    s2 = (sizes + 2 * sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
+    s2.type = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+    s2.descriptorCount = FRAMES * MAX_SETS
     pool_info = calloc(1, sizeof(VkDescriptorPoolCreateInfo)) as *VkDescriptorPoolCreateInfo
     pool_info.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
     pool_info.maxSets = FRAMES * MAX_SETS
-    pool_info.poolSizeCount = 2
+    pool_info.poolSizeCount = 3
     pool_info.pPoolSizes = sizes
     r = vk.vkCreateDescriptorPool(d, pool_info as ptr, null, g_cell)
     made = (g_cell as ptr[])[0]
@@ -504,7 +525,8 @@ grow_sets() {
     g_set_room = room
 }
 
-// A set's binding 0 pointed at its slot's ring now.
+// A set's binding 0 pointed at its slot's ring now, and its binding 10, the
+// skin rows, at the same ring whole (#855).
 write_ring(set: @keep ptr, frame: int) {
     buffer = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
     buffer.buffer = ring_buffer(frame)
@@ -520,6 +542,7 @@ write_ring(set: @keep ptr, frame: int) {
     vk.vkUpdateDescriptorSets(vkhost.device(), 1, w as ptr, 0, null)
     free(w as ptr)
     free(buffer as ptr)
+    buffer_write(set, 10, vk.DESCRIPTOR_TYPE_STORAGE_BUFFER, ring_buffer(frame), vk.WHOLE_SIZE)
 }
 
 // --- the clustered lamps -----------------------------------------------------------------------------------------
@@ -659,6 +682,19 @@ stop() {
     g_pool = null
     g_set_layout = null
     if g_set_count != null { memset(g_set_count, 0, (FRAMES * 4) as long) }
+    if g_palettes != null {
+        p = 0
+        while p < PROGRAM_COUNT {
+            if (g_palettes as ptr[])[p] != null { free((g_palettes as ptr[])[p]) }
+            p = p + 1
+        }
+        free(g_palettes)
+        free(g_palette_room)
+        free(g_palette_bones)
+        g_palettes = null
+        g_palette_room = null
+        g_palette_bones = null
+    }
 }
 
 set_layout() -> ptr { return g_set_layout }
@@ -1095,7 +1131,7 @@ ring_grow(frame: int) -> bool {
     if (g_retired_count as int[])[frame] >= RETIRED_MOST { return false }
     room = (g_ring_room as int[])[frame] * 2
     host = vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT
-    ring = vkhost.buffer_of(g_stride * room, vk.BUFFER_USAGE_UNIFORM_BUFFER_BIT, host)
+    ring = vkhost.buffer_of(g_stride * room, ring_usage(), host)
     if ring.buffer == null { return false }
     if vk.vkMapMemory(vkhost.device(), ring.memory, 0, vk.WHOLE_SIZE, 0, g_cell) != vk.SUCCESS {
         vkhost.device_buffer_free(vkhost.DeviceBuffer { buffer: ring.buffer, memory: ring.memory })
@@ -1116,14 +1152,57 @@ ring_grow(frame: int) -> bool {
     return true
 }
 
+// A skinned draw's palettes for program `p`'s next draw (#855): `count`
+// bones, `now` their matrices (sixteen floats a bone, column by column) and
+// `previous` last frame's top three rows (twelve floats a bone, #639),
+// copied, as a block's uniforms are. A count of 0 stages none.
+set_palette(now: ptr, previous: ptr, count: int) {
+    p = g_program
+    if g_palettes == null {
+        g_palettes = calloc(PROGRAM_COUNT, 8)
+        g_palette_room = calloc(PROGRAM_COUNT, 4)
+        g_palette_bones = calloc(PROGRAM_COUNT, 4)
+    }
+    if now == null || count <= 0 {
+        (g_palette_bones as int[])[p] = 0
+        return
+    }
+    if count > (g_palette_room as int[])[p] {
+        if (g_palettes as ptr[])[p] != null { free((g_palettes as ptr[])[p]) }
+        (g_palettes as ptr[])[p] = calloc(count * PALETTE_VEC4S, 16)
+        (g_palette_room as int[])[p] = count
+    }
+    staged = (g_palettes as ptr[])[p]
+    memcpy(staged, now, (count * 64) as long)
+    if previous != null {
+        memcpy(staged + count * 64, previous, (count * 48) as long)
+    } else {
+        memset(staged + count * 64, 0, (count * 48) as long)
+    }
+    (g_palette_bones as int[])[p] = count
+}
+
+// The bytes program `p`'s staged palettes take in the ring, a slice's
+// alignment whole.
+fn palette_bytes(p: int) -> int {
+    if g_palette_bones == null { return 0 }
+    bytes = (g_palette_bones as int[])[p] * PALETTE_VEC4S * 16
+    return (bytes + g_align - 1) / g_align * g_align
+}
+
 // Program `p`'s block copied into the next slice of the frame's ring: its
 // dynamic offset in the ring ring_buffer names now, or -1 when the ring is
 // full and no larger one could be made. A `skinned` draw's slice is the whole
-// block; any other's ends where the bone palettes begin, a third of it.
+// block and its palettes after it, in the skin rows (#855), where the block's
+// copy is pointed (skinBase, skinPrevBase, in vec4s from the ring's start);
+// any other's ends where the skin's members begin.
 ring_push(frame: int, p: int, skinned: bool) -> int {
     used = (g_ring_used as int[])[frame]
-    // Its binding reaches a whole block past its start, whatever it copies.
-    if used + g_stride > (g_ring_room as int[])[frame] * g_stride {
+    rows = 0
+    if skinned { rows = palette_bytes(p) }
+    // Its binding reaches a whole block past its start, whatever it copies,
+    // and a skinned one's palettes follow that.
+    if used + g_stride + rows > (g_ring_room as int[])[frame] * g_stride {
         if !ring_grow(frame) {
             println("vkdesc: a frame's draws past ${(g_ring_room as int[])[frame]} blocks could not be given a larger ring; dropped")
             return 0 - 1
@@ -1133,11 +1212,23 @@ ring_push(frame: int, p: int, skinned: bool) -> int {
     size = g_short
     bytes = vkscene.SCENE_SKIN_FROM
     if skinned {
-        size = g_stride
+        size = g_stride + rows
         bytes = vkscene.DRAW_SIZE
     }
     (g_ring_used as int[])[frame] = used + size
-    memcpy((g_ring_mapped as ptr[])[frame] + used, block(p), bytes as long)
+    at = (g_ring_mapped as ptr[])[frame] + used
+    memcpy(at, block(p), bytes as long)
+    if skinned {
+        bones = 0
+        if g_palette_bones != null { bones = (g_palette_bones as int[])[p] }
+        base = (used + g_stride) / 16
+        ((at + vkscene.OFF_SKINBASE) as int[])[0] = base
+        ((at + vkscene.OFF_SKINPREVBASE) as int[])[0] = base + bones * 4
+        if bones > 0 {
+            memcpy(at + g_stride, (g_palettes as ptr[])[p], (bones * PALETTE_VEC4S * 16) as long)
+            bytes = bytes + bones * PALETTE_VEC4S * 16
+        }
+    }
     g_ring_bytes = g_ring_bytes + bytes
     return used
 }
@@ -1273,8 +1364,23 @@ set_for(frame: int, texture: int, normal: int, bank: int, default_texture: int, 
         image_write(3, set, 4, vktexture.view(bank_handle), vktexture.sampler_of(bank_handle), read)
     }
     image_write(4, set, 9, vktexture.view(mask_handle), vktexture.sampler_of(mask_handle), read)
+    // Binding 10, the skin rows: the same ring whole, where a skinned draw's
+    // palettes follow its block (#855).
+    rows = calloc(1, sizeof(VkDescriptorBufferInfo)) as *VkDescriptorBufferInfo
+    rows.buffer = ring_buffer(frame)
+    rows.offset = 0
+    rows.range = vk.WHOLE_SIZE
+    wr = (g_writes + 5 * sizeof(VkWriteDescriptorSet)) as *VkWriteDescriptorSet
+    memset(wr as ptr, 0, sizeof(VkWriteDescriptorSet) as long)
+    wr.sType = vk.STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    wr.dstSet = set
+    wr.dstBinding = 10
+    wr.descriptorCount = 1
+    wr.descriptorType = vk.DESCRIPTOR_TYPE_STORAGE_BUFFER
+    wr.pBufferInfo = rows as ptr
     vk.vkUpdateDescriptorSets(vkhost.device(), BINDINGS, g_writes, 0, null)
     free(buffer as ptr)
+    free(rows as ptr)
 
     index = reuse
     if reuse < 0 {

@@ -44,9 +44,14 @@ struct Cut {
     int joints0;
     int joints1;
     int joints2;
-    char ae_pad1[8];
+    int joints3;
+    int joints4;
+    int joints5;
+    int joints6;
+    int joints7;
+    char ae_pad1[4];
 };
-static_assert(sizeof(Cut) == 64, "Cut: std140");
+static_assert(sizeof(Cut) == 80, "Cut: std140");
 static_assert(__builtin_offsetof(Cut, on) == 0, "Cut.on: std140");
 static_assert(__builtin_offsetof(Cut, plane) == 16, "Cut.plane: std140");
 static_assert(__builtin_offsetof(Cut, detached) == 32, "Cut.detached: std140");
@@ -55,6 +60,11 @@ static_assert(__builtin_offsetof(Cut, noise_scale) == 40, "Cut.noise_scale: std1
 static_assert(__builtin_offsetof(Cut, joints0) == 44, "Cut.joints0: std140");
 static_assert(__builtin_offsetof(Cut, joints1) == 48, "Cut.joints1: std140");
 static_assert(__builtin_offsetof(Cut, joints2) == 52, "Cut.joints2: std140");
+static_assert(__builtin_offsetof(Cut, joints3) == 56, "Cut.joints3: std140");
+static_assert(__builtin_offsetof(Cut, joints4) == 60, "Cut.joints4: std140");
+static_assert(__builtin_offsetof(Cut, joints5) == 64, "Cut.joints5: std140");
+static_assert(__builtin_offsetof(Cut, joints6) == 68, "Cut.joints6: std140");
+static_assert(__builtin_offsetof(Cut, joints7) == 72, "Cut.joints7: std140");
 
 struct Eye {
     float4x4 view_projection;
@@ -88,12 +98,13 @@ static_assert(__builtin_offsetof(Eye, ray_reach) == 264, "Eye.ray_reach: std140"
 static_assert(__builtin_offsetof(Eye, ray_frame) == 268, "Eye.ray_frame: std140");
 
 struct Skin {
-    float4x4 bones[96];
-    float4 prev_rows[288];
+    int base;
+    int prev_base;
+    char ae_pad0[8];
 };
-static_assert(sizeof(Skin) == 10752, "Skin: std140");
-static_assert(__builtin_offsetof(Skin, bones) == 0, "Skin.bones: std140");
-static_assert(__builtin_offsetof(Skin, prev_rows) == 6144, "Skin.prev_rows: std140");
+static_assert(sizeof(Skin) == 16, "Skin: std140");
+static_assert(__builtin_offsetof(Skin, base) == 0, "Skin.base: std140");
+static_assert(__builtin_offsetof(Skin, prev_base) == 4, "Skin.prev_base: std140");
 
 struct DrawBlock {
     Draw draw;
@@ -102,10 +113,10 @@ struct DrawBlock {
     char ae_pad1[1744];
     Skin skin;
 };
-static_assert(sizeof(DrawBlock) == 13056, "DrawBlock: std140");
+static_assert(sizeof(DrawBlock) == 2336, "DrawBlock: std140");
 static_assert(__builtin_offsetof(DrawBlock, draw) == 0, "DrawBlock.draw: std140");
 static_assert(__builtin_offsetof(DrawBlock, cut) == 496, "DrawBlock.cut: std140");
-static_assert(__builtin_offsetof(DrawBlock, skin) == 2304, "DrawBlock.skin: std140");
+static_assert(__builtin_offsetof(DrawBlock, skin) == 2320, "DrawBlock.skin: std140");
 
 struct CameraBlock {
     Eye eye;
@@ -145,26 +156,41 @@ struct ae_lit_plain_vertex_out {
 
 static float ae3d_shaders_lit_clip_joint_on(float joint, constant Cut& cut) {
     int j = int((joint + 0.5));
-    int word = j < 32 ? cut.joints0 : (j < 64 ? cut.joints1 : cut.joints2);
+    int w = j >> 5;
+    int word = w < 4 ? (w < 2 ? (w == 0 ? cut.joints0 : cut.joints1) : (w == 2 ? cut.joints2 : cut.joints3)) : (w < 6 ? (w == 4 ? cut.joints4 : cut.joints5) : (w == 6 ? cut.joints6 : cut.joints7));
     return float((word >> (j & 31) & 1));
 }
 
 static float ae3d_shaders_lit_clip_limb_of(float4 joints, float4 weights, constant Draw& draw, constant Cut& cut) {
-    if (draw.skinned == 0 || (cut.joints0 | cut.joints1 | cut.joints2) == 0) {
+    if (draw.skinned == 0 || (cut.joints0 | cut.joints1 | cut.joints2 | cut.joints3 | cut.joints4 | cut.joints5 | cut.joints6 | cut.joints7) == 0) {
         return 1.0;
     }
     return weights.x * ae3d_shaders_lit_clip_joint_on(joints.x, cut) + weights.y * ae3d_shaders_lit_clip_joint_on(joints.y, cut) + weights.z * ae3d_shaders_lit_clip_joint_on(joints.z, cut) + weights.w * ae3d_shaders_lit_clip_joint_on(joints.w, cut);
 }
 
-static float4x4 ae3d_shaders_lit_prev_bone(float joint, constant Skin& skin) {
-    int j = int((joint + 0.5)) * 3;
-    return transpose(float4x4(skin.prev_rows[j], skin.prev_rows[j + 1], skin.prev_rows[j + 2], float4(float3(0.0, 0.0, 0.0), 1.0)));
+static float4x4 ae3d_shaders_lit_skin_bone(float joint, const device float4* skin_rows, constant Skin& skin) {
+    int j = skin.base + int((joint + 0.5)) * 4;
+    return float4x4(skin_rows[j], skin_rows[(j + 1)], skin_rows[(j + 2)], skin_rows[(j + 3)]);
+}
+
+static float4x4 ae3d_shaders_lit_skin_now_of(float4 joints, float4 weights, const device float4* skin_rows, constant Skin& skin) {
+    return ((((weights.x * ae3d_shaders_lit_skin_bone(joints.x, skin_rows, skin)) + (weights.y * ae3d_shaders_lit_skin_bone(joints.y, skin_rows, skin))) + (weights.z * ae3d_shaders_lit_skin_bone(joints.z, skin_rows, skin))) + (weights.w * ae3d_shaders_lit_skin_bone(joints.w, skin_rows, skin)));
+}
+
+static float4x4 ae3d_shaders_lit_prev_bone(float joint, const device float4* skin_rows, constant Skin& skin) {
+    int j = skin.prev_base + int((joint + 0.5)) * 3;
+    return transpose(float4x4(skin_rows[j], skin_rows[(j + 1)], skin_rows[(j + 2)], float4(float3(0.0, 0.0, 0.0), 1.0)));
+}
+
+static float4x4 ae3d_shaders_lit_skin_prev_of(float4 joints, float4 weights, const device float4* skin_rows, constant Skin& skin) {
+    return ((((weights.x * ae3d_shaders_lit_prev_bone(joints.x, skin_rows, skin)) + (weights.y * ae3d_shaders_lit_prev_bone(joints.y, skin_rows, skin))) + (weights.z * ae3d_shaders_lit_prev_bone(joints.z, skin_rows, skin))) + (weights.w * ae3d_shaders_lit_prev_bone(joints.w, skin_rows, skin)));
 }
 
 vertex ae_lit_plain_vertex_out ae_lit_plain_vertex_vertex(
     ae_lit_plain_vertex_in ae_in [[stage_in]],
     constant DrawBlock& ae_set0 [[buffer(0)]],
-    constant CameraBlock& ae_set1 [[buffer(1)]]) {
+    constant CameraBlock& ae_set1 [[buffer(1)]],
+    const device float4* skin_rows [[buffer(8)]]) {
     ae_lit_plain_vertex_out ae_out;
     float3 inPosition = ae_in.inPosition;
     float2 inTexCoord = ae_in.inTexCoord;
@@ -229,8 +255,8 @@ vertex ae_lit_plain_vertex_out ae_lit_plain_vertex_vertex(
     if (draw.skinned != 0) {
         float4 weights = float4(0.0);
         float4 joints = float4(0.0);
-        float4x4 skin_now = ((((weights.x * skin.bones[int(joints.x)]) + (weights.y * skin.bones[int(joints.y)])) + (weights.z * skin.bones[int(joints.z)])) + (weights.w * skin.bones[int(joints.w)]));
-        float4x4 skin_prev = ((((weights.x * ae3d_shaders_lit_prev_bone(joints.x, skin)) + (weights.y * ae3d_shaders_lit_prev_bone(joints.y, skin))) + (weights.z * ae3d_shaders_lit_prev_bone(joints.z, skin))) + (weights.w * ae3d_shaders_lit_prev_bone(joints.w, skin)));
+        float4x4 skin_now = ae3d_shaders_lit_skin_now_of(joints, weights, skin_rows, skin);
+        float4x4 skin_prev = ae3d_shaders_lit_skin_prev_of(joints, weights, skin_rows, skin);
         posed_prev = (skin_prev * posed0);
         posed = (skin_now * posed0);
         posed_normal = (ae_mat3(skin_now) * inNormal);
