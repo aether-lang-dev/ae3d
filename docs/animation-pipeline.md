@@ -138,6 +138,8 @@ The last word on a pose before it is drawn is `ae3d.ikrig`'s, in the animator's 
 | the female's planted toe on retargeted gaits | 0.03 mm | 5 mm |
 | the roll's root motion carried onto the object | 4.9914 of 4.9914 m | 1% |
 | one foot over a 10 cm block: its sole, the other's, the fastest turn | +100.6 mm, 0.0 mm, 4.4° a step | 5 mm, 5 mm, 6° |
+
+`tests/test_skinned_render.ae` holds a skeleton of 256 bones (`skin.MAX_BONES`, a UE5 Manny's with its fingers, face and twist bones): its last nine skin a column, every bone below them moved off its bind pose, and the GPU's draw is held to the same column skinned on the CPU by the same palette. On OpenGL and Vulkan it is 0 channels apart, against the 4,337 and 4,333 the bend moves (held to 1% of them). The palettes reach the vertex stage as skin rows, a storage buffer on Vulkan and a texture of rows on OpenGL, not a uniform array; `benchmarks/bench_skin.ae` times a skinned vertex on the device.
 | walking with a bowl in both hands: each hand off its grip, the elbows | 0.2 mm at worst, 102 to 152° | 5 mm, 25 to 172° |
 | a rest pose against its mirror; a walk mirrored twice | 0.021°; 3·10⁻⁶° | 0.5°; 0.001° |
 | an event at 0.25 s over three cycles of the walk | fired 3 times | once a cycle |
@@ -173,6 +175,14 @@ The last word on a pose before it is drawn is `ae3d.ikrig`'s, in the animator's 
 | a 20° ramp up and down at 0.7 of the stride: a foot down's sole off it; into it; a flat foot's heel and pad off where the clip has them | 4.5 mm; 0.008 mm; 4.4 mm | 1 cm; 5 mm; 5 mm |
 
 `tools/anim_showcase.ae` puts seven figures on these layers for a person to watch, and prints each cycle the worst a planted toe slid. The fourth walks 100STYLE's captured forward and backward walks out along a line and back on a character controller, by root motion; the sixth climbs stairs and walks a ramp with a bowl in its hands; the seventh aims a rifle with both hands.
+
+## The old modules: frozen
+
+Eight modules wrote a figure's bones before the pipeline: `ae3d.motion`, `ae3d.locomotion`, `ae3d.feet`, `ae3d.lookat`, `ae3d.idle`, `ae3d.posing`, `ae3d.anim` and `ae3d.handover`. They are frozen (#854) until #860 moves their users onto the layers above and retires them:
+
+- Only bug fixes go into them: a defect in what they already do, fixed where it lives. No new capability and no new tuning.
+- New motion work goes into the pipeline's layers (`pose`, `clips`, `retarget`, `animator`, `ikrig`, `physanim`, `metrics`), and a capability one of the old modules has that the pipeline lacks is built there, not extended in the old module.
+- Each module's header says so, and a review refuses a change to one that is not a bug fix.
 
 ## Next
 
