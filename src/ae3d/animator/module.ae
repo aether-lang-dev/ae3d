@@ -63,7 +63,7 @@ exports (
     contact_weight, plant_weight, figure_object, update_now,
     event_count, event_name, fired,
     take_over, set_every, update_every, graph_cost, state_sample,
-    on_pool, profile, profile_reset, profile_now, profile_add, profile_seconds, profile_name, PROF_SECTIONS, PROF_MOVER, PROF_STEER, PROF_CHARACTER, state_cycle, state_speed, hold_cadence, stop_seconds, cycle_time, cycle_phase,
+    on_pool, profile, profile_reset, profile_now, profile_add, profile_seconds, profile_name, PROF_SECTIONS, PROF_MOVER, PROF_STEER, PROF_CHARACTER, state_cycle, state_speed, hold_cadence, transition_rests, stop_seconds, cycle_time, cycle_phase,
     state_size, state_write, state_read
 )
 
@@ -216,6 +216,10 @@ struct Animator {
     moved: Vec3                    // last frame's root motion on the object: world x, z and the turn about up
     ground_speed: float            // the current state's ground speed now, metres a second
     held: ptr                      // the *State whose cadence a stop holds (hold_cadence), or null
+    rest_from: int                 // the gait a stop on its loop rests from (hold_cadence), -1 none
+    rest_stand: int                // the stand it rests in, chosen as it began: its feet's stance the feet are brought to
+    rest_at: float                 // and the time that stand is entered at
+    rest_ref: ptr                  // scratch: the gait's pose where the stop rests, the rig's space
     feet: ptr                      // *Feet (ikrig), or null
     hands: ptr                     // *Hands (ikrig), or null
     look: ptr                      // *Look (ikrig), or null
@@ -361,6 +365,7 @@ struct Transition {
     window: float                  // seconds either side of its nominal entry it searches (transition_match), 0 none
     others: ptr                    // int[]: states it may go to instead, the one whose feet match best (transition_or)
     other_count: int
+    rests: bool                    // what a stop on its state's loop comes to rest by (transition_rests)
     conditions: ptr                // list of *Condition
 }
 
@@ -461,6 +466,8 @@ attach(e: *Engine, o: *GameObject) -> *Animator {
     a.aims = list.new()
     a.fade_from = 0 - 1
     a.warp_state = 0 - 1
+    a.rest_from = 0 - 1
+    a.rest_stand = 0 - 1
     a.down_from = calloc(2, 8)
     a.plant_from = calloc(2, 8)
     a.down_drawn = calloc(2, 8)
@@ -472,6 +479,7 @@ attach(e: *Engine, o: *GameObject) -> *Animator {
     (a.plant_drawn as float[])[1] = 1.0
     a.work3 = pose.new(rig)
     a.blend_work = pose.new(rig)
+    a.rest_ref = pose.new(rig)
     a.posts = list.new()
     a.helds = list.new()
     a.users = list.new()
@@ -1196,8 +1204,6 @@ apply_inertia(a: *Animator, p: ptr, t: float) {
 // value; at or past either end, that end alone. A 2D blend's by gradient
 // bands (weights_2d).
 blend_weights(s: *State) {
-    // Held by a stop (hold_cadence): the gait it stops from.
-    if s.held_cycle > 0.0 { return }
     if s.kind == STATE_BLEND2 {
         weights_2d(s)
         return
@@ -1534,6 +1540,11 @@ state_stride(s: *State) -> float {
 // slows, and stops with its feet together whatever its stride's phase, as
 // a stop take brings them (#860).
 pace_stride(a: *Animator) -> float {
+    // A stop's stand taking over (hold_cadence): its feet held at its
+    // stance, where the stand's own are, until it has (rest_settle). Eased
+    // back to a whole stride through the transition, a foot of a run
+    // stopped from 3 m/s was drawn 13 cm off the stance and stepped back.
+    if rest_taking_over(a) { return 0.0 }
     now = state_stride(state_at(a, a.current))
     if a.fade_from >= 0 && a.fade_time > 0.0 {
         old = state_at(a, a.fade_from)
@@ -2281,6 +2292,7 @@ free_graph(a: *Animator) {
     list.free(a.aims)
     pose.release(a.work3)
     pose.release(a.blend_work)
+    pose.release(a.rest_ref)
 }
 
 // --- a pose held --------------------------------------------------------------------------------
@@ -2843,7 +2855,9 @@ evaluate_graph(a: *Animator, dt: float, frame: float, spread: bool) -> bool {
     if a.feet != null {
         orient_step(a, dt)
         ikrig.feet_set_gait_turn(a.feet as *Feet, a.orient)
-        ikrig.feet_set_pace_stride(a.feet as *Feet, pace_stride(a))
+        stride_now = pace_stride(a)
+        ikrig.feet_set_pace_stride(a.feet as *Feet, stride_now)
+        rest_settle(a, stride_now)
         // What the feet are given, kept: a transition eases out of it (#966).
         // As much as the trunk stands (ikrig.trunk_upright): a foot is not
         // stood on by a figure lying, and locked there a get-up's foot was
@@ -3200,12 +3214,22 @@ state_speed(a: *Animator, state: int) -> float {
 // gait left to slow by its speed played its steps ever slower (PACE_LEAST)
 // on an open stride: a crouch walk stopped with its feet 0.4 m apart and
 // stepped them in after it stood. Nothing for a state that is no blend.
-hold_cadence(a: *Animator, on: bool) {
+//
+// Held, it comes to rest `seconds` on, in the stand its rest transition
+// goes to (transition_rests): of that transition's states the one, and
+// the time in it, whose feet lie nearest the gait's at the phase it rests
+// at, the foot it lands last ahead as the gait has it. Its feet are
+// brought to that stand's stance as the stride shrinks (ikrig's
+// feet_set_stance), and the transition enters it there, so the stand takes
+// over with no foot to step (#1024). Let go (`on` false) it holds the
+// stance until the stand has taken over, or the gait plays on.
+hold_cadence(a: *Animator, on: bool, seconds: float = 0.0) {
     if a.held != null {
         (a.held as *State).held_cycle = 0.0
         a.held = null
     }
     if !on { return }
+    rest_let_go(a)
     s = state_at(a, a.current)
     if s == null || (s.kind != STATE_BLEND && s.kind != STATE_BLEND2) { return }
     cycle = blend_cycle(s)
@@ -3213,6 +3237,113 @@ hold_cadence(a: *Animator, on: bool) {
     if cycle <= 0.0 || s.pace <= 0.0 || rate < 0.000001 { return }
     s.held_cycle = cycle / (s.pace * rate)
     a.held = s as ptr
+    if seconds > 0.0 { rest_choose(a, s, seconds / s.held_cycle) }
+}
+
+// The stand a stop held on gait `s` (the state playing) rests in, its feet
+// `cycles` of `s` on where it rests (hold_cadence): set as a.rest_stand and
+// a.rest_at, and its stance given the feet.
+rest_choose(a: *Animator, s: *State, cycles: float) {
+    tr = rest_transition(a, a.current)
+    if tr == null { return }
+    r = a.rig as *pose.Rig
+    phase = s.time + cycles
+    phase = phase - floor_of(phase)
+    keep = s.time
+    s.time = phase
+    sample_state(a, s, a.work)
+    s.time = keep
+    pose.world(r, a.work, a.rest_ref)
+    best = 0 - 1
+    best_at = 0.0
+    best_cost = 1000000000.0
+    k = 0 - 1
+    while k < tr.other_count {
+        candidate = tr.to
+        if k >= 0 { candidate = (tr.others as int[])[k] }
+        c = state_at(a, candidate)
+        if c != null && c.kind == STATE_TAKE {
+            take = list.get_raw(c.takes, 0) as *Take
+            hi = 0.0
+            if c.loop && c.clock < 0 { hi = clips.duration(take) }
+            at = 0.0
+            while at <= hi + 0.000001 {
+                cost = feet_cost_to(a, candidate, at, a.rest_ref)
+                if cost < best_cost {
+                    best_cost = cost
+                    best = candidate
+                    best_at = at
+                }
+                at = at + MATCH_STEP
+            }
+        }
+        k = k + 1
+    }
+    if best < 0 { return }
+    a.rest_from = a.current
+    a.rest_stand = best
+    a.rest_at = best_at
+    rest_stance(a)
+}
+
+// The stance of the stand chosen (rest_choose) given the feet.
+rest_stance(a: *Animator) {
+    c = state_at(a, a.rest_stand)
+    if c == null || a.feet == null { return }
+    r = a.rig as *pose.Rig
+    keep = c.time
+    c.time = a.rest_at
+    sample_state(a, c, a.work)
+    c.time = keep
+    pose.world(r, a.work, a.work2)
+    ikrig.feet_set_stance(a.feet as *Feet, r, a.work2)
+}
+
+// The transition a stop on state `from`'s loop rests by (transition_rests),
+// or null.
+rest_transition(a: *Animator, from: int) -> *Transition {
+    i = 0
+    while i < list.size(a.transitions) {
+        t = list.get_raw(a.transitions, i) as *Transition
+        if t.rests && t.from == from { return t }
+        i = i + 1
+    }
+    return null
+}
+
+// The stop's stand and stance let go (hold_cadence).
+rest_let_go(a: *Animator) {
+    if a.rest_stand >= 0 && a.feet != null { ikrig.feet_clear_stance(a.feet as *Feet) }
+    a.rest_from = 0 - 1
+    a.rest_stand = 0 - 1
+}
+
+// Each frame, the feet given `stride` (pace_stride): a stop's stance let go
+// once its cadence is let go and either a state other than its gait has
+// taken over (the stand, where the feet stand as its stance has them) or
+// the gait plays on at a whole stride, so letting it go moves no foot.
+rest_settle(a: *Animator, stride: float) {
+    if a.rest_stand < 0 || a.held != null || rest_taking_over(a) { return }
+    if a.current == a.rest_from && stride < 1.0 { return }
+    rest_let_go(a)
+}
+
+// A transition out of a stop's gait (hold_cadence) under way.
+rest_taking_over(a: *Animator) -> bool {
+    if a.rest_stand < 0 || a.current == a.rest_from { return false }
+    if a.fade_from >= 0 && a.fade_t < a.fade_time { return true }
+    return a.blend_t < a.blend_time
+}
+
+// Transition `tr` is the one a stop on its state's loop comes to rest by
+// (hold_cadence): its stand, or of its others (transition_or) the one
+// whose feet lie nearest the gait's where it rests, is chosen as the stop
+// begins, and the feet are brought to that stand's stance as they slow,
+// as UE5's distance-matched stops end in their idle's stance. A gait with
+// none comes to rest with its feet under its hips.
+transition_rests(a: *Animator, tr: int) {
+    if tr < 0 || tr >= list.size(a.transitions) { return }
+    (list.get_raw(a.transitions, tr) as *Transition).rests = true
 }
 
 // Seconds from now to the footfall of the gait playing now nearest `steps`
@@ -3716,6 +3847,16 @@ transition_or(a: *Animator, tr: int, state: int) {
 // feet (balls and ankles about the root, in the rig's space) at the time it
 // would enter lie nearest the pose drawn now's.
 best_target(a: *Animator, t: *Transition) -> int {
+    // A stop held on its gait's loop rests in the stand it chose as it
+    // began, where its feet were brought (hold_cadence).
+    if t.rests && t.from == a.rest_from && a.rest_stand >= 0 {
+        s = state_at(a, a.rest_stand)
+        if s != null && s.clock < 0 {
+            s.entry_at = a.rest_at
+            s.chosen = true
+            return a.rest_stand
+        }
+    }
     if t.other_count == 0 && t.window <= 0.0 { return t.to }
     r = a.rig as *pose.Rig
     pose.world(r, a.out, a.worlds)
@@ -3797,7 +3938,11 @@ feet_cost(a: *Animator, state: int) -> float {
 
 // As feet_cost, the state entered `at` seconds in (a take's time, a blend's
 // phase).
-feet_cost_at(a: *Animator, state: int, at: float) -> float {
+feet_cost_at(a: *Animator, state: int, at: float) -> float { return feet_cost_to(a, state, at, a.worlds) }
+
+// As feet_cost_at, against the feet of the pose whose rig-space joints are
+// `ref` (pose.world's).
+feet_cost_to(a: *Animator, state: int, at: float, ref: ptr) -> float {
     s = state_at(a, state)
     if s == null { return 1000000.0 }
     r = a.rig as *pose.Rig
@@ -3815,7 +3960,7 @@ feet_cost_at(a: *Animator, state: int, at: float) -> float {
     while k < 4 {
         j = pose.human(r, slots[k])
         if j >= 0 && root >= 0 {
-            now = core.v3_sub(pose.translation(a.worlds, j), pose.translation(a.worlds, root))
+            now = core.v3_sub(pose.translation(ref, j), pose.translation(ref, root))
             then = core.v3_sub(pose.translation(a.work2, j), pose.translation(a.work2, root))
             d = core.v3_sub(now, then)
             cost = cost + core.v3_dot(d, d)
