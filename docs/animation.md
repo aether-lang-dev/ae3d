@@ -434,12 +434,14 @@ query's pose was a frame not being shown.
 
 ## Standing still
 
-`ae3d.idle` (#592, part of #509) adds a standing figure's breath and its
-shifting weight over whatever its clip poses, in the pose phase.
+The animator's breathing layer (#592, part of #509; `ae3d.idle` until #860
+retired it onto the animator) adds a standing figure's breath and its
+shifting weight over its state and layers, before the feet: feet on the
+ground stay put and the legs take the sway.
 
 ```aether
-d = idle.attach(e, figure_root, hips, chest, forward)
-idle.set_speed(d, speed)   // every frame: moving, it fades out
+animator.breathe_on(a, seed)   // seed 0 starts both cycles at their rest
+animator.breath_weight(a, w)   // how much of it is laid on, 0 to 1
 ```
 
 - **The breath.** The chest pitches back 2 degrees at the top of each
@@ -447,9 +449,11 @@ idle.set_speed(d, speed)   // every frame: moving, it fades out
   cycle, so no two breaths are alike.
 - **The weight.** The hips sway 2.5 cm across, from one foot to the other,
   over 7.3 s. That period never falls in step with the breath's.
-- **Moving.** Both fade with speed, and are gone at 0.4 m/s.
+- **Moving.** Both fade with the state's ground speed, and are gone at
+  0.4 m/s.
 
-`tests/test_idle.ae`, 30 s of the box man playing its Idle:
+`tests/test_idle.ae`, 30 s of the box man playing its Idle beside a twin
+playing it with no breathing:
 
 | Measure | Result |
 |---|---|
@@ -457,10 +461,10 @@ idle.set_speed(d, speed)   // every frame: moving, it fades out
 | Breaths | 7, from 3.7 to 4.9 s long |
 | The hips' sway | ±0.025 m |
 | How in step the breath and the sway are | correlation 0.009 |
-| The bones' own turn and shift against what the layer drew | under 1e-8 |
-| Moving at 0.4 m/s | the clip exactly |
+| The joints' own turn and shift against what the layer drew | under 1e-8 |
+| Walking at 1.0 m/s | the twin's pose (3e-8) |
 
-No other bone is touched.
+No other joint is touched.
 
 ### Foot contacts
 
