@@ -551,6 +551,19 @@ if [ "$(uname -s)" = "Darwin" ]; then
     fi
 fi
 
+# The motion modules retired onto the pipeline (#860, docs/animation-
+# pipeline.md, "The old modules: frozen") stay gone: nothing in the engine,
+# its tests, tools, examples or editor imports one again.
+if in_tier suites && first_shard; then
+step "retired motion modules stay retired"
+if git grep -nE '^import ae3d\.(idle|lookat)\b' -- src tests tools examples editor scripts benchmarks >/tmp/ae3d_retired.log 2>/dev/null; then
+    fail "an import of a retired motion module"
+    sed 's/^/        /' /tmp/ae3d_retired.log | head -10
+else
+    pass "no import of ae3d.idle or ae3d.lookat"
+fi
+fi
+
 # One runner is enough to say a module stopped compiling: the check is the
 # compiler's front end, the same on every platform, and each platform's
 # suites compile the modules they import again. On macOS it was two of the
