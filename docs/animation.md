@@ -47,14 +47,13 @@ from that pose rather than from zero.
 
 `gltf.bake_bank` puts every node back as it stood after it bakes (#673):
 it left them on the clip's last sample, where a clip played next that does
-not key a node left it. `locomotion.attach` still measures its walk on
-the rig and leaves it there, the box man's hips 3 cm low until it first
-walks (#676).
+not key a node left it.
 
-Other writers move some of the same nodes every frame. On the box man in
-its Idle, which keys only its Spine2's turn, those are
-`ae3d.locomotion`'s lift, lean and foot hold on the hips, and
-`ae3d.feet`'s pelvis drop on them and its solved turns on the legs. Each writer, the figure among them, takes its
+Other writers moved some of the same nodes every frame before the
+animation pipeline (docs/animation-pipeline.md) made the animator a
+figure's one writer: the old locomotion module's lift, lean and foot hold
+on the hips, and the old feet module's pelvis drop on them and its solved
+turns on the legs (both retired by #860). Each writer, the figure among them, takes its
 own last move off a node before it makes the next (#673):
 - On a node another writer has moved since it drew it, the figure takes
   off only what it added over the clip last frame, the transition's
@@ -154,142 +153,82 @@ pace with their gait slowed to match, instead of rotating π in one step.
 
 ## Feet on the world
 
-A clip is made on a flat floor. `ae3d.feet` (#577) puts a walking figure's
-feet on the ground under them, whatever shape it is, every frame in the
-engine's pose phase (after the clips, before the draw):
+A clip is made on a flat floor. `ae3d.ikrig`'s feet (#857) put a figure's
+feet on the ground under them, whatever shape it is, as the animator's
+last word on its pose (docs/animation-pipeline.md, "Feet on any ground"):
 
 ```aether
-f = feet.attach(e, figure_root, hips, l_hip, l_knee, l_ankle, r_hip, r_knee, r_ankle)
-feet.ground_physics(f, physics.of(e))      // a ray down onto the static world
-feet.ground_height(f, height_fn, state)    // or a function of x and z
+f = ikrig.feet_new(animator.rig(a), o)
+ikrig.feet_ground_physics(f, physics.of(e))   // the static world under the soles
+animator.set_feet(a, f)
 ```
 
-- **The target.** Each foot's target is its animated place raised or
-  lowered to the ground under it, by however far that ground is from the
-  root's floor. A swing over a kerb clears the kerb by what it cleared the
-  floor.
-- **The pelvis.** It comes down so the lower foot can reach its ground,
-  and never goes up. It eases at no more than `PELVIS_SPEED`
-  (0.6 m/s), so a kerb appearing under a foot never snaps the body down.
-  Each frame it takes last frame's drop off first. `feet.set_figure(f,
-  figure)` names the figure posing the legs, so the drop comes off by
-  how far it moved the hips, even where another writer moved them since,
-  unless the figure put the hips' place back itself (`figure.put_back`,
-  #673).
-  `ae3d.locomotion` does the same with its lift and lean. Each used to
-  take its move off only where the hips still held exactly what it had
-  written. The other's write in between defeated that, and in the plaza a
-  standing walker's feet ended 13 cm in the ground.
-  `tests/test_hips_writers.ae` walks the box man on a 10-degree slope
-  across its way, stepping on and stopping every second, for 12 s:
-  standing at the end of each second, its hips, less the pelvis drop, are
-  where they were the second before to 1 cm (to the micron, here), and no
-  foot goes under the slope.
-- **The legs.** Each is solved onto its target with `ae3d.ik`'s two-bone
-  solver, its knee turned toward the way the figure faces.
-- **The foot.** A foot on the ground is turned to lie on it, by up to 30
-  degrees.
-- **Locking.** A foot the clip has set down (low and slow) is locked where
-  it was set, whatever the body does over it, until the clip lifts it. It
-  is then let go over 0.15 s. No hand-made contact labels are needed.
-  Held, and while it is let go, it stands on the ground under where it is,
-  not under the clip's ankle: a walker going along the plaza's kerb with a
-  foot held on it had that foot posed at the road's height, 15 cm down
-  inside the kerb, once the clip's ankle had passed the kerb's edge.
+The old feet module (#577) was retired onto them (#860). The pelvis comes
+down by what the lower foot and each leg's reach need, on a spring, and no
+faster than `STAND_DROP_SPEED` (0.6 m/s, the old module's `PELVIS_SPEED`)
+while the figure stands, so ground falling away under a standing foot
+never snaps the body down. One writer, the hips no longer gather two
+modules' moves: `tests/test_hips_writers.ae` walks the mannequin on a
+10-degree slope across its way, stepping on and stopping every second, for
+12 s, and standing at the end of each second its pelvis, less the drop, is
+where it was the second before to 0.6 mm, no sole under the slope.
 
-`set_weight` eases it out while the figure is in the air or ragdolled.
-
-`tests/test_feet.ae` runs on the box man (Mixamo's names), with no window:
-- on flat ground nothing moves;
-- on a 15-degree slope across the stance, each foot stands within 1e-14 m
-  of its height over the slope, the pelvis comes down 2.7 cm for the lower
-  foot, and the knees bend forward, never past straight;
-- stood on a 20 cm kerb with one foot off, that foot reaches the road and
-  the pelvis comes down 20 cm, 1 cm a frame at most;
-- a planted foot moves 2 mm while the body walks 6 cm over it, and is let
-  go when the clip lifts it;
-- a foot set down on a 15 cm kerb 3 cm in from its edge stays on the kerb's
-  top (to 1 cm; 2.5e-16 m now) while the body moves 6 cm on off it, the
-  clip's ankle 3 cm past the edge. Before, it was posed 15 cm down, inside
-  the kerb.
+`tests/test_feet.ae` holds the feet on the Rigify mannequin's clips, with
+no window:
+- on flat ground the pelvis stays where the clip has it (0 mm);
+- on a 15-degree slope across the stance each sole is within 2.7 mm of the
+  slope, the pelvis comes down 4.3 cm for the lower foot, the knees bend
+  forward within their most, and each foot is turned 15 degrees to lie on
+  it; a walk's knees stay bent the way its clip bends them;
+- stood on a 20 cm kerb with a plank under its other foot, the plank taken
+  away, that foot reaches the road and the pelvis comes down 20 cm, 1 cm a
+  frame at most (on the spring alone it was 3.6 cm a frame);
+- a foot let go 10 cm behind where the clip has it, the clip keeping its
+  sole on the floor, is carried 2.6 cm over the ground, none of its way
+  along it, and lands on the clip's ankle;
+- a knee overstraightened 5 degrees as a walk begins, its foot on a 6 cm
+  step, bends 9.3 cm ahead, its thigh not turned round.
 
 ## A figure under a player's hand
 
-`ae3d.locomotion` (#576) is what a player's character is made of: a
-character controller for where it goes, a figure for how it looks going
-there, and the motion between them.
+A player's character is `ae3d.character` (#903): a capsule for where it
+goes, the mover's springs for how it gets there, and the animator's graph
+for how it looks going there (docs/animation-pipeline.md). The old
+locomotion module (#576) was retired onto it (#860).
 
 ```aether
-c = physics.character_controller(player, 0.3, 1.8)
-l = locomotion.attach(e, player, c, "Idle", "Walk", "Run")
-locomotion.set_input(l, direction, running)   // every frame; the length is the stick's deflection
+c = character.humanoid(e, "Player", "people/mannequin.glb", character.gaits(prefix))
+character.move(c, velocity, facing)   // every frame; a zero facing faces the way it goes
 ```
 
-- **Momentum.** The asked-for velocity is reached at no more than
-  `ACCELERATION` (4 m/s²) and given up at no more than `DECELERATION`
-  (6 m/s²). A start leans into its first steps, a stop settles.
-- **The clip follows the speed, and the speed the clip.** Each clip's own
-  speed is read from it as the crowd's banks are, sampled at 120 a second:
-  which foot is the lowest changes between samples, and a coarse bake puts
-  that change early or late and the speed off by it. The walk or the run is
-  played at the body's speed over that, so its feet cover what the body
-  does. Below `IDLE_BELOW` it idles; it runs above the middle of the two
-  speeds. Every change is inertialized.
-- **The facing** turns toward the way the body goes at no more than
-  `TURN_RATE` (4 rad/s). The way a clip walks is read from it (its root's
-  way, or against the way its feet go back), so a pack whose figures face
-  -z walks forward.
-- **The lean.** The hips lean into a turn by how fast it turns at its speed
-  (up to 12 degrees), and forward or back into a change of speed (up to 6).
-  The hips are a pack's by name, else the shallowest bone the walk poses:
-  a skin's first joint is often a still root above it. They are put back
-  to their own pose before each frame's lean, so a bone no clip poses does
-  not gather it frame on frame.
-- **A step.** The controller climbs a step at once; the drawn body climbs
-  it at `STEP_SPEED` (1.2 m/s), the hips carried by the difference.
-  `ae3d.feet` finishes the job where the figure has legs.
+A load carried in its hands (`ikrig.hands_load`) leans its trunk away from
+the load, back from one ahead and aside from one at the side, and slows it:
+it goes at the pace asked less half the load's share of its mass
+(`character.LOAD_SLOW`, `character.laden_pace`).
 
-`tests/test_locomotion.ae` drives the Fox at a metre long through a scripted
-run with no window: stand, walk, half the stick, run, stop, a quarter turn,
-turn round, a 20 cm step. The numbers:
+`tests/test_locomotion.ae` holds the mannequin on 100STYLE's gaits to what
+the old module was held to, with no window:
 
-| Measure | Result |
-|---|---|
-| The foot on the ground's drift along the way, over whole cycles | 0.19% of the body's way walking, 1.7% at half the stick, 0.14% running |
-| The same, aside | 0.01%, 0.02%, 2.2% (the run's own gallop) |
-| The most any bone turns in a frame, through every change | 25 degrees, the clips' own (a cut is 89) |
-| The facing's turn in a frame | 3.82 degrees, the cap |
-| Change of speed | 6 m/s² at most, the deceleration |
-| The drawn hips up a 20 cm step | 1.24 m/s, against 1.2 plus the walk's own bob of 0.22 |
+| Measure | Result | Held to |
+|---|---|---|
+| Change of speed through stand, walk, half pace, run, stop, a quarter turn, turn round | 5.7 m/s² at most | 6 |
+| The facing's turn | 2.5 rad/s at most | 4 |
+| The drawn pelvis up a 20 cm step | 1.07 m/s | 1.2 plus the walk's own bob of 0.23 |
+| Attaching the animator: the pelvis and ankles off the bind pose | 0 mm | 1 mm |
+| Stopped: the pelvis against the height it stood at; a sole off the floor | 0.1 mm; 0.01 mm | 1 cm |
+| The box man's ways off its clips: back, the sides; their paces | 3.1416, ∓1.5708 rad; 0.72, 0.33 m/s | to 0.05 rad; 0.71, 0.33 to 2 cm/s |
+| 20 kg a quarter metre to its side, and 0.3 m ahead: the trunk's lean | 0.2 rad away, 0.2 back (ikrig's most) | the balance, to 0.002 rad |
+| Walking laden at 1.2 m/s asked, 20 kg on 65.6 kg | 1.017 m/s | 1.017, to 2% |
 
-The Fox's clips themselves carry a foot 14 cm (walk) and 32 cm (run) while
-it is the lowest, as it lands and lifts, played on the spot as much as
-under a body. Pacing cannot take that out; locking the feet (`ae3d.feet`)
-does, on a figure with legs to solve.
+Its stop brakes as its stop take does (distance matching), so from a run at
+3 m/s it is at rest in 2.1 s; the old module braked at 6 m/s² and stood in
+one.
 
 ## Going to a spot
 
-`locomotion.go_to(l, at, facing, running)` (#825) sends a figure to a spot and stops it there, facing a given way: the spot a game sends someone to, to sit, to work, to stand guard. It sets the input each step; `arrived(l)` says it is within 5 cm and 0.1 rad, standing, and `set_input` or `stop_going` ends it.
+A spot a game sends someone to, to sit, to work, to stand guard (#825), is a usable's stand slot: `character.use` walks the figure there, running when asked, and stops it on the point facing the slot's way (#949). The old `locomotion.go_to` was retired onto it (#860). Its feet turn it on the spot in steps (`ikrig.feet_set_steps`, #827), and its stop is played by the distance left (distance matching, #828).
 
-- **Arriving.** Toward the spot at the speed it can still stop from in the distance left, braking at half its `DECELERATION` (Reynolds' arrive, 1999), so its own momentum brings it to rest there. Once there it stays, until it is moved more than 0.3 m off: a person does not walk a 5 cm correction, and steered again for every drift, the box man turned to face each one and ended 104 degrees off.
-- **Coming in along the facing.** Over its last metre it comes along the way it is to face, as a GTA scenario point's or an Unreal Smart Object slot's entry has a character come in: it heads for a point a metre back along the facing, then walks the line. Turned on the spot at the end instead, its body was walked round its planted foot, 0.26 m off the spot. From nearer than a metre and a half when sent, it goes straight there and turns on the spot.
-- **Stopping on a footfall (#828).** The walk is paced to the body, so its cycle and the ground go together. At attach the walk's footfalls are read from the clip (the moments its lowest foot changes to the other), and the stop is planned onto the footfall nearest the spot that it can still brake to: Distance Matching's aim (Paragon, GDC 2016), a move ending on its mark with its feet where they land. It stops with both feet down. Cut wherever the speed ran out, the walk ended mid-stride and the lifted foot was carried 8 cm low over the ground to the idle's place. A run brakes into the walk before the stop is planned, since a run's footfall nearest the spot can be 0.38 m off it.
-- **Keeping its gait.** It runs once past the middle of the walk's and the run's speeds by `GAIT_BAND` (0.15 m/s), and walks again only below it by as much: switched at the middle itself, a figure braking from a run changed clip every frame, each change a new blend, and a foot was flung up to its hips.
-- **Turning on the spot by steps (#827).** `set_turn_steps(l, true)`, for a figure on `ae3d.feet`: turning on the spot it plays its idle, turns at `TURN_SPOT_RATE` (2.5 rad/s, about a second and a quarter for a turn round), and the feet stay planted and step themselves round, about every 45 degrees, as `ae3d.feet` steps a standing figure's feet. That is procedural legs' planting and stepping. Off, as before, the walk is played at a slow pace and held on its planted foot, which carries the body round it.
-
-For the feet's own steps, `ae3d.feet` now asks the body to be still where it stands: the clip's ankle still in the figure's own frame, and the root not going over the ground. Turning where it stands is still. Measured in the world, the turning body moved every ankle and no foot stepped until the turn was over; measured in the clip alone, a body carried over a held foot stepped it by itself. And a step is over its place by 80% of its way before it is set down, as a foot reaches its place before it lands: carried the whole way, a turning figure's foot came down still going 13 mm a frame.
-
-`tests/test_go_to.ae` sends the box man on `ae3d.feet` to a spot 10 m off five ways:
-
-| | arrived in | off the spot | toe slid in a plant, at the most |
-|---|---|---|---|
-| straight ahead | 10.7 s | 6.0 cm | 4.1 mm |
-| ahead, then turned a quarter | 11.7 s | 16.3 cm | 5.0 mm |
-| to its side | 11.8 s | 19.8 cm | 7.7 mm |
-| behind it | 11.3 s | 10.3 cm | 8.4 mm |
-| ahead at a run | 5.6 s | 7.8 cm | 15.6 mm |
-
-Each faces the way asked to the degree, no bone goes faster than 7 m/s in the figure's frame, and its toes move under 5 mm in the 1.5 s after it arrives. #825's bar is 5 mm a plant: setting off and turning while walking (#827) and braking a run (#828) still slide a toe further, and the test holds them to what they slide now until those are fixed.
+`tests/test_go_to.ae` sends the Rigify mannequin on 100STYLE's gaits to a spot 10 m off five ways (straight ahead; ahead, then turned a quarter; to its side; behind it; ahead at a run): each gets there within 15 s, within 5 cm and 0.1 rad, no toe slides 5 mm in a stance, and it stands still once there.
 
 ## Motion matching
 

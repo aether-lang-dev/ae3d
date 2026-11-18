@@ -556,11 +556,11 @@ fi
 # its tests, tools, examples or editor imports one again.
 if in_tier suites && first_shard; then
 step "retired motion modules stay retired"
-if git grep -nE '^import ae3d\.(idle|lookat)\b' -- src tests tools examples editor scripts benchmarks >/tmp/ae3d_retired.log 2>/dev/null; then
+if git grep -nE '^import ae3d\.(idle|lookat|feet|locomotion)\b' -- src tests tools examples editor scripts benchmarks >/tmp/ae3d_retired.log 2>/dev/null; then
     fail "an import of a retired motion module"
     sed 's/^/        /' /tmp/ae3d_retired.log | head -10
 else
-    pass "no import of ae3d.idle or ae3d.lookat"
+    pass "no import of ae3d.idle, ae3d.lookat, ae3d.feet or ae3d.locomotion"
 fi
 fi
 

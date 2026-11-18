@@ -180,7 +180,13 @@ The last word on a pose before it is drawn is `ae3d.ikrig`'s, in the animator's 
 
 ## The old modules: frozen
 
-Eight modules wrote a figure's bones before the pipeline. Two are retired (#860): `ae3d.idle`, whose breath and weight shift are the animator's breathing layer (`animator.breathe_on`, held by test_idle), and `ae3d.lookat`, whose look is the animator's (`animator.look_at`, `character.look`, held by test_lookat); `locomotion.go_to` is `character.use` with a stand slot (test_go_to). ci.sh's "retired motion modules stay retired" step fails on an import of one. The other six, `ae3d.motion`, `ae3d.locomotion`, `ae3d.feet`, `ae3d.posing`, `ae3d.anim` and `ae3d.handover`, are frozen (#854) until #860 moves their users onto the layers above and retires them:
+Eight modules wrote a figure's bones before the pipeline. Four are retired (#860):
+- `ae3d.idle`, whose breath and weight shift are the animator's breathing layer (`animator.breathe_on`, held by test_idle);
+- `ae3d.lookat`, whose look is the animator's (`animator.look_at`, `character.look`, held by test_lookat);
+- the feet module (#577, #857), whose feet are ikrig's: test_feet holds them on static grounds to its numbers (the pelvis down for the lower foot on a slope and off a kerb, no faster than 0.6 m/s standing, `ikrig.STAND_DROP_SPEED`; a released foot carried over the ground; knees bent as the clip bends them), and test_hips_writers its hips through 12 s of stop and go on a slope;
+- the locomotion module (#576), whose player's figure is `ae3d.character` on the mover and the graph: test_locomotion holds its momentum, turning, step, rest stance, clip ways and load (a load leans the trunk away, `ikrig.hands_load`, and slows the figure, `character.laden_pace`), test_characters_meet two solid walkers drawn apart, test_character_bodies a capsule over a knocked-down person and a walker through its own bodies, test_struck_walker the graph held when knocked down (`animator.pause`); its `go_to` is `character.use` with a stand slot (test_go_to).
+
+ci.sh's "retired motion modules stay retired" step fails on an import of one. The other four, `ae3d.motion`, `ae3d.posing`, `ae3d.anim` and `ae3d.handover`, are frozen (#854) until #860 moves their users onto the layers above and retires them:
 
 - Only bug fixes go into them: a defect in what they already do, fixed where it lives. No new capability and no new tuning.
 - New motion work goes into the pipeline's layers (`pose`, `clips`, `retarget`, `animator`, `ikrig`, `physanim`, `metrics`), and a capability one of the old modules has that the pipeline lacks is built there, not extended in the old module.
@@ -189,7 +195,7 @@ Eight modules wrote a figure's bones before the pipeline. Two are retired (#860)
 ## Next
 
 - Motion matching on a database of the style's whole takes, its changes held to the takes' own joint speeds (today's database is one short take of each motion).
-- One foot system (#857): `ae3d.feet` and the physical figure's own feet retired onto `ikrig` as the plaza and the motion showcase move onto the pipeline (#860).
+- One foot system (#857): the physical figure's own feet retired onto `ikrig` as the plaza and the motion showcase move onto the pipeline (#860), as the feet module is.
 - A reach across the trunk (#700): the physical figure's forearm still rests against its chest 22 cm short of a wound on the other arm. An elbow swung clear of the trunk brought it to 19 cm but turned the arm at 26 rad/s; a route that keeps the arm's speed is still to find.
 - Walking a 20° ramp at the walk's own stride, the trailing leg is straight at its push-off and its toe stands 16 mm off the slope; the ramp is walked at 0.7 of the stride, as people step short up a steep slope. A gait for slopes would let the stride stay long.
 - The physics asset and physical animation (#858), then ragdolls and get-ups into matched clips (#859).
