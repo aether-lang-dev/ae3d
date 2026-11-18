@@ -350,44 +350,43 @@ Fox's database. A larger database, or the job system, is the next step.
 
 ## Looking
 
-`ae3d.lookat` (#587, part of #509) turns a figure's head to look at a
-point. It runs every frame in the pose phase, after the clips.
+The animator's look (ikrig's `look_solve`; `character.look` calls it)
+turns a figure's head to look at a point, after its feet and before its
+hands. `ae3d.lookat` did this on a figure's bones until #860 retired it
+onto the animator.
 
 ```aether
-l = lookat.attach(e, figure_root, neck, head, forward)   // forward: the way the figure faces, in its root's frame
-lookat.set_target(l, point)
-lookat.clear(l)
+animator.look_at(a, point, weight)
+animator.look_off(a)   // eased out on the point it was on
 ```
 
-- **The turn.** It runs from where the clip has the head facing to the
-  point: about the figure's up, then across. Each part is held within a
-  neck's reach: 80 degrees either side, 57 up and down.
-- **Eased.** A critically damped spring with a 0.12 s half-life moves the
-  turn toward what is asked, or back to none when cleared, so a head never
-  snaps round. `set_weight` fades it in and out.
-- **Shared.** The neck takes 40% of the turn and the head the rest. The
-  whole turn is made first and then shared: a yaw-and-pitch turn on the
-  neck and another on the head are not the whole one, and they left the
-  head 3 degrees off.
-- **Put back each frame.** The bones it turns are returned to their own
-  pose before each frame's turn, so a still pose is not turned further
-  frame after frame. `lookat.set_figure(l, figure)` tells it the figure,
-  and where the figure didn't put a bone's turn back it takes its own turn
-  off on the node's side, as the feet and locomotion do (#673). Without
-  that, a change of clip whose offset still fell on the neck and head left
-  the look's turn on, and the next went on top.
+- **The turn.** The way looked is held within LOOK_YAW_MOST (1.3 rad)
+  either side of the way the figure faces, 0.6 rad up and 0.8 down, and
+  turns toward a new way at LOOK_TURN (5 rad/s) at the most, the whole
+  turn and not each axis's. Past the side's limit the look lets go over
+  LOOK_FADE: a point behind the figure is not looked at.
+- **Shared.** The chest, the neck and the head share it (a fifth, three
+  eighths and the rest); an aimed trunk is the aim's.
+- **Drawn fresh.** The animator draws each frame's pose from its takes, so
+  nothing is put back and a change of state cannot leave a turn on.
 
-`tests/test_lookat.ae`, on the box man playing its Idle:
+`tests/test_lookat.ae`, on the box man playing its Idle beside a twin
+with no look:
 - **Within the limits.** A point 31 degrees aside and a little up is faced
-  to 2.8 degrees. The rest is the eased turn trailing the Idle's sway.
-- **Past the limits.** A point behind holds the turn at 1.4 rad.
-- **No snapping.** The head turns 5.7 degrees a frame at most, the clip
-  included.
-- **Cleared.** It is back on its clip, to 0.0001 rad.
-- **Nothing else moves.** No other bone moves.
-- **Through a change of clip.** Looking aside from the Idle into a clip
-  keying the neck and head and back four frames later, then cleared, the
-  head is 7e-5 rad from a twin that never looked (1.71 rad before).
+  to 0.29 degrees.
+- **Past the limits.** A point 86 degrees aside holds the way at 1.3 rad;
+  the head turns 1.09 rad. A point behind is let go.
+- **No snapping.** The head turns 5.6 degrees a frame at most, the clip
+  included (6.05 with the yaw and pitch each held to LOOK_TURN, 6.8 with
+  `look_off` turning the head toward the world's origin as it let go).
+- **Cleared.** It is back on its clip, exactly.
+- **Nothing else moves.** No joint outside the chest, the neck and the head.
+- **Through a change of state.** Looking aside from the Idle into the Walk
+  and back four frames later, then cleared, the head is on its twin's.
+- **Struck while looking.** Its physical animation's bodies take over the
+  drawn pose over 0.25 s as the look lets go: the neck turns 49 degrees a
+  second at most against the chest in the three steps after, and a second
+  on is 4.8 degrees off its animated target (bounds 100 and 5).
 
 ## A player's figure posed by matching
 
