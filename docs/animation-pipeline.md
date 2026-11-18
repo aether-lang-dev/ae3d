@@ -176,6 +176,8 @@ The last word on a pose before it is drawn is `ae3d.ikrig`'s, in the animator's 
 
 `tools/anim_showcase.ae` puts seven figures on these layers for a person to watch, and prints each cycle the worst a planted toe slid. The fourth walks 100STYLE's captured forward and backward walks out along a line and back on a character controller, by root motion; the sixth climbs stairs and walks a ramp with a bowl in its hands; the seventh aims a rifle with both hands.
 
+`tools/anim_viewer.ae` (#854) shows one clip at a time: UAL1's, on its own Rigify mannequin, and the same clip retargeted onto the UE5 mannequin (or any figure named by `AE3D_TARGET`) beside it. Up and Down step through the clip list, Space plays and pauses, Left and Right step a frame. Each figure goes over the ground as its take carries it, its skeleton drawn joint to parent from `pose.world` over it, and its `ae3d.metrics` meters on screen, the worst over the clip so far, red past the showcase's bounds. The source's feet are the take's own (no feet IK): its walk's soles go 29 mm into the floor, as the table above has it, so the skating meter, which counts a foot as standing while its sole is within 1.5 cm of the floor, reads the start and the end of each swing as stance on both figures (about 100 mm on UAL1's walk). The retargeted toe itself stays put through each held stance.
+
 ## The old modules: frozen
 
 Eight modules wrote a figure's bones before the pipeline: `ae3d.motion`, `ae3d.locomotion`, `ae3d.feet`, `ae3d.lookat`, `ae3d.idle`, `ae3d.posing`, `ae3d.anim` and `ae3d.handover`. They are frozen (#854) until #860 moves their users onto the layers above and retires them:

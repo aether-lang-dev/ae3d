@@ -84,6 +84,7 @@ ae run examples/spinning_cube.ae                 # build and run, as any Aether 
 ./build.sh examples/street_drive.ae && ./build/street_drive      # W/S A/D, space, shift; drives itself if left alone
 ./build.sh examples/street_life.ae && ./build/street_life        # people on the street at half past five
 ./build.sh tools/anim_showcase.ae && ./build/anim_showcase       # the animation pipeline on seven people
+./build.sh tools/anim_viewer.ae && ./build/anim_viewer           # a clip and its retarget side by side, scrubbed
 ./build.sh examples/zombie_city.ae && AE3D_CROWD=100000 ./build/zombie_city
 AE3D_API=opengl ./build/zombie_city                              # the other renderer
 ```
@@ -183,6 +184,7 @@ How the loop, the behaviours, the renderers and the job pool fit together is in 
 | `gltf_crowd`, `gltf_viewer` | Any glTF figure as a horde, or on a floor playing one of its animations. |
 | `physics` | The reference scenes: `AE3D_PHYSICS_SCENE=pyramid`, `pile`, `ragdolls` or `cloth`. |
 | `tools/anim_showcase` | The animation pipeline on seven people: gaits, retargets, motion capture, a graph on a mover, stairs and a ramp, a rifle aimed with both hands, hit layers, feet and look IK; `AE3D_METRICS=1` measures what a player would see wrong. |
+| `tools/anim_viewer` | A clip on UAL1's Rigify mannequin and the same clip retargeted onto another figure (`AE3D_TARGET`), side by side: the clip list, scrubbing a frame at a time, each skeleton drawn over its figure, and its `ae3d.metrics` meters on screen. |
 | `caustics`, `smooth_terrain`, `voxel_world`, `sand`, `black_hole` | Water, terrain, voxels, a million instances, curved space. |
 | `lights`, `models`, `blender_pipeline`, `backend_switch`, `spinning_cube` | Materials and lights, OBJ, the Blender export, the two renderers, the smallest program. |
 
