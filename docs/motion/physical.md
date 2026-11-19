@@ -138,6 +138,8 @@ rose = until_up(e, hero, 8.0)
 
 Done by hand in another order, the drawn pelvis jumped 1.3 m.
 
+`examples/docs/physical.ae` on 2026-11-19 at `bea4c991`: shoved with 60 N s it staggered and stayed up; knocked down with 300 N s it lay still 1.8 s on, got up by `LayToIdle` and was on its stand 1.68 s after `get_up`; dead, its ragdoll was at rest 4 s on.
+
 Got up under the plaza's car before step 4, its capsule was pushed out 0.85 to 1.3 m in a step and threw the car off at 45 m/s (#982).
 
 `tests/test_knockdowns.ae` knocks the mannequin down over 100 seeds and holds each get-up to the clip's own: up within 0.5 s of coming to rest, no joint past the clip's own fastest, no falling again, the capsule under the pelvis. Measured on 2026-11-06 (#859): up within 0.217 s of rest at worst (0.185 mean), 0 of 100 falling again; the capsule within 0.08 mm of the pelvis on 2026-11-09 (#859, commit `19a0c6da` on a branch since landed).
