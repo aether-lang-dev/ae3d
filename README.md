@@ -20,7 +20,7 @@ ae3d draws with Vulkan or OpenGL behind one scene API, simulates with a physics 
 
 ## What's inside
 
-**Characters and animation** ([docs](docs/animation-pipeline.md))
+**Characters and animation** ([docs](docs/motion/README.md))
 
 ![People walking a sunlit street toward the camera, others standing in pairs by the buildings](docs/images/street-life.gif)
 
@@ -36,7 +36,7 @@ ae3d draws with Vulkan or OpenGL behind one scene API, simulates with a physics 
   - from 1 to 8 m/s a planted toe slides under 1.5 mm, and the feet carry the ground at the speed asked within 1%;
   - on 0.2 m stairs and a 20° ramp no sole sinks 1 mm into the ground;
   - a change of gait turns no joint 2% faster than the clips themselves do.
-- **Active ragdolls** on any figure, struck and recovering ([natural motion](docs/motion.md)). Physical animation and get-ups into matched clips are under way ([#853](https://github.com/aether-lang-dev/ae3d/issues/853)).
+- **Active ragdolls** on any figure, struck and recovering ([physical animation](docs/motion/physical.md)). Physical animation and get-ups into matched clips are under way ([#853](https://github.com/aether-lang-dev/ae3d/issues/853)).
 
 **Rendering** ([docs](docs/rendering.md))
 - Physically based materials, sixteen lights a frame from any number, normal maps, texel-snapped shadow maps.
@@ -222,10 +222,8 @@ docs/         the documentation, docs/images/ its pictures
 [Architecture](docs/architecture.md) ·
 [Building](docs/building.md) ·
 [Rendering](docs/rendering.md) ·
-[Animation pipeline](docs/animation-pipeline.md) ·
-[Animation](docs/animation.md) ·
+[Motion](docs/motion/README.md) ·
 [Physics](docs/physics.md) ·
-[Natural motion](docs/motion.md) ·
 [Crowds](docs/crowds.md) ·
 [Networking](docs/networking.md) ·
 [Pipeline](docs/pipeline.md) ·
