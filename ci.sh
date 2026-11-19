@@ -479,6 +479,21 @@ else
     sed "s/^/        /" /tmp/ae3d_docs.log | head -12
 fi
 
+step "docs/motion's code is its examples' code"
+# Every code block in docs/motion is a region of a program under
+# examples/docs, which the examples' step builds and runs (#1027): a block
+# with no program behind it, or one that drifted from its program, fails.
+./scripts/check_doc_examples.sh >/tmp/ae3d_doc_examples.log 2>&1
+doc_examples_status=$?
+if [ "$doc_examples_status" -eq 0 ]; then
+    pass "$(tail -1 /tmp/ae3d_doc_examples.log)"
+elif [ "$doc_examples_status" -ne 1 ]; then
+    skip "docs/motion's code" "$(head -1 /tmp/ae3d_doc_examples.log)"
+else
+    fail "docs/motion's code differs from examples/docs"
+    sed "s/^/        /" /tmp/ae3d_doc_examples.log | head -24
+fi
+
 # The Vulkan shaders are generated from the GLSL in src/ae3d/shaders, and
 # from the trees of the shaders written with `quote` (ae3d.shaders.fxaa), and
 # checked in. An edit to the GLSL without the generator run after it leaves
@@ -822,9 +837,12 @@ export SUITE_CFLAGS=-O0
 # examples do: the motion showcase crashed on its first frame for 43 commits
 # while every suite passed, its people's shared takes freed under them.
 showcases="tools/anim_showcase.ae tools/plaza_showcase.ae tools/people_plaza.ae tools/anim_viewer.ae"
-build_together examples/*.ae $showcases $scene_tools
+# The programs docs/motion shows its code from (#1027): built and run as the
+# examples are, each exiting 0 only when what it did is what the page says.
+doc_examples="$(ls examples/docs/*.ae 2>/dev/null)"
+build_together examples/*.ae $doc_examples $showcases $scene_tools
 unset SUITE_CFLAGS
-for example in examples/*.ae $showcases; do
+for example in examples/*.ae $doc_examples $showcases; do
     name="$(basename "$example" .ae)"
     if ! built_ok "$name"; then
         fail "$name (build)"
