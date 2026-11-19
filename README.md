@@ -33,7 +33,7 @@ ae3d draws with Vulkan or OpenGL behind one scene API, simulates with a physics 
   - an aim spread up the spine, with both hands on a rifle;
   - feet on any ground: soles traced heel to toe on stairs and slopes, measured from the mesh where a rig has no toes.
 - **Held to numbers on real people:**
-  - from 1 to 8 m/s a planted toe slides under 1.5 mm, and the feet carry the ground at the speed asked within 1%;
+  - from 1 to 6 m/s a planted toe slides under 1 mm, and 4.4 mm at 8 m/s ([ikrig](docs/motion/ikrig.md)), and the feet carry the ground at the speed asked within 1%;
   - on 0.2 m stairs and a 20° ramp no sole sinks 1 mm into the ground;
   - a change of gait turns no joint 2% faster than the clips themselves do.
 - **Active ragdolls** on any figure, struck and recovering ([physical animation](docs/motion/physical.md)). Physical animation and get-ups into matched clips are under way ([#853](https://github.com/aether-lang-dev/ae3d/issues/853)).
