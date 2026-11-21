@@ -166,9 +166,17 @@ are decoded (by what the bytes are: PNG, JPEG, TGA, BMP) and registered under
 `data:` URI too. A sparse accessor (#868) is made whole as it is opened, the
 base values (zeros with no buffer view) with the sparse elements written over
 them, so positions, normals, UVs and indices alike come out substituted; one
-that names an element it lacks is refused whole, with a warning. What is not
-read -- morph targets, cameras, lights -- is named in the scene's warnings,
-and the rest of the file loads. The palette holds ninety-six
+that names an element it lacks is refused whole, with a warning. Morph
+targets (#910) are read onto each primitive's model (`core.model_morph`, an
+`ae3d.morph` set): their POSITION, NORMAL and TANGENT offsets, named by the
+mesh's `extras.targetNames`, drawn by the node's weights (its own `weights`,
+else the mesh's), which a weights animation channel plays (`anim.WEIGHTS`);
+both renderers morph a mesh on the GPU before skinning it, the active
+targets only, and a rig carries the weights as pose curves
+(`pose.add_morph_curves`) that takes, blends and the animator treat as they
+do the joints. `ae3d.face` maps a head's targets onto ARKit's 52 shapes by
+name and blinks it. What is not read -- cameras, lights -- is named in the
+scene's warnings, and the rest of the file loads. The palette holds ninety-six
 bones, which is a Mixamo rig with its fingers. `examples/gltf_viewer.ae`
 frames any file on a floor -- every vertex, skinned, over sixteen points of
 the clip it plays, filling 55% of the frame's height from a three-quarter

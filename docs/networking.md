@@ -312,7 +312,7 @@ A client reads its horde as the host does: `horde_count`, and the `positions`, `
 
 ### Struck zombies, handed to ragdolls on every peer
 
-`ae3d.handover` hands a struck zombie to an active ragdoll and takes it back when the figure recovers, a player alone ([motion.md](motion.md)). A networked horde is simulated on every peer and hashed, so a zombie has to leave it at the same tick everywhere and come back to the same bits; and a ragdoll is physics, which isn't bit-exact across machines. `ae3d.nethandover` joins the two (#466):
+`ae3d.handover` hands a struck zombie to an active ragdoll and takes it back when the figure recovers, a player alone ([motion/physical.md](motion/physical.md#the-frozen-active-ragdoll-ae3dmotion)). A networked horde is simulated on every peer and hashed, so a zombie has to leave it at the same tick everywhere and come back to the same bits; and a ragdoll is physics, which isn't bit-exact across machines. `ae3d.nethandover` joins the two (#466):
 
 ```aether
 import ae3d.nethandover
@@ -333,6 +333,11 @@ nethandover.kill(glue, index, point, impulse, now)      // the host: LIMP, and c
 - **Moved.** A kill's swap moves the last zombie into the dead one's index; the horde says so on every peer (`set_on_move`), and a figure handed that zombie follows it (`handover.renumber`).
 - **Joining mid-handover.** A client that joins while a zombie is out is sent the horde with its out flags, the bones alive (net's created objects), and the "horde.ragdoll" for each: it draws what everyone else does.
 
+### A character's animation: its inputs, not its poses
+
+A figure is not sent a pose at a time. Every peer runs the same graph (`ae3d.character`: its mover, animator, feet, look and aim) from the same inputs, so what crosses the wire is what the game asked of the character, as Unreal's character movement sends its moves and Unity's Netcode its input commands (`ae3d.netanim`, #911):
+
+How, with its code, what crosses, what a snapshot holds, late joins and determinism: [docs/motion/networking.md](motion/networking.md).
 ### The same on every platform
 
 **What makes a tick the same everywhere.** A tick is `ae3d.horde`'s and `ae3d.nav`'s passes in a fixed order: the headings turned toward the field (`flow_steer`), the velocities along them (`wander`), the separation, and the step, by 1 / the tick rate, never a frame's delta, then the shoves, each moving only its own zombie. Each pass works a figure at a time over the pool and writes only that figure, so the pool's size and its timing change nothing. With one exception, found on the way: the separation with no pool visits each pair once and pushes both, which adds the same pushes in another order than the pool's gather, and 1,773 of the 4,500 velocity components of a knot of 1,500 differ in their last bits. `horde.separate_exact` gathers at any thread count, and is what the horde steps by. The flow field's headings were libm's `atan2`, which isn't the same function on every platform; a cell points one of eight ways, so they are eight constants now. What is left of libm is `sqrt`, `floor` and `fabs`, exact everywhere, beside the horde's own polynomial sine and arctangent. A figure's pose bank (`set_figure`, when the walk drives the step) has to be the same bytes on every side too: its travel table is in the step.

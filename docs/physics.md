@@ -164,13 +164,10 @@ street's walkers are this: the export's gait cycle on a player per bone,
 the root placed each step where the walker has got to at the clip's own
 pace (0.85 m/s), the ragdoll a step behind.
 
-`ragdoll_power(r, torque, assist)` plays the rig through the joints'
-motors instead, within a torque budget, and `ragdoll_aim(r, bone,
-rotation)` drives one bone to a rotation in the world from wherever its
-parent is, instead of to the rig's pose (`ragdoll_clear_aim`,
-`ragdoll_clear_aims`). Balance, the protective fall and the rest of the
-NaturalMotion line are built on these in `ae3d.motion`
-([docs/motion.md](motion.md)).
+How the bodies are driven from an animation (anchors, motors within a
+torque budget, aims, per-body modes and weights), and what is built on
+them (hits, shoves, knockdowns, get-ups, deaths), is
+[docs/motion/physical.md](motion/physical.md).
 
 ## Vehicles
 

@@ -20,7 +20,7 @@ ae3d draws with Vulkan or OpenGL behind one scene API, simulates with a physics 
 
 ## What's inside
 
-**Characters and animation** ([docs](docs/animation-pipeline.md))
+**Characters and animation** ([docs](docs/motion/README.md))
 
 ![People walking a sunlit street toward the camera, others standing in pairs by the buildings](docs/images/street-life.gif)
 
@@ -33,10 +33,10 @@ ae3d draws with Vulkan or OpenGL behind one scene API, simulates with a physics 
   - an aim spread up the spine, with both hands on a rifle;
   - feet on any ground: soles traced heel to toe on stairs and slopes, measured from the mesh where a rig has no toes.
 - **Held to numbers on real people:**
-  - from 1 to 8 m/s a planted toe slides under 1.5 mm, and the feet carry the ground at the speed asked within 1%;
+  - from 1 to 6 m/s a planted toe slides under 1 mm, and 4.4 mm at 8 m/s ([ikrig](docs/motion/ikrig.md)), and the feet carry the ground at the speed asked within 1%;
   - on 0.2 m stairs and a 20° ramp no sole sinks 1 mm into the ground;
   - a change of gait turns no joint 2% faster than the clips themselves do.
-- **Active ragdolls** on any figure, struck and recovering ([natural motion](docs/motion.md)). Physical animation and get-ups into matched clips are under way ([#853](https://github.com/aether-lang-dev/ae3d/issues/853)).
+- **Active ragdolls** on any figure, struck and recovering ([physical animation](docs/motion/physical.md)). Physical animation and get-ups into matched clips are under way ([#853](https://github.com/aether-lang-dev/ae3d/issues/853)).
 
 **Rendering** ([docs](docs/rendering.md))
 - Physically based materials, sixteen lights a frame from any number, normal maps, texel-snapped shadow maps.
@@ -84,6 +84,7 @@ ae run examples/spinning_cube.ae                 # build and run, as any Aether 
 ./build.sh examples/street_drive.ae && ./build/street_drive      # W/S A/D, space, shift; drives itself if left alone
 ./build.sh examples/street_life.ae && ./build/street_life        # people on the street at half past five
 ./build.sh tools/anim_showcase.ae && ./build/anim_showcase       # the animation pipeline on seven people
+./build.sh tools/anim_viewer.ae && ./build/anim_viewer           # a clip and its retarget side by side, scrubbed
 ./build.sh examples/zombie_city.ae && AE3D_CROWD=100000 ./build/zombie_city
 AE3D_API=opengl ./build/zombie_city                              # the other renderer
 ```
@@ -183,6 +184,7 @@ How the loop, the behaviours, the renderers and the job pool fit together is in 
 | `gltf_crowd`, `gltf_viewer` | Any glTF figure as a horde, or on a floor playing one of its animations. |
 | `physics` | The reference scenes: `AE3D_PHYSICS_SCENE=pyramid`, `pile`, `ragdolls` or `cloth`. |
 | `tools/anim_showcase` | The animation pipeline on seven people: gaits, retargets, motion capture, a graph on a mover, stairs and a ramp, a rifle aimed with both hands, hit layers, feet and look IK; `AE3D_METRICS=1` measures what a player would see wrong. |
+| `tools/anim_viewer` | A clip on UAL1's Rigify mannequin and the same clip retargeted onto another figure (`AE3D_TARGET`), side by side: the clip list, scrubbing a frame at a time, each skeleton drawn over its figure, and its `ae3d.metrics` meters on screen. |
 | `caustics`, `smooth_terrain`, `voxel_world`, `sand`, `black_hole` | Water, terrain, voxels, a million instances, curved space. |
 | `lights`, `models`, `blender_pipeline`, `backend_switch`, `spinning_cube` | Materials and lights, OBJ, the Blender export, the two renderers, the smallest program. |
 
@@ -220,10 +222,8 @@ docs/         the documentation, docs/images/ its pictures
 [Architecture](docs/architecture.md) ·
 [Building](docs/building.md) ·
 [Rendering](docs/rendering.md) ·
-[Animation pipeline](docs/animation-pipeline.md) ·
-[Animation](docs/animation.md) ·
+[Motion](docs/motion/README.md) ·
 [Physics](docs/physics.md) ·
-[Natural motion](docs/motion.md) ·
 [Crowds](docs/crowds.md) ·
 [Networking](docs/networking.md) ·
 [Pipeline](docs/pipeline.md) ·
