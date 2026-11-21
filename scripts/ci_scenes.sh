@@ -333,9 +333,11 @@ fi
 # frame. On Vulkan, the renderer the engine is taken forward on.
 #
 # A device that traces rays shadows the city by ray, and one that does not
-# draws its shadow map: every cascade's and every lamp face's casters, 410
-# draws more of the frame on an Apple M6 (696 against the 285 of the RTX
-# 4070 Ti's) and six pipelines (11 against 5). The frame is a different one,
+# draws its shadow map: every cascade's and every lamp face's casters, some
+# 410 draws more of the frame on an Apple M6 (694 against the 285 of the RTX
+# 4070 Ti's, which was recorded before #882 stopped counting the depth's
+# resolve and the occlusion's pass, and is to be recorded again on that
+# card) and six pipelines (11 against 5). The frame is a different one,
 # so it has a budget of its own, recorded where the shadow map stands
 # (*.shadowmap.budget.json), and the bench takes it when frame.stats says
 # the frame was not traced.

@@ -67,7 +67,29 @@ fragment ae_world_text_frag_out ae_world_text_fragment(
     constant float2& jitter = ae_params.jitter;
     float d = atlas.sample(ae_smp_atlas, uv).x;
     float w = abs(dfdx(d)) + abs(dfdy(d));
-    float a = ae3d_shaders_lettering_coverage(d, w, float(edge) / 65536.0) * alpha;
+    float at_edge = float(edge) / 65536.0;
+    float a = ae3d_shaders_lettering_coverage(d, w, at_edge);
+    float2 du = dfdx(uv);
+    float2 dv = dfdy(uv);
+    float2 size = float2(float(atlas.get_width()), float(atlas.get_height()));
+    float across = max(length(du * size), length(dv * size));
+    if (across > 1.0) {
+        float n = min(ceil(across), 4.0);
+        float share = w / n;
+        float sum = 0.0;
+        float j = 0.0;
+        while (j < n) {
+            float i = 0.0;
+            while (i < n) {
+                float2 at = uv + du * ((i + 0.5) / n - 0.5) + dv * ((j + 0.5) / n - 0.5);
+                sum = sum + ae3d_shaders_lettering_coverage(atlas.sample(ae_smp_atlas, at, level(0.0)).x, share, at_edge);
+                i = i + 1.0;
+            }
+            j = j + 1.0;
+        }
+        a = mix(a, sum / (n * n), clamp(across - 1.0, 0.0, 1.0));
+    }
+    a = a * alpha;
     if (a < 0.002) {
         discard_fragment();
     }
