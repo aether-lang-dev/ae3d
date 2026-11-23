@@ -1535,6 +1535,47 @@ the two halves the scene pass is drawn in, the nearest of the samples a
 pixel. Both are the depth of what was drawn -- the near figure's real
 silhouette, the picture of a far one -- and neither draws anything twice.
 
+### The opaque depth prepass (Vulkan)
+
+The opaque surfaces are drawn twice:
+1. **Depth alone.** Through the casters' depth shaders, which drop a cut's
+   far side and a wound's core as the lit shader does. The camera's
+   view-projection goes in every program's light-space slot for this, and
+   each program's own matrix goes back after.
+2. **Lit.** Testing against that depth without writing it, so each pixel
+   is lit once, by the surface that shows there.
+
+The lit pixel shader can discard: a cutout's holes, a cut, a wound. On a
+tiled GPU (Apple's, under MoltenVK), a pipeline that can discard and
+writes depth loses the hidden-surface removal and the early depth test.
+Every opaque surface drawn over another was then lit in full at every
+pixel it covered. A town seen from above, roofs over walls over ground,
+paid for every layer.
+
+Measured on an M1 Pro, Vulkan:
+
+| Scene | Without the prepass | With it |
+|---|---|---|
+| 120 layers at 640x360, 4x MSAA (`test_vk_stages`) | 20.3 ms | 2.48 ms |
+| 60 layers at 480x270 (`test_vk_prepass`) | 2.7–4.2 ms | 0.28–0.83 ms |
+
+`test_vk_prepass` holds the picture to the one without it, to the channel:
+overlapping cubes, a batch, an instanced model, a cut cube, a cutout and a
+glass sphere.
+
+What is left out:
+- surfaces with a cutout, whose holes are in their texture;
+- impostors, crowds, cluster cuts and points, which draw by their own paths.
+
+These draw as before, writing their own depth. The prepass's depth is one
+step farther than the surface's, so a last bit of rounding between the two
+programs cannot fail the lit draw's test. There is no slope term: at a
+silhouette the slope is steep, and the samples behind won the edge.
+
+`AE3D_PREPASS=0` (or `vulkan.renderer_set_prepass(r, false)`) turns it
+off. The draw count is the scene's draws, as on OpenGL: the prepass's are
+not counted, as the shadow maps' are not.
+
 ### What a frame's draw count is
 
 The draw count (`backend_draw_calls`, `engine_draw_calls`, `frame.stats`' draw
@@ -1575,6 +1616,18 @@ a loop that picks as the pointer moves costs no more than the pick pass.
 `backend_pick_ask` and `backend_pick_read` are the same on a backend, and one
 frame answers for as many as sixteen pixels. The editor selects by it, and
 the agent channel's `frame.pixel` carries it as `pick` (docs/agent.md).
+
+What space the pixel is in:
+- **The engine's forms take a window point**, the cursor's space, so
+  `engine_mouse_x` and `engine_mouse_y` go in as they are. The engine takes
+  the point to the frame's pixel. On a display that scales (a Retina Mac)
+  that pixel is twice the point; the render scale is the backend's to
+  apply.
+- **The backends' forms and `frame.pixel` take the frame's pixel**: the
+  captured frame's, the size `engine.width` holds.
+
+Before 2026-11-23 a point was passed through as a pixel, and on a Retina
+Mac every pick read a spot halfway to the frame's top left corner.
 
 It is the scene's surfaces drawn again from the camera into a target that
 holds ids instead of colour: ae3d.shaders.lit's `pick_vertex` and `pick_pixel`

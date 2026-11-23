@@ -21,7 +21,8 @@ exports (
     create, destroy, layout, pull_set_layout, pull_layout, scene_layouts, shader, build_on, entry_of, msl_made, msl_made_for,
     single_sample,
     scene, scene_blend, scene_add, skinned, skinned_blend, points, points_blend, points_add,
-    shadow, skinned_shadow, point_shadow
+    shadow, skinned_shadow, point_shadow,
+    prepass, skinned_prepass, scene_after, skinned_after, BLEND_DEPTH_ONLY
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -35,6 +36,10 @@ const STRIDE = 36
 const INSTANCE_STRIDE = 80
 const POINT_STRIDE = 48
 const SKIN_STRIDE = 48
+
+// A pipeline that writes depth and nothing else, biased a step farther:
+// the opaque prepass's (build's blend).
+const BLEND_DEPTH_ONLY = 4
 
 var g_layout: ptr = null
 // A draw that pulls its vertices (a crowd's cluster cut): the scene's set,
@@ -57,6 +62,15 @@ var g_points_add: ptr = null
 var g_shadow: ptr = null
 var g_skinned_shadow: ptr = null
 var g_point_shadow: ptr = null
+// The opaque depth prepass (ae3d.vkframe): depth alone, then the lit draws
+// of the same surfaces testing against it without writing it, so each pixel
+// is lit once. A pipeline that can discard (the lit one: cutout, cut,
+// wound) loses a tiled GPU's hidden-surface removal and early depth test,
+// and every overlapping opaque surface was lit in full at every pixel.
+var g_prepass: ptr = null          // VkPipeline[2], by cull
+var g_skinned_prepass: ptr = null  // VkPipeline[2]
+var g_scene_after: ptr = null      // VkPipeline[2]: the lit opaque draw over a prepass
+var g_skinned_after: ptr = null    // VkPipeline[2]
 
 layout() -> ptr { return g_layout }
 
@@ -75,6 +89,16 @@ skinned_blend() -> ptr { return g_skinned_blend }
 points(cull: int) -> ptr { return (g_points as ptr[])[cull] }
 points_blend() -> ptr { return g_points_blend }
 shadow() -> ptr { return g_shadow }
+// The prepass's pipelines and the lit ones that follow it, null where the
+// device would not build them: the frame then draws as it did.
+prepass(cull: int) -> ptr { return table_at(g_prepass, cull) }
+skinned_prepass(cull: int) -> ptr { return table_at(g_skinned_prepass, cull) }
+scene_after(cull: int) -> ptr { return table_at(g_scene_after, cull) }
+skinned_after(cull: int) -> ptr { return table_at(g_skinned_after, cull) }
+table_at(table: ptr, cull: int) -> ptr {
+    if table == null { return null }
+    return (table as ptr[])[cull]
+}
 skinned_shadow() -> ptr { return g_skinned_shadow }
 point_shadow() -> ptr { return g_point_shadow }
 
@@ -301,6 +325,17 @@ build_on(vertex: @keep ptr, fragment: @keep ptr, blend: int, depth_test: bool, d
     if cull { raster.cullMode = vk.CULL_MODE_BACK_BIT }
     raster.frontFace = vk.FRONT_FACE_COUNTER_CLOCKWISE
     raster.lineWidth = 1.0
+    // The prepass's depth one step farther than the surface's: the lit draw
+    // that follows computes the same position in another program, and a
+    // last bit of rounding the other way would fail its test and leave a
+    // hole. No slope term: at a silhouette the slope is steep, the bias it
+    // gave let the surface behind win the edge's samples, and the edges of
+    // the picture differed (test_vk_prepass).
+    if blend == BLEND_DEPTH_ONLY {
+        raster.depthBiasEnable = 1
+        raster.depthBiasConstantFactor = 1.0
+        raster.depthBiasSlopeFactor = 0.0
+    }
 
     // Every pass but the scene's draws single-sampled: the screen passes (the
     // composite, the one the resolve, the reflection and the temporal pass
@@ -332,7 +367,7 @@ build_on(vertex: @keep ptr, fragment: @keep ptr, blend: int, depth_test: bool, d
     blends = calloc(2, sizeof(VkPipelineColorBlendAttachmentState))
     a0 = blends as *VkPipelineColorBlendAttachmentState
     a0.blendEnable = 0
-    if blend != 0 { a0.blendEnable = 1 }
+    if blend != 0 && blend != BLEND_DEPTH_ONLY { a0.blendEnable = 1 }
     a0.srcColorBlendFactor = vk.BLEND_FACTOR_SRC_ALPHA
     a0.dstColorBlendFactor = vk.BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
     if blend == 2 {
@@ -348,6 +383,11 @@ build_on(vertex: @keep ptr, fragment: @keep ptr, blend: int, depth_test: bool, d
     a1 = (blends + sizeof(VkPipelineColorBlendAttachmentState)) as *VkPipelineColorBlendAttachmentState
     a1.colorWriteMask = vk.COLOR_COMPONENT_R_BIT | vk.COLOR_COMPONENT_G_BIT
     if blend == 2 { a1.colorWriteMask = 0 }
+    // Depth alone: neither the colour nor the motion written.
+    if blend == BLEND_DEPTH_ONLY {
+        a0.colorWriteMask = 0
+        a1.colorWriteMask = 0
+    }
 
     // As many blend attachments as the subpass has colour attachments,
     // which for the shadow pass is none: it writes depth and nothing else;
@@ -439,7 +479,34 @@ create_pass_pipelines() -> bool {
         return false
     }
     g_point_shadow = pass_pipeline(vkspirv.LIT_DEPTH_PLAIN_QUOTED_VERT, vkspirv.LIT_DEPTH_QUOTED_FRAG, 0, true, true, shadow_pass, false, true)
+    make_prepass()
     return true
+}
+
+// The prepass's pipelines, in the scene pass: the casters' depth shaders
+// (a cut's far side and a wound's core dropped as the lit pass drops them),
+// depth written, nothing else. Not required: any that will not build leaves
+// the prepass off.
+make_prepass() {
+    if g_prepass == null {
+        g_prepass = calloc(2, 8)
+        g_skinned_prepass = calloc(2, 8)
+    }
+    plain = shader(vkspirv.LIT_DEPTH_PLAIN_QUOTED_VERT)
+    posed = shader(vkspirv.LIT_DEPTH_QUOTED_VERT)
+    depth = shader(vkspirv.LIT_DEPTH_QUOTED_FRAG)
+    if plain != null && posed != null && depth != null {
+        render = vktargets.scene_pass()
+        cull = 0
+        while cull < 2 {
+            (g_prepass as ptr[])[cull] = build(plain, depth, BLEND_DEPTH_ONLY, true, true, render, cull == 1, false, false)
+            (g_skinned_prepass as ptr[])[cull] = build(posed, depth, BLEND_DEPTH_ONLY, true, true, render, cull == 1, true, false)
+            cull = cull + 1
+        }
+    }
+    if plain != null { vk.vkDestroyShaderModule(vkhost.device(), plain, null) }
+    if posed != null { vk.vkDestroyShaderModule(vkhost.device(), posed, null) }
+    if depth != null { vk.vkDestroyShaderModule(vkhost.device(), depth, null) }
 }
 
 // The pipeline layout over the scene's set layout, the scene's pipelines
@@ -451,6 +518,8 @@ create() -> bool {
         g_scene = calloc(2, 8)
         g_skinned = calloc(2, 8)
         g_points = calloc(2, 8)
+        g_scene_after = calloc(2, 8)
+        g_skinned_after = calloc(2, 8)
     }
     d = vkhost.device()
     vertex = shader(vkspirv.LIT_QUOTED_VERT)
@@ -503,6 +572,9 @@ create() -> bool {
     while cull < 2 {
         (g_scene as ptr[])[cull] = build(plain, fragment, 1, true, true, render, cull == 1, false, false)
         (g_skinned as ptr[])[cull] = build(vertex, fragment, 1, true, true, render, cull == 1, true, false)
+        // Over a prepass: tested against the depth it wrote, not writing it.
+        (g_scene_after as ptr[])[cull] = build(plain, fragment, 1, true, false, render, cull == 1, false, false)
+        (g_skinned_after as ptr[])[cull] = build(vertex, fragment, 1, true, false, render, cull == 1, true, false)
         if (g_scene as ptr[])[cull] == null || (g_skinned as ptr[])[cull] == null { ok = false }
         cull = cull + 1
     }
@@ -607,6 +679,10 @@ destroy() {
         gone((g_scene as ptr[])[cull])
         gone((g_skinned as ptr[])[cull])
         gone((g_points as ptr[])[cull])
+        gone(table_at(g_scene_after, cull))
+        gone(table_at(g_skinned_after, cull))
+        gone(table_at(g_prepass, cull))
+        gone(table_at(g_skinned_prepass, cull))
         cull = cull + 1
     }
     gone(g_scene_blend)
@@ -625,6 +701,10 @@ destroy() {
     forget(g_scene, 2)
     forget(g_skinned, 2)
     forget(g_points, 2)
+    forget(g_scene_after, 2)
+    forget(g_skinned_after, 2)
+    forget(g_prepass, 2)
+    forget(g_skinned_prepass, 2)
     g_layout = null
     g_scene_blend = null
     g_skinned_blend = null

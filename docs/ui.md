@@ -182,11 +182,18 @@ is asked for later is drawn over what was asked for earlier.
 
 ### A frame
 
-The engine makes one overlay, hands it to its backend
-(`Backend.set_overlay`), and clears it after each frame is drawn, so what
-`update`, `pose` and a script's `late_update` ask for is that frame's.
-An engine behaviour's `late_update` runs after the draw, and what it asks
-for is the next frame's. `engine_over` -- the editor's engine over its own
+The engine makes one overlay and hands it to its backend
+(`Backend.set_overlay`). At the start of each frame it lets the last frame's
+drawing go, so what `update`, `pose` and a script's `late_update` ask for is
+that frame's. An engine behaviour's `late_update` runs after the draw, and
+what it asks for is the next frame's.
+
+A held frame (`frame.pause`, `AE3D_HOLD`) runs no update, so it keeps
+what its scripts drew last. The menus and late updates drawn over it go
+each frame, so nothing piles up. Before 2026-11-23 the overlay was cleared
+after every draw, so a held frame showed no HUD, and the agent's
+`snapshot` of a paused scene had none (`test_hud_hold`). `hud.mark`,
+`hud.back_to` and `hud.drop_before` are the keeping and the letting go. `engine_over` -- the editor's engine over its own
 renderer -- makes one too. It is cleared at the start of each
 `engine_update`, so the owner's renders between two updates draw what the
 first asked for. It reaches the renderer once the owner calls

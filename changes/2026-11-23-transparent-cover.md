@@ -16,3 +16,7 @@
 - `test_transparent_cover`, new: a sheet filling the view is one screen, a
   small far one a sliver, an opaque one and one behind the camera none.
 - `docs/performance.md`, "Measuring".
+- A particle emitter's model is named "particles", so the line names it.
+  A game names its own with `core.model_set_name(particles.emitter_model(em), ...)`.
+  The share is an upper bound: an emitter's bounds count as covered where
+  its cards are sparse.

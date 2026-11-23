@@ -48,8 +48,10 @@ lit once per layer at every pixel it covers, so this pass's cost goes with
 that area, not with draws: about 1.75 ms per screen-covering layer at
 640x360 with 4x MSAA on an M1 Pro (`test_vk_stages`' transparent scene).
 The estimate is the model's bounds as the camera sees them, capped at a
-screen (`engine.transparent_share`), so a field of soft cards reads as the
-volume it fills.
+screen (`engine.transparent_share`). It is an upper bound: a field of
+sparse soft cards reads as the whole volume it fills, though its cards
+cover a part of it. A particle emitter is named "particles" unless the
+game names it (`core.model_set_name(particles.emitter_model(em), ...)`).
 
 Until 2026-11-23 two stamps were written beside the next ones, so the
 opaque draws read as `camdepth` and the transparent ones as `occlusion`
