@@ -23,6 +23,7 @@ at the root is the front page; this is the map.
 | [Networking](networking.md) | `ae3d.net`: a host and its clients, the transports (loopback with simulated conditions, TCP), replication and interpolation, and the numbers they are held to |
 | [Components](components.md) | Game objects as their components, the scene as an object: the registry of kinds the inspector, the scene file and the agent read, and the engine's own kinds |
 | [Scenes in code](scenes-in-code.md) | `ae3d.scenedsl`: a scene written as nested builders, nesting the hierarchy; placing it; the editor writing every saved scene as that code, and the test that holds code and file to one scene |
+| [Props placed by rule](scatter.md) | `ae3d.scatter` (#918): a district's props from tagged areas, roads, places kept clear and palettes, the same from a seed on every machine; one instanced model per prop; the scatter file; what it costs |
 | [The editor](editor.md) | The scene editor: panels, controls, undo, scene files, how the viewport is drawn |
 | [The game UI layer](ui.md) | Text and screen-space UI for a game: the TrueType reader, the distance-field glyph atlas, layout, and what they are held to |
 | [Performance](performance.md) | How a frame is measured, and where the frames are on the machine the numbers were taken on |
