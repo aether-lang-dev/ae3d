@@ -68,8 +68,10 @@ struct DrawMaterial {
     int blend;
     float reflectivity;
     int normal_map;
+    packed_float3 emissive;
+    int emissive_map;
 };
-static_assert(sizeof(DrawMaterial) == 128, "DrawMaterial: std140");
+static_assert(sizeof(DrawMaterial) == 144, "DrawMaterial: std140");
 static_assert(__builtin_offsetof(DrawMaterial, diffuse) == 0, "DrawMaterial.diffuse: std140");
 static_assert(__builtin_offsetof(DrawMaterial, specular) == 16, "DrawMaterial.specular: std140");
 static_assert(__builtin_offsetof(DrawMaterial, metallic) == 28, "DrawMaterial.metallic: std140");
@@ -97,6 +99,8 @@ static_assert(__builtin_offsetof(DrawMaterial, ember_glow) == 112, "DrawMaterial
 static_assert(__builtin_offsetof(DrawMaterial, blend) == 116, "DrawMaterial.blend: std140");
 static_assert(__builtin_offsetof(DrawMaterial, reflectivity) == 120, "DrawMaterial.reflectivity: std140");
 static_assert(__builtin_offsetof(DrawMaterial, normal_map) == 124, "DrawMaterial.normal_map: std140");
+static_assert(__builtin_offsetof(DrawMaterial, emissive) == 128, "DrawMaterial.emissive: std140");
+static_assert(__builtin_offsetof(DrawMaterial, emissive_map) == 140, "DrawMaterial.emissive_map: std140");
 
 struct Eye {
     float4x4 view_projection;
@@ -167,11 +171,11 @@ struct DrawBlock {
     Cut cut;
     Wounds wounds;
 };
-static_assert(sizeof(DrawBlock) == 2192, "DrawBlock: std140");
+static_assert(sizeof(DrawBlock) == 2208, "DrawBlock: std140");
 static_assert(__builtin_offsetof(DrawBlock, draw) == 0, "DrawBlock.draw: std140");
 static_assert(__builtin_offsetof(DrawBlock, material) == 240, "DrawBlock.material: std140");
-static_assert(__builtin_offsetof(DrawBlock, cut) == 496, "DrawBlock.cut: std140");
-static_assert(__builtin_offsetof(DrawBlock, wounds) == 560, "DrawBlock.wounds: std140");
+static_assert(__builtin_offsetof(DrawBlock, cut) == 512, "DrawBlock.cut: std140");
+static_assert(__builtin_offsetof(DrawBlock, wounds) == 576, "DrawBlock.wounds: std140");
 
 struct CameraBlock {
     Eye eye;

@@ -39,13 +39,13 @@ static_assert(__builtin_offsetof(Wounds, layers) == 1552, "Wounds.layers: std140
 static_assert(__builtin_offsetof(Wounds, core) == 1616, "Wounds.core: std140");
 
 struct DrawBlock {
-    char ae_pad0[496];
+    char ae_pad0[512];
     Cut cut;
     Wounds wounds;
 };
-static_assert(sizeof(DrawBlock) == 2192, "DrawBlock: std140");
-static_assert(__builtin_offsetof(DrawBlock, cut) == 496, "DrawBlock.cut: std140");
-static_assert(__builtin_offsetof(DrawBlock, wounds) == 560, "DrawBlock.wounds: std140");
+static_assert(sizeof(DrawBlock) == 2208, "DrawBlock: std140");
+static_assert(__builtin_offsetof(DrawBlock, cut) == 512, "DrawBlock.cut: std140");
+static_assert(__builtin_offsetof(DrawBlock, wounds) == 576, "DrawBlock.wounds: std140");
 
 struct ae_lit_depth_in {
     float3 BindPos [[user(locn0)]];

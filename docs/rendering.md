@@ -1383,6 +1383,30 @@ to 31 by the eighth frame and the last frame gives off 0.005% of the
 brightest's light. `tests/test_particles_drawn.ae`: a flame at full heat
 draws (250, 232) red and green, cooled to 0.6 (193, 63), on both renderers.
 
+### A surface's own light
+
+A lit window, a lamp's pane, a sign: a surface that gives light to the eye
+whatever lights it.
+- `core.model_set_emissive(m, r, g, b, strength)` sets its colour, linear,
+  times its strength. A night window wants several.
+- `core.model_set_emissive_map(m, path)` sets where: the map's colour times
+  the emissive, so one mesh can have lit panes in a dark wall.
+
+The light is added after the surface's own shading and before the fog, as
+the embers' is, and the bloom picks it up from there. Both renderers carry
+it: Vulkan's draw set has the map at binding 10, OpenGL's on unit 5.
+
+glTF materials bring theirs: `emissiveFactor` (black when absent),
+times `KHR_materials_emissive_strength`, times `emissiveTexture`. The scene
+file keeps a material's `emissive` and `emissive_path` when it has them, and
+the scene DSL writes `emissive(r, g, b, strength)` and `emissive_map(path)`.
+
+`tests/test_emissive.ae` holds it on both renderers, in the dark:
+- a plain surface reads black;
+- an emissive orange reads 225 195 0;
+- a half-white map glows only on its white half;
+- OpenGL and Vulkan agree to 1 of 255.
+
 ### Rain on the surfaces
 
 `engine_set_wetness(e, amount)` is rain on the scene: every surface that

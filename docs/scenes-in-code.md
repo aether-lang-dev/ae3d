@@ -56,7 +56,7 @@ what the first one said.
 | `model(path)`, `mesh(path)`, `group(name)`, `cube(size)`, `sphere(radius, segments, rings)`, `quad(w, d)`, `plane(grid, spacing)` | a model: an OBJ file (read once however many name it), a mesh file a scene was saved with, a group to hang children on, the loader's shapes |
 | `name`, `position`, `scale`, `scale3`, `rotate` (degrees, as `core.model_rotate`), `rotation` (a quaternion), `hidden`, `no_shadow`, `shader` | the model |
 | `polished_metal`, `rough_metal`, `metallic`, `plastic`, `matte`, `glossy`, `glass` | core's surfaces, on every material the model has |
-| `material() { ... }`, `diffuse`, `specular`, `surface(name, value)`, `texture`, `normal_map`, `tile_breakup` | the model's material as a scene file sets it: its numbers start as a new material's, and are then set by the file's names (`"roughness"`, `"embers"`, the list is `scene.material_number_name`) |
+| `material() { ... }`, `diffuse`, `specular`, `surface(name, value)`, `texture`, `normal_map`, `tile_breakup`, `emissive(r, g, b, strength)`, `emissive_map(path)` | the model's material as a scene file sets it: its numbers start as a new material's, and are then set by the file's names (`"roughness"`, `"embers"`, the list is `scene.material_number_name`) |
 | `uniform`, `uniform_int`, `uniform_vec3`, `uniform_values(name, vec3) { value(...) }` | the model's shader settings |
 | `sun`, `directional_light`, `point_light`, `spot_light`, `light()`; `color`, `intensity`, `direction`, `position`, `range`, `cone` | a light, as core makes it |
 | `body(kind, collider)`, `record(name)`, `script`, `kind` | what the model carries, in the scene file's records: a body and its fields (`"friction"`, `"trigger"`), water, a voxel world, a figure, motion |
