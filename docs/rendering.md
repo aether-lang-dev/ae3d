@@ -1774,6 +1774,12 @@ It works by clustered shading (`ae3d.lightgrid`, #468).
   value at the lamp, the fall-off the shader used to cut at, and its light
   fades to nothing over the last quarter of that distance, so a pool ends
   in a gradient.
+  - That is far for a small light: `light_point` with a range of 4 m
+    reaches 28 m, and every pixel within shades it.
+  - `core.light_set_reach(l, metres)` ends its pool sooner, with the same
+    fade over its last quarter, and the scene file keeps it as `"reach"`.
+    A window's glow with its reach set to 4 m is listed in 26 cells where
+    it was in 802 (`test_light_reach`); 0 gives back its fall-off's reach.
 - **The layout.** The lamps (five vec4s each) and the cells' lists are
   built once on the CPU in one layout. Vulkan reads them as storage buffers
   at bindings 2 and 3 of the camera's set. OpenGL 4.1, which has no storage buffers, reads the
