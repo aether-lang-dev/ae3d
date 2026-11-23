@@ -1,4 +1,4 @@
-### Menu themes
+### Menu themes, and menus taller than the screen
 
 - `menu.set_theme(stack, Theme)` draws a stack's menus in a game's colours,
   and `menu.set_menu_theme(menu, Theme)` gives one menu its own
@@ -16,3 +16,12 @@
 - `test_menu`: the default on a new stack; the stack's theme and none of
   the default; a menu's own over the stack's; and back.
 - `docs/ui.md`, "Menus".
+- **A menu taller than the screen fits it.** A menu of eight rows and a
+  button in a window 900 tall drew its button cut in half off the screen.
+  A menu that does not fit is now drawn and hit smaller, panel and widgets
+  together, until it fits the screen less a margin
+  (`widget_rect`/`panel_rect`, so clicks land where it is drawn). One that
+  fits is drawn as placed.
+- `test_menu` (43): nine rows on a screen 180 tall, every widget inside and
+  the last button pressed where it is drawn.
+

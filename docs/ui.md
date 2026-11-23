@@ -370,6 +370,12 @@ the same, so a menu written for the game works unchanged in its viewport.
   menu.set_theme(engine.engine_menus(e), brass)
   ```
 
+- **Taller than the screen.** A menu that does not fit the screen (more
+  rows than a window is tall) is drawn and hit smaller, the whole of it,
+  until it fits the screen less 12 points: its panel and widgets together,
+  their text with them. Its last button is shown and is pressed where it
+  shows. A menu that fits, however tight, is drawn as it was placed.
+
 `examples/game_hud.ae` opens a pause menu with Escape or Start.
 `tests/test_menu.ae` drives a menu with injected cursor, key, pad and text
 events at 320 x 180 (scale 1) and 640 x 360 (scale 2):
@@ -385,4 +391,5 @@ events at 320 x 180 (scale 1) and 640 x 360 (scale 2):
 | The game's reads through clicks, keys, text and movement with a menu open | none stirred |
 | Escape closing the last menu, still held | no "pause" edge for the game |
 | Drawn on both renderers | every widget where the hit test puts it, the focus ring round the focused one only; Vulkan within 360 channels of OpenGL |
+| Nine rows of 40 on a screen 180 tall | made smaller to fit, every widget inside; the last button pressed where it is drawn; one that fits as placed |
 | A theme on the stack, one on a menu, then cleared | drawn in the stack's, the menu's over it, the stack's again; a new stack in the default |
