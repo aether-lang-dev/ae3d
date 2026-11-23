@@ -1538,10 +1538,10 @@ silhouette, the picture of a far one -- and neither draws anything twice.
 ### The opaque depth prepass (Vulkan)
 
 The opaque surfaces are drawn twice:
-1. **Depth alone.** Through the casters' depth shaders, which drop a cut's
-   far side and a wound's core as the lit shader does. The camera's
-   view-projection goes in every program's light-space slot for this, and
-   each program's own matrix goes back after.
+1. **Depth alone.** Through the casters' vertex shaders and no pixel shader
+   at all, the device's fastest depth path. The camera's view-projection
+   goes in every program's light-space slot for this, and each program's
+   own matrix goes back after.
 2. **Lit.** Testing against that depth without writing it, so each pixel
    is lit once, by the surface that shows there.
 
@@ -1564,7 +1564,9 @@ overlapping cubes, a batch, an instanced model, a cut cube, a cutout and a
 glass sphere.
 
 What is left out:
-- surfaces with a cutout, whose holes are in their texture;
+- surfaces that drop pixels: a cutout's holes, a cut, a wound, a damage
+  mask. The prepass has no pixel shader to drop them, and one that could
+  discard would cost the prepass the fast depth path it is for;
 - impostors, crowds, cluster cuts and points, which draw by their own paths.
 
 These draw as before, writing their own depth. The prepass's depth is one

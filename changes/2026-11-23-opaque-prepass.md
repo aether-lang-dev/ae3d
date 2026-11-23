@@ -6,13 +6,15 @@
   drawn over another was lit in full at every pixel it covered.
   Hushlight's isometric town spent 25-30 ms of a frame there, at about 16
   ns a pixel, against about 1.8 for one plain layer.
-- **What.** The opaque surfaces' depth first, through the casters' depth
-  shaders. The camera's view-projection goes into every program's
-  light-space slot for this, and each program's own matrix goes back
-  after. Then their lit draws test against that depth and write none
+- **What.** The opaque surfaces' depth first, through the casters' vertex
+  shaders and no pixel shader. The camera's view-projection goes into every
+  program's light-space slot for this, and each program's own matrix goes
+  back after. Then their lit draws test against that depth and write none
   (`vkpipes.prepass`, `scene_after`).
-  - Left to draw as before: surfaces with a cutout, impostors, crowds,
-    cluster cuts and points.
+  - Left to draw as before: surfaces that drop pixels (a cutout, a cut, a
+    wound, a damage mask), impostors, crowds, cluster cuts and points. A
+    prepass pixel shader that could discard cost the prepass the device's
+    fast depth path; on a light scene it then cost more than it saved.
   - The prepass's depth is one step farther than the surface's. A slope
     term at silhouettes let the surface behind win the edge samples.
 - **Measured** (M1 Pro, Vulkan):

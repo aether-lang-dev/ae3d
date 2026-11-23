@@ -354,6 +354,22 @@ the same, so a menu written for the game works unchanged in its viewport.
   Escape that closes the pause menu does not reopen it. The click that
   pressed Resume fires no shot.
 
+- **Themes.** A game's menus match its HUD: `menu.set_theme(stack, t)`
+  draws every menu of a stack in `t`, and `menu.set_menu_theme(m, t)`
+  gives one menu its own over the stack's (`clear_menu_theme` gives it
+  back). A `Theme` is the veil over what is under a menu, the panel and
+  its outline, a widget's face (at rest, under the cursor, pressed), the
+  text and its dim kind, the accent and a field's ground.
+  `menu.theme_default()` is the look every menu had, so a game sets only
+  what it changes:
+
+  ```aether
+  brass = menu.theme_default()
+  brass.panel = hud.rgba(0.2, 0.15, 0.1, 0.9)
+  brass.accent = hud.rgba(0.85, 0.65, 0.3, 1.0)
+  menu.set_theme(engine.engine_menus(e), brass)
+  ```
+
 `examples/game_hud.ae` opens a pause menu with Escape or Start.
 `tests/test_menu.ae` drives a menu with injected cursor, key, pad and text
 events at 320 x 180 (scale 1) and 640 x 360 (scale 2):
@@ -369,3 +385,4 @@ events at 320 x 180 (scale 1) and 640 x 360 (scale 2):
 | The game's reads through clicks, keys, text and movement with a menu open | none stirred |
 | Escape closing the last menu, still held | no "pause" edge for the game |
 | Drawn on both renderers | every widget where the hit test puts it, the focus ring round the focused one only; Vulkan within 360 channels of OpenGL |
+| A theme on the stack, one on a menu, then cleared | drawn in the stack's, the menu's over it, the stack's again; a new stack in the default |
