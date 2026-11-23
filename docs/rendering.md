@@ -1789,12 +1789,24 @@ Now each lamp the budget holds has a map of its own (`ae3d.lampshadows`):
   fades a lamp's shadow out, so one leaving the budget does not pop. Where
   the device traces, a lamp whose light lies wholly inside the rays' reach
   is left to the rays.
+- **Which lamps cast.** A light that should never cast -- a window's glow, a
+  fill -- says so: `core.light_set_shadows(l, false)`, kept in the scene
+  file as `"shadows": false`. It is lit as before and gives its slot to the
+  next lamp. `engine.engine_set_lamp_shadow_limit(e, n)` keeps the nearest
+  `n` (at most ten), for a scene of many small lamps whose faces cost more
+  than their shadows give.
 - **Two layers.** A face's static casters -- plain models, whose world
   stamp says when they move -- are drawn into a static atlas only when what
   stands still in the face changes. The atlas the shader reads is that
   layer copied up a tile at a time, with what moves on its own -- a skinned
-  figure, a crowd, an instance stream -- drawn over the copy every frame it
-  is there. A lamp over a walking figure costs a copy and a draw a face, not
+  figure, a crowd, an instance stream whose instances changed this frame --
+  drawn over the copy every frame it is there. An instance stream that
+  stands still, a town's placed props, is the static layer's. It counted as
+  moving, and every instanced prop in a lamp's reach was drawn into each of
+  its six faces every frame: 40 instanced props among ten lamps drew 1,047
+  calls a frame, 125 now (`benchmarks/bench_lamp_instances.ae`, M1 Pro,
+  Vulkan; 11.5 → 10.6 ms a frame, the timestamped shadow stage 0.38 → 0.49
+  ms, where Metal stamps only at pass edges). A lamp over a walking figure costs a copy and a draw a face, not
   its street again: `zombie_street` draws 87 calls a frame on OpenGL and 88
   on Vulkan, where the one map it had drew 255.
 - **The lookup.** Each clustered lamp carries its slot; the slots' data --
@@ -1821,6 +1833,10 @@ Held to numbers: `tests/test_lamp_shadows.ae`, offscreen on both renderers.
   a lamp draws two; a cube as an instance stream hung under a lamp darkens
   the ground behind it to 29 (77 without it) with no static layer drawn,
   and moved away leaves 77.04 against 77.04.
+- Two props as a still instance stream: their faces are drawn as they
+  settle (18 on both renderers), and not again the frame after.
+- A lamp told to cast no shadow has no map and the next lamp has its slot,
+  and a limit of three shadows the three nearest.
 - `tests/test_ray_shadows`: the map path and the rays shadow the ground
   past the ball from a lamp alike (403 each, 598 with the ball casting
   nothing).

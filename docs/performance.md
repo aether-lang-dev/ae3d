@@ -35,6 +35,22 @@ What each scene stage holds:
 - `transparent`: the transparent draws (water, particles, glass) and the
   world's text.
 
+A third line, `perf transparent_cover`, names what the transparent pass
+shades, the largest five first:
+
+```
+perf transparent_cover mist=1.9(80) water=0.6(1) unnamed=0.2(3)
+```
+
+Each entry is a model name, the screens its bounds cover a frame (summed
+over the models of that name), and its draws a frame. A blended surface is
+lit once per layer at every pixel it covers, so this pass's cost goes with
+that area, not with draws: about 1.75 ms per screen-covering layer at
+640x360 with 4x MSAA on an M1 Pro (`test_vk_stages`' transparent scene).
+The estimate is the model's bounds as the camera sees them, capped at a
+screen (`engine.transparent_share`), so a field of soft cards reads as the
+volume it fills.
+
 Until 2026-11-23 two stamps were written beside the next ones, so the
 opaque draws read as `camdepth` and the transparent ones as `occlusion`
 (`test_vk_stages` holds the split now).

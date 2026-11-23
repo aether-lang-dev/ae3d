@@ -22,6 +22,7 @@ import ae3d.component
 import ae3d.components
 import ae3d.input
 import ae3d.scene
+import ae3d.lampshadows
 import ae3d.loader
 import ae3d.exposure
 import ae3d.hud
@@ -45,7 +46,7 @@ exports (
     engine_add_light, engine_remove_light,
     engine_camera, engine_window, engine_renderer_failed, engine_backend_name,
     engine_set_size, engine_set_title, engine_set_msaa, engine_set_decorated, engine_set_post,
-    engine_set_render_scale, engine_render_scale, engine_set_upscaler, engine_upscaler, engine_upscale_sharpness, engine_set_depth_of_field, engine_depth_of_field, engine_set_environment, engine_set_environment_yaw, engine_set_environment_look, engine_environment, engine_environment_intensity, engine_environment_yaw, engine_dof_focus, engine_dof_aperture, engine_dof_max_radius, engine_environment_error, UPSCALER_BILINEAR, UPSCALER_SPATIAL, engine_ssao, engine_bloom, engine_fxaa, engine_set_shadows, engine_shadows, engine_set_fog, engine_fog, engine_set_shadow_distance, engine_shadow_distance,
+    engine_set_render_scale, engine_render_scale, engine_set_upscaler, engine_upscaler, engine_upscale_sharpness, engine_set_depth_of_field, engine_depth_of_field, engine_set_environment, engine_set_environment_yaw, engine_set_environment_look, engine_environment, engine_environment_intensity, engine_environment_yaw, engine_dof_focus, engine_dof_aperture, engine_dof_max_radius, engine_environment_error, UPSCALER_BILINEAR, UPSCALER_SPATIAL, engine_ssao, engine_bloom, engine_fxaa, engine_set_shadows, engine_shadows, engine_set_fog, engine_fog, engine_set_shadow_distance, engine_shadow_distance, engine_set_lamp_shadow_limit, engine_lamp_shadow_limit, transparent_share,
     engine_set_vsync, engine_set_camera_input, engine_set_fixed_step,
     engine_set_camera_collision, engine_camera_collision, engine_set_camera_radius, engine_camera_radius,
     engine_camera_move, engine_camera_boom, engine_camera_prepare, engine_viewpoint,
@@ -375,6 +376,7 @@ struct Engine {
     ssr_strength: float
     perf_on: bool
     perf_frames: int
+    perf_cover: ptr                // list of *PerfCover: the blended models' screen share, by name
     perf_shadow_ms: float
     perf_scene_ms: float
     perf_post_ms: float
@@ -1530,6 +1532,14 @@ engine_set_shadow_distance(e: *Engine, metres: float) {
 }
 
 engine_shadow_distance(e: *Engine) -> float { return e.shadow_distance }
+
+// How many lamps a frame cast their own shadow, the nearest first: at most
+// lampshadows.SLOTS (10), each six faces drawn. A scene of many small lamps
+// keeps its nearest few shadowed and the rest lit without a map; a lamp that
+// should never cast one says so itself (core.light_set_shadows).
+engine_set_lamp_shadow_limit(e: *Engine, lamps: int) { lampshadows.set_limit(lamps) }
+
+engine_lamp_shadow_limit(e: *Engine) -> int { return lampshadows.limit() }
 
 // What the backend managed rather than what was asked for: a device that could
 // not build the map reports false here.
@@ -3552,6 +3562,134 @@ account_perf(e: *Engine) {
     e.perf_cpu_ms = e.perf_cpu_ms + cpu
     e.perf_update_ms = e.perf_update_ms + e.update_seconds * 1000.0
     e.perf_draws = e.perf_draws + engine_draw_calls(e)
+    account_cover(e)
+}
+
+// What the transparent pass shades, by model name: a blended surface is lit
+// once a layer at every pixel it covers, so its cost is its covered area,
+// not its draws. The share is of the screen, of the model's bounds as the
+// camera sees them, capped at the whole screen: a field of soft cards reads
+// as the volume it fills.
+struct PerfCover {
+    name: string
+    share: float                   // summed over the run's frames
+    draws: int
+}
+
+account_cover(e: *Engine) {
+    cam = e.camera as *Camera
+    if cam == null { return }
+    if e.perf_cover == null { e.perf_cover = list.new() }
+    count = engine_model_count(e)
+    i = 0
+    while i < count {
+        m = engine_model_at(e, i)
+        share = transparent_share(cam, m, e.width, e.height)
+        if share > 0.0 {
+            label = core.text(m.name)
+            if label == "" { label = "unnamed" }
+            cover_add(e.perf_cover as ptr, label, share)
+        }
+        i = i + 1
+    }
+}
+
+// The share of a `width` by `height` screen the transparent pass shades for
+// `m`, as the camera sees its bounds: 0 for a model that does not blend, is
+// hidden or is behind the camera; 1 for one whose bounds hold the camera or
+// fill the view.
+transparent_share(cam: *Camera, m: *Model, width: int, height: int) -> float {
+    if cam == null || m == null || !m.visible || !blended(m) || width <= 0 || height <= 0 { return 0.0 }
+    to = core.v3_sub(m.bounding_center, cam.position)
+    depth = core.v3_dot(to, cam.front)
+    if depth + m.bounding_radius <= cam.near { return 0.0 }
+    if depth <= m.bounding_radius { return 1.0 }
+    focal = (height as float) * 0.5 / core.tan_of(core.deg_to_rad(cam.fov) * 0.5)
+    r = m.bounding_radius * focal / depth
+    share = 3.14159265 * r * r / ((width * height) as float)
+    if share > 1.0 { share = 1.0 }
+    return share
+}
+
+// The models the backend draws.
+engine_model_count(e: *Engine) -> int {
+    if e.api == platform.API_VULKAN { return vulkan.renderer_model_count(e.backend_state as *VKRenderer) }
+    return gl.renderer_model_count(e.gl_renderer as *GLRenderer)
+}
+
+engine_model_at(e: *Engine, index: int) -> *Model {
+    if e.api == platform.API_VULKAN { return vulkan.renderer_model(e.backend_state as *VKRenderer, index) }
+    return gl.renderer_model(e.gl_renderer as *GLRenderer, index)
+}
+
+// Whether any surface of the model blends: the transparent pass draws it.
+blended(m: *Model) -> bool {
+    groups = core.model_material_count(m)
+    k = 0
+    while k < groups {
+        if core.surface_blend(m, core.model_material_at(m, k)) != core.BLEND_OPAQUE { return true }
+        k = k + 1
+    }
+    return core.surface_blend(m, m.material) != core.BLEND_OPAQUE
+}
+
+cover_add(covers: ptr, label: string, share: float) {
+    i = 0
+    while i < list.size(covers) {
+        c = list.get_raw(covers, i) as *PerfCover
+        if string.equals(c.name, label) == 1 {
+            c.share = c.share + share
+            c.draws = c.draws + 1
+            return
+        }
+        i = i + 1
+    }
+    c = heap.new(PerfCover)
+    c.name = string.copy(label)
+    c.share = share
+    c.draws = 1
+    list.add_raw(covers, c as ptr)
+}
+
+// The five that cover the most, a frame on average: "name=share(draws)",
+// share in screens.
+say_cover(e: *Engine, n: float) {
+    covers = e.perf_cover as ptr
+    if covers == null || list.size(covers) == 0 { return }
+    line = "perf transparent_cover"
+    taken = 0
+    while taken < 5 && taken < list.size(covers) {
+        best = 0 - 1
+        best_share = 0.0 - 1.0
+        i = 0
+        while i < list.size(covers) {
+            c = list.get_raw(covers, i) as *PerfCover
+            if c.draws >= 0 && c.share > best_share {
+                best = i
+                best_share = c.share
+            }
+            i = i + 1
+        }
+        if best < 0 { break }
+        c = list.get_raw(covers, best) as *PerfCover
+        line = "${line} ${c.name}=${c.share / n}(${(c.draws as float) / n})"
+        // Taken: not offered again.
+        c.draws = 0 - 1 - c.draws
+        taken = taken + 1
+    }
+    println(line)
+}
+
+perf_cover_free(e: *Engine) {
+    covers = e.perf_cover as ptr
+    if covers == null { return }
+    i = 0
+    while i < list.size(covers) {
+        heap.free(list.get_raw(covers, i) as *PerfCover)
+        i = i + 1
+    }
+    list.free(covers)
+    e.perf_cover = null
 }
 
 // One line, machine-readable, the same on every backend: what a frame of
@@ -3563,6 +3701,9 @@ say_perf(e: *Engine) {
     fps = 0.0
     if wall > 0.0 { fps = n / wall }
     println("perf backend=${e.backend_name} frames=${e.perf_frames} fps=${fps} gpu_shadow_ms=${e.perf_shadow_ms / n} gpu_scene_ms=${e.perf_scene_ms / n} gpu_post_ms=${e.perf_post_ms / n} cpu_ms=${e.perf_cpu_ms / n} update_ms=${e.perf_update_ms / n} draws=${e.perf_draws / e.perf_frames} width=${e.width} height=${e.height}")
+    // What the transparent pass shades, the largest first: its cost goes
+    // with the screen it covers.
+    say_cover(e, n)
     if e.api == platform.API_VULKAN {
         // The scene's own split, which is where a frame's cost is.
         stages = e.perf_stage_ms as float[]
@@ -3594,6 +3735,7 @@ engine_shutdown(e: *Engine) {
     // Between runs there is no running engine for a script to find.
     if g_running == e as ptr { g_running = null }
     say_perf(e)
+    perf_cover_free(e)
     wander_report(e)
     if e.agent_on {
         agent.capture_release()
