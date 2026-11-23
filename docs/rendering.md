@@ -1631,6 +1631,18 @@ What space the pixel is in:
 Before 2026-11-23 a point was passed through as a pixel, and on a Retina
 Mac every pick read a spot halfway to the frame's top left corner.
 
+**Reading without waiting.** Read in the frame that asked (in its
+`late_update`, or `engine_pick`), a pick waits for the device to finish
+that frame, a whole frame's work with the program stopped. A game that
+picks as the pointer moves instead asks, then reads on the first frame
+`engine_pick_ready(e, k)` is true: on Vulkan, two frames later, once a
+later frame's start has waited for the answering one; on OpenGL, the next
+frame. Read when ready, a pick costs no more than a frame with none
+(1.70-1.77 ms against 2.8-3.0 ms read at once, in a light scene; in a
+frame of 30 ms on the device, the wait was most of a frame). The pick pass
+draws only the box round the pixels asked, a pixel spare, on both
+renderers.
+
 It is the scene's surfaces drawn again from the camera into a target that
 holds ids instead of colour: ae3d.shaders.lit's `pick_vertex` and `pick_pixel`
 (quote shaders, with the MSL), over the draw's own block, whose `Draw.pick`

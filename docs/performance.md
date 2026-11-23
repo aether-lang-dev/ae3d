@@ -50,7 +50,8 @@ that area, not with draws: about 1.75 ms per screen-covering layer at
 The estimate is the model's bounds as the camera sees them, capped at a
 screen (`engine.transparent_share`). It is an upper bound: a field of
 sparse soft cards reads as the whole volume it fills, though its cards
-cover a part of it. A particle emitter is named "particles" unless the
+cover a part of it. A model off the view, and an instanced one drawing
+nothing (an emitter with no live particle), count for none. A particle emitter is named "particles" unless the
 game names it (`core.model_set_name(particles.emitter_model(em), ...)`).
 
 Until 2026-11-23 two stamps were written beside the next ones, so the
