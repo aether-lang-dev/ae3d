@@ -1,0 +1,1434 @@
+// A scene written in code as the shape it is (#275): nesting is the
+// hierarchy, and what a model carries is written inside its block.
+//
+//     s = scene() {
+//         sun(0.4, 0.8, 0.5)
+//         camera(0.0, 20.0, 90.0) { look_at(0.0, 0.0, 0.0) }
+//         cube(1.0) {
+//             scale(20.0)
+//             polished_metal(0.85, 0.35, 0.2)
+//             component("Spinner") { field("pitch", 18.0) field("yaw", 30.0) }
+//             cube(0.3) { position(0.0, 1.2, 0.0) }
+//         }
+//     }
+//
+// Every builder takes the block it is written in as `_ctx`, Aether's
+// trailing-block builders as aether-ui's take theirs: a model in a model's
+// block is that model's child, a light in the scene's block is the scene's
+// and in a model's the model's own, a component is on the model whose block
+// it is in, or on the scene's root.
+//
+// What it builds is what a scene file loads into (ae3d.scene): the models,
+// parents before children; the lights, the first the key light; the
+// attachments; the components. The models are made as a program makes them,
+// by the loader and core. Everything else is written as the scene file's
+// own record, in the file's own names, and read by the file's own reader
+// (scene.attachment_of, scene.load_light), so what the two make is the same
+// by construction. test_scenedsl holds the models to that too: a scene
+// built here, saved and loaded back, is the same tree.
+//
+// `write_from_file` is the other way: a saved scene's JSON as the code that
+// builds it, which the editor writes beside every save.
+
+import std.list
+import std.heap
+import std.string
+import std.strbuilder
+import std.json
+import std.fs
+import ae3d.core
+import ae3d.loader
+import ae3d.scene
+import ae3d.behaviour
+import ae3d.component
+import ae3d.components
+import ae3d.engine
+import ae3d.water
+import ae3d.voxel
+
+exports (
+    SceneNode, SceneBuild,
+    scene, model, mesh, group, cube, sphere, quad, plane,
+    name, position, scale, scale3, rotate, rotation, hidden, no_shadow, shader,
+    material, diffuse, specular, surface, texture, normal_map, tile_breakup,
+    metallic, plastic, polished_metal, rough_metal, matte, glossy, glass,
+    uniform, uniform_int, uniform_vec3, uniform_values, value,
+    sun, directional_light, point_light, spot_light, light, color, intensity, direction, range, cone,
+    camera, look_at, component, record, body, script, kind,
+    field, field_int, field_bool, field_text, field_vec3, field_quat, field_append, field_object,
+    models, lights, attachments, components, errors, error, place, release,
+    write_from_file, text_from_file
+)
+
+const NODE_SCENE = 0
+const NODE_MODEL = 1
+const NODE_MATERIAL = 2
+const NODE_LIGHT = 3
+const NODE_RECORD = 4
+const NODE_COMPONENT = 5
+const NODE_UNIFORM = 6
+
+// What the builders made, held by the scene's node until release.
+struct SceneBuild {
+    models: ptr                    // *Model, in the order written
+    entries: ptr                   // each model's records (a JSON object), or null; beside models
+    light_records: ptr             // the scene's lights, as the file's records (a JSON array)
+    loaded: ptr                    // LoadedComponent, as scene_load_components hands them
+    nodes: ptr                     // every SceneNode
+    sources: ptr                   // each OBJ read once (scene.source_clone)
+    lights: ptr                    // made from light_records at finish
+    attachments: ptr               // made from entries at finish
+    finished: bool
+    placed: bool                   // its models are objects', freed with them
+    errors: int
+    error: string
+}
+
+// A block's handle: the scene, a model, one of a model's materials, a light,
+// a record, a component or a uniform's values.
+struct SceneNode {
+    kind: int
+    build: ptr                     // *SceneBuild
+    model: ptr                     // a model's, or the model the node is on (null: the scene's)
+    index: int                     // that model's place among the models, -1 for the scene
+    material: ptr                  // a material block's *Material
+    record: ptr                    // a light's or a record's JSON object, a component's fields
+    loaded: ptr                    // a component's *LoadedComponent
+    vec3: bool                     // a uniform's values: three to an element
+    name: string                   // a uniform's name
+    values: ptr                    // a uniform's values, as they are written (a JSON array)
+}
+
+// --- the scene ------------------------------------------------------------------
+
+// The scene's node: what its block's builders build into. Hand it to
+// models(), lights(), attachments() and components(), or to place(), and
+// release() it when done.
+scene() -> *SceneNode {
+    b = heap.new(SceneBuild)
+    b.models = list.new()
+    b.entries = list.new()
+    b.light_records = json.arr()
+    b.loaded = list.new()
+    b.nodes = list.new()
+    b.sources = scene.sources_new()
+    b.error = ""
+    n = node_new(b, NODE_SCENE, null, 0 - 1)
+    return n
+}
+
+node_new(b: *SceneBuild, kind: int, m: *Model, index: int) -> *SceneNode {
+    n = heap.new(SceneNode)
+    n.kind = kind
+    n.build = b as ptr
+    n.model = m as ptr
+    n.index = index
+    n.name = ""
+    list.add_raw(b.nodes, n as ptr)
+    return n
+}
+
+// What a builder was handed, as a node: null outside any block.
+node_of(ctx: @into ptr) -> *SceneNode { return ctx as *SceneNode }
+
+build_of(n: *SceneNode) -> *SceneBuild {
+    if n == null { return null }
+    return n.build as *SceneBuild
+}
+
+// A builder written where it means nothing (a cube in a light's block, a
+// colour on the scene) is not done, and said: the first such is kept.
+refuse(n: *SceneNode, what: string) {
+    b = build_of(n)
+    if b == null {
+        println("scenedsl: ${what}, outside any scene")
+        return
+    }
+    b.errors = b.errors + 1
+    if b.errors == 1 { b.error = string.copy(what) }
+}
+
+// --- models ---------------------------------------------------------------------
+
+// The model `m` made for the block `ctx`: the scene's, or a child of the
+// model whose block it is in. A model that did not make (its file gone)
+// is said, and its block's builders do nothing.
+add_model(ctx: ptr, m: *Model, what: string) -> *SceneNode {
+    parent = node_of(ctx)
+    b = build_of(parent)
+    if b == null || b.finished || (parent.kind != NODE_SCENE && parent.kind != NODE_MODEL) {
+        refuse(parent, "${what} is a model: it goes in the scene's block or a model's")
+        if m != null { core.model_free(m) }
+        return dead(b)
+    }
+    if parent.kind == NODE_MODEL && parent.model == null {
+        // In the block of a model that did not make: nothing to hang it on.
+        if m != null { core.model_free(m) }
+        return dead(b)
+    }
+    if m == null {
+        refuse(parent, "${what}: ${scene.last_error()}")
+        return dead(b)
+    }
+    if parent.kind == NODE_MODEL { core.model_set_parent(m, parent.model as *Model) }
+    core.model_update_matrix(m)
+    core.model_recalculate_bounds(m)
+    list.add_raw(b.models, m as ptr)
+    list.add_raw(b.entries, null)
+    return node_new(b, NODE_MODEL, m, list.size(b.models) - 1)
+}
+
+// A model's node whose model did not make: its block's builders find no
+// model and do nothing more.
+dead(b: *SceneBuild) -> *SceneNode {
+    if b == null { return null }
+    return node_new(b, NODE_MODEL, null, 0 - 1)
+}
+
+// A model from an OBJ file, read once however many models name it.
+model(_ctx: ptr, path: string) -> *SceneNode {
+    b = build_of(node_of(_ctx))
+    m = null as *Model
+    if b != null { m = scene.source_clone(b.sources, path) }
+    return add_model(_ctx, m, "model(\"${path}\")")
+}
+
+// A model from a mesh file a scene was saved with.
+mesh(_ctx: ptr, path: string) -> *SceneNode {
+    return add_model(_ctx, scene.mesh_model(path), "mesh(\"${path}\")")
+}
+
+// A transform and nothing to draw, what its children are placed by.
+group(_ctx: ptr, label: string) -> *SceneNode {
+    m = core.model_new()
+    core.model_set_name(m, label)
+    return add_model(_ctx, m, "group")
+}
+
+cube(_ctx: ptr, size: float) -> *SceneNode { return add_model(_ctx, loader.cube(size), "cube") }
+
+sphere(_ctx: ptr, radius: float, segments: int = 24, rings: int = 16) -> *SceneNode {
+    return add_model(_ctx, loader.sphere(radius, segments, rings), "sphere")
+}
+
+quad(_ctx: ptr, width: float, depth: float) -> *SceneNode { return add_model(_ctx, loader.quad(width, depth), "quad") }
+
+plane(_ctx: ptr, grid: int, spacing: float) -> *SceneNode { return add_model(_ctx, loader.plane(grid, spacing), "plane") }
+
+// The model of a model's block, or null (said) for any other block.
+model_of(ctx: ptr, what: string) -> *Model {
+    n = node_of(ctx)
+    if n == null || n.kind != NODE_MODEL {
+        refuse(n, "${what} goes in a model's block")
+        return null
+    }
+    return n.model as *Model
+}
+
+name(_ctx: ptr, text: string) {
+    m = model_of(_ctx, "name")
+    if m != null { core.model_set_name(m, text) }
+}
+
+// Where it is: a model's, under its parent; a light's; or a camera's.
+position(_ctx: ptr, x: float, y: float, z: float) {
+    n = node_of(_ctx)
+    if n != null && n.kind == NODE_MODEL {
+        m = n.model as *Model
+        if m != null {
+            core.model_set_position(m, x, y, z)
+            core.model_update_matrix(m)
+        }
+        return
+    }
+    if n != null && (n.kind == NODE_LIGHT || n.kind == NODE_COMPONENT) {
+        put_vec3(n.record, "position", x, y, z)
+        return
+    }
+    refuse(n, "position goes in a model's, a light's or a camera's block")
+}
+
+scale(_ctx: ptr, s: float) { scale3(_ctx, s, s, s) }
+
+scale3(_ctx: ptr, x: float, y: float, z: float) {
+    m = model_of(_ctx, "scale")
+    if m == null { return }
+    core.model_set_scale(m, x, y, z)
+    core.model_update_matrix(m)
+}
+
+// Turned by degrees about x, then y, then z, as core.model_rotate turns.
+rotate(_ctx: ptr, x: float, y: float, z: float) {
+    m = model_of(_ctx, "rotate")
+    if m != null { core.model_rotate(m, x, y, z) }
+}
+
+// Its rotation as the quaternion it is.
+rotation(_ctx: ptr, x: float, y: float, z: float, w: float) {
+    m = model_of(_ctx, "rotation")
+    if m == null { return }
+    core.model_set_rotation(m, core.quat(x, y, z, w))
+    core.model_update_matrix(m)
+}
+
+hidden(_ctx: ptr) {
+    m = model_of(_ctx, "hidden")
+    if m != null { m.visible = false }
+}
+
+no_shadow(_ctx: ptr) {
+    m = model_of(_ctx, "no_shadow")
+    if m != null { m.casts_shadow = false }
+}
+
+// A named shader, by the kind the scene file records (core.SHADER_*).
+shader(_ctx: ptr, kind: int) {
+    m = model_of(_ctx, "shader")
+    if m != null { core.model_set_shader(m, scene.shader_for(kind)) }
+}
+
+// --- surfaces -------------------------------------------------------------------
+
+// The model's material as a scene file's: every number what a new material
+// holds until the block says otherwise, its textures kept. The block's
+// colours and numbers are that material's; outside one they are every
+// material the model has.
+material(_ctx: ptr) -> *SceneNode {
+    n = node_of(_ctx)
+    m = model_of(_ctx, "material")
+    if m == null { return dead(build_of(n)) }
+    core.model_ensure_material(m)
+    mat = m.material
+    fresh = core.material_new("")
+    i = 0
+    while i < scene.material_number_count() {
+        scene.material_set_number(mat, i, scene.material_number(fresh, i))
+        i = i + 1
+    }
+    mat.diffuse = fresh.diffuse
+    mat.specular = fresh.specular
+    mat.tile_breakup = false
+    core.material_free(fresh)
+    out = node_new(build_of(n), NODE_MATERIAL, m, n.index)
+    out.material = mat as ptr
+    return out
+}
+
+// The materials a surface builder sets: the block's one, or every one of
+// the model's. Answers how many there are, -1 (said) for a block that has
+// none.
+surface_count(n: *SceneNode, what: string) -> int {
+    if n != null && n.kind == NODE_MATERIAL { return 1 }
+    if n != null && n.kind == NODE_MODEL {
+        if n.model == null { return 0 }
+        return core.model_material_count(n.model as *Model)
+    }
+    refuse(n, "${what} goes in a model's or a material's block")
+    return 0 - 1
+}
+
+surface_at(n: *SceneNode, k: int) -> *Material {
+    if n.kind == NODE_MATERIAL { return n.material as *Material }
+    return core.model_material_at(n.model as *Model, k)
+}
+
+diffuse(_ctx: ptr, r: float, g: float, b: float) {
+    n = node_of(_ctx)
+    count = surface_count(n, "diffuse")
+    k = 0
+    while k < count {
+        mat = surface_at(n, k)
+        if mat != null { mat.diffuse = core.vec3(r, g, b) }
+        k = k + 1
+    }
+}
+
+specular(_ctx: ptr, r: float, g: float, b: float) {
+    n = node_of(_ctx)
+    count = surface_count(n, "specular")
+    k = 0
+    while k < count {
+        mat = surface_at(n, k)
+        if mat != null { mat.specular = core.vec3(r, g, b) }
+        k = k + 1
+    }
+}
+
+// A material's number by the scene file's name for it: "roughness",
+// "detail_scale", "embers" (scene.material_number_name).
+surface(_ctx: ptr, number: string, amount: float) {
+    n = node_of(_ctx)
+    which = scene.material_number_index(number)
+    if which < 0 {
+        refuse(n, "a material has no number \"${number}\"")
+        return
+    }
+    count = surface_count(n, "surface")
+    k = 0
+    while k < count {
+        scene.material_set_number(surface_at(n, k), which, amount)
+        k = k + 1
+    }
+}
+
+texture(_ctx: ptr, path: string) {
+    n = node_of(_ctx)
+    count = surface_count(n, "texture")
+    k = 0
+    while k < count {
+        mat = surface_at(n, k)
+        if mat != null { core.material_set_texture_path(mat, path) }
+        k = k + 1
+    }
+}
+
+normal_map(_ctx: ptr, path: string) {
+    n = node_of(_ctx)
+    count = surface_count(n, "normal_map")
+    k = 0
+    while k < count {
+        mat = surface_at(n, k)
+        if mat != null { core.material_set_normal_path(mat, path) }
+        k = k + 1
+    }
+}
+
+tile_breakup(_ctx: ptr, on: bool) {
+    n = node_of(_ctx)
+    count = surface_count(n, "tile_breakup")
+    k = 0
+    while k < count {
+        mat = surface_at(n, k)
+        if mat != null { mat.tile_breakup = on }
+        k = k + 1
+    }
+}
+
+// core's surfaces, on every material the model has.
+metallic(_ctx: ptr, r: float, g: float, b: float, roughness: float) {
+    m = model_of(_ctx, "metallic")
+    if m != null { core.model_metallic(m, r, g, b, roughness) }
+}
+
+plastic(_ctx: ptr, r: float, g: float, b: float, roughness: float) {
+    m = model_of(_ctx, "plastic")
+    if m != null { core.model_plastic(m, r, g, b, roughness) }
+}
+
+polished_metal(_ctx: ptr, r: float, g: float, b: float) {
+    m = model_of(_ctx, "polished_metal")
+    if m != null { core.model_polished_metal(m, r, g, b) }
+}
+
+rough_metal(_ctx: ptr, r: float, g: float, b: float) {
+    m = model_of(_ctx, "rough_metal")
+    if m != null { core.model_rough_metal(m, r, g, b) }
+}
+
+matte(_ctx: ptr, r: float, g: float, b: float) {
+    m = model_of(_ctx, "matte")
+    if m != null { core.model_matte(m, r, g, b) }
+}
+
+glossy(_ctx: ptr, r: float, g: float, b: float) {
+    m = model_of(_ctx, "glossy")
+    if m != null { core.model_glossy(m, r, g, b) }
+}
+
+glass(_ctx: ptr, r: float, g: float, b: float, alpha: float) {
+    m = model_of(_ctx, "glass")
+    if m != null { core.model_glass(m, r, g, b, alpha) }
+}
+
+// --- uniforms -------------------------------------------------------------------
+
+uniform(_ctx: ptr, label: string, amount: float) {
+    m = model_of(_ctx, "uniform")
+    if m != null { core.model_set_uniform_float(m, label, amount) }
+}
+
+uniform_int(_ctx: ptr, label: string, amount: int) {
+    m = model_of(_ctx, "uniform_int")
+    if m != null { core.model_set_uniform_int(m, label, amount) }
+}
+
+uniform_vec3(_ctx: ptr, label: string, x: float, y: float, z: float) {
+    m = model_of(_ctx, "uniform_vec3")
+    if m != null { core.model_set_uniform_vec3(m, label, core.vec3(x, y, z)) }
+}
+
+// An array uniform, its values each a value() in the block: three to an
+// element when `vec3`. Set on the model as the block ends... which a
+// regular block cannot say, so each value() sets it again whole: an array
+// is a few dozen numbers.
+uniform_values(_ctx: ptr, label: string, vec3: bool) -> *SceneNode {
+    n = node_of(_ctx)
+    m = model_of(_ctx, "uniform_values")
+    if m == null { return dead(build_of(n)) }
+    out = node_new(build_of(n), NODE_UNIFORM, m, n.index)
+    out.name = string.copy(label)
+    out.vec3 = vec3
+    out.values = json.arr()
+    core.model_set_uniform_array(m, label, 0, vec3)
+    return out
+}
+
+value(_ctx: ptr, amount: float) {
+    n = node_of(_ctx)
+    if n == null || n.kind != NODE_UNIFORM {
+        refuse(n, "value goes in a uniform_values block")
+        return
+    }
+    if n.model == null { return }
+    json.array_add_raw(n.values, json.num(amount))
+    count = json.array_size(n.values)
+    into = core.model_set_uniform_array(n.model as *Model, n.name, count, n.vec3)
+    k = 0
+    while k < count {
+        core.farr_set(into, k, json.get_number(json.array_get_raw(n.values, k)))
+        k = k + 1
+    }
+}
+
+// --- lights ---------------------------------------------------------------------
+
+// A light, as the scene file's record of it: in the scene's block one of
+// the scene's lights, the first its key light; in a model's block that
+// model's own, the light a marker stands for.
+add_light(ctx: ptr, l: *Light, what: string) -> *SceneNode {
+    n = node_of(ctx)
+    b = build_of(n)
+    record = json.obj()
+    if b == null || b.finished || (n.kind != NODE_SCENE && n.kind != NODE_MODEL) {
+        refuse(n, "${what} is a light: it goes in the scene's block or a model's")
+        core.light_free(l)
+        json.free(record)
+        return dead(b)
+    }
+    if n.kind == NODE_MODEL && n.model == null {
+        core.light_free(l)
+        json.free(record)
+        return dead(b)
+    }
+    written = scene.light_json(l)
+    core.light_free(l)
+    kept = null as ptr
+    if n.kind == NODE_SCENE {
+        json.array_add_raw(b.light_records, written)
+        kept = json.array_get_raw(b.light_records, json.array_size(b.light_records) - 1)
+    } else {
+        entry = entry_of(n)
+        json.object_set_raw(entry, "light", written)
+        kept = json.object_get_raw(entry, "light")
+    }
+    json.free(record)
+    out = node_new(b, NODE_LIGHT, n.model as *Model, n.index)
+    out.record = kept
+    return out
+}
+
+// A sun from `direction` (toward it): core.light_sun.
+sun(_ctx: ptr, x: float, y: float, z: float) -> *SceneNode {
+    return add_light(_ctx, core.light_sun(core.vec3(x, y, z)), "sun")
+}
+
+directional_light(_ctx: ptr, x: float, y: float, z: float) -> *SceneNode {
+    return add_light(_ctx, core.light_directional(core.vec3(x, y, z), core.vec3(1.0, 1.0, 1.0), 1.0), "directional_light")
+}
+
+point_light(_ctx: ptr, x: float, y: float, z: float, reach: float) -> *SceneNode {
+    return add_light(_ctx, core.light_point(core.vec3(x, y, z), core.vec3(1.0, 1.0, 1.0), 1.0, reach), "point_light")
+}
+
+spot_light(_ctx: ptr, x: float, y: float, z: float, dx: float, dy: float, dz: float, reach: float,
+           inner_degrees: float, outer_degrees: float) -> *SceneNode {
+    return add_light(_ctx, core.light_spot(core.vec3(x, y, z), core.vec3(dx, dy, dz), core.vec3(1.0, 1.0, 1.0), 1.0, reach,
+                                           inner_degrees, outer_degrees), "spot_light")
+}
+
+// A light as the file has it, its fields each a field() in the block: what
+// write_from_file writes.
+light(_ctx: ptr) -> *SceneNode { return add_light(_ctx, core.light_new(), "light") }
+
+light_node(ctx: @into ptr, what: string) -> *SceneNode {
+    n = node_of(ctx)
+    if n == null || n.kind != NODE_LIGHT {
+        refuse(n, "${what} goes in a light's block")
+        return null
+    }
+    return n
+}
+
+color(_ctx: ptr, r: float, g: float, b: float) {
+    n = light_node(_ctx, "color")
+    if n != null { put_vec3(n.record, "color", r, g, b) }
+}
+
+intensity(_ctx: ptr, amount: float) {
+    n = light_node(_ctx, "intensity")
+    if n != null { json.object_set_raw(n.record, "intensity", json.num(amount)) }
+}
+
+direction(_ctx: ptr, x: float, y: float, z: float) {
+    n = light_node(_ctx, "direction")
+    if n == null { return }
+    d = core.v3_normalize(core.vec3(x, y, z))
+    put_vec3(n.record, "direction", d.x, d.y, d.z)
+}
+
+// How far it reaches, as core.light_set_range fades it.
+range(_ctx: ptr, reach: float) {
+    n = light_node(_ctx, "range")
+    if n == null { return }
+    l = scene.load_light(n.record)
+    core.light_set_range(l, reach)
+    json.object_set_raw(n.record, "constant", json.num(l.constant_atten))
+    json.object_set_raw(n.record, "linear", json.num(l.linear_atten))
+    json.object_set_raw(n.record, "quadratic", json.num(l.quadratic_atten))
+    core.light_free(l)
+}
+
+// A spot's cone, as core.light_set_cone takes it.
+cone(_ctx: ptr, inner_degrees: float, outer_degrees: float) {
+    n = light_node(_ctx, "cone")
+    if n == null { return }
+    l = scene.load_light(n.record)
+    core.light_set_cone(l, inner_degrees, outer_degrees)
+    json.object_set_raw(n.record, "cos_inner", json.num(l.spot_cos_inner))
+    json.object_set_raw(n.record, "cos_outer", json.num(l.spot_cos_outer))
+    core.light_free(l)
+}
+
+// --- what a model carries -------------------------------------------------------
+
+// The model's records, as the file's entry for it carries them.
+entry_of(n: *SceneNode) -> ptr {
+    b = build_of(n)
+    entry = list.get_raw(b.entries, n.index)
+    if entry == null {
+        entry = json.obj()
+        list.set(b.entries, n.index, entry)
+    }
+    return entry
+}
+
+// One of the model's records by the file's name for it -- "physics",
+// "water", "voxel", "figure", "motion" -- its fields each a field() in the
+// block, by the file's names.
+record(_ctx: ptr, label: string) -> *SceneNode {
+    n = node_of(_ctx)
+    if model_of(_ctx, "record(\"${label}\")") == null { return dead(build_of(n)) }
+    entry = entry_of(n)
+    json.object_set_raw(entry, label, json.obj())
+    out = node_new(build_of(n), NODE_RECORD, n.model as *Model, n.index)
+    out.record = json.object_get_raw(entry, label)
+    return out
+}
+
+// A body of `kind` ("static", "kinematic", "dynamic" or "character") and a
+// collider of its mesh ("box", "sphere", "capsule", "hull" or "mesh");
+// "friction", "restitution", "density" and "trigger" are its fields.
+body(_ctx: ptr, kind: string, collider: string) -> *SceneNode {
+    out = record(_ctx, "physics")
+    if out.record != null {
+        json.object_set_raw(out.record, "body", json.str(kind))
+        json.object_set_raw(out.record, "collider", json.str(collider))
+    }
+    return out
+}
+
+// One of the editor's own scripts on the model, by its name.
+script(_ctx: ptr, label: string) {
+    m = model_of(_ctx, "script")
+    if m != null { json.object_set_raw(entry_of(node_of(_ctx)), "script", json.str(label)) }
+}
+
+// What the editor shows the model as ("light", "water", ...).
+kind(_ctx: ptr, label: string) {
+    m = model_of(_ctx, "kind")
+    if m != null { json.object_set_raw(entry_of(node_of(_ctx)), "component", json.str(label)) }
+}
+
+// A component of the kind named, on the model whose block it is in or on
+// the scene's root, its fields each a field() in the block. The kind is
+// found by name when the scene is placed, as a file's are.
+component(_ctx: ptr, label: string) -> *SceneNode {
+    n = node_of(_ctx)
+    b = build_of(n)
+    if b == null || b.finished || (n.kind != NODE_SCENE && n.kind != NODE_MODEL) {
+        refuse(n, "component(\"${label}\") goes in the scene's block or a model's")
+        return dead(b)
+    }
+    if n.kind == NODE_MODEL && n.model == null { return dead(b) }
+    c = heap.new(LoadedComponent)
+    c.model = n.index
+    c.kind = string.copy(label)
+    c.enabled = true
+    c.fields = json.obj()
+    list.add_raw(b.loaded, c as ptr)
+    out = node_new(b, NODE_COMPONENT, n.model as *Model, n.index)
+    out.record = c.fields
+    out.loaded = c as ptr
+    return out
+}
+
+// The scene's camera: its Camera component, where it stands.
+camera(_ctx: ptr, x: float, y: float, z: float) -> *SceneNode {
+    n = node_of(_ctx)
+    if n == null || n.kind != NODE_SCENE {
+        refuse(n, "camera goes in the scene's block")
+        return dead(build_of(n))
+    }
+    out = component(_ctx, "Camera")
+    put_vec3(out.record, "position", x, y, z)
+    return out
+}
+
+// Turned to look at a point, as core.camera_look_at turns a camera.
+look_at(_ctx: ptr, x: float, y: float, z: float) {
+    n = node_of(_ctx)
+    if n == null || n.kind != NODE_COMPONENT {
+        refuse(n, "look_at goes in a camera's block")
+        return
+    }
+    at = json.object_get_raw(n.record, "position")
+    from = core.vec3(number_at(at, 0), number_at(at, 1), number_at(at, 2))
+    angles = core.look_angles(from, core.vec3(x, y, z))
+    json.object_set_raw(n.record, "yaw", json.num(angles.x))
+    json.object_set_raw(n.record, "pitch", json.num(angles.y))
+}
+
+number_at(node: ptr, index: int) -> float {
+    if node == null || json.array_size(node) <= index { return 0.0 }
+    return json.get_number(json.array_get_raw(node, index))
+}
+
+// --- fields, of a light, a record or a component, by the file's names -------------
+
+fields_of(ctx: ptr, what: string) -> ptr {
+    n = node_of(ctx)
+    if n == null || (n.kind != NODE_LIGHT && n.kind != NODE_RECORD && n.kind != NODE_COMPONENT) {
+        refuse(n, "${what} goes in a light's, a record's or a component's block")
+        return null
+    }
+    return n.record
+}
+
+field(_ctx: ptr, label: string, amount: float) {
+    f = fields_of(_ctx, "field")
+    if f != null { json.object_set_raw(f, label, json.num(amount)) }
+}
+
+field_int(_ctx: ptr, label: string, amount: int) {
+    f = fields_of(_ctx, "field_int")
+    if f != null { json.object_set_raw(f, label, json.from_int(amount)) }
+}
+
+field_bool(_ctx: ptr, label: string, on: bool) {
+    f = fields_of(_ctx, "field_bool")
+    if f != null { json.object_set_raw(f, label, json.boolean(on)) }
+}
+
+field_text(_ctx: ptr, label: string, text: string) {
+    f = fields_of(_ctx, "field_text")
+    if f != null { json.object_set_raw(f, label, json.str(text)) }
+}
+
+field_vec3(_ctx: ptr, label: string, x: float, y: float, z: float) {
+    f = fields_of(_ctx, "field_vec3")
+    if f != null { put_vec3(f, label, x, y, z) }
+}
+
+field_quat(_ctx: ptr, label: string, x: float, y: float, z: float, w: float) {
+    f = fields_of(_ctx, "field_quat")
+    if f == null { return }
+    q = json.arr()
+    json.array_add_raw(q, json.num(x))
+    json.array_add_raw(q, json.num(y))
+    json.array_add_raw(q, json.num(z))
+    json.array_add_raw(q, json.num(w))
+    json.object_set_raw(f, label, q)
+}
+
+// A number onto the end of the list named (made empty the first time):
+// a voxel world's hand-raised columns, x, z and height each.
+field_append(_ctx: ptr, label: string, amount: float) {
+    f = fields_of(_ctx, "field_append")
+    if f == null { return }
+    if json.object_get_raw(f, label) == null { json.object_set_raw(f, label, json.arr()) }
+    json.array_add_raw(json.object_get_raw(f, label), json.num(amount))
+}
+
+// A component's field naming another object: the model `target` was made
+// for, its object once the scene is placed.
+field_object(_ctx: ptr, label: string, target: *SceneNode) {
+    n = node_of(_ctx)
+    if n == null || n.kind != NODE_COMPONENT {
+        refuse(n, "field_object goes in a component's block")
+        return
+    }
+    c = n.loaded as *LoadedComponent
+    if c.refs == null { c.refs = json.obj() }
+    place = 0 - 1
+    if target != null && target.kind == NODE_MODEL { place = target.index }
+    json.object_set_raw(c.refs, label, json.from_int(place))
+}
+
+put_vec3(into: ptr, label: string, x: float, y: float, z: float) {
+    if into == null { return }
+    v = json.arr()
+    json.array_add_raw(v, json.num(x))
+    json.array_add_raw(v, json.num(y))
+    json.array_add_raw(v, json.num(z))
+    json.object_set_raw(into, label, v)
+}
+
+// --- what was built ---------------------------------------------------------------
+
+// The records read as the file's reader reads them, once: after it, the
+// builders refuse.
+finish(s: *SceneNode) -> *SceneBuild {
+    b = build_of(s)
+    if b == null || b.finished { return b }
+    b.finished = true
+    b.lights = list.new()
+    count = json.array_size(b.light_records)
+    i = 0
+    while i < count {
+        beam = scene.load_light(json.array_get_raw(b.light_records, i))
+        if beam != null { list.add_raw(b.lights, beam as ptr) }
+        i = i + 1
+    }
+    b.attachments = list.new()
+    count = list.size(b.models)
+    i = 0
+    while i < count {
+        a = scene.attachment_of(list.get_raw(b.entries, i), list.get_raw(b.models, i) as *Model)
+        if a != null { list.add_raw(b.attachments, a as ptr) }
+        i = i + 1
+    }
+    return b
+}
+
+// The models, parents before children: what scene.scene_load hands back.
+models(s: *SceneNode) -> ptr { return finish(s).models }
+
+// The scene's lights, the first its key light: scene.scene_load_lights'.
+lights(s: *SceneNode) -> ptr { return finish(s).lights }
+
+// What the models carry: scene.scene_load_attachments'.
+attachments(s: *SceneNode) -> ptr { return finish(s).attachments }
+
+// The components: scene.scene_load_components'.
+components(s: *SceneNode) -> ptr { return finish(s).loaded }
+
+// How many builders were written where they mean nothing, or failed (a
+// model's file gone), and what the first said.
+errors(s: *SceneNode) -> int {
+    b = build_of(s)
+    if b == null { return 0 }
+    return b.errors
+}
+
+error(s: *SceneNode) -> string {
+    b = build_of(s)
+    if b == null { return "" }
+    return b.error
+}
+
+// Into an engine: each model an object (its own from here, freed with it),
+// the scene's lights its lights and a marker's light added, each body the
+// object's Physics Body component, and the components onto their objects
+// by kind name. Answers the objects, a model's at its place among the
+// models; the list is the caller's. Release the scene after the engine is
+// freed: the lights are the scene's, lit by the engine until then.
+//
+// What it does not place is in attachments(): water and voxel worlds, the
+// editor's scripts, figures, which a program puts where it keeps them.
+// What the components name of kinds this program does not have is said.
+place(e: *Engine, s: *SceneNode) -> ptr {
+    b = finish(s)
+    objects = list.new()
+    if b == null || b.placed { return objects }
+    b.placed = true
+    count = list.size(b.models)
+    i = 0
+    while i < count {
+        m = list.get_raw(b.models, i) as *Model
+        list.add_raw(objects, engine.object(e, core.text(m.name), m) as ptr)
+        i = i + 1
+    }
+    count = list.size(b.lights)
+    i = 0
+    while i < count {
+        l = list.get_raw(b.lights, i) as *Light
+        if i == 0 { engine.engine_set_light(e, l) } else { engine.engine_add_light(e, l) }
+        i = i + 1
+    }
+    count = list.size(b.attachments)
+    i = 0
+    while i < count {
+        a = list.get_raw(b.attachments, i) as *Attachment
+        o = list.get_raw(objects, scene.index_of_model(b.models, a.model as *Model)) as *GameObject
+        spec = scene.attachment_physics(a)
+        if spec != null { components.attach_physics(o, scene.physics_spec_copy(spec)) }
+        beam = scene.attachment_light(a)
+        if beam != null { engine.engine_add_light(e, beam) }
+        i = i + 1
+    }
+    unresolved = component.attach_loaded(engine.engine_scene(e), objects, b.loaded)
+    if list.size(unresolved) > 0 { refuse(s, "${list.size(unresolved)} component(s) of kinds this program does not have") }
+    scene.saved_components_free(unresolved)
+    return objects
+}
+
+// Everything the scene made, but the models placed: those are their
+// objects'.
+release(s: *SceneNode) {
+    b = build_of(s)
+    if b == null { return }
+    if !b.placed { scene.scene_free(b.models) } else { list.free(b.models) }
+    count = list.size(b.entries)
+    i = 0
+    while i < count {
+        entry = list.get_raw(b.entries, i)
+        if entry != null { json.free(entry) }
+        i = i + 1
+    }
+    list.free(b.entries)
+    json.free(b.light_records)
+    scene.loaded_components_free(b.loaded)
+    scene.sources_free(b.sources)
+    if b.lights != null {
+        count = list.size(b.lights)
+        i = 0
+        while i < count {
+            core.light_free(list.get_raw(b.lights, i) as *Light)
+            i = i + 1
+        }
+        list.free(b.lights)
+    }
+    if b.attachments != null {
+        // What the file's reader made for them is the caller's there; here
+        // the scene is the caller.
+        count = list.size(b.attachments)
+        i = 0
+        while i < count {
+            a = list.get_raw(b.attachments, i) as *Attachment
+            if a.light != null { core.light_free(a.light as *Light) }
+            if a.water != null {
+                // A simulation frees the model it adopted; the model is the
+                // scene's (or, placed, its object's) and freed with it.
+                sim = a.water as *Simulation
+                sim.model = null
+                water.simulation_free(sim)
+            }
+            if a.world != null { voxel.world_free(a.world as *VoxelWorld) }
+            i = i + 1
+        }
+        scene.attachments_free(b.attachments)
+    }
+    count = list.size(b.nodes)
+    i = 0
+    while i < count {
+        n = list.get_raw(b.nodes, i) as *SceneNode
+        if n.values != null { json.free(n.values) }
+        heap.free(n)
+        i = i + 1
+    }
+    list.free(b.nodes)
+    if b.errors > 0 { string.free(b.error) }
+    heap.free(b)
+}
+
+// --- a saved scene, written as the code that builds it ------------------------------
+
+// The scene file at `json_path` as an Aether module building it, written to
+// `path`: its build() is the scene. The editor writes one beside every
+// save. Answers whether it was written; scene.last_error says why not.
+write_from_file(json_path: string, path: string) -> bool {
+    text = text_from_file(json_path)
+    if text == "" { return false }
+    err = fs.write(path, text)
+    string.free(text)
+    return err == ""
+}
+
+const BUILDERS = "scene, model, mesh, group, name, position, scale3, rotation, hidden, no_shadow, shader, material, diffuse, specular, surface, texture, normal_map, tile_breakup, uniform, uniform_int, uniform_vec3, uniform_values, value, light, component, record, script, kind, field, field_bool, field_text, field_vec3, field_quat, field_append, field_object"
+
+// The module's text, or "" for a file that does not read.
+text_from_file(json_path: string) -> string {
+    text, err = fs.read(json_path)
+    if err != "" {
+        string.free(text)
+        return ""
+    }
+    root = json.parse_raw(text)
+    string.free(text)
+    if root == null { return "" }
+    out = strbuilder.new(4096)
+    strbuilder.append(out, "// ${json_path} as the code that builds it (ae3d.scenedsl), written by the editor.\n")
+    strbuilder.append(out, "// build() is the scene: scenedsl.place(e, build()) puts it in an engine.\n\n")
+    strbuilder.append(out, "import ae3d.scenedsl\n")
+    strbuilder.append(out, "import ae3d.scenedsl (${BUILDERS})\n\n")
+    strbuilder.append(out, "exports (build)\n\n")
+    strbuilder.append(out, "build() -> *SceneNode {\n")
+
+    entries = json.object_get_raw(root, "models")
+    count = 0
+    if entries != null { count = json.array_size(entries) }
+    // Which models a component names, by a variable each.
+    named = calloc(count + 1, 1)
+    saved = json.object_get_raw(root, "components")
+    if saved != null {
+        k = 0
+        while k < json.array_size(saved) {
+            c = json.array_get_raw(saved, k)
+            refs = json.object_get_raw(c, "refs")
+            if refs != null {
+                // The model it is on, written against after every model.
+                owner = field_int_of(c, "model", 0 - 1)
+                if owner >= 0 && owner < count { (named as byte[])[owner] = 1 as byte }
+                r = 0
+                while r < json.object_size_raw(refs) {
+                    place = json.get_int(json.object_value_at(refs, r))
+                    if place >= 0 && place < count { (named as byte[])[place] = 1 as byte }
+                    r = r + 1
+                }
+            }
+            k = k + 1
+        }
+    }
+
+    // A model a component names, declared here: one first set in a block
+    // is that block's.
+    i = 0
+    while i < count {
+        if (named as byte[])[i] != 0 as byte { strbuilder.append(out, "    m${i} = null as *SceneNode\n") }
+        i = i + 1
+    }
+    strbuilder.append(out, "    s = scene() {\n")
+    lamps = json.object_get_raw(root, "lights")
+    if lamps != null {
+        k = 0
+        while k < json.array_size(lamps) {
+            write_record(out, "light()", json.array_get_raw(lamps, k), 2)
+            k = k + 1
+        }
+    }
+    // The models with no parent among them, each with its children inside.
+    i = 0
+    while i < count {
+        if parent_of(entries, i) < 0 { write_model(out, root, entries, i, named, 2) }
+        i = i + 1
+    }
+    // The scene's components, and those naming other models, after every
+    // model has its name.
+    if saved != null {
+        k = 0
+        while k < json.array_size(saved) {
+            c = json.array_get_raw(saved, k)
+            owner = field_int_of(c, "model", 0 - 1)
+            if owner < 0 {
+                write_component(out, c, "", 2)
+            } else if json.object_get_raw(c, "refs") != null && owner < count {
+                write_component(out, c, "m${owner}, ", 2)
+            }
+            k = k + 1
+        }
+    }
+    strbuilder.append(out, "    }\n    return s\n}\n")
+    free(named)
+    json.free(root)
+    return strbuilder.finish(out)
+}
+
+parent_of(entries: ptr, i: int) -> int {
+    p = field_int_of(json.array_get_raw(entries, i), "parent", 0 - 1)
+    if p < 0 || p >= json.array_size(entries) || p == i { return 0 - 1 }
+    return p
+}
+
+field_int_of(node: ptr, label: string, fallback: int) -> int {
+    v = json.object_get_raw(node, label)
+    if v == null { return fallback }
+    return json.get_int(v)
+}
+
+indent(out: ptr, depth: int) {
+    k = 0
+    while k < depth {
+        strbuilder.append(out, "    ")
+        k = k + 1
+    }
+}
+
+// A number as an Aether float literal that reads back as the same double:
+// the JSON writer's shortest form, a point added where it has none.
+number_text(amount: float) -> string {
+    n = json.num(amount)
+    t = json.stringify_raw(n)
+    json.free(n)
+    if string.index_of(t, ".") >= 0 || string.index_of(t, "e") >= 0 || string.index_of(t, "n") >= 0 { return t }
+    out = string.concat(t, ".0")
+    string.free(t)
+    return out
+}
+
+put_number(out: ptr, amount: float) {
+    t = number_text(amount)
+    strbuilder.append(out, t)
+    string.free(t)
+}
+
+// A string as an Aether literal: quoted, its quotes, backslashes and
+// interpolations escaped.
+put_quoted(out: ptr, text: string) {
+    strbuilder.append(out, "\"")
+    count = string.length(text)
+    k = 0
+    while k < count {
+        c = string.char_at(text, k)
+        if c == 34 || c == 92 || c == 36 { strbuilder.append_byte(out, 92) }
+        if c == 10 {
+            strbuilder.append(out, "\\n")
+        } else {
+            strbuilder.append_byte(out, c)
+        }
+        k = k + 1
+    }
+    strbuilder.append(out, "\"")
+}
+
+put_numbers(out: ptr, node: ptr, count: int) {
+    k = 0
+    while k < count {
+        if k > 0 { strbuilder.append(out, ", ") }
+        put_number(out, number_at(node, k))
+        k = k + 1
+    }
+}
+
+write_model(out: ptr, root: ptr, entries: ptr, i: int, named: ptr, depth: int) {
+    entry = json.array_get_raw(entries, i)
+    indent(out, depth)
+    if (named as byte[])[i] != 0 as byte { strbuilder.append(out, "m${i} = ") }
+    source = text_of(entry, "source_path")
+    mesh_file = text_of(entry, "mesh_file")
+    grouped = json.object_get_raw(entry, "group")
+    if grouped != null && json.get_bool(grouped) == 1 {
+        strbuilder.append(out, "group(")
+        put_quoted(out, text_of(entry, "name"))
+    } else if source != "" {
+        strbuilder.append(out, "model(")
+        put_quoted(out, source)
+    } else {
+        strbuilder.append(out, "mesh(")
+        put_quoted(out, mesh_file)
+    }
+    strbuilder.append(out, ") {\n")
+    inner = depth + 1
+    // A group is made with its name; the rest are named here.
+    if grouped == null || json.get_bool(grouped) == 0 {
+        indent(out, inner)
+        strbuilder.append(out, "name(")
+        put_quoted(out, text_of(entry, "name"))
+        strbuilder.append(out, ")\n")
+    }
+    // Where a new model already is -- at the origin, unit size, unturned --
+    // is not written.
+    write_unless(out, "position", json.object_get_raw(entry, "position"), 3, [0.0, 0.0, 0.0, 0.0], inner)
+    write_unless(out, "scale3", json.object_get_raw(entry, "scale"), 3, [1.0, 1.0, 1.0, 0.0], inner)
+    write_unless(out, "rotation", json.object_get_raw(entry, "rotation"), 4, [0.0, 0.0, 0.0, 1.0], inner)
+    visible = json.object_get_raw(entry, "visible")
+    if visible != null && json.get_bool(visible) == 0 {
+        indent(out, inner)
+        strbuilder.append(out, "hidden()\n")
+    }
+    casts = json.object_get_raw(entry, "casts_shadow")
+    if casts != null && json.get_bool(casts) == 0 {
+        indent(out, inner)
+        strbuilder.append(out, "no_shadow()\n")
+    }
+    shader_kind = json.object_get_raw(entry, "shader")
+    if shader_kind != null {
+        indent(out, inner)
+        strbuilder.append(out, "shader(${json.get_int(shader_kind)})\n")
+    }
+    // A water surface's uniforms are the water's, set again from it as it
+    // is made: written, they would be read only to be written over.
+    if json.object_get_raw(entry, "water") == null { write_uniforms(out, json.object_get_raw(entry, "uniforms"), inner) }
+    write_material(out, json.object_get_raw(entry, "material"), inner)
+    label = text_of(entry, "component")
+    if label != "" {
+        indent(out, inner)
+        strbuilder.append(out, "kind(")
+        put_quoted(out, label)
+        strbuilder.append(out, ")\n")
+    }
+    label = text_of(entry, "script")
+    if label != "" {
+        indent(out, inner)
+        strbuilder.append(out, "script(")
+        put_quoted(out, label)
+        strbuilder.append(out, ")\n")
+    }
+    beam = json.object_get_raw(entry, "light")
+    if beam != null { write_record(out, "light()", beam, inner) }
+    records = ["physics", "water", "voxel", "figure", "motion"]
+    k = 0
+    while k < 5 {
+        r = json.object_get_raw(entry, records[k])
+        if r != null { write_record(out, "record(\"${records[k]}\")", r, inner) }
+        k = k + 1
+    }
+    // Its components, but those naming other models: written after them.
+    saved = json.object_get_raw(root, "components")
+    if saved != null {
+        k = 0
+        while k < json.array_size(saved) {
+            c = json.array_get_raw(saved, k)
+            if field_int_of(c, "model", 0 - 1) == i && json.object_get_raw(c, "refs") == null { write_component(out, c, "", inner) }
+            k = k + 1
+        }
+    }
+    // Its children, in the file's order.
+    count = json.array_size(entries)
+    k = 0
+    while k < count {
+        if parent_of(entries, k) == i { write_model(out, root, entries, k, named, inner) }
+        k = k + 1
+    }
+    indent(out, depth)
+    strbuilder.append(out, "}\n")
+}
+
+text_of(node: ptr, label: string) -> string {
+    v = json.object_get_raw(node, label)
+    if v == null || json.json_type(v) != json.JSON_STRING { return "" }
+    return json.get_string_raw(v)
+}
+
+// A call of `count` numbers, unless they are `rest`, what a new model has.
+write_unless(out: ptr, call: string, node: ptr, count: int, rest: float[4], depth: int) {
+    if node == null || json.array_size(node) < count { return }
+    k = 0
+    while k < count {
+        if number_at(node, k) != rest[k] {
+            write_call(out, call, node, count, depth)
+            return
+        }
+        k = k + 1
+    }
+}
+
+write_call(out: ptr, call: string, node: ptr, count: int, depth: int) {
+    if node == null || json.array_size(node) < count { return }
+    indent(out, depth)
+    strbuilder.append(out, "${call}(")
+    put_numbers(out, node, count)
+    strbuilder.append(out, ")\n")
+}
+
+write_uniforms(out: ptr, node: ptr, depth: int) {
+    if node == null { return }
+    count = json.array_size(node)
+    i = 0
+    while i < count {
+        u = json.array_get_raw(node, i)
+        label = text_of(u, "name")
+        kind_of = field_int_of(u, "kind", core.UNIFORM_FLOAT)
+        values = json.object_get_raw(u, "values")
+        one = json.object_get_raw(u, "value")
+        if label != "" && values != null {
+            indent(out, depth)
+            strbuilder.append(out, "uniform_values(")
+            put_quoted(out, label)
+            if kind_of == core.UNIFORM_VEC3_ARRAY { strbuilder.append(out, ", true) {\n") } else { strbuilder.append(out, ", false) {\n") }
+            k = 0
+            while k < json.array_size(values) {
+                indent(out, depth + 1)
+                strbuilder.append(out, "value(")
+                put_number(out, number_at(values, k))
+                strbuilder.append(out, ")\n")
+                k = k + 1
+            }
+            indent(out, depth)
+            strbuilder.append(out, "}\n")
+        } else if label != "" && one != null {
+            indent(out, depth)
+            if kind_of == core.UNIFORM_INT {
+                strbuilder.append(out, "uniform_int(")
+                put_quoted(out, label)
+                strbuilder.append(out, ", ${json.get_int(one)})\n")
+            } else if kind_of == core.UNIFORM_VEC3 {
+                strbuilder.append(out, "uniform_vec3(")
+                put_quoted(out, label)
+                strbuilder.append(out, ", ")
+                put_numbers(out, one, 3)
+                strbuilder.append(out, ")\n")
+            } else {
+                strbuilder.append(out, "uniform(")
+                put_quoted(out, label)
+                strbuilder.append(out, ", ")
+                put_number(out, json.get_number(one))
+                strbuilder.append(out, ")\n")
+            }
+        }
+        i = i + 1
+    }
+}
+
+// The material as material() makes it and then what differs: material()
+// holds a new material's numbers, as the file's reader does for a number a
+// file does not name. One that differs in nothing is still material(): the
+// file gives the model a material of its own, where a model made without
+// one has none.
+write_material(out: ptr, node: ptr, depth: int) {
+    if node == null { return }
+    body = strbuilder.new(256)
+    fresh = core.material_new("")
+    write_colour(body, "diffuse", json.object_get_raw(node, "diffuse"), fresh.diffuse, depth + 1)
+    write_colour(body, "specular", json.object_get_raw(node, "specular"), fresh.specular, depth + 1)
+    i = 0
+    while i < scene.material_number_count() {
+        label = scene.material_number_name(i)
+        v = json.object_get_raw(node, label)
+        if v != null && json.get_number(v) != scene.material_number(fresh, i) {
+            indent(body, depth + 1)
+            strbuilder.append(body, "surface(\"${label}\", ")
+            put_number(body, json.get_number(v))
+            strbuilder.append(body, ")\n")
+        }
+        i = i + 1
+    }
+    core.material_free(fresh)
+    broken = json.object_get_raw(node, "tile_breakup")
+    if broken != null && json.get_bool(broken) == 1 {
+        indent(body, depth + 1)
+        strbuilder.append(body, "tile_breakup(true)\n")
+    }
+    path = text_of(node, "texture_path")
+    if path != "" {
+        indent(body, depth + 1)
+        strbuilder.append(body, "texture(")
+        put_quoted(body, path)
+        strbuilder.append(body, ")\n")
+    }
+    path = text_of(node, "normal_path")
+    if path != "" {
+        indent(body, depth + 1)
+        strbuilder.append(body, "normal_map(")
+        put_quoted(body, path)
+        strbuilder.append(body, ")\n")
+    }
+    lines = strbuilder.finish(body)
+    if lines != "" {
+        indent(out, depth)
+        strbuilder.append(out, "material() {\n")
+        strbuilder.append(out, lines)
+        indent(out, depth)
+        strbuilder.append(out, "}\n")
+    } else {
+        indent(out, depth)
+        strbuilder.append(out, "material()\n")
+    }
+    string.free(lines)
+}
+
+// A colour, unless it is what a new material has.
+write_colour(out: ptr, call: string, node: ptr, fresh: Vec3, depth: int) {
+    if node == null || json.array_size(node) < 3 { return }
+    if number_at(node, 0) == fresh.x && number_at(node, 1) == fresh.y && number_at(node, 2) == fresh.z { return }
+    write_call(out, call, node, 3, depth)
+}
+
+write_component(out: ptr, c: ptr, owner: string, depth: int) {
+    indent(out, depth)
+    strbuilder.append(out, "component(${owner}")
+    put_quoted(out, text_of(c, "kind"))
+    strbuilder.append(out, ") {\n")
+    write_fields(out, json.object_get_raw(c, "fields"), depth + 1)
+    refs = json.object_get_raw(c, "refs")
+    if refs != null {
+        r = 0
+        while r < json.object_size_raw(refs) {
+            place = json.get_int(json.object_value_at(refs, r))
+            indent(out, depth + 1)
+            strbuilder.append(out, "field_object(")
+            put_quoted(out, json.object_key_at(refs, r))
+            if place >= 0 { strbuilder.append(out, ", m${place})\n") } else { strbuilder.append(out, ", null)\n") }
+            r = r + 1
+        }
+    }
+    indent(out, depth)
+    strbuilder.append(out, "}\n")
+}
+
+write_record(out: ptr, call: string, node: ptr, depth: int) {
+    indent(out, depth)
+    strbuilder.append(out, "${call} {\n")
+    write_fields(out, node, depth + 1)
+    indent(out, depth)
+    strbuilder.append(out, "}\n")
+}
+
+// Each field of a record by its kind of value: a number, a switch, a text,
+// three numbers or four, or a list of numbers.
+write_fields(out: ptr, node: ptr, depth: int) {
+    if node == null { return }
+    count = json.object_size_raw(node)
+    i = 0
+    while i < count {
+        label = json.object_key_at(node, i)
+        v = json.object_value_at(node, i)
+        t = json.json_type(v)
+        indent(out, depth)
+        if t == json.JSON_NUMBER {
+            strbuilder.append(out, "field(")
+            put_quoted(out, label)
+            strbuilder.append(out, ", ")
+            put_number(out, json.get_number(v))
+            strbuilder.append(out, ")\n")
+        } else if t == json.JSON_BOOL {
+            strbuilder.append(out, "field_bool(")
+            put_quoted(out, label)
+            if json.get_bool(v) == 1 { strbuilder.append(out, ", true)\n") } else { strbuilder.append(out, ", false)\n") }
+        } else if t == json.JSON_STRING {
+            strbuilder.append(out, "field_text(")
+            put_quoted(out, label)
+            strbuilder.append(out, ", ")
+            put_quoted(out, json.get_string_raw(v))
+            strbuilder.append(out, ")\n")
+        } else if t == json.JSON_ARRAY && json.array_size(v) == 3 {
+            strbuilder.append(out, "field_vec3(")
+            put_quoted(out, label)
+            strbuilder.append(out, ", ")
+            put_numbers(out, v, 3)
+            strbuilder.append(out, ")\n")
+        } else if t == json.JSON_ARRAY && json.array_size(v) == 4 {
+            strbuilder.append(out, "field_quat(")
+            put_quoted(out, label)
+            strbuilder.append(out, ", ")
+            put_numbers(out, v, 4)
+            strbuilder.append(out, ")\n")
+        } else if t == json.JSON_ARRAY {
+            // A list: each number onto it. An empty one is no list, as the
+            // reader takes a missing one.
+            strbuilder.append(out, "// ${label}: ${json.array_size(v)}\n")
+            k = 0
+            while k < json.array_size(v) {
+                indent(out, depth)
+                strbuilder.append(out, "field_append(")
+                put_quoted(out, label)
+                strbuilder.append(out, ", ")
+                put_number(out, number_at(v, k))
+                strbuilder.append(out, ")\n")
+                k = k + 1
+            }
+        } else {
+            strbuilder.append(out, "// ${label}: not a value a field takes\n")
+        }
+        i = i + 1
+    }
+}

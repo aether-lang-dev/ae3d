@@ -611,7 +611,9 @@ fi
 # a script is a separate library the test opens at runtime rather than
 # something linked into it, which is the whole point of one.
 step "scripts"
-for script_source in resources/scripts/*.ae; do
+# With them, the fixtures test_script holds the loader to (a library built
+# before scripts said their layout, and one built against another engine).
+for script_source in resources/scripts/*.ae tests/fixtures/scripts/*.ae; do
     [ -e "$script_source" ] || continue
     script_name="$(basename "$script_source" .ae)"
     if ! ./scripts/build_script.sh "$script_source" >/tmp/ae3d_script.log 2>&1; then

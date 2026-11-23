@@ -66,6 +66,9 @@ interleaved with the first.
 | `component.add` | `object, kind, [fields]` | Adds a component of that kind with its defaults, and the fields given; refused when the kind is one per object and the object has one. |
 | `component.remove` | `object, kind` | Removes the object's component of that kind. |
 | `component.enable` | `object, kind, on` | Enables or disables the object's component of that kind: a disabled component's phases do not run. |
+| `persist.checkpoint` | `[name]` | Keep the scene of game objects as it is now under a name (default "default"): every object's transform and component fields, and the bodies' motion. A checkpoint of the same name is replaced. |
+| `persist.rollback` | `[name]` | Put the scene back to a checkpoint: what was made since destroyed, what was destroyed since made back by the game's spawner, every field and body as it was. Answers what could not be made back. |
+| `persist.checkpoints` |  | The checkpoints kept, by name. |
 | `scene.save` | `path, [mesh_directory]` | Write the scene to JSON, with generated geometry beside it. |
 | `scene.load` | `path` | Replace the scene with one from a file, and reframe the camera as it was saved. |
 | `frame.capture` |  | Read the finished frame into the engine. Answers with its size once it is there. |

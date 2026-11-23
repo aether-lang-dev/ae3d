@@ -84,6 +84,96 @@ frame -- carries the record of every body, and the street opens in the
 editor with its 299 bodies ([docs/editor.md](editor.md)). A ragdoll's
 bones are the ragdoll's and are not recorded one by one.
 
+A trigger is recorded as one: `"trigger": true` beside its collider, written
+only when it is one, so a file with none reads and writes as it did.
+
+## Collisions and triggers
+
+After each step the physics tells the objects what touches what, as Unity's
+OnCollisionEnter, Stay and Exit and OnTriggerEnter, Stay and Exit (#508). A
+component has the phases ([scripting.md](scripting.md#its-phases)):
+
+```aether
+landed(p: ptr, go: *GameObject, hit: *Collision) {
+    if hit.speed > 4.0 { play_thud(go, hit.point, hit.impulse) }
+}
+
+component.set_collisions(kind, landed, null, null)
+component.set_triggers(kind, picked_up, null, null)       // fn(ptr, *GameObject, *GameObject)
+```
+
+**What a collision says.**
+
+- `hit.other`: the object met.
+- `hit.point`: the deepest point of the step's contact between the two
+  shapes. It is the middle of the two bodies' anchors, as the solver's hit
+  events place it.
+- `hit.normal`: from this object's shape into the other's.
+- `hit.impulse`: what the step pushed them apart with along the normal, in
+  N s, over all four sub-steps. A crate resting on the ground reads its
+  weight over a step, `test_contacts` to 0.05.
+- `hit.speed`: the fastest closing speed at a point, in m/s.
+
+An exit says only `other`: they no longer touch.
+
+**When.**
+
+- *Enter*: the step two shapes begin to touch.
+- *Stay*: every step after, while they do.
+- *Exit*: the step they part, or either side goes (destroyed, its collider
+  taken off, its character freed). The side that went is not told; it is
+  being freed.
+
+The ends are told before the beginnings, so a pair that parts and touches
+again in one step is told it exited and then entered. Each pair of shapes is
+told: a body of three colliders resting on the ground on two of them is told
+twice.
+
+**Triggers.** Any convex collider is a trigger when it is made with
+`trigger = true` (`box_collider(o, half, material, density, true)`, and the
+same last argument on `sphere_collider`, `capsule_collider`, `hull_collider`
+and `convex_collider_of_model`). A trigger is a sensor: it collides with
+nothing, and it tells what overlaps it and is told it.
+
+- **Characters.** A character is told the triggers its capsule is in and
+  walks through them. Its own moves and room checks pass over triggers: a
+  pickup is not a wall.
+- **Static pairs.** Two bodies that never move are never told of each other,
+  so a trigger laid on the ground does not enter the ground.
+
+**Who is told.**
+
+- **Only a running component.** It must be enabled, on an active object.
+  Unity also tells a disabled script of its collisions, so one switched off
+  to stop it reacting went on reacting.
+- **Only pairs someone listens to.** A pair is kept only where one side
+  listens, so a pile of rubble no script hears costs the world's events and
+  nothing more.
+- **Pairs that began earlier.** One that began before its object had a
+  listener is not told: what is told is what began while it listened.
+- **A scene being freed.** A scene freeing every object at once tells none of
+  them.
+- **Destroying from a phase.** Use `behaviour.scene_destroy_later`, as from
+  any phase.
+
+**What it costs.** Every collider raises the world's contact and sensor
+events: a record as each pair begins and ends, none a step between. A
+contact's object is read off its shape (each collider's shape names its
+body), with no search. The characters' trigger query runs only while the
+world holds a trigger: one capsule query per character per step.
+
+**What is checked.** `tests/test_contacts.ae`, headless:
+
+- a crate dropped on the ground enters once, with its normal down and its
+  point on the ground's top, and stays at its weight;
+- a ball falls through a trigger to the ground and rests in it, and is
+  thrown out of it;
+- a character walks through a trigger;
+- a disabled listener hears nothing;
+- a body destroyed, and a trigger taken off, while something touches them,
+  each told once;
+- nothing told again a step later.
+
 ## Ragdolls
 
 `ragdoll(e, name, position, friction_torque, hertz, damping_ratio)` is

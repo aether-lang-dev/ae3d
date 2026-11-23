@@ -22,10 +22,13 @@ at the root is the front page; this is the map.
 | [Natural motion](motion.md) | `ae3d.motion`: active ragdolls -- the animation played by joint motors within a torque budget, balance, hits that weaken a limb, and what the test holds them to |
 | [Networking](networking.md) | `ae3d.net`: a host and its clients, the transports (loopback with simulated conditions, TCP), replication and interpolation, and the numbers they are held to |
 | [Components](components.md) | Game objects as their components, the scene as an object: the registry of kinds the inspector, the scene file and the agent read, and the engine's own kinds |
+| [Scenes in code](scenes-in-code.md) | `ae3d.scenedsl`: a scene written as nested builders, nesting the hierarchy; placing it; the editor writing every saved scene as that code, and the test that holds code and file to one scene |
 | [The editor](editor.md) | The scene editor: panels, controls, undo, scene files, how the viewport is drawn |
 | [The game UI layer](ui.md) | Text and screen-space UI for a game: the TrueType reader, the distance-field glyph atlas, layout, and what they are held to |
 | [Performance](performance.md) | How a frame is measured, and where the frames are on the machine the numbers were taken on |
 | [Testing and verification](testing.md) | The suites, the benchmarks, the critique, the frame budget, and how a scene is verified by number rather than by eye |
+| [Saving and loading](persistence.md) | `ae3d.persist`: save slots with pictures, saved off the frame; a system's own state (the bodies' motion); checkpoints and roll back; versions and migrations; what each costs |
+| [Scripting](scripting.md) | A game's scripts: from an empty folder (`tools/new_game`) to a moving, tunable object; a struct's derived schema as its fields, the phases, collisions and triggers, building, the layout check, hot reload |
 | [Writing Aether in this engine](writing-aether.md) | The conventions and the language's edges the engine is written around |
 | [The black hole](black-hole.md) | A worked example: Kerr geodesics per pixel, and what checking them taught the engine |
 

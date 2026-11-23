@@ -25,6 +25,7 @@ import ae3d.raycast
 import ae3d.picture
 import ae3d.behaviour
 import ae3d.component
+import ae3d.persist
 
 exports (
     Context, context_new, context_free,
@@ -100,6 +101,9 @@ struct Context {
     // The scene of game objects (ae3d.behaviour's Scene), for the object
     // and component ops; null where the program keeps none.
     scene: ptr
+    // The scene as it was at each named checkpoint (persist.checkpoint), to be
+    // rolled back to: list of *Checkpoint.
+    checkpoints: ptr
 
     frame_count: int
     fps: float
@@ -457,7 +461,35 @@ context_free(c: *Context) {
         }
         list.free(c.deferred)
     }
+    if c.checkpoints != null {
+        k = 0
+        while k < list.size(c.checkpoints) {
+            kept = list.get_raw(c.checkpoints, k) as *Checkpoint
+            json.free(kept.doc)
+            heap.free(kept)
+            k = k + 1
+        }
+        list.free(c.checkpoints)
+    }
     heap.free(c)
+}
+
+// A scene as it was, named: what an agent tries something from and rolls
+// back to.
+struct Checkpoint {
+    name: string
+    doc: ptr                       // persist.checkpoint's document, owned
+}
+
+checkpoint_named(c: *Context, name: string) -> *Checkpoint {
+    if c.checkpoints == null { return null }
+    k = 0
+    while k < list.size(c.checkpoints) {
+        kept = list.get_raw(c.checkpoints, k) as *Checkpoint
+        if string.equals(kept.name, name) == 1 { return kept }
+        k = k + 1
+    }
+    return null
 }
 
 start() -> bool {
@@ -754,6 +786,12 @@ help_result() -> ptr {
         "Removes the object's component of that kind."))
     json.array_add_raw(ops, describe("component.enable", "object, kind, on",
         "Enables or disables the object's component of that kind: a disabled component's phases do not run."))
+    json.array_add_raw(ops, describe("persist.checkpoint", "[name]",
+        "Keep the scene of game objects as it is now under a name (default \"default\"): every object's transform and component fields, and the bodies' motion. A checkpoint of the same name is replaced."))
+    json.array_add_raw(ops, describe("persist.rollback", "[name]",
+        "Put the scene back to a checkpoint: what was made since destroyed, what was destroyed since made back by the game's spawner, every field and body as it was. Answers what could not be made back."))
+    json.array_add_raw(ops, describe("persist.checkpoints", "",
+        "The checkpoints kept, by name."))
     json.array_add_raw(ops, describe("scene.save", "path, [mesh_directory]",
         "Write the scene to JSON, with generated geometry beside it."))
     json.array_add_raw(ops, describe("scene.load", "path",
@@ -1306,20 +1344,6 @@ add_model_to_renderer(c: *Context, m: *Model) {
     if c.vk_renderer != null { vulkan.renderer_add_model(c.vk_renderer, m) }
 }
 
-view_from_camera(c: *Context) -> View {
-    v = scene.view_defaults()
-    if c.camera == null { return v }
-    cam = c.camera as *Camera
-    v.camera_x = cam.position.x
-    v.camera_y = cam.position.y
-    v.camera_z = cam.position.z
-    v.yaw = cam.yaw
-    v.pitch = cam.pitch
-    v.fov = cam.fov
-    v.near = cam.near
-    v.far = cam.far
-    return v
-}
 
 save_scene(c: *Context, path: string, mesh_directory: string) -> bool {
     models = list.new()
@@ -1342,11 +1366,11 @@ save_scene(c: *Context, path: string, mesh_directory: string) -> bool {
 
     attachments = null as ptr
     if c.on_attachments != null { attachments = c.on_attachments(c.user_data) }
-    view = view_from_camera(c)
-    // The components that own their state, from the scene of game objects
-    // when the program keeps one.
+    // The scene's components -- its camera, its sky, its passes (#895) -- and
+    // its objects' own, from the scene of game objects when the program keeps
+    // one.
     owned = component.saved_for(c.scene as *Scene)
-    ok = scene.scene_save(models, lights, attachments, &view, owned, path, mesh_directory)
+    ok = scene.scene_save(models, lights, attachments, owned, path, mesh_directory)
     scene.saved_components_free(owned)
     scene.attachments_free(attachments)
     list.free(models)
@@ -1374,12 +1398,27 @@ load_scene(c: *Context, path: string) -> int {
     list.free(loaded)
 
     if c.camera != null {
-        view = scene.scene_load_view(path)
         cam = c.camera as *Camera
-        core.camera_set_position(cam, core.vec3(view.camera_x, view.camera_y, view.camera_z))
-        core.camera_set_fov(cam, view.fov)
-        core.camera_set_near(cam, view.near)
-        core.camera_set_far(cam, view.far)
+        if scene.scene_has_view(path) {
+            // A file from before the camera was the scene's component.
+            view = scene.scene_load_view(path)
+            core.camera_set_position(cam, core.vec3(view.camera_x, view.camera_y, view.camera_z))
+            core.camera_set_fov(cam, view.fov)
+            core.camera_set_near(cam, view.near)
+            core.camera_set_far(cam, view.far)
+        } else {
+            // The scene's Camera, as the file has it.
+            carried = scene.scene_load_components(path)
+            k = 0
+            while k < list.size(carried) {
+                entry = list.get_raw(carried, k) as *LoadedComponent
+                if entry.model < 0 && string.equals(entry.kind, "Camera") == 1 && entry.fields != null {
+                    camera_from_fields(cam, entry.fields)
+                }
+                k = k + 1
+            }
+            scene.loaded_components_free(carried)
+        }
     }
     return count
 }
@@ -3201,6 +3240,61 @@ handle(c: *Context, op: string, id: int, request: ptr) -> bool {
         return false
     }
 
+    if op == "persist.checkpoint" || op == "persist.rollback" || op == "persist.checkpoints" {
+        if c.scene == null {
+            fail(id, "this program keeps no scene of game objects")
+            return false
+        }
+        if op == "persist.checkpoints" {
+            names = json.arr()
+            if c.checkpoints != null {
+                k = 0
+                while k < list.size(c.checkpoints) {
+                    json.array_add_raw(names, json.str((list.get_raw(c.checkpoints, k) as *Checkpoint).name))
+                    k = k + 1
+                }
+            }
+            out = json.obj()
+            json.object_set_raw(out, "checkpoints", names)
+            answer(id, out)
+            return false
+        }
+        name = "default"
+        node = json.object_get_raw(request, "name")
+        if node != null { name = json.get_string_raw(node) }
+        if op == "persist.checkpoint" {
+            if c.checkpoints == null { c.checkpoints = list.new() }
+            kept = checkpoint_named(c, name)
+            if kept == null {
+                kept = heap.new(Checkpoint)
+                kept.name = string.copy(name)
+                list.add_raw(c.checkpoints, kept as ptr)
+            } else {
+                json.free(kept.doc)
+            }
+            kept.doc = persist.checkpoint(c.scene as *Scene)
+            out = json.obj()
+            json.object_set_raw(out, "name", json.str(name))
+            json.object_set_raw(out, "objects", json.from_int(behaviour.scene_count(c.scene as *Scene)))
+            answer(id, out)
+            return false
+        }
+        kept = checkpoint_named(c, name)
+        if kept == null {
+            fail(id, "no checkpoint named ${name} (persist.checkpoints lists them)")
+            return false
+        }
+        restored = persist.restore(c.scene as *Scene, kept.doc)
+        out = json.obj()
+        json.object_set_raw(out, "name", json.str(name))
+        json.object_set_raw(out, "restored", json.boolean(restored))
+        json.object_set_raw(out, "missing", json.from_int(persist.last_missing()))
+        json.object_set_raw(out, "unknown", json.from_int(persist.last_unknown()))
+        if !restored { json.object_set_raw(out, "reason", json.str(persist.last_error())) }
+        answer(id, out)
+        return false
+    }
+
     if op == "scene.load" {
         node = json.object_get_raw(request, "path")
         if node == null {
@@ -3706,4 +3800,24 @@ answer_capture_unsupported(c: *Context, reason: string) {
         c.pending_explain_id = -1
         c.pending_explain_model = null
     }
+}
+
+// The scene's Camera fields, as a scene file writes them, onto a camera.
+camera_from_fields(cam: *Camera, fields: ptr) {
+    at = json.object_get_raw(fields, "position")
+    if at != null {
+        core.camera_set_position(cam, core.vec3(json.get_number(json.array_get_raw(at, 0)),
+            json.get_number(json.array_get_raw(at, 1)), json.get_number(json.array_get_raw(at, 2))))
+    }
+    yaw = json.object_get_raw(fields, "yaw")
+    if yaw != null { cam.yaw = json.get_number(yaw) }
+    pitch = json.object_get_raw(fields, "pitch")
+    if pitch != null { cam.pitch = json.get_number(pitch) }
+    core.camera_update_vectors(cam)
+    fov = json.object_get_raw(fields, "field of view")
+    if fov != null { core.camera_set_fov(cam, json.get_number(fov)) }
+    near = json.object_get_raw(fields, "near")
+    if near != null { core.camera_set_near(cam, json.get_number(near)) }
+    far = json.object_get_raw(fields, "far")
+    if far != null { core.camera_set_far(cam, json.get_number(far)) }
 }
