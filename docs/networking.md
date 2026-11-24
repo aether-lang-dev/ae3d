@@ -281,6 +281,26 @@ net.destroy_object(session, rocket, now)
 - **The snapshots say it went, and its last fields.** The destroy message is reliable, and a lost one lands only with its resend: under 10% loss a client held an object for over a second after the host let it go (#515). And a snapshot leaves a destroyed object out, so a change made in the object's last tick -- or carried by a snapshot a client lost -- would never arrive: the client would hold ticks after the destroy with the fields before it (#513). The host keeps each destroyed object as it went -- the time, the place, the fields -- and every snapshot against a base older than the destroy's tick carries it (flag 8), until each client has acknowledged a snapshot of that tick. A client lets the object go on whichever word comes first, the message's or a snapshot's, the same way: drawn to that place, gone when its view reaches that moment. Its fields are taken where the client has the object's layout, its hooks with them; one that never learned it steps over them. `hub_set_reliable_delay` holds the loopback's reliable parcels back, to test what happens while one is on its way.
 - **Letting go.** The unmaker is the game's (`engine.destroy`, as a game does); `net_free` calls it for every created object still alive. A null unmaker leaves the object to the game.
 
+### A networked object's spawn
+
+A component is told `on_net_spawn` once its object is on the network, on
+every peer, as Unity Netcode's OnNetworkSpawn (#508). When it is told, the
+object's id is given, its transform is where the session put it, and
+`behaviour.object_remote(go)` says whether this side simulates it. That is
+the place to start what only the side that simulates an object should, or
+to give a copy what makes it look like the host's:
+
+- **A scene's object** is told as it is marked `networked`.
+- **An object the host creates** is told on the host, once it is placed and
+  told to every client, and on each client once its copy is placed where
+  the host made it and seeded from the newest snapshot.
+- **A player** is told on every side once its side is known: the host's own
+  and each client's own simulated, every other remote.
+
+It is told once, enabled or not, as `awake` is: a component switched off at
+its spawn would never hear it otherwise. `tests/test_net_spawn.ae` holds all
+three on a host and a client over the loopback.
+
 ## The horde
 
 A horde isn't sent a zombie at a time. A snapshot of floats was 31 bytes an object, so three thousand zombies would be 2.7 MB a second to every client, and a city holds a hundred thousand. `ae3d.nethorde` sends what the horde's simulation can't know by itself, where it began and every change to what drives it, and every peer, the host among them, steps the same horde at the same fixed ticks and holds it to the bit.

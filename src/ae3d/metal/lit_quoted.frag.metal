@@ -153,8 +153,10 @@ struct DrawMaterial {
     int blend;
     float reflectivity;
     int normal_map;
+    packed_float3 emissive;
+    int emissive_map;
 };
-static_assert(sizeof(DrawMaterial) == 128, "DrawMaterial: std140");
+static_assert(sizeof(DrawMaterial) == 144, "DrawMaterial: std140");
 static_assert(__builtin_offsetof(DrawMaterial, diffuse) == 0, "DrawMaterial.diffuse: std140");
 static_assert(__builtin_offsetof(DrawMaterial, specular) == 16, "DrawMaterial.specular: std140");
 static_assert(__builtin_offsetof(DrawMaterial, metallic) == 28, "DrawMaterial.metallic: std140");
@@ -182,6 +184,8 @@ static_assert(__builtin_offsetof(DrawMaterial, ember_glow) == 112, "DrawMaterial
 static_assert(__builtin_offsetof(DrawMaterial, blend) == 116, "DrawMaterial.blend: std140");
 static_assert(__builtin_offsetof(DrawMaterial, reflectivity) == 120, "DrawMaterial.reflectivity: std140");
 static_assert(__builtin_offsetof(DrawMaterial, normal_map) == 124, "DrawMaterial.normal_map: std140");
+static_assert(__builtin_offsetof(DrawMaterial, emissive) == 128, "DrawMaterial.emissive: std140");
+static_assert(__builtin_offsetof(DrawMaterial, emissive_map) == 140, "DrawMaterial.emissive_map: std140");
 
 struct Draw {
     float4x4 model;
@@ -384,13 +388,13 @@ struct DrawBlock {
     Wounds wounds;
     Damage damage;
 };
-static_assert(sizeof(DrawBlock) == 2320, "DrawBlock: std140");
+static_assert(sizeof(DrawBlock) == 2336, "DrawBlock: std140");
 static_assert(__builtin_offsetof(DrawBlock, draw) == 0, "DrawBlock.draw: std140");
 static_assert(__builtin_offsetof(DrawBlock, material) == 240, "DrawBlock.material: std140");
-static_assert(__builtin_offsetof(DrawBlock, shading) == 368, "DrawBlock.shading: std140");
-static_assert(__builtin_offsetof(DrawBlock, cut) == 496, "DrawBlock.cut: std140");
-static_assert(__builtin_offsetof(DrawBlock, wounds) == 576, "DrawBlock.wounds: std140");
-static_assert(__builtin_offsetof(DrawBlock, damage) == 2208, "DrawBlock.damage: std140");
+static_assert(__builtin_offsetof(DrawBlock, shading) == 384, "DrawBlock.shading: std140");
+static_assert(__builtin_offsetof(DrawBlock, cut) == 512, "DrawBlock.cut: std140");
+static_assert(__builtin_offsetof(DrawBlock, wounds) == 592, "DrawBlock.wounds: std140");
+static_assert(__builtin_offsetof(DrawBlock, damage) == 2224, "DrawBlock.damage: std140");
 
 struct CameraBlock {
     Eye eye;
@@ -1327,12 +1331,13 @@ fragment ae_lit_frag_out ae_lit_fragment(
     texture2d<float> scene_depth [[texture(2)]], sampler ae_smp_scene_depth [[sampler(2)]],
     texture2d<float> normal_map [[texture(1)]], sampler ae_smp_normal_map [[sampler(1)]],
     texture2d<float> damage_mask [[texture(3)]], sampler ae_smp_damage_mask [[sampler(3)]],
-    texture2d<float> shadow_map [[texture(4)]], sampler ae_smp_shadow_map [[sampler(4)]],
-    texture2d<float> lamp_shadow_map [[texture(5)]], sampler ae_smp_lamp_shadow_map [[sampler(5)]],
-    texture2d<float> occlusion_map [[texture(6)]], sampler ae_smp_occlusion_map [[sampler(6)]],
-    texture2d<float> sky_irradiance [[texture(9)]], sampler ae_smp_sky_irradiance [[sampler(9)]],
-    texture2d<float> sky_light [[texture(7)]], sampler ae_smp_sky_light [[sampler(7)]],
-    texture2d<float> brdf_lut [[texture(8)]], sampler ae_smp_brdf_lut [[sampler(8)]],
+    texture2d<float> shadow_map [[texture(5)]], sampler ae_smp_shadow_map [[sampler(5)]],
+    texture2d<float> lamp_shadow_map [[texture(6)]], sampler ae_smp_lamp_shadow_map [[sampler(6)]],
+    texture2d<float> occlusion_map [[texture(7)]], sampler ae_smp_occlusion_map [[sampler(7)]],
+    texture2d<float> sky_irradiance [[texture(10)]], sampler ae_smp_sky_irradiance [[sampler(10)]],
+    texture2d<float> sky_light [[texture(8)]], sampler ae_smp_sky_light [[sampler(8)]],
+    texture2d<float> brdf_lut [[texture(9)]], sampler ae_smp_brdf_lut [[sampler(9)]],
+    texture2d<float> emissive_map [[texture(4)]], sampler ae_smp_emissive_map [[sampler(4)]],
     const device float4* cluster_lights [[buffer(2)]],
     const device float* cluster_words [[buffer(3)]]) {
     ae_lit_frag_out ae_out;
@@ -1580,6 +1585,11 @@ fragment ae_lit_frag_out ae_lit_fragment(
     float3 colour4 = colour3;
     if (material.embers > 0.0) {
         colour4 = colour3 + ae3d_shaders_lit_ember_light(FragPos, world, material);
+    }
+    if (material.emissive_map != 0) {
+        colour4 = colour4 + material.emissive * emissive_map.sample(ae_smp_emissive_map, fragTexCoord).rgb;
+    } else {
+        colour4 = colour4 + material.emissive;
     }
     float3 colour = colour4;
     if (weather.fog != 0) {

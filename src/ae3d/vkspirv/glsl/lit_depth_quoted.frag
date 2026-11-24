@@ -24,7 +24,7 @@ struct Wounds {
 };
 layout(std140, set = 0, binding = 0) uniform DrawBlock {
     vec4 draw_unread[15];
-    vec4 material_unread[8];
+    vec4 material_unread[9];
     vec4 shading_unread[8];
     Cut cut;
     Wounds wounds;

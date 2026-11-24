@@ -52,7 +52,7 @@ struct Eye {
 };
 layout(std140, set = 0, binding = 0) uniform DrawBlock {
     Draw draw;
-    vec4 material_unread[8];
+    vec4 material_unread[9];
     vec4 shading_unread[8];
     Cut cut;
     vec4 wounds_unread[102];

@@ -36,6 +36,16 @@ ae3d_native_pic_flag() {
 # DLL beside the executable that asked for it, and a script opened by a running
 # host binds to the copy that host already has open.
 ae3d_native_rpath() {
+    # A whole path is the library's directory itself (a script built outside
+    # this tree); a relative one is from the linked file.
+    case "$1" in
+        /*)
+            case "$(uname -s)" in
+                MINGW*|MSYS*|CYGWIN*|Windows_NT) echo "" ;;
+                *) echo "-Wl,-rpath,$1" ;;
+            esac
+            return ;;
+    esac
     case "$(uname -s)" in
         Darwin) echo "-Wl,-rpath,@loader_path/$1" ;;
         MINGW*|MSYS*|CYGWIN*|Windows_NT) echo "" ;;

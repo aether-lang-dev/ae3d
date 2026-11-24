@@ -1,0 +1,1213 @@
+// Props placed by rule (#918): street clutter, vegetation and debris over a
+// district, from the district's tagged areas, its roads and the ground's
+// slope, the same from the same seed on every machine.
+//
+// The pieces:
+//   - The ground: a height field sampled from the ground's models, the top
+//     surface and its normal a cell (ground_new).
+//   - Areas: polygons on the ground plane with tags (industrial, residential,
+//     rundown...) and a wealth from 0 to 1. Roads: polylines with a width.
+//     Exclusions: circles nothing is placed in (a doorway, a nav corridor).
+//   - Palettes: which props, how many a square metre, how far apart at
+//     least, on what slope and height, under which tags and wealth, turned
+//     at random, to the surface or along the nearest road, at what scale.
+//   - The placements, then one instanced model a prop: a district of
+//     thousands of props is a draw a prop.
+//
+// The same seed and rules give the same placements on every machine: the
+// random numbers are integers (splitmix64), a direction is drawn by
+// rejection rather than from an angle, the slope limit's cosine is this
+// module's own series, and what is left is IEEE arithmetic and square
+// roots, which every platform rounds alike (the engine builds with
+// -ffp-contract=off). hash() is the placements' fingerprint, which the test
+// holds to one number.
+//
+// A scatter file (load) carries the areas, roads, exclusions and palettes
+// as JSON, for the pipeline to write from a district's tagged areas.
+
+import std.list
+import std.heap
+import std.string
+import std.strarr
+import std.json
+import std.fs
+import std.mem
+import ae3d.core
+import ae3d.geometry
+import ae3d.loader
+
+exports (
+    Ground, Scatter, Palette, Placement,
+    ground_new, ground_free, ground_at, ground_height, ground_normal_y, ground_covers,
+    scatter_new, scatter_free, add_area, add_road, add_exclusion, add_palette,
+    palette_new, palette_slope, palette_height, palette_tags, palette_wealth, palette_align, palette_scale, palette_prop,
+    run, placement_count, placement, hash, build_models, models_free, load, last_error,
+    slope_cos, road_distance, in_exclusion, area_of, in_area,
+    ALIGN_NONE, ALIGN_SURFACE, ALIGN_ROAD
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern sqrt(x: float) -> float
+
+const ALIGN_NONE = 0             // turned at random about the up
+const ALIGN_SURFACE = 1          // its up the ground's normal, turned at random
+const ALIGN_ROAD = 2             // facing along the nearest road
+
+var g_error = ""
+
+last_error() -> string { return g_error }
+
+// --- the ground ------------------------------------------------------------------
+
+// The ground as a height field: `w` by `h` cells of `cell` metres from
+// (x0, z0), each the top surface's height and its normal there, or none.
+struct Ground {
+    x0: float
+    z0: float
+    cell: float
+    w: int
+    h: int
+    heights: ptr                 // float[w * h]
+    normals: ptr                 // float[w * h * 3]
+    covered: ptr                 // byte[w * h]: a surface is there
+}
+
+// The ground the models make, `cell` metres a sample: every triangle of each
+// model, as it stands in the world, rasterized at the cells' centres, the
+// highest surface kept. Null for no models or a cell of nothing.
+ground_new(models: ptr, cell: float) -> *Ground {
+    if models == null || list.size(models) == 0 || cell <= 0.0 { return null }
+    // The models' extent on the ground plane, from their vertices as placed.
+    x0 = 0.0
+    z0 = 0.0
+    x1 = 0.0
+    z1 = 0.0
+    any = false
+    k = 0
+    while k < list.size(models) {
+        m = list.get_raw(models, k) as *Model
+        core.model_update_matrix(m)
+        n = core.mesh_vertex_count(m.mesh)
+        i = 0
+        while i < n {
+            p = placed(m, core.mesh_position(m.mesh, i))
+            if !any || p.x < x0 { x0 = p.x }
+            if !any || p.z < z0 { z0 = p.z }
+            if !any || p.x > x1 { x1 = p.x }
+            if !any || p.z > z1 { z1 = p.z }
+            any = true
+            i = i + 1
+        }
+        k = k + 1
+    }
+    if !any { return null }
+    g = heap.new(Ground)
+    g.x0 = x0
+    g.z0 = z0
+    g.cell = cell
+    g.w = ((x1 - x0) / cell) as int + 1
+    g.h = ((z1 - z0) / cell) as int + 1
+    g.heights = calloc(g.w * g.h, 8)
+    g.normals = calloc(g.w * g.h * 3, 8)
+    g.covered = calloc(g.w * g.h, 1)
+    k = 0
+    while k < list.size(models) {
+        rasterize(g, list.get_raw(models, k) as *Model)
+        k = k + 1
+    }
+    return g
+}
+
+placed(m: *Model, p: Vec3) -> Vec3 {
+    v = core.mat4_mul_v4(m.model_matrix, core.vec4(p.x, p.y, p.z, 1.0))
+    return core.vec3(v.x, v.y, v.z)
+}
+
+// A model's triangles into the field: at each cell centre a triangle covers
+// on the ground plane, its height there, kept where it is the highest yet.
+rasterize(g: *Ground, m: *Model) {
+    heights = g.heights as float[]
+    normals = g.normals as float[]
+    covered = g.covered as byte[]
+    count = core.mesh_index_count(m.mesh)
+    t = 0
+    while t + 2 < count {
+        a = placed(m, core.mesh_position(m.mesh, core.mesh_index_at(m.mesh, t)))
+        b = placed(m, core.mesh_position(m.mesh, core.mesh_index_at(m.mesh, t + 1)))
+        c = placed(m, core.mesh_position(m.mesh, core.mesh_index_at(m.mesh, t + 2)))
+        t = t + 3
+        // The face's normal, up the way the ground faces.
+        ex = b.x - a.x
+        ey = b.y - a.y
+        ez = b.z - a.z
+        fx = c.x - a.x
+        fy = c.y - a.y
+        fz = c.z - a.z
+        nx = ey * fz - ez * fy
+        ny = ez * fx - ex * fz
+        nz = ex * fy - ey * fx
+        length = sqrt(nx * nx + ny * ny + nz * nz)
+        if length <= 0.0 { continue }
+        if ny < 0.0 {
+            nx = 0.0 - nx
+            ny = 0.0 - ny
+            nz = 0.0 - nz
+        }
+        nx = nx / length
+        ny = ny / length
+        nz = nz / length
+        // A wall has no top: it is not ground.
+        area2 = (b.x - a.x) * (c.z - a.z) - (c.x - a.x) * (b.z - a.z)
+        if area2 == 0.0 { continue }
+        lo_x = min3(a.x, b.x, c.x)
+        hi_x = max3(a.x, b.x, c.x)
+        lo_z = min3(a.z, b.z, c.z)
+        hi_z = max3(a.z, b.z, c.z)
+        cx0 = clampi(((lo_x - g.x0) / g.cell) as int, 0, g.w - 1)
+        cx1 = clampi(((hi_x - g.x0) / g.cell) as int + 1, 0, g.w - 1)
+        cz0 = clampi(((lo_z - g.z0) / g.cell) as int, 0, g.h - 1)
+        cz1 = clampi(((hi_z - g.z0) / g.cell) as int + 1, 0, g.h - 1)
+        cz = cz0
+        while cz <= cz1 {
+            pz = g.z0 + ((cz as float) + 0.5) * g.cell
+            cx = cx0
+            while cx <= cx1 {
+                px = g.x0 + ((cx as float) + 0.5) * g.cell
+                // Barycentric weights on the ground plane.
+                w1 = ((b.x - px) * (c.z - pz) - (c.x - px) * (b.z - pz)) / area2
+                w2 = ((c.x - px) * (a.z - pz) - (a.x - px) * (c.z - pz)) / area2
+                w3 = 1.0 - w1 - w2
+                if w1 >= 0.0 && w2 >= 0.0 && w3 >= 0.0 {
+                    y = w1 * a.y + w2 * b.y + w3 * c.y
+                    at = cz * g.w + cx
+                    if covered[at] == 0 as byte || y > heights[at] {
+                        heights[at] = y
+                        normals[at * 3] = nx
+                        normals[at * 3 + 1] = ny
+                        normals[at * 3 + 2] = nz
+                        covered[at] = 1 as byte
+                    }
+                }
+                cx = cx + 1
+            }
+            cz = cz + 1
+        }
+    }
+}
+
+min3(a: float, b: float, c: float) -> float {
+    m = a
+    if b < m { m = b }
+    if c < m { m = c }
+    return m
+}
+
+max3(a: float, b: float, c: float) -> float {
+    m = a
+    if b > m { m = b }
+    if c > m { m = c }
+    return m
+}
+
+clampi(v: int, lo: int, hi: int) -> int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+ground_free(g: *Ground) {
+    if g == null { return }
+    free(g.heights)
+    free(g.normals)
+    free(g.covered)
+    heap.free(g)
+}
+
+// The cell under (x, z), or -1 off the ground or where nothing is.
+cell_at(g: *Ground, x: float, z: float) -> int {
+    if g == null { return 0 - 1 }
+    cx = ((x - g.x0) / g.cell) as int
+    cz = ((z - g.z0) / g.cell) as int
+    if x < g.x0 || z < g.z0 || cx < 0 || cz < 0 || cx >= g.w || cz >= g.h { return 0 - 1 }
+    at = cz * g.w + cx
+    if (g.covered as byte[])[at] == 0 as byte { return 0 - 1 }
+    return at
+}
+
+ground_covers(g: *Ground, x: float, z: float) -> bool { return cell_at(g, x, z) >= 0 }
+
+// The ground's height at (x, z), and its normal: the cell's.
+ground_at(g: *Ground, x: float, z: float) -> (float, Vec3) {
+    at = cell_at(g, x, z)
+    if at < 0 { return 0.0, core.vec3(0.0, 1.0, 0.0) }
+    n = g.normals as float[]
+    return (g.heights as float[])[at], core.vec3(n[at * 3], n[at * 3 + 1], n[at * 3 + 2])
+}
+
+ground_height(g: *Ground, x: float, z: float) -> float {
+    h, _n = ground_at(g, x, z)
+    return h
+}
+
+ground_normal_y(g: *Ground, x: float, z: float) -> float {
+    _h, n = ground_at(g, x, z)
+    return n.y
+}
+
+// --- the rules ---------------------------------------------------------------------
+
+struct Area {
+    points: ptr                  // float[count * 2], x z
+    count: int
+    tags: ptr                    // strarr
+    wealth: float
+    size: float                  // square metres
+}
+
+struct Road {
+    points: ptr                  // float[count * 2]
+    count: int
+    width: float
+}
+
+struct Exclusion {
+    x: float
+    z: float
+    radius: float
+}
+
+struct Prop {
+    model: ptr                   // *Model, the template; the caller's
+    weight: float
+}
+
+struct Palette {
+    name: string
+    props: ptr                   // list of *Prop
+    density: float               // a square metre
+    spacing: float               // metres from any prop placed before, at least
+    slope_min: float             // degrees
+    slope_max: float
+    height_min: float
+    height_max: float
+    require: ptr                 // strarr: an area has every one
+    exclude: ptr                 // strarr: an area has none
+    wealth_min: float
+    wealth_max: float
+    align: int
+    scale_min: float
+    scale_max: float
+}
+
+// One prop placed: which palette and prop, where, its up and its facing on
+// the ground plane, its scale.
+struct Placement {
+    palette: int
+    prop: int
+    x: float
+    y: float
+    z: float
+    ux: float
+    uy: float
+    uz: float
+    fx: float
+    fz: float
+    scale: float
+}
+
+struct Scatter {
+    seed: long
+    state: long
+    areas: ptr                   // list of *Area
+    roads: ptr                   // list of *Road
+    exclusions: ptr              // list of *Exclusion
+    palettes: ptr                // list of *Palette
+    placed: ptr                  // Placement[capacity]
+    count: int
+    capacity: int
+    // The placements by where they are, for the spacing: heads by bucket,
+    // the next in each chain by placement.
+    buckets: ptr
+    bucket_count: int
+    next: ptr
+    bucket_cell: float
+    owns_models: bool            // the props' templates are the scatter's (load)
+}
+
+scatter_new(seed: long) -> *Scatter {
+    s = heap.new(Scatter)
+    s.seed = seed
+    s.areas = list.new()
+    s.roads = list.new()
+    s.exclusions = list.new()
+    s.palettes = list.new()
+    return s
+}
+
+// An area of `count` points (x z pairs in `xz`), its tags comma-separated,
+// its wealth 0..1.
+add_area(s: *Scatter, xz: ptr, count: int, tags: string, wealth: float) {
+    a = heap.new(Area)
+    a.points = calloc(count * 2, 8)
+    mem.copy(a.points, xz, (count * 16) as long)
+    a.count = count
+    a.tags = split_tags(tags)
+    a.wealth = wealth
+    a.size = area_of(a.points, count)
+    list.add_raw(s.areas, a as ptr)
+}
+
+add_road(s: *Scatter, xz: ptr, count: int, width: float) {
+    r = heap.new(Road)
+    r.points = calloc(count * 2, 8)
+    mem.copy(r.points, xz, (count * 16) as long)
+    r.count = count
+    r.width = width
+    list.add_raw(s.roads, r as ptr)
+}
+
+add_exclusion(s: *Scatter, x: float, z: float, radius: float) {
+    e = heap.new(Exclusion)
+    e.x = x
+    e.z = z
+    e.radius = radius
+    list.add_raw(s.exclusions, e as ptr)
+}
+
+// A palette: `density` props a square metre, `spacing` metres apart at
+// least. Any slope, height, tag and wealth, turned at random, at scale 1,
+// until its setters say otherwise.
+palette_new(name: string, density: float, spacing: float) -> *Palette {
+    p = heap.new(Palette)
+    p.name = string.copy(name)
+    p.props = list.new()
+    p.density = density
+    p.spacing = spacing
+    p.slope_min = 0.0
+    p.slope_max = 90.0
+    p.height_min = 0.0 - 1000000.0
+    p.height_max = 1000000.0
+    p.require = strarr.new()
+    p.exclude = strarr.new()
+    p.wealth_min = 0.0
+    p.wealth_max = 1.0
+    p.align = ALIGN_NONE
+    p.scale_min = 1.0
+    p.scale_max = 1.0
+    return p
+}
+
+palette_slope(p: *Palette, min_degrees: float, max_degrees: float) {
+    p.slope_min = min_degrees
+    p.slope_max = max_degrees
+}
+
+palette_height(p: *Palette, low: float, high: float) {
+    p.height_min = low
+    p.height_max = high
+}
+
+// The tags an area must have, and those it must not, comma-separated.
+palette_tags(p: *Palette, require: string, exclude: string) {
+    strarr.free(p.require)
+    strarr.free(p.exclude)
+    p.require = split_tags(require)
+    p.exclude = split_tags(exclude)
+}
+
+palette_wealth(p: *Palette, low: float, high: float) {
+    p.wealth_min = low
+    p.wealth_max = high
+}
+
+palette_align(p: *Palette, align: int) { p.align = align }
+
+palette_scale(p: *Palette, low: float, high: float) {
+    p.scale_min = low
+    p.scale_max = high
+}
+
+// A prop of the palette: `model` (the caller's, kept as its template) chosen
+// in proportion to `weight`.
+palette_prop(p: *Palette, model: @keep *Model, weight: float) {
+    pr = heap.new(Prop)
+    pr.model = model as ptr
+    pr.weight = weight
+    list.add_raw(p.props, pr as ptr)
+}
+
+// The palette into the scatter, which frees it with itself.
+add_palette(s: *Scatter, p: @keep *Palette) { list.add_raw(s.palettes, p as ptr) }
+
+split_tags(csv: string) -> ptr {
+    out = strarr.new()
+    start = 0
+    n = string.length(csv)
+    i = 0
+    while i <= n {
+        if i == n || string.char_at(csv, i) == 44 {
+            if i > start {
+                part = string.trim(string.substring(csv, start, i))
+                if string.length(part) > 0 { strarr.push_copy(out, part) }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+has_tag(tags: ptr, tag: string) -> bool {
+    i = 0
+    while i < strarr.size(tags) {
+        if string.equals(strarr.get(tags, i), tag) == 1 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Whether the palette places in the area: every tag it requires, none it
+// excludes, the wealth in its range.
+palette_fits(p: *Palette, a: *Area) -> bool {
+    i = 0
+    while i < strarr.size(p.require) {
+        if !has_tag(a.tags, strarr.get(p.require, i)) { return false }
+        i = i + 1
+    }
+    i = 0
+    while i < strarr.size(p.exclude) {
+        if has_tag(a.tags, strarr.get(p.exclude, i)) { return false }
+        i = i + 1
+    }
+    return a.wealth >= p.wealth_min && a.wealth <= p.wealth_max
+}
+
+// --- geometry on the ground plane ---------------------------------------------------
+
+// A polygon's area, by the shoelace.
+area_of(xz: ptr, count: int) -> float {
+    v = xz as float[]
+    sum = 0.0
+    i = 0
+    while i < count {
+        j = (i + 1) % count
+        sum = sum + v[i * 2] * v[j * 2 + 1] - v[j * 2] * v[i * 2 + 1]
+        i = i + 1
+    }
+    if sum < 0.0 { sum = 0.0 - sum }
+    return sum * 0.5
+}
+
+// Whether (x, z) is inside the polygon, by crossings.
+in_area(xz: ptr, count: int, x: float, z: float) -> bool {
+    v = xz as float[]
+    inside = false
+    i = 0
+    j = count - 1
+    while i < count {
+        xi = v[i * 2]
+        zi = v[i * 2 + 1]
+        xj = v[j * 2]
+        zj = v[j * 2 + 1]
+        if (zi > z) != (zj > z) && x < (xj - xi) * (z - zi) / (zj - zi) + xi { inside = !inside }
+        j = i
+        i = i + 1
+    }
+    return inside
+}
+
+// How far (x, z) is from the road's centre line, and the direction of the
+// nearest segment (unit, x z), into `dir` (float[2]).
+road_distance(r: *Road, x: float, z: float, dir: ptr) -> float {
+    v = r.points as float[]
+    best = 0.0 - 1.0
+    d = dir as float[]
+    i = 0
+    while i + 1 < r.count {
+        ax = v[i * 2]
+        az = v[i * 2 + 1]
+        bx = v[i * 2 + 2]
+        bz = v[i * 2 + 3]
+        sx = bx - ax
+        sz = bz - az
+        len2 = sx * sx + sz * sz
+        t = 0.0
+        if len2 > 0.0 { t = ((x - ax) * sx + (z - az) * sz) / len2 }
+        if t < 0.0 { t = 0.0 }
+        if t > 1.0 { t = 1.0 }
+        qx = ax + sx * t - x
+        qz = az + sz * t - z
+        dist = sqrt(qx * qx + qz * qz)
+        if best < 0.0 || dist < best {
+            best = dist
+            if len2 > 0.0 {
+                length = sqrt(len2)
+                d[0] = sx / length
+                d[1] = sz / length
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+in_exclusion(s: *Scatter, x: float, z: float) -> bool {
+    i = 0
+    while i < list.size(s.exclusions) {
+        e = list.get_raw(s.exclusions, i) as *Exclusion
+        dx = x - e.x
+        dz = z - e.z
+        if dx * dx + dz * dz < e.radius * e.radius { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// The cosine of `degrees`, by its own series: what a slope limit is held to,
+// the same on every machine (a platform's cos may round the last bit
+// otherwise, and a prop on the edge would come and go).
+slope_cos(degrees: float) -> float {
+    x = degrees * 3.14159265358979323846 / 180.0
+    x2 = x * x
+    term = 1.0
+    sum = 1.0
+    k = 1
+    while k < 12 {
+        term = (0.0 - term) * x2 / (((2 * k - 1) * (2 * k)) as float)
+        sum = sum + term
+        k = k + 1
+    }
+    return sum
+}
+
+// --- the random numbers -------------------------------------------------------------------
+
+// splitmix64: an integer and the next state, the same everywhere.
+next_long(s: *Scatter) -> long {
+    s.state = s.state + (0 - 7046029254386353131 as long)
+    z = s.state
+    z = (z ^ (z >> 30 & 17179869183 as long)) * (0 - 4658895280553007687 as long)
+    z = (z ^ (z >> 27 & 137438953471 as long)) * (0 - 7723592293110705685 as long)
+    return z ^ (z >> 31 & 8589934591 as long)
+}
+
+// A number in [0, 1), from the top 53 bits.
+next01(s: *Scatter) -> float {
+    bits = (next_long(s) >> 11) & 9007199254740991 as long
+    return (bits as float) / 9007199254740992.0
+}
+
+// A direction on the ground plane, unit, by rejection: no angle, no cos.
+// (A point outside the ring is drawn again; three in four land in it.)
+next_direction(s: *Scatter) -> (float, float) {
+    x = 0.0
+    z = 0.0
+    r2 = 0.0
+    while r2 <= 0.0625 || r2 > 1.0 {
+        x = next01(s) * 2.0 - 1.0
+        z = next01(s) * 2.0 - 1.0
+        r2 = x * x + z * z
+    }
+    r = sqrt(r2)
+    return x / r, z / r
+}
+
+// --- placing ----------------------------------------------------------------------------------
+
+// Every palette over every area it fits, in order, from the seed: the
+// placements, as many as each area's size and density ask for where the
+// ground, the slope, the height, the roads, the exclusions and the spacing
+// allow. Answers how many. Run again, it starts over from the seed.
+run(s: *Scatter, g: *Ground) -> int {
+    s.state = s.seed
+    s.count = 0
+    widest = 0.25
+    i = 0
+    while i < list.size(s.palettes) {
+        p = list.get_raw(s.palettes, i) as *Palette
+        if p.spacing > widest { widest = p.spacing }
+        i = i + 1
+    }
+    buckets_new(s, widest, expected(s))
+    pi = 0
+    while pi < list.size(s.palettes) {
+        p = list.get_raw(s.palettes, pi) as *Palette
+        if list.size(p.props) > 0 && p.density > 0.0 {
+            cos_steep = slope_cos(p.slope_max)
+            cos_flat = slope_cos(p.slope_min)
+            ai = 0
+            while ai < list.size(s.areas) {
+                a = list.get_raw(s.areas, ai) as *Area
+                if palette_fits(p, a) { place_in(s, g, p, pi, a, cos_steep, cos_flat) }
+                ai = ai + 1
+            }
+        }
+        pi = pi + 1
+    }
+    return s.count
+}
+
+expected(s: *Scatter) -> int {
+    n = 0.0
+    pi = 0
+    while pi < list.size(s.palettes) {
+        p = list.get_raw(s.palettes, pi) as *Palette
+        ai = 0
+        while ai < list.size(s.areas) {
+            a = list.get_raw(s.areas, ai) as *Area
+            if palette_fits(p, a) { n = n + p.density * a.size }
+            ai = ai + 1
+        }
+        pi = pi + 1
+    }
+    return (n as int) + 16
+}
+
+place_in(s: *Scatter, g: *Ground, p: *Palette, pi: int, a: *Area, cos_steep: float, cos_flat: float) {
+    want = (p.density * a.size + 0.5) as int
+    if want <= 0 { return }
+    v = a.points as float[]
+    x0 = v[0]
+    z0 = v[1]
+    x1 = v[0]
+    z1 = v[1]
+    k = 1
+    while k < a.count {
+        if v[k * 2] < x0 { x0 = v[k * 2] }
+        if v[k * 2] > x1 { x1 = v[k * 2] }
+        if v[k * 2 + 1] < z0 { z0 = v[k * 2 + 1] }
+        if v[k * 2 + 1] > z1 { z1 = v[k * 2 + 1] }
+        k = k + 1
+    }
+    dir = calloc(2, 8)
+    placed_here = 0
+    tries = want * 30
+    while tries > 0 && placed_here < want {
+        tries = tries - 1
+        x = x0 + next01(s) * (x1 - x0)
+        z = z0 + next01(s) * (z1 - z0)
+        // The draws for this candidate's prop, direction and scale are taken
+        // whether or not it is kept, so a rule that refuses one moves no
+        // other placement's numbers.
+        pick = next01(s)
+        dx, dz = next_direction(s)
+        size = next01(s)
+        if !in_area(a.points, a.count, x, z) || in_exclusion(s, x, z) { continue }
+        at = cell_at(g, x, z)
+        if at < 0 { continue }
+        height = (g.heights as float[])[at]
+        ny = (g.normals as float[])[at * 3 + 1]
+        if height < p.height_min || height > p.height_max { continue }
+        if ny < cos_steep || ny > cos_flat + 0.0000001 { continue }
+        // Off the roads, and facing along the nearest where it is asked to.
+        on_road = false
+        nearest = 0.0 - 1.0
+        along_x = 0.0
+        along_z = 1.0
+        r = 0
+        while r < list.size(s.roads) {
+            road = list.get_raw(s.roads, r) as *Road
+            d = road_distance(road, x, z, dir)
+            if d < road.width * 0.5 + p.spacing * 0.5 { on_road = true }
+            if nearest < 0.0 || d < nearest {
+                nearest = d
+                along_x = (dir as float[])[0]
+                along_z = (dir as float[])[1]
+            }
+            r = r + 1
+        }
+        if on_road { continue }
+        if crowded(s, x, z, p.spacing) { continue }
+        n = (g.normals as float[])
+        up_x = 0.0
+        up_y = 1.0
+        up_z = 0.0
+        if p.align == ALIGN_SURFACE {
+            up_x = n[at * 3]
+            up_y = n[at * 3 + 1]
+            up_z = n[at * 3 + 2]
+        }
+        if p.align == ALIGN_ROAD && nearest >= 0.0 {
+            dx = along_x
+            dz = along_z
+        }
+        put(s, Placement {
+            palette: pi, prop: choose(p, pick), x: x, y: height, z: z, ux: up_x, uy: up_y, uz: up_z, fx: dx, fz: dz,
+            scale: p.scale_min + (p.scale_max - p.scale_min) * size
+        })
+        placed_here = placed_here + 1
+    }
+    free(dir)
+}
+
+// The prop `t` (0..1) lands on, by weight.
+choose(p: *Palette, t: float) -> int {
+    total = 0.0
+    i = 0
+    while i < list.size(p.props) {
+        total = total + (list.get_raw(p.props, i) as *Prop).weight
+        i = i + 1
+    }
+    if total <= 0.0 { return 0 }
+    target = t * total
+    run_sum = 0.0
+    i = 0
+    while i < list.size(p.props) {
+        run_sum = run_sum + (list.get_raw(p.props, i) as *Prop).weight
+        if target < run_sum { return i }
+        i = i + 1
+    }
+    return list.size(p.props) - 1
+}
+
+// --- the placements by where they are ----------------------------------------------
+
+buckets_new(s: *Scatter, cell: float, expected: int) {
+    if s.buckets != null { free(s.buckets) }
+    n = 64
+    while n < expected * 2 { n = n * 2 }
+    s.buckets = calloc(n, 4)
+    s.bucket_count = n
+    s.bucket_cell = cell
+    heads = s.buckets as int[]
+    i = 0
+    while i < n {
+        heads[i] = 0 - 1
+        i = i + 1
+    }
+}
+
+bucket_of(s: *Scatter, cx: int, cz: int) -> int {
+    h = cx * 73856093 + cz * 19349663
+    if h < 0 { h = 0 - h }
+    return h % s.bucket_count
+}
+
+// Whether a placement already made is within `spacing` of (x, z).
+crowded(s: *Scatter, x: float, z: float, spacing: float) -> bool {
+    if spacing <= 0.0 { return false }
+    cx = floor_int(x / s.bucket_cell)
+    cz = floor_int(z / s.bucket_cell)
+    reach = (spacing / s.bucket_cell) as int + 1
+    heads = s.buckets as int[]
+    links = s.next as int[]
+    oz = 0 - reach
+    while oz <= reach {
+        ox = 0 - reach
+        while ox <= reach {
+            i = heads[bucket_of(s, cx + ox, cz + oz)]
+            while i >= 0 {
+                q = at(s, i)
+                ddx = q.x - x
+                ddz = q.z - z
+                if ddx * ddx + ddz * ddz < spacing * spacing { return true }
+                i = links[i]
+            }
+            ox = ox + 1
+        }
+        oz = oz + 1
+    }
+    return false
+}
+
+floor_int(v: float) -> int {
+    i = v as int
+    if (i as float) > v { i = i - 1 }
+    return i
+}
+
+put(s: *Scatter, pl: Placement) {
+    if s.count >= s.capacity {
+        room = s.capacity * 2
+        if room < 64 { room = 64 }
+        grown = calloc(room, sizeof(Placement))
+        links = calloc(room, 4)
+        if s.placed != null {
+            mem.copy(grown, s.placed, (s.count * sizeof(Placement)) as long)
+            mem.copy(links, s.next, (s.count * 4) as long)
+            free(s.placed)
+            free(s.next)
+        }
+        s.placed = grown
+        s.next = links
+        s.capacity = room
+    }
+    slot = (s.placed + s.count * sizeof(Placement)) as *Placement
+    slot.palette = pl.palette
+    slot.prop = pl.prop
+    slot.x = pl.x
+    slot.y = pl.y
+    slot.z = pl.z
+    slot.ux = pl.ux
+    slot.uy = pl.uy
+    slot.uz = pl.uz
+    slot.fx = pl.fx
+    slot.fz = pl.fz
+    slot.scale = pl.scale
+    b = bucket_of(s, floor_int(pl.x / s.bucket_cell), floor_int(pl.z / s.bucket_cell))
+    (s.next as int[])[s.count] = (s.buckets as int[])[b]
+    (s.buckets as int[])[b] = s.count
+    s.count = s.count + 1
+}
+
+at(s: *Scatter, i: int) -> *Placement { return (s.placed + i * sizeof(Placement)) as *Placement }
+
+placement_count(s: *Scatter) -> int { return s.count }
+
+placement(s: *Scatter, i: int) -> *Placement {
+    if i < 0 || i >= s.count { return null }
+    return at(s, i)
+}
+
+// The placements' fingerprint (FNV-1a over each one's palette, prop and the
+// bits of its numbers): the same seed and rules, the same number, anywhere.
+hash(s: *Scatter) -> long {
+    h = 0 - 3750763034362895579 as long
+    i = 0
+    while i < s.count {
+        p = at(s, i)
+        h = mix(h, p.palette as long)
+        h = mix(h, p.prop as long)
+        h = mix(h, mem.bits_of_float(p.x))
+        h = mix(h, mem.bits_of_float(p.y))
+        h = mix(h, mem.bits_of_float(p.z))
+        h = mix(h, mem.bits_of_float(p.ux))
+        h = mix(h, mem.bits_of_float(p.uy))
+        h = mix(h, mem.bits_of_float(p.uz))
+        h = mix(h, mem.bits_of_float(p.fx))
+        h = mix(h, mem.bits_of_float(p.fz))
+        h = mix(h, mem.bits_of_float(p.scale))
+        i = i + 1
+    }
+    return h
+}
+
+mix(h: long, v: long) -> long {
+    out = h
+    k = 0
+    while k < 8 {
+        out = (out ^ ((v >> (k * 8)) & 255 as long)) * 1099511628211 as long
+        k = k + 1
+    }
+    return out
+}
+
+// --- drawn --------------------------------------------------------------------------------------
+
+// One instanced model a prop that was placed, its instances where its
+// placements are: a copy of the prop's template, the caller's to add to an
+// engine or a backend and to free (models_free). A district is a draw a
+// prop.
+build_models(s: *Scatter) -> ptr {
+    out = list.new()
+    // Every (palette, prop) a slot: the palette's first slot, then its props.
+    first = calloc(list.size(s.palettes) + 1, 4)
+    slots = 0
+    pi = 0
+    while pi < list.size(s.palettes) {
+        (first as int[])[pi] = slots
+        slots = slots + list.size((list.get_raw(s.palettes, pi) as *Palette).props)
+        pi = pi + 1
+    }
+    // Two passes over the placements, not one a prop: how many each slot
+    // has, then each written into its model's next instance.
+    counts = calloc(slots + 1, 4)
+    models = calloc(slots + 1, 8)
+    i = 0
+    while i < s.count {
+        q = at(s, i)
+        slot = (first as int[])[q.palette] + q.prop
+        (counts as int[])[slot] = (counts as int[])[slot] + 1
+        i = i + 1
+    }
+    pi = 0
+    while pi < list.size(s.palettes) {
+        p = list.get_raw(s.palettes, pi) as *Palette
+        k = 0
+        while k < list.size(p.props) {
+            slot = (first as int[])[pi] + k
+            n = (counts as int[])[slot]
+            if n > 0 {
+                template = (list.get_raw(p.props, k) as *Prop).model as *Model
+                m = core.model_clone(template)
+                core.model_set_name(m, "${p.name} ${k}")
+                m.position = core.vec3(0.0, 0.0, 0.0)
+                m.rotation = core.quat_ident()
+                m.scale = core.vec3(1.0, 1.0, 1.0)
+                core.model_update_matrix(m)
+                core.model_enable_instancing(m, n)
+                core.model_set_instance_draw_count(m, n)
+                (models as ptr[])[slot] = m as ptr
+                list.add_raw(out, m as ptr)
+            }
+            // From here, the instances the slot has written.
+            (counts as int[])[slot] = 0
+            k = k + 1
+        }
+        pi = pi + 1
+    }
+    matrix = calloc(16, 8)
+    i = 0
+    while i < s.count {
+        q = at(s, i)
+        slot = (first as int[])[q.palette] + q.prop
+        m = (models as ptr[])[slot] as *Model
+        write_matrix(matrix, q)
+        geometry.inst_set_matrix(m.instances, (counts as int[])[slot], matrix)
+        (counts as int[])[slot] = (counts as int[])[slot] + 1
+        i = i + 1
+    }
+    free(matrix)
+    i = 0
+    while i < list.size(out) {
+        m = list.get_raw(out, i) as *Model
+        m.instances_updated = true
+        core.model_recalculate_bounds(m)
+        i = i + 1
+    }
+    free(first)
+    free(counts)
+    free(models)
+    return out
+}
+
+// A placement's matrix, column by column: its right, its up, its facing,
+// each times its scale, and where it stands.
+write_matrix(out: ptr, q: *Placement) {
+    v = out as float[]
+    // Facing along (fx, 0, fz), made square to the up.
+    dot = q.fx * q.ux + q.fz * q.uz
+    fx = q.fx - q.ux * dot
+    fy = 0.0 - q.uy * dot
+    fz = q.fz - q.uz * dot
+    length = sqrt(fx * fx + fy * fy + fz * fz)
+    if length > 0.0 {
+        fx = fx / length
+        fy = fy / length
+        fz = fz / length
+    }
+    // Right = up x facing.
+    rx = q.uy * fz - q.uz * fy
+    ry = q.uz * fx - q.ux * fz
+    rz = q.ux * fy - q.uy * fx
+    sc = q.scale
+    v[0] = rx * sc
+    v[1] = ry * sc
+    v[2] = rz * sc
+    v[3] = 0.0
+    v[4] = q.ux * sc
+    v[5] = q.uy * sc
+    v[6] = q.uz * sc
+    v[7] = 0.0
+    v[8] = fx * sc
+    v[9] = fy * sc
+    v[10] = fz * sc
+    v[11] = 0.0
+    v[12] = q.x
+    v[13] = q.y
+    v[14] = q.z
+    v[15] = 1.0
+}
+
+models_free(models: ptr) {
+    if models == null { return }
+    i = 0
+    while i < list.size(models) {
+        core.model_free(list.get_raw(models, i) as *Model)
+        i = i + 1
+    }
+    list.free(models)
+}
+
+// Everything the scatter holds; the props' template models are the
+// caller's (load's are the scatter's, freed here).
+scatter_free(s: *Scatter) {
+    if s == null { return }
+    i = 0
+    while i < list.size(s.areas) {
+        a = list.get_raw(s.areas, i) as *Area
+        free(a.points)
+        strarr.free(a.tags)
+        heap.free(a)
+        i = i + 1
+    }
+    list.free(s.areas)
+    i = 0
+    while i < list.size(s.roads) {
+        r = list.get_raw(s.roads, i) as *Road
+        free(r.points)
+        heap.free(r)
+        i = i + 1
+    }
+    list.free(s.roads)
+    i = 0
+    while i < list.size(s.exclusions) {
+        heap.free(list.get_raw(s.exclusions, i) as *Exclusion)
+        i = i + 1
+    }
+    list.free(s.exclusions)
+    i = 0
+    while i < list.size(s.palettes) {
+        p = list.get_raw(s.palettes, i) as *Palette
+        k = 0
+        while k < list.size(p.props) {
+            pr = list.get_raw(p.props, k) as *Prop
+            if s.owns_models { core.model_free(pr.model as *Model) }
+            heap.free(pr)
+            k = k + 1
+        }
+        list.free(p.props)
+        strarr.free(p.require)
+        strarr.free(p.exclude)
+        string.free(p.name)
+        heap.free(p)
+        i = i + 1
+    }
+    list.free(s.palettes)
+    if s.placed != null { free(s.placed) }
+    if s.next != null { free(s.next) }
+    if s.buckets != null { free(s.buckets) }
+    heap.free(s)
+}
+
+// --- the scatter file ------------------------------------------------------------------------
+
+// A scatter file: its seed, areas, roads, exclusions and palettes, the
+// palettes' props by their OBJ files (the scatter's, freed with it).
+//
+//   {"seed": 7,
+//    "areas": [{"points": [x, z, ...], "tags": ["residential"], "wealth": 0.4}],
+//    "roads": [{"points": [x, z, ...], "width": 6}],
+//    "exclusions": [{"x": 0, "z": 0, "radius": 2}],
+//    "palettes": [{"name": "clutter", "density": 0.05, "spacing": 2,
+//                  "slope": [0, 20], "height": [-10, 50], "require": ["residential"],
+//                  "exclude": [], "wealth": [0, 1], "align": "road", "scale": [0.8, 1.2],
+//                  "props": [{"model": "resources/obj/Cube.obj", "weight": 1}]}]}
+//
+// Null, with last_error, for a file that does not read or a prop that does
+// not load.
+load(path: string) -> *Scatter {
+    text, err = fs.read(path)
+    if err != "" {
+        g_error = "cannot read ${path}"
+        string.free(text)
+        return null
+    }
+    root = json.parse_raw(text)
+    string.free(text)
+    if root == null {
+        g_error = "cannot parse ${path}"
+        return null
+    }
+    s = scatter_new(int_of(json.object_get_raw(root, "seed"), 0) as long)
+    s.owns_models = true
+    areas = json.object_get_raw(root, "areas")
+    i = 0
+    while areas != null && i < json.array_size(areas) {
+        a = json.array_get_raw(areas, i)
+        xz, n = points_of(json.object_get_raw(a, "points"))
+        add_area(s, xz, n, tags_csv(json.object_get_raw(a, "tags")), number_of(json.object_get_raw(a, "wealth"), 0.0))
+        free(xz)
+        i = i + 1
+    }
+    roads = json.object_get_raw(root, "roads")
+    i = 0
+    while roads != null && i < json.array_size(roads) {
+        r = json.array_get_raw(roads, i)
+        xz, n = points_of(json.object_get_raw(r, "points"))
+        add_road(s, xz, n, number_of(json.object_get_raw(r, "width"), 4.0))
+        free(xz)
+        i = i + 1
+    }
+    holes = json.object_get_raw(root, "exclusions")
+    i = 0
+    while holes != null && i < json.array_size(holes) {
+        e = json.array_get_raw(holes, i)
+        add_exclusion(s, number_of(json.object_get_raw(e, "x"), 0.0), number_of(json.object_get_raw(e, "z"), 0.0),
+                      number_of(json.object_get_raw(e, "radius"), 1.0))
+        i = i + 1
+    }
+    palettes = json.object_get_raw(root, "palettes")
+    i = 0
+    while palettes != null && i < json.array_size(palettes) {
+        node = json.array_get_raw(palettes, i)
+        p = palette_new(text_of(json.object_get_raw(node, "name")), number_of(json.object_get_raw(node, "density"), 0.0),
+                        number_of(json.object_get_raw(node, "spacing"), 0.0))
+        add_palette(s, p)
+        pair = json.object_get_raw(node, "slope")
+        if pair != null { palette_slope(p, item(pair, 0, 0.0), item(pair, 1, 90.0)) }
+        pair = json.object_get_raw(node, "height")
+        if pair != null { palette_height(p, item(pair, 0, p.height_min), item(pair, 1, p.height_max)) }
+        pair = json.object_get_raw(node, "wealth")
+        if pair != null { palette_wealth(p, item(pair, 0, 0.0), item(pair, 1, 1.0)) }
+        pair = json.object_get_raw(node, "scale")
+        if pair != null { palette_scale(p, item(pair, 0, 1.0), item(pair, 1, 1.0)) }
+        palette_tags(p, tags_csv(json.object_get_raw(node, "require")), tags_csv(json.object_get_raw(node, "exclude")))
+        align = text_of(json.object_get_raw(node, "align"))
+        if align == "surface" { palette_align(p, ALIGN_SURFACE) }
+        if align == "road" { palette_align(p, ALIGN_ROAD) }
+        props = json.object_get_raw(node, "props")
+        k = 0
+        while props != null && k < json.array_size(props) {
+            pr = json.array_get_raw(props, k)
+            model_path = text_of(json.object_get_raw(pr, "model"))
+            m = loader.load_obj(model_path, false)
+            if m == null {
+                g_error = "cannot load ${model_path}"
+                json.free(root)
+                scatter_free(s)
+                return null
+            }
+            palette_prop(p, m, number_of(json.object_get_raw(pr, "weight"), 1.0))
+            k = k + 1
+        }
+        i = i + 1
+    }
+    json.free(root)
+    return s
+}
+
+points_of(node: ptr) -> (ptr, int) {
+    n = 0
+    if node != null { n = json.array_size(node) / 2 }
+    out = calloc(n * 2 + 1, 8)
+    v = out as float[]
+    i = 0
+    while i < n * 2 {
+        v[i] = json.get_number(json.array_get_raw(node, i))
+        i = i + 1
+    }
+    return out, n
+}
+
+tags_csv(node: ptr) -> string {
+    out = ""
+    i = 0
+    while node != null && i < json.array_size(node) {
+        if i > 0 { out = "${out}," }
+        out = "${out}${json.get_string_raw(json.array_get_raw(node, i))}"
+        i = i + 1
+    }
+    return out
+}
+
+number_of(node: ptr, fallback: float) -> float {
+    if node == null { return fallback }
+    return json.get_number(node)
+}
+
+int_of(node: ptr, fallback: int) -> int {
+    if node == null { return fallback }
+    return json.get_int(node)
+}
+
+item(node: ptr, index: int, fallback: float) -> float {
+    if node == null || json.array_size(node) <= index { return fallback }
+    return json.get_number(json.array_get_raw(node, index))
+}
+
+text_of(node: ptr) -> string {
+    if node == null { return "" }
+    return json.get_string_raw(node)
+}

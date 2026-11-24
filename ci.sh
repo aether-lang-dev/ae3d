@@ -144,7 +144,8 @@ GPU_SUITES="test_gpu_fxaa test_pick test_pick_crowd test_view test_engine_view t
     test_render test_render_scale test_scene_hold test_scene_look test_shading_isolation
     test_shading_knobs test_shadow_batches test_shadow_cascades test_sky_light
     test_shadows test_skinned_render test_ssr test_taa test_texture_swap
-    test_trace test_velocity test_vk_fence_wait test_vk_mesh test_vk_msl test_weather"
+    test_trace test_velocity test_vk_fence_wait test_vk_mesh test_vk_msl test_weather
+    test_emissive test_hidden_size test_hud_hold test_instance_cull test_stream_drive test_texture_release test_vk_prepass test_vk_rings test_vk_stages"
 suite_sources() {   # the suites this tier, and this shard of it, builds and runs
     turn=0
     for suite in tests/test_*.ae; do
@@ -639,7 +640,9 @@ fi
 # a script is a separate library the test opens at runtime rather than
 # something linked into it, which is the whole point of one.
 step "scripts"
-for script_source in resources/scripts/*.ae; do
+# With them, the fixtures test_script holds the loader to (a library built
+# before scripts said their layout, and one built against another engine).
+for script_source in resources/scripts/*.ae tests/fixtures/scripts/*.ae; do
     [ -e "$script_source" ] || continue
     script_name="$(basename "$script_source" .ae)"
     if ! ./scripts/build_script.sh "$script_source" >/tmp/ae3d_script.log 2>&1; then

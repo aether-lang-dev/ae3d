@@ -78,6 +78,8 @@ struct DrawMaterial {
     int blend;
     float reflectivity;
     int normal_map;
+    vec3 emissive;
+    int emissive_map;
 };
 struct Draw {
     mat4 model;
@@ -197,6 +199,7 @@ layout(set = 1, binding = 5) uniform sampler2D occlusion_map;
 layout(set = 2, binding = 3) uniform sampler2D sky_irradiance;
 layout(set = 2, binding = 1) uniform sampler2D sky_light;
 layout(set = 2, binding = 2) uniform sampler2D brdf_lut;
+layout(set = 0, binding = 11) uniform sampler2D emissive_map;
 layout(std430, set = 1, binding = 2) readonly buffer cluster_lights_buffer { vec4 cluster_lights[]; };
 layout(std430, set = 1, binding = 3) readonly buffer cluster_words_buffer { float cluster_words[]; };
 
@@ -1323,6 +1326,11 @@ void main() {
     vec3 colour4 = colour3;
     if (material.embers > 0.0) {
         colour4 = colour3 + ae3d_shaders_lit_ember_light();
+    }
+    if (material.emissive_map != 0) {
+        colour4 = colour4 + material.emissive * texture(emissive_map, fragTexCoord).rgb;
+    } else {
+        colour4 = colour4 + material.emissive;
     }
     vec3 colour = colour4;
     if (weather.fog != 0) {

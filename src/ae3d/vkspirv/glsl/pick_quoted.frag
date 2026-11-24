@@ -50,6 +50,8 @@ struct DrawMaterial {
     int blend;
     float reflectivity;
     int normal_map;
+    vec3 emissive;
+    int emissive_map;
 };
 struct Eye {
     mat4 view_projection;

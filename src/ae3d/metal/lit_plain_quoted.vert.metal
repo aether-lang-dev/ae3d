@@ -108,15 +108,15 @@ static_assert(__builtin_offsetof(Skin, prev_base) == 4, "Skin.prev_base: std140"
 
 struct DrawBlock {
     Draw draw;
-    char ae_pad0[256];
+    char ae_pad0[272];
     Cut cut;
     char ae_pad1[1744];
     Skin skin;
 };
-static_assert(sizeof(DrawBlock) == 2336, "DrawBlock: std140");
+static_assert(sizeof(DrawBlock) == 2352, "DrawBlock: std140");
 static_assert(__builtin_offsetof(DrawBlock, draw) == 0, "DrawBlock.draw: std140");
-static_assert(__builtin_offsetof(DrawBlock, cut) == 496, "DrawBlock.cut: std140");
-static_assert(__builtin_offsetof(DrawBlock, skin) == 2320, "DrawBlock.skin: std140");
+static_assert(__builtin_offsetof(DrawBlock, cut) == 512, "DrawBlock.cut: std140");
+static_assert(__builtin_offsetof(DrawBlock, skin) == 2336, "DrawBlock.skin: std140");
 
 struct CameraBlock {
     Eye eye;

@@ -22,7 +22,50 @@ transparent draws and the post chain -- so the second line says which
 stage a frame's cost is in: the scene's five, and the shadow work's three
 (the sorts, the rays' structure with the skinned figures posed into it,
 and the maps: the cascades and the lamps' faces). The same split is in the
-editor's stats bar and in the agent channel's `frame.stats`. `update_ms`
+editor's stats bar and in the agent channel's `frame.stats`.
+
+What each scene stage holds:
+
+- `camdepth`: nothing now. The depth is resolved after the opaque draws,
+  so the stage stays, at zero, for a reader that names it.
+- `opaque`: the opaque draws.
+- `sky`: the sky, drawn after them.
+- `occlusion`: the depth resolved for the occlusion, the reflection and the
+  water.
+- `transparent`: the transparent draws (water, particles, glass) and the
+  world's text.
+
+A third line, `perf transparent_cover`, names what the transparent pass
+shades, the largest five first:
+
+```
+perf transparent_cover mist=1.9(80) water=0.6(1) unnamed=0.2(3)
+```
+
+Each entry is a model name, the screens its bounds cover a frame (summed
+over the models of that name), and its draws a frame. A blended surface is
+lit once per layer at every pixel it covers, so this pass's cost goes with
+that area, not with draws: about 1.75 ms per screen-covering layer at
+640x360 with 4x MSAA on an M1 Pro (`test_vk_stages`' transparent scene).
+The estimate is the model's bounds as the camera sees them, capped at a
+screen (`engine.transparent_share`). It is an upper bound: a field of
+sparse soft cards reads as the whole volume it fills, though its cards
+cover a part of it. A model off the view, and an instanced one drawing
+nothing (an emitter with no live particle), count for none. A particle emitter is named "particles" unless the
+game names it (`core.model_set_name(particles.emitter_model(em), ...)`).
+
+Until 2026-11-23 two stamps were written beside the next ones, so the
+opaque draws read as `camdepth` and the transparent ones as `occlusion`
+(`test_vk_stages` holds the split now).
+
+On a device layered over Metal (MoltenVK: `vkdevice.portable()`), a stamp
+lands only at a render pass's edge: Apple's GPUs sample their counters
+where a pass begins or ends, not between draws. The marks inside the scene
+pass are written at its next edge there. So `opaque` is the opaque draws
+and the sky together, and when nothing splits the pass (no occlusion,
+reflection or water to resolve the depth for) it is the whole scene pass,
+transparent draws included. Before, a stamp written between draws came
+back as the frame's end, and `opaque` carried everything after it. `update_ms`
 is the behaviours' own time -- the fixed updates, the updates, the clips
 advancing: the simulation -- which is where a frame goes once the device
 is done with it: half a million zombies are 8 ms of device and 25 of
@@ -205,6 +248,41 @@ now, like a model's own stream, and the scene's CPU time is a tenth of a
 millisecond. A number in the CPU column that is not near zero is that
 kind of thing: the engine's CPU work in a frame is small, so what shows
 up there is a wait.
+
+### Streams that grow, and buffers let go of
+
+Two waits of the same kind were left. Both drained the whole device with
+`vkDeviceWaitIdle`:
+
+- **A ring outgrown.** An instance stream's ring of per-frame buffers was
+  remade exactly the size asked at every new most. An emitter one particle
+  fuller each frame remade it every frame.
+- **A mesh freed.** `mesh_free` waited for the device before destroying the
+  buffers, because the frames in flight might be drawing them.
+
+Now a ring at least doubles when it grows. Whatever a ring outgrew, and the
+buffers of a freed mesh, are retired (`ae3d.vkmesh`): each is stamped with
+the number of frames begun, and destroyed once `FRAMES` more have begun.
+A frame's start waits for the fence of the frame `FRAMES` before it, so by
+then no frame can be reading the buffer. A mesh with a ray-tracing
+structure still waits as it is freed, since the structure goes with it;
+only a device that traces has one.
+
+`benchmarks/bench_streams.ae`, M1 Pro, Vulkan, 640x360 offscreen: 200
+streams each one instance fuller a frame up to 120 (a ground mist of small
+emitters).
+
+| | before | after |
+|---|---|---|
+| growing, ms a frame | 20.3–20.6 | 3.10–3.13 |
+| moving, not growing, ms a frame | 4.84–5.06 | 4.82–4.86 |
+
+`test_vk_rings` holds it:
+- a stream creeping from 1 to 256 instances remakes its ring 9 times, where
+  it remade it 255;
+- every frame draws its newest instance;
+- what was retired is gone frames later, from a ring and from a stream
+  let go of.
 
 ## Loading: the OBJ parse cache
 

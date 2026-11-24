@@ -66,6 +66,9 @@ interleaved with the first.
 | `component.add` | `object, kind, [fields]` | Adds a component of that kind with its defaults, and the fields given; refused when the kind is one per object and the object has one. |
 | `component.remove` | `object, kind` | Removes the object's component of that kind. |
 | `component.enable` | `object, kind, on` | Enables or disables the object's component of that kind: a disabled component's phases do not run. |
+| `persist.checkpoint` | `[name]` | Keep the scene of game objects as it is now under a name (default "default"): every object's transform and component fields, and the bodies' motion. A checkpoint of the same name is replaced. |
+| `persist.rollback` | `[name]` | Put the scene back to a checkpoint: what was made since destroyed, what was destroyed since made back by the game's spawner, every field and body as it was. Answers what could not be made back. |
+| `persist.checkpoints` |  | The checkpoints kept, by name. |
 | `scene.save` | `path, [mesh_directory]` | Write the scene to JSON, with generated geometry beside it. |
 | `scene.load` | `path` | Replace the scene with one from a file, and reframe the camera as it was saved. |
 | `frame.capture` |  | Read the finished frame into the engine. Answers with its size once it is there. |
@@ -85,6 +88,7 @@ interleaved with the first.
 | `frame.pause` |  | Hold the simulation still. The scene still renders and can be queried; time and the frame counter stop. |
 | `frame.resume` |  | Let the simulation run again. |
 | `frame.step` | `count` | Pause, run exactly count frames, pause again. Answers with stepped_from and stepped. |
+| `stream.cells` | `[stream]` | Every streamed world in the program (ae3d.stream), or the one at that place: its grid, its loading radius, margin and far radius, the bytes its cells hold now and the most they have, how many loads are in flight and how many cells within the radius are missing, and every cell that is not unloaded: where it is, its state (loading, leaving, loaded, attaching, resident) and its stand-in's, how far it is from the nearest focus, its models and how many times it has loaded. |
 | `net.stats` | `[session]` | Every multiplayer session in the program (ae3d.net), a host and its clients alike, or the one at that place: its role, its transport, the link it simulates, and for every peer the round trip and its jitter in microseconds and the loss in parts per million (ten pings a second each way), and the bytes a second each way by kind -- snapshots, events, inputs, acks, the link's pings, the transport's headers and its resends -- over the last second, and their totals; a host's peer adds its budget, its largest snapshot, its whole snapshots against its deltas, the most ticks a relevant object waited (in all, and in each sight: seen, out of view, occluded) and the bytes spent on what it could see; a client adds its snapshots and its prediction's corrections, the last and the worst, in micrometres. Every figure a whole number, the one ae3d.net measures. |
 | `net.set_link` | `latency, jitter, loss, [session]` | The link's simulated conditions: seconds of latency and up to seconds of jitter more, one way, and the share of datagrams (of unreliable messages, on the loopback) lost, as the editor's play sliders set them. On every session there is, or the one at that place: a UDP session's on what it sends, a loopback session's on its hub. TCP has none. Answers with each session's link as it now is. |
 | `quit` |  | Stop the engine's loop and let it shut down normally. |

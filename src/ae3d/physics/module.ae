@@ -47,7 +47,10 @@ import ae3d.loader
 import ae3d.skin
 import ae3d.scene
 import ae3d.viewpoint
+import ae3d.persist
+import ae3d.component
 import std.strarr
+import std.json
 
 exports (
     Physics, Rigidbody, Ragdoll, Vehicle, ragdoll_bone_count,
@@ -150,6 +153,14 @@ struct Physics {
     sub_steps: int
     step_count: int
     ankles: bool                   // ragdolls made from here have feet of their own (#709)
+    // The touching pairs some side hears of (tell_contacts, #508): list of
+    // *Touch. A pair is let go of while they are told (`telling`) by
+    // marking it, and swept once they have been; `quiet` while the world
+    // is freed, when nothing is told.
+    touches: ptr
+    triggers: int                  // how many trigger shapes the world holds
+    telling: bool
+    quiet: bool
 }
 
 // A body on a game object.
@@ -162,6 +173,7 @@ struct Rigidbody {
     friction: float
     restitution: float
     density: float
+    trigger: bool                  // the first collider a trigger, for the scene file
     colliders: ptr                 // list of *Collider: its shapes, and what each was made from
 }
 
@@ -171,6 +183,7 @@ struct Collider {
     shape: ShapeId
     hull: ptr                      // *HullData, or null
     mesh: ptr                      // *MeshData, or null
+    trigger: bool                  // a sensor: it overlaps and is told, it does not collide
 }
 
 // A ragdoll: aephysics's human, and a game object per bone. Standing,
@@ -357,6 +370,7 @@ attach(e: *Engine) -> *Physics {
     p.rigidbodies = list.new()
     p.ragdolls = list.new()
     p.characters = list.new()
+    p.touches = list.new()
     p.sub_steps = 4
     // AE3D_ANKLES=1: every ragdoll made here with feet of its own
     // (physics_set_ankles), as the muscles were tuned on; read once, here.
@@ -378,6 +392,8 @@ attach(e: *Engine) -> *Physics {
     p.behaviour = b as ptr
     if g_attached == null { g_attached = list.new() }
     list.add_raw(g_attached, p as ptr)
+    // A save keeps the bodies' motion with the objects (#507).
+    persist.provider(SAVE_PROVIDER, SAVE_WIDTH, save_bodies, load_bodies, p as ptr)
     return p
 }
 
@@ -504,6 +520,9 @@ on_fixed_update(state: ptr, e: *Engine, step: float) {
         }
         i = i + 1
     }
+    // The step's contacts told to the objects that hear them, every body
+    // where the step left it (#508).
+    tell_contacts(p)
 }
 
 // The frame's pose phase, after the clips: every ragdoll that draws its
@@ -553,6 +572,8 @@ physics_released(state: ptr) {
 
 physics_free(p: *Physics) {
     if p == null { return }
+    p.quiet = true
+    persist.provider_remove(p as ptr)
     e = p.engine as *Engine
     engine.engine_remove_on_free(e, p as ptr)
     // Out of the engine's list, the step is the physics's to free: the
@@ -598,6 +619,8 @@ physics_free(p: *Physics) {
     dynamics.destroy_world(p.world_id)
     list.free(p.rigidbodies)
     list.free(p.ragdolls)
+    sweep_touches(p, true)
+    list.free(p.touches)
     if g_attached != null {
         n = list.size(g_attached)
         i = 0
@@ -664,6 +687,7 @@ rigidbody_gone(state: ptr, o: *GameObject) {
 // other body's shape holds them, and its record.
 release_rigidbody(rb: *Rigidbody) {
     p = rb.physics as *Physics
+    let_go_touches(p, rb as ptr, null, false)
     if dynamics.body_is_valid(rb.body_id) { dynamics.destroy_body(rb.body_id) }
     n = list.size(p.rigidbodies)
     i = 0
@@ -677,6 +701,7 @@ release_rigidbody(rb: *Rigidbody) {
     while list.size(rb.colliders) > 0 {
         col = list.get_raw(rb.colliders, 0) as *Collider
         list.remove(rb.colliders, 0)
+        if col.trigger { p.triggers = p.triggers - 1 }
         release_source(p, col)
         heap.free(col)
     }
@@ -725,6 +750,9 @@ collider_remove(o: *GameObject, shape: ShapeId) -> bool {
     while i < list.size(rb.colliders) {
         col = list.get_raw(rb.colliders, i) as *Collider
         if col.shape.index1 == shape.index1 && col.shape.world0 == shape.world0 && col.shape.generation == shape.generation {
+            // Whoever touched it told it is gone, then the shape.
+            let_go_touches(rb.physics as *Physics, null, (&shape) as ptr, false)
+            if col.trigger { (rb.physics as *Physics).triggers = (rb.physics as *Physics).triggers - 1 }
             dynamics.destroy_shape(col.shape, true)
             list.remove(rb.colliders, i)
             release_source(rb.physics as *Physics, col)
@@ -748,6 +776,11 @@ keep_collider(rb: *Rigidbody, shape: ShapeId, h: @keep ptr, md: @keep ptr) -> Sh
     col.shape = shape
     col.hull = h
     col.mesh = md
+    if dynamics.shape_is_valid(shape) && dynamics.shape_is_sensor(shape) {
+        col.trigger = true
+        p = rb.physics as *Physics
+        p.triggers = p.triggers + 1
+    }
     list.add_raw(rb.colliders, col as ptr)
     return shape
 }
@@ -819,6 +852,439 @@ rigidbody_enable_hit_events(rb: *Rigidbody, flag: bool) {
 hit_event_count(p: *Physics) -> int { return physics_world.contact_hit_event_count(p.world_id) }
 hit_event(p: *Physics, index: int) -> ContactHitEvent { return physics_world.contact_hit_event(p.world_id, index) }
 
+// --- what touches what, told to the objects (#508) ---------------------------------------------------------------
+//
+// After each step the objects hear of their contacts, as Unity's
+// OnCollisionEnter, Stay and Exit and OnTriggerEnter, Stay and Exit (the
+// phases on behaviour.Component): entered the step two shapes begin to touch,
+// stayed every step after while they do, exited the step they stop or either
+// goes. A collision is two solid shapes touching; a trigger is a sensor
+// shape (a collider made with `trigger`) overlapping another body's convex
+// shape, or a character's capsule. Both sides are told, each with the other.
+//
+// The world raises a begin and an end per touching pair, nothing a step
+// between (aephysics's contact and sensor events; a character has no body,
+// so its capsule is put to the world's triggers by a query of its own). The
+// pairs are kept here only where a side hears of them -- an object with a
+// running component that has one of the phases -- so a pile of rubble no
+// script listens to costs the world's events and no more. A pair begun
+// before its object had a listener is not told of: what is told is what
+// began while it listened.
+//
+// Telling may change the world: a script destroys what it hit, takes a
+// collider off, switches a trigger's object off. A pair whose side goes is
+// marked and its survivor told it exited, and the marks are swept once the
+// telling is done, so nothing told is a freed body's.
+
+const TOUCH_SENSE = 64             // the triggers a character's capsule is put to at once
+
+// A pair of shapes touching, and the bodies (or the character) they are on.
+struct Touch {
+    a: ptr                         // *Rigidbody of shape_a, or of the trigger a character overlaps
+    b: ptr                         // *Rigidbody of shape_b, or null for a character
+    character: ptr                 // *CharacterController in a trigger, or null
+    shape_a: ShapeId
+    shape_b: ShapeId
+    contact: ContactId
+    trigger: bool
+    born: int                      // the step it began, which is told enter, not stay
+    seen: int                      // a character's: the last step its query found it
+    gone: bool
+}
+
+// The scratch a character's trigger query fills.
+struct TouchSense {
+    shapes: ptr                    // ShapeId[TOUCH_SENSE]
+    count: int
+}
+
+// No contact: a trigger's pair has none (its overlap is a sensor's, not a
+// contact), and index 0 names none, as a shape's null id does.
+no_contact() -> ContactId { return ContactId { index1: 0, world0: 0, generation: 0 } }
+
+same_shape(a: ShapeId, b: ShapeId) -> bool {
+    return a.index1 == b.index1 && a.world0 == b.world0 && a.generation == b.generation
+}
+
+// The rigidbody a shape of this world's colliders is on, or null for any
+// other (a ragdoll's bone, a vehicle's wheel, one already destroyed): every
+// collider's shape names its body (collider_def).
+body_of_shape(id: ShapeId) -> *Rigidbody {
+    if !dynamics.shape_is_valid(id) { return null }
+    return dynamics.shape_get_user_data(id) as *Rigidbody
+}
+
+closing(o: *GameObject) -> bool {
+    if o == null { return false }
+    return behaviour.scene_closing(behaviour.object_scene(o))
+}
+
+rb_object(rb: ptr) -> *GameObject {
+    if rb == null { return null }
+    return (rb as *Rigidbody).object as *GameObject
+}
+
+character_object(c: ptr) -> *GameObject {
+    if c == null { return null }
+    return (c as *CharacterController).object as *GameObject
+}
+
+// Where and how hard a pair touches now, as `side` (shape_a's, or shape_b's
+// when `from_b`) is told: the deepest point of the contact's manifolds, its
+// normal turned to point from the side's shape into the other's, the step's
+// normal impulse over every point, and the fastest closing speed at one.
+touch_collision(t: *Touch, from_b: bool, out: *Collision) {
+    out.point = core.vec3(0.0, 0.0, 0.0)
+    out.normal = core.vec3(0.0, 0.0, 0.0)
+    out.impulse = 0.0
+    out.speed = 0.0
+    data = dynamics.contact_get_data(t.contact)
+    if data.manifold_count <= 0 || data.manifolds == null { return }
+    // The manifold's normal points from the contact's shape a into its b; the
+    // contact's a is not always the pair's.
+    flip = from_b
+    if !same_shape(data.shape_id_a, t.shape_a) { flip = !flip }
+    body_a = dynamics.shape_get_body(data.shape_id_a)
+    body_b = dynamics.shape_get_body(data.shape_id_b)
+    centre_a = dynamics.body_get_world_center(body_a)
+    centre_b = dynamics.body_get_world_center(body_b)
+    deepest = 0.0
+    found = false
+    i = 0
+    while i < data.manifold_count {
+        m = (data.manifolds + i * sizeof(Manifold)) as *Manifold
+        k = 0
+        while k < m.point_count {
+            mp = dynamics.manifold_point_at(m, k)
+            // The whole step's push: normal_impulse is the last sub-step's alone.
+            out.impulse = out.impulse + (mp.total_normal_impulse as float)
+            closing = 0.0 - (mp.normal_velocity as float)
+            if closing > out.speed { out.speed = closing }
+            depth = mp.separation as float
+            if !found || depth < deepest {
+                deepest = depth
+                found = true
+                // Each anchor is its body's centre of mass to the point; the
+                // two agree to within the separation, and the middle is taken
+                // as the solver's hit events take it.
+                on_a = core.v3_add(centre_a, math.widen3(mp.anchor_a))
+                on_b = core.v3_add(centre_b, math.widen3(mp.anchor_b))
+                out.point = core.v3_mul(core.v3_add(on_a, on_b), 0.5)
+                out.normal = math.widen3(m.normal)
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    if flip { out.normal = core.v3_mul(out.normal, 0.0 - 1.0) }
+}
+
+// Both sides of a pair told one phase, each with the other; a side given as
+// `skip` (one being freed) is not.
+tell_touch(p: *Physics, t: *Touch, phase: int, skip: *GameObject) {
+    if p.quiet { return }
+    first = rb_object(t.a)
+    second = rb_object(t.b)
+    if t.character != null { second = character_object(t.character) }
+    // A scene freeing every object at once tells none of them: each pair
+    // goes with the first of its two.
+    if closing(first) || closing(second) { return }
+    if t.trigger {
+        if first != skip { behaviour.object_trigger(first, phase, second) }
+        if second != skip { behaviour.object_trigger(second, phase, first) }
+        return
+    }
+    hit = Collision { other: second, point: core.vec3(0.0, 0.0, 0.0), normal: core.vec3(0.0, 0.0, 0.0), impulse: 0.0, speed: 0.0 }
+    if phase != behaviour.CONTACT_EXIT { touch_collision(t, false, &hit) }
+    if first != skip { behaviour.object_collide(first, phase, &hit) }
+    hit.other = first
+    if phase != behaviour.CONTACT_EXIT { touch_collision(t, true, &hit) }
+    if second != skip { behaviour.object_collide(second, phase, &hit) }
+}
+
+// The pair kept and told it began, when either side hears of its kind.
+begin_touch(p: *Physics, a: *Rigidbody, b: *Rigidbody, character: @keep ptr, shape_a: ShapeId, shape_b: ShapeId, contact: ContactId, trigger: bool) {
+    first = rb_object(a as ptr)
+    second = rb_object(b as ptr)
+    if character != null { second = character_object(character) }
+    if first == null || second == null { return }
+    hears = false
+    if trigger {
+        hears = behaviour.object_hears_triggers(first) || behaviour.object_hears_triggers(second)
+    } else {
+        hears = behaviour.object_hears_collisions(first) || behaviour.object_hears_collisions(second)
+    }
+    if !hears { return }
+    t = heap.new(Touch)
+    t.a = a as ptr
+    t.b = b as ptr
+    t.character = character
+    t.shape_a = shape_a
+    t.shape_b = shape_b
+    t.contact = contact
+    t.trigger = trigger
+    t.born = p.step_count
+    t.seen = p.step_count
+    list.add_raw(p.touches, t as ptr)
+    tell_touch(p, t, behaviour.CONTACT_ENTER, null)
+}
+
+// The kept pair of these two shapes, either way round, or null.
+find_touch(p: *Physics, x: ShapeId, y: ShapeId, trigger: bool) -> *Touch {
+    n = list.size(p.touches)
+    i = 0
+    while i < n {
+        t = list.get_raw(p.touches, i) as *Touch
+        if !t.gone && t.trigger == trigger && t.character == null {
+            if (same_shape(t.shape_a, x) && same_shape(t.shape_b, y)) || (same_shape(t.shape_a, y) && same_shape(t.shape_b, x)) { return t }
+        }
+        i = i + 1
+    }
+    return null
+}
+
+end_touch(p: *Physics, t: *Touch, skip: *GameObject) {
+    if t == null || t.gone { return }
+    t.gone = true
+    tell_touch(p, t, behaviour.CONTACT_EXIT, skip)
+}
+
+// Every pair a body (`rb`), a shape (`shape`, a *ShapeId) or a character is
+// part of let go, its other side told it exited: what touched it is told
+// as the body goes, as it would be had they come apart. The side going is
+// not told; it is being freed.
+let_go_touches(p: *Physics, rb: ptr, shape: ptr, character: bool) {
+    if p == null || p.touches == null { return }
+    n = list.size(p.touches)
+    i = 0
+    while i < n {
+        t = list.get_raw(p.touches, i) as *Touch
+        if !t.gone {
+            skip = null as *GameObject
+            if character && t.character == rb {
+                skip = character_object(t.character)
+                end_touch(p, t, skip)
+            } else if !character && rb != null && (t.a == rb || t.b == rb) {
+                skip = rb_object(rb)
+                end_touch(p, t, skip)
+            } else if shape != null {
+                id = (shape as ShapeId[])[0]
+                if same_shape(t.shape_a, id) || (t.character == null && same_shape(t.shape_b, id)) { end_touch(p, t, null) }
+            }
+        }
+        i = i + 1
+    }
+    if !p.telling { sweep_touches(p, false) }
+}
+
+// The pairs marked gone freed (every pair, when `all`).
+sweep_touches(p: *Physics, all: bool) {
+    i = list.size(p.touches) - 1
+    while i >= 0 {
+        t = list.get_raw(p.touches, i) as *Touch
+        if all || t.gone {
+            list.remove(p.touches, i)
+            heap.free(t)
+        }
+        i = i - 1
+    }
+}
+
+touch_sense_visitor(id: ShapeId, context: ptr) -> bool {
+    sense = context as *TouchSense
+    if dynamics.shape_is_sensor(id) && body_of_shape(id) != null && sense.count < TOUCH_SENSE {
+        ids = sense.shapes as ShapeId[]
+        ids[sense.count] = id
+        sense.count = sense.count + 1
+    }
+    return true
+}
+
+// Each character's capsule put to the world's triggers: a trigger it is in
+// now and was not entered, one it was in and is not exited.
+sense_characters(p: *Physics) {
+    if p.triggers <= 0 { return }
+    block = calloc(TOUCH_SENSE, sizeof(ShapeId))
+    points_block = calloc(2, sizeof(Vec3))
+    sense = TouchSense { shapes: block, count: 0 }
+    ids = block as ShapeId[]
+    points = points_block as Vec3[]
+    k = 0
+    while k < list.size(p.characters) {
+        ch = list.get_raw(p.characters, k) as *CharacterController
+        o = ch.object as *GameObject
+        if o != null {
+            capsule = character_capsule(ch)
+            points[0] = capsule.center1
+            points[1] = capsule.center2
+            sense.count = 0
+            physics_world.overlap_shape(p.world_id, character_feet(ch), distance.shape_proxy(points_block, 2, capsule.radius),
+                                        shape.default_query_filter(), touch_sense_visitor, (&sense) as ptr)
+            j = 0
+            while j < sense.count {
+                t = character_touch(p, ch as ptr, ids[j])
+                if t != null {
+                    t.seen = p.step_count
+                } else {
+                    begin_touch(p, body_of_shape(ids[j]), null, ch as ptr, ids[j], dynamics.null_shape_id(), no_contact(), true)
+                }
+                j = j + 1
+            }
+        }
+        k = k + 1
+    }
+    // A character's pair its query did not find this step has ended.
+    n = list.size(p.touches)
+    i = 0
+    while i < n {
+        t = list.get_raw(p.touches, i) as *Touch
+        if !t.gone && t.character != null && t.seen != p.step_count { end_touch(p, t, null) }
+        i = i + 1
+    }
+    free(block)
+    free(points_block)
+}
+
+character_touch(p: *Physics, ch: ptr, trigger: ShapeId) -> *Touch {
+    n = list.size(p.touches)
+    i = 0
+    while i < n {
+        t = list.get_raw(p.touches, i) as *Touch
+        if !t.gone && t.character == ch && same_shape(t.shape_a, trigger) { return t }
+        i = i + 1
+    }
+    return null
+}
+
+// The step's contacts told: the ends first (a pair that ends and begins
+// again in one step is told it exited and entered, in that order), then the
+// beginnings, the triggers', the characters', and every pair that goes on.
+tell_contacts(p: *Physics) {
+    w = p.world_id
+    ends = physics_world.contact_end_event_count(w)
+    begins = physics_world.contact_begin_event_count(w)
+    sensor_ends = physics_world.sensor_end_event_count(w)
+    sensor_begins = physics_world.sensor_begin_event_count(w)
+    if ends + begins + sensor_ends + sensor_begins == 0 && list.size(p.touches) == 0 && (p.triggers == 0 || list.size(p.characters) == 0) { return }
+    p.telling = true
+    i = 0
+    while i < ends {
+        ended = physics_world.contact_end_event(w, i)
+        end_touch(p, find_touch(p, ended.shape_id_a, ended.shape_id_b, false), null)
+        i = i + 1
+    }
+    i = 0
+    while i < begins {
+        began = physics_world.contact_begin_event(w, i)
+        a = body_of_shape(began.shape_id_a)
+        b = body_of_shape(began.shape_id_b)
+        if a != null && b != null { begin_touch(p, a, b, null, began.shape_id_a, began.shape_id_b, began.contact_id, false) }
+        i = i + 1
+    }
+    i = 0
+    while i < sensor_ends {
+        left = physics_world.sensor_end_event(w, i)
+        end_touch(p, find_touch(p, left.sensor_shape_id, left.visitor_shape_id, true), null)
+        i = i + 1
+    }
+    i = 0
+    while i < sensor_begins {
+        came = physics_world.sensor_begin_event(w, i)
+        a = body_of_shape(came.sensor_shape_id)
+        b = body_of_shape(came.visitor_shape_id)
+        // Two bodies that never move are never told of each other: a trigger
+        // laid on the ground does not enter the ground (as in Unity, one side
+        // moves).
+        if a != null && b != null && (a.kind != STATIC || b.kind != STATIC) { begin_touch(p, a, b, null, came.sensor_shape_id, came.visitor_shape_id, no_contact(), true) }
+        i = i + 1
+    }
+    sense_characters(p)
+    // What touched before this step and still does.
+    i = 0
+    while i < list.size(p.touches) {
+        t = list.get_raw(p.touches, i) as *Touch
+        if !t.gone && t.born != p.step_count { tell_touch(p, t, behaviour.CONTACT_STAY, null) }
+        i = i + 1
+    }
+    p.telling = false
+    sweep_touches(p, false)
+}
+
+// --- what a save keeps of the bodies (#507) ----------------------------------------------------------------------
+//
+// A save (ae3d.persist) holds each object's transform; what the bodies keep
+// beside it -- how fast each moves and turns, whether it sleeps -- is saved
+// here, a record a moving body (SAVE_WIDTH numbers, appended on the frame to
+// the save's capture). Read back over a loaded scene, each body is put where
+// its object now is (the save's transform: a dynamic body otherwise wrote
+// where the scene had it back over the object at the next step) and given
+// its motion. Static bodies never move and are as the scene made them.
+//
+// Numbers are written whole (std.json writes a double to the bit), so two
+// loads of one save step the same, on any machine. They do not step as the
+// world the save was taken from went on: the solver carries each contact's
+// impulses from step to step, which no save holds, and a world loaded is a
+// world whose contacts begin.
+
+const SAVE_PROVIDER = "physics"
+
+// A record a moving body: its object's id, its velocity, its spin, and 1
+// awake or 0 asleep.
+const SAVE_WIDTH = 8
+
+save_bodies(context: ptr, s: *Scene, cap: *Capture) {
+    p = context as *Physics
+    // Another world's scene is another world's to save.
+    if engine.engine_scene(p.engine as *Engine) != s { return }
+    i = 0
+    while i < list.size(p.rigidbodies) {
+        rb = list.get_raw(p.rigidbodies, i) as *Rigidbody
+        o = rb.object as *GameObject
+        if rb.kind != STATIC && o != null && behaviour.object_scene(o) == s && dynamics.body_is_valid(rb.body_id) {
+            v = dynamics.body_get_linear_velocity(rb.body_id)
+            w = dynamics.body_get_angular_velocity(rb.body_id)
+            component.put_float(cap, behaviour.object_id(o) as float)
+            component.put_float(cap, v.x)
+            component.put_float(cap, v.y)
+            component.put_float(cap, v.z)
+            component.put_float(cap, w.x)
+            component.put_float(cap, w.y)
+            component.put_float(cap, w.z)
+            awake = 0.0
+            if dynamics.body_is_awake(rb.body_id) { awake = 1.0 }
+            component.put_float(cap, awake)
+        }
+        i = i + 1
+    }
+}
+
+load_bodies(context: ptr, s: *Scene, entry: ptr) -> int {
+    p = context as *Physics
+    if engine.engine_scene(p.engine as *Engine) != s { return 0 }
+    bodies = json.object_get_raw(entry, "records")
+    if bodies == null { return 0 }
+    missing = 0
+    i = 0
+    while i < json.array_size(bodies) {
+        record = json.array_get_raw(bodies, i)
+        o = behaviour.scene_find_id(s, json.get_number(json.array_get_raw(record, 0)) as int)
+        rb = null as *Rigidbody
+        if o != null { rb = rigidbody_of(o) }
+        if rb == null || rb.physics != p as ptr {
+            missing = missing + 1
+        } else {
+            dynamics.body_set_transform(rb.body_id, behaviour.object_world_position(o), behaviour.object_world_rotation(o))
+            dynamics.body_set_linear_velocity(rb.body_id, core.vec3(json.get_number(json.array_get_raw(record, 1)),
+                json.get_number(json.array_get_raw(record, 2)), json.get_number(json.array_get_raw(record, 3))))
+            dynamics.body_set_angular_velocity(rb.body_id, core.vec3(json.get_number(json.array_get_raw(record, 4)),
+                json.get_number(json.array_get_raw(record, 5)), json.get_number(json.array_get_raw(record, 6))))
+            dynamics.body_set_awake(rb.body_id, json.get_number(json.array_get_raw(record, 7)) != 0.0)
+        }
+        i = i + 1
+    }
+    return missing
+}
+
 // The body a collider goes on: the object's, or a static one made for
 // it, as a Unity collider without a Rigidbody is static.
 body_for_collider(o: *GameObject) -> *Rigidbody {
@@ -833,6 +1299,20 @@ shape_def(m: SurfaceMaterial, density: float) -> ShapeDef {
     sdef = dynamics.default_shape_def()
     sdef.base_material = m
     sdef.density = density
+    return sdef
+}
+
+// A collider's definition: a shape_def that names its body (a contact on the
+// shape is a contact on the body's object, read back without a search) and
+// raises the contact and sensor events the objects are told of (#508). The
+// events cost a record a pair as a touch begins and ends, not a step; a
+// trigger is a sensor, which collides with nothing.
+collider_def(rb: *Rigidbody, m: SurfaceMaterial, density: float, trigger: bool) -> ShapeDef {
+    sdef = shape_def(m, density)
+    sdef.user_data = rb as ptr
+    sdef.enable_contact_events = true
+    sdef.enable_sensor_events = true
+    sdef.is_sensor = trigger
     return sdef
 }
 
@@ -852,49 +1332,53 @@ collider_name(kind: int) -> string {
     return ""
 }
 
-// The first collider's kind and material, kept on the body for the scene file.
-note_collider(rb: *Rigidbody, kind: int, m: SurfaceMaterial, density: float) {
+// The first collider's kind and material, and whether it is a trigger, kept
+// on the body for the scene file.
+note_collider(rb: *Rigidbody, kind: int, m: SurfaceMaterial, density: float, trigger: bool = false) {
     if rb.collider != 0 { return }
     rb.collider = kind
+    rb.trigger = trigger
     rb.friction = m.friction
     rb.restitution = m.restitution
     rb.density = density
 }
 
-// A box of these half extents about the object's origin.
-box_collider(o: *GameObject, half_extents: Vec3, m: SurfaceMaterial, density: float = 1.0) -> ShapeId {
+// A box of these half extents about the object's origin. Every convex
+// collider can be a trigger: a sensor that collides with nothing and tells
+// the objects it overlaps (on_trigger_enter, stay, exit; #508).
+box_collider(o: *GameObject, half_extents: Vec3, m: SurfaceMaterial, density: float = 1.0, trigger: bool = false) -> ShapeId {
     rb = body_for_collider(o)
     if rb == null { return dynamics.null_shape_id() }
     box = hull.make_box_hull(half_extents.x, half_extents.y, half_extents.z)
-    sdef = shape_def(m, density)
-    note_collider(rb, COLLIDER_BOX, m, density)
+    sdef = collider_def(rb, m, density, trigger)
+    note_collider(rb, COLLIDER_BOX, m, density, trigger)
     return keep_collider(rb, dynamics.create_hull_shape(rb.body_id, &sdef, box), box as ptr, null)
 }
 
-sphere_collider(o: *GameObject, radius: float, m: SurfaceMaterial, density: float = 1.0) -> ShapeId {
+sphere_collider(o: *GameObject, radius: float, m: SurfaceMaterial, density: float = 1.0, trigger: bool = false) -> ShapeId {
     rb = body_for_collider(o)
     if rb == null { return dynamics.null_shape_id() }
-    sdef = shape_def(m, density)
-    note_collider(rb, COLLIDER_SPHERE, m, density)
+    sdef = collider_def(rb, m, density, trigger)
+    note_collider(rb, COLLIDER_SPHERE, m, density, trigger)
     return keep_collider(rb, dynamics.create_sphere_shape(rb.body_id, &sdef, manifold.sphere(math.vec3_zero(), radius)), null, null)
 }
 
 // A capsule between two centres in the object's frame.
-capsule_collider(o: *GameObject, center1: Vec3, center2: Vec3, radius: float, m: SurfaceMaterial, density: float = 1.0) -> ShapeId {
+capsule_collider(o: *GameObject, center1: Vec3, center2: Vec3, radius: float, m: SurfaceMaterial, density: float = 1.0, trigger: bool = false) -> ShapeId {
     rb = body_for_collider(o)
     if rb == null { return dynamics.null_shape_id() }
-    sdef = shape_def(m, density)
-    note_collider(rb, COLLIDER_CAPSULE, m, density)
+    sdef = collider_def(rb, m, density, trigger)
+    note_collider(rb, COLLIDER_CAPSULE, m, density, trigger)
     return keep_collider(rb, dynamics.create_capsule_shape(rb.body_id, &sdef, manifold.capsule(center1, center2, radius)), null, null)
 }
 
 // A convex hull in the object's frame; the hull is the world's from
 // here on, freed when the last collider made from it goes.
-hull_collider(o: *GameObject, h: *HullData, m: SurfaceMaterial, density: float = 1.0) -> ShapeId {
+hull_collider(o: *GameObject, h: *HullData, m: SurfaceMaterial, density: float = 1.0, trigger: bool = false) -> ShapeId {
     rb = body_for_collider(o)
     if rb == null || h == null { return dynamics.null_shape_id() }
-    sdef = shape_def(m, density)
-    note_collider(rb, COLLIDER_HULL, m, density)
+    sdef = collider_def(rb, m, density, trigger)
+    note_collider(rb, COLLIDER_HULL, m, density, trigger)
     return keep_collider(rb, dynamics.create_hull_shape(rb.body_id, &sdef, h), h as ptr, null)
 }
 
@@ -904,8 +1388,7 @@ hull_collider(o: *GameObject, h: *HullData, m: SurfaceMaterial, density: float =
 mesh_collider(o: *GameObject, md: *MeshData, m: SurfaceMaterial, scale: Vec3 = math.vec3_one()) -> ShapeId {
     rb = body_for_collider(o)
     if rb == null || md == null { return dynamics.null_shape_id() }
-    sdef = dynamics.default_shape_def()
-    sdef.base_material = m
+    sdef = collider_def(rb, m, dynamics.default_shape_def().density, false)
     note_collider(rb, COLLIDER_MESH, m, 0.0)
     return keep_collider(rb, dynamics.create_mesh_shape(rb.body_id, &sdef, md, scale), null, md as ptr)
 }
@@ -923,7 +1406,9 @@ spec_of(o: *GameObject) -> *PhysicsSpec {
     body = "dynamic"
     if rb.kind == KINEMATIC { body = "kinematic" }
     if rb.kind == STATIC { body = "static" }
-    return scene.physics_spec_new(body, collider_name(rb.collider), rb.friction, rb.restitution, rb.density)
+    spec = scene.physics_spec_new(body, collider_name(rb.collider), rb.friction, rb.restitution, rb.density)
+    spec.trigger = rb.trigger
+    return spec
 }
 
 // A body and its collider on an object from the scene file's record: the
@@ -950,19 +1435,19 @@ apply_spec(o: *GameObject, spec: *PhysicsSpec) -> *Rigidbody {
         radius = half.x
         if half.y > radius { radius = half.y }
         if half.z > radius { radius = half.z }
-        sphere_collider(o, radius, m, spec.density)
+        sphere_collider(o, radius, m, spec.density, spec.trigger)
     } else if spec.collider == "capsule" {
         radius = half.x
         if half.z > radius { radius = half.z }
         reach = half.y - radius
         if reach < 0.0 { reach = 0.0 }
-        capsule_collider(o, math.vec3(0.0, 0.0 - reach, 0.0), math.vec3(0.0, reach, 0.0), radius, m, spec.density)
+        capsule_collider(o, math.vec3(0.0, 0.0 - reach, 0.0), math.vec3(0.0, reach, 0.0), radius, m, spec.density, spec.trigger)
     } else if spec.collider == "hull" {
-        convex_collider_of_model(o, m, spec.density)
+        convex_collider_of_model(o, m, spec.density, spec.trigger)
     } else if spec.collider == "mesh" {
         mesh_collider_of_model(o, m)
     } else {
-        box_collider(o, half, m, spec.density)
+        box_collider(o, half, m, spec.density, spec.trigger)
     }
     return rb
 }
@@ -1117,10 +1602,10 @@ mesh_of_mesh(drawn: ptr) -> *MeshData {
 
 // The object's own model as its collider: convex (a prop, dynamic or
 // not) from the hull of its vertices at the model's scale.
-convex_collider_of_model(o: *GameObject, m: SurfaceMaterial, density: float = 1.0) -> ShapeId {
+convex_collider_of_model(o: *GameObject, m: SurfaceMaterial, density: float = 1.0, trigger: bool = false) -> ShapeId {
     model = behaviour.object_model(o)
     if model == null || model.mesh == null { return dynamics.null_shape_id() }
-    return hull_collider(o, hull_of_mesh(model.mesh, model.scale), m, density)
+    return hull_collider(o, hull_of_mesh(model.mesh, model.scale), m, density, trigger)
 }
 
 // The object's own model as its collider: its triangles, for the static
@@ -5867,6 +6352,8 @@ struct ClearProbe {
 }
 
 clear_visitor(shape_id: ShapeId, results: PlaneResult[], count: int, context: ptr) -> bool {
+    // A trigger takes up no room.
+    if dynamics.shape_is_sensor(shape_id) { return true }
     probe = context as *ClearProbe
     i = 0
     while i < count {
@@ -7567,6 +8054,8 @@ character_free(c: *CharacterController) {
     if c == null { return }
     p = c.physics as *Physics
     if p != null {
+        // The triggers it stood in told it left.
+        let_go_touches(p, c as ptr, null, true)
         i = 0
         while i < list.size(p.characters) {
             if list.get_raw(p.characters, i) == c as ptr { list.remove(p.characters, i); break }
@@ -7684,6 +8173,8 @@ character_capsule(c: *CharacterController) -> Capsule {
 // no sideways share to lay flat, is held off by the ground and taken as no
 // plane.
 character_plane_visitor(shape_id: ShapeId, results: PlaneResult[], count: int, context: ptr) -> bool {
+    // A trigger is overlapped and told of, never walked into (#508).
+    if dynamics.shape_is_sensor(shape_id) { return true }
     c = context as *CharacterController
     if c.world_only && dynamics.body_get_type(dynamics.shape_get_body(shape_id)) != dynamics.BODY_STATIC { return true }
     if own_body(c, shape_id) || driven_figure(c, shape_id) { return true }
@@ -7758,6 +8249,7 @@ already_pushed(c: *CharacterController, body: BodyId) -> bool {
 }
 
 character_cast_filter(shape_id: ShapeId, context: ptr) -> bool {
+    if dynamics.shape_is_sensor(shape_id) { return false }
     if context == null { return true }
     c = context as *CharacterController
     return !own_body(c, shape_id) && !driven_figure(c, shape_id)

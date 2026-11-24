@@ -354,7 +354,8 @@ overcast the rows above hold. While there is weather the sky is the
 weather's, so the clouds and overcast rows wait until it clears; the light
 rows still act, and the weather dims from whatever they set. The kind is
 one undo step, the rows undo like any row, and the scene file carries all
-of it (`weather`: the kind by name, the strength, the wind). Underneath,
+of it as the scene's Weather component (the kind by name, the intensity,
+the wind's heading and speed; #895). Underneath,
 the editor holds an `engine.engine_over` -- an Engine wrapped around the
 viewport's renderer, camera and light, with no window or loop of its own,
 stepped by the frame with `engine_update` -- so what is written for the

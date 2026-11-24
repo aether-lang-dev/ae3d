@@ -23,6 +23,8 @@
 // collide and hand back the wrong mesh -- and counts the models drawing
 // each. A mesh is freed when the last of them lets go of it.
 
+import std.list
+import std.heap
 import contrib.vulkan.vk
 import ae3d.vkhost
 import ae3d.vkdevice
@@ -35,7 +37,7 @@ exports (
     mesh_upload, mesh_upload_as, mesh_upload_shared, mesh_free, mesh_shared, blas_address, uploads, shares, live, slots,
     in_range, drawable, vertex_buffer, index_buffer, index_count, vertex_count, skin_buffer, skinned, points,
     vertex_address, index_address, STRIDE,
-    upload_instances, update_instances, clear
+    upload_instances, update_instances, clear, frame_begun, retired, ring_size
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -412,7 +414,12 @@ mesh_free(handle: int) {
     // renderer as the model goes (vkrays.skin_forget).
     vkmorph.forget(handle)
     release_slot(handle)
-    vkrays.blas_free(structure)
+    // The structure is destroyed now, not retired: the frames in flight may
+    // trace it, so they are waited for. Only a device that traces has one.
+    if structure.handle != null {
+        vk.vkDeviceWaitIdle(vkhost.device())
+        vkrays.blas_free(structure)
+    }
 }
 
 // How many vertices the mesh under `handle` has, 0 for none.
@@ -485,6 +492,83 @@ struct VKMeshSlot {
 }
 
 const FRAMES = 2
+
+// --- buffers no frame will draw from again ---------------------------------------------------------------------
+//
+// A buffer let go of while frames are in flight may still be read by them.
+// It used to be destroyed behind vkDeviceWaitIdle, the whole device drained
+// at each: a stream that crept upward (an emitter one particle fuller) did
+// that every frame it grew, and a game of two hundred small emitters spent
+// two fifths of its frame there. Now it waits here instead, stamped with how
+// many frames had begun, and goes once FRAMES more have: the start of a frame
+// waits for the fence of the frame FRAMES before it, so by then every frame
+// that could have bound it has finished.
+struct Retired {
+    buffer: ptr
+    memory: ptr
+    mapped: bool                   // its memory mapped, unmapped as it goes
+    after: long                    // destroyed once this many frames have begun
+}
+
+var g_retired: ptr = null          // list of *Retired, oldest first
+var g_frames_begun: long = 0
+
+retire(buffer: @keep ptr, memory: @keep ptr, mapped: bool) {
+    if buffer == null && memory == null { return }
+    if g_retired == null { g_retired = list.new() }
+    r = heap.new(Retired)
+    r.buffer = buffer
+    r.memory = memory
+    r.mapped = mapped
+    r.after = g_frames_begun + FRAMES
+    list.add_raw(g_retired, r as ptr)
+}
+
+// Buffers waiting to go: a test's count.
+retired() -> int {
+    if g_retired == null { return 0 }
+    return list.size(g_retired)
+}
+
+// A frame has begun, its slot's fence waited for: what the frames before it
+// let go of is destroyed once none can still be reading it.
+frame_begun() {
+    g_frames_begun = g_frames_begun + 1
+    destroy_retired(false)
+}
+
+// The retired buffers whose frames are done; every one with `all` (the
+// device idle).
+destroy_retired(all: bool) {
+    if g_retired == null { return }
+    d = vkhost.device()
+    kept = 0
+    count = list.size(g_retired)
+    i = 0
+    while i < count {
+        r = list.get_raw(g_retired, i) as *Retired
+        if all || r.after <= g_frames_begun {
+            if r.mapped { vk.vkUnmapMemory(d, r.memory) }
+            if r.buffer != null { vk.vkDestroyBuffer(d, r.buffer, null) }
+            if r.memory != null { vk.vkFreeMemory(d, r.memory, null) }
+            heap.free(r)
+        } else {
+            // Oldest first, so what is kept stays in order at the front.
+            list.set(g_retired, kept, r as ptr)
+            kept = kept + 1
+        }
+        i = i + 1
+    }
+    while list.size(g_retired) > kept { list.remove(g_retired, list.size(g_retired) - 1) }
+}
+
+// How many bytes a stream's ring holds a frame (0 for none): a test's.
+ring_size(handle: int) -> int {
+    if !in_range(handle) { return 0 }
+    s = slot_at(handle)
+    if !s.streaming { return 0 }
+    return s.ring_size
+}
 
 var g_slots: ptr = null            // VKMeshSlot[g_slot_capacity]
 var g_slot_capacity = 0
@@ -571,6 +655,25 @@ slots() -> int {
     return live_now
 }
 
+// The ring's buffers retired, for the frames in flight that may draw them.
+retire_ring(s: *VKMeshSlot) {
+    if s.ring != null {
+        i = 0
+        while i < FRAMES {
+            retire((s.ring as ptr[])[i], (s.ring_memory as ptr[])[i], (s.ring_mapped as ptr[])[i] != null)
+            i = i + 1
+        }
+        free(s.ring)
+        free(s.ring_memory)
+        free(s.ring_mapped)
+    }
+    s.ring = null
+    s.ring_memory = null
+    s.ring_mapped = null
+    s.ring_size = 0
+    s.streaming = false
+}
+
 free_ring(s: *VKMeshSlot) {
     d = vkhost.device()
     if s.ring != null {
@@ -617,12 +720,22 @@ free_slot_buffers(s: *VKMeshSlot) {
 started() -> bool { return vkhost.command_pool() != null }
 
 // The slot under `handle` freed: the batch run first (it may name its
-// buffers), the device waited for (the frames in flight may draw them).
+// buffers), and the buffers retired, not destroyed: the frames in flight may
+// draw them. The slot is free for another mesh at once.
 release_slot(handle: int) {
     if !started() || !drawable(handle) { return }
     vkhost.flush()
-    vk.vkDeviceWaitIdle(vkhost.device())
-    free_slot_buffers(slot_at(handle))
+    s = slot_at(handle)
+    if s.streaming {
+        // The bound buffer is one of the ring's.
+        s.vertex_buffer = null
+        s.vertex_memory = null
+        retire_ring(s)
+    }
+    retire(s.vertex_buffer, s.vertex_memory, false)
+    retire(s.index_buffer, s.index_memory, false)
+    retire(s.skin_buffer, s.skin_memory, false)
+    memset(s as ptr, 0, sizeof(VKMeshSlot) as long)
 }
 
 // Every slot freed and the table with it, the device idle: at shutdown;
@@ -638,6 +751,7 @@ clear() {
     if g_slots != null { free(g_slots) }
     g_slots = null
     g_slot_capacity = 0
+    destroy_retired(true)
     forget(true)
 }
 
@@ -652,6 +766,7 @@ struct InstancePack {
     colours: ptr
     phases: ptr
     has_colours: bool
+    order: ptr                     // int[]: the copy at each place, or null for the stream's own order
 }
 
 pack_block(begin: int, end: int, worker: int, context: ptr) {
@@ -659,12 +774,16 @@ pack_block(begin: int, end: int, worker: int, context: ptr) {
     out = job.packed as f32[]
     ph = job.phases as f32[]
     coloured = job.has_colours && job.colours != null
+    order = job.order as int[]
     i = begin
     while i < end {
         o = i * 20
-        memcpy(job.packed + o * 4, job.matrices + i * 64, 64 as long)
+        // The copy that goes at this place: its own, or its cluster's order's.
+        src = i
+        if job.order != null { src = order[i] }
+        memcpy(job.packed + o * 4, job.matrices + src * 64, 64 as long)
         if coloured {
-            memcpy(job.packed + (o + 16) * 4, job.colours + i * 12, 12 as long)
+            memcpy(job.packed + (o + 16) * 4, job.colours + src * 12, 12 as long)
         } else {
             out[o + 16] = 1.0
             out[o + 17] = 1.0
@@ -673,7 +792,7 @@ pack_block(begin: int, end: int, worker: int, context: ptr) {
         // The phase rides in the float after the colour; the crowd vertex
         // shader reads it, nothing else does.
         out[o + 19] = 0.0
-        if job.phases != null { out[o + 19] = ph[i] }
+        if job.phases != null { out[o + 19] = ph[src] }
         i = i + 1
     }
 }
@@ -683,7 +802,10 @@ pack_block(begin: int, end: int, worker: int, context: ptr) {
 pack_into(packed: @keep ptr, instances: ptr, count: int) {
     job = InstancePack { packed: packed, matrices: geometry.inst_matrix_data(instances),
                          colours: geometry.inst_color_data(instances), phases: null,
-                         has_colours: geometry.inst_has_colors(instances) == 1 }
+                         has_colours: geometry.inst_has_colors(instances) == 1, order: null }
+    // A still stream in clusters is sent in their order (geometry.inst_cluster).
+    clusters = geometry.inst_clusters(instances)
+    if clusters != null && clusters.count == count { job.order = clusters.order }
     if geometry.inst_has_phases(instances) == 1 { job.phases = geometry.inst_phase_data(instances) }
     jobs.parallel_for(pack_block, count, 8192, (&job) as ptr)
 }
@@ -732,18 +854,20 @@ upload_instances(instances: ptr) -> int {
 ensure_ring(s: *VKMeshSlot, bytes: int) -> bool {
     if s.streaming && s.ring_size >= bytes { return true }
     d = vkhost.device()
-    vk.vkDeviceWaitIdle(d)
+    // Grown, at least doubled: a stream that creeps upward regrows a handful
+    // of times in its life rather than at every new most.
+    size = bytes
+    if s.streaming && s.ring_size * 2 > size { size = s.ring_size * 2 }
     if s.streaming {
         // Regrowing: the bound buffer is one of the ring's, which the ring
-        // frees. Destroying it here as well destroyed it twice, and the
-        // driver fell over on the second when a stream grew.
+        // retires. Retiring it here as well destroyed it twice.
         s.vertex_buffer = null
         s.vertex_memory = null
     }
-    free_ring(s)
-    // The device-local buffer the first upload made is not read again.
-    if s.vertex_buffer != null { vk.vkDestroyBuffer(d, s.vertex_buffer, null) }
-    if s.vertex_memory != null { vk.vkFreeMemory(d, s.vertex_memory, null) }
+    // The old ring, and the device-local buffer the first upload made, are
+    // not written again; the frames in flight may still draw them.
+    retire_ring(s)
+    retire(s.vertex_buffer, s.vertex_memory, false)
     s.vertex_buffer = null
     s.vertex_memory = null
     s.ring = calloc(FRAMES, 8)
@@ -753,7 +877,7 @@ ensure_ring(s: *VKMeshSlot, bytes: int) -> bool {
     cell = calloc(1, 8)
     i = 0
     while i < FRAMES {
-        made = vkhost.buffer_of(bytes, instance_usage(), host)
+        made = vkhost.buffer_of(size, instance_usage(), host)
         (s.ring as ptr[])[i] = made.buffer
         (s.ring_memory as ptr[])[i] = made.memory
         if made.buffer == null {
@@ -761,7 +885,7 @@ ensure_ring(s: *VKMeshSlot, bytes: int) -> bool {
             free_ring(s)
             return false
         }
-        if vk.vkMapMemory(d, made.memory, 0, bytes, 0, cell) != vk.SUCCESS {
+        if vk.vkMapMemory(d, made.memory, 0, size, 0, cell) != vk.SUCCESS {
             free(cell)
             free_ring(s)
             vkdevice.fail("vkMapMemory failed for an instance ring")
@@ -771,7 +895,7 @@ ensure_ring(s: *VKMeshSlot, bytes: int) -> bool {
         i = i + 1
     }
     free(cell)
-    s.ring_size = bytes
+    s.ring_size = size
     s.streaming = true
     return true
 }

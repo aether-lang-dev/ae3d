@@ -182,11 +182,18 @@ is asked for later is drawn over what was asked for earlier.
 
 ### A frame
 
-The engine makes one overlay, hands it to its backend
-(`Backend.set_overlay`), and clears it after each frame is drawn, so what
-`update`, `pose` and a script's `late_update` ask for is that frame's.
-An engine behaviour's `late_update` runs after the draw, and what it asks
-for is the next frame's. `engine_over` -- the editor's engine over its own
+The engine makes one overlay and hands it to its backend
+(`Backend.set_overlay`). At the start of each frame it lets the last frame's
+drawing go, so what `update`, `pose` and a script's `late_update` ask for is
+that frame's. An engine behaviour's `late_update` runs after the draw, and
+what it asks for is the next frame's.
+
+A held frame (`frame.pause`, `AE3D_HOLD`) runs no update, so it keeps
+what its scripts drew last. The menus and late updates drawn over it go
+each frame, so nothing piles up. Before 2026-11-23 the overlay was cleared
+after every draw, so a held frame showed no HUD, and the agent's
+`snapshot` of a paused scene had none (`test_hud_hold`). `hud.mark`,
+`hud.back_to` and `hud.drop_before` are the keeping and the letting go. `engine_over` -- the editor's engine over its own
 renderer -- makes one too. It is cleared at the start of each
 `engine_update`, so the owner's renders between two updates draw what the
 first asked for. It reaches the renderer once the owner calls
@@ -347,6 +354,28 @@ the same, so a menu written for the game works unchanged in its viewport.
   Escape that closes the pause menu does not reopen it. The click that
   pressed Resume fires no shot.
 
+- **Themes.** A game's menus match its HUD: `menu.set_theme(stack, t)`
+  draws every menu of a stack in `t`, and `menu.set_menu_theme(m, t)`
+  gives one menu its own over the stack's (`clear_menu_theme` gives it
+  back). A `Theme` is the veil over what is under a menu, the panel and
+  its outline, a widget's face (at rest, under the cursor, pressed), the
+  text and its dim kind, the accent and a field's ground.
+  `menu.theme_default()` is the look every menu had, so a game sets only
+  what it changes:
+
+  ```aether
+  brass = menu.theme_default()
+  brass.panel = hud.rgba(0.2, 0.15, 0.1, 0.9)
+  brass.accent = hud.rgba(0.85, 0.65, 0.3, 1.0)
+  menu.set_theme(engine.engine_menus(e), brass)
+  ```
+
+- **Taller than the screen.** A menu that does not fit the screen (more
+  rows than a window is tall) is drawn and hit smaller, the whole of it,
+  until it fits the screen less 12 points: its panel and widgets together,
+  their text with them. Its last button is shown and is pressed where it
+  shows. A menu that fits, however tight, is drawn as it was placed.
+
 `examples/game_hud.ae` opens a pause menu with Escape or Start.
 `tests/test_menu.ae` drives a menu with injected cursor, key, pad and text
 events at 320 x 180 (scale 1) and 640 x 360 (scale 2):
@@ -362,3 +391,5 @@ events at 320 x 180 (scale 1) and 640 x 360 (scale 2):
 | The game's reads through clicks, keys, text and movement with a menu open | none stirred |
 | Escape closing the last menu, still held | no "pause" edge for the game |
 | Drawn on both renderers | every widget where the hit test puts it, the focus ring round the focused one only; Vulkan within 360 channels of OpenGL |
+| Nine rows of 40 on a screen 180 tall | made smaller to fit, every widget inside; the last button pressed where it is drawn; one that fits as placed |
+| A theme on the stack, one on a menu, then cleared | drawn in the stack's, the menu's over it, the stack's again; a new stack in the default |

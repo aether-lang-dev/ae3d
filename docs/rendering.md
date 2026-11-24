@@ -1383,6 +1383,30 @@ to 31 by the eighth frame and the last frame gives off 0.005% of the
 brightest's light. `tests/test_particles_drawn.ae`: a flame at full heat
 draws (250, 232) red and green, cooled to 0.6 (193, 63), on both renderers.
 
+### A surface's own light
+
+A lit window, a lamp's pane, a sign: a surface that gives light to the eye
+whatever lights it.
+- `core.model_set_emissive(m, r, g, b, strength)` sets its colour, linear,
+  times its strength. A night window wants several.
+- `core.model_set_emissive_map(m, path)` sets where: the map's colour times
+  the emissive, so one mesh can have lit panes in a dark wall.
+
+The light is added after the surface's own shading and before the fog, as
+the embers' is, and the bloom picks it up from there. Both renderers carry
+it: Vulkan's draw set has the map at binding 11, OpenGL's on unit 5.
+
+glTF materials bring theirs: `emissiveFactor` (black when absent),
+times `KHR_materials_emissive_strength`, times `emissiveTexture`. The scene
+file keeps a material's `emissive` and `emissive_path` when it has them, and
+the scene DSL writes `emissive(r, g, b, strength)` and `emissive_map(path)`.
+
+`tests/test_emissive.ae` holds it on both renderers, in the dark:
+- a plain surface reads black;
+- an emissive orange reads 225 195 0;
+- a half-white map glows only on its white half;
+- OpenGL and Vulkan agree to 1 of 255.
+
 ### Rain on the surfaces
 
 `engine_set_wetness(e, amount)` is rain on the scene: every surface that
@@ -1535,6 +1559,119 @@ the two halves the scene pass is drawn in, the nearest of the samples a
 pixel. Both are the depth of what was drawn -- the near figure's real
 silhouette, the picture of a far one -- and neither draws anything twice.
 
+### The opaque depth prepass (Vulkan)
+
+The opaque surfaces are drawn twice:
+1. **Depth alone.** Through the casters' vertex shaders and no pixel shader
+   at all, the device's fastest depth path. The camera's view-projection
+   goes in every program's light-space slot for this, and each program's
+   own matrix goes back after.
+2. **Lit.** Testing against that depth without writing it, so each pixel
+   is lit once, by the surface that shows there.
+
+The lit pixel shader can discard: a cutout's holes, a cut, a wound. On a
+tiled GPU (Apple's, under MoltenVK), a pipeline that can discard and
+writes depth loses the hidden-surface removal and the early depth test.
+Every opaque surface drawn over another was then lit in full at every
+pixel it covered. A town seen from above, roofs over walls over ground,
+paid for every layer.
+
+Measured on an M1 Pro, Vulkan:
+
+| Scene | Without the prepass | With it |
+|---|---|---|
+| 120 layers at 640x360, 4x MSAA (`test_vk_stages`) | 20.3 ms | 2.48 ms |
+| 120 layers at 480x270 (`test_vk_prepass`: off and on in turns, the median of 20 frames each; ten runs) | 1.81–2.51 ms | 0.53–1.17 ms |
+
+The prepass is on by default on a GPU and off on a CPU rasterizer
+(lavapipe, SwiftShader). A rasterizer in software tests depth before it
+shades whether or not a pipeline can discard, so it has nothing to win and
+pays for the second pass in full: on llvmpipe the 60 layers took 152.6 ms
+with the prepass and 144.2 ms without. `AE3D_PREPASS=1` or `0`, or
+`vulkan.renderer_set_prepass`, decides it either way.
+
+`test_vk_prepass` holds the picture to the one without it, to the channel:
+overlapping cubes, a batch, an instanced model, a cut cube, a cutout and a
+glass sphere.
+
+What is left out:
+- surfaces that drop pixels: a cutout's holes, a cut, a wound, a damage
+  mask. The prepass has no pixel shader to drop them, and one that could
+  discard would cost the prepass the fast depth path it is for;
+- impostors, crowds, cluster cuts and points, which draw by their own paths.
+
+These draw as before, writing their own depth. The prepass's depth is one
+step farther than the surface's, so a last bit of rounding between the two
+programs cannot fail the lit draw's test. There is no slope term: at a
+silhouette the slope is steep, and the samples behind won the edge.
+
+`AE3D_PREPASS=0` (or `vulkan.renderer_set_prepass(r, false)`) turns it
+off. The draw count is the scene's draws, as on OpenGL: the prepass's are
+not counted, as the shadow maps' are not.
+
+### An instanced model's copies, culled by cluster
+
+An instanced model used to be drawn whole: a prop kind laid over a whole
+map drew every copy, every frame. Now, once a stream has stood still for a
+frame, its copies are cut into clusters of about 32 copies that stand near
+one another (`geometry.inst_cluster`). The clusters are cells of a grid over
+the copies' places on the ground, taken in Morton order so that the
+clusters a view sees tend to sit side by side. Each cluster has the sphere
+its copies fit in. The stream is then sent once in that order, and the
+camera's opaque pass and its prepass draw only the runs of clusters that
+the frustum reaches (`core.instance_runs`). Past 16 runs, the runs with the
+smallest gaps between them are joined, so a scattered view costs a few
+draws.
+
+Measured on an M1 Pro, Vulkan, 1280x720 (`benchmarks/bench_instance_cull`):
+600 tiles of 16 m, each with a 3,200-triangle ground piece and four props
+of 5,000 triangles, with every kind one instanced model, and the camera
+over a corner. Each figure is the median of 40 frames, off and on in turns;
+three runs.
+
+| | Scene pass | Triangles |
+|---|---|---|
+| Drawn whole | 28.5–29.7 ms | 13.92M |
+| Culled by cluster | 12.1–12.3 ms | 2.32M, in 5 runs |
+
+What it leaves alone:
+- A copy keeps its index. A game's copy 7 is still copy 7, and a pick names
+  the copy, not its place in cluster order (`core.pick_copy_of_place`).
+- A stream that changes is drawn whole, in its own order, until it is
+  still again. Clustering it again is one pass over its copies, 46 µs for
+  2,401.
+- Some streams are never clustered: crowds, points, what blends (its
+  copies' order is the order they blend in), and streams of fewer than 128
+  copies, where the extra draws would cost more than they save.
+- The shadow and pick passes draw a stream whole. On OpenGL 4.1, which has
+  no first instance to draw from, each run points the copies' attributes at
+  its first place.
+
+`tests/test_instance_cull.ae` checks that every copy is in exactly one
+cluster and inside its sphere, and that the runs hold every copy a view can
+see (on a corner view and a wide one). It also checks that the picture is
+the same with the culling as without it on both renderers, and that a pick
+names the copy the game set.
+
+### How long a texture is held
+
+A renderer reads a texture the first time a model it draws uses a material
+that names it. It holds the texture while any of its models draws with
+that material: its own material, or a group's (a group with none draws with
+the model's). With the last such model it lets the texture go
+(`Material.renderer_users`). A model added again later reads it again, and a
+model whose geometry changed is uploaded again with the texture it had. A
+world streamed past therefore keeps only the textures its near cells draw
+with. Only what the renderer read from a path is its own to let go: an id
+set with no path, such as a view's picture (`engine_view_texture`), stays
+as it was set. `tests/test_texture_release.ae` holds this on both
+renderers.
+
+Before, OpenGL let a texture go once for every model taken out, though it
+had read it once for the material. With two models sharing a material, the
+first one out deleted the texture under the second, and a model put back
+kept the deleted id. Vulkan never let a texture go.
+
 ### What a frame's draw count is
 
 The draw count (`backend_draw_calls`, `engine_draw_calls`, `frame.stats`' draw
@@ -1575,6 +1712,30 @@ a loop that picks as the pointer moves costs no more than the pick pass.
 `backend_pick_ask` and `backend_pick_read` are the same on a backend, and one
 frame answers for as many as sixteen pixels. The editor selects by it, and
 the agent channel's `frame.pixel` carries it as `pick` (docs/agent.md).
+
+What space the pixel is in:
+- **The engine's forms take a window point**, the cursor's space, so
+  `engine_mouse_x` and `engine_mouse_y` go in as they are. The engine takes
+  the point to the frame's pixel. On a display that scales (a Retina Mac)
+  that pixel is twice the point; the render scale is the backend's to
+  apply.
+- **The backends' forms and `frame.pixel` take the frame's pixel**: the
+  captured frame's, the size `engine.width` holds.
+
+Before 2026-11-23 a point was passed through as a pixel, and on a Retina
+Mac every pick read a spot halfway to the frame's top left corner.
+
+**Reading without waiting.** Read in the frame that asked (in its
+`late_update`, or `engine_pick`), a pick waits for the device to finish
+that frame, a whole frame's work with the program stopped. A game that
+picks as the pointer moves instead asks, then reads on the first frame
+`engine_pick_ready(e, k)` is true: on Vulkan, two frames later, once a
+later frame's start has waited for the answering one; on OpenGL, the next
+frame. Read when ready, a pick costs no more than a frame with none
+(1.70-1.77 ms against 2.8-3.0 ms read at once, in a light scene; in a
+frame of 30 ms on the device, the wait was most of a frame). The pick pass
+draws only the box round the pixels asked, a pixel spare, on both
+renderers.
 
 It is the scene's surfaces drawn again from the camera into a target that
 holds ids instead of colour: ae3d.shaders.lit's `pick_vertex` and `pick_pixel`
@@ -1683,6 +1844,12 @@ It works by clustered shading (`ae3d.lightgrid`, #468).
   value at the lamp, the fall-off the shader used to cut at, and its light
   fades to nothing over the last quarter of that distance, so a pool ends
   in a gradient.
+  - That is far for a small light: `light_point` with a range of 4 m
+    reaches 28 m, and every pixel within shades it.
+  - `core.light_set_reach(l, metres)` ends its pool sooner, with the same
+    fade over its last quarter, and the scene file keeps it as `"reach"`.
+    A window's glow with its reach set to 4 m is listed in 26 cells where
+    it was in 802 (`test_light_reach`); 0 gives back its fall-off's reach.
 - **The layout.** The lamps (five vec4s each) and the cells' lists are
   built once on the CPU in one layout. Vulkan reads them as storage buffers
   at bindings 2 and 3 of the camera's set. OpenGL 4.1, which has no storage buffers, reads the
@@ -1789,12 +1956,24 @@ Now each lamp the budget holds has a map of its own (`ae3d.lampshadows`):
   fades a lamp's shadow out, so one leaving the budget does not pop. Where
   the device traces, a lamp whose light lies wholly inside the rays' reach
   is left to the rays.
+- **Which lamps cast.** A light that should never cast -- a window's glow, a
+  fill -- says so: `core.light_set_shadows(l, false)`, kept in the scene
+  file as `"shadows": false`. It is lit as before and gives its slot to the
+  next lamp. `engine.engine_set_lamp_shadow_limit(e, n)` keeps the nearest
+  `n` (at most ten), for a scene of many small lamps whose faces cost more
+  than their shadows give.
 - **Two layers.** A face's static casters -- plain models, whose world
   stamp says when they move -- are drawn into a static atlas only when what
   stands still in the face changes. The atlas the shader reads is that
   layer copied up a tile at a time, with what moves on its own -- a skinned
-  figure, a crowd, an instance stream -- drawn over the copy every frame it
-  is there. A lamp over a walking figure costs a copy and a draw a face, not
+  figure, a crowd, an instance stream whose instances changed this frame --
+  drawn over the copy every frame it is there. An instance stream that
+  stands still, a town's placed props, is the static layer's. It counted as
+  moving, and every instanced prop in a lamp's reach was drawn into each of
+  its six faces every frame: 40 instanced props among ten lamps drew 1,047
+  calls a frame, 125 now (`benchmarks/bench_lamp_instances.ae`, M1 Pro,
+  Vulkan; 11.5 → 10.6 ms a frame, the timestamped shadow stage 0.38 → 0.49
+  ms, where Metal stamps only at pass edges). A lamp over a walking figure costs a copy and a draw a face, not
   its street again: `zombie_street` draws 87 calls a frame on OpenGL and 88
   on Vulkan, where the one map it had drew 255.
 - **The lookup.** Each clustered lamp carries its slot; the slots' data --
@@ -1821,6 +2000,10 @@ Held to numbers: `tests/test_lamp_shadows.ae`, offscreen on both renderers.
   a lamp draws two; a cube as an instance stream hung under a lamp darkens
   the ground behind it to 29 (77 without it) with no static layer drawn,
   and moved away leaves 77.04 against 77.04.
+- Two props as a still instance stream: their faces are drawn as they
+  settle (18 on both renderers), and not again the frame after.
+- A lamp told to cast no shadow has no map and the next lamp has its slot,
+  and a limit of three shadows the three nearest.
 - `tests/test_ray_shadows`: the map path and the rays shadow the ground
   past the ball from a lamp alike (403 each, 598 with the ball casting
   nothing).
