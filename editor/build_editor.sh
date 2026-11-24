@@ -40,8 +40,13 @@ LAUNCHER="${AE3D_CC_LAUNCHER:-}"
 CFLAGS="${CFLAGS:--O2}"
 WARN="-Wall -Wextra"
 
-AETHER_CFLAGS="$(ae cflags 2>/dev/null || true)"
-AETHER_LIBS="$(ae cflags --libs 2>/dev/null || true)"
+# The flags of the compiler this build uses, as ../build.sh asks for them
+# (`--cc`, Aether 0.940 on; an older ae is asked as before).
+ae_cflags() {
+    ae cflags "$@" --cc "$CC" 2>/dev/null || ae cflags "$@" 2>/dev/null || true
+}
+AETHER_CFLAGS="$(ae_cflags)"
+AETHER_LIBS="$(ae_cflags --libs)"
 if [ -z "$AETHER_CFLAGS" ]; then
     echo "ae3d: 'ae cflags' produced nothing; is the toolchain on PATH?" >&2
     exit 1
@@ -50,7 +55,7 @@ fi
 # reason: $GEN is Aether's generated C, and -fwrapv is what makes its `int`
 # arithmetic wrap the way the language reference says it does. Filtering the
 # toolchain flags down to -I drops it.
-AETHER_COMPILE_FLAGS="$(ae cflags --cflags 2>/dev/null || true)"
+AETHER_COMPILE_FLAGS="$(ae_cflags --cflags)"
 if [ -z "$AETHER_COMPILE_FLAGS" ]; then
     AETHER_COMPILE_FLAGS="$(printf '%s\n' $AETHER_CFLAGS | grep -E '^-I' | tr '\n' ' ')"
 fi

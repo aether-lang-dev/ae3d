@@ -31,7 +31,13 @@ SUFFIX="$(ae3d_native_suffix)"
 GEN="$OUT_DIR/$NAME.c"
 LIB="$OUT_DIR/$NAME$SUFFIX"
 
-AETHER_CFLAGS="$(ae cflags --cflags 2>/dev/null || true)"
+CC="${CC:-cc}"
+# The flags of the compiler this build uses, as ../build.sh asks for them
+# (`--cc`, Aether 0.940 on; an older ae is asked as before).
+ae_cflags() {
+    ae cflags "$@" --cc "$CC" 2>/dev/null || ae cflags "$@" 2>/dev/null || true
+}
+AETHER_CFLAGS="$(ae_cflags --cflags)"
 if [ -z "$AETHER_CFLAGS" ]; then
     echo "ae3d: 'ae cflags' produced nothing; is the toolchain on PATH?" >&2
     exit 1
@@ -39,7 +45,6 @@ fi
 
 AETHER_LIB_DIR="$ROOT/src" aetherc "$SOURCE" "$GEN"
 
-CC="${CC:-cc}"
 # What the script leaves to the program that loads it, by platform. A
 # script uses the Aether runtime as any Aether code does -- its fields are
 # named strings, its state is allocated -- and where that runtime comes
@@ -62,7 +67,7 @@ case "$(uname -s)" in
     Darwin) LINK_FLAGS="-dynamiclib -undefined dynamic_lookup" ;;
     MINGW*|MSYS*|CYGWIN*)
         LINK_FLAGS="-shared"
-        RUNTIME_LIBS="$(ae3d_runtime_link_flags "$(ae cflags --libs 2>/dev/null || true)")" ;;
+        RUNTIME_LIBS="$(ae3d_runtime_link_flags "$(ae_cflags --libs)")" ;;
     *)      LINK_FLAGS="-shared" ;;
 esac
 
