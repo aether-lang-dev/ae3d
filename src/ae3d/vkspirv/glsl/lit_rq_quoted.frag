@@ -205,7 +205,7 @@ layout(set = 2, binding = 1) uniform sampler2D sky_light;
 layout(set = 2, binding = 2) uniform sampler2D brdf_lut;
 layout(set = 1, binding = 6) uniform sampler2D ddgi_irradiance;
 layout(set = 1, binding = 7) uniform sampler2D ddgi_distance;
-layout(set = 0, binding = 10) uniform sampler2D emissive_map;
+layout(set = 0, binding = 11) uniform sampler2D emissive_map;
 layout(std430, set = 1, binding = 2) readonly buffer cluster_lights_buffer { vec4 cluster_lights[]; };
 layout(set = 2, binding = 4) uniform accelerationStructureEXT scene;
 layout(std430, set = 1, binding = 3) readonly buffer cluster_words_buffer { float cluster_words[]; };

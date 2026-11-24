@@ -1394,7 +1394,7 @@ whatever lights it.
 
 The light is added after the surface's own shading and before the fog, as
 the embers' is, and the bloom picks it up from there. Both renderers carry
-it: Vulkan's draw set has the map at binding 10, OpenGL's on unit 5.
+it: Vulkan's draw set has the map at binding 11, OpenGL's on unit 5.
 
 glTF materials bring theirs: `emissiveFactor` (black when absent),
 times `KHR_materials_emissive_strength`, times `emissiveTexture`. The scene
