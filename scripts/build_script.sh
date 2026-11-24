@@ -70,10 +70,18 @@ CC="${CC:-cc}"
 #            host's. aether-lang-dev/aether#2297 asks for the runtime and
 #            the engine as one library both link.
 RUNTIME_LIBS=""
+SCRIPT_DEFINES=""
 case "$(uname -s)" in
     Darwin) LINK_FLAGS="-dynamiclib -undefined dynamic_lookup" ;;
     MINGW*|MSYS*|CYGWIN*)
         LINK_FLAGS="-shared"
+        # A C name of its own (@c_callback) is written weak, and GNU ld's
+        # DLL leaves weak definitions out of what it exports -- by name in a
+        # .def too ("symbol wrong type"): every script on Windows was
+        # refused for not saying its layout (script_layout_hash). A script
+        # is one C file, each such name in it once, so here they are
+        # ordinary definitions, and exported with the rest.
+        SCRIPT_DEFINES="-DAETHER_WEAK_DEF="
         RUNTIME_LIBS="$(ae3d_runtime_link_flags "$(ae cflags --libs 2>/dev/null || true)")" ;;
     *)      LINK_FLAGS="-shared" ;;
 esac
@@ -89,7 +97,7 @@ fi
 # (ae3d.platform), and on Windows a DLL resolves everything at its link.
 ae3d_glfw_flags
 # shellcheck disable=SC2086
-$CC -O2 -fwrapv $(ae3d_fp_flags) $(ae3d_native_pic_flag) $AETHER_CFLAGS $(ae3d_program_includes "$GEN") $LINK_FLAGS \
+$CC -O2 -fwrapv $(ae3d_fp_flags) $(ae3d_native_pic_flag) $AETHER_CFLAGS $SCRIPT_DEFINES $(ae3d_program_includes "$GEN") $LINK_FLAGS \
     "$GEN" $(ae3d_native_link_flags "$NATIVE_DIR") $GLFW_LIBS $RUNTIME_LIBS -o "$LIB"
 
 echo "built: $LIB"

@@ -1581,7 +1581,14 @@ Measured on an M1 Pro, Vulkan:
 | Scene | Without the prepass | With it |
 |---|---|---|
 | 120 layers at 640x360, 4x MSAA (`test_vk_stages`) | 20.3 ms | 2.48 ms |
-| 60 layers at 480x270 (`test_vk_prepass`) | 2.7–4.2 ms | 0.28–0.83 ms |
+| 120 layers at 480x270 (`test_vk_prepass`: off and on in turns, the median of 20 frames each; ten runs) | 1.81–2.51 ms | 0.53–1.17 ms |
+
+The prepass is on by default on a GPU and off on a CPU rasterizer
+(lavapipe, SwiftShader). A rasterizer in software tests depth before it
+shades whether or not a pipeline can discard, so it has nothing to win and
+pays for the second pass in full: on llvmpipe the 60 layers took 152.6 ms
+with the prepass and 144.2 ms without. `AE3D_PREPASS=1` or `0`, or
+`vulkan.renderer_set_prepass`, decides it either way.
 
 `test_vk_prepass` holds the picture to the one without it, to the channel:
 overlapping cubes, a batch, an instanced model, a cut cube, a cutout and a
@@ -1601,6 +1608,25 @@ silhouette the slope is steep, and the samples behind won the edge.
 `AE3D_PREPASS=0` (or `vulkan.renderer_set_prepass(r, false)`) turns it
 off. The draw count is the scene's draws, as on OpenGL: the prepass's are
 not counted, as the shadow maps' are not.
+
+### How long a texture is held
+
+A renderer reads a texture the first time a model it draws uses a material
+that names it. It holds the texture while any of its models draws with
+that material: its own material, or a group's (a group with none draws with
+the model's). With the last such model it lets the texture go
+(`Material.renderer_users`). A model added again later reads it again, and a
+model whose geometry changed is uploaded again with the texture it had. A
+world streamed past therefore keeps only the textures its near cells draw
+with. Only what the renderer read from a path is its own to let go: an id
+set with no path, such as a view's picture (`engine_view_texture`), stays
+as it was set. `tests/test_texture_release.ae` holds this on both
+renderers.
+
+Before, OpenGL let a texture go once for every model taken out, though it
+had read it once for the material. With two models sharing a material, the
+first one out deleted the texture under the second, and a model put back
+kept the deleted id. Vulkan never let a texture go.
 
 ### What a frame's draw count is
 
