@@ -123,6 +123,17 @@ separation carry on.
 - `flow_block_model(f, model)` the bounding sphere's square: cheap and
   right for something compact, wrong for anything long, thin or hollow.
 
+A cell counts what blocks it. `flow_unblock_mesh` (the same model, band and
+growth) and `flow_unblock` (the same rectangle) each take one blocker off
+each cell of the footprint, so a cell stays blocked while anything else
+still blocks it. A streamed cell's walls let go leave its neighbour's
+standing, and the game's own blocks stay. A grown footprint changes each of
+its cells once, however many of its marks reach it: a stamped footprint's
+cells are listed as they are first reached, and the count changed over the
+list. The fence below costs 0.43 ms where it cost 0.42 before the count.
+`flow_open` still opens a rectangle whatever blocks it, and `flow_clear`
+opens the whole field.
+
 ### Dear cells and the clearance
 
 Blocked is all or nothing. A field that kept bodies off walls by blocking a

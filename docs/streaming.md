@@ -70,13 +70,44 @@ by being handed its mesh, and the decoded textures are offered to the
 renderer (`core.offer_preloaded_image`), which takes them as the models
 reach it.
 
-### What the game does with it
+### Colliders and walkers
+
+```
+physics.attach(e)
+stream.set_physics(st, true, 0.6)                    // FLAG_COLLIDER models, friction 0.6
+stream.set_nav(st, field, -0.3, 2.2, 0)              // FLAG_NAV models block the walkers' field
+```
+
+- **Colliders.** A `FLAG_COLLIDER` model's collision mesh is built on the
+  worker during the cell's decode (`physics.mesh_of_mesh`). When the model
+  attaches it becomes a static game object with a mesh collider, so the
+  collider is in place from the moment the model is, and leaving destroys
+  it. Instanced models are left out, since their copies are not one body.
+- **Walkers.** A cell's `FLAG_NAV` models block the field when the cell
+  becomes resident (`nav.flow_block_mesh`), and are unblocked just before
+  it leaves (`nav.flow_unblock_mesh`). A cell's blockers let go open only
+  what nothing else blocks: a neighbouring cell's walls and the game's own
+  blocks stay (see "What blocks a cell" in [crowds.md](crowds.md)).
 
 `event_count`, `event_kind` and `event_cell` report each cell that arrived
-(`ARRIVED`, all its models in) or is about to leave (`LEFT`, said before
-its models are freed). `cell_models` gives the cell's models, so the game
-can add and remove colliders and nav blockers. Call `events_clear` once the
-events have been read.
+(`ARRIVED`, all its models in and its blockers placed) or is about to
+leave (`LEFT`, reported before its models are freed). `cell_models` gives
+the cell's models for anything else the game hangs on them. Call
+`events_clear` once the events have been read.
+
+### Driven across
+
+`tests/test_stream_drive.ae` drives a 448 m world of 196 cells in a running
+engine (Vulkan, M1 Pro, 640x360). A ball is pushed along at 30 m/s by the
+engine's physics, rolling on the streamed ground tiles, and the stream
+follows it. The drive runs twice: with every cell loaded first, then
+streamed from a standing start.
+
+- The ball's lowest point is 0.505 m in both: it rests on the ground the
+  whole way, so every collider was in place before it arrived. With the
+  streamed colliders switched off, it falls through within 128 frames.
+- The 99th percentile frame is 9.41 ms streamed against 9.61 ms with
+  everything loaded. The test holds streaming to adding under 8 ms.
 
 ### What it holds
 

@@ -50,10 +50,13 @@ import ae3d.core
 import ae3d.cellfile
 import ae3d.engine
 import ae3d.agent
+import ae3d.nav
+import ae3d.physics
+import aephysics.mesh
 
 exports (
     Streamer, Cell,
-    open, stream_free, last_error, set_engine, set_radius, set_far, set_budget, set_loads,
+    open, stream_free, last_error, set_engine, set_radius, set_far, set_budget, set_loads, set_nav, set_physics,
     focus_clear, focus, update, wait_idle,
     cell_count, cell_at, cell_of, cell_state, cell_far_state, cell_far_shown, cell_models, cell_x, cell_z, cell_loads,
     missing, resident_count, resident_bytes, peak_bytes, loading_count,
@@ -91,6 +94,10 @@ struct Layer {
     bytes: long                  // what its decode made, while counted
     loads: int                   // how many times it has been loaded
     paths: ptr                   // strarr: the textures its materials name, while held
+    flags: ptr                   // int[]: each attached model's cellfile.FLAG_*, sized when its decode arrives
+    objects: ptr                 // list beside models: its *GameObject where it is a collider, else null
+    colliders: ptr               // ptr[]: each decoded model's collision mesh (*MeshData) or null, until attached
+    collider_count: int
 }
 
 struct Cell {
@@ -108,6 +115,8 @@ struct LoadJob {
     path: string
     skip: ptr                    // strarr, the job's own
     data: *CellData
+    colliders: bool              // its collision meshes built on the worker too
+    meshes: ptr                  // ptr[]: each model's *MeshData or null
 }
 
 struct Event {
@@ -145,6 +154,16 @@ struct Streamer {
     held: ptr                    // list of *Held
     events: ptr                  // list of *Event
     frame: int
+    // The walkers' field the resident cells' FLAG_NAV models block, and how
+    // (nav.flow_block_mesh's band and growth); null for none.
+    nav: ptr
+    nav_low: float
+    nav_high: float
+    nav_grow: int
+    // Whether FLAG_COLLIDER models are static colliders of the engine's
+    // physics (ae3d.physics, attached to the engine).
+    physics: bool
+    friction: float
 }
 
 // --- the world --------------------------------------------------------------------------------------
@@ -238,6 +257,7 @@ layer_new(file: string) -> *Layer {
     l = heap.new(Layer)
     l.file = string.copy(file)
     l.models = list.new()
+    l.objects = list.new()
     return l
 }
 
@@ -284,6 +304,28 @@ set_radius(st: *Streamer, radius: float, margin: float) {
     st.radius = radius
     st.margin = margin
     if st.margin < 0.0 { st.margin = 0.0 }
+}
+
+// The resident cells' FLAG_NAV models blocked in `field` (a *FlowField) as
+// they arrive and unblocked as they leave, by their triangles between `low`
+// and `high` metres, grown by `grow` cells (nav.flow_block_mesh). A cell's
+// blockers let go open only what nothing else blocks: its neighbour's walls
+// and the game's own stay. Null for none.
+set_nav(st: *Streamer, field: @keep ptr, low: float, high: float, grow: int) {
+    st.nav = field
+    st.nav_low = low
+    st.nav_high = high
+    st.nav_grow = grow
+}
+
+// The cells' FLAG_COLLIDER models as static colliders of the engine's
+// physics (physics.attach first): each a game object with a mesh collider of
+// its triangles, the collision mesh built on the worker with the decode, in
+// place from the moment the model is. `friction` its surface's. A model
+// drawn as instances is left out: its copies are no one body.
+set_physics(st: *Streamer, on: bool, friction: float) {
+    st.physics = on
+    st.friction = friction
 }
 
 // Stand-ins out to `metres` (0: none).
@@ -426,6 +468,7 @@ load(st: *Streamer, c: *Cell, l: *Layer) {
     job.layer = l
     job.cell = c
     job.path = string.copy(l.file)
+    job.colliders = st.physics && st.e != null && l == c.full
     job.skip = strarr.new()
     i = 0
     while i < list.size(st.held) {
@@ -441,7 +484,31 @@ load(st: *Streamer, c: *Cell, l: *Layer) {
 // On the worker: the file read and decoded.
 load_run(job: *LoadJob) -> ptr {
     job.data = cellfile.decode(job.path, job.skip)
+    if job.colliders && job.data.error == "" {
+        n = cellfile.model_count(job.data)
+        job.meshes = calloc(n + 1, 8)
+        i = 0
+        while i < n {
+            cm = cellfile.model_at(job.data, i)
+            if (cm.flags & cellfile.FLAG_COLLIDER) != 0 && cm.instance_count == 0 && cm.mesh != null {
+                (job.meshes as ptr[])[i] = physics.mesh_of_mesh(cm.mesh) as ptr
+            }
+            i = i + 1
+        }
+    }
     return null
+}
+
+// Collision meshes built and never given to a collider.
+meshes_free(meshes: ptr, count: int) {
+    if meshes == null { return }
+    i = 0
+    while i < count {
+        md = (meshes as ptr[])[i]
+        if md != null { mesh.destroy_mesh(md as *MeshData) }
+        i = i + 1
+    }
+    free(meshes)
 }
 
 // On the loop thread: the decode is back.
@@ -451,14 +518,20 @@ load_end(job: *LoadJob, result: ptr) {
     st.in_flight = st.in_flight - 1
     d = job.data
     strarr.free(job.skip)
+    count = cellfile.model_count(d)
     if d.error != "" {
         println("ae3d stream: ${d.error}")
+        meshes_free(job.meshes, count)
         cellfile.data_free(d)
         l.state = UNLOADED
     } else if l.state == LEAVING {
+        meshes_free(job.meshes, count)
         cellfile.data_free(d)
         l.state = UNLOADED
     } else {
+        l.colliders = job.meshes
+        l.collider_count = count
+        l.flags = calloc(count + 1, 4)
         l.data = d
         l.next = 0
         l.state = LOADED
@@ -499,16 +572,39 @@ attach(st: *Streamer) {
         while l.next < cellfile.model_count(l.data) {
             cost = cellfile.model_at(l.data, l.next).bytes
             if attached_one && spent + cost > st.budget { return }
+            flags = cellfile.model_at(l.data, l.next).flags
             m = cellfile.instantiate(l.data, l.next)
             if l == best.far { m.casts_shadow = false }
             list.add_raw(l.models, m as ptr)
-            if st.e != null { engine.engine_add_model(st.e as *Engine, m) }
+            (l.flags as int[])[l.next] = flags
+            list.add_raw(l.objects, attach_model(st, l, m) as ptr)
             spent = spent + cost
             attached_one = true
             l.next = l.next + 1
         }
         resident(st, best, l)
     }
+}
+
+// A model to the engine: a static collider's game object where its cell
+// made it a collision mesh, else the renderer's alone. The object, or null.
+attach_model(st: *Streamer, l: *Layer, m: *Model) -> *GameObject {
+    if st.e == null { return null }
+    e = st.e as *Engine
+    md = null as ptr
+    if l.colliders != null && l.next < l.collider_count {
+        md = (l.colliders as ptr[])[l.next]
+        (l.colliders as ptr[])[l.next] = null
+    }
+    if md == null {
+        engine.engine_add_model(e, m)
+        return null
+    }
+    // The object owns the model from here (engine.destroy frees it).
+    o = engine.object(e, core.text(m.name), m)
+    physics.rigidbody(o, physics.STATIC)
+    _shape = physics.mesh_collider(o, md as *MeshData, physics.material(st.friction, 0.0), m.scale)
+    return o
 }
 
 // The decoded textures put where the renderer takes them as the models
@@ -543,8 +639,13 @@ resident(st: *Streamer, c: *Cell, l: *Layer) {
     }
     cellfile.data_free(d)
     l.data = null
+    meshes_free(l.colliders, l.collider_count)
+    l.colliders = null
     l.state = RESIDENT
-    if l == c.full { say(st, ARRIVED, c) }
+    if l == c.full {
+        nav_step(st, l, true)
+        say(st, ARRIVED, c)
+    }
 }
 
 hold(st: *Streamer, path: string, by: int) {
@@ -569,17 +670,52 @@ hold(st: *Streamer, path: string, by: int) {
     list.add_raw(st.held, h as ptr)
 }
 
-// The layer's models out of the renderer and freed, its decode with them.
+// The resident layer's walkers' blockers into the field (or out of it).
+nav_step(st: *Streamer, l: *Layer, block: bool) {
+    if st.nav == null { return }
+    i = 0
+    while i < list.size(l.models) {
+        flags = (l.flags as int[])[i]
+        if (flags & cellfile.FLAG_NAV) != 0 {
+            m = list.get_raw(l.models, i) as *Model
+            if block {
+                _b = nav.flow_block_mesh(st.nav as *FlowField, m, st.nav_low, st.nav_high, st.nav_grow)
+            } else {
+                _o = nav.flow_unblock_mesh(st.nav as *FlowField, m, st.nav_low, st.nav_high, st.nav_grow)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// The layer's models out of the renderer and freed, its decode with them:
+// its walkers' blockers let go first, its colliders' objects destroyed.
 detach(st: *Streamer, c: *Cell, l: *Layer) {
-    if l == c.full && l.state == RESIDENT { say(st, LEFT, c) }
+    if l == c.full && l.state == RESIDENT {
+        say(st, LEFT, c)
+        nav_step(st, l, false)
+    }
     i = 0
     while i < list.size(l.models) {
         m = list.get_raw(l.models, i) as *Model
-        if st.e != null { engine.engine_remove_model(st.e as *Engine, m) }
-        core.model_free(m)
+        o = list.get_raw(l.objects, i) as *GameObject
+        if o != null {
+            // Out of the renderer and the physics, freed at the frame's end.
+            engine.destroy(st.e as *Engine, o)
+        } else {
+            if st.e != null { engine.engine_remove_model(st.e as *Engine, m) }
+            core.model_free(m)
+        }
         i = i + 1
     }
     list.clear(l.models)
+    list.clear(l.objects)
+    if l.flags != null {
+        free(l.flags)
+        l.flags = null
+    }
+    meshes_free(l.colliders, l.collider_count)
+    l.colliders = null
     if l.data != null {
         // Offered and not taken: the renderer will not ask now.
         k = 0
@@ -675,6 +811,7 @@ stream_free(st: *Streamer) {
 layer_free(st: *Streamer, c: *Cell, l: *Layer) {
     if l.state != UNLOADED { detach(st, c, l) }
     list.free(l.models)
+    list.free(l.objects)
     string.free(l.file)
     heap.free(l)
 }
