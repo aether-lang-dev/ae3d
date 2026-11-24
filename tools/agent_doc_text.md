@@ -58,6 +58,42 @@ loop measures the round trip as much as the request.
 
 `snapshot` answers when the file is on disk, not when the request was accepted.
 
+## Running to a moment, and watching the way there
+
+An agent chasing a bug wants the frame where it happens, not a guess at
+how many frames to step. `frame.until` runs the game until an expression
+over its objects holds. It then holds at that frame and answers it, so
+whatever is asked next is about that moment:
+
+    frame.pause
+    watch.add expression="Player.Health.value" name=health   -> {"watch": 1}
+    frame.until expression="Player.Health.value < 50" timeout=600
+                                           -> {"met": true, "frame": 412, "value": 1, ...}
+    watch.get watch=1                      -> {"frames": [361, ..., 412], "values": [100, ..., 49]}
+
+An expression reads fields of components by object, kind and field name:
+`Player.Health.value`. An object can also be given as `'Enemy 2'` (quoted,
+for a name with a space) or by its id (`#12`), and a kind or field with a
+space in its name is quoted too: `'Street Lamp'.Light.'outer angle'`. An
+object's `position` has `.x`, `.y` and `.z`. A vector field without an
+axis is its length; a bool reads 1 or 0, and an enum its index. The
+expression combines these with numbers, `true`, `false` and `frame`, using
+`+ - * /`, `< <= > >= == !=`, `&& || !` and parentheses.
+
+A path that finds nothing (an object not spawned yet, a kind it does not
+carry, a misspelt field) is false, not 0. So `frame.until` waits for it,
+and a watch records `null` for that frame. A malformed expression is
+refused, and the error says where and what was expected:
+
+    frame.until expression="Player.position.x <"
+      -> error: the expression: at 20: expected a number, a path or '(', found the end
+
+Nothing asked after a `frame.until` is answered before it, as for
+`frame.step`. A watch keeps the last 4,096 frames it read. `watch.get`
+answers 1,024 at a time, with `more` and `next` (the frame to ask from) for
+the rest. `object.find` narrows the scene by part of a name, a tag and a
+component kind before any of this.
+
 ## Reading pixels
 
 `frame.capture` reads the finished frame into the engine; `frame.pixel` and

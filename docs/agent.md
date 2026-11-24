@@ -58,6 +58,12 @@ interleaved with the first.
 | `input.set` | `[key], [mouse], [button], [axis], [value], [down], [cursor], [scroll], [clear]` | Press or release a key, mouse button or pad button, hold a pad axis at a value, put the cursor at [x, y] in window coordinates (held until clear), turn the wheel by scroll notches (read for one frame), or clear every injection: what the engine's input reads next frame beside the real devices. |
 | `input.get` |  | Every bound action with its state this frame: down, pressed, released, value. |
 | `light.set` | `[index], [position], [direction], [color], [intensity]` | Change a light. |
+| `object.find` | `[name], [tag], [component]` | The objects whose name holds name, whose tag is tag and that carry a component of that kind -- whichever are given, together: index, id, name, tag, whether active and their components' kinds, the first 256, with count (how many there are) and more. |
+| `frame.until` | `expression, [timeout]` | Run frame by frame until the expression holds, then hold at that frame and answer it (frame.stats with met, the value, from and frames), or after timeout frames (600 by default) with met false. The expression reads the game's objects: Player.Health.value < 50, 'Enemy 2'.position.y < -10 \|\| frame > 900, #12.Rigidbody.velocity.x >= 3 (an object by name, quoted name or id; a component kind and field, quoted where the name has a space; position; an axis x, y, z or w; numbers, true, false, frame; + - * / < <= > >= == != && \|\| ! and parentheses). A path with nothing there is false, not 0. A malformed expression is refused saying where and what was expected. Nothing asked after it is answered before it. |
+| `watch.add` | `expression, [name]` | Read the expression at every frame the world moves, the last 4096 frames kept. Answers the watch's number. The expression is frame.until's. |
+| `watch.get` | `watch, [since]` | A watch's values frame by frame after frame since (all it keeps by default), oldest first, at most 1024 an answer: frames, values (null where it read nothing there), more and next, the frame to ask from for the rest. |
+| `watch.list` |  | Every watch: its number, name, expression and how many samples it holds. |
+| `watch.remove` | `watch` | Stop a watch and let its samples go. |
 | `object.list` | `[filter]` | The scene's game objects: index, id (what an object field holds to name it), name, tag, whether active, and the kinds of their components in order. The scene itself comes first as index -1, named Scene: its components are what is the scene's rather than any object's (Environment, Rendering, a script keeping the game's rules). With filter, only the objects whose name has the text. |
 | `object.get` | `object` | One object and every component on it: its kind, whether enabled, its version (how many times it has changed) and its fields by name. object is an index from object.list, a name, or Scene. |
 | `component.kinds` |  | Every kind of component there is -- the engine's and the game's -- with the heading it is listed under, whether an object may carry only one, whether it is the scene's, and each field's name, type (bool, int, float, vec3, color, rotation, enum, text, asset, object: another object's id), range, choices and tooltip. |
@@ -109,6 +115,42 @@ Read the same frame twice and the answer is the same.
 loop measures the round trip as much as the request.
 
 `snapshot` answers when the file is on disk, not when the request was accepted.
+
+## Running to a moment, and watching the way there
+
+An agent chasing a bug wants the frame where it happens, not a guess at
+how many frames to step. `frame.until` runs the game until an expression
+over its objects holds. It then holds at that frame and answers it, so
+whatever is asked next is about that moment:
+
+    frame.pause
+    watch.add expression="Player.Health.value" name=health   -> {"watch": 1}
+    frame.until expression="Player.Health.value < 50" timeout=600
+                                           -> {"met": true, "frame": 412, "value": 1, ...}
+    watch.get watch=1                      -> {"frames": [361, ..., 412], "values": [100, ..., 49]}
+
+An expression reads fields of components by object, kind and field name:
+`Player.Health.value`. An object can also be given as `'Enemy 2'` (quoted,
+for a name with a space) or by its id (`#12`), and a kind or field with a
+space in its name is quoted too: `'Street Lamp'.Light.'outer angle'`. An
+object's `position` has `.x`, `.y` and `.z`. A vector field without an
+axis is its length; a bool reads 1 or 0, and an enum its index. The
+expression combines these with numbers, `true`, `false` and `frame`, using
+`+ - * /`, `< <= > >= == !=`, `&& || !` and parentheses.
+
+A path that finds nothing (an object not spawned yet, a kind it does not
+carry, a misspelt field) is false, not 0. So `frame.until` waits for it,
+and a watch records `null` for that frame. A malformed expression is
+refused, and the error says where and what was expected:
+
+    frame.until expression="Player.position.x <"
+      -> error: the expression: at 20: expected a number, a path or '(', found the end
+
+Nothing asked after a `frame.until` is answered before it, as for
+`frame.step`. A watch keeps the last 4,096 frames it read. `watch.get`
+answers 1,024 at a time, with `more` and `next` (the frame to ask from) for
+the rest. `object.find` narrows the scene by part of a name, a tag and a
+component kind before any of this.
 
 ## Reading pixels
 

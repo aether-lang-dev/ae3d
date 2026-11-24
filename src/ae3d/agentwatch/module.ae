@@ -1,0 +1,507 @@
+// Expressions over a running game's objects, for the agent channel's
+// frame.until and watch ops (#510): what a field of a component of an
+// object is, compared and combined, read at a frame.
+//
+//     Player.Health.value < 50
+//     object.Player.position.y < -10 || frame > 600
+//     #12.Rigidbody.velocity.x >= 3 && 'Enemy 2'.Health.value == 0
+//
+// The language:
+//   expr    or
+//   or      and ('||' and)*
+//   and     cmp ('&&' cmp)*
+//   cmp     sum (('<' | '<=' | '>' | '>=' | '==' | '!=') sum)?
+//   sum     term (('+' | '-') term)*
+//   term    unary (('*' | '/') unary)*
+//   unary   '-' unary | '!' unary | atom
+//   atom    number | true | false | frame | path | '(' expr ')'
+//   path    ['object' '.'] object '.' (Kind '.' field | 'position') ['.' x|y|z|w]
+//   object  a name, '#' and an id, or a name in single quotes
+//   Kind, field  a name, or one in single quotes ('outer angle')
+// A comparison is 1 or 0; '&&' and '||' take anything not 0 as true. A
+// vector field is its length unless an axis is named; a bool is 1 or 0; an
+// enum its choice's index. A path whose object, kind or field is not there
+// at a frame reads as nothing there (missing): a comparison with it is
+// false, and the whole is false, so `until` waits for it to exist.
+//
+// compile() parses once, naming what was wrong and where; evaluate() reads
+// the scene at the frame it is asked.
+
+import std.list
+import std.heap
+import std.string
+import ae3d.core
+import ae3d.behaviour
+import ae3d.component
+
+exports (
+    Expr, compile, evaluate, expr_free, last_error, last_missing, text_of
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern sqrt(x: float) -> float
+
+// Node kinds.
+const N_NUMBER = 0
+const N_FRAME = 1
+const N_FIELD = 2                // object, kind, field, axis
+const N_POSITION = 3             // object, axis
+const N_NOT = 4
+const N_NEG = 5
+const N_BINARY = 6
+
+// Binary operators.
+const OP_OR = 0
+const OP_AND = 1
+const OP_LT = 2
+const OP_LE = 3
+const OP_GT = 4
+const OP_GE = 5
+const OP_EQ = 6
+const OP_NE = 7
+const OP_ADD = 8
+const OP_SUB = 9
+const OP_MUL = 10
+const OP_DIV = 11
+
+struct Node {
+    kind: int
+    op: int
+    value: float
+    left: *Node
+    right: *Node
+    object: string               // a name, or "" when by id
+    id: int                      // the object's id, or -1 when by name
+    kind_name: string
+    field: string
+    axis: int                    // -1 none (a vector's length), 0..3 x y z w
+}
+
+struct Expr {
+    root: *Node
+    text: string
+}
+
+var g_error = ""
+var g_missing = false            // the last evaluate met a path with nothing there
+
+last_error() -> string { return g_error }
+last_missing() -> bool { return g_missing }
+text_of(e: *Expr) -> string { return e.text }
+
+// --- parsing ------------------------------------------------------------------------------------
+
+struct Parser {
+    text: string
+    at: int
+    length: int
+    failed: bool
+}
+
+// The expression, or null with last_error saying where and what.
+compile(text: string) -> *Expr {
+    g_error = ""
+    p = Parser { text: text, at: 0, length: string.length(text), failed: false }
+    root = parse_or(&p)
+    blanks(&p)
+    if !p.failed && p.at < p.length { fail(&p, "an operator or the end") }
+    if p.failed {
+        node_free(root)
+        return null
+    }
+    e = heap.new(Expr)
+    e.root = root
+    e.text = string.copy(text)
+    return e
+}
+
+fail(p: *Parser, wanted: string) {
+    if p.failed { return }
+    p.failed = true
+    seen = "the end"
+    if p.at < p.length { seen = "'${string.substring(p.text, p.at, p.at + 1)}'" }
+    g_error = "at ${p.at + 1}: expected ${wanted}, found ${seen}"
+}
+
+blanks(p: *Parser) {
+    while p.at < p.length {
+        c = string.char_at(p.text, p.at)
+        if c != 32 && c != 9 && c != 10 && c != 13 { return }
+        p.at = p.at + 1
+    }
+}
+
+// Whether the text at the cursor is `token`; taken if it is.
+take(p: *Parser, token: string) -> bool {
+    blanks(p)
+    n = string.length(token)
+    if p.at + n > p.length { return false }
+    k = 0
+    while k < n {
+        if string.char_at(p.text, p.at + k) != string.char_at(token, k) { return false }
+        k = k + 1
+    }
+    p.at = p.at + n
+    return true
+}
+
+binary(op: int, left: *Node, right: *Node) -> *Node {
+    n = heap.new(Node)
+    n.kind = N_BINARY
+    n.op = op
+    n.left = left
+    n.right = right
+    return n
+}
+
+parse_or(p: *Parser) -> *Node {
+    left = parse_and(p)
+    while !p.failed && take(p, "||") { left = binary(OP_OR, left, parse_and(p)) }
+    return left
+}
+
+parse_and(p: *Parser) -> *Node {
+    left = parse_cmp(p)
+    while !p.failed && take(p, "&&") { left = binary(OP_AND, left, parse_cmp(p)) }
+    return left
+}
+
+parse_cmp(p: *Parser) -> *Node {
+    left = parse_sum(p)
+    if p.failed { return left }
+    // Two-character operators before their one-character prefixes.
+    if take(p, "<=") { return binary(OP_LE, left, parse_sum(p)) }
+    if take(p, ">=") { return binary(OP_GE, left, parse_sum(p)) }
+    if take(p, "==") { return binary(OP_EQ, left, parse_sum(p)) }
+    if take(p, "!=") { return binary(OP_NE, left, parse_sum(p)) }
+    if take(p, "<") { return binary(OP_LT, left, parse_sum(p)) }
+    if take(p, ">") { return binary(OP_GT, left, parse_sum(p)) }
+    return left
+}
+
+parse_sum(p: *Parser) -> *Node {
+    left = parse_term(p)
+    while !p.failed {
+        if take(p, "+") {
+            left = binary(OP_ADD, left, parse_term(p))
+        } else if take(p, "-") {
+            left = binary(OP_SUB, left, parse_term(p))
+        } else {
+            return left
+        }
+    }
+    return left
+}
+
+parse_term(p: *Parser) -> *Node {
+    left = parse_unary(p)
+    while !p.failed {
+        if take(p, "*") {
+            left = binary(OP_MUL, left, parse_unary(p))
+        } else if take(p, "/") {
+            left = binary(OP_DIV, left, parse_unary(p))
+        } else {
+            return left
+        }
+    }
+    return left
+}
+
+parse_unary(p: *Parser) -> *Node {
+    if take(p, "-") {
+        n = heap.new(Node)
+        n.kind = N_NEG
+        n.left = parse_unary(p)
+        return n
+    }
+    // '!' and not '!=': a '!' before an '=' is the comparison's.
+    blanks(p)
+    if p.at < p.length && string.char_at(p.text, p.at) == 33 &&
+       !(p.at + 1 < p.length && string.char_at(p.text, p.at + 1) == 61) {
+        p.at = p.at + 1
+        n = heap.new(Node)
+        n.kind = N_NOT
+        n.left = parse_unary(p)
+        return n
+    }
+    return parse_atom(p)
+}
+
+is_digit(c: int) -> bool { return c >= 48 && c <= 57 }
+is_name_char(c: int) -> bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || is_digit(c) || c == 95 }
+
+parse_atom(p: *Parser) -> *Node {
+    blanks(p)
+    if p.at >= p.length {
+        fail(p, "a number, a path or '('")
+        return null
+    }
+    c = string.char_at(p.text, p.at)
+    if c == 40 {
+        p.at = p.at + 1
+        inner = parse_or(p)
+        if !take(p, ")") { fail(p, "')'") }
+        return inner
+    }
+    if is_digit(c) || c == 46 { return parse_number(p) }
+    // A name, '#' with an id, or a quoted name: a word or the head of a path.
+    first = ""
+    id = 0 - 1
+    if c == 35 {
+        p.at = p.at + 1
+        start = p.at
+        while p.at < p.length && is_digit(string.char_at(p.text, p.at)) { p.at = p.at + 1 }
+        if p.at == start {
+            fail(p, "an object id after '#'")
+            return null
+        }
+        parsed, _bad = string.to_int(string.substring(p.text, start, p.at))
+        id = parsed
+    } else if c == 39 {
+        p.at = p.at + 1
+        start = p.at
+        while p.at < p.length && string.char_at(p.text, p.at) != 39 { p.at = p.at + 1 }
+        if p.at >= p.length {
+            fail(p, "a closing quote")
+            return null
+        }
+        first = string.substring(p.text, start, p.at)
+        p.at = p.at + 1
+    } else if is_name_char(c) {
+        first = word(p)
+    } else {
+        fail(p, "a number, a path or '('")
+        return null
+    }
+    if id < 0 && first == "true" { return number(1.0) }
+    if id < 0 && first == "false" { return number(0.0) }
+    if id < 0 && first == "frame" && !next_is_dot(p) {
+        n = heap.new(Node)
+        n.kind = N_FRAME
+        return n
+    }
+    // 'object.' is an optional head.
+    if id < 0 && first == "object" && next_is_dot(p) {
+        p.at = p.at + 1
+        return parse_atom(p)
+    }
+    return parse_path(p, first, id)
+}
+
+next_is_dot(p: *Parser) -> bool { return p.at < p.length && string.char_at(p.text, p.at) == 46 }
+
+word(p: *Parser) -> string {
+    start = p.at
+    while p.at < p.length && is_name_char(string.char_at(p.text, p.at)) { p.at = p.at + 1 }
+    return string.substring(p.text, start, p.at)
+}
+
+// A kind's or a field's name: a word, or anything in single quotes.
+segment(p: *Parser) -> string {
+    if p.at < p.length && string.char_at(p.text, p.at) == 39 {
+        p.at = p.at + 1
+        start = p.at
+        while p.at < p.length && string.char_at(p.text, p.at) != 39 { p.at = p.at + 1 }
+        if p.at >= p.length {
+            fail(p, "a closing quote")
+            return ""
+        }
+        out = string.substring(p.text, start, p.at)
+        p.at = p.at + 1
+        return out
+    }
+    return word(p)
+}
+
+number(v: float) -> *Node {
+    n = heap.new(Node)
+    n.kind = N_NUMBER
+    n.value = v
+    return n
+}
+
+parse_number(p: *Parser) -> *Node {
+    start = p.at
+    while p.at < p.length && (is_digit(string.char_at(p.text, p.at)) || string.char_at(p.text, p.at) == 46) { p.at = p.at + 1 }
+    text = string.substring(p.text, start, p.at)
+    value, err = string.to_float(text)
+    if err != "" {
+        p.at = start
+        fail(p, "a number")
+        return null
+    }
+    return number(value)
+}
+
+// After the object: '.' Kind '.' field, or '.position'; then an axis.
+parse_path(p: *Parser, object: string, id: int) -> *Node {
+    n = heap.new(Node)
+    n.object = string.copy(object)
+    n.id = id
+    n.axis = 0 - 1
+    n.kind_name = ""
+    n.field = ""
+    if !next_is_dot(p) {
+        fail(p, "'.' and a component kind, or '.position', after the object")
+        return n
+    }
+    p.at = p.at + 1
+    second = segment(p)
+    if p.failed { return n }
+    if second == "" {
+        fail(p, "a component kind or 'position'")
+        return n
+    }
+    if second == "position" {
+        n.kind = N_POSITION
+    } else {
+        n.kind = N_FIELD
+        n.kind_name = string.copy(second)
+        if !next_is_dot(p) {
+            fail(p, "'.' and a field of ${second}")
+            return n
+        }
+        p.at = p.at + 1
+        third = segment(p)
+        if p.failed { return n }
+        if third == "" {
+            fail(p, "a field of ${second}")
+            return n
+        }
+        n.field = string.copy(third)
+    }
+    if next_is_dot(p) {
+        save = p.at
+        p.at = p.at + 1
+        axis = word(p)
+        if axis == "x" { n.axis = 0 }
+        else if axis == "y" { n.axis = 1 }
+        else if axis == "z" { n.axis = 2 }
+        else if axis == "w" { n.axis = 3 }
+        else {
+            p.at = save + 1
+            fail(p, "an axis, x, y, z or w")
+        }
+    }
+    return n
+}
+
+// --- reading ------------------------------------------------------------------------------------
+
+// The expression's value at the scene as it is (`frame` the frame it is
+// read at). last_missing says whether a path met nothing there.
+evaluate(e: *Expr, scene: *Scene, frame: int) -> float {
+    g_missing = false
+    v, present = eval_node(e.root, scene, frame)
+    if !present { g_missing = true }
+    if !present { return 0.0 }
+    return v
+}
+
+// A value, and whether everything it read was there.
+eval_node(n: *Node, scene: *Scene, frame: int) -> (float, bool) {
+    if n == null { return 0.0, false }
+    if n.kind == N_NUMBER { return n.value, true }
+    if n.kind == N_FRAME { return frame as float, true }
+    if n.kind == N_FIELD || n.kind == N_POSITION { return read_path(n, scene) }
+    if n.kind == N_NEG {
+        v, ok = eval_node(n.left, scene, frame)
+        return 0.0 - v, ok
+    }
+    if n.kind == N_NOT {
+        v, ok = eval_node(n.left, scene, frame)
+        if !ok { return 0.0, false }
+        if v == 0.0 { return 1.0, true }
+        return 0.0, true
+    }
+    a, aok = eval_node(n.left, scene, frame)
+    b, bok = eval_node(n.right, scene, frame)
+    // '||' is true when either side is there and true; '&&' only when both.
+    if n.op == OP_OR {
+        if (aok && a != 0.0) || (bok && b != 0.0) { return 1.0, true }
+        return 0.0, aok && bok
+    }
+    if n.op == OP_AND {
+        if aok && bok && a != 0.0 && b != 0.0 { return 1.0, true }
+        return 0.0, aok && bok
+    }
+    if !aok || !bok { return 0.0, false }
+    if n.op == OP_LT { return truth(a < b), true }
+    if n.op == OP_LE { return truth(a <= b), true }
+    if n.op == OP_GT { return truth(a > b), true }
+    if n.op == OP_GE { return truth(a >= b), true }
+    if n.op == OP_EQ { return truth(a == b), true }
+    if n.op == OP_NE { return truth(a != b), true }
+    if n.op == OP_ADD { return a + b, true }
+    if n.op == OP_SUB { return a - b, true }
+    if n.op == OP_MUL { return a * b, true }
+    if b == 0.0 { return 0.0, false }
+    return a / b, true
+}
+
+truth(b: bool) -> float {
+    if b { return 1.0 }
+    return 0.0
+}
+
+object_of(n: *Node, scene: *Scene) -> *GameObject {
+    if scene == null { return null }
+    if n.id >= 0 { return behaviour.scene_find_id(scene, n.id) }
+    return behaviour.scene_find(scene, n.object)
+}
+
+read_path(n: *Node, scene: *Scene) -> (float, bool) {
+    o = object_of(n, scene)
+    if o == null { return 0.0, false }
+    if n.kind == N_POSITION { return axis_of(behaviour.object_world_position(o), n.axis), true }
+    k = component.kind_named(n.kind_name)
+    if k == null { return 0.0, false }
+    c = component.find(o, k)
+    if c == null { return 0.0, false }
+    f = component.field_named(k, n.field)
+    if f == null { return 0.0, false }
+    if f.type == component.TYPE_FLOAT { return component.get_float(c, f), true }
+    if f.type == component.TYPE_INT || f.type == component.TYPE_ENUM || f.type == component.TYPE_OBJECT {
+        return component.get_int(c, f) as float, true
+    }
+    if f.type == component.TYPE_BOOL { return truth(component.get_bool(c, f)), true }
+    if f.type == component.TYPE_VEC3 || f.type == component.TYPE_COLOR { return axis_of(component.get_vec3(c, f), n.axis), true }
+    if f.type == component.TYPE_ROTATION {
+        q = component.get_rotation(c, f)
+        if n.axis == 0 { return q.x, true }
+        if n.axis == 1 { return q.y, true }
+        if n.axis == 2 { return q.z, true }
+        return q.w, true
+    }
+    // Text has no number.
+    return 0.0, false
+}
+
+axis_of(v: Vec3, axis: int) -> float {
+    if axis == 0 { return v.x }
+    if axis == 1 { return v.y }
+    if axis == 2 { return v.z }
+    return sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+}
+
+// --- freeing ------------------------------------------------------------------------------------
+
+expr_free(e: *Expr) {
+    if e == null { return }
+    node_free(e.root)
+    string.free(e.text)
+    heap.free(e)
+}
+
+node_free(n: *Node) {
+    if n == null { return }
+    node_free(n.left)
+    node_free(n.right)
+    if n.kind == N_FIELD || n.kind == N_POSITION {
+        string.free(n.object)
+        string.free(n.kind_name)
+        string.free(n.field)
+    }
+    heap.free(n)
+}
