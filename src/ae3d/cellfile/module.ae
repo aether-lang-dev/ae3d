@@ -1,0 +1,502 @@
+// A cell of a streamed world as one file (#917): its models' geometry,
+// materials, instances and what each is to the world (drawn, shadowed, a
+// collider, a nav blocker), written so a worker thread can read and decode
+// it whole and the loop thread need only hand the result to the engine.
+//
+// Why a file of its own and not a scene file: a scene file names its
+// meshes' OBJ files and its loader parses them where it is called, through
+// state the loader keeps for itself, so a cell loaded that way is parsed on
+// the frame that wants it. Here a model's vertices are the bytes the
+// renderer takes, and decode touches nothing the loop thread does: the
+// file's bytes, its meshes (geometry's, plain memory), its materials' JSON
+// (std.json keeps its state a thread) and the textures it names (picture,
+// what the job pool already decodes in parallel).
+//
+// The file, little-endian:
+//   0   "AECL", version, model count, 0
+//   16  total length (64 bits)
+//   24  each model:
+//         name                        (32-bit length, bytes)
+//         flags                       FLAG_*
+//         position, rotation, scale   ten 64-bit floats, the world's
+//         material                    its JSON (scene.material_json), or empty
+//         group count, each group     first index, index count, material JSON
+//         vertex count, index count, instance count
+//         vertices                    geometry's 36 bytes each
+//         indices                     32 bits each
+//         instances                   16 32-bit floats each, column by column
+//
+// Write with write; decode (anywhere), then instantiate each model (on the
+// loop thread) and data_free.
+
+import std.list
+import std.heap
+import std.string
+import std.strarr
+import std.bytes
+import std.mem
+import std.fs
+import std.json
+import ae3d.core
+import ae3d.geometry
+import ae3d.picture
+import ae3d.scene
+
+exports (
+    CellData, CellModel, CellImage,
+    write, decode, data_free, model_count, model_at, instantiate, image_count, image_at, data_bytes,
+    FLAG_VISIBLE, FLAG_SHADOW, FLAG_COLLIDER, FLAG_NAV, MAGIC, VERSION
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+const MAGIC = 1279476033         // "AECL"
+const VERSION = 1
+const HEADER = 24
+const VERTEX_BYTES = 36
+
+const FLAG_VISIBLE = 1           // drawn
+const FLAG_SHADOW = 2            // casts a shadow
+const FLAG_COLLIDER = 4          // a static collider of its triangles
+const FLAG_NAV = 8               // blocks the ground's walkers (a nav blocker)
+
+struct CellGroup {
+    start: int
+    count: int
+    material: ptr                // its JSON, or null
+}
+
+// A model as the file has it, decoded: its geometry built, its material
+// read, waiting for instantiate.
+struct CellModel {
+    name: string
+    flags: int
+    px: float
+    py: float
+    pz: float
+    rx: float
+    ry: float
+    rz: float
+    rw: float
+    sx: float
+    sy: float
+    sz: float
+    material: ptr                // its JSON, or null
+    groups: ptr                  // list of *CellGroup
+    mesh: ptr                    // a geometry mesh, the model's once instantiated
+    instances: ptr               // f32[instance_count * 16], or null
+    instance_count: int
+    bytes: long                  // its vertices, indices and instances
+}
+
+// A texture the cell names, decoded with it.
+struct CellImage {
+    path: string
+    image: ptr                   // an ae3d.picture, the taker's; null once taken
+}
+
+struct CellData {
+    models: ptr                  // list of *CellModel
+    images: ptr                  // list of *CellImage
+    paths: ptr                   // strarr: every texture its materials name, decoded or skipped
+    bytes: long                  // the geometry's and the decoded textures'
+    error: string                // "" when it read
+}
+
+// --- writing --------------------------------------------------------------------------------------
+
+// The models into a cell file at `path`, as they stand in the world (each
+// model's own transform composed with its parents'). `flags`, an int[] beside
+// the list or null, adds FLAG_COLLIDER and FLAG_NAV; drawn and shadowed are
+// the models' own. "" when written, else why not.
+write(path: string, models: ptr, flags: ptr) -> string {
+    n = list.size(models)
+    // Every model's JSON first, so the file's size is known before it is laid out.
+    texts = strarr.new()
+    total = HEADER
+    i = 0
+    while i < n {
+        m = list.get_raw(models, i) as *Model
+        core.model_update_matrix(m)
+        material_text = text_of_material(m.material)
+        strarr.push_copy(texts, material_text)
+        total = total + 4 + string.length(core.text(m.name)) + 4 + 80 + 4 + string.length(material_text) + 4
+        g = 0
+        while g < core.model_group_count(m) {
+            group_text = text_of_material(core.model_group(m, g).material)
+            strarr.push_copy(texts, group_text)
+            total = total + 12 + string.length(group_text)
+            g = g + 1
+        }
+        total = total + 12 + core.mesh_vertex_count(m.mesh) * VERTEX_BYTES + core.mesh_index_count(m.mesh) * 4 +
+                instances_of(m) * 64
+        i = i + 1
+    }
+    b = bytes.new(total)
+    bytes.set_length(b, total)
+    bytes.set_le32(b, 0, MAGIC)
+    bytes.set_le32(b, 4, VERSION)
+    bytes.set_le32(b, 8, n)
+    bytes.set_le32(b, 12, 0)
+    bytes.set_le64(b, 16, total as long)
+    at = HEADER
+    text_at = 0
+    i = 0
+    while i < n {
+        m = list.get_raw(models, i) as *Model
+        at = put_string(b, at, core.text(m.name))
+        f = 0
+        if m.visible { f = f | FLAG_VISIBLE }
+        if m.casts_shadow { f = f | FLAG_SHADOW }
+        if flags != null { f = f | ((flags as int[])[i] & (FLAG_COLLIDER | FLAG_NAV)) }
+        bytes.set_le32(b, at, f)
+        at = at + 4
+        at = put_float(b, at, m.world_position.x)
+        at = put_float(b, at, m.world_position.y)
+        at = put_float(b, at, m.world_position.z)
+        at = put_float(b, at, m.world_rotation.x)
+        at = put_float(b, at, m.world_rotation.y)
+        at = put_float(b, at, m.world_rotation.z)
+        at = put_float(b, at, m.world_rotation.w)
+        at = put_float(b, at, m.world_scale.x)
+        at = put_float(b, at, m.world_scale.y)
+        at = put_float(b, at, m.world_scale.z)
+        at = put_string(b, at, strarr.get(texts, text_at))
+        text_at = text_at + 1
+        groups = core.model_group_count(m)
+        bytes.set_le32(b, at, groups)
+        at = at + 4
+        g = 0
+        while g < groups {
+            group = core.model_group(m, g)
+            bytes.set_le32(b, at, group.index_start)
+            bytes.set_le32(b, at + 4, group.index_count)
+            at = put_string(b, at + 8, strarr.get(texts, text_at))
+            text_at = text_at + 1
+            g = g + 1
+        }
+        vertices = core.mesh_vertex_count(m.mesh)
+        indices = core.mesh_index_count(m.mesh)
+        count = instances_of(m)
+        bytes.set_le32(b, at, vertices)
+        bytes.set_le32(b, at + 4, indices)
+        bytes.set_le32(b, at + 8, count)
+        at = at + 12
+        data = bytes.data(b)
+        if vertices > 0 { mem.copy_at(data, at as long, geometry.mesh_vertex_data(m.mesh), 0 as long, (vertices * VERTEX_BYTES) as long) }
+        at = at + vertices * VERTEX_BYTES
+        if indices > 0 { mem.copy_at(data, at as long, geometry.mesh_index_data(m.mesh), 0 as long, (indices * 4) as long) }
+        at = at + indices * 4
+        if count > 0 { mem.copy_at(data, at as long, geometry.inst_matrix_data(m.instances), 0 as long, (count * 64) as long) }
+        at = at + count * 64
+        i = i + 1
+    }
+    strarr.free(texts)
+    err = fs.write_binary(path, (bytes.data(b) as byte[])[0..total])
+    bytes.free(b)
+    if err != "" { return "cannot write ${path}: ${err}" }
+    return ""
+}
+
+// The instances a model draws, or 0 for one drawn once.
+instances_of(m: *Model) -> int {
+    if !m.is_instanced || m.instances == null { return 0 }
+    return core.model_instance_count(m)
+}
+
+text_of_material(material: *Material) -> string {
+    if material == null { return "" }
+    node = scene.material_json(material)
+    text = json.stringify_raw(node)
+    json.free(node)
+    return text
+}
+
+put_string(b: ptr, at: int, text: string) -> int {
+    length = string.length(text)
+    bytes.set_le32(b, at, length)
+    if length > 0 { bytes.copy_from_string(b, at + 4, text, length) }
+    return at + 4 + length
+}
+
+put_float(b: ptr, at: int, v: float) -> int {
+    bytes.set_le64(b, at, mem.bits_of_float(v))
+    return at + 8
+}
+
+// --- reading ---------------------------------------------------------------------------------------
+
+// The cell file at `path`, decoded whole: every model's geometry built, its
+// materials read, and every texture they name decoded but those in `skip`
+// (a strarr, or null: the paths a renderer already holds). Touches nothing
+// but its own, so any thread may run it. Always a CellData: its error says
+// whether it read.
+decode(path: string, skip: ptr) -> *CellData {
+    d = heap.new(CellData)
+    d.models = list.new()
+    d.images = list.new()
+    d.paths = strarr.new()
+    d.error = ""
+    content, length, err = fs.read_binary(path)
+    if err != "" {
+        d.error = "cannot read ${path}"
+        return d
+    }
+    if length < HEADER {
+        d.error = "${path} is not a cell file"
+        return d
+    }
+    b = bytes.new(length + 4)
+    bytes.copy_from_string(b, 0, content, length)
+    if bytes.get_le32(b, 0) != MAGIC || bytes.get_le32(b, 4) != VERSION || bytes.get_le64(b, 16) != (length as long) {
+        bytes.free(b)
+        d.error = "${path} is not a cell file of version ${VERSION}, or is cut short"
+        return d
+    }
+    raw = bytes.data(b)
+    n = bytes.get_le32(b, 8)
+    at = HEADER
+    i = 0
+    while i < n && d.error == "" {
+        at = read_model(d, b, raw, at, length, path)
+        i = i + 1
+    }
+    bytes.free(b)
+    if d.error == "" { decode_images(d, skip) }
+    return d
+}
+
+// One model from `at`; where the next begins. A count that runs past the
+// file's end is an error, not a read past it.
+read_model(d: *CellData, b: ptr, raw: ptr, start: int, length: int, path: string) -> int {
+    at = start
+    cm = heap.new(CellModel)
+    cm.groups = list.new()
+    list.add_raw(d.models, cm as ptr)
+    if !room(at, 4, length) { return short(d, path) }
+    name_length = bytes.get_le32(b, at)
+    if name_length < 0 || !room(at + 4, name_length + 4 + 80 + 4, length) { return short(d, path) }
+    cm.name = bytes.string_from_ptr(raw + at + 4, name_length)
+    at = at + 4 + name_length
+    cm.flags = bytes.get_le32(b, at)
+    at = at + 4
+    cm.px = get_float(b, at)
+    cm.py = get_float(b, at + 8)
+    cm.pz = get_float(b, at + 16)
+    cm.rx = get_float(b, at + 24)
+    cm.ry = get_float(b, at + 32)
+    cm.rz = get_float(b, at + 40)
+    cm.rw = get_float(b, at + 48)
+    cm.sx = get_float(b, at + 56)
+    cm.sy = get_float(b, at + 64)
+    cm.sz = get_float(b, at + 72)
+    at = at + 80
+    material_length = bytes.get_le32(b, at)
+    if material_length < 0 || !room(at + 4, material_length + 4, length) { return short(d, path) }
+    cm.material = parse_at(raw, at + 4, material_length)
+    at = at + 4 + material_length
+    groups = bytes.get_le32(b, at)
+    at = at + 4
+    g = 0
+    while g < groups {
+        if !room(at, 12, length) { return short(d, path) }
+        group = heap.new(CellGroup)
+        group.start = bytes.get_le32(b, at)
+        group.count = bytes.get_le32(b, at + 4)
+        group_length = bytes.get_le32(b, at + 8)
+        list.add_raw(cm.groups, group as ptr)
+        if group_length < 0 || !room(at + 12, group_length, length) { return short(d, path) }
+        group.material = parse_at(raw, at + 12, group_length)
+        at = at + 12 + group_length
+        g = g + 1
+    }
+    if !room(at, 12, length) { return short(d, path) }
+    vertices = bytes.get_le32(b, at)
+    indices = bytes.get_le32(b, at + 4)
+    count = bytes.get_le32(b, at + 8)
+    at = at + 12
+    if vertices < 0 || indices < 0 || count < 0 { return short(d, path) }
+    geometry_bytes = (vertices as long) * (VERTEX_BYTES as long) + (indices as long) * (4 as long) + (count as long) * (64 as long)
+    if (at as long) + geometry_bytes > (length as long) { return short(d, path) }
+    cm.mesh = geometry.mesh_create()
+    if vertices > 0 && geometry.mesh_append_raw(cm.mesh, raw + at, vertices, raw + at + vertices * VERTEX_BYTES, indices) == 0 {
+        d.error = "${path}: a mesh of ${vertices} vertices could not be made"
+        return at
+    }
+    at = at + vertices * VERTEX_BYTES + indices * 4
+    if count > 0 {
+        cm.instances = calloc(count * 16, 4)
+        mem.copy_at(cm.instances, 0 as long, raw, at as long, (count * 64) as long)
+        cm.instance_count = count
+    }
+    at = at + count * 64
+    cm.bytes = geometry_bytes
+    d.bytes = d.bytes + geometry_bytes
+    return at
+}
+
+room(at: int, wanted: int, length: int) -> bool { return (at as long) + (wanted as long) <= (length as long) }
+
+short(d: *CellData, path: string) -> int {
+    d.error = "${path} is cut short"
+    return 0
+}
+
+get_float(b: ptr, at: int) -> float { return mem.float_from_bits(bytes.get_le64(b, at)) }
+
+parse_at(raw: ptr, at: int, length: int) -> ptr {
+    if length == 0 { return null }
+    return json.parse_raw(bytes.string_from_ptr(raw + at, length))
+}
+
+// Every texture the cell's materials name, once (d.paths), decoded but
+// those in `skip`.
+decode_images(d: *CellData, skip: ptr) {
+    i = 0
+    while i < list.size(d.models) {
+        cm = list.get_raw(d.models, i) as *CellModel
+        image_paths(cm.material, d.paths)
+        g = 0
+        while g < list.size(cm.groups) {
+            image_paths((list.get_raw(cm.groups, g) as *CellGroup).material, d.paths)
+            g = g + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < strarr.size(d.paths) {
+        if skip != null && has(skip, strarr.get(d.paths, i)) {
+            i = i + 1
+            continue
+        }
+        image = picture.load(strarr.get(d.paths, i))
+        if image != null {
+            ci = heap.new(CellImage)
+            ci.path = string.copy(strarr.get(d.paths, i))
+            ci.image = image
+            list.add_raw(d.images, ci as ptr)
+            d.bytes = d.bytes + (picture.width(image) as long) * (picture.height(image) as long) * (4 as long)
+        }
+        i = i + 1
+    }
+}
+
+image_paths(node: ptr, out: ptr) {
+    if node == null { return }
+    add_path(json.object_get_raw(node, "texture_path"), out)
+    add_path(json.object_get_raw(node, "normal_path"), out)
+    add_path(json.object_get_raw(node, "emissive_path"), out)
+}
+
+add_path(node: ptr, out: ptr) {
+    if node == null { return }
+    path = json.get_string_raw(node)
+    if path == "" || has(out, path) { return }
+    strarr.push_copy(out, path)
+}
+
+has(paths: ptr, path: string) -> bool {
+    i = 0
+    while i < strarr.size(paths) {
+        if string.equals(strarr.get(paths, i), path) == 1 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// --- into the world ------------------------------------------------------------------------------------
+
+model_count(d: *CellData) -> int {
+    if d == null { return 0 }
+    return list.size(d.models)
+}
+
+model_at(d: *CellData, i: int) -> *CellModel { return list.get_raw(d.models, i) as *CellModel }
+
+image_count(d: *CellData) -> int {
+    if d == null { return 0 }
+    return list.size(d.images)
+}
+
+image_at(d: *CellData, i: int) -> *CellImage { return list.get_raw(d.images, i) as *CellImage }
+
+data_bytes(d: *CellData) -> long {
+    if d == null { return 0 as long }
+    return d.bytes
+}
+
+// The cell's model `i` as a model of the engine's, on the loop thread: its
+// geometry handed over (the decoded mesh becomes the model's), its
+// materials made and owned by it. The caller's to add and to free.
+instantiate(d: *CellData, i: int) -> *Model {
+    cm = model_at(d, i)
+    m = core.model_new()
+    if cm.mesh != null {
+        geometry.mesh_destroy(m.mesh)
+        m.mesh = cm.mesh
+        cm.mesh = null
+    }
+    core.model_set_name(m, cm.name)
+    m.visible = (cm.flags & FLAG_VISIBLE) != 0
+    m.casts_shadow = (cm.flags & FLAG_SHADOW) != 0
+    m.position = core.vec3(cm.px, cm.py, cm.pz)
+    m.rotation = core.quat(cm.rx, cm.ry, cm.rz, cm.rw)
+    m.scale = core.vec3(cm.sx, cm.sy, cm.sz)
+    if cm.material != null {
+        m.material = core.model_own_material(m, scene.material_from_json(cm.material))
+    }
+    g = 0
+    while g < list.size(cm.groups) {
+        group = list.get_raw(cm.groups, g) as *CellGroup
+        material = null as *Material
+        if group.material != null { material = core.model_own_material(m, scene.material_from_json(group.material)) }
+        core.model_add_group(m, material, group.start, group.count)
+        g = g + 1
+    }
+    if cm.instance_count > 0 {
+        core.model_enable_instancing(m, cm.instance_count)
+        core.model_set_instance_draw_count(m, cm.instance_count)
+        mem.copy_at(geometry.inst_matrix_data(m.instances), 0 as long, cm.instances, 0 as long, (cm.instance_count * 64) as long)
+        m.instances_updated = true
+    }
+    core.model_update_matrix(m)
+    core.model_recalculate_bounds(m)
+    return m
+}
+
+// Everything the decode made that was not handed over: meshes not
+// instantiated, textures not taken, the materials' JSON.
+data_free(d: *CellData) {
+    if d == null { return }
+    i = 0
+    while i < list.size(d.models) {
+        cm = list.get_raw(d.models, i) as *CellModel
+        if cm.mesh != null { geometry.mesh_destroy(cm.mesh) }
+        if cm.name != null { string.free(cm.name) }
+        if cm.material != null { json.free(cm.material) }
+        if cm.instances != null { free(cm.instances) }
+        g = 0
+        while g < list.size(cm.groups) {
+            group = list.get_raw(cm.groups, g) as *CellGroup
+            if group.material != null { json.free(group.material) }
+            heap.free(group)
+            g = g + 1
+        }
+        list.free(cm.groups)
+        heap.free(cm)
+        i = i + 1
+    }
+    list.free(d.models)
+    i = 0
+    while i < list.size(d.images) {
+        ci = list.get_raw(d.images, i) as *CellImage
+        if ci.image != null { picture.dispose(ci.image) }
+        string.free(ci.path)
+        heap.free(ci)
+        i = i + 1
+    }
+    list.free(d.images)
+    strarr.free(d.paths)
+    heap.free(d)
+}

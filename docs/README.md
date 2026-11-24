@@ -24,6 +24,7 @@ at the root is the front page; this is the map.
 | [Components](components.md) | Game objects as their components, the scene as an object: the registry of kinds the inspector, the scene file and the agent read, and the engine's own kinds |
 | [Scenes in code](scenes-in-code.md) | `ae3d.scenedsl`: a scene written as nested builders, nesting the hierarchy; placing it; the editor writing every saved scene as that code, and the test that holds code and file to one scene |
 | [Props placed by rule](scatter.md) | `ae3d.scatter` (#918): a district's props from tagged areas, roads, places kept clear and palettes, the same from a seed on every machine; one instanced model per prop; the scatter file; what it costs |
+| [Streaming a world](streaming.md) | `ae3d.worldbake` and `ae3d.stream` (#917): a world cut into cells and their far stand-ins, the cells loaded on workers around the camera and the players and let go behind them, a cell's states, its budget, what it holds, and the `stream.cells` op |
 | [The editor](editor.md) | The scene editor: panels, controls, undo, scene files, how the viewport is drawn |
 | [The game UI layer](ui.md) | Text and screen-space UI for a game: the TrueType reader, the distance-field glyph atlas, layout, and what they are held to |
 | [Performance](performance.md) | How a frame is measured, and where the frames are on the machine the numbers were taken on |
