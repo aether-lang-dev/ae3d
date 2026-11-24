@@ -97,7 +97,7 @@ that position agree without anything syncing them.
 | Mesh Renderer | the object's model | visible, casts shadow |
 | Material | the model's material | color, metallic, roughness, reflectivity, exposure, opacity, texture, normal map |
 | Light | the light it carries | type (point, directional, spot), color, intensity, temperature, range, direction, inner and outer angle |
-| Camera | the camera it carries | field of view, near, far, speed, sensitivity, invert mouse |
+| Camera | the camera it carries | position, yaw, pitch, field of view, near, far, speed, sensitivity, invert mouse |
 | Water | the surface's simulation | wave height, speed, scale and randomness, color, opacity, foam and its intensity, shore fade and foam, reflection, sky color, sky, caustics and their intensity and scale, shadow, distortion, normal strength |
 | Terrain | the terrain's voxel world | biome, seed, style (blocks or smooth); each write fills and draws the world again on its model |
 | Physics Body | the body record the scene file writes | body (static, kinematic, dynamic, character), collider (box, sphere, capsule, hull, mesh), friction, bounce, density; no body is no component |
@@ -105,7 +105,8 @@ that position agree without anything syncing them.
 | Natural Motion | the motion record the scene file writes with the figure | mode (animated, powered, limp), protective, strength, get up after; no natural motion is no component |
 | Audio Source | the source (ae3d.audio, registered by `audio.register_kind`) | clip, bus (music, effects, ambience, voice), volume, pitch, loop, spatial, min and max distance, Doppler, play on start; bound to the engine's sound in its start phase |
 | Environment | the engine | sky (an image, or none), sky color, environment map (a Radiance `.hdr` or OpenEXR picture that lights the scene in place of the sky's light, or none), its intensity and its yaw in degrees, sun by time, time of day, clouds, cloud wind, overcast and its color, fog, fog start, end, density and color |
-| Rendering | the engine | FXAA, bloom and its threshold and intensity, shadows and their distance, reflections and their height and strength, ambient occlusion and its radius and intensity, temporal antialiasing, exposure, global illumination, depth of field (on, focus distance, aperture, widest blur) |
+| Rendering | the engine | FXAA, bloom and its threshold and intensity, shadows and their distance, reflections and their height and strength, ambient occlusion and its radius and intensity, temporal antialiasing, exposure, global illumination, depth of field (on, focus distance, aperture, widest blur), face culling, frustum culling |
+| Weather | the scene's weather (ae3d.weather, `weather.weather_component_kind`) | kind (clear, rain, snow, dust, storm), intensity, wind heading in degrees, wind speed; each written through `weather_set`, so the particles, the fog and the light follow |
 
 `engine.object` gives every object a Transform first, and a drawn one its
 Mesh Renderer and Material. An object with no model still has a Transform:
@@ -117,22 +118,34 @@ its model is a group that is never drawn.
 Scene. It is never one of the scene's objects, so it is never found, listed,
 destroyed or cleared with them, and its components run before any object's
 in every phase. The engine puts **Environment** and **Rendering** on it,
-with the engine as their state. `engine_set_fog` and the Scene's fog row
-edit one value. A game puts its rules there too: a match timer, a score.
+with the engine as their state, and its **Camera**, the camera the scene is
+seen from, once the window has made one (`components.place_camera`). The
+editor puts its **Weather** there too (`weather.weather_attach`). A component
+of these the scene already carries, read from its file before the camera or
+the weather existed, gives them its fields and gives way. `engine_set_fog`
+and the Scene's fog row edit one value. A game puts its rules there too: a match timer, a score.
 
 ## Saved
 
 A component is written by whatever owns its state:
-- **A view** (Transform, Material, Light, Environment) is written by the
-  model, the light or the scene's view, as before.
+- **A view of a model or a light** (Transform, Material, Light) is written by
+  the model or the light.
 - **A component that owns its state** (a game's kind, a script) is written
-  by the registry. Its entry in the scene file's `components` array names
-  its model by its place among the models written, or -1 for the scene:
+  by the registry, and so is **one that borrows a state nothing else writes**
+  (`component.set_saved_borrowed`): the scene's Environment, Rendering,
+  Camera and Weather. What a scene is set to -- where it is seen from, its sky,
+  its passes, its weather -- is its root's components (#895).
+  A file written before that carried them in a `view` instead: it still
+  opens, through `scene.scene_load_view`, applied only where the file has one
+  (`scene.scene_has_view`).
 
-  ```json
-  {"kind": "Stamina", "enabled": true, "model": 3,
-   "fields": {"value": 40, "max": 100, "sprinting": false}}
-  ```
+The registry's entry in the scene file's `components` array names its model
+by its place among the models written, or -1 for the scene:
+
+```json
+{"kind": "Stamina", "enabled": true, "model": 3,
+ "fields": {"value": 40, "max": 100, "sprinting": false}}
+```
 
 Loading reads the fields by name:
 - a field the file does not name keeps its default, so a file from before
@@ -190,19 +203,14 @@ off the frame, and the scene file as the text form of the same document.
 ## Scripts
 
 A script is a component kind in a file of its own, built into a shared
-library and opened at run time (`ae3d.script`). The file declares its state
-struct, `create` and `destroy` for it, `fields(k)` registering what the
-inspector shows and the scene saves, and whichever of Unity's phases it
-needs -- `awake`, `start`, `update`, `fixed_update`, `late_update`,
-`on_destroy`. `script.script_kind(lib, name)` registers it under Scripts;
-from there it is given to objects as any component is. A game that compiles
-its scripts in registers the same functions with `component.kind` directly,
-so one file serves the editor and a shipped game.
-
-`script.script_reload(kind, old, new, scene, others)` swaps a rebuilt
-library under every object carrying it: each attachment's fields are read
-out, its state freed by the old library and made again by the new, and the
-fields written back by name.
+library and opened at run time (`ae3d.script`), or compiled into a program.
+Its struct derives its schema (`@derive(schema)`), which is its fields, their
+ranges, defaults and flags, and its phases are Unity's, by Unity's names.
+[scripting.md](scripting.md) is the whole of it: from an empty folder to a
+script, its fields and phases, building, loading, the layout check and hot
+reload. A kind is read off any struct the same way
+(`component.schema_kind(name, category, T_schema())`), a script's or the
+engine's.
 
 **One Aether runtime per process.** A script is Aether code, and Aether code
 calls the runtime -- its strings, its allocations, the accounting it keeps

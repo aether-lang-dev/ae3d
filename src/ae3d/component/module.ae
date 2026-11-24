@@ -55,16 +55,23 @@ import std.string
 import std.mem
 import std.json
 import std.observe
+import std.reflect
+import std.bytes
 import ae3d.core
 import ae3d.behaviour
 import ae3d.scene
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern realloc(p: ptr, size: long) -> ptr
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
 
 exports (
     ComponentKind, ComponentField,
     TYPE_BOOL, TYPE_INT, TYPE_FLOAT, TYPE_VEC3, TYPE_COLOR, TYPE_ROTATION, TYPE_ENUM, TYPE_TEXT, TYPE_ASSET, TYPE_OBJECT,
     FIELD_TRANSIENT, FIELD_READONLY, FIELD_HIDDEN,
     kind, kind_free, kinds_clear, kind_count, kind_at, kind_find, kind_named, kind_of, enum_choice_add,
-    set_unique, set_scene, set_observable, set_recorded, set_validate, set_category, phases, set_lifecycle,
+    set_unique, set_scene, set_observable, set_recorded, set_saved_borrowed, set_validate, set_category, phases, set_lifecycle, set_activation, set_collisions, set_triggers, set_net_spawn,
     bool_field, bool_property, int_field, int_property, float_field, float_property, vec3_field, color_field, rotation_field, enum_field, enum_property, text_field, asset_field, object_field,
     set_flags, set_tooltip, set_step,
     field_count, field_at, field_named, field_index, field_default_float, field_default_vec3,
@@ -74,7 +81,12 @@ exports (
     enum_choice_count, enum_choice, reset_field, reset,
     to_json, from_json, differs, copy_fields, last_error,
     set_schema_version, schema_version, rename_field, renamed_since, json_copy,
-    entry_json, saved_for, attach_loaded, kind_redefine, release_state, replace_state
+    entry_json, saved_for, attach_loaded, kind_redefine, release_state, replace_state,
+    state_of, state_named,
+    Capture, capture_new, capture_free, capture_length, put_long, put_float, put_text,
+    get_long_at, get_float_at, set_long_at, text_at, text_slots, capture_fields, captured_json,
+    capture_kind, captured_kinds, captured_kind_name, captured_kind_version, captured_kinds_free,
+    script_layout, schema_kind, schema_fields, schema_holds_text, make_state, schema_state_new, schema_state_free
 )
 
 const TYPE_BOOL = 0
@@ -149,6 +161,15 @@ struct ComponentKind {
     fixed_update: fn(ptr, *GameObject, float)
     late_update: fn(ptr, *GameObject, float)
     on_destroy: fn(ptr, *GameObject)
+    on_enable: fn(ptr, *GameObject)
+    on_disable: fn(ptr, *GameObject)
+    on_collision_enter: fn(ptr, *GameObject, *Collision)
+    on_collision_stay: fn(ptr, *GameObject, *Collision)
+    on_collision_exit: fn(ptr, *GameObject, *Collision)
+    on_trigger_enter: fn(ptr, *GameObject, *GameObject)
+    on_trigger_stay: fn(ptr, *GameObject, *GameObject)
+    on_trigger_exit: fn(ptr, *GameObject, *GameObject)
+    on_net_spawn: fn(ptr, *GameObject)
     unique: bool                   // at most one on an object
     scene: bool                    // lives on the scene's root, not on an object
     observable: bool               // its state struct is @observable
@@ -156,7 +177,15 @@ struct ComponentKind {
     // attachment's physics), so a save leaves it out of the components and
     // it is never written twice.
     recorded: bool
+    // A component of it that borrows its state is still the scene file's to
+    // write: nothing else writes that state (the engine's settings as the
+    // scene's Environment, its camera as its Camera; #895). A view of a model
+    // or a light is not: the model's and the light's records write those.
+    saved_borrowed: bool
     defaults: ptr                  // one state made by create, read for every default
+    // The derived schema (`@derive(schema)`) the kind's states are made from
+    // when it has no create of its own (schema_kind), or null.
+    table: ptr
     id: int
     // What its saved fields are (#507): a version, 1 until the kind says
     // otherwise, recorded with every save, and the names fields had before
@@ -305,6 +334,7 @@ kind_of(c: *Component) -> *ComponentKind {
 set_unique(k: *ComponentKind, unique: bool) { k.unique = unique }
 set_scene(k: *ComponentKind, scene: bool) { k.scene = scene }
 set_recorded(k: *ComponentKind, on: bool) { k.recorded = on }
+set_saved_borrowed(k: *ComponentKind, on: bool) { k.saved_borrowed = on }
 set_observable(k: *ComponentKind, observable: bool) { k.observable = observable }
 set_validate(k: *ComponentKind, validate: fn(ptr, int)) { k.validate = validate }
 set_category(k: *ComponentKind, category: string) { k.category = string.copy(category) }
@@ -323,6 +353,56 @@ phases(k: *ComponentKind, start: fn(ptr, *GameObject), update: fn(ptr, *GameObje
 set_lifecycle(k: *ComponentKind, awake: fn(ptr, *GameObject), on_destroy: fn(ptr, *GameObject)) {
     k.awake = awake
     k.on_destroy = on_destroy
+}
+
+// Unity's OnEnable and OnDisable: as a component comes to run (added
+// enabled to an active object, enabled, or its object made active) and as it
+// stops (disabled, its object made inactive, or taken off, before on_destroy).
+set_activation(k: *ComponentKind, on_enable: fn(ptr, *GameObject), on_disable: fn(ptr, *GameObject)) {
+    k.on_enable = on_enable
+    k.on_disable = on_disable
+}
+
+// Unity's OnCollisionEnter, Stay and Exit: told by the physics after each
+// step of what the object's colliders touch (ae3d.physics); any may be null.
+set_collisions(k: *ComponentKind, enter: fn(ptr, *GameObject, *Collision), stay: fn(ptr, *GameObject, *Collision),
+               exit: fn(ptr, *GameObject, *Collision)) {
+    k.on_collision_enter = enter
+    k.on_collision_stay = stay
+    k.on_collision_exit = exit
+}
+
+// Unity's OnTriggerEnter, Stay and Exit: what overlaps a trigger collider, or
+// the trigger an object's body or character is in, with the other object.
+set_triggers(k: *ComponentKind, enter: fn(ptr, *GameObject, *GameObject), stay: fn(ptr, *GameObject, *GameObject),
+             exit: fn(ptr, *GameObject, *GameObject)) {
+    k.on_trigger_enter = enter
+    k.on_trigger_stay = stay
+    k.on_trigger_exit = exit
+}
+
+// Unity Netcode's OnNetworkSpawn: told once the object is on the network
+// (ae3d.net), on every peer, with object_remote saying which simulates it.
+set_net_spawn(k: *ComponentKind, on_net_spawn: fn(ptr, *GameObject)) { k.on_net_spawn = on_net_spawn }
+
+// The kind's phases onto a component of it: as it is made, and again when
+// a reloaded script redefines the kind.
+take_phases(c: *Component, k: *ComponentKind) {
+    c.awake = k.awake
+    c.start = k.start
+    c.update = k.update
+    c.fixed_update = k.fixed_update
+    c.late_update = k.late_update
+    c.destroy = k.on_destroy
+    c.on_enable = k.on_enable
+    c.on_disable = k.on_disable
+    c.on_collision_enter = k.on_collision_enter
+    c.on_collision_stay = k.on_collision_stay
+    c.on_collision_exit = k.on_collision_exit
+    c.on_trigger_enter = k.on_trigger_enter
+    c.on_trigger_stay = k.on_trigger_stay
+    c.on_trigger_exit = k.on_trigger_exit
+    c.on_net_spawn = k.on_net_spawn
 }
 
 new_field(k: *ComponentKind, name: string, type: int, offset: int) -> *ComponentField {
@@ -900,11 +980,12 @@ add(o: *GameObject, k: *ComponentKind) -> *Component {
         set_error("${o.name} already has a ${k.name}")
         return null
     }
-    if k.create == null {
+    data = make_state(k)
+    if data == null {
         set_error("${k.name} has no constructor; attach_state gives it one")
         return null
     }
-    return attach_state(o, k, k.create(), true)
+    return attach_state(o, k, data, true)
 }
 
 // The same with a state the caller made: a model that is its own transform,
@@ -913,12 +994,7 @@ add(o: *GameObject, k: *ComponentKind) -> *Component {
 attach_state(o: *GameObject, k: *ComponentKind, data: @keep ptr, owned: bool) -> *Component {
     c = behaviour.component_new(k.name, behaviour.KIND_CUSTOM, data)
     c.schema = k as ptr
-    c.awake = k.awake
-    c.start = k.start
-    c.update = k.update
-    c.fixed_update = k.fixed_update
-    c.late_update = k.late_update
-    c.destroy = k.on_destroy
+    take_phases(c, k)
     if owned { c.dispose = k.destroy }
     if k.observable && data != null {
         // A store the script makes on its own state (`self.health = 50`)
@@ -942,8 +1018,8 @@ add_with(o: *GameObject, k: *ComponentKind, node: ptr) -> *Component {
         set_error("${o.name} already has a ${k.name}")
         return null
     }
-    if k.create == null { return null }
-    data = k.create()
+    data = make_state(k)
+    if data == null { return null }
     // Read into a bare component first, so the fields are the file's by the
     // time awake sees them.
     staged = behaviour.component_new(k.name, behaviour.KIND_CUSTOM, data)
@@ -969,6 +1045,22 @@ find(o: *GameObject, k: *ComponentKind) -> *Component {
         i = i + 1
     }
     return null
+}
+
+// The state of the object's component of kind `k` (Unity's GetComponent),
+// or null. A ptr: a lookup by kind cannot say the state's type until Aether
+// has type parameters (aether-lang-dev/aether#1973), so the one cast is the
+// caller's, where the type is known: `h = component.state_of(go, health) as
+// *Health`.
+state_of(o: *GameObject, k: *ComponentKind) -> ptr {
+    c = find(o, k)
+    if c == null { return null }
+    return c.state
+}
+
+// The same by the kind's name, as a script names another's: "Bob".
+state_named(o: *GameObject, name: string) -> ptr {
+    return state_of(o, kind_named(name))
 }
 
 find_named(o: *GameObject, name: string) -> *Component {
@@ -1111,10 +1203,10 @@ collect_owned(o: *GameObject, model: *Model, out: ptr) {
     i = 0
     while i < count {
         c = behaviour.object_component(o, i)
-        // Only a component that owns its state is the file's to write: one
-        // that is a view of a model, a light or the engine's settings is
-        // written by whatever owns those.
-        if c != null && kind_of(c) != null && c.dispose != null && !kind_of(c).recorded {
+        // A component that owns its state is the file's to write, and one that
+        // borrows it where nothing else writes it (saved_borrowed): a view of
+        // a model or a light is written by whatever owns those.
+        if c != null && kind_of(c) != null && (c.dispose != null || kind_of(c).saved_borrowed) && !kind_of(c).recorded {
             saved = scene.saved_component_new(model, entry_json(c))
             add_refs(saved, c)
             list.add_raw(out, saved)
@@ -1165,8 +1257,10 @@ ids_for_places(k: *ComponentKind, entry: *LoadedComponent, objects: ptr) {
     }
 }
 
-// The components of the scene's objects and of the scene itself that own
-// their state, as scene.scene_save takes them.
+// The components a scene file writes, as scene.scene_save takes them: those of
+// the scene and its objects that own their state, and those that borrow it
+// where nothing else writes it -- the scene's settings, its sky, its passes,
+// its camera, its weather, whatever holds them (#895).
 saved_for(s: *Scene) -> ptr {
     out = list.new()
     if s == null { return out }
@@ -1239,8 +1333,8 @@ attach_loaded(s: *Scene, objects: ptr, loaded: ptr) -> ptr {
 // The kind's constructor and destructor replaced and its fields cleared, to
 // be registered again: a script library rebuilt is the same kind with new
 // code. The defaults are freed by the destructor that made them and made
-// again by the new constructor.
-kind_redefine(k: *ComponentKind, create: fn() -> ptr, destroy: fn(ptr)) {
+// again by the new constructor (or the new schema, given one: schema_kind).
+kind_redefine(k: *ComponentKind, create: fn() -> ptr, destroy: fn(ptr), table: @keep ptr = null) {
     if k == null { return }
     g_generation = g_generation + 1
     count = list.size(k.fields)
@@ -1259,7 +1353,8 @@ kind_redefine(k: *ComponentKind, create: fn() -> ptr, destroy: fn(ptr)) {
     k.defaults = null
     k.create = create
     k.destroy = destroy
-    if create != null { k.defaults = create() }
+    k.table = table
+    k.defaults = make_state(k)
 }
 
 // The component's state freed and taken off it, leaving the component: what
@@ -1284,12 +1379,7 @@ replace_state(c: *Component, data: @keep ptr) {
     if c == null || k == null { return }
     c.state = data
     c.dispose = k.destroy
-    c.awake = k.awake
-    c.start = k.start
-    c.update = k.update
-    c.fixed_update = k.fixed_update
-    c.late_update = k.late_update
-    c.destroy = k.on_destroy
+    take_phases(c, k)
     if k.observable && data != null {
         watched = c
         c.observer = observe.observe(data, |obj: ptr| {
@@ -1297,4 +1387,698 @@ replace_state(c: *Component, data: @keep ptr) {
         })
     }
     c.version = c.version + 1
+}
+
+// --- the layout a script is built against (#508) --------------------------------------------------------------
+//
+// A script is compiled from the engine's sources and carries its own copy of
+// every module it imports, so its code reads the host's objects through its
+// own idea of their layout. Built against another tree it silently misread a
+// Model. This is that idea, as a number: FNV-1a over the size of every struct
+// a script is handed or reaches through them, and the offset of every field of
+// the ones it is handed (GameObject, Component, Scene, ComponentKind,
+// ComponentField, Collision, Model). A C name of its own (@c_callback) keeps it
+// out of the statics: every library built with this module exports it, and
+// ae3d.script refuses one whose number is not the host's. It touches no
+// string and no runtime, as a function a library is asked for must not.
+//
+// Not named ae3d_*: ci.sh holds a script to defining none of the engine's C,
+// by that prefix.
+//
+// A field added, removed, moved or retyped in any of them changes it; the
+// list below names each field, so one removed fails the build here, where the
+// list is kept, and is not left out of the number.
+
+const ABI_BASIS = 1469598103934665603
+const ABI_PRIME = 1099511628211
+
+abi_mix(h: long, v: int) -> long { return (h ^ (v as long)) * (ABI_PRIME as long) }
+
+@c_callback("script_layout_hash")
+script_layout() -> long {
+    h = ABI_BASIS as long
+    h = abi_mix(h, sizeof(GameObject))
+    h = abi_mix(h, offsetof(GameObject, name))
+    h = abi_mix(h, offsetof(GameObject, tag))
+    h = abi_mix(h, offsetof(GameObject, model))
+    h = abi_mix(h, offsetof(GameObject, components))
+    h = abi_mix(h, offsetof(GameObject, active))
+    h = abi_mix(h, offsetof(GameObject, started))
+    h = abi_mix(h, offsetof(GameObject, owns_model))
+    h = abi_mix(h, offsetof(GameObject, remote))
+    h = abi_mix(h, offsetof(GameObject, scene))
+    h = abi_mix(h, offsetof(GameObject, id))
+    h = abi_mix(h, sizeof(Component))
+    h = abi_mix(h, offsetof(Component, `state`))
+    h = abi_mix(h, offsetof(Component, owner))
+    h = abi_mix(h, offsetof(Component, name))
+    h = abi_mix(h, offsetof(Component, kind))
+    h = abi_mix(h, offsetof(Component, enabled))
+    h = abi_mix(h, offsetof(Component, started))
+    h = abi_mix(h, offsetof(Component, schema))
+    h = abi_mix(h, offsetof(Component, version))
+    h = abi_mix(h, offsetof(Component, dispose))
+    h = abi_mix(h, offsetof(Component, observer))
+    h = abi_mix(h, offsetof(Component, awake))
+    h = abi_mix(h, offsetof(Component, start))
+    h = abi_mix(h, offsetof(Component, update))
+    h = abi_mix(h, offsetof(Component, fixed_update))
+    h = abi_mix(h, offsetof(Component, late_update))
+    h = abi_mix(h, offsetof(Component, destroy))
+    h = abi_mix(h, offsetof(Component, on_enable))
+    h = abi_mix(h, offsetof(Component, on_disable))
+    h = abi_mix(h, offsetof(Component, live))
+    h = abi_mix(h, offsetof(Component, on_collision_enter))
+    h = abi_mix(h, offsetof(Component, on_collision_stay))
+    h = abi_mix(h, offsetof(Component, on_collision_exit))
+    h = abi_mix(h, offsetof(Component, on_trigger_enter))
+    h = abi_mix(h, offsetof(Component, on_trigger_stay))
+    h = abi_mix(h, offsetof(Component, on_trigger_exit))
+    h = abi_mix(h, offsetof(Component, on_net_spawn))
+    h = abi_mix(h, sizeof(Scene))
+    h = abi_mix(h, offsetof(Scene, objects))
+    h = abi_mix(h, offsetof(Scene, pending_destroy))
+    h = abi_mix(h, offsetof(Scene, host))
+    h = abi_mix(h, offsetof(Scene, root))
+    h = abi_mix(h, offsetof(Scene, closing))
+    h = abi_mix(h, offsetof(Scene, next_id))
+    h = abi_mix(h, sizeof(ComponentKind))
+    h = abi_mix(h, offsetof(ComponentKind, name))
+    h = abi_mix(h, offsetof(ComponentKind, category))
+    h = abi_mix(h, offsetof(ComponentKind, fields))
+    h = abi_mix(h, offsetof(ComponentKind, create))
+    h = abi_mix(h, offsetof(ComponentKind, destroy))
+    h = abi_mix(h, offsetof(ComponentKind, validate))
+    h = abi_mix(h, offsetof(ComponentKind, awake))
+    h = abi_mix(h, offsetof(ComponentKind, start))
+    h = abi_mix(h, offsetof(ComponentKind, update))
+    h = abi_mix(h, offsetof(ComponentKind, fixed_update))
+    h = abi_mix(h, offsetof(ComponentKind, late_update))
+    h = abi_mix(h, offsetof(ComponentKind, on_destroy))
+    h = abi_mix(h, offsetof(ComponentKind, on_enable))
+    h = abi_mix(h, offsetof(ComponentKind, on_disable))
+    h = abi_mix(h, offsetof(ComponentKind, on_collision_enter))
+    h = abi_mix(h, offsetof(ComponentKind, on_collision_stay))
+    h = abi_mix(h, offsetof(ComponentKind, on_collision_exit))
+    h = abi_mix(h, offsetof(ComponentKind, on_trigger_enter))
+    h = abi_mix(h, offsetof(ComponentKind, on_trigger_stay))
+    h = abi_mix(h, offsetof(ComponentKind, on_trigger_exit))
+    h = abi_mix(h, offsetof(ComponentKind, on_net_spawn))
+    h = abi_mix(h, offsetof(ComponentKind, unique))
+    h = abi_mix(h, offsetof(ComponentKind, scene))
+    h = abi_mix(h, offsetof(ComponentKind, observable))
+    h = abi_mix(h, offsetof(ComponentKind, recorded))
+    h = abi_mix(h, offsetof(ComponentKind, saved_borrowed))
+    h = abi_mix(h, offsetof(ComponentKind, defaults))
+    h = abi_mix(h, offsetof(ComponentKind, table))
+    h = abi_mix(h, offsetof(ComponentKind, id))
+    h = abi_mix(h, offsetof(ComponentKind, schema_version))
+    h = abi_mix(h, offsetof(ComponentKind, renames))
+    h = abi_mix(h, sizeof(ComponentField))
+    h = abi_mix(h, offsetof(ComponentField, name))
+    h = abi_mix(h, offsetof(ComponentField, tooltip))
+    h = abi_mix(h, offsetof(ComponentField, type))
+    h = abi_mix(h, offsetof(ComponentField, offset))
+    h = abi_mix(h, offsetof(ComponentField, min))
+    h = abi_mix(h, offsetof(ComponentField, max))
+    h = abi_mix(h, offsetof(ComponentField, step))
+    h = abi_mix(h, offsetof(ComponentField, flags))
+    h = abi_mix(h, offsetof(ComponentField, choices))
+    h = abi_mix(h, offsetof(ComponentField, get_text))
+    h = abi_mix(h, offsetof(ComponentField, set_text))
+    h = abi_mix(h, offsetof(ComponentField, get_number))
+    h = abi_mix(h, offsetof(ComponentField, set_number))
+    h = abi_mix(h, offsetof(ComponentField, get_flag))
+    h = abi_mix(h, offsetof(ComponentField, set_flag))
+    h = abi_mix(h, offsetof(ComponentField, get_integer))
+    h = abi_mix(h, offsetof(ComponentField, set_integer))
+    h = abi_mix(h, offsetof(ComponentField, asset_kind))
+    h = abi_mix(h, sizeof(Collision))
+    h = abi_mix(h, offsetof(Collision, other))
+    h = abi_mix(h, offsetof(Collision, point))
+    h = abi_mix(h, offsetof(Collision, normal))
+    h = abi_mix(h, offsetof(Collision, impulse))
+    h = abi_mix(h, offsetof(Collision, speed))
+    h = abi_mix(h, sizeof(Model))
+    h = abi_mix(h, offsetof(Model, model_matrix))
+    h = abi_mix(h, offsetof(Model, position))
+    h = abi_mix(h, offsetof(Model, scale))
+    h = abi_mix(h, offsetof(Model, rotation))
+    h = abi_mix(h, offsetof(Model, bounding_center))
+    h = abi_mix(h, offsetof(Model, bounding_radius))
+    h = abi_mix(h, offsetof(Model, parent))
+    h = abi_mix(h, offsetof(Model, children))
+    h = abi_mix(h, offsetof(Model, world_position))
+    h = abi_mix(h, offsetof(Model, world_scale))
+    h = abi_mix(h, offsetof(Model, world_rotation))
+    h = abi_mix(h, offsetof(Model, world_stamp))
+    h = abi_mix(h, offsetof(Model, interp_mark))
+    h = abi_mix(h, offsetof(Model, interp_born))
+    h = abi_mix(h, offsetof(Model, interp))
+    h = abi_mix(h, offsetof(Model, parent_stamp))
+    h = abi_mix(h, offsetof(Model, draw_stamp))
+    h = abi_mix(h, offsetof(Model, shadow_stamp))
+    h = abi_mix(h, offsetof(Model, mesh))
+    h = abi_mix(h, offsetof(Model, skeleton))
+    h = abi_mix(h, offsetof(Model, skin_reach))
+    h = abi_mix(h, offsetof(Model, instances))
+    h = abi_mix(h, offsetof(Model, material))
+    h = abi_mix(h, offsetof(Model, materials))
+    h = abi_mix(h, offsetof(Model, groups))
+    h = abi_mix(h, offsetof(Model, uniforms))
+    h = abi_mix(h, offsetof(Model, uniform_names))
+    h = abi_mix(h, offsetof(Model, shader))
+    h = abi_mix(h, offsetof(Model, vao))
+    h = abi_mix(h, offsetof(Model, vbo))
+    h = abi_mix(h, offsetof(Model, ebo))
+    h = abi_mix(h, offsetof(Model, skin_vbo))
+    h = abi_mix(h, offsetof(Model, shares_geometry))
+    h = abi_mix(h, offsetof(Model, cluster_graph))
+    h = abi_mix(h, offsetof(Model, cluster_draw))
+    h = abi_mix(h, offsetof(Model, instance_vbo))
+    h = abi_mix(h, offsetof(Model, instance_vbo_capacity))
+    h = abi_mix(h, offsetof(Model, instance_color_vbo))
+    h = abi_mix(h, offsetof(Model, pose_bank))
+    h = abi_mix(h, offsetof(Model, pose_bank_texture))
+    h = abi_mix(h, offsetof(Model, pose_bank_frames))
+    h = abi_mix(h, offsetof(Model, instance_phase_vbo))
+    h = abi_mix(h, offsetof(Model, is_dirty))
+    h = abi_mix(h, offsetof(Model, geometry_stamp))
+    h = abi_mix(h, offsetof(Model, uploaded_stamp))
+    h = abi_mix(h, offsetof(Model, is_instanced))
+    h = abi_mix(h, offsetof(Model, instances_updated))
+    h = abi_mix(h, offsetof(Model, instance_colors_updated))
+    h = abi_mix(h, offsetof(Model, instance_phases_updated))
+    h = abi_mix(h, offsetof(Model, visible))
+    h = abi_mix(h, offsetof(Model, casts_shadow))
+    h = abi_mix(h, offsetof(Model, billboard))
+    h = abi_mix(h, offsetof(Model, blend))
+    h = abi_mix(h, offsetof(Model, flipbook_columns))
+    h = abi_mix(h, offsetof(Model, flipbook_rows))
+    h = abi_mix(h, offsetof(Model, billboard_lift))
+    h = abi_mix(h, offsetof(Model, impostor_cols))
+    h = abi_mix(h, offsetof(Model, impostor_rows))
+    h = abi_mix(h, offsetof(Model, impostor_width))
+    h = abi_mix(h, offsetof(Model, impostor_height))
+    h = abi_mix(h, offsetof(Model, clip_on))
+    h = abi_mix(h, offsetof(Model, clip_plane))
+    h = abi_mix(h, offsetof(Model, clip_noise))
+    h = abi_mix(h, offsetof(Model, clip_noise_scale))
+    h = abi_mix(h, offsetof(Model, clip_joints0))
+    h = abi_mix(h, offsetof(Model, clip_joints1))
+    h = abi_mix(h, offsetof(Model, clip_joints2))
+    h = abi_mix(h, offsetof(Model, clip_detached))
+    h = abi_mix(h, offsetof(Model, wound_count))
+    h = abi_mix(h, offsetof(Model, wounds))
+    h = abi_mix(h, offsetof(Model, wound_layers))
+    h = abi_mix(h, offsetof(Model, wound_core))
+    h = abi_mix(h, offsetof(Model, damage))
+    h = abi_mix(h, offsetof(Model, depth_proxy))
+    h = abi_mix(h, offsetof(Model, depth_proxy_vao))
+    h = abi_mix(h, offsetof(Model, device_crowd))
+    h = abi_mix(h, offsetof(Model, device_tier))
+    h = abi_mix(h, offsetof(Model, device_part))
+    h = abi_mix(h, offsetof(Model, drawn_model_matrix))
+    h = abi_mix(h, offsetof(Model, prev_model_matrix))
+    h = abi_mix(h, offsetof(Model, prev_model_valid))
+    h = abi_mix(h, offsetof(Model, crowd_walk))
+    h = abi_mix(h, offsetof(Model, id))
+    h = abi_mix(h, offsetof(Model, name))
+    h = abi_mix(h, offsetof(Model, source_path))
+    h = abi_mix(h, offsetof(Model, solid))
+    h = abi_mix(h, sizeof(Vec3))
+    h = abi_mix(h, sizeof(Quat))
+    h = abi_mix(h, sizeof(Mat4))
+    h = abi_mix(h, sizeof(Material))
+    h = abi_mix(h, sizeof(GeoMesh))
+    h = abi_mix(h, sizeof(GeoInstances))
+    h = abi_mix(h, sizeof(Camera))
+    h = abi_mix(h, sizeof(Light))
+    return h
+}
+
+// --- a kind from its struct's derived schema (#508) -------------------------------------------------------------
+//
+// A struct that derives its schema says its fields itself, so the kind is
+// read off it and nothing is kept beside it (aether#2298):
+//
+//     @derive(schema)
+//     struct Bob @observable {
+//         rate: float @range(0.0, 20.0) @default(2.0) @tooltip("radians of the curve a second")
+//         height: float @range(0.0, 100.0) @default(6.0)
+//         clock: float @transient @readonly
+//     }
+//
+//     k = component.schema_kind("Bob", "Motion", Bob_schema())
+//
+// Each field is the registry's field of its type: a float, an int, a bool, a
+// Vec3 (a colour with @color), a Quat (a rotation); an int with
+// @enum("a", "b", ...) a choice, with @object another object's id. Its
+// attributes: @range(lo, hi), @tooltip("..."), @transient (not saved),
+// @readonly (shown, not edited), @hidden (neither), and @default(...), what a
+// state the kind makes holds there. A field of any other type -- a pointer,
+// a list, a struct of the game's own -- is the state's own bookkeeping and is
+// not registered. Text is: it is registered as before, through the two
+// functions that know the struct (text_field), since a string in a struct is
+// the struct's own to replace and to free.
+//
+// Its states are made from the schema -- the struct's size, zeroed, its
+// defaults written -- and freed as the memory they are. A struct holding a
+// string cannot be: only the code that knows the struct frees what its
+// string fields own, so such a kind is given its own constructor and
+// destructor (`kind` with them, then schema_fields), and schema_kind refuses it.
+
+const ATTR_DEFAULT = "default"
+
+// Whether any field of the schema holds a string, which a state made and
+// freed from the schema alone would leak.
+schema_holds_text(table: ptr) -> bool {
+    if table == null { return false }
+    i = 0
+    while i < reflect.field_count(table) {
+        if reflect.field_kind(table, i) == reflect.KIND_STRING { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// A kind whose states are its derived schema's, registered under `name` (an
+// existing one answered, as kind does). Null, and last_error saying why,
+// for a schema with a string field.
+schema_kind(name: string, category: string, table: @keep ptr) -> *ComponentKind {
+    if table == null {
+        set_error("${name}: no schema")
+        return null
+    }
+    if schema_holds_text(table) {
+        set_error("${name}: a struct holding a string frees it itself; give the kind create and destroy, then schema_fields")
+        return null
+    }
+    existing = kind_named(name)
+    if existing != null { return existing }
+    k = kind(name, category, null, schema_state_free)
+    k.table = table
+    k.defaults = make_state(k)
+    schema_fields(k, table)
+    return k
+}
+
+// A state of the kind: its constructor's, or its schema's. Null for a kind
+// with neither.
+make_state(k: *ComponentKind) -> ptr {
+    if k == null { return null }
+    if k.create != null { return k.create() }
+    if k.table != null { return schema_state_new(k.table) }
+    return null
+}
+
+// The schema's struct, zeroed, with every field's @default written: a number
+// or a bool its one argument, a Vec3 its three, a Quat its four, and a Quat
+// with none the identity (a zero quaternion is no rotation at all).
+schema_state_new(table: ptr) -> ptr {
+    if table == null { return null }
+    size = reflect.size(table)
+    if size < 1 { size = 1 }
+    p = calloc(1, size)
+    if p == null { return null }
+    i = 0
+    while i < reflect.field_count(table) {
+        at = p + (reflect.field_offset(table, i) as long)
+        type = reflect.field_kind(table, i)
+        d = reflect.attr_index(table, i, ATTR_DEFAULT)
+        if type == reflect.KIND_STRUCT && string.equals(reflect.field_type(table, i), "Quat") == 1 {
+            q = at as float[]
+            q[3] = 1.0
+        }
+        if d >= 0 && reflect.attr_arg_count(table, i, d) > 0 {
+            if type == reflect.KIND_FLOAT {
+                (at as float[])[0] = reflect.attr_float(table, i, d, 0)
+            } else if type == reflect.KIND_INT {
+                (at as int[])[0] = reflect.attr_int(table, i, d, 0) as int
+            } else if type == reflect.KIND_LONG {
+                (at as long[])[0] = reflect.attr_int(table, i, d, 0)
+            } else if type == reflect.KIND_BOOL {
+                (at as bool[])[0] = reflect.attr_int(table, i, d, 0) != (0 as long)
+            } else if type == reflect.KIND_STRUCT {
+                v = at as float[]
+                width = reflect.field_size(table, i) / 8
+                k = 0
+                while k < reflect.attr_arg_count(table, i, d) && k < width {
+                    v[k] = reflect.attr_float(table, i, d, k)
+                    k = k + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return p
+}
+
+schema_state_free(p: ptr) { if p != null { free(p) } }
+
+// Every field of the schema the registry has a type for, registered on `k`
+// in the struct's order with its attributes; how many were.
+schema_fields(k: *ComponentKind, table: ptr) -> int {
+    if k == null || table == null { return 0 }
+    registered = 0
+    i = 0
+    while i < reflect.field_count(table) {
+        f = schema_field(k, table, i)
+        if f != null {
+            registered = registered + 1
+            if reflect.has_attr(table, i, "transient") { f.flags = f.flags | FIELD_TRANSIENT }
+            if reflect.has_attr(table, i, "readonly") { f.flags = f.flags | FIELD_READONLY }
+            if reflect.has_attr(table, i, "hidden") { f.flags = f.flags | FIELD_HIDDEN }
+            tip = reflect.attr_index(table, i, "tooltip")
+            if tip >= 0 && reflect.attr_arg_count(table, i, tip) > 0 { f.tooltip = string.copy(reflect.attr_text(table, i, tip, 0)) }
+        }
+        i = i + 1
+    }
+    return registered
+}
+
+// Field i of the schema as a registry field, or null for a type it has none for.
+schema_field(k: *ComponentKind, table: ptr, i: int) -> *ComponentField {
+    name = reflect.field_name(table, i)
+    at = reflect.field_offset(table, i)
+    type = reflect.field_kind(table, i)
+    lo = 0.0
+    hi = 0.0
+    range = reflect.attr_index(table, i, "range")
+    if range >= 0 && reflect.attr_arg_count(table, i, range) >= 2 {
+        lo = reflect.attr_float(table, i, range, 0)
+        hi = reflect.attr_float(table, i, range, 1)
+    }
+    if type == reflect.KIND_FLOAT { return float_field(k, name, at, lo, hi) }
+    if type == reflect.KIND_BOOL { return bool_field(k, name, at) }
+    if type == reflect.KIND_INT {
+        if reflect.has_attr(table, i, "object") { return object_field(k, name, at) }
+        choices = reflect.attr_index(table, i, "enum")
+        if choices >= 0 {
+            f = enum_field(k, name, at)
+            c = 0
+            while c < reflect.attr_arg_count(table, i, choices) {
+                enum_choice_add(f, reflect.attr_text(table, i, choices, c))
+                c = c + 1
+            }
+            return f
+        }
+        return int_field(k, name, at, lo as int, hi as int)
+    }
+    if type == reflect.KIND_STRUCT {
+        written = reflect.field_type(table, i)
+        if string.equals(written, "Vec3") == 1 {
+            if reflect.has_attr(table, i, "color") { return color_field(k, name, at) }
+            return vec3_field(k, name, at)
+        }
+        if string.equals(written, "Quat") == 1 { return rotation_field(k, name, at) }
+    }
+    return null
+}
+
+// --- a component's fields, captured to be written later (#507) -----------------------------------------------
+//
+// A save's frame cost is what it reads of the running game; writing it out
+// as text, deflating it and writing the file can be done anywhere, on any
+// thread, from a copy. The copy is a Capture: 8-byte slots, an int a long,
+// a float a double (the bits, so what is written is what was read), text its
+// length and then its bytes in as many slots as they fill. capture_fields
+// reads a component's saved fields into one; captured_json writes them out
+// as to_json writes them, reading nothing but the capture and the kind.
+
+struct Capture {
+    // A std.bytes buffer, so text is copied into it by bytes.copy_from_string
+    // with nothing allocated a string; `data` is its bytes, again whenever it
+    // grows.
+    buffer: ptr
+    data: ptr
+    length: int                    // slots used
+    capacity: int                  // slots there is room for
+}
+
+capture_new() -> *Capture {
+    cap = heap.new(Capture)
+    cap.capacity = 1024
+    cap.buffer = bytes.new(cap.capacity * 8)
+    bytes.set_length(cap.buffer, cap.capacity * 8)
+    cap.data = bytes.data(cap.buffer)
+    return cap
+}
+
+capture_free(cap: *Capture) {
+    if cap == null { return }
+    bytes.free(cap.buffer)
+    heap.free(cap)
+}
+
+capture_length(cap: *Capture) -> int { return cap.length }
+
+room(cap: *Capture, slots: int) {
+    if cap.length + slots <= cap.capacity { return }
+    grown = cap.capacity * 2
+    while grown < cap.length + slots { grown = grown * 2 }
+    larger = bytes.new(grown * 8)
+    bytes.set_length(larger, grown * 8)
+    bytes.copy_from_bytes(larger, 0, cap.buffer, 0, cap.length * 8)
+    bytes.free(cap.buffer)
+    cap.buffer = larger
+    cap.data = bytes.data(larger)
+    cap.capacity = grown
+}
+
+put_long(cap: *Capture, v: long) {
+    room(cap, 1)
+    (cap.data as long[])[cap.length] = v
+    cap.length = cap.length + 1
+}
+
+put_float(cap: *Capture, v: float) {
+    room(cap, 1)
+    (cap.data as float[])[cap.length] = v
+    cap.length = cap.length + 1
+}
+
+// The slots `length` bytes of text take, its length's slot not counted.
+text_slots(length: int) -> int { return (length + 7) / 8 }
+
+put_text(cap: *Capture, s: string) {
+    length = string.length(s)
+    put_long(cap, length as long)
+    slots = text_slots(length)
+    room(cap, slots)
+    if length > 0 { bytes.copy_from_string(cap.buffer, cap.length * 8, s, length) }
+    cap.length = cap.length + slots
+}
+
+get_long_at(cap: *Capture, at: int) -> long { return (cap.data as long[])[at] }
+get_float_at(cap: *Capture, at: int) -> float { return (cap.data as float[])[at] }
+
+// The text whose length is at slot `at` (its bytes after it).
+text_at(cap: *Capture, at: int) -> string {
+    length = (cap.data as long[])[at] as int
+    return bytes.string_from_ptr(cap.data + (((at + 1) as long) * (8 as long)), length)
+}
+
+// The component's saved fields, as to_json(c, changed_only) would write them
+// (objects included): a slot that counts them, then each one's index in its
+// kind and its value. How many were captured.
+capture_fields(c: *Component, cap: *Capture, changed_only: bool) -> int {
+    k = kind_of(c)
+    count_at = cap.length
+    put_long(cap, 0 as long)
+    if k == null { return 0 }
+    written = 0
+    i = 0
+    while i < field_count(k) {
+        f = field_at(k, i)
+        skip = (f.flags & (FIELD_HIDDEN | FIELD_TRANSIENT)) != 0
+        if !skip && changed_only && !differs(c, f) { skip = true }
+        if !skip {
+            put_long(cap, i as long)
+            if f.type == TYPE_BOOL {
+                on = 0
+                if get_bool(c, f) { on = 1 }
+                put_long(cap, on as long)
+            } else if f.type == TYPE_INT || f.type == TYPE_ENUM {
+                put_long(cap, get_int(c, f) as long)
+            } else if f.type == TYPE_OBJECT {
+                put_long(cap, object_ref(c, f) as long)
+            } else if f.type == TYPE_FLOAT {
+                put_float(cap, get_float(c, f))
+            } else if f.type == TYPE_VEC3 || f.type == TYPE_COLOR {
+                v = get_vec3(c, f)
+                put_float(cap, v.x)
+                put_float(cap, v.y)
+                put_float(cap, v.z)
+            } else if f.type == TYPE_ROTATION {
+                q = get_rotation(c, f)
+                put_float(cap, q.x)
+                put_float(cap, q.y)
+                put_float(cap, q.z)
+                put_float(cap, q.w)
+            } else {
+                put_text(cap, get_text(c, f))
+            }
+            written = written + 1
+        }
+        i = i + 1
+    }
+    (cap.data as long[])[count_at] = written as long
+    return written
+}
+
+// The fields capture_fields put at slot `at`, of the kind at `kind` in the
+// capture's table (captured_kinds), as the object to_json writes, and the
+// slot after them. Read off the capture alone: a kind redefined since (a
+// script reloaded) writes as it was when it was captured.
+captured_json(table: ptr, kind: int, cap: *Capture, at: int) -> (ptr, int) {
+    out = json.obj()
+    k = list.get_raw(table, kind) as *CapturedKind
+    count = get_long_at(cap, at) as int
+    p = at + 1
+    n = 0
+    while n < count {
+        f = list.get_raw(k.fields, get_long_at(cap, p) as int) as *CapturedField
+        p = p + 1
+        value = null as ptr
+        if f.type == TYPE_BOOL {
+            value = json.boolean(get_long_at(cap, p) != (0 as long))
+            p = p + 1
+        } else if f.type == TYPE_INT || f.type == TYPE_OBJECT {
+            value = json.from_int(get_long_at(cap, p) as int)
+            p = p + 1
+        } else if f.type == TYPE_ENUM {
+            choice = get_long_at(cap, p) as int
+            name = ""
+            if choice >= 0 && choice < list.size(f.choices) { name = (list.get_raw(f.choices, choice) as *ChoiceName).text }
+            value = json.str(name)
+            p = p + 1
+        } else if f.type == TYPE_FLOAT {
+            value = json.num(get_float_at(cap, p))
+            p = p + 1
+        } else if f.type == TYPE_VEC3 || f.type == TYPE_COLOR {
+            value = vec3_json(core.vec3(get_float_at(cap, p), get_float_at(cap, p + 1), get_float_at(cap, p + 2)))
+            p = p + 3
+        } else if f.type == TYPE_ROTATION {
+            a = json.arr()
+            k4 = 0
+            while k4 < 4 {
+                json.array_add_raw(a, json.num(get_float_at(cap, p + k4)))
+                k4 = k4 + 1
+            }
+            value = a
+            p = p + 4
+        } else {
+            value = json.str(text_at(cap, p))
+            p = p + 1 + text_slots(get_long_at(cap, p) as int)
+        }
+        json.object_set_raw(out, f.name, value)
+        n = n + 1
+    }
+    return out, p
+}
+
+// set_long_at: a slot written again, a count known once what it counts is in.
+set_long_at(cap: *Capture, at: int, v: long) { (cap.data as long[])[at] = v }
+
+// A kind as a capture keeps it: its name, its version, and each field's
+// name, type and, for a choice, its names, in its kind's order.
+capture_kind(k: *ComponentKind, cap: *Capture) {
+    put_text(cap, k.name)
+    put_long(cap, schema_version(k) as long)
+    put_long(cap, field_count(k) as long)
+    i = 0
+    while i < field_count(k) {
+        f = field_at(k, i)
+        put_text(cap, f.name)
+        put_long(cap, f.type as long)
+        choices = 0
+        if f.choices != null { choices = list.size(f.choices) }
+        put_long(cap, choices as long)
+        c = 0
+        while c < choices {
+            put_text(cap, (list.get_raw(f.choices, c) as *ChoiceName).text)
+            c = c + 1
+        }
+        i = i + 1
+    }
+}
+
+struct CapturedKind {
+    name: string
+    version: int
+    fields: ptr                    // list of *CapturedField
+}
+
+struct CapturedField {
+    name: string
+    type: int
+    choices: ptr                   // list of *ChoiceName
+}
+
+// The table of kinds a capture keeps at slot `at` (its count, then each),
+// read back: a list of *CapturedKind, freed with captured_kinds_free.
+captured_kinds(cap: *Capture, at: int) -> ptr {
+    table = list.new()
+    count = get_long_at(cap, at) as int
+    p = at + 1
+    i = 0
+    while i < count {
+        k = heap.new(CapturedKind)
+        k.name = text_at(cap, p)
+        p = p + 1 + text_slots(get_long_at(cap, p) as int)
+        k.version = get_long_at(cap, p) as int
+        fields = get_long_at(cap, p + 1) as int
+        p = p + 2
+        k.fields = list.new()
+        j = 0
+        while j < fields {
+            f = heap.new(CapturedField)
+            f.name = text_at(cap, p)
+            p = p + 1 + text_slots(get_long_at(cap, p) as int)
+            f.type = get_long_at(cap, p) as int
+            choices = get_long_at(cap, p + 1) as int
+            p = p + 2
+            f.choices = list.new()
+            c = 0
+            while c < choices {
+                named = heap.new(ChoiceName)
+                named.text = text_at(cap, p)
+                p = p + 1 + text_slots(get_long_at(cap, p) as int)
+                list.add_raw(f.choices, named as ptr)
+                c = c + 1
+            }
+            list.add_raw(k.fields, f as ptr)
+            j = j + 1
+        }
+        list.add_raw(table, k as ptr)
+        i = i + 1
+    }
+    return table
+}
+
+captured_kind_name(table: ptr, kind: int) -> string { return (list.get_raw(table, kind) as *CapturedKind).name }
+captured_kind_version(table: ptr, kind: int) -> int { return (list.get_raw(table, kind) as *CapturedKind).version }
+
+captured_kinds_free(table: ptr) {
+    i = 0
+    while i < list.size(table) {
+        k = list.get_raw(table, i) as *CapturedKind
+        j = 0
+        while j < list.size(k.fields) {
+            f = list.get_raw(k.fields, j) as *CapturedField
+            c = 0
+            while c < list.size(f.choices) {
+                heap.free(list.get_raw(f.choices, c) as *ChoiceName)
+                c = c + 1
+            }
+            list.free(f.choices)
+            heap.free(f)
+            j = j + 1
+        }
+        list.free(k.fields)
+        heap.free(k)
+        i = i + 1
+    }
+    list.free(table)
 }

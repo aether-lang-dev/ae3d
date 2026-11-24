@@ -1,0 +1,969 @@
+// A world larger than memory (#917): a grid of cells, each a cell file
+// (ae3d.cellfile), loaded around the camera and the players and let go
+// behind them; far cells drawn as their stand-ins (HLOD).
+//
+//     st = stream.open("world/world.json")          // the grid the baker wrote
+//     stream.set_engine(st, e)
+//     stream.set_radius(st, 160.0, 32.0)            // loaded within 160 m, let go past 192
+//     stream.set_far(st, 600.0)                     // stand-ins out to 600 m
+//     stream.set_budget(st, 4 * 1024 * 1024)        // 4 MB into the renderer a frame, at most
+//     ...each frame:
+//     stream.focus_clear(st)
+//     stream.focus(st, cam.position.x, cam.position.z)
+//     stream.update(st)
+//
+// A cell is a small state machine:
+//   UNLOADED    nothing of it in memory;
+//   LOADING     a worker reading and decoding its file (std.worker): its
+//               bytes, its meshes built, its materials read, the textures
+//               it names that no resident cell holds decoded;
+//   LEAVING     loading, but wanted no more: freed the moment it arrives;
+//   LOADED      decoded, waiting for the frame's budget;
+//   ATTACHING   its models going to the renderer, as many a frame as the
+//               budget allows (a model at least, so no cell waits for ever);
+//   RESIDENT    every model in.
+// A cell is wanted when its square comes within the radius of any focus,
+// kept until it is past the radius and the margin (the hysteresis: a focus
+// pacing along a border does not load and free the same cell each step),
+// and loaded nearest first, a few at a time.
+//
+// The stand-ins are a second layer of the same machine: a cell's HLOD file
+// (one merged, simplified model, its colour baked into its vertices) is
+// loaded within the far radius and drawn while its cell is not resident.
+//
+// What arrives and leaves is said as events (event_count / event_*), for
+// the game's colliders and walkers; what each cell is doing is the agent's
+// to read (the stream.cells op).
+//
+// Memory: what each cell's decode made (its geometry and the textures it
+// decoded), counted from the moment it arrives to the moment it is freed,
+// with the most there has been at once (resident_bytes, peak_bytes).
+
+import std.list
+import std.heap
+import std.string
+import std.strarr
+import std.json
+import std.fs
+import std.worker
+import ae3d.core
+import ae3d.cellfile
+import ae3d.engine
+import ae3d.agent
+import ae3d.nav
+import ae3d.physics
+import aephysics.mesh
+
+exports (
+    Streamer, Cell,
+    open, stream_free, last_error, set_engine, set_radius, set_far, set_budget, set_loads, set_nav, set_physics,
+    focus_clear, focus, update, wait_idle,
+    cell_count, cell_at, cell_of, cell_state, cell_far_state, cell_far_shown, cell_models, cell_x, cell_z, cell_loads,
+    missing, resident_count, resident_bytes, peak_bytes, loading_count,
+    event_count, event_kind, event_cell, events_clear, report,
+    UNLOADED, LOADING, LEAVING, LOADED, ATTACHING, RESIDENT, ARRIVED, LEFT
+)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+
+const UNLOADED = 0
+const LOADING = 1
+const LEAVING = 2
+const LOADED = 3
+const ATTACHING = 4
+const RESIDENT = 5
+
+// Events.
+const ARRIVED = 1                // a cell's models are all in (after the frame's attach)
+const LEFT = 2                   // a cell's models are about to be taken out and freed
+
+var g_error = ""
+var g_streams: ptr = null        // list of *Streamer, open, for the agent channel
+var g_answering = false
+
+last_error() -> string { return g_error }
+
+// One layer of a cell: its full models or its stand-in.
+struct Layer {
+    file: string                 // the cell file, "" for none
+    state: int
+    data: *CellData              // while LOADED or ATTACHING
+    models: ptr                  // list of *Model given to the renderer
+    next: int                    // the next of data's models to attach
+    bytes: long                  // what its decode made, while counted
+    loads: int                   // how many times it has been loaded
+    paths: ptr                   // strarr: the textures its materials name, while held
+    flags: ptr                   // int[]: each attached model's cellfile.FLAG_*, sized when its decode arrives
+    objects: ptr                 // list beside models: its *GameObject where it is a collider, else null
+    colliders: ptr               // ptr[]: each decoded model's collision mesh (*MeshData) or null, until attached
+    collider_count: int
+}
+
+struct Cell {
+    ix: int
+    iz: int
+    full: *Layer
+    far: *Layer
+    distance: float              // to the nearest focus, this frame
+    streamer: ptr                // *Streamer
+}
+
+struct LoadJob {
+    layer: *Layer
+    cell: *Cell
+    path: string
+    skip: ptr                    // strarr, the job's own
+    data: *CellData
+    colliders: bool              // its collision meshes built on the worker too
+    meshes: ptr                  // ptr[]: each model's *MeshData or null
+}
+
+struct Event {
+    kind: int
+    cell: *Cell
+}
+
+// Textures held by resident layers, so a cell that names one is not given
+// it decoded again.
+struct Held {
+    path: string
+    users: int
+}
+
+struct Streamer {
+    e: ptr                       // *Engine, or null: models made and held, given to no renderer
+    cell: float
+    x0: float
+    z0: float
+    nx: int
+    nz: int
+    cells: ptr                   // list of *Cell, row by row
+    base: string                 // the manifest's directory
+    radius: float
+    margin: float
+    far: float
+    budget: long
+    loads: int                   // in flight at most
+    in_flight: int
+    foci: ptr                    // float[2 * focus_capacity]
+    focus_count: int
+    focus_capacity: int
+    resident: long
+    peak: long
+    held: ptr                    // list of *Held
+    events: ptr                  // list of *Event
+    frame: int
+    // The walkers' field the resident cells' FLAG_NAV models block, and how
+    // (nav.flow_block_mesh's band and growth); null for none.
+    nav: ptr
+    nav_low: float
+    nav_high: float
+    nav_grow: int
+    // Whether FLAG_COLLIDER models are static colliders of the engine's
+    // physics (ae3d.physics, attached to the engine).
+    physics: bool
+    friction: float
+}
+
+// --- the world --------------------------------------------------------------------------------------
+
+// The world a manifest describes (written by the baker, tools/bake_world.ae):
+//
+//   {"cell": 64, "origin": [x0, z0], "size": [nx, nz],
+//    "cells": [{"x": 0, "z": 0, "file": "cell_0_0.aecell", "far": "cell_0_0.far.aecell"}]}
+//
+// cell files relative to the manifest. A cell the manifest does not list is
+// empty ground. Null, with last_error, for a manifest that does not read.
+open(path: string) -> *Streamer {
+    text, err = fs.read(path)
+    if err != "" {
+        g_error = "cannot read ${path}"
+        string.free(text)
+        return null
+    }
+    root = json.parse_raw(text)
+    string.free(text)
+    if root == null {
+        g_error = "cannot parse ${path}"
+        return null
+    }
+    st = heap.new(Streamer)
+    st.cell = number_of(json.object_get_raw(root, "cell"), 64.0)
+    origin = json.object_get_raw(root, "origin")
+    st.x0 = item(origin, 0, 0.0)
+    st.z0 = item(origin, 1, 0.0)
+    size = json.object_get_raw(root, "size")
+    st.nx = item(size, 0, 0.0) as int
+    st.nz = item(size, 1, 0.0) as int
+    if st.cell <= 0.0 || st.nx <= 0 || st.nz <= 0 {
+        g_error = "${path}: a world needs a cell size and a size in cells"
+        json.free(root)
+        heap.free(st)
+        return null
+    }
+    st.base = directory_of(path)
+    st.cells = list.new()
+    iz = 0
+    while iz < st.nz {
+        ix = 0
+        while ix < st.nx {
+            c = heap.new(Cell)
+            c.ix = ix
+            c.iz = iz
+            c.full = layer_new("")
+            c.far = layer_new("")
+            c.streamer = st as ptr
+            list.add_raw(st.cells, c as ptr)
+            ix = ix + 1
+        }
+        iz = iz + 1
+    }
+    listed = json.object_get_raw(root, "cells")
+    i = 0
+    while listed != null && i < json.array_size(listed) {
+        node = json.array_get_raw(listed, i)
+        ix = number_of(json.object_get_raw(node, "x"), -1.0) as int
+        iz = number_of(json.object_get_raw(node, "z"), -1.0) as int
+        if ix >= 0 && ix < st.nx && iz >= 0 && iz < st.nz {
+            c = list.get_raw(st.cells, iz * st.nx + ix) as *Cell
+            set_file(c.full, joined(st.base, text_of(json.object_get_raw(node, "file"))))
+            set_file(c.far, joined(st.base, text_of(json.object_get_raw(node, "far"))))
+        }
+        i = i + 1
+    }
+    json.free(root)
+    st.radius = st.cell * 2.0
+    st.margin = st.cell * 0.5
+    st.far = 0.0
+    st.budget = (4 * 1024 * 1024) as long
+    st.loads = 2
+    st.focus_capacity = 8
+    st.foci = calloc(st.focus_capacity * 2, 8)
+    st.held = list.new()
+    st.events = list.new()
+    if g_streams == null { g_streams = list.new() }
+    list.add_raw(g_streams, st as ptr)
+    // The agent channel asks every open stream (stream.cells): handed the
+    // stream.* ops once, by the first a program opens.
+    if !g_answering {
+        agent.provide("stream.", answer_op, null)
+        g_answering = true
+    }
+    return st
+}
+
+layer_new(file: string) -> *Layer {
+    l = heap.new(Layer)
+    l.file = string.copy(file)
+    l.models = list.new()
+    l.objects = list.new()
+    return l
+}
+
+set_file(l: *Layer, file: string) {
+    string.free(l.file)
+    l.file = string.copy(file)
+}
+
+joined(base: string, name: string) -> string {
+    if name == "" { return "" }
+    if fs.path_is_absolute(name) != 0 { return name }
+    return "${base}${name}"
+}
+
+directory_of(path: string) -> string {
+    i = string.length(path) - 1
+    while i >= 0 {
+        if string.char_at(path, i) == 47 { return string.substring(path, 0, i + 1) }
+        i = i - 1
+    }
+    return ""
+}
+
+number_of(node: ptr, fallback: float) -> float {
+    if node == null { return fallback }
+    return json.get_number(node)
+}
+
+item(node: ptr, index: int, fallback: float) -> float {
+    if node == null || json.array_size(node) <= index { return fallback }
+    return json.get_number(json.array_get_raw(node, index))
+}
+
+text_of(node: ptr) -> string {
+    if node == null { return "" }
+    return json.get_string_raw(node)
+}
+
+// The engine the cells' models go to; null to make and hold them only.
+set_engine(st: *Streamer, e: *Engine) { st.e = e as ptr }
+
+// Loaded within `radius` metres of a focus, let go past `radius + margin`.
+set_radius(st: *Streamer, radius: float, margin: float) {
+    st.radius = radius
+    st.margin = margin
+    if st.margin < 0.0 { st.margin = 0.0 }
+}
+
+// The resident cells' FLAG_NAV models blocked in `field` (a *FlowField) as
+// they arrive and unblocked as they leave, by their triangles between `low`
+// and `high` metres, grown by `grow` cells (nav.flow_block_mesh). A cell's
+// blockers let go open only what nothing else blocks: its neighbour's walls
+// and the game's own stay. Null for none.
+set_nav(st: *Streamer, field: @keep ptr, low: float, high: float, grow: int) {
+    st.nav = field
+    st.nav_low = low
+    st.nav_high = high
+    st.nav_grow = grow
+}
+
+// The cells' FLAG_COLLIDER models as static colliders of the engine's
+// physics (physics.attach first): each a game object with a mesh collider of
+// its triangles, the collision mesh built on the worker with the decode, in
+// place from the moment the model is. `friction` its surface's. A model
+// drawn as instances is left out: its copies are no one body.
+set_physics(st: *Streamer, on: bool, friction: float) {
+    st.physics = on
+    st.friction = friction
+}
+
+// Stand-ins out to `metres` (0: none).
+set_far(st: *Streamer, metres: float) { st.far = metres }
+
+// Bytes of geometry given to the renderer a frame, at most: what it uploads.
+set_budget(st: *Streamer, bytes: long) { st.budget = bytes }
+
+// Cells being read and decoded at once, at most.
+set_loads(st: *Streamer, count: int) {
+    st.loads = count
+    if st.loads < 1 { st.loads = 1 }
+}
+
+// --- each frame -----------------------------------------------------------------------------------------
+
+focus_clear(st: *Streamer) { st.focus_count = 0 }
+
+// A place cells are loaded around: the camera, a player, a host's players.
+focus(st: *Streamer, x: float, z: float) {
+    if st.focus_count == st.focus_capacity {
+        bigger = calloc(st.focus_capacity * 4, 8)
+        k = 0
+        while k < st.focus_count * 2 {
+            (bigger as float[])[k] = (st.foci as float[])[k]
+            k = k + 1
+        }
+        free(st.foci)
+        st.foci = bigger
+        st.focus_capacity = st.focus_capacity * 2
+    }
+    (st.foci as float[])[st.focus_count * 2] = x
+    (st.foci as float[])[st.focus_count * 2 + 1] = z
+    st.focus_count = st.focus_count + 1
+}
+
+// What arrived, what is wanted and what is not, the loads begun and the
+// frame's budget given to the renderer.
+update(st: *Streamer) {
+    st.frame = st.frame + 1
+    worker.drain(0)
+    n = list.size(st.cells)
+    reach = st.radius + st.margin
+    far_reach = st.far + st.margin
+    i = 0
+    while i < n {
+        c = list.get_raw(st.cells, i) as *Cell
+        c.distance = distance_to(st, c)
+        // A layer with no file is nothing to load.
+        if c.full.file != "" { want(st, c, c.full, c.distance <= st.radius, c.distance <= reach) }
+        if c.far.file != "" && st.far > 0.0 {
+            want(st, c, c.far, c.distance <= st.far, c.distance <= far_reach)
+        } else if c.far.state != UNLOADED {
+            want(st, c, c.far, false, false)
+        }
+        i = i + 1
+    }
+    begin_loads(st)
+    attach(st)
+    show_stand_ins(st)
+}
+
+// The square's nearest point to the nearest focus, in metres; far away with
+// no focus at all.
+distance_to(st: *Streamer, c: *Cell) -> float {
+    if st.focus_count == 0 { return 1000000000.0 }
+    x0 = st.x0 + (c.ix as float) * st.cell
+    z0 = st.z0 + (c.iz as float) * st.cell
+    best = 0.0 - 1.0
+    k = 0
+    while k < st.focus_count {
+        fx = (st.foci as float[])[k * 2]
+        fz = (st.foci as float[])[k * 2 + 1]
+        dx = 0.0
+        if fx < x0 { dx = x0 - fx }
+        if fx > x0 + st.cell { dx = fx - x0 - st.cell }
+        dz = 0.0
+        if fz < z0 { dz = z0 - fz }
+        if fz > z0 + st.cell { dz = fz - z0 - st.cell }
+        d = core.v3_len(core.vec3(dx, 0.0, dz))
+        if best < 0.0 || d < best { best = d }
+        k = k + 1
+    }
+    return best
+}
+
+// A layer's state against whether it is wanted and whether it is kept.
+want(st: *Streamer, c: *Cell, l: *Layer, wanted: bool, kept: bool) {
+    if l.state == LEAVING && wanted {
+        l.state = LOADING
+        return
+    }
+    if kept { return }
+    if l.state == LOADING {
+        l.state = LEAVING
+    } else if l.state == LOADED || l.state == ATTACHING || l.state == RESIDENT {
+        detach(st, c, l)
+    }
+}
+
+// The wanted cells not yet loading, nearest first, while there is room: the
+// cells within the radius before any stand-in.
+begin_loads(st: *Streamer) {
+    while st.in_flight < st.loads {
+        best = null as *Cell
+        i = 0
+        while i < list.size(st.cells) {
+            c = list.get_raw(st.cells, i) as *Cell
+            if c.full.file != "" && c.full.state == UNLOADED && c.distance <= st.radius &&
+               (best == null || c.distance < best.distance) {
+                best = c
+            }
+            i = i + 1
+        }
+        if best != null {
+            load(st, best, best.full)
+        } else {
+            // A stand-in where its cell is not wanted: inside the radius the
+            // cell itself is coming.
+            i = 0
+            while i < list.size(st.cells) {
+                c = list.get_raw(st.cells, i) as *Cell
+                if c.far.file != "" && st.far > 0.0 && c.far.state == UNLOADED && c.distance <= st.far &&
+                   c.distance > st.radius && (best == null || c.distance < best.distance) {
+                    best = c
+                }
+                i = i + 1
+            }
+            if best == null { return }
+            load(st, best, best.far)
+        }
+    }
+}
+
+load(st: *Streamer, c: *Cell, l: *Layer) {
+    l.state = LOADING
+    l.loads = l.loads + 1
+    st.in_flight = st.in_flight + 1
+    job = heap.new(LoadJob)
+    job.layer = l
+    job.cell = c
+    job.path = string.copy(l.file)
+    job.colliders = st.physics && st.e != null && l == c.full
+    job.skip = strarr.new()
+    i = 0
+    while i < list.size(st.held) {
+        strarr.push_copy(job.skip, (list.get_raw(st.held, i) as *Held).path)
+        i = i + 1
+    }
+    if !worker.run(|| { return load_run(job) }, |result: @keep ptr| { load_end(job, result) }) {
+        // No thread to read on: read here.
+        load_end(job, load_run(job))
+    }
+}
+
+// On the worker: the file read and decoded.
+load_run(job: *LoadJob) -> ptr {
+    job.data = cellfile.decode(job.path, job.skip)
+    if job.colliders && job.data.error == "" {
+        n = cellfile.model_count(job.data)
+        job.meshes = calloc(n + 1, 8)
+        i = 0
+        while i < n {
+            cm = cellfile.model_at(job.data, i)
+            if (cm.flags & cellfile.FLAG_COLLIDER) != 0 && cm.instance_count == 0 && cm.mesh != null {
+                (job.meshes as ptr[])[i] = physics.mesh_of_mesh(cm.mesh) as ptr
+            }
+            i = i + 1
+        }
+    }
+    return null
+}
+
+// Collision meshes built and never given to a collider.
+meshes_free(meshes: ptr, count: int) {
+    if meshes == null { return }
+    i = 0
+    while i < count {
+        md = (meshes as ptr[])[i]
+        if md != null { mesh.destroy_mesh(md as *MeshData) }
+        i = i + 1
+    }
+    free(meshes)
+}
+
+// On the loop thread: the decode is back.
+load_end(job: *LoadJob, result: ptr) {
+    l = job.layer
+    st = job.cell.streamer as *Streamer
+    st.in_flight = st.in_flight - 1
+    d = job.data
+    strarr.free(job.skip)
+    count = cellfile.model_count(d)
+    if d.error != "" {
+        println("ae3d stream: ${d.error}")
+        meshes_free(job.meshes, count)
+        cellfile.data_free(d)
+        l.state = UNLOADED
+    } else if l.state == LEAVING {
+        meshes_free(job.meshes, count)
+        cellfile.data_free(d)
+        l.state = UNLOADED
+    } else {
+        l.colliders = job.meshes
+        l.collider_count = count
+        l.flags = calloc(count + 1, 4)
+        l.data = d
+        l.next = 0
+        l.state = LOADED
+        l.bytes = cellfile.data_bytes(d)
+        st.resident = st.resident + l.bytes
+        if st.resident > st.peak { st.peak = st.resident }
+    }
+    string.free(job.path)
+    heap.free(job)
+}
+
+// The frame's budget given to the decoded layers, nearest first.
+attach(st: *Streamer) {
+    spent = 0 as long
+    attached_one = false
+    while true {
+        best = null as *Cell
+        best_layer = null as *Layer
+        i = 0
+        while i < list.size(st.cells) {
+            c = list.get_raw(st.cells, i) as *Cell
+            if (c.full.state == LOADED || c.full.state == ATTACHING) && (best == null || c.distance < best.distance) {
+                best = c
+                best_layer = c.full
+            }
+            if (c.far.state == LOADED || c.far.state == ATTACHING) && best == null {
+                best = c
+                best_layer = c.far
+            }
+            i = i + 1
+        }
+        if best == null { return }
+        l = best_layer
+        if l.state == LOADED {
+            offer_images(l.data)
+            l.state = ATTACHING
+        }
+        while l.next < cellfile.model_count(l.data) {
+            cost = cellfile.model_at(l.data, l.next).bytes
+            if attached_one && spent + cost > st.budget { return }
+            flags = cellfile.model_at(l.data, l.next).flags
+            m = cellfile.instantiate(l.data, l.next)
+            if l == best.far { m.casts_shadow = false }
+            list.add_raw(l.models, m as ptr)
+            (l.flags as int[])[l.next] = flags
+            list.add_raw(l.objects, attach_model(st, l, m) as ptr)
+            spent = spent + cost
+            attached_one = true
+            l.next = l.next + 1
+        }
+        resident(st, best, l)
+    }
+}
+
+// A model to the engine: a static collider's game object where its cell
+// made it a collision mesh, else the renderer's alone. The object, or null.
+attach_model(st: *Streamer, l: *Layer, m: *Model) -> *GameObject {
+    if st.e == null { return null }
+    e = st.e as *Engine
+    md = null as ptr
+    if l.colliders != null && l.next < l.collider_count {
+        md = (l.colliders as ptr[])[l.next]
+        (l.colliders as ptr[])[l.next] = null
+    }
+    if md == null {
+        engine.engine_add_model(e, m)
+        return null
+    }
+    // The object owns the model from here (engine.destroy frees it).
+    o = engine.object(e, core.text(m.name), m)
+    physics.rigidbody(o, physics.STATIC)
+    _shape = physics.mesh_collider(o, md as *MeshData, physics.material(st.friction, 0.0), m.scale)
+    return o
+}
+
+// The decoded textures put where the renderer takes them as the models
+// reach it.
+offer_images(d: *CellData) {
+    i = 0
+    while i < cellfile.image_count(d) {
+        ci = cellfile.image_at(d, i)
+        if ci.image != null {
+            core.offer_preloaded_image(ci.path, ci.image)
+            ci.image = null
+        }
+        i = i + 1
+    }
+}
+
+// Every model of the layer in: the decode let go, its textures held.
+resident(st: *Streamer, c: *Cell, l: *Layer) {
+    d = l.data
+    // What the renderer did not take (it already had them) let go.
+    i = 0
+    while i < cellfile.image_count(d) {
+        core.drop_preloaded_image(cellfile.image_at(d, i).path)
+        i = i + 1
+    }
+    l.paths = strarr.new()
+    i = 0
+    while i < strarr.size(d.paths) {
+        strarr.push_copy(l.paths, strarr.get(d.paths, i))
+        hold(st, strarr.get(d.paths, i), 1)
+        i = i + 1
+    }
+    cellfile.data_free(d)
+    l.data = null
+    meshes_free(l.colliders, l.collider_count)
+    l.colliders = null
+    l.state = RESIDENT
+    if l == c.full {
+        nav_step(st, l, true)
+        say(st, ARRIVED, c)
+    }
+}
+
+hold(st: *Streamer, path: string, by: int) {
+    i = 0
+    while i < list.size(st.held) {
+        h = list.get_raw(st.held, i) as *Held
+        if string.equals(h.path, path) == 1 {
+            h.users = h.users + by
+            if h.users <= 0 {
+                string.free(h.path)
+                heap.free(h)
+                list.remove(st.held, i)
+            }
+            return
+        }
+        i = i + 1
+    }
+    if by <= 0 { return }
+    h = heap.new(Held)
+    h.path = string.copy(path)
+    h.users = by
+    list.add_raw(st.held, h as ptr)
+}
+
+// The resident layer's walkers' blockers into the field (or out of it).
+nav_step(st: *Streamer, l: *Layer, block: bool) {
+    if st.nav == null { return }
+    i = 0
+    while i < list.size(l.models) {
+        flags = (l.flags as int[])[i]
+        if (flags & cellfile.FLAG_NAV) != 0 {
+            m = list.get_raw(l.models, i) as *Model
+            if block {
+                _b = nav.flow_block_mesh(st.nav as *FlowField, m, st.nav_low, st.nav_high, st.nav_grow)
+            } else {
+                _o = nav.flow_unblock_mesh(st.nav as *FlowField, m, st.nav_low, st.nav_high, st.nav_grow)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// The layer's models out of the renderer and freed, its decode with them:
+// its walkers' blockers let go first, its colliders' objects destroyed.
+detach(st: *Streamer, c: *Cell, l: *Layer) {
+    if l == c.full && l.state == RESIDENT {
+        say(st, LEFT, c)
+        nav_step(st, l, false)
+    }
+    i = 0
+    while i < list.size(l.models) {
+        m = list.get_raw(l.models, i) as *Model
+        o = list.get_raw(l.objects, i) as *GameObject
+        if o != null {
+            // Out of the renderer and the physics, freed at the frame's end.
+            engine.destroy(st.e as *Engine, o)
+        } else {
+            if st.e != null { engine.engine_remove_model(st.e as *Engine, m) }
+            core.model_free(m)
+        }
+        i = i + 1
+    }
+    list.clear(l.models)
+    list.clear(l.objects)
+    if l.flags != null {
+        free(l.flags)
+        l.flags = null
+    }
+    meshes_free(l.colliders, l.collider_count)
+    l.colliders = null
+    if l.data != null {
+        // Offered and not taken: the renderer will not ask now.
+        k = 0
+        while k < cellfile.image_count(l.data) {
+            core.drop_preloaded_image(cellfile.image_at(l.data, k).path)
+            k = k + 1
+        }
+        cellfile.data_free(l.data)
+        l.data = null
+    }
+    if l.paths != null {
+        k = 0
+        while k < strarr.size(l.paths) {
+            hold(st, strarr.get(l.paths, k), 0 - 1)
+            k = k + 1
+        }
+        strarr.free(l.paths)
+        l.paths = null
+    }
+    st.resident = st.resident - l.bytes
+    l.bytes = 0 as long
+    l.next = 0
+    l.state = UNLOADED
+}
+
+// A stand-in drawn while its cell is not all there.
+show_stand_ins(st: *Streamer) {
+    i = 0
+    while i < list.size(st.cells) {
+        c = list.get_raw(st.cells, i) as *Cell
+        if c.far.state == RESIDENT || c.far.state == ATTACHING {
+            show = c.full.state != RESIDENT
+            k = 0
+            while k < list.size(c.far.models) {
+                (list.get_raw(c.far.models, k) as *Model).visible = show
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+say(st: *Streamer, kind: int, c: *Cell) {
+    ev = heap.new(Event)
+    ev.kind = kind
+    ev.cell = c
+    list.add_raw(st.events, ev as ptr)
+}
+
+// Every load in flight finished (a test's frame, or a stream about to be
+// freed).
+wait_idle(st: *Streamer) {
+    while st.in_flight > 0 { worker.drain(0) }
+}
+
+// Everything let go: what is in flight waited for, every cell's models out
+// of the renderer and freed.
+stream_free(st: *Streamer) {
+    if st == null { return }
+    wait_idle(st)
+    i = 0
+    while i < list.size(st.cells) {
+        c = list.get_raw(st.cells, i) as *Cell
+        layer_free(st, c, c.full)
+        layer_free(st, c, c.far)
+        heap.free(c)
+        i = i + 1
+    }
+    list.free(st.cells)
+    events_clear(st)
+    list.free(st.events)
+    i = 0
+    while i < list.size(st.held) {
+        h = list.get_raw(st.held, i) as *Held
+        string.free(h.path)
+        heap.free(h)
+        i = i + 1
+    }
+    list.free(st.held)
+    free(st.foci)
+    string.free(st.base)
+    i = 0
+    while i < list.size(g_streams) {
+        if list.get_raw(g_streams, i) == st as ptr {
+            list.remove(g_streams, i)
+            i = list.size(g_streams)
+        }
+        i = i + 1
+    }
+    heap.free(st)
+}
+
+layer_free(st: *Streamer, c: *Cell, l: *Layer) {
+    if l.state != UNLOADED { detach(st, c, l) }
+    list.free(l.models)
+    list.free(l.objects)
+    string.free(l.file)
+    heap.free(l)
+}
+
+// --- what it is doing ---------------------------------------------------------------------------------
+
+cell_count(st: *Streamer) -> int { return list.size(st.cells) }
+cell_at(st: *Streamer, i: int) -> *Cell { return list.get_raw(st.cells, i) as *Cell }
+
+// The cell under (x, z), or null off the grid.
+cell_of(st: *Streamer, x: float, z: float) -> *Cell {
+    ix = floor_int((x - st.x0) / st.cell)
+    iz = floor_int((z - st.z0) / st.cell)
+    if ix < 0 || iz < 0 || ix >= st.nx || iz >= st.nz { return null }
+    return list.get_raw(st.cells, iz * st.nx + ix) as *Cell
+}
+
+floor_int(v: float) -> int {
+    i = v as int
+    if (i as float) > v { i = i - 1 }
+    return i
+}
+
+cell_state(c: *Cell) -> int { return c.full.state }
+cell_far_state(c: *Cell) -> int { return c.far.state }
+
+// Whether the cell's stand-in is drawn: one of its models visible.
+cell_far_shown(c: *Cell) -> bool {
+    i = 0
+    while i < list.size(c.far.models) {
+        if (list.get_raw(c.far.models, i) as *Model).visible { return true }
+        i = i + 1
+    }
+    return false
+}
+cell_models(c: *Cell) -> ptr { return c.full.models }
+cell_x(c: *Cell) -> int { return c.ix }
+cell_z(c: *Cell) -> int { return c.iz }
+cell_loads(c: *Cell) -> int { return c.full.loads }
+
+// The cells with a file within `metres` of a focus that are not resident:
+// what a focus would find missing there.
+missing(st: *Streamer, metres: float) -> int {
+    n = 0
+    i = 0
+    while i < list.size(st.cells) {
+        c = list.get_raw(st.cells, i) as *Cell
+        if c.full.file != "" && distance_to(st, c) <= metres && c.full.state != RESIDENT { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+resident_count(st: *Streamer) -> int {
+    n = 0
+    i = 0
+    while i < list.size(st.cells) {
+        if (list.get_raw(st.cells, i) as *Cell).full.state == RESIDENT { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+loading_count(st: *Streamer) -> int { return st.in_flight }
+resident_bytes(st: *Streamer) -> long { return st.resident }
+peak_bytes(st: *Streamer) -> long { return st.peak }
+
+event_count(st: *Streamer) -> int { return list.size(st.events) }
+event_kind(st: *Streamer, i: int) -> int { return (list.get_raw(st.events, i) as *Event).kind }
+event_cell(st: *Streamer, i: int) -> *Cell { return (list.get_raw(st.events, i) as *Event).cell }
+
+// The events read: the game's to call once it has.
+events_clear(st: *Streamer) {
+    i = 0
+    while i < list.size(st.events) {
+        heap.free(list.get_raw(st.events, i))
+        i = i + 1
+    }
+    list.clear(st.events)
+}
+
+state_name(state: int) -> string {
+    if state == LOADING { return "loading" }
+    if state == LEAVING { return "leaving" }
+    if state == LOADED { return "loaded" }
+    if state == ATTACHING { return "attaching" }
+    if state == RESIDENT { return "resident" }
+    return "unloaded"
+}
+
+// The stream as JSON, the caller's: the grid, the memory, and every cell
+// that is not unloaded, its state, its stand-in's and its distance.
+report(st: *Streamer) -> ptr {
+    out = json.obj()
+    json.object_set_raw(out, "frame", json.from_int(st.frame))
+    json.object_set_raw(out, "cell", json.num(st.cell))
+    json.object_set_raw(out, "size", pair(st.nx, st.nz))
+    json.object_set_raw(out, "radius", json.num(st.radius))
+    json.object_set_raw(out, "margin", json.num(st.margin))
+    json.object_set_raw(out, "far", json.num(st.far))
+    json.object_set_raw(out, "resident_bytes", json.num(st.resident as float))
+    json.object_set_raw(out, "peak_bytes", json.num(st.peak as float))
+    json.object_set_raw(out, "loading", json.from_int(st.in_flight))
+    json.object_set_raw(out, "missing", json.from_int(missing(st, st.radius)))
+    cells = json.arr()
+    i = 0
+    while i < list.size(st.cells) {
+        c = list.get_raw(st.cells, i) as *Cell
+        if c.full.state != UNLOADED || c.far.state != UNLOADED {
+            entry = json.obj()
+            json.object_set_raw(entry, "x", json.from_int(c.ix))
+            json.object_set_raw(entry, "z", json.from_int(c.iz))
+            json.object_set_raw(entry, "state", json.str(state_name(c.full.state)))
+            json.object_set_raw(entry, "far", json.str(state_name(c.far.state)))
+            json.object_set_raw(entry, "distance", json.num(c.distance))
+            json.object_set_raw(entry, "models", json.from_int(list.size(c.full.models)))
+            json.object_set_raw(entry, "loads", json.from_int(c.full.loads))
+            json.array_add_raw(cells, entry)
+        }
+        i = i + 1
+    }
+    json.object_set_raw(out, "cells", cells)
+    return out
+}
+
+// --- on the agent channel ---------------------------------------------------------------------------
+
+// stream.cells: every open stream's report, or the one at `stream`.
+answer_op(context: ptr, op: string, request: ptr) -> ptr {
+    if op != "stream.cells" { return json.str("unknown op ${op}; stream.cells is ae3d.stream's") }
+    count = 0
+    if g_streams != null { count = list.size(g_streams) }
+    only = 0 - 1
+    node = json.object_get_raw(request, "stream")
+    if node != null {
+        only = json.get_int(node)
+        if only < 0 || only >= count { return json.str("no stream ${only}: there are ${count}") }
+    }
+    out = json.obj()
+    streams = json.arr()
+    k = 0
+    while k < count {
+        if only < 0 || only == k { json.array_add_raw(streams, report(list.get_raw(g_streams, k) as *Streamer)) }
+        k = k + 1
+    }
+    json.object_set_raw(out, "streams", streams)
+    return out
+}
+
+pair(a: int, b: int) -> ptr {
+    out = json.arr()
+    json.array_add_raw(out, json.from_int(a))
+    json.array_add_raw(out, json.from_int(b))
+    return out
+}

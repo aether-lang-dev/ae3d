@@ -1,0 +1,269 @@
+// The opaque depth prepass (ae3d.vkframe): the same picture with it as
+// without, each opaque pixel lit once. On a tiled GPU the lit pipeline,
+// which can discard, lost its hidden-surface removal and early depth test,
+// so every opaque surface behind another was lit in full where it was
+// hidden; the prepass writes the depth first and the lit draws test against
+// it without writing it.
+//
+// One scene drawn both ways, pixel by pixel:
+//   - opaque cubes overlapping one another, drawn far ones first;
+//   - a batch of the same cube (merged into one instanced draw);
+//   - an instanced model;
+//   - a cut cube (its far side dropped, by both passes alike);
+//   - a cutout quad, which the prepass leaves to the lit pass;
+//   - a glass sphere in front, blended over them all.
+// And what it is for: a stack of opaque layers costs a fraction of what it
+// did. Headless; SKIP without Vulkan.
+
+import std.list
+import std.mem
+import ae3d.core
+import ae3d.vulkan
+import ae3d.vkdevice
+import ae3d.loader
+
+const WIDTH = 480
+const HEIGHT = 270
+const LAYERS = 120
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
+extern exit(code: int)
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+add(backend: *Backend, models: ptr, m: *Model) -> *Model {
+    core.model_recalculate_bounds(m)
+    core.backend_add_model(backend, m)
+    list.add_raw(models, m as ptr)
+    return m
+}
+
+// The frame after a few to settle (TAA off, so one frame is the picture),
+// copied out.
+picture(backend: *Backend, cam: *Camera, light: *Light) -> ptr {
+    frame = 0
+    while frame < 3 {
+        core.backend_render(backend, cam, light)
+        frame = frame + 1
+    }
+    pixels = core.backend_frame_pixels(backend)
+    if pixels == null { return null }
+    out = calloc(WIDTH * HEIGHT, 4)
+    memcpy(out, pixels, (WIDTH * HEIGHT * 4) as long)
+    return out
+}
+
+// The opaque stage's least over eight frames, after two to settle.
+// The scene pass's milliseconds without the prepass and with it, measured
+// in turns: frame by frame it is off, then on, so whatever else the device
+// is doing (another program drawing, its clock moving under so light a
+// load) falls on both alike; each the median of its 20 frames. A frame's
+// stamps are read back two frames on (vkframe's two frames in flight), so
+// the reading after a frame is that of the frame two before it, which had
+// the same setting. One frame's GPU time is no measure on its own: on an M1
+// Pro, sixty layers read 0.19 ms on one frame and 8.4 on the next. The whole
+// pass, not its opaque stage: under MoltenVK a timestamp lands only at a
+// render pass's edges. What else the pass draws is the same either way.
+scene_medians(backend: *Backend, r: *VKRenderer, cam: *Camera, light: *Light) -> (float, float) {
+    n = 20
+    block = calloc(n * 2, 8)
+    ms = block as float[]
+    got = calloc(2, 4)
+    count = got as int[]
+    frame = 0
+    while frame < n * 2 + 6 {
+        on = frame % 2 == 1
+        vulkan.renderer_set_prepass(r, on)
+        core.backend_render(backend, cam, light)
+        // From the third frame on, the reading is a frame of this setting's.
+        side = frame % 2
+        if frame >= 6 && count[side] < n {
+            ms[side * n + count[side]] = vulkan.renderer_scene_ms(r)
+            count[side] = count[side] + 1
+        }
+        frame = frame + 1
+    }
+    off = median(ms, 0, count[0])
+    with = median(ms, n, count[1])
+    free(got)
+    free(block)
+    return off, with
+}
+
+// The median of v[from .. from + n), sorted in place.
+median(v: float[], from: int, n: int) -> float {
+    if n == 0 { return 0.0 }
+    a = 1
+    while a < n {
+        x = v[from + a]
+        b = a - 1
+        while b >= 0 && v[from + b] > x {
+            v[from + b + 1] = v[from + b]
+            b = b - 1
+        }
+        v[from + b + 1] = x
+        a = a + 1
+    }
+    if n % 2 == 1 { return v[from + n / 2] }
+    return (v[from + n / 2 - 1] + v[from + n / 2]) * 0.5
+}
+
+main() {
+    println("vk_prepass: the opaque depth prepass draws the same picture, each pixel lit once")
+    if !vulkan.available() {
+        println("vk_prepass: SKIP no Vulkan driver (${vulkan.last_error()})")
+        return
+    }
+    r = vulkan.renderer_new()
+    backend = vulkan.backend(r)
+    if !core.backend_init(&backend, null, WIDTH, HEIGHT) {
+        println("vk_prepass: SKIP Vulkan would not start (${vulkan.last_error()})")
+        vulkan.renderer_free(r)
+        return
+    }
+    // What the device chose, before the test asks for either.
+    default_on = vulkan.renderer_prepass(r)
+    vulkan.renderer_set_prepass(r, true)
+    if !vulkan.renderer_prepass(r) {
+        println("vk_prepass: SKIP this device has no prepass pipelines")
+        core.backend_cleanup(&backend)
+        vulkan.renderer_free(r)
+        return
+    }
+    models = list.new()
+    // Far ones first: the order the prepass is for.
+    k = 0
+    while k < 6 {
+        c = loader.cube(3.0)
+        core.model_set_position(c, (k as float) * 1.2 - 3.0, 0.3 * (k as float), 0.0 - (6 - k) as float)
+        core.model_rotate(c, 10.0 * (k as float), 25.0, 0.0)
+        core.model_matte(c, 0.2 + 0.12 * (k as float), 0.5, 0.8 - 0.1 * (k as float))
+        add(&backend, models, c)
+        k = k + 1
+    }
+    // A batch: the same cube, plain, in a row.
+    k = 0
+    while k < 5 {
+        b = loader.cube(1.0)
+        core.model_set_position(b, (k as float) * 1.5 - 3.0, 0.0 - 2.5, 1.0)
+        add(&backend, models, b)
+        k = k + 1
+    }
+    many = loader.sphere(0.4, 12, 8)
+    core.model_enable_instancing(many, 4)
+    k = 0
+    while k < 4 {
+        core.model_set_instance_position(many, k, core.vec3((k as float) - 1.5, 2.5, 0.5))
+        k = k + 1
+    }
+    core.model_set_instance_draw_count(many, 4)
+    add(&backend, models, many)
+    cut = add(&backend, models, loader.cube(2.0))
+    core.model_set_position(cut, 3.5, 1.0, 0.0)
+    core.model_set_clip(cut, core.vec3(1.0, 0.0, 0.0), 0.0, 0.0, 1.0)
+    leaf = add(&backend, models, loader.quad(2.0, 2.0))
+    core.model_rotate(leaf, 90.0, 0.0, 0.0)
+    core.model_set_position(leaf, 0.0 - 3.5, 1.0, 1.5)
+    core.model_set_texture(leaf, "resources/textures/sand.png")
+    core.model_set_cutout(leaf, 0.5)
+    glass = add(&backend, models, loader.sphere(1.0, 24, 16))
+    core.model_set_position(glass, 0.0, 0.0, 3.0)
+    core.model_glass(glass, 0.6, 0.8, 1.0, 0.4)
+
+    cam = core.camera_new(WIDTH, HEIGHT)
+    core.camera_set_position(cam, core.vec3(0.0, 1.0, 12.0))
+    core.camera_look_at(cam, core.vec3(0.0, 0.0, 0.0))
+    light = core.light_sun(core.vec3(0.3, 0.8, 0.5))
+
+    with_prepass = picture(&backend, cam, light)
+    vulkan.renderer_set_prepass(r, false)
+    without = picture(&backend, cam, light)
+    differ = 0
+    worst = 0
+    lit = 0
+    lit_with = 0
+    if with_prepass != null && without != null {
+        i = 0
+        while i < WIDTH * HEIGHT * 4 {
+            if i % 4 != 3 {
+                d = mem.get_byte(with_prepass, i) - mem.get_byte(without, i)
+                if d < 0 { d = 0 - d }
+                if d > worst { worst = d }
+                if d > 2 { differ = differ + 1 }
+                if mem.get_byte(without, i) > 30 { lit = lit + 1 }
+                if mem.get_byte(with_prepass, i) > 30 { lit_with = lit_with + 1 }
+            }
+            i = i + 1
+        }
+    }
+    println("    ${differ} channels differ by more than 2 (worst ${worst}) of ${lit} lit without, ${lit_with} with")
+    check("the frame drew something", lit > 1000)
+    check("the picture with the prepass is the picture without it", with_prepass != null && differ * 1000 <= lit)
+    if with_prepass != null { free(with_prepass) }
+    if without != null { free(without) }
+
+    // What it is for: opaque layers, nearest first, lit once each pixel.
+    stack = list.new()
+    k = 0
+    while k < LAYERS {
+        q = loader.quad(60.0, 60.0)
+        core.model_rotate(q, 90.0, 0.0, 0.0)
+        core.model_set_position(q, 0.0, 0.0, 0.0 - (k as float) * 0.3)
+        core.model_matte(q, 0.5, 0.6, 0.7)
+        add(&backend, stack, q)
+        k = k + 1
+    }
+    // In turns, each the median of its frames (scene_medians).
+    off_ms, on_ms = scene_medians(&backend, r, cam, light)
+    println("    ${LAYERS} opaque layers: the scene pass ${off_ms} ms without the prepass, ${on_ms} ms with it")
+    if vkdevice.software() {
+        // A rasterizer in software tests depth before it shades with or
+        // without it, and pays the second pass in full: off unless asked.
+        check("on a CPU rasterizer it is off unless asked (it costs ${on_ms / off_ms} of the cost without)", !default_on)
+    } else {
+        // 0.21 to 0.58 of the cost over twenty runs on an M1 Pro: held under
+        // 0.7, three tenths saved at the least, with room for the device.
+        check("a stack of opaque layers costs a fraction with it (${on_ms / off_ms})", on_ms < off_ms * 0.7)
+        check("and on a GPU it is on unless asked", default_on)
+    }
+
+    i = 0
+    while i < list.size(stack) {
+        m = list.get_raw(stack, i) as *Model
+        core.backend_remove_model(&backend, m)
+        core.model_free(m)
+        i = i + 1
+    }
+    list.free(stack)
+    i = 0
+    while i < list.size(models) {
+        m = list.get_raw(models, i) as *Model
+        core.backend_remove_model(&backend, m)
+        core.model_free(m)
+        i = i + 1
+    }
+    list.free(models)
+    core.light_free(light)
+    core.camera_free(cam)
+    core.backend_cleanup(&backend)
+    vulkan.renderer_free(r)
+    if g_failures == 0 {
+        println("vk_prepass: all checks passed (${g_checks})")
+    } else {
+        println("vk_prepass: ${g_failures} of ${g_checks} checks FAILED")
+        exit(1)
+    }
+}

@@ -76,36 +76,112 @@ buffer the compute sort reads.
 
 ## Navigation
 
-A path per zombie is a search per zombie; a hundred thousand of them want
+A path per figure is a search per figure; a hundred thousand of them want
 one search. `ae3d.nav` is a flow field over the ground:
 
 ```aether
-field = nav.flow_new(x0, z0, x1, z1, 1.0)          // the ground, metres, a cell a metre
-nav.flow_block_model(field, building)               // what nothing walks through
-nav.flow_build(field, core.vec3(px, 0.0, pz))       // the target: the player
+field = nav.flow_new(x0, z0, x1, z1, 1.0)            // the ground, metres, a cell a metre
+nav.flow_block_mesh(field, fence, -0.3, 2.2, 0)       // what nothing walks through: its own triangles
+nav.flow_block_model(field, bin)                      // or a compact thing's bounding square
+nav.flow_clearance(field, 2, 30)                      // walls kept at a body's distance
+nav.flow_build(field, core.vec3(px, 0.0, pz))         // the target: the player
 nav.flow_steer(field, positions, yaws, count, 2.0 * delta)   // every heading toward it
 ```
 
-The field is the cost from every cell to the target, found by one flood
+The field is the price from every cell to the target, found by one flood
 from the target outward over the cells nothing stands in: a Dijkstra
 eight ways, a straight step 10 and a diagonal 14 (tenths of a cell, as
-integers, so the frontier is a ring and not a heap), no diagonal past a
-blocked corner so nothing is told to walk through the edge of a wall, and
-a direction per cell toward the cheapest neighbour. A figure reads the
-direction under its feet and turns toward it by at most `turn` a step, so
-the horde swings round rather than snapping; where the field says nothing
-it keeps its heading and the wander and separation carry on.
+integers, so the frontier is a ring and not a heap), plus what the cell
+stepped into costs, and no diagonal past a blocked corner so nothing is
+told to walk through the edge of a wall. Each cell's direction is set with
+its cost, toward the cell it was reached from, so it points along the walk
+its cost was paid for; where two ways in tie, the one from nearer the
+target. A figure reads the direction under its feet and turns toward it by
+at most `turn` a step, so the horde swings round rather than snapping;
+where the field says nothing it keeps its heading and the wander and
+separation carry on.
 
-The flood is paid once each time the target crosses a cell: 8.2 ms for
-the city's field against the C's 8.3 (the marks as ints; as bytes read
-through `std.mem` the flood took twice as long, a runtime call a read).
-The steer runs over the pool: 1.7 ms for 200,000 figures on one thread.
-A cell points one of eight ways, so the heading it asks for is one of
-eight constants, not libm's `atan2`, which isn't the same function on
-every platform: a horde stepped on every peer of a game
-([networking.md](networking.md#the-horde)) turns by the same bits on each.
-The city's horde hunts the camera with it, so it fills the view it is
-seen from (`AE3D_HUNT=0` lets it wander instead).
+### What blocks a cell
+
+- `flow_block(f, x0, z0, x1, z1)` a rectangle, and `flow_open` the same
+  rectangle open again (a wall torn down).
+- `flow_block_mesh(f, model, low, high, grow)` the cells under a model's own
+  triangles, each instance's for an instanced model, cut to the band of
+  heights from `low` to `high` (where a body is, in the world's heights),
+  then grown by `grow` cells. A 40 m fence 0.2 m thick blocks its 40 cells;
+  its bounding square closed over 1,600. A shack keeps its doorway, a water
+  tower blocks its legs and not the ground under its tank (#817). A cell is
+  covered where the triangle's shadow is inside it by more than a
+  ten-thousandth of a cell, and more where float32 is coarser, so a block
+  a cell across placed on the cell's lines, by an instance matrix too,
+  blocks its one cell. A face on a cell line blocks the cell behind it,
+  into the solid (the faces wound counter-clockwise, as glTF and the
+  loaders wind them), so a lone panel on a line blocks one row and leaks
+  nothing. Growth is a disc by the flood's own measure: one cell round a
+  row of 20 is 62 cells, and two round a single cell is 13. A skinned mesh
+  and a model drawn as points block nothing.
+- `flow_block_model(f, model)` the bounding sphere's square: cheap and
+  right for something compact, wrong for anything long, thin or hollow.
+
+A cell counts what blocks it. `flow_unblock_mesh` (the same model, band and
+growth) and `flow_unblock` (the same rectangle) each take one blocker off
+each cell of the footprint, so a cell stays blocked while anything else
+still blocks it. A streamed cell's walls let go leave its neighbour's
+standing, and the game's own blocks stay. A grown footprint changes each of
+its cells once, however many of its marks reach it: a stamped footprint's
+cells are listed as they are first reached, and the count changed over the
+list. The fence below costs 0.43 ms where it cost 0.42 before the count.
+`flow_open` still opens a rectangle whatever blocks it, and `flow_clear`
+opens the whole field.
+
+### Dear cells and the clearance
+
+Blocked is all or nothing. A field that kept bodies off walls by blocking a
+margin closed every doorway narrower than two margins, and left whoever
+stood in the margin on a cell with no direction (#819). A cell can be dear
+instead: every step into it costs its price more, in tenths of a cell for
+each cell crossed (a diagonal 1.4 times it).
+
+- `flow_clearance(f, cells, extra)` prices the cells within `cells` of a
+  wall: `extra` beside it, falling evenly to `extra / cells` at `cells` away.
+  The field then leads round a wall at a body's distance, through a doorway
+  when that is the only way, and out of the margin for anyone already in it.
+  It stays with the field: as walls go up and come down, only the cells
+  within reach of the change are priced again (a 20 m wall, 1.05 us; the
+  whole million-cell field, 5.7 ms).
+- `flow_cost_rect(f, x0, z0, x1, z1, extra)` sets an area's own price, for
+  mud, a fire, a road the crowd keeps off; 0 takes it off.
+- `flow_price(f, x, z)` reads a cell's price, `flow_cost` the walk's price in
+  metres (its length plus what the dear cells on it add).
+
+A price is at most `MAX_PRICE` (1000, a hundred cells' walk), and less on a
+field of more than about 1.5 million cells, where the cap keeps every walk's
+cost inside an int.
+
+### What it costs
+
+`benchmarks/bench_nav` on a field of 1024 x 1024 cells (a city of 24 m
+blocks with gaps, 520,026 cells reached), best of nine on an M-series Mac:
+
+| | ms |
+|---|---|
+| flood, every cell one price | 12.1 to 13.2 (16.2 before the directions were set in the flood) |
+| flood, with a clearance of two cells | 14.7 to 16.4 |
+| the clearance over the whole field | 5.7 |
+| a 20 m wall up or down, clearance on | 0.001 |
+| a 600-instance fence's footprint (7,200 triangles), grown by a cell | 0.35 to 0.40 |
+
+A bucket queue (Dial's), which settles each cell once, was measured on the
+same field at 19.7 and 15.9 ms: its lists cost more writes a step than the
+second relaxations it saves (0.8% of cells at one price, 18% with the
+clearance). The marks, prices and costs are ints and the direction one int
+naming one of eight ways, 28 bytes a cell. The steer runs over the pool and
+reads a cell's way and its heading from a table of eight. A cell points
+one of eight ways, so the heading it asks for is one of eight constants,
+not libm's `atan2`, which isn't the same function on every platform: a
+horde stepped on every peer of a game
+([networking.md](networking.md#the-horde)) turns by the same bits on each. The city's horde hunts the camera with it, so it fills the
+view it is seen from (`AE3D_HUNT=0` lets it wander instead).
 
 ## What is checked
 
@@ -114,7 +190,11 @@ distance to the target collapses (a horde moves as one); `test_horde_separate`
 starts 1,500 figures on one spot and checks the crowd's spread grows as they
 shove apart; `test_horde_scale` runs the whole update over half a million
 and fails if a step blows past real time; `test_nav` floods a field and
-checks the directions and the headings turned by them; `test_posebank`
+checks the directions and the headings turned by them, the footprints a
+cube, a fence straight and on the diagonal, a shack, a water tower and a
+lone panel take, by exact cell counts, the clearance's prices to the tenth,
+every cell's way against its cost and the step it names, and prices kept
+up as walls go up and down against prices made at once; `test_posebank`
 checks each baked frame against the skeleton driven live to the same
 time; `test_crowd_ecs` and `test_ecs*` the store; `test_device_crowd` the
 device sort against the CPU's; `test_jobs` the pool's pass and block

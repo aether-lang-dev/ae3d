@@ -1,0 +1,460 @@
+// The pipeline's half of a streamed world (#917): a scene's models cut into
+// the cells ae3d.stream loads, each cell's file and its stand-in for when it
+// is far, and the manifest that names them.
+//
+//     err = worldbake.bake(models, flags, 64.0, x0, z0, nx, nz, "build/world/")
+//
+// A model belongs to the cell its bounds' centre stands over, so a cell's
+// models are the ones a focus near it needs, whatever they overhang. A
+// cell's stand-in (its "far" file) is one model for the whole cell:
+//   - every model drawn once (not an instanced crowd of props: at the
+//     distance a stand-in is drawn from they are under a pixel) merged into
+//     one mesh, in the world, a range of triangles a source material;
+//   - simplified to the coarsest cut of its cluster graph (ae3d.clusterlod:
+//     edge collapses that hold the vertices two materials share, so the
+//     simplification opens no crack between them);
+//   - a material a range with no texture: the colour the texture averages
+//     to (in linear light, as the shader multiplies it) baked into its
+//     diffuse. Far away a texture's detail is below a pixel and what is
+//     left of it is its mean; a stand-in so made needs no texture held for
+//     it, which is what lets a world of distinct cells keep only the near
+//     ones' in memory.
+
+import std.list
+import std.heap
+import std.string
+import std.strarr
+import std.json
+import std.fs
+import ae3d.core
+import ae3d.geometry
+import ae3d.picture
+import ae3d.cellfile
+import ae3d.clusterlod
+
+exports (bake, stand_in, BakeStats, last_stats)
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern pow(x: float, y: float) -> float
+
+const VERTEX_FLOATS = 9
+
+// What the last bake wrote.
+struct BakeStats {
+    cells: int                   // cells with any model
+    models: int
+    full_triangles: int          // every cell's, as drawn near
+    far_triangles: int           // every stand-in's
+    bytes: long                  // every file's
+}
+
+var g_cells = 0
+var g_models = 0
+var g_full = 0
+var g_far = 0
+var g_bytes: long = 0
+var g_linear: ptr = null         // float[256]: an sRGB byte in linear light
+
+last_stats() -> BakeStats {
+    return BakeStats { cells: g_cells, models: g_models, full_triangles: g_full, far_triangles: g_far, bytes: g_bytes }
+}
+
+// The world under `dir` (made if it is not there): the `nx` by `nz` cells of
+// `cell` metres from (x0, z0), a cell file and a stand-in each that any
+// model stands over, and world.json naming them. `flags` (int[] beside the
+// models, or null) carries what each is to the world (cellfile.FLAG_*).
+// "" when written, else why not.
+bake(models: ptr, flags: ptr, cell: float, x0: float, z0: float, nx: int, nz: int, dir: string) -> string {
+    g_cells = 0
+    g_models = 0
+    g_full = 0
+    g_far = 0
+    g_bytes = 0 as long
+    if cell <= 0.0 || nx <= 0 || nz <= 0 { return "a world needs a cell size and a size in cells" }
+    made = fs.mkdir_p(dir)
+    if made != "" && fs.exists(dir) == 0 { return "cannot make ${dir}: ${made}" }
+    // Each model's cell, by the centre of its bounds.
+    n = list.size(models)
+    owner = calloc(n + 1, 4)
+    i = 0
+    while i < n {
+        m = list.get_raw(models, i) as *Model
+        core.model_update_matrix(m)
+        c = m.bounding_center
+        ix = floor_int((c.x - x0) / cell)
+        iz = floor_int((c.z - z0) / cell)
+        (owner as int[])[i] = 0 - 1
+        if ix >= 0 && iz >= 0 && ix < nx && iz < nz { (owner as int[])[i] = iz * nx + ix }
+        i = i + 1
+    }
+    manifest = json.obj()
+    json.object_set_raw(manifest, "cell", json.num(cell))
+    json.object_set_raw(manifest, "origin", pair_float(x0, z0))
+    size = json.arr()
+    json.array_add_raw(size, json.from_int(nx))
+    json.array_add_raw(size, json.from_int(nz))
+    json.object_set_raw(manifest, "size", size)
+    listed = json.arr()
+    err = ""
+    k = 0
+    while k < nx * nz && err == "" {
+        sub = list.new()
+        sub_flags = calloc(n + 1, 4)
+        i = 0
+        while i < n {
+            if (owner as int[])[i] == k {
+                if flags != null { (sub_flags as int[])[list.size(sub)] = (flags as int[])[i] }
+                list.add_raw(sub, list.get_raw(models, i))
+            }
+            i = i + 1
+        }
+        if list.size(sub) > 0 {
+            ix = k % nx
+            iz = k / nx
+            name = "cell_${ix}_${iz}.aecell"
+            far_name = "cell_${ix}_${iz}.far.aecell"
+            err = cellfile.write("${dir}${name}", sub, sub_flags)
+            far = stand_in(sub)
+            if err == "" && far != null {
+                one = list.new()
+                list.add_raw(one, far as ptr)
+                err = cellfile.write("${dir}${far_name}", one, null)
+                list.free(one)
+            }
+            entry = json.obj()
+            json.object_set_raw(entry, "x", json.from_int(ix))
+            json.object_set_raw(entry, "z", json.from_int(iz))
+            json.object_set_raw(entry, "file", json.str(name))
+            if far != null {
+                json.object_set_raw(entry, "far", json.str(far_name))
+                g_far = g_far + core.mesh_index_count(far.mesh) / 3
+                core.model_free(far)
+            }
+            json.array_add_raw(listed, entry)
+            g_cells = g_cells + 1
+            g_models = g_models + list.size(sub)
+            g_full = g_full + triangles_of(sub)
+            g_bytes = g_bytes + file_size("${dir}${name}") + file_size("${dir}${far_name}")
+        }
+        free(sub_flags)
+        list.free(sub)
+        k = k + 1
+    }
+    free(owner)
+    json.object_set_raw(manifest, "cells", listed)
+    if err == "" {
+        text = json.stringify_raw(manifest)
+        werr = fs.write("${dir}world.json", text)
+        if werr != "" { err = "cannot write ${dir}world.json: ${werr}" }
+    }
+    json.free(manifest)
+    return err
+}
+
+triangles_of(models: ptr) -> int {
+    t = 0
+    i = 0
+    while i < list.size(models) {
+        m = list.get_raw(models, i) as *Model
+        copies = 1
+        if m.is_instanced && m.instances != null { copies = core.model_instance_count(m) }
+        t = t + core.mesh_index_count(m.mesh) / 3 * copies
+        i = i + 1
+    }
+    return t
+}
+
+file_size(path: string) -> long {
+    size, err = fs.size(path)
+    if err != "" { return 0 as long }
+    return size
+}
+
+pair_float(a: float, b: float) -> ptr {
+    out = json.arr()
+    json.array_add_raw(out, json.num(a))
+    json.array_add_raw(out, json.num(b))
+    return out
+}
+
+floor_int(v: float) -> int {
+    i = v as int
+    if (i as float) > v { i = i - 1 }
+    return i
+}
+
+// --- the stand-in ---------------------------------------------------------------------------------
+
+// One range of the merged mesh: the triangles one source material drew.
+struct Range {
+    material: *Material          // the source's, read only
+    start: int
+    count: int
+}
+
+// The models as one far model, simplified, its colours baked (above); the
+// caller's. Null when nothing among them is drawn once.
+stand_in(models: ptr) -> *Model {
+    // Sizes first: every model drawn once, every triangle of it.
+    vertices = 0
+    indices = 0
+    i = 0
+    while i < list.size(models) {
+        m = list.get_raw(models, i) as *Model
+        if counts(m) {
+            vertices = vertices + core.mesh_vertex_count(m.mesh)
+            indices = indices + core.mesh_index_count(m.mesh)
+        }
+        i = i + 1
+    }
+    if vertices == 0 || indices < 3 { return null }
+    vbuf = calloc(vertices * VERTEX_FLOATS, 4)
+    ibuf = calloc(indices, 4)
+    v = vbuf as f32[]
+    ix = ibuf as int[]
+    ranges = list.new()
+    base = 0
+    at = 0
+    i = 0
+    while i < list.size(models) {
+        m = list.get_raw(models, i) as *Model
+        if counts(m) {
+            merge_model(m, v, base, ix, at, ranges)
+            base = base + core.mesh_vertex_count(m.mesh)
+            at = at + core.mesh_index_count(m.mesh)
+        }
+        i = i + 1
+    }
+    // The ranges as clusterlod takes them: a start and a count each.
+    rc = list.size(ranges)
+    rbuf = calloc(rc * 2, 4)
+    i = 0
+    while i < rc {
+        r = list.get_raw(ranges, i) as *Range
+        (rbuf as int[])[i * 2] = r.start
+        (rbuf as int[])[i * 2 + 1] = r.count
+        i = i + 1
+    }
+    cm = clusterlod.build(vbuf, vertices, ibuf, indices, rbuf, rc)
+    far = coarsest(cm, v, vertices, ranges)
+    clusterlod.free_mesh(cm)
+    free(rbuf)
+    i = 0
+    while i < rc {
+        heap.free(list.get_raw(ranges, i))
+        i = i + 1
+    }
+    list.free(ranges)
+    free(vbuf)
+    free(ibuf)
+    return far
+}
+
+// Whether a model goes into a stand-in: drawn, and drawn once.
+counts(m: *Model) -> bool {
+    return m != null && m.visible && !m.is_instanced && m.mesh != null && core.mesh_index_count(m.mesh) >= 3 &&
+           geometry.mesh_is_skinned(m.mesh) == 0
+}
+
+// The model's vertices into `v` from `base`, in the world, its triangles
+// into `ix` from `at`, a range for each material it draws with.
+merge_model(m: *Model, v: f32[], base: int, ix: int[], at: int, ranges: ptr) {
+    src = geometry.mesh_vertex_data(m.mesh) as f32[]
+    count = core.mesh_vertex_count(m.mesh)
+    mat = m.model_matrix
+    k = 0
+    while k < count {
+        s = k * VERTEX_FLOATS
+        d = (base + k) * VERTEX_FLOATS
+        p = core.mat4_transform_point(mat, core.vec3(src[s] as float, src[s + 1] as float, src[s + 2] as float))
+        // The normal through the model's turn: a stand-in is lit as the
+        // surfaces it stands for. (Its scale left out: the length is put
+        // back, and a scale uneven enough to bend a normal far is no wall's.)
+        nrm = core.v3_normalize(core.quat_apply(m.world_rotation, core.vec3(src[s + 3] as float, src[s + 4] as float, src[s + 5] as float)))
+        v[d] = p.x as f32
+        v[d + 1] = p.y as f32
+        v[d + 2] = p.z as f32
+        v[d + 3] = nrm.x as f32
+        v[d + 4] = nrm.y as f32
+        v[d + 5] = nrm.z as f32
+        j = 6
+        while j < VERTEX_FLOATS {
+            v[d + j] = src[s + j]
+            j = j + 1
+        }
+        k = k + 1
+    }
+    idx = geometry.mesh_index_data(m.mesh) as int[]
+    total = core.mesh_index_count(m.mesh)
+    k = 0
+    while k < total {
+        ix[at + k] = idx[k] + base
+        k = k + 1
+    }
+    groups = core.model_group_count(m)
+    if groups == 0 {
+        add_range(ranges, m.material, at, total)
+        return
+    }
+    g = 0
+    while g < groups {
+        group = core.model_group(m, g)
+        material = group.material
+        if material == null { material = m.material }
+        add_range(ranges, material, at + group.index_start, group.index_count)
+        g = g + 1
+    }
+}
+
+add_range(ranges: ptr, material: *Material, start: int, count: int) {
+    if count <= 0 { return }
+    r = heap.new(Range)
+    r.material = material
+    r.start = start
+    r.count = count
+    list.add_raw(ranges, r as ptr)
+}
+
+// The graph's coarsest cut (every cluster with no parent) as a model: the
+// vertices it uses, renumbered, and a group a range with its colour baked.
+coarsest(cm: *ClusterMesh, v: f32[], vertices: int, ranges: ptr) -> *Model {
+    remap = calloc(vertices + 1, 4)
+    k = 0
+    while k < vertices {
+        (remap as int[])[k] = 0 - 1
+        k = k + 1
+    }
+    rc = list.size(ranges)
+    // The roots' triangles, range by range, so each range's are one group.
+    tri_count = 0
+    k = 0
+    while k < clusterlod.cluster_count(cm) {
+        w = clusterlod.record(cm, k) as int[]
+        f = clusterlod.record(cm, k) as f32[]
+        if (f[clusterlod.REC_PARENT_ERROR] as float) >= clusterlod.ROOT_ERROR * 0.5 { tri_count = tri_count + w[clusterlod.REC_TRIANGLES] }
+        k = k + 1
+    }
+    if tri_count == 0 {
+        free(remap)
+        return null
+    }
+    out_idx = calloc(tri_count * 3, 4)
+    oi = out_idx as int[]
+    out_v = calloc(vertices * VERTEX_FLOATS, 4)
+    ov = out_v as f32[]
+    used = 0
+    written = 0
+    m = core.model_new()
+    core.model_set_name(m, "stand-in")
+    refs = clusterlod.vertex_refs(cm) as int[]
+    tris = clusterlod.triangles(cm) as int[]
+    r = 0
+    while r < rc {
+        first = written
+        k = 0
+        while k < clusterlod.cluster_count(cm) {
+            w = clusterlod.record(cm, k) as int[]
+            f = clusterlod.record(cm, k) as f32[]
+            if (f[clusterlod.REC_PARENT_ERROR] as float) >= clusterlod.ROOT_ERROR * 0.5 && w[clusterlod.REC_MATERIAL] == r {
+                ref0 = w[clusterlod.REC_REFS]
+                tri0 = w[clusterlod.REC_TRIS]
+                t = 0
+                while t < w[clusterlod.REC_TRIANGLES] {
+                    packed = tris[tri0 + t]
+                    c = 0
+                    while c < 3 {
+                        local = (packed >> (c * 8)) & 255
+                        source = refs[ref0 + local]
+                        if (remap as int[])[source] < 0 {
+                            (remap as int[])[source] = used
+                            j = 0
+                            while j < VERTEX_FLOATS {
+                                ov[used * VERTEX_FLOATS + j] = v[source * VERTEX_FLOATS + j]
+                                j = j + 1
+                            }
+                            used = used + 1
+                        }
+                        oi[written] = (remap as int[])[source]
+                        written = written + 1
+                        c = c + 1
+                    }
+                    t = t + 1
+                }
+            }
+            k = k + 1
+        }
+        if written > first {
+            range = list.get_raw(ranges, r) as *Range
+            core.model_add_group(m, core.model_own_material(m, baked(range.material)), first, written - first)
+        }
+        r = r + 1
+    }
+    geometry.mesh_append_raw(m.mesh, out_v, used, out_idx, written)
+    free(out_v)
+    free(out_idx)
+    free(remap)
+    core.model_update_matrix(m)
+    core.model_recalculate_bounds(m)
+    return m
+}
+
+// A source material as a stand-in's: its numbers, no maps, its colour times
+// what its texture averages to.
+baked(source: *Material) -> *Material {
+    out = core.material_new("stand-in")
+    if source == null { return out }
+    out.diffuse = source.diffuse
+    out.specular = source.specular
+    out.metallic = source.metallic
+    out.roughness = source.roughness
+    out.exposure = source.exposure
+    out.reflectivity = source.reflectivity
+    out.alpha = source.alpha
+    out.emissive = source.emissive
+    path = core.text(source.texture_path)
+    if path != "" {
+        mean = mean_colour(path)
+        out.diffuse = core.vec3(out.diffuse.x * mean.x, out.diffuse.y * mean.y, out.diffuse.z * mean.z)
+    }
+    return out
+}
+
+// The texture's mean colour in linear light, white for one that does not
+// read. Every texel, through an sRGB table: a bake, not a frame.
+mean_colour(path: string) -> Vec3 {
+    image = picture.load(path)
+    if image == null { return core.vec3(1.0, 1.0, 1.0) }
+    lin = linear_table()
+    w = picture.width(image)
+    h = picture.height(image)
+    px = picture.pixels(image) as byte[]
+    r = 0.0
+    g = 0.0
+    b = 0.0
+    n = w * h
+    i = 0
+    while i < n {
+        r = r + lin[px[i * 4] as int]
+        g = g + lin[px[i * 4 + 1] as int]
+        b = b + lin[px[i * 4 + 2] as int]
+        i = i + 1
+    }
+    picture.dispose(image)
+    if n == 0 { return core.vec3(1.0, 1.0, 1.0) }
+    return core.vec3(r / (n as float), g / (n as float), b / (n as float))
+}
+
+linear_table() -> float[] {
+    if g_linear == null {
+        g_linear = calloc(256, 8)
+        t = g_linear as float[]
+        i = 0
+        while i < 256 {
+            c = (i as float) / 255.0
+            if c <= 0.04045 { t[i] = c / 12.92 } else { t[i] = pow((c + 0.055) / 1.055, 2.4) }
+            i = i + 1
+        }
+    }
+    return g_linear as float[]
+}

@@ -22,7 +22,6 @@
 
 import std.list
 import std.heap
-import std.worker
 import std.strarr
 import std.os
 import std.string
@@ -67,8 +66,10 @@ exports (
     model_set_skeleton, model_skeleton,
     model_set_specular, model_set_pbr, model_set_exposure, model_set_reflectivity, model_set_alpha, model_set_cutout, model_set_normal_strength, model_set_tile_breakup, model_set_variation, model_set_detail, model_set_fire, model_set_triplanar, model_set_soft, model_set_glitter, model_set_embers, model_material_count, model_material_at,
     model_set_texture, model_set_shader, model_set_name, model_set_source_path,
-    material_set_texture_path, material_set_normal_path, material_set_normal_strength, material_set_tile_breakup, material_set_variation, material_set_detail, material_set_triplanar, material_set_name, light_set_name, camera_set_name, text,
+    material_set_texture_path, material_set_normal_path, material_set_emissive, material_set_emissive_path, model_set_emissive, model_set_emissive_map, material_set_normal_strength, material_set_tile_breakup, material_set_variation, material_set_detail, material_set_triplanar, material_set_name, light_set_name, camera_set_name, text,
     preload_images, take_preloaded_image, release_preloaded_images, material_image_paths,
+    offer_preloaded_image, drop_preloaded_image,
+    instances_clusterable, instances_cluster, instance_runs, RUN_LIMIT, pick_copy_of_place,
     model_metallic, model_plastic, model_rough_metal,
     model_polished_metal, model_matte, model_glossy, model_glass, model_transparent_plastic,
     model_add_group, model_group, model_group_count, model_sort_groups_by_texture,
@@ -92,14 +93,14 @@ exports (
     backend_set_render_scale, backend_set_overlay,
     backend_shadows,
     backend_add_light, backend_remove_light, backend_draw_calls, backend_frame_pixels,
-    Pick, backend_pick_ask, backend_pick_read, backend_pick, unproject_pixel, device_crowd_figure_at,
+    Pick, backend_pick_ask, backend_pick_read, backend_pick_ready, backend_pick, unproject_pixel, device_crowd_figure_at,
     backend_view_new, backend_view_free, backend_view_render, backend_view_texture, backend_view_pixels, backend_view_set_exposure, backend_view_blit, material_set_texture_id,
     backend_cleanup, Camera, FrustumPlane, Frustum, camera_new,
     camera_free, camera_update_projection, camera_set_fov, camera_set_near, camera_set_far,
     camera_far,
     camera_set_aspect, camera_set_position, camera_set_speed, camera_view,
     camera_projection, camera_view_projection, camera_world_to_screen, camera_process_keyboard,
-    camera_process_mouse, camera_move, camera_look_at, camera_update_vectors, camera_frustum,
+    camera_process_mouse, camera_move, camera_look_at, look_angles, light_set_shadows, light_shadows, light_set_reach, camera_update_vectors, camera_frustum,
     frustum_intersects_sphere, plane_distance, camera_screen_to_world,
     frustum_new, frustum_free, camera_fill_frustum, frustum_sphere_visible,
     mesh_create, mesh_destroy, mesh_reserve, mesh_push_vertex, mesh_push_triangle,
@@ -341,6 +342,18 @@ struct Material {
     normal_id: int
     normal_stale: bool
     normal_path: string
+    // Its own light: what it gives the eye whatever lights it, linear, its
+    // colour by its strength -- a lit window, a lamp's pane, a glTF's
+    // emissiveFactor -- and the map that says where (emissiveTexture), its
+    // colour times the emissive. Black and none: no light of its own.
+    emissive: Vec3
+    emissive_id: int
+    emissive_stale: bool
+    emissive_path: string
+    // How many of a renderer's models draw with it (a model's groups', or its
+    // own). Its textures are the renderer's while there is one: the ids above
+    // are let go with the last, and a model added after reads them again.
+    renderer_users: int
 }
 
 struct MaterialGroup {
@@ -366,47 +379,51 @@ struct PreloadedImage {
 
 var g_preloaded: ptr = null        // list of *PreloadedImage
 
-// Decode every path in `paths` (a strarr, distinct) across the pool,
-// keeping what comes back for the renderer to take. What an earlier
+// The paths a preload decodes and where each picture goes, for the pool's
+// blocks.
+struct Decoding {
+    paths: ptr                     // strarr
+    images: ptr                    // ptr[], beside paths
+}
+
+// The block below by its C name, which the pool is handed.
+extern core_decode_images_for_pool(context: ptr, start: int, end: int)
+
+@c_callback("core_decode_images_for_pool")
+decode_images(context: ptr, start: int, end: int) {
+    d = context as *Decoding
+    i = start
+    while i < end {
+        (d.images as ptr[])[i] = picture.load(strarr.get(d.paths, i))
+        i = i + 1
+    }
+}
+
+// Decode every path in `paths` (a strarr, distinct) across the engine's job
+// pool, keeping what comes back for the renderer to take. What an earlier
 // preload left untaken is freed first.
+//
+// The pool joins exactly these. They were std.worker jobs joined with
+// worker.wait(), which waits for every job the process ever launched,
+// detached ones too: the pool's own threads, which never end, so a scene
+// with textures loaded after an engine was made waited for ever. Without a
+// pool (no engine yet) they decode on this thread.
 preload_images(paths: ptr) {
     release_preloaded_images()
     n = strarr.size(paths)
     if n == 0 { return }
-    // A list of slots, as std.worker.map collects into: a completion's
-    // `ptr` is borrowed (a closure cannot declare it `@keep`), and handing it
-    // to list.set is how a completion keeps a result.
-    slots = list.new()
-    i = 0
-    while i < n {
-        list.add_raw(slots, null)
-        i = i + 1
-    }
-    i = 0
-    while i < n {
-        path = strarr.get(paths, i)
-        at = i
-        launched = worker.run(|| { return picture.load(path) }, |image: @keep ptr| { list.set(slots, at, image) })
-        // No thread to run it on: the renderer decodes this one itself.
-        if !launched { list.set(slots, at, null) }
-        i = i + 1
-    }
-    // A host that delivers completions on its own loop thread has them, not
-    // this one, and wait says so: the slots then fill later, so they are
-    // left alive and nothing is preloaded -- the renderers decode as they
-    // always did. Neither ae3d's editor nor its programs install one.
-    ran, _why = worker.wait()
-    if ran < 0 { return }
+    d = Decoding { paths: paths, images: calloc(n, 8) }
+    geometry.run_blocks(n, 1, (&core_decode_images_for_pool) as ptr, (&d) as ptr)
     g_preloaded = list.new()
     i = 0
     while i < n {
         entry = heap.new(PreloadedImage)
         entry.path = string.copy(strarr.get(paths, i))
-        entry.image = list.get_raw(slots, i)
+        entry.image = (d.images as ptr[])[i]
         list.add_raw(g_preloaded, entry as ptr)
         i = i + 1
     }
-    list.free(slots)
+    free(d.images)
 }
 
 // The decoded image for `path`, handed over (the caller frees it as it
@@ -424,6 +441,36 @@ take_preloaded_image(path: string) -> ptr {
         i = i + 1
     }
     return null
+}
+
+// A picture decoded elsewhere (a streamed cell's, on a worker) for the
+// renderer to take when a model names `path`: handed over, the taker's or
+// drop_preloaded_image's to free.
+offer_preloaded_image(path: string, image: @keep ptr) {
+    if image == null { return }
+    if g_preloaded == null { g_preloaded = list.new() }
+    entry = heap.new(PreloadedImage)
+    entry.path = string.copy(path)
+    entry.image = image
+    list.add_raw(g_preloaded, entry as ptr)
+}
+
+// An offered picture no model took (the renderer held the texture already)
+// let go, and its entry with it.
+drop_preloaded_image(path: string) {
+    if g_preloaded == null { return }
+    i = 0
+    while i < list.size(g_preloaded) {
+        entry = list.get_raw(g_preloaded, i) as *PreloadedImage
+        if string.equals(entry.path, path) == 1 {
+            if entry.image != null { picture.dispose(entry.image) }
+            string.free(entry.path)
+            heap.free(entry)
+            list.remove(g_preloaded, i)
+            return
+        }
+        i = i + 1
+    }
 }
 
 // Whatever was preloaded and never taken.
@@ -465,6 +512,7 @@ add_material_paths(material: *Material, out: ptr) {
     if material == null { return }
     add_distinct(out, text(material.texture_path))
     add_distinct(out, text(material.normal_path))
+    add_distinct(out, text(material.emissive_path))
 }
 
 add_distinct(out: ptr, path: string) {
@@ -632,10 +680,17 @@ struct Model {
     uploaded_stamp: int
     is_instanced: bool
     instances_updated: bool
+    // The renderer's frame its instances last went to the device: a lamp's
+    // shadow draws an instanced model that changed this frame over its
+    // static layer, and one that did not into the layer itself, once.
+    instances_changed: int
     instance_colors_updated: bool
     instance_phases_updated: bool
     visible: bool
     casts_shadow: bool
+    // Whether a renderer holds its materials (Material.renderer_users): from
+    // the add that drew it to the remove that let it go.
+    materials_held: bool
     // Point instances drawn as billboards turned to the eye: 0 as the
     // mesh is, 1 upright (a streak of rain), 2 full (a flake).
     billboard: int
@@ -736,6 +791,15 @@ struct Light {
     kind: int
     mode: int
     name: string
+    // Casting no shadow of its own (light_set_shadows): a window's glow or a
+    // fill light, lit but never given a lamp's six-face shadow map. False,
+    // the default of a light however it was made, is a light that casts.
+    shadowless: bool
+    // How far it lights, in metres, at most: its pool fades to nothing by
+    // there. 0, the default, is as far as its fall-off takes it to a 64th
+    // (lightgrid.reach) -- a light_point made with a range of 4 m reaches
+    // 28 m by that, and every pixel within lights it.
+    reach_limit: float
 }
 
 struct Skybox {
@@ -878,6 +942,9 @@ struct Backend {
     // hit, all zero for none -- and says whether there was an answer to give.
     pick_ask:        fn(ptr, int, int) -> int
     pick_read:       fn(ptr, int, ptr) -> bool
+    // pick_ready: whether the frame that answers the last asks is done on
+    // the device, so pick_read would not wait for it.
+    pick_ready:      fn(ptr) -> bool
     // Views (#866): a camera drawn into a texture of its own. view_new makes
     // one `width` by `height` (its handle, 0 for none), view_render draws the
     // scene through a camera and a light into it, view_texture is the
@@ -1737,6 +1804,12 @@ backend_pick_ask(b: *Backend, x: int, y: int) -> int {
 
 // Answer `k`, from the render that followed the asks, for a frame of
 // `width` by `height` seen through `cam`. A miss when there was none.
+// Whether backend_pick_read would answer without waiting for the device.
+backend_pick_ready(b: *Backend) -> bool {
+    if b == null || b.pick_ready == null { return true }
+    return b.pick_ready(b.state)
+}
+
 backend_pick_read(b: *Backend, k: int, cam: *Camera, x: int, y: int, width: int, height: int) -> Pick {
     out = Pick { hit: false, model_id: 0, instance: 0, depth: 0.0, x: x, y: y, position: vec3(0.0, 0.0, 0.0) }
     cells = calloc(4, 4)
@@ -1950,6 +2023,9 @@ material_new(name: string) -> *Material {
     m.texture_stale = false
     m.normal_id = 0
     m.normal_stale = false
+    m.emissive = vec3(0.0, 0.0, 0.0)
+    m.emissive_id = 0
+    m.emissive_stale = false
     return m
 }
 
@@ -1968,6 +2044,8 @@ material_equals(a: *Material, b: *Material) -> bool {
     // paving stones the same colour with different bumps drew as one, all with
     // the first one's bumps.
     if a.normal_id != b.normal_id { return false }
+    if a.emissive_id != b.emissive_id { return false }
+    if a.emissive.x != b.emissive.x || a.emissive.y != b.emissive.y || a.emissive.z != b.emissive.z { return false }
     if a.metallic != b.metallic { return false }
     if a.roughness != b.roughness || a.exposure != b.exposure || a.alpha != b.alpha || a.cutout != b.cutout || a.normal_strength != b.normal_strength {
         return false
@@ -1993,6 +2071,8 @@ material_clone(src: *Material) -> *Material {
     material_set_name(m, src.name)
     material_set_texture_path(m, text(src.texture_path))
     material_set_normal_path(m, text(src.normal_path))
+    if text(src.emissive_path) != "" { material_set_emissive_path(m, src.emissive_path) }
+    m.emissive = src.emissive
     m.diffuse = src.diffuse
     m.specular = src.specular
     m.metallic = src.metallic
@@ -2022,6 +2102,8 @@ material_clone(src: *Material) -> *Material {
     m.texture_stale = src.texture_stale
     m.normal_id = src.normal_id
     m.normal_stale = src.normal_stale
+    m.emissive_id = src.emissive_id
+    m.emissive_stale = src.emissive_stale
     return m
 }
 
@@ -2756,6 +2838,41 @@ material_set_normal_path(m: *Material, path: string) {
     m.normal_stale = true
 }
 
+// The material's own light, linear: `r`, `g`, `b` its colour, `strength` how
+// bright (1 the colour as it is; a lit window at night wants several).
+material_set_emissive(m: *Material, r: float, g: float, b: float, strength: float) {
+    if m == null { return }
+    m.emissive = vec3(r * strength, g * strength, b * strength)
+}
+
+// The map that says where it gives its light and of what colour, times the
+// emissive; "" for none.
+material_set_emissive_path(m: *Material, path: string) {
+    if m == null { return }
+    m.emissive_path = string.copy(path)
+    m.emissive_stale = true
+}
+
+// Every material of the model given its own light (material_set_emissive).
+model_set_emissive(m: *Model, r: float, g: float, b: float, strength: float) {
+    model_ensure_material(m)
+    k = 0
+    while k < model_material_count(m) {
+        material_set_emissive(model_material_at(m, k), r, g, b, strength)
+        k = k + 1
+    }
+}
+
+// Every material of the model given the emissive map at `path`.
+model_set_emissive_map(m: *Model, path: string) {
+    model_ensure_material(m)
+    k = 0
+    while k < model_material_count(m) {
+        material_set_emissive_path(model_material_at(m, k), path)
+        k = k + 1
+    }
+}
+
 material_set_normal_strength(m: *Material, strength: float) {
     m.normal_strength = strength
 }
@@ -3172,6 +3289,26 @@ light_new() -> *Light {
     return l
 }
 
+// Whether the light casts its own shadow: a lamp's map, when the lamps'
+// budget reaches it. On by default.
+light_set_shadows(l: *Light, on: bool) {
+    if l != null { l.shadowless = !on }
+}
+
+// Where the light's pool ends, at most (`metres`; 0 for its fall-off's own
+// reach). A small light -- a window's glow, a candle -- costs every pixel it
+// reaches: kept to its few metres, it costs those.
+light_set_reach(l: *Light, metres: float) {
+    if l == null { return }
+    l.reach_limit = metres
+    if l.reach_limit < 0.0 { l.reach_limit = 0.0 }
+}
+
+light_shadows(l: *Light) -> bool {
+    if l == null { return false }
+    return !l.shadowless
+}
+
 light_free(l: *Light) {
     if l == null { return }
     heap.free(l)
@@ -3420,11 +3557,19 @@ camera_process_mouse(c: *Camera, x_offset: float, y_offset: float, constrain_pit
 }
 
 camera_look_at(c: *Camera, target: Vec3) {
-    direction = v3_normalize(v3_sub(target, c.position))
-    c.yaw = rad_to_deg(atan2_of(direction.z, direction.x))
-    horizontal = sqrt_of(direction.x * direction.x + direction.z * direction.z)
-    c.pitch = rad_to_deg(atan2_of(direction.y, horizontal))
+    angles = look_angles(c.position, target)
+    c.yaw = angles.x
+    c.pitch = angles.y
     camera_update_vectors(c)
+}
+
+// The yaw (x) and pitch (y), in degrees, a camera at `from` takes to look at
+// `to`: camera_look_at's, for what holds a camera's angles without the
+// camera (a scene's Camera component, written before there is one).
+look_angles(from: Vec3, to: Vec3) -> Vec3 {
+    direction = v3_normalize(v3_sub(to, from))
+    horizontal = sqrt_of(direction.x * direction.x + direction.z * direction.z)
+    return vec3(rad_to_deg(atan2_of(direction.z, direction.x)), rad_to_deg(atan2_of(direction.y, horizontal)), 0.0)
 }
 
 normalize_plane(p: FrustumPlane) -> FrustumPlane {
@@ -4884,6 +5029,131 @@ camera_fill_frustum(c: *Camera, target: ptr) {
     f.top = computed.top
     f.near = computed.near
     f.far = computed.far
+}
+
+// --- an instanced model's copies culled by cluster (#19) ------------------------------------------------------------
+
+// The most runs a pass draws a model in: past it, the nearest runs are
+// joined (drawing the hidden clusters between), so a view that sees a
+// scatter of clusters costs a few draws, not one a cluster.
+const RUN_LIMIT = 16
+
+// Whether a model's copies may be drawn by cluster: a still, opaque stream
+// of matrices -- not a crowd's posed copies, not points, not what blends
+// (its copies' order is the order they are blended in).
+instances_clusterable(m: *Model) -> bool {
+    if m == null || !m.is_instanced || m.instances == null { return false }
+    if geometry.inst_is_points(m.instances) == 1 { return false }
+    if m.pose_bank != null || m.device_crowd != null || m.skeleton != null { return false }
+    if surface_blend(m, m.material) != BLEND_OPAQUE { return false }
+    k = 0
+    while k < model_group_count(m) {
+        g = model_group(m, k)
+        drawn = g.material
+        if drawn == null { drawn = m.material }
+        if surface_blend(m, drawn) != BLEND_OPAQUE { return false }
+        k = k + 1
+    }
+    return true
+}
+
+// The model's copies cut into clusters, for a renderer about to send them
+// (geometry.inst_cluster): false where it is not clusterable or too few.
+instances_cluster(m: *Model) -> bool {
+    if !instances_clusterable(m) { return false }
+    return geometry.inst_cluster(m.instances, m.mesh)
+}
+
+var g_runs: ptr = null              // int[2 * g_runs_capacity]: a pass's runs before they are joined
+var g_runs_capacity = 0
+
+// The runs of the model's clusters `frustum` reaches (a *Frustum), as places
+// in cluster order: `firsts[k]` and `counts[k]` for each, at most
+// RUN_LIMIT; how many. Past the limit the runs with the smallest gaps
+// between them are joined, so the fewest hidden copies are drawn. A model
+// with no clusters is one run of every copy.
+instance_runs(m: *Model, frustum: ptr, firsts: int[], counts: int[]) -> int {
+    c = geometry.inst_clusters(m.instances)
+    if c == null {
+        firsts[0] = 0
+        counts[0] = model_instance_count(m)
+        return 1
+    }
+    if g_runs_capacity < c.clusters {
+        if g_runs != null { free(g_runs) }
+        g_runs_capacity = c.clusters * 2
+        g_runs = calloc(g_runs_capacity * 2, 4)
+    }
+    at = g_runs as int[]
+    first = c.first as int[]
+    sp = c.spheres as f32[]
+    scale = fabs(m.world_scale.x)
+    if fabs(m.world_scale.y) > scale { scale = fabs(m.world_scale.y) }
+    if fabs(m.world_scale.z) > scale { scale = fabs(m.world_scale.z) }
+    runs = 0
+    open = false
+    k = 0
+    while k < c.clusters {
+        centre = mat4_transform_point(m.model_matrix, vec3(sp[k * 4] as float, sp[k * 4 + 1] as float, sp[k * 4 + 2] as float))
+        if frustum_sphere_visible(frustum, centre, (sp[k * 4 + 3] as float) * scale) {
+            if open {
+                at[(runs - 1) * 2 + 1] = first[k + 1]
+            } else {
+                at[runs * 2] = first[k]
+                at[runs * 2 + 1] = first[k + 1]
+                runs = runs + 1
+                open = true
+            }
+        } else {
+            open = false
+        }
+        k = k + 1
+    }
+    // Joined across the smallest gap until within the limit.
+    while runs > RUN_LIMIT {
+        best = 0
+        k = 1
+        while k < runs - 1 {
+            if at[(k + 1) * 2] - at[k * 2 + 1] < at[(best + 1) * 2] - at[best * 2 + 1] { best = k }
+            k = k + 1
+        }
+        at[best * 2 + 1] = at[(best + 1) * 2 + 1]
+        k = best + 1
+        while k < runs - 1 {
+            at[k * 2] = at[(k + 1) * 2]
+            at[k * 2 + 1] = at[(k + 1) * 2 + 1]
+            k = k + 1
+        }
+        runs = runs - 1
+    }
+    k = 0
+    while k < runs {
+        firsts[k] = at[k * 2]
+        counts[k] = at[k * 2 + 1] - at[k * 2]
+        k = k + 1
+    }
+    return runs
+}
+
+// A pick's answer (id, instance, depth, covered: four floats) from a pass
+// that drew a clustered stream in cluster order: its instance, a place in
+// that order, turned back into the copy it is (geometry.inst_place_of), so a
+// game hears the copy it set.
+pick_copy_of_place(models: ptr, cells: ptr) {
+    f = cells as f32[]
+    if f[3] < 0.5 || f[0] < 0.5 { return }
+    id = (f[0] + 0.5) as int
+    i = 0
+    while i < list.size(models) {
+        m = list.get_raw(models, i) as *Model
+        if m != null && m.id == id {
+            if m.is_instanced && m.instances != null && geometry.inst_clusters(m.instances) != null {
+                f[1] = geometry.inst_place_of(m.instances, (f[1] + 0.5) as int) as f32
+            }
+            return
+        }
+        i = i + 1
+    }
 }
 
 frustum_sphere_visible(target: ptr, center: Vec3, radius: float) -> bool {

@@ -94,6 +94,14 @@ whose data began with a magic number.
   file reader are still C. `std.mem`'s byte accessors are runtime calls
   too: a hot loop over bytes is written over `int` arrays (the flow field's
   marks: as bytes the flood took twice as long).
+- An `int` times an `int` is an `int`, and wraps (`-fwrapv`) before any
+  `as long` around it: `(count * 36) as long` is already wrong past 59
+  million. A byte size or offset is made from longs,
+  `(count as long) * (36 as long)`, and `ptr + long` is a byte offset. A
+  store's elements are reached by `int` indices, so a store that can grow
+  has a bound where its widest stream's last index still fits an int, and
+  refuses a request past it (`geometry.MAX_MESH_VERTICES`: 2^27 vertices
+  is 1.6 billion skin floats, 2^28 would pass 2^31; #899).
 - A string does not cast to a pointer or back; see above.
 - A raw C function pointer is called through a cast:
   `sym as fn(ptr, ptr, float) -> void` (how `ae3d.script` calls into a

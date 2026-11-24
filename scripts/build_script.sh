@@ -8,20 +8,28 @@
 # library whose undefined symbols are resolved out of the host at load time:
 # the runtime, and whatever native calls the engine code it imported makes.
 #
-# CRITICAL: build a script with the same tree that will run it. A script
-# carries its own copy of what it imported, so the host and the script agree
-# about what a Model is only while both were built from the same sources.
+# Build a script with the same tree that will run it. A script carries its
+# own copy of what it imported, so the host and the script agree about what
+# a Model is only while both were built from the same sources; the library
+# says the layout it was built against and the loader refuses another
+# (ae3d.script, component.script_layout).
+#
+# The paths are the caller's: a game with ae3d at ext/ae3d builds its own
+# scripts with ext/ae3d/scripts/build_script.sh scripts/spinner.ae, from its
+# own root.
 
 set -euo pipefail
 
+CALLER="$(pwd)"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+absolute() { case "$1" in /*) printf '%s\n' "$1" ;; *) printf '%s\n' "$CALLER/$1" ;; esac; }
+SOURCE="$(absolute "${1:?usage: build_script.sh <script.ae> [output directory]}")"
+OUT_DIR="$(absolute "${2:-build/scripts}")"
 cd "$ROOT"
 
 . "$ROOT/scripts/platform.sh"
 . "$ROOT/scripts/native.sh"
 
-SOURCE="${1:?usage: build_script.sh <script.ae> [output directory]}"
-OUT_DIR="${2:-build/scripts}"
 NAME="$(basename "$SOURCE" .ae)"
 
 mkdir -p "$OUT_DIR"
@@ -38,6 +46,10 @@ if [ -z "$AETHER_CFLAGS" ]; then
 fi
 
 AETHER_LIB_DIR="$ROOT/src" aetherc "$SOURCE" "$GEN"
+
+# Where the engine's library is, from the script's directory (its rpath).
+NATIVE_DIR=".."
+if [ "$(cd "$OUT_DIR" && pwd)" != "$ROOT/build/scripts" ]; then NATIVE_DIR="$ROOT/build"; fi
 
 CC="${CC:-cc}"
 # What the script leaves to the program that loads it, by platform. A
@@ -70,12 +82,23 @@ if [ ! -f "$(ae3d_native_library)" ] || { [ -n "$RUNTIME_LIBS" ] && [ ! -f "$(ae
     ./build.sh --natives >/dev/null
 fi
 
-# A script sits in build/scripts, one directory below the library. It names
+# A script in this tree's build/scripts is one directory below the library,
+# which it finds there; one built elsewhere (a game's own build/scripts) finds
+# it in this tree's build, by its whole path. It names
 # GLFW as a program does: the engine's Aether it imports calls GLFW
 # (ae3d.platform), and on Windows a DLL resolves everything at its link.
 ae3d_glfw_flags
+# A C name of its own (@c_callback) is written weak, and GNU ld's DLL leaves
+# weak definitions out of what it exports -- by name in a .def too ("symbol
+# wrong type"): every script on Windows was refused for not saying its
+# layout (script_layout_hash). A script is one C file, each such name in it
+# once, so there they are ordinary definitions, exported with the rest.
+SCRIPT_DEFINES=""
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) SCRIPT_DEFINES="-DAETHER_WEAK_DEF=" ;;
+esac
 # shellcheck disable=SC2086
-$CC -O2 -fwrapv $(ae3d_fp_flags) $(ae3d_native_pic_flag) $AETHER_CFLAGS $(ae3d_program_includes "$GEN") $LINK_FLAGS \
-    "$GEN" $(ae3d_native_link_flags ..) $GLFW_LIBS $RUNTIME_LIBS -o "$LIB"
+$CC -O2 -fwrapv $(ae3d_fp_flags) $(ae3d_native_pic_flag) $AETHER_CFLAGS $SCRIPT_DEFINES $(ae3d_program_includes "$GEN") $LINK_FLAGS \
+    "$GEN" $(ae3d_native_link_flags "$NATIVE_DIR") $GLFW_LIBS $RUNTIME_LIBS -o "$LIB"
 
 echo "built: $LIB"

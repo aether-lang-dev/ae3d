@@ -24,6 +24,11 @@
 // first: a field added since takes its default, a renamed one its old
 // value, and a removed one is dropped and counted.
 //
+// A system's own state -- a body's velocity and its sleep, what no component
+// field holds -- is saved by the system: it registers a provider
+// (persist.provider), which writes its records into the save and reads them
+// back over the loaded objects (ae3d.physics registers the bodies').
+//
 // Two forms of one document. Text (save_json, load_json) for a diff or a
 // bug report; a slot file (save, load) for the game: a header of its own --
 // "AE3S", the format, the slot's details as text for a menu to list
@@ -44,10 +49,15 @@ import ae3d.component
 import ae3d.deflate
 import ae3d.inflate
 import ae3d.checksum
+import ae3d.png
+import std.worker
 
 exports (
     Baseline, baseline, baseline_free, state_json, save_json, load_json, apply_json, save, load,
-    slot_info, migration, migrations_clear, set_spawner, last_error, last_unknown, last_dangling, FORMAT
+    slot_info, migration, migrations_clear, set_spawner, last_error, last_unknown, last_dangling, FORMAT,
+    provider, provider_remove, checkpoint, restore, last_missing,
+    capture, capture_doc, save_async, save_finished, save_job_ok, save_job_error, save_job_free, SaveJob,
+    slot_picture
 )
 
 extern calloc(count: int, size: int) -> ptr
@@ -57,11 +67,19 @@ extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
 // What this program writes and reads.
 const FORMAT = 1
 const MAGIC = 0x53334541             // "AE3S", little-endian
-const HEADER = 24                    // magic, format, the details' length, the state's length, its deflated CRC-32 and length
+// A slot's header: magic, the slot's format, the details' length, the
+// state's length, its deflated CRC-32 and length, and from format 2 the
+// picture's length. Format 2 is the details, the picture (a PNG, or nothing)
+// and the deflated state, in that order; a format 1 slot, which has no
+// picture, reads as it did.
+const SLOT_FORMAT = 2
+const HEADER_1 = 24
+const HEADER = 28
 
 var g_error = ""
 var g_unknown = 0
 var g_dangling = 0
+var g_missing = 0
 var g_spawner: fn(ptr, string, string) -> *GameObject = null
 var g_spawn_context: ptr = null
 var g_migrations: ptr = null         // list of *Migration
@@ -81,12 +99,113 @@ fail(why: string) -> bool {
     return false
 }
 
+// --- ids to objects, in constant time ---------------------------------------------------
+//
+// A save names every object by its id, and a save of thousands looked each one
+// up by walking the scene: 2,000 objects were four million comparisons a
+// save. An IdMap is open addressing over a power-of-two table at most half
+// full, ids 1 and up (0 is the scene's root, never looked up here), each to an
+// object or, for a set, to the map itself.
+
+struct IdMap {
+    keys: ptr                        // int[size], 0 for empty
+    values: ptr                      // ptr[size]
+    size: int
+    count: int
+}
+
+idmap_new(expected: int) -> *IdMap {
+    m = heap.new(IdMap)
+    size = 16
+    while size < expected * 2 { size = size * 2 }
+    m.size = size
+    m.keys = calloc(size, 4)
+    m.values = calloc(size, 8)
+    return m
+}
+
+idmap_free(m: *IdMap) {
+    if m == null { return }
+    free(m.keys)
+    free(m.values)
+    heap.free(m)
+}
+
+// The slot `id` is in, or the empty one it would go in.
+idmap_slot(m: *IdMap, id: int) -> int {
+    keys = m.keys as int[]
+    mask = m.size - 1
+    at = ((id as long) * (2654435761 as long)) as int & mask
+    while keys[at] != 0 && keys[at] != id { at = (at + 1) & mask }
+    return at
+}
+
+idmap_put(m: *IdMap, id: int, value: @keep ptr) {
+    if id <= 0 { return }
+    at = idmap_slot(m, id)
+    if (m.keys as int[])[at] == 0 {
+        // Kept at most half full: grown before it would pass it.
+        if (m.count + 1) * 2 > m.size {
+            idmap_grow(m)
+            at = idmap_slot(m, id)
+        }
+        m.count = m.count + 1
+    }
+    (m.keys as int[])[at] = id
+    (m.values as ptr[])[at] = value
+}
+
+idmap_grow(m: *IdMap) {
+    old_keys = m.keys as int[]
+    old_values = m.values as ptr[]
+    old_size = m.size
+    old_keys_block = m.keys
+    old_values_block = m.values
+    m.size = m.size * 2
+    m.keys = calloc(m.size, 4)
+    m.values = calloc(m.size, 8)
+    i = 0
+    while i < old_size {
+        if old_keys[i] != 0 {
+            at = idmap_slot(m, old_keys[i])
+            (m.keys as int[])[at] = old_keys[i]
+            (m.values as ptr[])[at] = old_values[i]
+        }
+        i = i + 1
+    }
+    free(old_keys_block)
+    free(old_values_block)
+}
+
+idmap_get(m: *IdMap, id: int) -> ptr {
+    if m == null || id <= 0 { return null }
+    at = idmap_slot(m, id)
+    if (m.keys as int[])[at] == 0 { return null }
+    return (m.values as ptr[])[at]
+}
+
+idmap_has(m: *IdMap, id: int) -> bool { return idmap_get(m, id) != null }
+
+// The scene's objects by id.
+scene_map(s: *Scene) -> *IdMap {
+    n = behaviour.scene_count(s)
+    m = idmap_new(n)
+    i = 0
+    while i < n {
+        o = behaviour.scene_object(s, i)
+        if o != null { idmap_put(m, behaviour.object_id(o), o as ptr) }
+        i = i + 1
+    }
+    return m
+}
+
 // --- the scene as authored -------------------------------------------------------------
 
 // The ids the scene held when it was loaded, what a save is written over.
 struct Baseline {
     ids: ptr                         // int[count]
     count: int
+    authored: *IdMap                 // the same ids, as a set
 }
 
 baseline(s: *Scene) -> *Baseline {
@@ -99,23 +218,23 @@ baseline(s: *Scene) -> *Baseline {
         i = i + 1
     }
     b.count = n
+    b.authored = idmap_new(n)
+    i = 0
+    while i < n {
+        idmap_put(b.authored, (b.ids as int[])[i], b.authored as ptr)
+        i = i + 1
+    }
     return b
 }
 
 baseline_free(b: *Baseline) {
     if b == null { return }
     free(b.ids)
+    idmap_free(b.authored)
     heap.free(b)
 }
 
-authored(b: *Baseline, id: int) -> bool {
-    i = 0
-    while i < b.count {
-        if (b.ids as int[])[i] == id { return true }
-        i = i + 1
-    }
-    return false
-}
+authored(b: *Baseline, id: int) -> bool { return idmap_has(b.authored, id) }
 
 // --- migrations -------------------------------------------------------------------------
 
@@ -177,7 +296,208 @@ set_spawner(maker: fn(ptr, string, string) -> *GameObject, context: @keep ptr) {
     g_spawn_context = context
 }
 
-// --- writing ----------------------------------------------------------------------------
+
+// --- what a system keeps that is no component's field ------------------------------------------
+//
+// A body's velocity and whether it sleeps, an animator's clip and where in
+// it, a horde's packed arrays: state a system keeps for the objects, not in
+// a registered field. A system says it is saved by registering a provider
+// under a name of its own, with the width of its records: on the frame its
+// `save` appends records of that many numbers to the capture it is handed
+// (component.put_float, put_long), and `load` reads them back once every
+// object of the save is in the scene with its transform and components,
+// answering how many of its records named something the scene does not have.
+// In the document a system is `systems.<name>`: `{"width": n, "records":
+// [[...], ...]}`, every provider of the name's records in one list (two
+// physics worlds each write theirs, and keep to their own scene). A save from
+// a program without the provider keeps nothing of it; a load of one without
+// the system's entry leaves the system as the scene made it.
+
+struct Provider {
+    name: string
+    width: int
+    save: fn(ptr, *Scene, *Capture)
+    load: fn(ptr, *Scene, ptr) -> int
+    context: ptr
+}
+
+var g_providers: ptr = null          // list of *Provider
+
+provider(name: string, width: int, save_state: fn(ptr, *Scene, *Capture), load_state: fn(ptr, *Scene, ptr) -> int, context: @keep ptr) {
+    if g_providers == null { g_providers = list.new() }
+    p = heap.new(Provider)
+    p.name = string.copy(name)
+    p.width = width
+    p.save = save_state
+    p.load = load_state
+    p.context = context
+    list.add_raw(g_providers, p as ptr)
+}
+
+// Every provider registered with `context` taken out: the system it saves is
+// going (a physics world freed).
+provider_remove(context: ptr) {
+    if g_providers == null { return }
+    i = list.size(g_providers) - 1
+    while i >= 0 {
+        p = list.get_raw(g_providers, i) as *Provider
+        if p.context == context {
+            list.remove(g_providers, i)
+            heap.free(p)
+        }
+        i = i - 1
+    }
+    if list.size(g_providers) == 0 {
+        list.free(g_providers)
+        g_providers = null
+    }
+}
+
+// --- the capture: what the frame pays -------------------------------------------------------
+//
+// A save reads the running game once, on the frame, into a Capture
+// (ae3d.component's slots): every object's id, flags, names and transform,
+// each component's kind and the fields that differ from its defaults, the
+// ids destroyed since, and each system's records. Nothing is allocated a
+// field: the slots grow by doubling. Everything a document is written from
+// is in it -- each kind's name, version and fields' names and choices once,
+// in a table at its end -- so it is written out as text, deflated and put on
+// disk from the capture alone, on any thread, while the game goes on and
+// kinds are redefined (a script reloaded). 2,000 objects of five changed
+// fields: benchmarks/bench_persist.
+
+const SNAP_ACTIVE = 1
+const SNAP_SPAWNED = 2
+const SNAP_MODEL = 4
+
+// Where a kind is in the capture's table, put there the first time.
+kind_slot(kinds: ptr, k: *ComponentKind) -> int {
+    i = 0
+    while i < list.size(kinds) {
+        if list.get_raw(kinds, i) == k as ptr { return i }
+        i = i + 1
+    }
+    list.add_raw(kinds, k as ptr)
+    return list.size(kinds) - 1
+}
+
+capture_object(cap: *Capture, o: *GameObject, id: int, spawned: bool, whole: bool, kinds: ptr) {
+    component.put_long(cap, id as long)
+    flags = 0
+    if o.active { flags = flags | SNAP_ACTIVE }
+    if spawned { flags = flags | SNAP_SPAWNED }
+    if spawned || whole { flags = flags | SNAP_MODEL }
+    component.put_long(cap, flags as long)
+    component.put_text(cap, core.text(o.name))
+    component.put_text(cap, core.text(o.tag))
+    if spawned || whole {
+        path = ""
+        m = behaviour.object_model(o)
+        if m != null { path = core.text(m.source_path) }
+        component.put_text(cap, path)
+    }
+    p = behaviour.object_position(o)
+    q = behaviour.object_rotation(o)
+    z = behaviour.object_scale(o)
+    component.put_float(cap, p.x)
+    component.put_float(cap, p.y)
+    component.put_float(cap, p.z)
+    component.put_float(cap, q.x)
+    component.put_float(cap, q.y)
+    component.put_float(cap, q.z)
+    component.put_float(cap, q.w)
+    component.put_float(cap, z.x)
+    component.put_float(cap, z.y)
+    component.put_float(cap, z.z)
+    count_at = component.capture_length(cap)
+    component.put_long(cap, 0 as long)
+    written = 0
+    n = behaviour.object_component_count(o)
+    i = 0
+    while i < n {
+        c = behaviour.object_component(o, i)
+        k = component.kind_of(c)
+        if k != null {
+            component.put_long(cap, kind_slot(kinds, k) as long)
+            on = 0
+            if behaviour.component_enabled(c) { on = 1 }
+            component.put_long(cap, on as long)
+            component.capture_fields(c, cap, true)
+            written = written + 1
+        }
+        i = i + 1
+    }
+    component.set_long_at(cap, count_at, written as long)
+}
+
+// The running game read into a capture: over the baseline `b`, or, with none,
+// every object as authored and with its model (`whole`, a checkpoint's).
+capture(s: *Scene, b: *Baseline, whole: bool) -> *Capture {
+    cap = component.capture_new()
+    kinds = list.new()
+    component.put_long(cap, FORMAT as long)
+    table_at = component.capture_length(cap)
+    component.put_long(cap, 0 as long)
+    n = behaviour.scene_count(s)
+    component.put_long(cap, (n + 1) as long)
+    // The scene's own components, as id 0.
+    capture_object(cap, behaviour.scene_root(s), 0, false, false, kinds)
+    i = 0
+    while i < n {
+        o = behaviour.scene_object(s, i)
+        spawned = b != null && !authored(b, behaviour.object_id(o))
+        capture_object(cap, o, behaviour.object_id(o), spawned, whole, kinds)
+        i = i + 1
+    }
+    gone_at = component.capture_length(cap)
+    component.put_long(cap, 0 as long)
+    gone = 0
+    if b != null {
+        here = scene_map(s)
+        i = 0
+        while i < b.count {
+            id = (b.ids as int[])[i]
+            if !idmap_has(here, id) {
+                component.put_long(cap, id as long)
+                gone = gone + 1
+            }
+            i = i + 1
+        }
+        idmap_free(here)
+    }
+    component.set_long_at(cap, gone_at, gone as long)
+    component.put_long(cap, behaviour.scene_next_id(s) as long)
+    // Each system's records: its name, its width, how many, then them.
+    providers = 0
+    if g_providers != null { providers = list.size(g_providers) }
+    component.put_long(cap, providers as long)
+    i = 0
+    while i < providers {
+        p = list.get_raw(g_providers, i) as *Provider
+        component.put_text(cap, p.name)
+        component.put_long(cap, p.width as long)
+        rows_at = component.capture_length(cap)
+        component.put_long(cap, 0 as long)
+        write_rows = p.save
+        write_rows(p.context, s, cap)
+        rows = 0
+        if p.width > 0 { rows = (component.capture_length(cap) - rows_at - 1) / p.width }
+        component.set_long_at(cap, rows_at, rows as long)
+        i = i + 1
+    }
+    // The kinds, as they are now: what the capture is written out by.
+    component.set_long_at(cap, table_at, component.capture_length(cap) as long)
+    component.put_long(cap, list.size(kinds) as long)
+    i = 0
+    while i < list.size(kinds) {
+        component.capture_kind(list.get_raw(kinds, i) as *ComponentKind, cap)
+        i = i + 1
+    }
+    list.free(kinds)
+    return cap
+}
+
+// --- a capture written out: anywhere, on any thread -----------------------------------------
 
 vec3_json(v: Vec3) -> ptr {
     a = json.arr()
@@ -187,79 +507,150 @@ vec3_json(v: Vec3) -> ptr {
     return a
 }
 
-quat_json(q: Quat) -> ptr {
+floats_json(cap: *Capture, at: int, n: int) -> ptr {
     a = json.arr()
-    json.array_add_raw(a, json.num(q.x))
-    json.array_add_raw(a, json.num(q.y))
-    json.array_add_raw(a, json.num(q.z))
-    json.array_add_raw(a, json.num(q.w))
+    i = 0
+    while i < n {
+        json.array_add_raw(a, json.num(component.get_float_at(cap, at + i)))
+        i = i + 1
+    }
     return a
 }
 
-// An object's saved record: who it is, where, and its components' fields.
-object_json(o: *GameObject, spawned: bool, kinds: ptr) -> ptr {
-    out = json.obj()
-    json.object_set_raw(out, "id", json.from_int(behaviour.object_id(o)))
-    json.object_set_raw(out, "name", json.str(core.text(o.name)))
-    json.object_set_raw(out, "tag", json.str(core.text(o.tag)))
-    json.object_set_raw(out, "active", json.boolean(o.active))
-    json.object_set_raw(out, "position", vec3_json(behaviour.object_position(o)))
-    json.object_set_raw(out, "rotation", quat_json(behaviour.object_rotation(o)))
-    json.object_set_raw(out, "scale", vec3_json(behaviour.object_scale(o)))
-    if spawned {
-        json.object_set_raw(out, "spawned", json.boolean(true))
-        path = ""
-        m = behaviour.object_model(o)
-        if m != null { path = core.text(m.source_path) }
-        json.object_set_raw(out, "model", json.str(path))
-    }
-    list_json = json.arr()
-    n = behaviour.object_component_count(o)
+// A capture as the document a save is: the caller frees it (json.free).
+capture_doc(cap: *Capture) -> ptr {
+    root = json.obj()
+    json.object_set_raw(root, "format", json.from_int(component.get_long_at(cap, 0) as int))
+    table = component.captured_kinds(cap, component.get_long_at(cap, 1) as int)
+    kinds = json.obj()
+    objects = json.arr()
+    count = component.get_long_at(cap, 2) as int
+    at = 3
     i = 0
-    while i < n {
-        c = behaviour.object_component(o, i)
-        k = component.kind_of(c)
-        if k != null {
-            entry = json.obj()
-            json.object_set_raw(entry, "kind", json.str(component.kind_name(k)))
-            json.object_set_raw(entry, "enabled", json.boolean(behaviour.component_enabled(c)))
-            json.object_set_raw(entry, "fields", component.to_json(c, true))
-            json.array_add_raw(list_json, entry)
-            json.object_set_raw(kinds, component.kind_name(k), json.from_int(component.schema_version(k)))
+    while i < count {
+        out = json.obj()
+        json.object_set_raw(out, "id", json.from_int(component.get_long_at(cap, at) as int))
+        flags = component.get_long_at(cap, at + 1) as int
+        at = at + 2
+        json.object_set_raw(out, "name", json.str(component.text_at(cap, at)))
+        at = at + 1 + component.text_slots(component.get_long_at(cap, at) as int)
+        json.object_set_raw(out, "tag", json.str(component.text_at(cap, at)))
+        at = at + 1 + component.text_slots(component.get_long_at(cap, at) as int)
+        json.object_set_raw(out, "active", json.boolean((flags & SNAP_ACTIVE) != 0))
+        if (flags & SNAP_SPAWNED) != 0 { json.object_set_raw(out, "spawned", json.boolean(true)) }
+        if (flags & SNAP_MODEL) != 0 {
+            json.object_set_raw(out, "model", json.str(component.text_at(cap, at)))
+            at = at + 1 + component.text_slots(component.get_long_at(cap, at) as int)
         }
+        json.object_set_raw(out, "position", floats_json(cap, at, 3))
+        json.object_set_raw(out, "rotation", floats_json(cap, at + 3, 4))
+        json.object_set_raw(out, "scale", floats_json(cap, at + 7, 3))
+        at = at + 10
+        components = component.get_long_at(cap, at) as int
+        at = at + 1
+        list_json = json.arr()
+        c = 0
+        while c < components {
+            kind = component.get_long_at(cap, at) as int
+            on = component.get_long_at(cap, at + 1) != (0 as long)
+            fields, after = component.captured_json(table, kind, cap, at + 2)
+            at = after
+            entry = json.obj()
+            json.object_set_raw(entry, "kind", json.str(component.captured_kind_name(table, kind)))
+            json.object_set_raw(entry, "enabled", json.boolean(on))
+            json.object_set_raw(entry, "fields", fields)
+            json.array_add_raw(list_json, entry)
+            json.object_set_raw(kinds, component.captured_kind_name(table, kind), json.from_int(component.captured_kind_version(table, kind)))
+            c = c + 1
+        }
+        json.object_set_raw(out, "components", list_json)
+        json.array_add_raw(objects, out)
         i = i + 1
     }
-    json.object_set_raw(out, "components", list_json)
-    return out
+    gone = json.arr()
+    gone_count = component.get_long_at(cap, at) as int
+    at = at + 1
+    i = 0
+    while i < gone_count {
+        json.array_add_raw(gone, json.from_int(component.get_long_at(cap, at + i) as int))
+        i = i + 1
+    }
+    at = at + gone_count
+    next_id = component.get_long_at(cap, at) as int
+    at = at + 1
+    json.object_set_raw(root, "kinds", kinds)
+    json.object_set_raw(root, "objects", objects)
+    json.object_set_raw(root, "destroyed", gone)
+    json.object_set_raw(root, "next_id", json.from_int(next_id))
+    providers = component.get_long_at(cap, at) as int
+    at = at + 1
+    if providers > 0 {
+        // The blocks in the capture's order; one entry a name, every block
+        // of the name's records in it.
+        blocks_block = calloc(providers, 4)
+        blocks = blocks_block as int[]
+        i = 0
+        while i < providers {
+            blocks[i] = at
+            name_slots = 1 + component.text_slots(component.get_long_at(cap, at) as int)
+            width = component.get_long_at(cap, at + name_slots) as int
+            rows = component.get_long_at(cap, at + name_slots + 1) as int
+            at = at + name_slots + 2 + rows * width
+            i = i + 1
+        }
+        systems = json.obj()
+        i = 0
+        while i < providers {
+            start = blocks[i]
+            name = component.text_at(cap, start)
+            if json.object_get_raw(systems, name) == null {
+                entry = json.obj()
+                width = component.get_long_at(cap, start + 1 + component.text_slots(component.get_long_at(cap, start) as int)) as int
+                records = json.arr()
+                j = i
+                while j < providers {
+                    other = blocks[j]
+                    if string.equals(component.text_at(cap, other), name) == 1 {
+                        name_slots = 1 + component.text_slots(component.get_long_at(cap, other) as int)
+                        rows = component.get_long_at(cap, other + name_slots + 1) as int
+                        first = other + name_slots + 2
+                        r = 0
+                        while r < rows {
+                            json.array_add_raw(records, floats_json(cap, first + r * width, width))
+                            r = r + 1
+                        }
+                    }
+                    j = j + 1
+                }
+                json.object_set_raw(entry, "width", json.from_int(width))
+                json.object_set_raw(entry, "records", records)
+                json.object_set_raw(systems, name, entry)
+            }
+            i = i + 1
+        }
+        free(blocks_block)
+        json.object_set_raw(root, "systems", systems)
+    }
+    component.captured_kinds_free(table)
+    return root
 }
 
 // The running game as one document: the caller frees it (json.free).
 state_json(s: *Scene, b: *Baseline) -> ptr {
-    root = json.obj()
-    kinds = json.obj()
-    json.object_set_raw(root, "format", json.from_int(FORMAT))
-    objects = json.arr()
-    // The scene's own components, as id 0.
-    json.array_add_raw(objects, object_json(behaviour.scene_root(s), false, kinds))
-    n = behaviour.scene_count(s)
-    i = 0
-    while i < n {
-        o = behaviour.scene_object(s, i)
-        json.array_add_raw(objects, object_json(o, !authored(b, behaviour.object_id(o)), kinds))
-        i = i + 1
-    }
-    gone = json.arr()
-    i = 0
-    while i < b.count {
-        id = (b.ids as int[])[i]
-        if behaviour.scene_find_id(s, id) == null { json.array_add_raw(gone, json.from_int(id)) }
-        i = i + 1
-    }
-    json.object_set_raw(root, "kinds", kinds)
-    json.object_set_raw(root, "objects", objects)
-    json.object_set_raw(root, "destroyed", gone)
-    json.object_set_raw(root, "next_id", json.from_int(behaviour.scene_next_id(s)))
-    return root
+    cap = capture(s, b, false)
+    doc = capture_doc(cap)
+    component.capture_free(cap)
+    return doc
+}
+
+// The scene as it is now, every object in it, for a live scene to be put
+// back to (restore): what the agent checkpoints and rolls back to. Every
+// object counts as authored, none as destroyed, and each records its model.
+checkpoint(s: *Scene) -> ptr {
+    cap = capture(s, null, true)
+    doc = capture_doc(cap)
+    component.capture_free(cap)
+    return doc
 }
 
 // The running game as text, to `path`.
@@ -342,9 +733,8 @@ apply_components(o: *GameObject, node: ptr, kinds: ptr) {
     }
 }
 
-drop_dangling(o: *GameObject, gone: ptr) {
+drop_dangling(o: *GameObject, here: *IdMap, gone: *IdMap) {
     if o == null { return }
-    s = behaviour.object_scene(o)
     n = behaviour.object_component_count(o)
     j = 0
     while j < n {
@@ -355,7 +745,7 @@ drop_dangling(o: *GameObject, gone: ptr) {
         while i < count {
             f = component.field_at(k, i)
             id = component.object_ref(c, f)
-            if id != 0 && (behaviour.scene_find_id(s, id) == null || names_id(gone, id)) {
+            if id != 0 && (!idmap_has(here, id) || idmap_has(gone, id)) {
                 component.set_object(c, f, null)
                 g_dangling = g_dangling + 1
             }
@@ -363,16 +753,6 @@ drop_dangling(o: *GameObject, gone: ptr) {
         }
         j = j + 1
     }
-}
-
-names_id(ids: ptr, id: int) -> bool {
-    if ids == null { return false }
-    i = 0
-    while i < json.array_size(ids) {
-        if json.get_int(json.array_get_raw(ids, i)) == id { return true }
-        i = i + 1
-    }
-    return false
 }
 
 names_kind(saved: ptr, count: int, name: string) -> bool {
@@ -387,23 +767,59 @@ names_kind(saved: ptr, count: int, name: string) -> bool {
 // A document read over the scene, which is the scene it was saved from, as
 // authored and just loaded. Objects the save destroyed go at the scene's
 // next update, as any destroyed object does.
-apply_json(s: *Scene, root: ptr) -> bool {
+apply_json(s: *Scene, root: ptr) -> bool { return apply_doc(s, root, false) }
+
+// A live scene put back to a checkpoint (checkpoint): every object the
+// checkpoint does not name -- made since -- destroyed, every one it names that
+// is gone made back by the game's spawner (set_spawner), and the rest as a
+// load puts them. False, with last_error and last_missing saying how many,
+// when an object destroyed since could not be made back (no spawner, or the
+// spawner made nothing); what could be put back is.
+restore(s: *Scene, root: ptr) -> bool { return apply_doc(s, root, true) }
+
+// How many objects the last load or restore named and could not place.
+last_missing() -> int { return g_missing }
+
+apply_doc(s: *Scene, root: ptr, live: bool) -> bool {
     g_unknown = 0
     g_dangling = 0
+    g_missing = 0
     format = json.object_get_raw(root, "format")
     if format == null || json.get_int(format) != FORMAT { return fail("not a save of format ${FORMAT}") }
     kinds = json.object_get_raw(root, "kinds")
     gone = json.object_get_raw(root, "destroyed")
+    // The scene's objects by id, and the save's destroyed, looked up in
+    // constant time however many there are.
+    here = scene_map(s)
+    gone_set = idmap_new(8)
     if gone != null {
         i = 0
         while i < json.array_size(gone) {
-            o = behaviour.scene_find_id(s, json.get_int(json.array_get_raw(gone, i)))
+            gone_id = json.get_int(json.array_get_raw(gone, i))
+            idmap_put(gone_set, gone_id, gone_set as ptr)
+            o = idmap_get(here, gone_id) as *GameObject
             if o != null { behaviour.scene_destroy_later(s, o) }
             i = i + 1
         }
     }
     objects = json.object_get_raw(root, "objects")
     missing = 0
+    if live && objects != null {
+        // What was made since the checkpoint goes, as any destroyed object does.
+        named = idmap_new(json.array_size(objects))
+        i = 0
+        while i < json.array_size(objects) {
+            idmap_put(named, json.get_int(json.object_get_raw(json.array_get_raw(objects, i), "id")), named as ptr)
+            i = i + 1
+        }
+        i = 0
+        while i < behaviour.scene_count(s) {
+            o = behaviour.scene_object(s, i)
+            if o != null && !idmap_has(named, behaviour.object_id(o)) { behaviour.scene_destroy_later(s, o) }
+            i = i + 1
+        }
+        idmap_free(named)
+    }
     if objects != null {
         i = 0
         while i < json.array_size(objects) {
@@ -413,13 +829,22 @@ apply_json(s: *Scene, root: ptr) -> bool {
             if id == 0 {
                 o = behaviour.scene_root(s)
             } else {
-                o = behaviour.scene_find_id(s, id)
+                o = idmap_get(here, id) as *GameObject
+                // Put back to a moment it was alive in: no longer to be destroyed.
+                if live && o != null { behaviour.scene_spare(s, o) }
                 spawned = json.object_get_raw(node, "spawned")
-                if o == null && spawned != null && json.get_bool(spawned) != 0 {
+                if o == null && (live || (spawned != null && json.get_bool(spawned) != 0)) && (g_spawner != null || !live) {
                     maker = g_spawner
-                    if maker == null { return fail("the save spawned objects and nothing is set to make them (set_spawner)") }
+                    if maker == null {
+                        idmap_free(here)
+                        idmap_free(gone_set)
+                        return fail("the save spawned objects and nothing is set to make them (set_spawner)")
+                    }
                     o = maker(g_spawn_context, text_of(node, "name"), text_of(node, "model"))
-                    if o != null { o.id = id }
+                    if o != null {
+                        o.id = id
+                        idmap_put(here, id, o as ptr)
+                    }
                 }
             }
             if o == null {
@@ -441,14 +866,33 @@ apply_json(s: *Scene, root: ptr) -> bool {
     }
     next = json.object_get_raw(root, "next_id")
     if next != null { behaviour.scene_set_next_id(s, json.get_int(next)) }
+    // Each system's own state, once every object it names is there with its
+    // transform and its components.
+    systems = json.object_get_raw(root, "systems")
+    if systems != null && g_providers != null {
+        i = 0
+        while i < list.size(g_providers) {
+            p = list.get_raw(g_providers, i) as *Provider
+            entry = json.object_get_raw(systems, p.name)
+            if entry != null {
+                read_state = p.load
+                g_unknown = g_unknown + read_state(p.context, s, entry)
+            }
+            i = i + 1
+        }
+    }
     // Once every object the save makes is there: a reference is to one of
     // them, or to nothing.
-    drop_dangling(behaviour.scene_root(s), gone)
+    drop_dangling(behaviour.scene_root(s), here, gone_set)
     i = 0
     while i < behaviour.scene_count(s) {
-        drop_dangling(behaviour.scene_object(s, i), gone)
+        drop_dangling(behaviour.scene_object(s, i), here, gone_set)
         i = i + 1
     }
+    idmap_free(here)
+    idmap_free(gone_set)
+    g_missing = missing
+    if missing > 0 && live { return fail("${missing} object(s) destroyed since the checkpoint could not be made back: the game sets a spawner for that (set_spawner)") }
     if missing > 0 { return fail("${missing} object(s) the save names are not in the scene: not the scene it was saved from") }
     return true
 }
@@ -465,19 +909,30 @@ load_json(s: *Scene, path: string) -> bool {
 
 // --- slot files ---------------------------------------------------------------------------
 
-// The running game to the slot file `path`: its details -- `title`, when
-// it was saved, `play_seconds`, and the game's own fields `extra` (a JSON
-// object, or null; the caller keeps it) -- then the state, deflated and
-// checksummed.
-save(s: *Scene, b: *Baseline, path: string, title: string, play_seconds: float, extra: ptr) -> bool {
+// The slot's details as text: `title`, when it was saved, `play_seconds`,
+// and the game's own fields `extra` (a JSON object, or null; the caller
+// keeps it).
+details_text(title: string, play_seconds: float, extra: ptr) -> string {
     details = json.obj()
     json.object_set_raw(details, "title", json.str(title))
     json.object_set_raw(details, "saved_ms", json.num(os.now_unix_ms() as float))
     json.object_set_raw(details, "play_seconds", json.num(play_seconds))
     if extra != null { json.object_set_raw(details, "game", component.json_copy(extra)) }
-    detail_text = json.stringify_raw(details)
+    text = json.stringify_raw(details)
     json.free(details)
-    root = state_json(s, b)
+    return text
+}
+
+// A capture to the slot file `path`, with its details and its picture (RGBA,
+// `width` by `height`, top row first, or null for none, encoded here as a
+// PNG): written out as text, deflated with its CRC-32, and put on disk
+// atomically. Reads nothing but its arguments, so it runs on any thread. ""
+// or why it failed.
+write_slot(path: string, detail_text: string, cap: *Capture, rgba: ptr, width: int, height: int) -> string {
+    picture = null as ptr
+    picture_length = 0
+    if rgba != null { picture, picture_length = png.encode(rgba, width, height) }
+    root = capture_doc(cap)
     state_text = json.stringify_raw(root)
     json.free(root)
     state_length = string.length(state_text)
@@ -489,30 +944,142 @@ save(s: *Scene, b: *Baseline, path: string, title: string, play_seconds: float, 
     deflate.done(z)
     bytes.free(plain)
     detail_length = string.length(detail_text)
-    total = HEADER + detail_length + packed_length
+    total = HEADER + detail_length + picture_length + packed_length
     out = bytes.new(total)
     bytes.copy_from_string(out, HEADER, detail_text, detail_length)
     raw = bytes.data(out)
     mem.set_uint32(raw, 0, MAGIC as long)
-    mem.set_uint32(raw, 4, FORMAT as long)
+    mem.set_uint32(raw, 4, SLOT_FORMAT as long)
     mem.set_uint32(raw, 8, detail_length as long)
     mem.set_uint32(raw, 12, state_length as long)
     mem.set_uint32(raw, 16, checksum.crc32(0 as long, packed, packed_length))
     mem.set_uint32(raw, 20, packed_length as long)
-    memcpy(raw + HEADER + detail_length, packed, packed_length as long)
+    mem.set_uint32(raw, 24, picture_length as long)
+    if picture != null {
+        memcpy(raw + HEADER + detail_length, picture, picture_length as long)
+        free(picture)
+    }
+    memcpy(raw + HEADER + detail_length + picture_length, packed, packed_length as long)
     err = fs.write_atomic(path, (raw as byte[])[0..total])
     bytes.free(out)
     free(packed)
-    string.free(detail_text)
     string.free(state_text)
-    if err != "" { return fail("cannot write ${path}: ${err}") }
+    if err != "" { return "cannot write ${path}: ${err}" }
+    return ""
+}
+
+// The running game to the slot file `path`: its details, its picture (RGBA,
+// `width` by `height`, or null: a save menu's thumbnail, a small view of the
+// frame from engine.engine_view_pixels), then the state, deflated and
+// checksummed. Done before it returns; save_async does the writing off the
+// frame.
+save(s: *Scene, b: *Baseline, path: string, title: string, play_seconds: float, extra: ptr,
+     picture: ptr = null, width: int = 0, height: int = 0) -> bool {
+    detail_text = details_text(title, play_seconds, extra)
+    cap = capture(s, b, false)
+    err = write_slot(path, detail_text, cap, picture, width, height)
+    component.capture_free(cap)
+    string.free(detail_text)
+    if err != "" { return fail(err) }
     return true
+}
+
+// A save on its way to disk (save_async): the frame captured the game; a
+// worker writes it.
+struct SaveJob {
+    path: string
+    details: string
+    cap: *Capture
+    picture: ptr                   // the picture's RGBA, copied off the frame's buffer, or null
+    width: int
+    height: int
+    state: int                     // SAVE_PENDING, SAVE_DONE or SAVE_FAILED
+    error: string
+}
+
+const SAVE_PENDING = 0
+const SAVE_DONE = 1
+const SAVE_FAILED = 2
+
+// The running game to `path` as save writes it, the frame paying only for
+// the capture: the text, the deflate and the disk are a worker's (std.worker).
+// Poll with save_finished; free with save_job_free once it is finished.
+save_async(s: *Scene, b: *Baseline, path: string, title: string, play_seconds: float, extra: ptr,
+           picture: ptr = null, width: int = 0, height: int = 0) -> *SaveJob {
+    job = heap.new(SaveJob)
+    // The picture copied now: the view it came from is drawn again next frame.
+    if picture != null && width > 0 && height > 0 {
+        job.picture = calloc(width * height, 4)
+        memcpy(job.picture, picture, ((width * height) as long) * (4 as long))
+        job.width = width
+        job.height = height
+    }
+    job.path = string.copy(path)
+    job.details = details_text(title, play_seconds, extra)
+    job.cap = capture(s, b, false)
+    job.state = SAVE_PENDING
+    job.error = ""
+    if !worker.run(|| { return save_job_run(job) }, |result: @keep ptr| { save_job_end(job, result) }) {
+        // No thread to write on: written here, as save would.
+        save_job_end(job, save_job_run(job))
+    }
+    return job
+}
+
+// On the worker: the slot written, the result its error as a string box
+// (null for none).
+save_job_run(job: *SaveJob) -> ptr {
+    err = write_slot(job.path, job.details, job.cap, job.picture, job.width, job.height)
+    if err == "" { return null }
+    return string.keep(err)
+}
+
+// On the loop thread: the job finished.
+save_job_end(job: *SaveJob, result: ptr) {
+    component.capture_free(job.cap)
+    job.cap = null
+    if job.picture != null {
+        free(job.picture)
+        job.picture = null
+    }
+    if result == null {
+        job.state = SAVE_DONE
+    } else {
+        job.state = SAVE_FAILED
+        why, _not = string.from_ptr(result)
+        job.error = string.copy(why)
+        string.release_kept(result)
+    }
+}
+
+// Whether the save has reached the disk (or failed: save_job_error says
+// why). Takes in the workers' finished jobs, so the frame that asks sees one
+// done the moment it is.
+save_finished(job: *SaveJob) -> bool {
+    if job == null { return true }
+    if job.state == SAVE_PENDING { worker.drain(0) }
+    return job.state != SAVE_PENDING
+}
+
+save_job_ok(job: *SaveJob) -> bool { return job != null && job.state == SAVE_DONE }
+save_job_error(job: *SaveJob) -> string {
+    if job == null { return "" }
+    return job.error
+}
+
+// The job let go; one not finished is waited for first.
+save_job_free(job: *SaveJob) {
+    if job == null { return }
+    while job.state == SAVE_PENDING { worker.drain(0) }
+    heap.free(job)
 }
 
 // A slot file's bytes, checked: null, with last_error, when it is not one.
 struct Slot {
     data: ptr                        // the file's bytes, a std.bytes buffer
     length: int
+    header: int                      // its header's length, by its format
+    picture: int                     // its picture's length, 0 for none
 }
 
 read_slot(path: string) -> *Slot {
@@ -521,7 +1088,7 @@ read_slot(path: string) -> *Slot {
         fail("cannot read ${path}: ${err}")
         return null
     }
-    if length < HEADER {
+    if length < HEADER_1 {
         fail("${path} is too short to be a save")
         return null
     }
@@ -533,14 +1100,26 @@ read_slot(path: string) -> *Slot {
         fail("${path} is not a save")
         return null
     }
-    if mem.get_uint32(raw, 4) != (FORMAT as long) {
+    format = mem.get_uint32(raw, 4) as int
+    if format != 1 && format != SLOT_FORMAT {
         bytes.free(b)
         fail("${path} is a save of another format")
         return null
     }
+    header = HEADER_1
+    picture = 0
+    if format >= 2 {
+        if length < HEADER {
+            bytes.free(b)
+            fail("${path} is too short to be a save")
+            return null
+        }
+        header = HEADER
+        picture = mem.get_uint32(raw, 24) as int
+    }
     detail_length = mem.get_uint32(raw, 8) as int
     packed_length = mem.get_uint32(raw, 20) as int
-    if HEADER + detail_length + packed_length != length {
+    if header + detail_length + picture + packed_length != length {
         bytes.free(b)
         fail("${path} is damaged: it is not as long as it says")
         return null
@@ -548,6 +1127,8 @@ read_slot(path: string) -> *Slot {
     sl = heap.new(Slot)
     sl.data = b
     sl.length = length
+    sl.header = header
+    sl.picture = picture
     return sl
 }
 
@@ -564,7 +1145,7 @@ slot_info(path: string) -> ptr {
     if sl == null { return null }
     raw = bytes.data(sl.data)
     detail_length = mem.get_uint32(raw, 8) as int
-    text = bytes.string_from_ptr(raw + HEADER, detail_length)
+    text = bytes.string_from_ptr(raw + sl.header, detail_length)
     slot_free(sl)
     root = json.parse_raw(text)
     string.free(text)
@@ -581,7 +1162,7 @@ load(s: *Scene, path: string) -> bool {
     state_length = mem.get_uint32(raw, 12) as int
     crc = mem.get_uint32(raw, 16)
     packed_length = mem.get_uint32(raw, 20) as int
-    packed = raw + HEADER + detail_length
+    packed = raw + sl.header + detail_length + sl.picture
     if checksum.crc32(0 as long, packed, packed_length) != crc {
         slot_free(sl)
         return fail("${path} is damaged: its checksum does not match")
@@ -605,4 +1186,24 @@ load(s: *Scene, path: string) -> bool {
     ok = apply_json(s, root)
     json.free(root)
     return ok
+}
+
+// A slot's picture, without reading its state: a PNG's bytes (malloc'd, the
+// caller frees them; picture.from_memory decodes them) and their length, or
+// null and 0 for a slot saved without one, or with last_error for a file that
+// is not a save.
+slot_picture(path: string) -> (ptr, int) {
+    sl = read_slot(path)
+    if sl == null { return null, 0 }
+    if sl.picture == 0 {
+        slot_free(sl)
+        return null, 0
+    }
+    raw = bytes.data(sl.data)
+    at = sl.header + (mem.get_uint32(raw, 8) as int)
+    out = calloc(sl.picture, 1)
+    memcpy(out, raw + at, sl.picture as long)
+    length = sl.picture
+    slot_free(sl)
+    return out, length
 }

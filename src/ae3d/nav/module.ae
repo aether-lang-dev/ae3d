@@ -1,46 +1,76 @@
-// Navigation for a horde: a flow field over the ground, built once per
-// target, read by every zombie every frame.
+// Navigation for a crowd: a flow field over the ground, built once per
+// target, read by every figure every frame.
 //
 //     field = nav.flow_new(x0, z0, x1, z1, 1.0)        // the ground, metres, a cell a metre
-//     nav.flow_block_model(field, building)             // what nothing walks through
+//     nav.flow_block_mesh(field, fence, -0.3, 2.2, 0)   // what nothing walks through: its triangles
+//     nav.flow_block_model(field, bin)                  // or, for a compact thing, its bounding square
+//     nav.flow_clearance(field, 2, 30)                  // walls kept at a body's distance, doorways open
 //     nav.flow_build(field, core.vec3(px, 0.0, pz))     // the target: the player
 //     nav.flow_steer(field, positions, yaws, count, 2.0 * delta)   // every heading toward it
 //
-// A path per zombie is a search per zombie; a hundred thousand of them want
-// one search. The field is the cost from every cell to the target, found by
-// one flood from the target outward over the cells nothing stands in (a
-// Dijkstra, eight ways, a straight step 10 and a diagonal 14 -- tenths of a
-// cell, integers, so the frontier is a ring and not a heap -- and no
-// diagonal past a blocked corner, so nothing is told to walk through the
-// edge of a wall), and a direction per cell toward the cheapest neighbour.
-// A zombie reads the direction under its feet and turns toward it by at
-// most `turn` a step, so the horde swings round rather than snapping;
-// where the field says nothing -- a blocked cell, one the target cannot
-// be reached from, the target's own -- it keeps its heading and the
-// wander and separation passes carry on. The flood is a few milliseconds
-// for a city, paid once each time the target crosses a cell; the steer
-// runs over the engine's pool.
+// A path per figure is a search per figure; a hundred thousand of them want
+// one search. The field is the price from every cell to the target, found by
+// one flood from the target outward over the cells nothing stands in: a
+// Dijkstra eight ways, a straight step 10 and a diagonal 14 (tenths of a
+// cell, integers), plus what the cell stepped into adds (its price, below),
+// and no diagonal past a blocked corner, so nothing is told to walk through
+// the edge of a wall. Then a direction per cell: the neighbour the cheapest
+// walk to the target goes through. A figure reads the direction under its
+// feet and turns toward it by at most `turn` a step, so a crowd swings round
+// rather than snapping; where the field says nothing -- a blocked cell, one
+// the target cannot be reached from, the target's own -- it keeps its
+// heading and the wander and separation passes carry on.
 //
-// What blocks a cell is a footprint -- a building, a bin, a lamp post --
-// given as a rectangle on the ground. The cells' costs and their blocked
-// and queued marks are ints (a byte would halve the memory, but a byte
-// in Aether is a runtime call per read and the flood took twice as long
-// on it), the directions doubles: twenty-eight bytes a cell, a few
-// megabytes for a city.
+// A cell is open, blocked, or open and dear. Blocked is all or nothing, so a
+// field that kept bodies off walls by blocking a margin closed every doorway
+// narrower than two margins, and stranded whoever stood in one with no
+// direction at all (#819). A price is walkable: each step into a dear cell
+// costs its price more, in tenths of a cell for every cell crossed (a
+// diagonal's 1.4 times it). `flow_clearance` prices the cells near a wall,
+// the nearer the dearer, so the field leads round a wall at a body's
+// distance, through a doorway when that is the only way, and out of the
+// margin for one already in it; `flow_cost_rect` prices an area of the
+// game's own (mud, a road the crowd prefers to avoid, a fire).
+//
+// The frontier is a ring of cells in the order they were reached (a FIFO,
+// not a heap: the steps are small integers), and a cell a cheaper way to
+// which turns up later is relaxed again. Each cell's way is set with its
+// cost, so the field is one pass: on a million cells, a city of blocks with
+// gaps, 11.7 ms with every cell one price (16.2 ms when the directions were
+// a second pass over the field; 0.8% of cells relaxed twice), and 14.6 ms
+// with a clearance of two cells (18% twice). A bucket queue (Dial's), which
+// settles each cell once, was measured at 19.7 and 15.9 ms on the same
+// field: its lists cost more writes a step than the relaxations it saves
+// (benchmarks/bench_nav).
+//
+// What blocks a cell is a footprint. `flow_block` takes a rectangle on the
+// ground; `flow_block_mesh` the cells under a model's own triangles within a
+// band of heights, which is what a fence, a wall, a ruin or a shack with a
+// doorway needs (#817): the bounding-sphere square of `flow_block_model`
+// blocks a 52 m fence's 56 m square and every doorway in a shack.
+//
+// The cells' marks, prices and costs are ints (a byte would halve the
+// memory, but a byte in Aether is a runtime call per read and the flood took
+// twice as long on it), the direction one int naming one of eight ways:
+// twenty-eight bytes a cell, 28 MB for a field a kilometre square at a metre
+// (thirty-two before the direction was a way and not a vector).
 import std.heap
 import ae3d.core
+import ae3d.geometry
 import ae3d.jobs
 
 exports (
-    FlowField,
-    flow_new, flow_free, flow_block, flow_block_model, flow_clear, flow_blocked,
+    FlowField, MAX_PRICE,
+    flow_new, flow_free, flow_block, flow_unblock, flow_open, flow_block_model, flow_block_mesh, flow_unblock_mesh, flow_clear, flow_blocked,
+    flow_cost_rect, flow_clearance, flow_price,
     flow_build, flow_cost, flow_direction, flow_has_direction, flow_steer,
     flow_width, flow_height, flow_cell, flow_target
 )
 
 extern calloc(count: int, size: int) -> ptr
+extern realloc(p: ptr, size: long) -> ptr
 extern free(p: ptr)
-extern memset(block: ptr, value: int, size: int) -> ptr
+extern memset(block: ptr, value: int, size: long) -> ptr
 extern floor(x: float) -> float
 extern sqrt(x: float) -> float
 
@@ -52,6 +82,14 @@ const HALF_PI = 1.5707963267948966
 const THREE_QUARTER_PI = 2.356194490192345
 const HEADING_PI = 3.141592653589793
 
+// The dearest a cell can be, in tenths of a cell a cell crossed: a hundred
+// cells' walk. A field caps it lower where its size needs it, so that no
+// walk's cost can pass an int (price_cap).
+const MAX_PRICE = 1000
+const INT_MAX = 2147483647
+// A distance no cell is from a wall, for the clearance's transform.
+const FAR = 1000000000
+
 struct FlowField {
     w: int
     h: int
@@ -59,10 +97,27 @@ struct FlowField {
     z0: float
     cell: float
     blocked: ptr                   // int[w*h]: 1 where nothing can walk
+    // What a step into a cell costs on top of its length, in tenths of a
+    // cell a cell crossed: `own` as the game set it (flow_cost_rect), and
+    // `price`, own with the clearance added, which is what the flood reads.
+    // `price` is made again only over the box of cells either has changed
+    // in (stale_c0 .. stale_c1, stale_r0 .. stale_r1; empty when c1 < c0),
+    // so a wall put up in a sandbox costs its own neighbourhood, not the field.
+    own: ptr                       // int[w*h]
+    price: ptr                     // int[w*h]
+    stale_c0: int
+    stale_r0: int
+    stale_c1: int
+    stale_r1: int
+    price_cap: int                 // MAX_PRICE, or less on a field so large a walk could overflow
+    clear_cells: int               // the clearance: how far from a wall it reaches, in cells (0 none)
+    clear_price: int               // and what it adds beside the wall
     cost: ptr                      // int[w*h]: tenths of a cell to the target, -1 unreachable
-    dir: ptr                       // float[w*h*2]: the way to walk, unit, or 0,0
+    way: ptr                       // int[w*h]: which of the eight ways to walk, -1 none
     queue: ptr                     // int[w*h + 1]: the flood's frontier, a ring (one over: a full ring is not an empty one)
-    queued: ptr                    // int[w*h]: whether a cell waits in the frontier
+    // Whether a cell waits in the frontier; all zero between floods, which
+    // is what lets the footprint and the clearance use it as their scratch.
+    queued: ptr                    // int[w*h]
     // Where it was last built for, so a caller can tell whether the target
     // has crossed into another cell and the flood is worth paying again.
     target: Vec3
@@ -84,16 +139,23 @@ flow_new(x0: float, z0: float, x1: float, z1: float, cell: float) -> *FlowField 
     f.cell = cell
     n = w * h
     f.blocked = calloc(n, 4)
+    f.own = calloc(n, 4)
+    f.price = calloc(n, 4)
+    nothing_stale(f)
+    // A walk crosses each cell once at most, so n steps of 14 and 1.4 prices
+    // bound every cost the flood can hold.
+    cap = (((INT_MAX / n) - 14) * 10) / 14
+    if cap > MAX_PRICE { cap = MAX_PRICE }
+    if cap < 0 { cap = 0 }
+    f.price_cap = cap
+    f.clear_cells = 0
+    f.clear_price = 0
     f.cost = calloc(n, 4)
-    f.dir = calloc(n * 2, 8)
+    f.way = calloc(n, 4)
     f.queue = calloc(n + 1, 4)
     f.queued = calloc(n, 4)
-    cost = f.cost as int[]
-    i = 0
-    while i < n {
-        cost[i] = 0 - 1
-        i = i + 1
-    }
+    memset(f.cost, 255, (n as long) * (4 as long))
+    memset(f.way, 255, (n as long) * (4 as long))
     f.target = core.vec3(0.0, 0.0, 0.0)
     f.built = false
     f.reached = 0
@@ -103,8 +165,10 @@ flow_new(x0: float, z0: float, x1: float, z1: float, cell: float) -> *FlowField 
 flow_free(f: *FlowField) {
     if f == null { return }
     free(f.blocked)
+    free(f.own)
+    free(f.price)
     free(f.cost)
-    free(f.dir)
+    free(f.way)
     free(f.queue)
     free(f.queued)
     heap.free(f)
@@ -119,8 +183,52 @@ col_of(f: *FlowField, x: float) -> int { return floor((x - f.x0) / f.cell) as in
 row_of(f: *FlowField, z: float) -> int { return floor((z - f.z0) / f.cell) as int }
 is_blocked(f: *FlowField, at: int) -> bool { blocked = f.blocked as int[]; return blocked[at] != 0 }
 
-// A footprint on the ground nothing walks through, world metres.
-flow_block(f: *FlowField, x0: float, z0: float, x1: float, z1: float) {
+nothing_stale(f: *FlowField) {
+    f.stale_c0 = f.w
+    f.stale_r0 = f.h
+    f.stale_c1 = 0 - 1
+    f.stale_r1 = 0 - 1
+}
+
+// The prices over a box of cells need making again: the box joined to what
+// was already stale, cut to the field.
+stale(f: *FlowField, c0: int, r0: int, c1: int, r1: int) {
+    if c1 < c0 || r1 < r0 { return }
+    if c0 < f.stale_c0 { f.stale_c0 = c0 }
+    if r0 < f.stale_r0 { f.stale_r0 = r0 }
+    if c1 > f.stale_c1 { f.stale_c1 = c1 }
+    if r1 > f.stale_r1 { f.stale_r1 = r1 }
+    if f.stale_c0 < 0 { f.stale_c0 = 0 }
+    if f.stale_r0 < 0 { f.stale_r0 = 0 }
+    if f.stale_c1 >= f.w { f.stale_c1 = f.w - 1 }
+    if f.stale_r1 >= f.h { f.stale_r1 = f.h - 1 }
+}
+
+all_stale(f: *FlowField) { stale(f, 0, 0, f.w - 1, f.h - 1) }
+
+// The marks changed over a box: the clearance, which is measured from them,
+// is stale as far from it as the clearance reaches.
+marks_changed(f: *FlowField, c0: int, r0: int, c1: int, r1: int) {
+    reach = f.clear_cells
+    if reach > 0 { stale(f, c0 - reach, r0 - reach, c1 + reach, r1 + reach) }
+}
+
+// A footprint on the ground nothing walks through, world metres: each cell
+// under it one blocker more.
+flow_block(f: *FlowField, x0: float, z0: float, x1: float, z1: float) { mark_rect(f, x0, z0, x1, z1, 1) }
+
+// What flow_block blocked, one blocker fewer: a cell something else blocks
+// stays blocked.
+flow_unblock(f: *FlowField, x0: float, z0: float, x1: float, z1: float) { mark_rect(f, x0, z0, x1, z1, 0 - 1) }
+
+// The cells under a rectangle open, whatever blocked them: a wall torn down
+// to the ground. What else stood there is the game's to block again
+// (flow_block_mesh on whatever overlaps).
+flow_open(f: *FlowField, x0: float, z0: float, x1: float, z1: float) { mark_rect(f, x0, z0, x1, z1, 0) }
+
+// Each cell under the rectangle `delta` blockers more (1, -1), or opened
+// outright (0).
+mark_rect(f: *FlowField, x0: float, z0: float, x1: float, z1: float, delta: int) {
     bx0 = x0
     bx1 = x1
     bz0 = z0
@@ -140,16 +248,20 @@ flow_block(f: *FlowField, x0: float, z0: float, x1: float, z1: float) {
     while r <= r1 {
         c = c0
         while c <= c1 {
-            blocked[r * f.w + c] = 1
+            at = r * f.w + c
+            if delta == 0 { blocked[at] = 0 } else { _changed = step_blocked(blocked, at, delta) }
             c = c + 1
         }
         r = r + 1
     }
+    marks_changed(f, c0, r0, c1, r1)
 }
 
 // A model's footprint: its bounding sphere's square on the ground. A
-// sphere overstates a long building's corners by a little, which keeps
-// the horde off its walls, and understates nothing.
+// sphere overstates a compact building's corners by a little, which keeps
+// a crowd off its walls, and understates nothing; for anything long, thin
+// or hollow it closes everything round it, and `flow_block_mesh` is the
+// footprint to take.
 flow_block_model(f: *FlowField, m: *Model) {
     if m == null { return }
     r = m.bounding_radius
@@ -158,7 +270,10 @@ flow_block_model(f: *FlowField, m: *Model) {
 }
 
 flow_clear(f: *FlowField) {
-    memset(f.blocked, 0, f.w * f.h * 4)
+    n = (f.w * f.h) as long
+    memset(f.blocked, 0, n * (4 as long))
+    memset(f.own, 0, n * (4 as long))
+    all_stale(f)
     f.built = false
 }
 
@@ -169,77 +284,811 @@ flow_blocked(f: *FlowField, x: float, z: float) -> bool {
     return is_blocked(f, r * f.w + c)
 }
 
-// The eight ways, straight first then diagonal, and each one's cost:
-// tables, filled once.
+// --- a model's footprint from its triangles (#817) ---------------------------------------------------------------
+//
+// Every triangle of the model's mesh, in the world (each instance's, for an
+// instanced model), is cut to the band of heights from `low` to `high` and
+// its piece laid on the ground: every cell the piece covers is blocked, then
+// every cell within `grow` cells of those, by the same eight-way distance the
+// flood walks. A fence blocks the line it runs along, a shack its walls and
+// not its doorway, a water tower its legs and not the ground under its tank
+// when the band stops under the tank. Heights are the world's: the band is
+// where a body is, from under its feet to over its head, on the ground the
+// field lies on.
+//
+// A cell is covered where the piece and the cell's square share a point,
+// with a cell's square taken as [x, x + cell) along each axis: a wall built
+// on a cell line blocks the cells on one side of it, not both. A skinned mesh
+// has no footprint of its own (its vertices are where its bones carry them,
+// not where its model stands) and a model drawn as points (particles) none
+// either; both block nothing. Returns how many cells were newly blocked.
+
+// The clip of one triangle against the band: up to five corners, x y z.
+struct NavClip {
+    a: ptr          // float[7 * 3]: the polygon
+    b: ptr          // float[7 * 3]: the scratch it is clipped into
+    edges: ptr      // float[7 * 5]: its edges' axes (mark_polygon)
+}
+
+// Keeps the side of the plane y = level a polygon is on: above it when
+// `keep_above`, below it otherwise. Sutherland-Hodgman, into `out`.
+clip_level(src: float[], count: int, out: float[], level: float, keep_above: bool) -> int {
+    kept = 0
+    i = 0
+    while i < count {
+        j = i + 1
+        if j == count { j = 0 }
+        ay = src[i * 3 + 1]
+        by = src[j * 3 + 1]
+        a_in = ay <= level
+        b_in = by <= level
+        if keep_above { a_in = ay >= level; b_in = by >= level }
+        if a_in {
+            out[kept * 3] = src[i * 3]
+            out[kept * 3 + 1] = ay
+            out[kept * 3 + 2] = src[i * 3 + 2]
+            kept = kept + 1
+        }
+        if a_in != b_in {
+            t = (level - ay) / (by - ay)
+            out[kept * 3] = src[i * 3] + (src[j * 3] - src[i * 3]) * t
+            out[kept * 3 + 1] = level
+            out[kept * 3 + 2] = src[i * 3 + 2] + (src[j * 3 + 2] - src[i * 3 + 2]) * t
+            kept = kept + 1
+        }
+        i = i + 1
+    }
+    return kept
+}
+
+// Marks (in `queued`, as 1) every cell the convex polygon's ground shadow
+// covers by more than `slack`; widens the box of marked cells in `bounds`
+// (c0, r0, c1, r1). `edges` is scratch for five floats an edge.
+//
+// The slack is what a vertex's float32 can be off by where it is: a box
+// placed by an instance's matrix on a cell's lines has its faces a few
+// millionths past them (21.2 + 0.8 is 22.000002 in float32), and without it
+// each such face reached the cell beyond. A shadow thinner than the slack
+// across a line (a wall's face on it) takes the cell its middle is in.
+mark_polygon(f: *FlowField, poly: float[], count: int, bounds: int[], edges: float[], slack: float) {
+    if count == 0 { return }
+    min_x = poly[0]
+    max_x = poly[0]
+    min_z = poly[2]
+    max_z = poly[2]
+    i = 1
+    while i < count {
+        x = poly[i * 3]
+        z = poly[i * 3 + 2]
+        if x < min_x { min_x = x }
+        if x > max_x { max_x = x }
+        if z < min_z { min_z = z }
+        if z > max_z { max_z = z }
+        i = i + 1
+    }
+    c0 = col_of(f, min_x + slack)
+    c1 = col_of(f, max_x - slack)
+    if c0 > c1 { c0 = col_of(f, (min_x + max_x) * 0.5); c1 = c0 }
+    r0 = row_of(f, min_z + slack)
+    r1 = row_of(f, max_z - slack)
+    if r0 > r1 { r0 = row_of(f, (min_z + max_z) * 0.5); r1 = r0 }
+    if c1 < 0 || r1 < 0 || c0 >= f.w || r0 >= f.h { return }
+    if c0 < 0 { c0 = 0 }
+    if r0 < 0 { r0 = 0 }
+    if c1 >= f.w { c1 = f.w - 1 }
+    if r1 >= f.h { r1 = f.h - 1 }
+    marks = f.queued as int[]
+    w = f.w
+    cell = f.cell
+    half = cell * 0.5
+    // One column or one row of cells: the shadow is convex and connected, so
+    // it reaches every cell of its box.
+    narrow = c0 == c1 || r0 == r1
+    // Otherwise a cell is covered unless an edge's normal separates them
+    // (the box's own axes are the cell range already): each edge's normal,
+    // the shadow's extent along it narrowed by the slack, and how far a
+    // cell's half reaches along it, once for the polygon.
+    axes = 0
+    if !narrow {
+        k = 0
+        while k < count {
+            j = k + 1
+            if j == count { j = 0 }
+            ex = poly[j * 3] - poly[k * 3]
+            ez = poly[j * 3 + 2] - poly[k * 3 + 2]
+            if ex != 0.0 || ez != 0.0 {
+                nx = 0.0 - ez
+                nz = ex
+                lo = poly[0] * nx + poly[2] * nz
+                hi = lo
+                q = 1
+                while q < count {
+                    d = poly[q * 3] * nx + poly[q * 3 + 2] * nz
+                    if d < lo { lo = d }
+                    if d > hi { hi = d }
+                    q = q + 1
+                }
+                anx = nx
+                if anx < 0.0 { anx = 0.0 - anx }
+                anz = nz
+                if anz < 0.0 { anz = 0.0 - anz }
+                give = slack * sqrt(nx * nx + nz * nz)
+                at = axes * 5
+                edges[at] = nx
+                edges[at + 1] = nz
+                edges[at + 2] = lo + give
+                edges[at + 3] = hi - give
+                edges[at + 4] = half * (anx + anz)
+                axes = axes + 1
+            }
+            k = k + 1
+        }
+    }
+    r = r0
+    while r <= r1 {
+        cz = f.z0 + ((r as float) + 0.5) * cell
+        c = c0
+        while c <= c1 {
+            covered = true
+            if !narrow {
+                cx = f.x0 + ((c as float) + 0.5) * cell
+                k = 0
+                while k < axes && covered {
+                    at = k * 5
+                    centre = cx * edges[at] + cz * edges[at + 1]
+                    reach = edges[at + 4]
+                    if centre + reach <= edges[at + 2] || centre - reach >= edges[at + 3] { covered = false }
+                    k = k + 1
+                }
+            }
+            if covered { marks[r * w + c] = 1 }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    if c0 < bounds[0] { bounds[0] = c0 }
+    if r0 < bounds[1] { bounds[1] = r0 }
+    if c1 > bounds[2] { bounds[2] = c1 }
+    if r1 > bounds[3] { bounds[3] = r1 }
+}
+
+// One placement of the mesh: the column-major matrix `mat` (sixteen floats)
+// takes its vertices into the world.
+mark_mesh(f: *FlowField, mesh: ptr, mat: float[], low: float, high: float, clip: *NavClip, bounds: int[]) {
+    g = mesh as *GeoMesh
+    v = g.vertices as f32[]
+    idx = g.indices as int[]
+    a = clip.a as float[]
+    b = clip.b as float[]
+    edges = clip.edges as float[]
+    // A ten-thousandth of a cell, and two float32 steps at the triangle's
+    // distance from the origin (float32 holds 24 bits, so 2.4e-7 of it).
+    base_slack = f.cell * 0.0001
+    t = 0
+    while t + 2 < g.index_count {
+        k = 0
+        out_low = 0
+        out_high = 0
+        while k < 3 {
+            at = idx[t + k] * geometry.VERTEX_FLOATS
+            px = v[at] as float
+            py = v[at + 1] as float
+            pz = v[at + 2] as float
+            wx = mat[0] * px + mat[4] * py + mat[8] * pz + mat[12]
+            wy = mat[1] * px + mat[5] * py + mat[9] * pz + mat[13]
+            wz = mat[2] * px + mat[6] * py + mat[10] * pz + mat[14]
+            a[k * 3] = wx
+            a[k * 3 + 1] = wy
+            a[k * 3 + 2] = wz
+            if wy < low { out_low = out_low + 1 }
+            if wy > high { out_high = out_high + 1 }
+            k = k + 1
+        }
+        if out_low < 3 && out_high < 3 {
+            // The way into the solid on the ground: against the face's
+            // normal (a counter-clockwise front, as glTF and the loaders
+            // wind it). A wall's face on a cell line is moved off it by twice
+            // the slack that way, so it blocks the cell behind it
+            // and not the open one in front: a block a cell across, its faces
+            // on the cell's lines, blocks that one cell, and a lone panel on
+            // a line still blocks one.
+            ux = a[3] - a[0]
+            uy = a[4] - a[1]
+            uz = a[5] - a[2]
+            vx = a[6] - a[0]
+            vy = a[7] - a[1]
+            vz = a[8] - a[2]
+            nx = uy * vz - uz * vy
+            nz = ux * vy - uy * vx
+            far = 0.0
+            q = 0
+            while q < 3 {
+                ax = a[q * 3]
+                if ax < 0.0 { ax = 0.0 - ax }
+                az = a[q * 3 + 2]
+                if az < 0.0 { az = 0.0 - az }
+                if ax > far { far = ax }
+                if az > far { far = az }
+                q = q + 1
+            }
+            slack = base_slack + far * 0.00000024
+            level = sqrt(nx * nx + nz * nz)
+            ox = 0.0
+            oz = 0.0
+            if level > 0.0 {
+                ox = 0.0 - nx / level * slack * 2.0
+                oz = 0.0 - nz / level * slack * 2.0
+            }
+            count = 3
+            if out_low > 0 { count = clip_level(a, count, b, low, true) } else { copy_poly(a, b, count) }
+            if out_high > 0 { count = clip_level(b, count, a, high, false) } else { copy_poly(b, a, count) }
+            q = 0
+            while q < count {
+                a[q * 3] = a[q * 3] + ox
+                a[q * 3 + 2] = a[q * 3 + 2] + oz
+                q = q + 1
+            }
+            mark_polygon(f, a, count, bounds, edges, slack)
+        }
+        t = t + 3
+    }
+}
+
+copy_poly(src: float[], dst: float[], count: int) {
+    i = 0
+    while i < count * 3 {
+        dst[i] = src[i]
+        i = i + 1
+    }
+}
+
+flow_block_mesh(f: *FlowField, m: *Model, low: float, high: float, grow: int) -> int {
+    return mesh_footprint(f, m, low, high, grow, 1)
+}
+
+// What flow_block_mesh blocked, opened again: the same footprint (the same
+// model where it stood, the same band and growth), each of its cells one
+// blocker fewer. A cell another blocker holds stays blocked -- a streamed
+// cell's walls let go do not open its neighbour's, nor a game's own block.
+// How many cells opened.
+flow_unblock_mesh(f: *FlowField, m: *Model, low: float, high: float, grow: int) -> int {
+    return mesh_footprint(f, m, low, high, grow, 0 - 1)
+}
+
+// A model's footprint, `delta` blockers more on each of its cells (1 or -1).
+// How many cells were blocked or opened by it.
+mesh_footprint(f: *FlowField, m: *Model, low: float, high: float, grow: int, delta: int) -> int {
+    if f == null || m == null || m.mesh == null || high < low { return 0 }
+    if geometry.mesh_is_skinned(m.mesh) == 1 { return 0 }
+    if geometry.mesh_index_count(m.mesh) < 3 { return 0 }
+    core.model_sync_transform(m)
+    clip = NavClip { a: calloc(21, 8), b: calloc(21, 8), edges: calloc(35, 8) }
+    mat = calloc(16, 8)
+    matrix = mat as float[]
+    bounds_ptr = calloc(4, 4)
+    bounds = bounds_ptr as int[]
+    bounds[0] = f.w
+    bounds[1] = f.h
+    bounds[2] = 0 - 1
+    bounds[3] = 0 - 1
+    if m.is_instanced && m.instances != null {
+        // An instance's matrix is the world's: an instanced model is drawn
+        // with no model matrix of its own (the renderers send the identity).
+        if geometry.inst_is_points(m.instances) == 0 {
+            inst = m.instances as *GeoInstances
+            data = inst.matrices as f32[]
+            i = 0
+            while i < inst.count {
+                k = 0
+                while k < 16 {
+                    matrix[k] = data[i * 16 + k] as float
+                    k = k + 1
+                }
+                mark_mesh(f, m.mesh, matrix, low, high, (&clip) as *NavClip, bounds)
+                i = i + 1
+            }
+        }
+    } else {
+        mm = m.model_matrix
+        matrix[0] = mm.m0;   matrix[1] = mm.m1;   matrix[2] = mm.m2;   matrix[3] = mm.m3
+        matrix[4] = mm.m4;   matrix[5] = mm.m5;   matrix[6] = mm.m6;   matrix[7] = mm.m7
+        matrix[8] = mm.m8;   matrix[9] = mm.m9;   matrix[10] = mm.m10; matrix[11] = mm.m11
+        matrix[12] = mm.m12; matrix[13] = mm.m13; matrix[14] = mm.m14; matrix[15] = mm.m15
+        mark_mesh(f, m.mesh, matrix, low, high, (&clip) as *NavClip, bounds)
+    }
+    blocked_now = 0
+    if bounds[2] >= 0 {
+        blocked_now = apply_marks(f, bounds[0], bounds[1], bounds[2], bounds[3], grow, delta)
+    }
+    if blocked_now > 0 {
+        g = grow
+        if g < 0 { g = 0 }
+        marks_changed(f, bounds[0] - g, bounds[1] - g, bounds[2] + g, bounds[3] + g)
+    }
+    free(clip.a)
+    free(clip.b)
+    free(clip.edges)
+    free(mat)
+    free(bounds_ptr)
+    return blocked_now
+}
+
+// The marks in `queued` over the box, grown by `grow` cells: each cell of
+// the footprint `delta` blockers more (a cell's blocked word counts what
+// blocks it, so a footprint let go opens only what nothing else holds),
+// once however many marks reach it; the box's scratch left zero again. How
+// many cells were newly blocked, or newly opened.
+apply_marks(f: *FlowField, c0: int, r0: int, c1: int, r1: int, grow: int, delta: int) -> int {
+    w = f.w
+    marks = f.queued as int[]
+    blocked = f.blocked as int[]
+    fresh = 0
+    if grow <= 0 {
+        r = r0
+        while r <= r1 {
+            c = c0
+            while c <= c1 {
+                at = r * w + c
+                if marks[at] != 0 {
+                    if step_blocked(blocked, at, delta) { fresh = fresh + 1 }
+                    marks[at] = 0
+                }
+                c = c + 1
+            }
+            r = r + 1
+        }
+        return fresh
+    }
+    // Grown: every cell within grow * 10 of a mark by the chamfer (10 a
+    // straight step, 14 a diagonal, the flood's own measure) blocked. The
+    // chamfer from one mark to (dx, dz) away is 14 min + 10 (max - min) of
+    // |dx|, |dz|, so the grown footprint is a disc stamped on every mark, or
+    // the distance transform over the box: the same cells either way, and
+    // whichever is cheaper is taken. A fence on the diagonal marks a few
+    // hundred cells of a box of 176,000, and stamping is a hundred times less.
+    count = 0
+    r = r0
+    while r <= r1 {
+        c = c0
+        while c <= c1 {
+            if marks[r * w + c] != 0 { count = count + 1 }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    side = 2 * grow + 1
+    area = ((c1 - c0 + 1 + 2 * grow) as long) * ((r1 - r0 + 1 + 2 * grow) as long)
+    if (count as long) * ((side * side) as long) < area * (4 as long) {
+        return stamp_marks(f, c0, r0, c1, r1, grow, delta, count)
+    }
+    gc0 = c0 - grow
+    gr0 = r0 - grow
+    gc1 = c1 + grow
+    gr1 = r1 + grow
+    if gc0 < 0 { gc0 = 0 }
+    if gr0 < 0 { gr0 = 0 }
+    if gc1 >= w { gc1 = w - 1 }
+    if gr1 >= f.h { gr1 = f.h - 1 }
+    r = gr0
+    while r <= gr1 {
+        c = gc0
+        while c <= gc1 {
+            at = r * w + c
+            if marks[at] != 0 { marks[at] = 0 } else { marks[at] = FAR }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    chamfer(marks, w, gc0, gr0, gc1, gr1)
+    reach = grow * 10
+    r = gr0
+    while r <= gr1 {
+        c = gc0
+        while c <= gc1 {
+            at = r * w + c
+            if marks[at] <= reach && step_blocked(blocked, at, delta) { fresh = fresh + 1 }
+            marks[at] = 0
+            c = c + 1
+        }
+        r = r + 1
+    }
+    return fresh
+}
+
+// A cell one blocker more (delta 1) or fewer (-1), never below none: whether
+// it went from open to blocked or back.
+step_blocked(blocked: int[], at: int, delta: int) -> bool {
+    was = blocked[at]
+    now = was + delta
+    if now < 0 { now = 0 }
+    blocked[at] = now
+    return (was == 0) != (now == 0)
+}
+
+// The footprint's cells as stamp_marks first reaches them: a list, so the
+// change after costs the footprint, not its box (a fence's box is the
+// field's width and its footprint a line through it).
+var g_foot: ptr = null             // int[g_foot_capacity]
+var g_foot_capacity = 0
+
+// The list at least `cells` long.
+foot_room(cells: int) -> int[] {
+    if cells > g_foot_capacity {
+        if g_foot != null { free(g_foot) }
+        g_foot_capacity = cells
+        if g_foot_capacity < 4096 { g_foot_capacity = 4096 }
+        g_foot = calloc(g_foot_capacity, 4)
+    }
+    return g_foot as int[]
+}
+
+// The disc of radius `grow` (by the chamfer) stamped on every mark in the
+// box. Discs overlap, so the footprint is gathered first -- in the scratch,
+// as -1, where a mark not yet visited is 1, and listed as it is first
+// reached -- and each of its cells changed once after.
+stamp_marks(f: *FlowField, c0: int, r0: int, c1: int, r1: int, grow: int, delta: int, count: int) -> int {
+    listed = 0
+    // Every mark's disc at most: the footprint's bound, so the list is
+    // never grown while it is written.
+    side = 2 * grow + 1
+    foot = foot_room(count * side * side)
+    w = f.w
+    h = f.h
+    marks = f.queued as int[]
+    blocked = f.blocked as int[]
+    reach = grow * 10
+    fresh = 0
+    r = r0
+    while r <= r1 {
+        c = c0
+        while c <= c1 {
+            at = r * w + c
+            if marks[at] > 0 {
+                marks[at] = 0 - 1
+                foot[listed] = at
+                listed = listed + 1
+                dz = 0 - grow
+                while dz <= grow {
+                    rr = r + dz
+                    if rr >= 0 && rr < h {
+                        az = dz
+                        if az < 0 { az = 0 - az }
+                        dx = 0 - grow
+                        while dx <= grow {
+                            cc = c + dx
+                            ax = dx
+                            if ax < 0 { ax = 0 - ax }
+                            lo = ax
+                            hi = az
+                            if az < ax { lo = az; hi = ax }
+                            if cc >= 0 && cc < w && 14 * lo + 10 * (hi - lo) <= reach {
+                                there = rr * w + cc
+                                if marks[there] == 0 {
+                                    marks[there] = 0 - 1
+                                    foot[listed] = there
+                                    listed = listed + 1
+                                }
+                            }
+                            dx = dx + 1
+                        }
+                    }
+                    dz = dz + 1
+                }
+            }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    // The footprint, each cell once.
+    k = 0
+    while k < listed {
+        at = foot[k]
+        if step_blocked(blocked, at, delta) { fresh = fresh + 1 }
+        marks[at] = 0
+        k = k + 1
+    }
+    return fresh
+}
+
+// The eight-way chamfer distance in place over a box of a w-wide grid: a
+// cell at 0 is a source, at FAR not yet reached. Two passes, the forward one
+// from the left and above, the backward one from the right and below; each
+// cell ends at the cheapest walk of straight (10) and diagonal (14) steps to
+// a source within the box, which is the measure the flood walks by.
+chamfer(d: int[], w: int, c0: int, r0: int, c1: int, r1: int) {
+    r = r0
+    while r <= r1 {
+        c = c0
+        while c <= c1 {
+            at = r * w + c
+            best = d[at]
+            if best > 0 {
+                if c > c0 && d[at - 1] + 10 < best { best = d[at - 1] + 10 }
+                if r > r0 {
+                    up = at - w
+                    if d[up] + 10 < best { best = d[up] + 10 }
+                    if c > c0 && d[up - 1] + 14 < best { best = d[up - 1] + 14 }
+                    if c < c1 && d[up + 1] + 14 < best { best = d[up + 1] + 14 }
+                }
+                d[at] = best
+            }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    r = r1
+    while r >= r0 {
+        c = c1
+        while c >= c0 {
+            at = r * w + c
+            best = d[at]
+            if best > 0 {
+                if c < c1 && d[at + 1] + 10 < best { best = d[at + 1] + 10 }
+                if r < r1 {
+                    down = at + w
+                    if d[down] + 10 < best { best = d[down] + 10 }
+                    if c > c0 && d[down - 1] + 14 < best { best = d[down - 1] + 14 }
+                    if c < c1 && d[down + 1] + 14 < best { best = d[down + 1] + 14 }
+                }
+                d[at] = best
+            }
+            c = c - 1
+        }
+        r = r - 1
+    }
+}
+
+// --- prices (#819) -----------------------------------------------------------------------------------------------
+
+clamp_price(f: *FlowField, p: int) -> int {
+    if p < 0 { return 0 }
+    if p > f.price_cap { return f.price_cap }
+    return p
+}
+
+// Every step into the cells under a rectangle costs `extra` more, in tenths
+// of a cell for each cell crossed: 10 makes crossing one cost two. It sets
+// the price (0 takes it off); it does not add to what was there, so a game
+// can mark an area dear and cheap again. Clamped to 0 and MAX_PRICE (less on
+// a field of more than about 1.5 million cells, where the cap keeps every
+// walk's cost inside an int).
+flow_cost_rect(f: *FlowField, x0: float, z0: float, x1: float, z1: float, extra: int) {
+    bx0 = x0
+    bx1 = x1
+    bz0 = z0
+    bz1 = z1
+    if bx1 < bx0 { bx0 = x1; bx1 = x0 }
+    if bz1 < bz0 { bz0 = z1; bz1 = z0 }
+    c0 = col_of(f, bx0)
+    c1 = col_of(f, bx1)
+    r0 = row_of(f, bz0)
+    r1 = row_of(f, bz1)
+    if c0 < 0 { c0 = 0 }
+    if r0 < 0 { r0 = 0 }
+    if c1 >= f.w { c1 = f.w - 1 }
+    if r1 >= f.h { r1 = f.h - 1 }
+    p = clamp_price(f, extra)
+    own = f.own as int[]
+    r = r0
+    while r <= r1 {
+        c = c0
+        while c <= c1 {
+            own[r * f.w + c] = p
+            c = c + 1
+        }
+        r = r + 1
+    }
+    stale(f, c0, r0, c1, r1)
+}
+
+// The cells within `cells` of a blocked one cost more, nearer dearer: the one
+// beside a wall `extra`, falling evenly to extra / cells at `cells` away, by
+// the flood's own eight-way distance. 0 cells turns it off. Kept with the
+// field and measured again from the marks whenever they change, so a wall
+// built or torn down later moves its margin with it.
+flow_clearance(f: *FlowField, cells: int, extra: int) {
+    c = cells
+    if c < 0 { c = 0 }
+    // Past the field's own size it reaches nothing more.
+    if c > f.w + f.h { c = f.w + f.h }
+    f.clear_cells = c
+    f.clear_price = clamp_price(f, extra)
+    all_stale(f)
+}
+
+// What a step into the cell under a point costs over its length, in tenths
+// of a cell a cell crossed: the game's price and the clearance together.
+// 0 off the field.
+flow_price(f: *FlowField, x: float, z: float) -> int {
+    c = col_of(f, x)
+    r = row_of(f, z)
+    if c < 0 || r < 0 || c >= f.w || r >= f.h { return 0 }
+    refresh_price(f)
+    price = f.price as int[]
+    return price[r * f.w + c]
+}
+
+// `price` = `own` plus the clearance, over the stale box. A cell's clearance
+// is its distance from the nearest blocked cell, and only one within
+// `clear_cells` of a wall pays any: such a wall is within `clear_cells` steps,
+// so the distances are taken over the box widened by that much and no
+// farther. The distances are taken in `queued`, zeroed after.
+refresh_price(f: *FlowField) {
+    c0 = f.stale_c0
+    r0 = f.stale_r0
+    c1 = f.stale_c1
+    r1 = f.stale_r1
+    if c1 < c0 || r1 < r0 { return }
+    nothing_stale(f)
+    w = f.w
+    own = f.own as int[]
+    price = f.price as int[]
+    if f.clear_cells <= 0 || f.clear_price <= 0 {
+        r = r0
+        while r <= r1 {
+            c = c0
+            while c <= c1 {
+                price[r * w + c] = own[r * w + c]
+                c = c + 1
+            }
+            r = r + 1
+        }
+        return
+    }
+    cells = f.clear_cells
+    dc0 = c0 - cells
+    dr0 = r0 - cells
+    dc1 = c1 + cells
+    dr1 = r1 + cells
+    if dc0 < 0 { dc0 = 0 }
+    if dr0 < 0 { dr0 = 0 }
+    if dc1 >= w { dc1 = w - 1 }
+    if dr1 >= f.h { dr1 = f.h - 1 }
+    d = f.queued as int[]
+    blocked = f.blocked as int[]
+    r = dr0
+    while r <= dr1 {
+        c = dc0
+        while c <= dc1 {
+            at = r * w + c
+            if blocked[at] != 0 { d[at] = 0 } else { d[at] = FAR }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    chamfer(d, w, dc0, dr0, dc1, dr1)
+    reach = cells * 10
+    span = reach as long
+    extra = f.clear_price as long
+    r = r0
+    while r <= r1 {
+        c = c0
+        while c <= c1 {
+            at = r * w + c
+            p = own[at]
+            away = d[at]
+            // 10 beside the wall pays the whole price, `reach` pays 1 / cells
+            // of it; integer arithmetic in long, so every platform rounds alike.
+            if away > 0 && away <= reach {
+                p = p + ((extra * ((span - (away as long)) + (10 as long))) / span) as int
+            }
+            price[at] = clamp_price(f, p)
+            c = c + 1
+        }
+        r = r + 1
+    }
+    r = dr0
+    while r <= dr1 {
+        c = dc0
+        while c <= dc1 {
+            d[r * w + c] = 0
+            c = c + 1
+        }
+        r = r + 1
+    }
+}
+
+// --- the flood ---------------------------------------------------------------------------------------------------
+
+// The eight ways, straight first then diagonal, each one's length, its unit
+// vector and its heading: tables, filled once.
 var g_dc: ptr = null
 var g_dr: ptr = null
 var g_step: ptr = null
+var g_ux: ptr = null
+var g_uz: ptr = null
+var g_heading: ptr = null
+var g_back: ptr = null
 
 steps_ready() {
     if g_dc != null { return }
     g_dc = calloc(8, 4)
     g_dr = calloc(8, 4)
     g_step = calloc(8, 4)
+    g_ux = calloc(8, 8)
+    g_uz = calloc(8, 8)
+    g_heading = calloc(8, 8)
+    g_back = calloc(8, 4)
     dc = g_dc as int[]
     dr = g_dr as int[]
     st = g_step as int[]
+    ux = g_ux as float[]
+    uz = g_uz as float[]
+    heading = g_heading as float[]
     dc[0] = 1; dc[1] = 0 - 1; dc[2] = 0; dc[3] = 0; dc[4] = 1; dc[5] = 1; dc[6] = 0 - 1; dc[7] = 0 - 1
     dr[0] = 0; dr[1] = 0; dr[2] = 1; dr[3] = 0 - 1; dr[4] = 1; dr[5] = 0 - 1; dr[6] = 1; dr[7] = 0 - 1
     st[0] = 10; st[1] = 10; st[2] = 10; st[3] = 10; st[4] = 14; st[5] = 14; st[6] = 14; st[7] = 14
+    // The way back along each: the walk toward the cell a step came from.
+    back = g_back as int[]
+    back[0] = 1; back[1] = 0; back[2] = 3; back[3] = 2; back[4] = 7; back[5] = 6; back[6] = 5; back[7] = 4
+    k = 0
+    while k < 8 {
+        dx = dc[k] as float
+        dz = dr[k] as float
+        len = sqrt(dx * dx + dz * dz)
+        ux[k] = dx / len
+        uz[k] = dz / len
+        heading[k] = heading_of(dx, dz)
+        k = k + 1
+    }
 }
 
 // The flood from the target; how many cells can reach it (0 for a target
-// off the field or inside a footprint). Two step weights on a FIFO settle
-// a cell more than once in the worst case; a cell already waiting in the
-// frontier is not queued twice, so the ring never holds more than every
-// cell once, and the relaxations are bounded since a cost only falls.
+// off the field or inside a footprint).
 flow_build(f: *FlowField, target: Vec3) -> int {
     f.target = target
+    refresh_price(f)
     f.reached = flood(f, target.x, target.z)
     f.built = f.reached > 0
     return f.reached
 }
 
+// A cell's way is set with its cost: back toward the cell it was reached
+// from at that cost, so it points along a cheapest walk to the target, and
+// the walk it points along is the one its cost was paid for. There is no
+// second pass over the field to find it.
 flood(f: *FlowField, tx: float, tz: float) -> int {
     steps_ready()
     dc = g_dc as int[]
     dr = g_dr as int[]
     st = g_step as int[]
+    back = g_back as int[]
     w = f.w
     h = f.h
     n = w * h
+    whole = (n as long) * (4 as long)
+    memset(f.cost, 255, whole)
+    memset(f.way, 255, whole)
     cost = f.cost as int[]
-    queue = f.queue as int[]
-    queued = f.queued as int[]
+    way = f.way as int[]
     blocked = f.blocked as int[]
-    dir = f.dir as float[]
-    i = 0
-    while i < n {
-        cost[i] = 0 - 1
-        dir[i * 2] = 0.0
-        dir[i * 2 + 1] = 0.0
-        i = i + 1
-    }
+    price = f.price as int[]
     c = col_of(f, tx)
     r = row_of(f, tz)
     if c < 0 || r < 0 || c >= w || r >= h { return 0 }
     target = r * w + c
     if blocked[target] != 0 { return 0 }
-    memset(f.queued, 0, n * 4)
+
+    // A cost only falls, and a cell already waiting is not queued twice, so
+    // the ring never holds more than every cell once and the relaxations are
+    // bounded. Every popped cell's mark is cleared, which leaves `queued` all
+    // zero when the frontier empties.
+    queue = f.queue as int[]
+    queued = f.queued as int[]
+    reached = 0
     cost[target] = 0
     head = 0
-    tail = 0
-    queue[tail] = target
-    tail = tail + 1
+    tail = 1
+    queue[0] = target
     queued[target] = 1
     while head != tail {
         at = queue[head]
         head = head + 1
+        if head == n + 1 { head = 0 }
+        queued[at] = 0
         ar = at / w
         ac = at % w
         base = cost[at]
-        if head == n + 1 { head = 0 }
-        queued[at] = 0
         k = 0
         while k < 8 {
             nc = ac + dc[k]
@@ -250,62 +1099,37 @@ flood(f: *FlowField, tx: float, tz: float) -> int {
                 passable = blocked[to] == 0
                 if passable && k >= 4 && (blocked[ar * w + nc] != 0 || blocked[nr * w + ac] != 0) { passable = false }
                 if passable {
-                    total = base + st[k]
-                    if cost[to] < 0 || cost[to] > total {
+                    p = price[to]
+                    if k >= 4 { p = (p * 14) / 10 }
+                    total = base + st[k] + p
+                    was = cost[to]
+                    if was < 0 || was > total {
+                        if was < 0 { reached = reached + 1 }
                         cost[to] = total
+                        way[to] = back[k]
                         if queued[to] == 0 {
                             queued[to] = 1
                             queue[tail] = to
                             tail = tail + 1
                             if tail == n + 1 { tail = 0 }
                         }
+                    } else if was == total {
+                        // As cheap a way in as the one it has: the one from
+                        // nearer the target, a diagonal over two straight
+                        // steps, as a walker cuts a corner.
+                        held = way[to]
+                        if base < cost[to + dc[held] + dr[held] * w] { way[to] = back[k] }
                     }
                 }
             }
             k = k + 1
         }
     }
-    // Every open cell points at its cheapest neighbour; the target's own cell points nowhere.
-    reached = 0
-    r = 0
-    while r < h {
-        c = 0
-        while c < w {
-            at = r * w + c
-            if cost[at] >= 0 && at != target {
-                reached = reached + 1
-                best = 0 - 1
-                best_cost = cost[at]
-                k = 0
-                while k < 8 {
-                    nc = c + dc[k]
-                    nr = r + dr[k]
-                    if nc >= 0 && nr >= 0 && nc < w && nr < h {
-                        to = nr * w + nc
-                        if cost[to] >= 0 {
-                            open = true
-                            if k >= 4 && (blocked[r * w + nc] != 0 || blocked[nr * w + c] != 0) { open = false }
-                            if open && cost[to] < best_cost { best_cost = cost[to]; best = k }
-                        }
-                    }
-                    k = k + 1
-                }
-                if best >= 0 {
-                    dx = dc[best] as float
-                    dz = dr[best] as float
-                    len = sqrt(dx * dx + dz * dz)
-                    dir[at * 2] = dx / len
-                    dir[at * 2 + 1] = dz / len
-                }
-            }
-            c = c + 1
-        }
-        r = r + 1
-    }
     return reached + 1   // the target's cell
 }
 
-// The walk from a point to the target in metres, -1 where it cannot reach.
+// The walk's price from a point to the target in metres, -1 where it cannot
+// reach: its length, and what the dear cells on the way add.
 flow_cost(f: *FlowField, x: float, z: float) -> float {
     c = col_of(f, x)
     r = row_of(f, z)
@@ -322,14 +1146,21 @@ flow_direction(f: *FlowField, x: float, z: float) -> Vec3 {
     c = col_of(f, x)
     r = row_of(f, z)
     if c < 0 || r < 0 || c >= f.w || r >= f.h { return core.vec3(0.0, 0.0, 0.0) }
-    dir = f.dir as float[]
-    at = r * f.w + c
-    return core.vec3(dir[at * 2], 0.0, dir[at * 2 + 1])
+    way = f.way as int[]
+    k = way[r * f.w + c]
+    if k < 0 { return core.vec3(0.0, 0.0, 0.0) }
+    steps_ready()
+    ux = g_ux as float[]
+    uz = g_uz as float[]
+    return core.vec3(ux[k], 0.0, uz[k])
 }
 
 flow_has_direction(f: *FlowField, x: float, z: float) -> bool {
-    d = flow_direction(f, x, z)
-    return d.x != 0.0 || d.z != 0.0
+    c = col_of(f, x)
+    r = row_of(f, z)
+    if c < 0 || r < 0 || c >= f.w || r >= f.h { return false }
+    way = f.way as int[]
+    return way[r * f.w + c] >= 0
 }
 
 // The heading of a cell's direction. The yaw convention is velocity
@@ -357,8 +1188,8 @@ heading_of(dx: float, dz: float) -> float {
 }
 
 // Every heading turned toward the field under it by at most `turn`
-// radians: `pos` and `yaw` are the crowd's packed columns (xyz a zombie,
-// one yaw a zombie), as crowd.crowd_wander reads them. A zombie on a
+// radians: `pos` and `yaw` are the crowd's packed columns (xyz a figure,
+// one yaw a figure), as crowd.crowd_wander reads them. A figure on a
 // cell with no direction keeps its heading.
 struct NavSteerJob {
     pos: ptr
@@ -372,17 +1203,16 @@ steer_run(start: int, end: int, worker: int, context: ptr) {
     f = job.f
     pos = job.pos as float[]
     yaw = job.yaw as float[]
-    dir = f.dir as float[]
+    way = f.way as int[]
+    heading = g_heading as float[]
     i = start
     while i < end {
         c = col_of(f, pos[i * 3])
         r = row_of(f, pos[i * 3 + 2])
         if c >= 0 && r >= 0 && c < f.w && r < f.h {
-            at = r * f.w + c
-            dx = dir[at * 2]
-            dz = dir[at * 2 + 1]
-            if dx != 0.0 || dz != 0.0 {
-                want = heading_of(dx, dz)
+            k = way[r * f.w + c]
+            if k >= 0 {
+                want = heading[k]
                 have = yaw[i]
                 diff = want - have
                 while diff > PI { diff = diff - 2.0 * PI }
@@ -398,6 +1228,8 @@ steer_run(start: int, end: int, worker: int, context: ptr) {
 
 flow_steer(f: *FlowField, pos: @keep ptr, yaw: @keep ptr, n: int, turn: float) {
     if f == null || pos == null || yaw == null || n <= 0 { return }
+    steps_ready()
     job = NavSteerJob { pos: pos, yaw: yaw, f: f, turn: turn }
     jobs.parallel_for(steer_run, n, 4096, (&job) as ptr)
 }
+

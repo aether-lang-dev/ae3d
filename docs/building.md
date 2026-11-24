@@ -215,7 +215,8 @@ to read them.
 |---|---|
 | `AE3D_API=opengl` | run through OpenGL instead of Vulkan |
 | `AE3D_FRAMES=n` | stop after `n` frames, so any example is a smoke test |
-| `AE3D_HIDDEN=1` | no window on screen; rendering still happens |
+| `AE3D_HIDDEN=1` | no window on screen; rendering still happens, at the size asked: a hidden window is drawn at its points, not a Retina display's pixels |
+| `AE3D_PIXEL_SCALE=1` | a shown window drawn at its points too, half the pixels a side on a display that scales |
 | `AE3D_WIDTH`, `AE3D_HEIGHT` | the window's size |
 | `AE3D_SNAPSHOT=path.png` | write the last frame; `AE3D_SNAPSHOT_BURST=k` for the last `k` |
 | `AE3D_PERF=1` | print the frame's cost by stage at exit ([performance.md](performance.md)) |
