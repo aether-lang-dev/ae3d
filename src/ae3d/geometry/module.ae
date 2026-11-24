@@ -49,6 +49,7 @@ exports (
     inst_remove, inst_enable_colors, inst_has_colors, inst_set_color, inst_compute_bounds,
     inst_bound_x, inst_bound_y, inst_bound_z, inst_bound_radius, inst_matrix_data,
     inst_color_data,
+    InstClusters, inst_cluster, inst_unclustered, inst_clusters, inst_place_of, inst_gather, CLUSTER_TARGET,
     skinrows_create, skinrows_destroy, skinrows_count, skinrows_set, skinrows_apply,
     set_runner, run_blocks
 )
@@ -131,6 +132,7 @@ struct GeoInstances {
     bound_y: f32
     bound_z: f32
     radius: f32
+    clusters: ptr                  // *InstClusters, or null: the stream unclustered
 }
 
 // The largest integer not above x, for the cells the decimation and the
@@ -1104,7 +1106,292 @@ inst_destroy(handle: ptr) {
     if n.colors != null { free(n.colors) }
     if n.phases != null { free(n.phases) }
     if n.points != null { free(n.points) }
+    inst_unclustered(handle)
     free(handle)
+}
+
+// --- clusters of a still stream (#19) -----------------------------------------------------------------------------
+//
+// An instanced model was drawn whole, wherever its copies stood: a prop kind
+// laid over a whole map drew every copy every frame, the five hundred off
+// the screen with the fifty on it. A stream that stands still is cut into
+// clusters of about CLUSTER_TARGET copies near one another (a grid over the
+// copies' places on the ground, its cells taken in Morton order, so the
+// clusters a view sees tend to sit side by side), each with the sphere its
+// copies' meshes fit in. A renderer uploads the copies in that order
+// (vkmesh, gl), each pass draws only the runs of clusters its frustum
+// reaches (core.instance_runs), and a pick's place in that order is turned
+// back into the copy (inst_place_of). The copies keep their own indices:
+// what a game set as copy 7 is copy 7.
+
+const CLUSTER_TARGET = 32
+
+struct InstClusters {
+    count: int                     // the copies clustered: all of the stream's
+    order: ptr                     // int[count]: the copy at each place, in cluster order
+    places: ptr                    // int[count]: each copy's place
+    clusters: int
+    first: ptr                     // int[clusters + 1]: each cluster's first place
+    spheres: ptr                   // f32[clusters * 4]: each cluster's centre and radius, in the model's space
+}
+
+inst_clusters(handle: ptr) -> *InstClusters {
+    if handle == null { return null }
+    return (handle as *GeoInstances).clusters as *InstClusters
+}
+
+// The stream drawn in its own order again: its clusters let go.
+inst_unclustered(handle: ptr) {
+    if handle == null { return }
+    n = handle as *GeoInstances
+    c = n.clusters as *InstClusters
+    if c == null { return }
+    free(c.order)
+    free(c.places)
+    free(c.first)
+    free(c.spheres)
+    free(c as ptr)
+    n.clusters = null
+}
+
+// The copy drawn at `place` in cluster order: itself for a stream with none.
+inst_place_of(handle: ptr, place: int) -> int {
+    c = inst_clusters(handle)
+    if c == null || place < 0 || place >= c.count { return place }
+    return (c.order as int[])[place]
+}
+
+// The stream cut into clusters, its copies of `mesh`. One pass to place each copy's
+// sphere, one to count each cell's, one to lay them out: O(copies), so a
+// stream that gains a copy is clustered again for the cost of a copy each.
+// A stream of fewer than four clusters' worth is left whole: it costs the
+// renderer more draws than it would save.
+inst_cluster(handle: ptr, mesh: ptr) -> bool {
+    inst_unclustered(handle)
+    if handle == null || mesh == null { return false }
+    n = handle as *GeoInstances
+    count = n.count
+    if n.is_points != 0 || count < CLUSTER_TARGET * 4 || n.matrices == null { return false }
+    g = mesh as *GeoMesh
+    local_bounds(g)
+    cx = g.local_x as float
+    cy = g.local_y as float
+    cz = g.local_z as float
+    radius = g.local_radius as float
+    m = n.matrices as f32[]
+    centres = calloc(count * 4, 4) as f32[]
+    x0 = 0.0
+    x1 = 0.0
+    z0 = 0.0
+    z1 = 0.0
+    i = 0
+    while i < count {
+        b = i * 16
+        x = (m[b] as float) * cx + (m[b + 4] as float) * cy + (m[b + 8] as float) * cz + (m[b + 12] as float)
+        y = (m[b + 1] as float) * cx + (m[b + 5] as float) * cy + (m[b + 9] as float) * cz + (m[b + 13] as float)
+        z = (m[b + 2] as float) * cx + (m[b + 6] as float) * cy + (m[b + 10] as float) * cz + (m[b + 14] as float)
+        // The copy's largest axis scales the mesh's sphere.
+        s0 = column_length(m, b)
+        s1 = column_length(m, b + 4)
+        s2 = column_length(m, b + 8)
+        if s1 > s0 { s0 = s1 }
+        if s2 > s0 { s0 = s2 }
+        centres[i * 4] = x as f32
+        centres[i * 4 + 1] = y as f32
+        centres[i * 4 + 2] = z as f32
+        centres[i * 4 + 3] = (radius * s0) as f32
+        if i == 0 || x < x0 { x0 = x }
+        if i == 0 || x > x1 { x1 = x }
+        if i == 0 || z < z0 { z0 = z }
+        if i == 0 || z > z1 { z1 = z }
+        i = i + 1
+    }
+    // A grid of about count / CLUSTER_TARGET cells, square on the ground.
+    wx = x1 - x0
+    wz = z1 - z0
+    if wx < 0.001 { wx = 0.001 }
+    if wz < 0.001 { wz = 0.001 }
+    cells_wanted = count / CLUSTER_TARGET
+    side = sqrt((wx * wz) / (cells_wanted as float))
+    gx = (wx / side) as int + 1
+    gz = (wz / side) as int + 1
+    if gx > 1024 { gx = 1024 }
+    if gz > 1024 { gz = 1024 }
+    cells = gx * gz
+    cell_of = calloc(count, 4) as int[]
+    per_cell = calloc(cells + 1, 4) as int[]
+    i = 0
+    while i < count {
+        ix = (((centres[i * 4] as float) - x0) / wx * (gx as float)) as int
+        iz = (((centres[i * 4 + 2] as float) - z0) / wz * (gz as float)) as int
+        if ix >= gx { ix = gx - 1 }
+        if iz >= gz { iz = gz - 1 }
+        if ix < 0 { ix = 0 }
+        if iz < 0 { iz = 0 }
+        cell_of[i] = iz * gx + ix
+        per_cell[cell_of[i]] = per_cell[cell_of[i]] + 1
+        i = i + 1
+    }
+    // The cells in Morton order, sorted by their interleaved keys (a shell
+    // sort: a cell a cluster's worth of copies, a few thousand at most).
+    by_rank = calloc(cells, 4) as int[]
+    keys = calloc(cells, 4) as int[]
+    k = 0
+    while k < cells {
+        by_rank[k] = k
+        keys[k] = morton(k % gx, k / gx)
+        k = k + 1
+    }
+    gap = cells / 2
+    while gap > 0 {
+        a = gap
+        while a < cells {
+            held = by_rank[a]
+            b = a
+            while b >= gap && keys[by_rank[b - gap]] > keys[held] {
+                by_rank[b] = by_rank[b - gap]
+                b = b - gap
+            }
+            by_rank[b] = held
+            a = a + 1
+        }
+        gap = gap / 2
+    }
+    free(keys as ptr)
+    cluster_of_cell = calloc(cells, 4) as int[]
+    c = heap_clusters(count)
+    clusters = 0
+    k = 0
+    while k < cells {
+        cell = by_rank[k]
+        cluster_of_cell[cell] = 0 - 1
+        if per_cell[cell] > 0 {
+            cluster_of_cell[cell] = clusters
+            clusters = clusters + 1
+        }
+        k = k + 1
+    }
+    c.clusters = clusters
+    c.first = calloc(clusters + 1, 4)
+    c.spheres = calloc(clusters * 4, 4)
+    first = c.first as int[]
+    k = 0
+    while k < cells {
+        cell = by_rank[k]
+        if cluster_of_cell[cell] >= 0 { first[cluster_of_cell[cell] + 1] = per_cell[cell] }
+        k = k + 1
+    }
+    k = 1
+    while k <= clusters {
+        first[k] = first[k] + first[k - 1]
+        k = k + 1
+    }
+    // Each copy to its place, clusters in order and the copies of one in
+    // their own order.
+    fill = calloc(clusters + 1, 4) as int[]
+    order = c.order as int[]
+    places = c.places as int[]
+    i = 0
+    while i < count {
+        cl = cluster_of_cell[cell_of[i]]
+        place = first[cl] + fill[cl]
+        fill[cl] = fill[cl] + 1
+        order[place] = i
+        places[i] = place
+        i = i + 1
+    }
+    // Each cluster's sphere: about the middle of its copies' centres, wide
+    // enough for the farthest copy's own sphere.
+    sp = c.spheres as f32[]
+    cl = 0
+    while cl < clusters {
+        mx = 0.0
+        my = 0.0
+        mz = 0.0
+        p = first[cl]
+        while p < first[cl + 1] {
+            j = order[p]
+            mx = mx + (centres[j * 4] as float)
+            my = my + (centres[j * 4 + 1] as float)
+            mz = mz + (centres[j * 4 + 2] as float)
+            p = p + 1
+        }
+        members = (first[cl + 1] - first[cl]) as float
+        mx = mx / members
+        my = my / members
+        mz = mz / members
+        reach = 0.0
+        p = first[cl]
+        while p < first[cl + 1] {
+            j = order[p]
+            dx = (centres[j * 4] as float) - mx
+            dy = (centres[j * 4 + 1] as float) - my
+            dz = (centres[j * 4 + 2] as float) - mz
+            d = sqrt(dx * dx + dy * dy + dz * dz) + (centres[j * 4 + 3] as float)
+            if d > reach { reach = d }
+            p = p + 1
+        }
+        sp[cl * 4] = mx as f32
+        sp[cl * 4 + 1] = my as f32
+        sp[cl * 4 + 2] = mz as f32
+        sp[cl * 4 + 3] = reach as f32
+        cl = cl + 1
+    }
+    free(fill as ptr)
+    free(cluster_of_cell as ptr)
+    free(by_rank as ptr)
+    free(per_cell as ptr)
+    free(cell_of as ptr)
+    free(centres as ptr)
+    n.clusters = c as ptr
+    return true
+}
+
+// The stream's matrices (16 floats each) or colours (3) in cluster order,
+// into `out` (count of them): what a renderer that uploads each stream on its
+// own sends (gl); vkmesh packs through the order itself.
+inst_gather(handle: ptr, which: int, out: ptr) {
+    n = handle as *GeoInstances
+    c = n.clusters as *InstClusters
+    width = 16
+    src = n.matrices
+    if which == 1 {
+        width = 3
+        src = n.colors
+    }
+    if src == null || c == null { return }
+    order = c.order as int[]
+    i = 0
+    while i < c.count {
+        memcpy(out + i * width * 4, src + order[i] * width * 4, (width * 4) as long)
+        i = i + 1
+    }
+}
+
+heap_clusters(count: int) -> *InstClusters {
+    c = calloc(1, sizeof(InstClusters)) as *InstClusters
+    c.count = count
+    c.order = calloc(count, 4)
+    c.places = calloc(count, 4)
+    return c
+}
+
+column_length(m: f32[], at: int) -> float {
+    a = m[at] as float
+    b = m[at + 1] as float
+    c = m[at + 2] as float
+    return sqrt(a * a + b * b + c * c)
+}
+
+// A cell's Morton key: x's and z's bits, ten each, interleaved.
+morton(x: int, z: int) -> int {
+    key = 0
+    bit = 0
+    while bit < 10 {
+        key = key | (((x >> bit) & 1) << (bit * 2)) | (((z >> bit) & 1) << (bit * 2 + 1))
+        bit = bit + 1
+    }
+    return key
 }
 
 // A point with nothing set: at the origin, scale one, white, phase zero.
