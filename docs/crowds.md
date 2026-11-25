@@ -134,6 +134,22 @@ list. The fence below costs 0.43 ms where it cost 0.42 before the count.
 `flow_open` still opens a rectangle whatever blocks it, and `flow_clear`
 opens the whole field.
 
+### A walk between two places
+
+`nav.flow_path(field, from, to)` gives the walk between any two places on
+the field, not only toward its target: whether there is one, its cost and
+its corners. It is a search of its own (A*), using the rule the flood
+walks by: a straight step 10, a diagonal 14, each cell's price on top, no
+diagonal past a blocked corner. Its cost is therefore the flood's, and it
+leaves alone the target, the costs and the ways the walkers steer by. The
+corners are the cells' middles where the walk must turn. From each, the
+walk goes on to the farthest cell of it that a straight line reaches
+without crossing a blocked cell or one dearer than the stretch it replaces,
+so the zigzag of a grid's ties between straight steps and diagonals is not
+reported as turns. Either end blocked, or off the field, or walled in:
+no points and cost -1. On the agent channel this is `nav.path`, over the
+fields a game exposes with `navagent.expose(field, name)`.
+
 ### Dear cells and the clearance
 
 Blocked is all or nothing. A field that kept bodies off walls by blocking a
