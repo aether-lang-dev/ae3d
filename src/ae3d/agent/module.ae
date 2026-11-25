@@ -11,6 +11,8 @@ import std.heap
 import std.json
 import std.string
 import std.list
+import std.os
+import std.bytes
 import ae3d.core
 import ae3d.gl
 import ae3d.skin
@@ -26,10 +28,12 @@ import ae3d.picture
 import ae3d.behaviour
 import ae3d.component
 import ae3d.persist
+import ae3d.agentwatch
+import ae3d.script
 
 exports (
     Context, context_new, context_free,
-    start, active, port, stop, pump, answer_step, answer_snapshot, answer_capture,
+    start, active, port, stop, pump, answer_step, answer_snapshot, answer_capture, observe,
     capture_release, capture_frame, capture_adopt, answer_pending_trace, answer_deferred,
     wants_deferred, clear_deferred, wants_capture, clear_capture,
     answer_capture_unsupported, is_paused, hold,
@@ -156,11 +160,52 @@ struct Context {
 
     deferred: ptr
     reference_frame: int
+
+    // frame.until: the expression run to, the request it answers (-1 for
+    // none), the frames it may still take and the frame it began at.
+    until: ptr                       // *Expr
+    until_id: int
+    until_left: int
+    until_from: int
+    // watch.add: each a *Watch, sampled at every frame the world moves.
+    watches: ptr
+    watch_next: int
+    observed: int                    // the last frame the watches were sampled at
 }
+
+// A watched expression's values, frame by frame: the last WATCH_KEEP of
+// them, oldest first from `head`.
+struct Watch {
+    id: int
+    name: string
+    expr: ptr                        // *Expr
+    frames: ptr                      // int[WATCH_KEEP]
+    values: ptr                      // float[WATCH_KEEP]
+    present: ptr                     // int[WATCH_KEEP]: 1 where everything the expression reads was there
+    count: int
+    head: int
+}
+
+const WATCH_KEEP = 4096
+const WATCH_ANSWER = 1024            // samples an answer carries at most; `more` says there are others
+const FIND_ANSWER = 256              // objects object.find answers with at most
+const UNTIL_DEFAULT = 600
+const UNTIL_MOST = 100000
 
 var g_error = ""
 
 last_error() -> string { return g_error }
+
+// The console kept for the channel (native/platform/console.c): log.tail
+// and log.since read its lines.
+extern ae3d_console_started() -> int
+extern ae3d_console_next() -> long
+extern ae3d_console_oldest() -> long
+extern ae3d_console_line(seq: long, frame: ptr, stream: ptr, object: ptr, text: ptr, room: int) -> int
+extern strlen(s: ptr) -> int
+
+const LOG_ANSWER = 1024            // lines an answer carries at most
+const LOG_TEXT = 1024              // a line's text, as the console keeps it
 
 context_new() -> *Context {
     c = heap.new(Context)
@@ -173,6 +218,10 @@ context_new() -> *Context {
     c.pending_explain_id = -1
     c.frame_exposure = 1.0
     c.want_deferred = false
+    c.until_id = 0 - 1
+    c.watches = list.new()
+    c.watch_next = 1
+    c.observed = 0 - 1
     c.deferred = list.new()
     c.reference_frame = -1
     return c
@@ -449,6 +498,13 @@ answer_one_read(c: *Context, d: *Deferred) {
 
 context_free(c: *Context) {
     if c == null { return }
+    if c.until != null { agentwatch.expr_free(c.until as *Expr) }
+    i = 0
+    while i < list.size(c.watches) {
+        watch_free(list.get_raw(c.watches, i) as *Watch)
+        i = i + 1
+    }
+    list.free(c.watches)
     // A read waiting on a frame that never arrived is still in the queue: the
     // context outlives the answer only when the program stops mid-exchange.
     if c.deferred != null {
@@ -770,6 +826,28 @@ help_result() -> ptr {
         "Every bound action with its state this frame: down, pressed, released, value."))
     json.array_add_raw(ops, describe("light.set", "[index], [position], [direction], [color], [intensity]",
         "Change a light."))
+    json.array_add_raw(ops, describe("script.list", "",
+        "Every script the program opened (ae3d.script): its name, the library it runs from, how many objects carry it, and why its last build or reload failed, when it did."))
+    json.array_add_raw(ops, describe("script.reload", "name, [source]",
+        "The script opened again from its library and swapped under every object carrying it, each keeping its fields by name (a renamed field takes its default) and starting again on the next frame. With source, the source built first (scripts/build_script.sh, or AE3D_SCRIPT_BUILD) into the library the script runs from; a build that fails is refused with the compiler's output, and the running script is left as it was."))
+    json.array_add_raw(ops, describe("script.errors", "",
+        "The scripts whose last build or reload failed, each with why: the compiler's output, or the reason the library was refused."))
+    json.array_add_raw(ops, describe("log.tail", "[count]",
+        "The program's console, the last count lines (100 by default, 1024 at most): every line it wrote to stdout and stderr, each with its seq, the frame it was printed in (the engine_frame_count its script saw), its stream (out or err) and, for a line a script's phase printed, the object (id and name); next, the seq to read on from with log.since, and oldest, the first still kept (the last 4096 are). Kept while the channel is open, unless AE3D_CONSOLE=0."))
+    json.array_add_raw(ops, describe("log.since", "seq, [count]",
+        "The console's lines after seq (0 for the oldest kept), up to count (100 by default, 1024 at most), as log.tail gives them, with more when there are others."))
+    json.array_add_raw(ops, describe("object.find", "[name], [tag], [component]",
+        "The objects whose name holds name, whose tag is tag and that carry a component of that kind -- whichever are given, together: index, id, name, tag, whether active and their components' kinds, the first 256, with count (how many there are) and more."))
+    json.array_add_raw(ops, describe("frame.until", "expression, [timeout]",
+        "Run frame by frame until the expression holds, then hold at that frame and answer it (frame.stats with met, the value, from and frames), or after timeout frames (600 by default) with met false. The expression reads the game's objects: Player.Health.value < 50, 'Enemy 2'.position.y < -10 || frame > 900, #12.Rigidbody.velocity.x >= 3 (an object by name, quoted name or id; a component kind and field, quoted where the name has a space; position; an axis x, y, z or w; numbers, true, false, frame; + - * / < <= > >= == != && || ! and parentheses). A path with nothing there is false, not 0. A malformed expression is refused saying where and what was expected. Nothing asked after it is answered before it."))
+    json.array_add_raw(ops, describe("watch.add", "expression, [name]",
+        "Read the expression at every frame the world moves, the last 4096 frames kept. Answers the watch's number. The expression is frame.until's."))
+    json.array_add_raw(ops, describe("watch.get", "watch, [since]",
+        "A watch's values frame by frame after frame since (all it keeps by default), oldest first, at most 1024 an answer: frames, values (null where it read nothing there), more and next, the frame to ask from for the rest."))
+    json.array_add_raw(ops, describe("watch.list", "",
+        "Every watch: its number, name, expression and how many samples it holds."))
+    json.array_add_raw(ops, describe("watch.remove", "watch",
+        "Stop a watch and let its samples go."))
     json.array_add_raw(ops, describe("object.list", "[filter]",
         "The scene's game objects: index, id (what an object field holds to name it), name, tag, whether active, and the kinds of their components in order. The scene itself comes first as index -1, named Scene: its components are what is the scene's rather than any object's (Environment, Rendering, a script keeping the game's rules). With filter, only the objects whose name has the text."))
     json.array_add_raw(ops, describe("object.get", "object",
@@ -830,6 +908,16 @@ help_result() -> ptr {
         "Let the simulation run again."))
     json.array_add_raw(ops, describe("frame.step", "count",
         "Pause, run exactly count frames, pause again. Answers with stepped_from and stepped."))
+    json.array_add_raw(ops, describe("physics.bodies", "[region], [world]",
+        "Every rigid body of the engine's physics (ae3d.physics), or those inside region ([x0, y0, z0, x1, y1, z1]): its object's name and id, its kind (dynamic, kinematic, static), position, velocity, whether it is awake, its mass and how many colliders it has; the first 256, with count and more."))
+    json.array_add_raw(ops, describe("physics.contacts", "[object], [world]",
+        "Every pair of bodies touching now, or those of one object: the two (their objects' names and ids, or ragdoll), how many points, where they touch (the points' middle), the normal, how deep and how hard (the step's normal impulse); each pair once; the first 256, with count and more."))
+    json.array_add_raw(ops, describe("physics.ray", "origin, direction, [reach], [world]",
+        "What a ray from origin along direction ([x, y, z] each) meets first within reach metres (100 by default), the static world too: whether it hit, the distance, the point, the normal, whether what it met is static, and its body's object."))
+    json.array_add_raw(ops, describe("nav.fields", "",
+        "The walkers' flow fields the game put on the channel (ae3d.navagent.expose): each one's name and size in cells."))
+    json.array_add_raw(ops, describe("nav.path", "from, to, [field]",
+        "The walk between two places ([x, z] or [x, y, z]) over a field (the first by default): whether there is one, its cost in tenths of a cell (the flood's measure) and its corners, the cells' middles where it turns. A search of its own (nav.flow_path, A* by the flood's rule): the target the walkers steer by is left alone."))
     json.array_add_raw(ops, describe("stream.cells", "[stream]",
         "Every streamed world in the program (ae3d.stream), or the one at that place: its grid, its loading radius, margin and far radius, the bytes its cells hold now and the most they have, how many loads are in flight and how many cells within the radius are missing, and every cell that is not unloaded: where it is, its state (loading, leaving, loaded, attaching, resident) and its stand-in's, how far it is from the nearest focus, its models and how many times it has loaded."))
     json.array_add_raw(ops, describe("net.stats", "[session]",
@@ -3502,6 +3590,217 @@ handle(c: *Context, op: string, id: int, request: ptr) -> bool {
         return true
     }
 
+    if op == "log.tail" || op == "log.since" {
+        if ae3d_console_started() != 1 {
+            fail(id, "the console is not kept: the channel keeps it unless AE3D_CONSOLE=0")
+            return false
+        }
+        next = ae3d_console_next()
+        oldest = ae3d_console_oldest()
+        count = 100
+        node = json.object_get_raw(request, "count")
+        if node != null { count = json.get_int(node) }
+        if count < 1 { count = 1 }
+        if count > LOG_ANSWER { count = LOG_ANSWER }
+        from = next - (count as long)
+        if op == "log.since" {
+            node = json.object_get_raw(request, "seq")
+            if node == null {
+                fail(id, "log.since needs seq: the last line already read (0 for the oldest kept)")
+                return false
+            }
+            from = (json.get_int(node) as long) + (1 as long)
+        }
+        if from < oldest { from = oldest }
+        answer(id, log_result(c, from, count, oldest, next))
+        return false
+    }
+
+    if op == "script.list" || op == "script.errors" {
+        out = json.obj()
+        items = json.arr()
+        k = 0
+        while k < script.loaded_count() {
+            if op == "script.list" || script.loaded_error(k) != "" {
+                entry = json.obj()
+                json.object_set_raw(entry, "name", json.str(script.loaded_name(k)))
+                json.object_set_raw(entry, "library", json.str(script.script_path(script.loaded_script(k))))
+                if op == "script.list" {
+                    json.object_set_raw(entry, "objects", json.from_int(carrying(c, script.loaded_kind(k))))
+                }
+                if script.loaded_error(k) != "" { json.object_set_raw(entry, "error", json.str(script.loaded_error(k))) }
+                json.array_add_raw(items, entry)
+            }
+            k = k + 1
+        }
+        json.object_set_raw(out, "scripts", items)
+        answer(id, out)
+        return false
+    }
+
+    if op == "script.reload" {
+        node = json.object_get_raw(request, "name")
+        if node == null {
+            fail(id, "script.reload needs the name of a script (script.list names them)")
+            return false
+        }
+        name = json.get_string_raw(node)
+        why = ""
+        source = json.object_get_raw(request, "source")
+        if source != null {
+            build_tool = "scripts/build_script.sh"
+            asked = os.getenv("AE3D_SCRIPT_BUILD")
+            if asked != null && asked != "" { build_tool = asked }
+            why = script.build_and_reload(name, json.get_string_raw(source), build_tool, c.scene as *Scene)
+        } else {
+            why = script.reload_named(name, c.scene as *Scene)
+        }
+        if why != "" {
+            fail(id, why)
+            return false
+        }
+        out = json.obj()
+        json.object_set_raw(out, "reloaded", json.str(name))
+        at = 0
+        k = 0
+        while k < script.loaded_count() {
+            if script.loaded_name(k) == name { at = k }
+            k = k + 1
+        }
+        json.object_set_raw(out, "objects", json.from_int(carrying(c, script.loaded_kind(at))))
+        answer(id, out)
+        return false
+    }
+
+    if op == "object.find" {
+        if c.scene == null {
+            fail(id, "this program keeps no scene of game objects")
+            return false
+        }
+        answer(id, find_result(c.scene as *Scene, request))
+        return false
+    }
+
+    if op == "frame.until" {
+        if c.scene == null {
+            fail(id, "this program keeps no scene of game objects")
+            return false
+        }
+        node = json.object_get_raw(request, "expression")
+        if node == null {
+            fail(id, "frame.until needs an expression, e.g. Player.Health.value < 50")
+            return false
+        }
+        e = agentwatch.compile(json.get_string_raw(node))
+        if e == null {
+            reason = "the expression: ${agentwatch.last_error()}"
+            fail(id, reason)
+            return false
+        }
+        timeout = UNTIL_DEFAULT
+        node = json.object_get_raw(request, "timeout")
+        if node != null { timeout = json.get_int(node) }
+        if timeout < 1 { timeout = 1 }
+        if timeout > UNTIL_MOST { timeout = UNTIL_MOST }
+        if c.until != null { agentwatch.expr_free(c.until as *Expr) }
+        c.until = e as ptr
+        c.until_id = id
+        c.until_left = timeout
+        c.until_from = c.frame_count
+        // Run, frame by frame, until it holds (observe).
+        c.paused = false
+        return true
+    }
+
+    if op == "watch.add" {
+        if c.scene == null {
+            fail(id, "this program keeps no scene of game objects")
+            return false
+        }
+        node = json.object_get_raw(request, "expression")
+        if node == null {
+            fail(id, "watch.add needs an expression, e.g. Player.position.y")
+            return false
+        }
+        e = agentwatch.compile(json.get_string_raw(node))
+        if e == null {
+            reason = "the expression: ${agentwatch.last_error()}"
+            fail(id, reason)
+            return false
+        }
+        w = heap.new(Watch)
+        w.id = c.watch_next
+        c.watch_next = c.watch_next + 1
+        w.name = string.copy(agentwatch.text_of(e))
+        named = json.object_get_raw(request, "name")
+        if named != null {
+            string.free(w.name)
+            w.name = string.copy(json.get_string_raw(named))
+        }
+        w.expr = e as ptr
+        w.frames = calloc(WATCH_KEEP, 4)
+        w.values = calloc(WATCH_KEEP, 8)
+        w.present = calloc(WATCH_KEEP, 4)
+        list.add_raw(c.watches, w as ptr)
+        out = json.obj()
+        json.object_set_raw(out, "watch", json.from_int(w.id))
+        json.object_set_raw(out, "name", json.str(w.name))
+        json.object_set_raw(out, "frame", json.from_int(c.frame_count))
+        answer(id, out)
+        return false
+    }
+
+    if op == "watch.get" || op == "watch.remove" {
+        node = json.object_get_raw(request, "watch")
+        w = null as *Watch
+        at = 0 - 1
+        if node != null {
+            watch_number = json.get_int(node)
+            k = 0
+            while k < list.size(c.watches) {
+                if (list.get_raw(c.watches, k) as *Watch).id == watch_number {
+                    w = list.get_raw(c.watches, k) as *Watch
+                    at = k
+                }
+                k = k + 1
+            }
+        }
+        if w == null {
+            fail(id, "${op} needs a watch watch.add made (watch.list names them)")
+            return false
+        }
+        if op == "watch.remove" {
+            list.remove(c.watches, at)
+            watch_free(w)
+            answer(id, json.obj())
+            return false
+        }
+        since = 0 - 1
+        node = json.object_get_raw(request, "since")
+        if node != null { since = json.get_int(node) }
+        answer(id, watch_result(w, since))
+        return false
+    }
+
+    if op == "watch.list" {
+        out = json.obj()
+        items = json.arr()
+        k = 0
+        while k < list.size(c.watches) {
+            w = list.get_raw(c.watches, k) as *Watch
+            entry = json.obj()
+            json.object_set_raw(entry, "watch", json.from_int(w.id))
+            json.object_set_raw(entry, "name", json.str(w.name))
+            json.object_set_raw(entry, "expression", json.str(agentwatch.text_of(w.expr as *Expr)))
+            json.object_set_raw(entry, "samples", json.from_int(w.count))
+            json.array_add_raw(items, entry)
+            k = k + 1
+        }
+        json.object_set_raw(out, "watches", items)
+        answer(id, out)
+        return false
+    }
+
     if op == "object.list" {
         if c.scene == null {
             fail(id, "this program keeps no scene of game objects")
@@ -3697,6 +3996,202 @@ pump(c: *Context) {
         json.free(request)
         if deferred { return }
     }
+}
+
+// The scene's objects (and its root) carrying a component of kind `k`.
+carrying(c: *Context, k: *ComponentKind) -> int {
+    if c.scene == null || k == null { return 0 }
+    scene = c.scene as *Scene
+    n = 0
+    if component.find(behaviour.scene_root(scene), k) != null { n = n + 1 }
+    i = 0
+    while i < behaviour.scene_count(scene) {
+        if component.find(behaviour.scene_object(scene, i), k) != null { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// --- the console (#510) ---------------------------------------------------------------------------
+
+// Up to `count` lines from seq `from`: each one's seq, frame, stream, the
+// object whose script printed it and its text; `next` the seq to read on
+// from, `more` whether there are others, `dropped` how many lines between
+// were no longer kept.
+log_result(c: *Context, from: long, count: int, oldest: long, next: long) -> ptr {
+    out = json.obj()
+    items = json.arr()
+    cells = calloc(3, 4)
+    text = calloc(LOG_TEXT + 1, 1)
+    seq = from
+    given = 0
+    while seq < next && given < count {
+        if ae3d_console_line(seq, cells, cells + 4, cells + 8, text, LOG_TEXT + 1) == 1 {
+            entry = json.obj()
+            json.object_set_raw(entry, "seq", json.num(seq as float))
+            json.object_set_raw(entry, "frame", json.from_int((cells as int[])[0]))
+            stream = "out"
+            if (cells as int[])[1] == 2 { stream = "err" }
+            json.object_set_raw(entry, "stream", json.str(stream))
+            object = (cells as int[])[2]
+            if object >= 0 {
+                who = json.obj()
+                json.object_set_raw(who, "id", json.from_int(object))
+                o = null as *GameObject
+                if c.scene != null { o = behaviour.scene_find_id(c.scene as *Scene, object) }
+                if o != null { json.object_set_raw(who, "name", json.str(o.name)) }
+                json.object_set_raw(entry, "object", who)
+            }
+            json.object_set_raw(entry, "text", json.str(bytes.string_from_ptr(text, strlen(text))))
+            json.array_add_raw(items, entry)
+            given = given + 1
+        }
+        seq = seq + (1 as long)
+    }
+    free(cells)
+    free(text)
+    json.object_set_raw(out, "lines", items)
+    json.object_set_raw(out, "next", json.num((seq - (1 as long)) as float))
+    json.object_set_raw(out, "more", json.boolean(seq < next))
+    json.object_set_raw(out, "oldest", json.num(oldest as float))
+    return out
+}
+
+// --- objects found, watched, run to (#510) -------------------------------------------------------
+
+// object.find: the objects whose name holds `name`, whose tag is `tag`,
+// that carry a component of kind `component` -- every one given, together
+// -- the first FIND_ANSWER of them, and how many there are.
+find_result(scene: *Scene, request: ptr) -> ptr {
+    name = ""
+    tag = ""
+    kind = null as *ComponentKind
+    node = json.object_get_raw(request, "name")
+    if node != null { name = json.get_string_raw(node) }
+    node = json.object_get_raw(request, "tag")
+    if node != null { tag = json.get_string_raw(node) }
+    node = json.object_get_raw(request, "component")
+    asked_kind = node != null
+    if asked_kind { kind = component.kind_named(json.get_string_raw(node)) }
+    out = json.obj()
+    items = json.arr()
+    found = 0
+    // A kind that is not one is no object's.
+    if !asked_kind || kind != null {
+        i = 0
+        while i < behaviour.scene_count(scene) {
+            o = behaviour.scene_object(scene, i)
+            fits = (name == "" || string.contains(o.name, name) == 1) &&
+                   (tag == "" || string.equals(core.text(o.tag), tag) == 1) &&
+                   (kind == null || component.find(o, kind) != null)
+            if fits {
+                if found < FIND_ANSWER { json.array_add_raw(items, object_summary(o, i)) }
+                found = found + 1
+            }
+            i = i + 1
+        }
+    }
+    json.object_set_raw(out, "objects", items)
+    json.object_set_raw(out, "count", json.from_int(found))
+    json.object_set_raw(out, "more", json.boolean(found > FIND_ANSWER))
+    return out
+}
+
+// A watch's samples after frame `since`, oldest first, at most
+// WATCH_ANSWER; `more` true and `next` the frame to ask from when there are
+// others. A sample whose expression met nothing there is null.
+watch_result(w: *Watch, since: int) -> ptr {
+    out = json.obj()
+    json.object_set_raw(out, "watch", json.from_int(w.id))
+    json.object_set_raw(out, "name", json.str(w.name))
+    frames = json.arr()
+    values = json.arr()
+    given = 0
+    more = false
+    last = since
+    k = 0
+    while k < w.count {
+        at = (w.head + k) % WATCH_KEEP
+        frame = (w.frames as int[])[at]
+        if frame > since {
+            if given == WATCH_ANSWER {
+                more = true
+                k = w.count
+            } else {
+                json.array_add_raw(frames, json.from_int(frame))
+                if (w.present as int[])[at] == 1 {
+                    json.array_add_raw(values, json.num((w.values as float[])[at]))
+                } else {
+                    json.array_add_raw(values, json.null_value())
+                }
+                last = frame
+                given = given + 1
+            }
+        }
+        k = k + 1
+    }
+    json.object_set_raw(out, "frames", frames)
+    json.object_set_raw(out, "values", values)
+    json.object_set_raw(out, "more", json.boolean(more))
+    json.object_set_raw(out, "next", json.from_int(last))
+    return out
+}
+
+watch_free(w: *Watch) {
+    agentwatch.expr_free(w.expr as *Expr)
+    string.free(w.name)
+    free(w.frames)
+    free(w.values)
+    free(w.present)
+    heap.free(w)
+}
+
+// Each frame, before the channel is drained: the watches sampled when the
+// world has moved, and a frame.until held to. True while an until runs --
+// the engine runs on and drains nothing new, as for a step, so what was
+// asked after it is answered after it.
+observe(c: *Context) -> bool {
+    moved = c.frame_count != c.observed
+    if moved && c.scene != null {
+        c.observed = c.frame_count
+        k = 0
+        while k < list.size(c.watches) {
+            w = list.get_raw(c.watches, k) as *Watch
+            v = agentwatch.evaluate(w.expr as *Expr, c.scene as *Scene, c.frame_count)
+            at = (w.head + w.count) % WATCH_KEEP
+            if w.count == WATCH_KEEP {
+                // Full: the oldest gives way.
+                at = w.head
+                w.head = (w.head + 1) % WATCH_KEEP
+            } else {
+                w.count = w.count + 1
+            }
+            (w.frames as int[])[at] = c.frame_count
+            (w.values as float[])[at] = v
+            (w.present as int[])[at] = 1
+            if agentwatch.last_missing() { (w.present as int[])[at] = 0 }
+            k = k + 1
+        }
+    }
+    if c.until_id < 0 { return false }
+    if !moved { return true }
+    e = c.until as *Expr
+    v = agentwatch.evaluate(e, c.scene as *Scene, c.frame_count)
+    met = v != 0.0 && !agentwatch.last_missing()
+    c.until_left = c.until_left - 1
+    if !met && c.until_left > 0 { return true }
+    // Held at the frame it held at, or the last it was given.
+    c.paused = true
+    out = stats_result(c)
+    json.object_set_raw(out, "met", json.boolean(met))
+    json.object_set_raw(out, "value", json.num(v))
+    json.object_set_raw(out, "from", json.from_int(c.until_from))
+    json.object_set_raw(out, "frames", json.from_int(c.frame_count - c.until_from))
+    answer(c.until_id, out)
+    agentwatch.expr_free(e)
+    c.until = null
+    c.until_id = 0 - 1
+    return false
 }
 
 answer_step(c: *Context) {

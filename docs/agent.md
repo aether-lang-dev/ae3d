@@ -58,6 +58,17 @@ interleaved with the first.
 | `input.set` | `[key], [mouse], [button], [axis], [value], [down], [cursor], [scroll], [clear]` | Press or release a key, mouse button or pad button, hold a pad axis at a value, put the cursor at [x, y] in window coordinates (held until clear), turn the wheel by scroll notches (read for one frame), or clear every injection: what the engine's input reads next frame beside the real devices. |
 | `input.get` |  | Every bound action with its state this frame: down, pressed, released, value. |
 | `light.set` | `[index], [position], [direction], [color], [intensity]` | Change a light. |
+| `script.list` |  | Every script the program opened (ae3d.script): its name, the library it runs from, how many objects carry it, and why its last build or reload failed, when it did. |
+| `script.reload` | `name, [source]` | The script opened again from its library and swapped under every object carrying it, each keeping its fields by name (a renamed field takes its default) and starting again on the next frame. With source, the source built first (scripts/build_script.sh, or AE3D_SCRIPT_BUILD) into the library the script runs from; a build that fails is refused with the compiler's output, and the running script is left as it was. |
+| `script.errors` |  | The scripts whose last build or reload failed, each with why: the compiler's output, or the reason the library was refused. |
+| `log.tail` | `[count]` | The program's console, the last count lines (100 by default, 1024 at most): every line it wrote to stdout and stderr, each with its seq, the frame it was printed in (the engine_frame_count its script saw), its stream (out or err) and, for a line a script's phase printed, the object (id and name); next, the seq to read on from with log.since, and oldest, the first still kept (the last 4096 are). Kept while the channel is open, unless AE3D_CONSOLE=0. |
+| `log.since` | `seq, [count]` | The console's lines after seq (0 for the oldest kept), up to count (100 by default, 1024 at most), as log.tail gives them, with more when there are others. |
+| `object.find` | `[name], [tag], [component]` | The objects whose name holds name, whose tag is tag and that carry a component of that kind -- whichever are given, together: index, id, name, tag, whether active and their components' kinds, the first 256, with count (how many there are) and more. |
+| `frame.until` | `expression, [timeout]` | Run frame by frame until the expression holds, then hold at that frame and answer it (frame.stats with met, the value, from and frames), or after timeout frames (600 by default) with met false. The expression reads the game's objects: Player.Health.value < 50, 'Enemy 2'.position.y < -10 \|\| frame > 900, #12.Rigidbody.velocity.x >= 3 (an object by name, quoted name or id; a component kind and field, quoted where the name has a space; position; an axis x, y, z or w; numbers, true, false, frame; + - * / < <= > >= == != && \|\| ! and parentheses). A path with nothing there is false, not 0. A malformed expression is refused saying where and what was expected. Nothing asked after it is answered before it. |
+| `watch.add` | `expression, [name]` | Read the expression at every frame the world moves, the last 4096 frames kept. Answers the watch's number. The expression is frame.until's. |
+| `watch.get` | `watch, [since]` | A watch's values frame by frame after frame since (all it keeps by default), oldest first, at most 1024 an answer: frames, values (null where it read nothing there), more and next, the frame to ask from for the rest. |
+| `watch.list` |  | Every watch: its number, name, expression and how many samples it holds. |
+| `watch.remove` | `watch` | Stop a watch and let its samples go. |
 | `object.list` | `[filter]` | The scene's game objects: index, id (what an object field holds to name it), name, tag, whether active, and the kinds of their components in order. The scene itself comes first as index -1, named Scene: its components are what is the scene's rather than any object's (Environment, Rendering, a script keeping the game's rules). With filter, only the objects whose name has the text. |
 | `object.get` | `object` | One object and every component on it: its kind, whether enabled, its version (how many times it has changed) and its fields by name. object is an index from object.list, a name, or Scene. |
 | `component.kinds` |  | Every kind of component there is -- the engine's and the game's -- with the heading it is listed under, whether an object may carry only one, whether it is the scene's, and each field's name, type (bool, int, float, vec3, color, rotation, enum, text, asset, object: another object's id), range, choices and tooltip. |
@@ -88,6 +99,11 @@ interleaved with the first.
 | `frame.pause` |  | Hold the simulation still. The scene still renders and can be queried; time and the frame counter stop. |
 | `frame.resume` |  | Let the simulation run again. |
 | `frame.step` | `count` | Pause, run exactly count frames, pause again. Answers with stepped_from and stepped. |
+| `physics.bodies` | `[region], [world]` | Every rigid body of the engine's physics (ae3d.physics), or those inside region ([x0, y0, z0, x1, y1, z1]): its object's name and id, its kind (dynamic, kinematic, static), position, velocity, whether it is awake, its mass and how many colliders it has; the first 256, with count and more. |
+| `physics.contacts` | `[object], [world]` | Every pair of bodies touching now, or those of one object: the two (their objects' names and ids, or ragdoll), how many points, where they touch (the points' middle), the normal, how deep and how hard (the step's normal impulse); each pair once; the first 256, with count and more. |
+| `physics.ray` | `origin, direction, [reach], [world]` | What a ray from origin along direction ([x, y, z] each) meets first within reach metres (100 by default), the static world too: whether it hit, the distance, the point, the normal, whether what it met is static, and its body's object. |
+| `nav.fields` |  | The walkers' flow fields the game put on the channel (ae3d.navagent.expose): each one's name and size in cells. |
+| `nav.path` | `from, to, [field]` | The walk between two places ([x, z] or [x, y, z]) over a field (the first by default): whether there is one, its cost in tenths of a cell (the flood's measure) and its corners, the cells' middles where it turns. A search of its own (nav.flow_path, A* by the flood's rule): the target the walkers steer by is left alone. |
 | `stream.cells` | `[stream]` | Every streamed world in the program (ae3d.stream), or the one at that place: its grid, its loading radius, margin and far radius, the bytes its cells hold now and the most they have, how many loads are in flight and how many cells within the radius are missing, and every cell that is not unloaded: where it is, its state (loading, leaving, loaded, attaching, resident) and its stand-in's, how far it is from the nearest focus, its models and how many times it has loaded. |
 | `net.stats` | `[session]` | Every multiplayer session in the program (ae3d.net), a host and its clients alike, or the one at that place: its role, its transport, the link it simulates, and for every peer the round trip and its jitter in microseconds and the loss in parts per million (ten pings a second each way), and the bytes a second each way by kind -- snapshots, events, inputs, acks, the link's pings, the transport's headers and its resends -- over the last second, and their totals; a host's peer adds its budget, its largest snapshot, its whole snapshots against its deltas, the most ticks a relevant object waited (in all, and in each sight: seen, out of view, occluded) and the bytes spent on what it could see; a client adds its snapshots and its prediction's corrections, the last and the worst, in micrometres. Every figure a whole number, the one ae3d.net measures. |
 | `net.set_link` | `latency, jitter, loss, [session]` | The link's simulated conditions: seconds of latency and up to seconds of jitter more, one way, and the share of datagrams (of unreliable messages, on the loopback) lost, as the editor's play sliders set them. On every session there is, or the one at that place: a UDP session's on what it sends, a loopback session's on its hub. TCP has none. Answers with each session's link as it now is. |
@@ -109,6 +125,101 @@ Read the same frame twice and the answer is the same.
 loop measures the round trip as much as the request.
 
 `snapshot` answers when the file is on disk, not when the request was accepted.
+
+## Running to a moment, and watching the way there
+
+An agent chasing a bug wants the frame where it happens, not a guess at
+how many frames to step. `frame.until` runs the game until an expression
+over its objects holds. It then holds at that frame and answers it, so
+whatever is asked next is about that moment:
+
+    frame.pause
+    watch.add expression="Player.Health.value" name=health   -> {"watch": 1}
+    frame.until expression="Player.Health.value < 50" timeout=600
+                                           -> {"met": true, "frame": 412, "value": 1, ...}
+    watch.get watch=1                      -> {"frames": [361, ..., 412], "values": [100, ..., 49]}
+
+An expression reads fields of components by object, kind and field name:
+`Player.Health.value`. An object can also be given as `'Enemy 2'` (quoted,
+for a name with a space) or by its id (`#12`), and a kind or field with a
+space in its name is quoted too: `'Street Lamp'.Light.'outer angle'`. An
+object's `position` has `.x`, `.y` and `.z`. A vector field without an
+axis is its length; a bool reads 1 or 0, and an enum its index. The
+expression combines these with numbers, `true`, `false` and `frame`, using
+`+ - * /`, `< <= > >= == !=`, `&& || !` and parentheses.
+
+A path that finds nothing (an object not spawned yet, a kind it does not
+carry, a misspelt field) is false, not 0. So `frame.until` waits for it,
+and a watch records `null` for that frame. A malformed expression is
+refused, and the error says where and what was expected:
+
+    frame.until expression="Player.position.x <"
+      -> error: the expression: at 20: expected a number, a path or '(', found the end
+
+Nothing asked after a `frame.until` is answered before it, as for
+`frame.step`. A watch keeps the last 4,096 frames it read. `watch.get`
+answers 1,024 at a time, with `more` and `next` (the frame to ask from) for
+the rest. `object.find` narrows the scene by part of a name, a tag and a
+component kind before any of this.
+
+## Changing a script while the game runs
+
+A script is a component compiled into a library (`docs/scripting.md`). The
+channel lists the ones a program opened, and swaps a rebuilt one under the
+objects that carry it, each keeping its fields by name:
+
+    script.list                            -> {"scripts": [{"name": "Talky", "library": "build/scripts/talky.dylib", "objects": 1}]}
+    script.reload name=Talky source=resources/scripts/talky.ae
+                                           -> {"reloaded": "Talky", "objects": 1}
+    log.tail count=5                       -> what the new code prints
+
+Given `source`, the script is built first (`scripts/build_script.sh`, or
+the build script `AE3D_SCRIPT_BUILD` names) into the library it runs from.
+A build that fails is refused with the compiler's own output, which
+`script.errors` also keeps, and the running code stays as it was:
+
+    script.reload name=Talky source=resources/scripts/talky.ae
+      -> error: error[E0100]: expected a value after `=`, found `}` ...
+
+A source whose file name is not the library's is refused too: it would
+build some other library, and the reload would pick up the old code.
+
+The rebuilt library is opened from a copy beside it (`talky.reload<pid>_<n>.so`),
+not from its own path. A loader hands back the library it already has
+open for a path, and the old one is still open while the states are
+swapped. The copy is deleted once it is open, or on Windows, where an
+open library cannot be deleted, when the script is closed.
+
+## The console
+
+While the channel is open, the program's console is kept: every line
+written to stdout and stderr, which covers every `println` and every
+engine warning. Each line carries the frame it was printed in (the
+`engine_frame_count` its script saw) and, for a line a script's phase
+printed, that object:
+
+    log.tail count=20
+      -> {"lines": [{"seq": 412, "frame": 96, "stream": "out",
+                     "object": {"id": 3, "name": "Player"}, "text": "jumped"}, ...],
+          "next": 431, "oldest": 1}
+    log.since seq=431                      -> the lines printed since
+
+The streams' file descriptors go to pipes, and a thread for each stream
+writes everything through to where it went before, so the terminal and CI
+logs see what they always did, a frame at a time. Two markers do the
+attributing, written into the streams themselves:
+
+- At each frame's end the engine writes a marker, so a line before it is
+  that frame's.
+- The behaviours mark each script phase that runs, into stdout's own
+  buffer, so a line between the marks is that object's. An object with no
+  script costs nothing.
+
+A write past the C streams (`io.stdout_write`) still gets its frame, but
+no object. At exit the streams are put back and the pipes drained, so a
+program's last lines reach the terminal. A crash puts them back before its
+stack trace. The last 4,096 lines are kept, and an answer carries at most
+1,024. `AE3D_CONSOLE=0` leaves the streams alone.
 
 ## Reading pixels
 
