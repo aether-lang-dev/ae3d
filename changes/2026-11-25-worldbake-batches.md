@@ -5,6 +5,9 @@
   world's. `bake` is the three in one. A cell takes its models from one
   batch: a later batch with a model in a cell already written is refused,
   since the file would lose the first batch's models.
+- A model off the grid was left out of the bake with nothing said. A
+  batch with one is now refused whole, naming the model and where it
+  stands, before anything is written.
 - `add` buckets the models by cell in one pass (a count, a running start,
   a place each), where it walked every model for every cell.
 - A texture's mean colour, which a stand-in is painted with, is read once
@@ -23,6 +26,7 @@
   about 60 cells and 220 MB at peak. The kit's road texture
   averages 0.2% albedo, so by day the road is lifted to dark asphalt.
 - `test_stream`: a world baked in two batches loads as one, and a second
-  batch into a cell already written is refused. 21 checks.
+  batch into a cell already written is refused, as is a batch with a model
+  off the grid. 23 checks.
 - README "Worlds" section and picture; `docs/streaming.md` covers baking
   in batches and the city.

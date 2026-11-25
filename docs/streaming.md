@@ -37,7 +37,9 @@ err = worldbake.finish(b)                  // world.json; b is freed
 Each batch's models are bucketed by cell and its cells written at once. A
 cell takes its models from one batch: a second batch with a model in a
 cell already written is refused, since the file would lose the first
-batch's. A texture's mean colour is read once for the whole bake.
+batch's. A batch with a model off the grid is refused whole, before
+anything is written, rather than baked without it. A texture's mean colour
+is read once for the whole bake.
 
 Each model goes into the cell its bounds' centre stands over. `flags`, an
 `int[]` beside the models or null, marks what each model is to the world
