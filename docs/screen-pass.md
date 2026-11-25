@@ -16,6 +16,20 @@ engine.engine_set_screen_pass(e, null, null)             // off; the shader stay
 gpu.shader_free(s)
 ```
 
+## Where in the frame
+
+`engine_set_screen_pass_rect(e, x, y, w, h)` draws the pass in a rectangle
+of the frame instead of the whole of it: `w` by `h` from (x, y), in the
+framebuffer's pixels from the top left (window points times
+`platform.window_content_scale`). The rest of the frame is the scene's and
+the clear colour's, with whatever the program draws over it: a panel of
+`ae3d.menu` sliders above the picture, say. The quad fills the rectangle,
+so the shader's `uv` runs across it, 0 to 1; `frag_coord()` stays the
+frame's. `uv`'s y runs down the rectangle on Vulkan and up on OpenGL, so a
+shader that measures from the top turns it over where `screen_y_sign()` is
+1. The Aether port of Chris Hinsley's Surface draws his shader this way, in
+the 640 x 480 rectangle under its sliders.
+
 ## The shader
 
 A `fragment(name) quote | uv: vec2 | { ... }`, as ae3d's own passes are
