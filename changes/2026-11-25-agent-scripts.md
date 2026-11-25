@@ -7,7 +7,8 @@
 - The build's stdout and stderr both go to a log that is read back. A
   capture of stdout alone took a failed build, whose compiler talks on
   stderr, for one with nothing to say, and reported it reloaded.
-- The rebuilt library is opened from a copy of its own. glibc's dlopen
+- The rebuilt library is opened from a copy of its own, named for the
+  process and the reload. glibc's dlopen
   hands back a library it already has open for that path, and the old
   one is open until the swap, so on Linux a reload ran the old code on
   (test_agent_script on the Linux runner: 0 lines of v2). The copy is

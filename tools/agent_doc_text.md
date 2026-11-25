@@ -116,7 +116,7 @@ A build that fails is refused with the compiler's own output, which
 A source whose file name is not the library's is refused too: it would
 build some other library, and the reload would pick up the old code.
 
-The rebuilt library is opened from a copy beside it (`talky.reload1.so`),
+The rebuilt library is opened from a copy beside it (`talky.reload<pid>_<n>.so`),
 not from its own path. A loader hands back the library it already has
 open for a path, and the old one is still open while the states are
 swapped. The copy is deleted once it is open, or on Windows, where an
