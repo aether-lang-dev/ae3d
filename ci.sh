@@ -145,7 +145,7 @@ GPU_SUITES="test_gpu_fxaa test_pick test_pick_crowd test_view test_engine_view t
     test_shading_knobs test_shadow_batches test_shadow_cascades test_sky_light
     test_shadows test_skinned_render test_ssr test_taa test_texture_swap
     test_trace test_velocity test_vk_fence_wait test_vk_mesh test_vk_msl test_weather
-    test_emissive test_hidden_size test_hud_hold test_agent_console test_agent_until test_agent_world test_instance_cull test_stream_drive test_texture_release test_vk_prepass test_vk_rings test_vk_stages"
+    test_emissive test_hidden_size test_hud_hold test_agent_console test_agent_script test_agent_until test_agent_world test_instance_cull test_stream_drive test_texture_release test_vk_prepass test_vk_rings test_vk_stages"
 suite_sources() {   # the suites this tier, and this shard of it, builds and runs
     turn=0
     for suite in tests/test_*.ae; do

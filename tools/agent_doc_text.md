@@ -94,6 +94,28 @@ answers 1,024 at a time, with `more` and `next` (the frame to ask from) for
 the rest. `object.find` narrows the scene by part of a name, a tag and a
 component kind before any of this.
 
+## Changing a script while the game runs
+
+A script is a component compiled into a library (`docs/scripting.md`). The
+channel lists the ones a program opened, and swaps a rebuilt one under the
+objects that carry it, each keeping its fields by name:
+
+    script.list                            -> {"scripts": [{"name": "Talky", "library": "build/scripts/talky.dylib", "objects": 1}]}
+    script.reload name=Talky source=resources/scripts/talky.ae
+                                           -> {"reloaded": "Talky", "objects": 1}
+    log.tail count=5                       -> what the new code prints
+
+Given `source`, the script is built first (`scripts/build_script.sh`, or
+the build script `AE3D_SCRIPT_BUILD` names) into the library it runs from.
+A build that fails is refused with the compiler's own output, which
+`script.errors` also keeps, and the running code stays as it was:
+
+    script.reload name=Talky source=resources/scripts/talky.ae
+      -> error: error[E0100]: expected a value after `=`, found `}` ...
+
+A source whose file name is not the library's is refused too: it would
+build some other library, and the reload would pick up the old code.
+
 ## The console
 
 While the channel is open, the program's console is kept: every line

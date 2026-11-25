@@ -58,6 +58,9 @@ interleaved with the first.
 | `input.set` | `[key], [mouse], [button], [axis], [value], [down], [cursor], [scroll], [clear]` | Press or release a key, mouse button or pad button, hold a pad axis at a value, put the cursor at [x, y] in window coordinates (held until clear), turn the wheel by scroll notches (read for one frame), or clear every injection: what the engine's input reads next frame beside the real devices. |
 | `input.get` |  | Every bound action with its state this frame: down, pressed, released, value. |
 | `light.set` | `[index], [position], [direction], [color], [intensity]` | Change a light. |
+| `script.list` |  | Every script the program opened (ae3d.script): its name, the library it runs from, how many objects carry it, and why its last build or reload failed, when it did. |
+| `script.reload` | `name, [source]` | The script opened again from its library and swapped under every object carrying it, each keeping its fields by name (a renamed field takes its default) and starting again on the next frame. With source, the source built first (scripts/build_script.sh, or AE3D_SCRIPT_BUILD) into the library the script runs from; a build that fails is refused with the compiler's output, and the running script is left as it was. |
+| `script.errors` |  | The scripts whose last build or reload failed, each with why: the compiler's output, or the reason the library was refused. |
 | `log.tail` | `[count]` | The program's console, the last count lines (100 by default, 1024 at most): every line it wrote to stdout and stderr, each with its seq, the frame it was printed in (the engine_frame_count its script saw), its stream (out or err) and, for a line a script's phase printed, the object (id and name); next, the seq to read on from with log.since, and oldest, the first still kept (the last 4096 are). Kept while the channel is open, unless AE3D_CONSOLE=0. |
 | `log.since` | `seq, [count]` | The console's lines after seq (0 for the oldest kept), up to count (100 by default, 1024 at most), as log.tail gives them, with more when there are others. |
 | `object.find` | `[name], [tag], [component]` | The objects whose name holds name, whose tag is tag and that carry a component of that kind -- whichever are given, together: index, id, name, tag, whether active and their components' kinds, the first 256, with count (how many there are) and more. |
@@ -158,6 +161,28 @@ Nothing asked after a `frame.until` is answered before it, as for
 answers 1,024 at a time, with `more` and `next` (the frame to ask from) for
 the rest. `object.find` narrows the scene by part of a name, a tag and a
 component kind before any of this.
+
+## Changing a script while the game runs
+
+A script is a component compiled into a library (`docs/scripting.md`). The
+channel lists the ones a program opened, and swaps a rebuilt one under the
+objects that carry it, each keeping its fields by name:
+
+    script.list                            -> {"scripts": [{"name": "Talky", "library": "build/scripts/talky.dylib", "objects": 1}]}
+    script.reload name=Talky source=resources/scripts/talky.ae
+                                           -> {"reloaded": "Talky", "objects": 1}
+    log.tail count=5                       -> what the new code prints
+
+Given `source`, the script is built first (`scripts/build_script.sh`, or
+the build script `AE3D_SCRIPT_BUILD` names) into the library it runs from.
+A build that fails is refused with the compiler's own output, which
+`script.errors` also keeps, and the running code stays as it was:
+
+    script.reload name=Talky source=resources/scripts/talky.ae
+      -> error: error[E0100]: expected a value after `=`, found `}` ...
+
+A source whose file name is not the library's is refused too: it would
+build some other library, and the reload would pick up the old code.
 
 ## The console
 
