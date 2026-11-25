@@ -1613,45 +1613,53 @@ not counted, as the shadow maps' are not.
 
 An instanced model used to be drawn whole: a prop kind laid over a whole
 map drew every copy, every frame. Now, once a stream has stood still for a
-frame, its copies are cut into clusters of about 32 copies that stand near
+frame, its copies are cut into clusters of about 8 copies that stand near
 one another (`geometry.inst_cluster`). The clusters are cells of a grid over
 the copies' places on the ground, taken in Morton order so that the
 clusters a view sees tend to sit side by side. Each cluster has the sphere
-its copies fit in. The stream is then sent once in that order, and the
+its copies fit in. The stream is then sent once in that order. The
 camera's opaque pass and its prepass draw only the runs of clusters that
-the frustum reaches (`core.instance_runs`). Past 16 runs, the runs with the
+the frustum reaches (`core.instance_runs`). Each shadow tile does the same
+with its own test (`core.instance_runs_by`): a sun cascade draws the
+clusters over its box, and a lamp's face the clusters it casts onto. These
+are the same tests that already culled whole casters. Past 16 runs, the runs with the
 smallest gaps between them are joined, so a scattered view costs a few
 draws.
 
 Measured on an M1 Pro, Vulkan, 1280x720 (`benchmarks/bench_instance_cull`):
 600 tiles of 16 m, each with a 3,200-triangle ground piece and four props
-of 5,000 triangles, with every kind one instanced model, and the camera
-over a corner. Each figure is the median of 40 frames, off and on in turns;
-three runs.
+of 5,000 triangles, with every kind one instanced model, the camera over a
+corner, and the sun's cascades out to 110 m. Each figure is the median of
+40 frames, off and on in turns; three runs.
 
-| | Scene pass | Triangles |
-|---|---|---|
-| Drawn whole | 28.5–29.7 ms | 13.92M |
-| Culled by cluster | 12.1–12.3 ms | 2.32M, in 5 runs |
+| | Scene pass | Shadow pass | Triangles (camera) |
+|---|---|---|---|
+| Drawn whole | 29.6–30.7 ms | 19.1–19.4 ms | 13.92M |
+| Culled by cluster | 7.4–7.8 ms | 1.9–2.6 ms | 1.35M, in 5 runs |
+
+At 32 copies a cluster the same view drew 2.32M triangles in the same five
+runs; 8 draws fewer of the hidden neighbours a view's edge cuts through,
+for a few more sphere tests a pass.
 
 What it leaves alone:
 - A copy keeps its index. A game's copy 7 is still copy 7, and a pick names
   the copy, not its place in cluster order (`core.pick_copy_of_place`).
 - A stream that changes is drawn whole, in its own order, until it is
-  still again. Clustering it again is one pass over its copies, 46 µs for
+  still again. Clustering it again is one pass over its copies, 55 µs for
   2,401.
 - Some streams are never clustered: crowds, points, what blends (its
-  copies' order is the order they blend in), and streams of fewer than 128
+  copies' order is the order they blend in), and streams of fewer than 32
   copies, where the extra draws would cost more than they save.
-- The shadow and pick passes draw a stream whole. On OpenGL 4.1, which has
-  no first instance to draw from, each run points the copies' attributes at
-  its first place.
+- The pick pass draws a stream whole: it reads which copy is under a pixel,
+  and the copy's place is turned back into the copy. On OpenGL 4.1, which
+  has no first instance to draw from, each run points the copies'
+  attributes at its first place.
 
 `tests/test_instance_cull.ae` checks that every copy is in exactly one
 cluster and inside its sphere, and that the runs hold every copy a view can
 see (on a corner view and a wide one). It also checks that the picture is
-the same with the culling as without it on both renderers, and that a pick
-names the copy the game set.
+the same with the culling as without it on both renderers, sun shadows
+included, and that a pick names the copy the game set.
 
 ### How long a texture is held
 

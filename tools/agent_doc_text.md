@@ -58,6 +58,101 @@ loop measures the round trip as much as the request.
 
 `snapshot` answers when the file is on disk, not when the request was accepted.
 
+## Running to a moment, and watching the way there
+
+An agent chasing a bug wants the frame where it happens, not a guess at
+how many frames to step. `frame.until` runs the game until an expression
+over its objects holds. It then holds at that frame and answers it, so
+whatever is asked next is about that moment:
+
+    frame.pause
+    watch.add expression="Player.Health.value" name=health   -> {"watch": 1}
+    frame.until expression="Player.Health.value < 50" timeout=600
+                                           -> {"met": true, "frame": 412, "value": 1, ...}
+    watch.get watch=1                      -> {"frames": [361, ..., 412], "values": [100, ..., 49]}
+
+An expression reads fields of components by object, kind and field name:
+`Player.Health.value`. An object can also be given as `'Enemy 2'` (quoted,
+for a name with a space) or by its id (`#12`), and a kind or field with a
+space in its name is quoted too: `'Street Lamp'.Light.'outer angle'`. An
+object's `position` has `.x`, `.y` and `.z`. A vector field without an
+axis is its length; a bool reads 1 or 0, and an enum its index. The
+expression combines these with numbers, `true`, `false` and `frame`, using
+`+ - * /`, `< <= > >= == !=`, `&& || !` and parentheses.
+
+A path that finds nothing (an object not spawned yet, a kind it does not
+carry, a misspelt field) is false, not 0. So `frame.until` waits for it,
+and a watch records `null` for that frame. A malformed expression is
+refused, and the error says where and what was expected:
+
+    frame.until expression="Player.position.x <"
+      -> error: the expression: at 20: expected a number, a path or '(', found the end
+
+Nothing asked after a `frame.until` is answered before it, as for
+`frame.step`. A watch keeps the last 4,096 frames it read. `watch.get`
+answers 1,024 at a time, with `more` and `next` (the frame to ask from) for
+the rest. `object.find` narrows the scene by part of a name, a tag and a
+component kind before any of this.
+
+## Changing a script while the game runs
+
+A script is a component compiled into a library (`docs/scripting.md`). The
+channel lists the ones a program opened, and swaps a rebuilt one under the
+objects that carry it, each keeping its fields by name:
+
+    script.list                            -> {"scripts": [{"name": "Talky", "library": "build/scripts/talky.dylib", "objects": 1}]}
+    script.reload name=Talky source=resources/scripts/talky.ae
+                                           -> {"reloaded": "Talky", "objects": 1}
+    log.tail count=5                       -> what the new code prints
+
+Given `source`, the script is built first (`scripts/build_script.sh`, or
+the build script `AE3D_SCRIPT_BUILD` names) into the library it runs from.
+A build that fails is refused with the compiler's own output, which
+`script.errors` also keeps, and the running code stays as it was:
+
+    script.reload name=Talky source=resources/scripts/talky.ae
+      -> error: error[E0100]: expected a value after `=`, found `}` ...
+
+A source whose file name is not the library's is refused too: it would
+build some other library, and the reload would pick up the old code.
+
+The rebuilt library is opened from a copy beside it (`talky.reload<pid>_<n>.so`),
+not from its own path. A loader hands back the library it already has
+open for a path, and the old one is still open while the states are
+swapped. The copy is deleted once it is open, or on Windows, where an
+open library cannot be deleted, when the script is closed.
+
+## The console
+
+While the channel is open, the program's console is kept: every line
+written to stdout and stderr, which covers every `println` and every
+engine warning. Each line carries the frame it was printed in (the
+`engine_frame_count` its script saw) and, for a line a script's phase
+printed, that object:
+
+    log.tail count=20
+      -> {"lines": [{"seq": 412, "frame": 96, "stream": "out",
+                     "object": {"id": 3, "name": "Player"}, "text": "jumped"}, ...],
+          "next": 431, "oldest": 1}
+    log.since seq=431                      -> the lines printed since
+
+The streams' file descriptors go to pipes, and a thread for each stream
+writes everything through to where it went before, so the terminal and CI
+logs see what they always did, a frame at a time. Two markers do the
+attributing, written into the streams themselves:
+
+- At each frame's end the engine writes a marker, so a line before it is
+  that frame's.
+- The behaviours mark each script phase that runs, into stdout's own
+  buffer, so a line between the marks is that object's. An object with no
+  script costs nothing.
+
+A write past the C streams (`io.stdout_write`) still gets its frame, but
+no object. At exit the streams are put back and the pipes drained, so a
+program's last lines reach the terminal. A crash puts them back before its
+stack trace. The last 4,096 lines are kept, and an answer carries at most
+1,024. `AE3D_CONSOLE=0` leaves the streams alone.
+
 ## Reading pixels
 
 `frame.capture` reads the finished frame into the engine; `frame.pixel` and

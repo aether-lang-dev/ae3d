@@ -31,8 +31,13 @@ static void ae3d_say(const char *text) {
     (void)written;
 }
 
+/* The console the agent channel keeps (console.c) holds stdout and stderr
+   in pipes; a crash puts them back before it says anything. */
+void ae3d_console_crash(void);
+
 static void ae3d_crash_handler(int sig) {
     void *frames[64];
+    ae3d_console_crash();
     int n = backtrace(frames, 64);
     char digit[2];
     digit[0] = (char)('0' + (sig % 10));
