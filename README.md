@@ -49,6 +49,7 @@ ae3d draws with Vulkan or OpenGL behind one scene API, simulates with a physics 
 - Ray-traced shadows and ambient occlusion through Vulkan ray queries, screen-space reflections, SSAO.
 - MSAA, TAA, DLSS and a spatial upscaler; HDR with bloom and ACES; depth of field; environment maps from HDR and EXR files.
 - A sky by the hour with volumetric clouds, weather (rain, snow, dust, storm), and a Gerstner sea with caustics.
+- Shaders written in Aether with `quote`, ae3d's own and a program's: a full-screen pass of the program's drawn over every frame on Vulkan and OpenGL ([screen pass](docs/screen-pass.md)).
 
 **Worlds** ([streaming](docs/streaming.md), [props by rule](docs/scatter.md))
 
