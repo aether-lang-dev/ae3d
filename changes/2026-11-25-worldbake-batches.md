@@ -27,6 +27,7 @@
   averages 0.2% albedo, so by day the road is lifted to dark asphalt.
 - `test_stream`: a world baked in two batches loads as one, and a second
   batch into a cell already written is refused, as is a batch with a model
-  off the grid. 23 checks.
+  off the grid. Settled, a stream holds its resident cells' geometry and
+  not their textures, to the byte. 24 checks.
 - README "Worlds" section and picture; `docs/streaming.md` covers baking
   in batches and the city.
