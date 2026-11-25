@@ -94,6 +94,37 @@ answers 1,024 at a time, with `more` and `next` (the frame to ask from) for
 the rest. `object.find` narrows the scene by part of a name, a tag and a
 component kind before any of this.
 
+## The console
+
+While the channel is open, the program's console is kept: every line
+written to stdout and stderr, which covers every `println` and every
+engine warning. Each line carries the frame it was printed in (the
+`engine_frame_count` its script saw) and, for a line a script's phase
+printed, that object:
+
+    log.tail count=20
+      -> {"lines": [{"seq": 412, "frame": 96, "stream": "out",
+                     "object": {"id": 3, "name": "Player"}, "text": "jumped"}, ...],
+          "next": 431, "oldest": 1}
+    log.since seq=431                      -> the lines printed since
+
+The streams' file descriptors go to pipes, and a thread for each stream
+writes everything through to where it went before, so the terminal and CI
+logs see what they always did, a frame at a time. Two markers do the
+attributing, written into the streams themselves:
+
+- At each frame's end the engine writes a marker, so a line before it is
+  that frame's.
+- The behaviours mark each script phase that runs, into stdout's own
+  buffer, so a line between the marks is that object's. An object with no
+  script costs nothing.
+
+A write past the C streams (`io.stdout_write`) still gets its frame, but
+no object. At exit the streams are put back and the pipes drained, so a
+program's last lines reach the terminal. A crash puts them back before its
+stack trace. The last 4,096 lines are kept, and an answer carries at most
+1,024. `AE3D_CONSOLE=0` leaves the streams alone.
+
 ## Reading pixels
 
 `frame.capture` reads the finished frame into the engine; `frame.pixel` and

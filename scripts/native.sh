@@ -353,7 +353,7 @@ ae3d_dlss_source() {
 #
 #   ae3d_native_sources <object directory> <aephysics root>
 ae3d_native_sources() {
-    list="native/platform/crash.c"
+    list="native/platform/crash.c native/platform/console.c"
     list="$list $(ae3d_dlss_source "$1") $2/aephysics/native/aephysics_native.c"
     if [ "$(uname -s)" = "Darwin" ]; then
         list="$list native/platform/metal_surface.m"

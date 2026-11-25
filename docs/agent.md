@@ -58,6 +58,8 @@ interleaved with the first.
 | `input.set` | `[key], [mouse], [button], [axis], [value], [down], [cursor], [scroll], [clear]` | Press or release a key, mouse button or pad button, hold a pad axis at a value, put the cursor at [x, y] in window coordinates (held until clear), turn the wheel by scroll notches (read for one frame), or clear every injection: what the engine's input reads next frame beside the real devices. |
 | `input.get` |  | Every bound action with its state this frame: down, pressed, released, value. |
 | `light.set` | `[index], [position], [direction], [color], [intensity]` | Change a light. |
+| `log.tail` | `[count]` | The program's console, the last count lines (100 by default, 1024 at most): every line it wrote to stdout and stderr, each with its seq, the frame it was printed in (the engine_frame_count its script saw), its stream (out or err) and, for a line a script's phase printed, the object (id and name); next, the seq to read on from with log.since, and oldest, the first still kept (the last 4096 are). Kept while the channel is open, unless AE3D_CONSOLE=0. |
+| `log.since` | `seq, [count]` | The console's lines after seq (0 for the oldest kept), up to count (100 by default, 1024 at most), as log.tail gives them, with more when there are others. |
 | `object.find` | `[name], [tag], [component]` | The objects whose name holds name, whose tag is tag and that carry a component of that kind -- whichever are given, together: index, id, name, tag, whether active and their components' kinds, the first 256, with count (how many there are) and more. |
 | `frame.until` | `expression, [timeout]` | Run frame by frame until the expression holds, then hold at that frame and answer it (frame.stats with met, the value, from and frames), or after timeout frames (600 by default) with met false. The expression reads the game's objects: Player.Health.value < 50, 'Enemy 2'.position.y < -10 \|\| frame > 900, #12.Rigidbody.velocity.x >= 3 (an object by name, quoted name or id; a component kind and field, quoted where the name has a space; position; an axis x, y, z or w; numbers, true, false, frame; + - * / < <= > >= == != && \|\| ! and parentheses). A path with nothing there is false, not 0. A malformed expression is refused saying where and what was expected. Nothing asked after it is answered before it. |
 | `watch.add` | `expression, [name]` | Read the expression at every frame the world moves, the last 4096 frames kept. Answers the watch's number. The expression is frame.until's. |
@@ -156,6 +158,37 @@ Nothing asked after a `frame.until` is answered before it, as for
 answers 1,024 at a time, with `more` and `next` (the frame to ask from) for
 the rest. `object.find` narrows the scene by part of a name, a tag and a
 component kind before any of this.
+
+## The console
+
+While the channel is open, the program's console is kept: every line
+written to stdout and stderr, which covers every `println` and every
+engine warning. Each line carries the frame it was printed in (the
+`engine_frame_count` its script saw) and, for a line a script's phase
+printed, that object:
+
+    log.tail count=20
+      -> {"lines": [{"seq": 412, "frame": 96, "stream": "out",
+                     "object": {"id": 3, "name": "Player"}, "text": "jumped"}, ...],
+          "next": 431, "oldest": 1}
+    log.since seq=431                      -> the lines printed since
+
+The streams' file descriptors go to pipes, and a thread for each stream
+writes everything through to where it went before, so the terminal and CI
+logs see what they always did, a frame at a time. Two markers do the
+attributing, written into the streams themselves:
+
+- At each frame's end the engine writes a marker, so a line before it is
+  that frame's.
+- The behaviours mark each script phase that runs, into stdout's own
+  buffer, so a line between the marks is that object's. An object with no
+  script costs nothing.
+
+A write past the C streams (`io.stdout_write`) still gets its frame, but
+no object. At exit the streams are put back and the pipes drained, so a
+program's last lines reach the terminal. A crash puts them back before its
+stack trace. The last 4,096 lines are kept, and an answer carries at most
+1,024. `AE3D_CONSOLE=0` leaves the streams alone.
 
 ## Reading pixels
 
