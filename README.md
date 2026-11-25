@@ -14,7 +14,12 @@ ae3d draws with Vulkan or OpenGL behind one scene API, simulates with a physics 
 ## Why ae3d
 
 - **Every claim is a number.** Each feature ships with a test that measures it on the frame or the simulation, and scenes are judged from a sweep of camera positions, not one flattering still ([testing](docs/testing.md)).
-- **Programs drive it.** `AE3D_AGENT=port` opens a JSON channel: change the scene, hold a frame, read its pixels, trace a model from its Blender object to the pixels it landed on ([agent channel](docs/agent.md)).
+- **Programs drive it.** `AE3D_AGENT=port` opens a JSON channel. Through it a program or an AI agent can:
+  - change the scene, hold a frame, read its pixels, and trace a model from its Blender object to the pixels it landed on;
+  - run the game until a condition holds (`frame.until "Player.Health.value < 50"`) and watch a value on the way there;
+  - read the console with each line's frame and object;
+  - ask the physics what touches what and the navigation how to walk from here to there;
+  - rebuild a script and swap it into the running game, hearing the compiler's errors when it fails ([agent channel](docs/agent.md)).
 - **One language, top to bottom.** The loop, the renderers, the physics and the crowd's kernels are Aether. The C that remains is listed with a reason for each ([native/README.md](native/README.md)).
 - **Two renderers, one interface.** Vulkan by default and OpenGL at parity; one test draws the same scene through both and holds them within 0.7% of channels. DirectX 12 and Metal are next on the same interface.
 
@@ -44,6 +49,16 @@ ae3d draws with Vulkan or OpenGL behind one scene API, simulates with a physics 
 - Ray-traced shadows and ambient occlusion through Vulkan ray queries, screen-space reflections, SSAO.
 - MSAA, TAA, DLSS and a spatial upscaler; HDR with bloom and ACES; depth of field; environment maps from HDR and EXR files.
 - A sky by the hour with volumetric clouds, weather (rain, snow, dust, storm), and a Gerstner sea with caustics.
+
+**Worlds** ([streaming](docs/streaming.md), [props by rule](docs/scatter.md))
+
+![A city of brick terraces from above in the late afternoon, looking down its middle street: damp roads catch the sky, lit windows near the camera, block after block on both sides into the haze](docs/images/open-world.jpg)
+
+<sub>`examples/open_world` with `AE3D_CITY=16x12`: the street's block laid out as a city of 192 blocks (1.3 by 0.5 km, 36,879 models), baked into 372 cells and streamed around the camera. The near cells are the block as modelled. Past 150 m each cell is a stand-in, out to 1.4 km: one simplified model with its textures' colours baked in. An unedited Vulkan frame.</sub>
+
+- **Larger than memory.** A world is cut into cells, each with a far stand-in. Cells load on worker threads around the camera and every player and attach within a per-frame budget. Their colliders and walkers' blockers come and go with them. A 30 m/s drive never finds a near cell missing, and streaming adds under 2 ms to the 99th-percentile frame of one with everything loaded.
+- **Props by rule.** Street clutter, vegetation and debris are placed from tagged areas, roads, slopes and spacing, the same from a seed on every machine, with one instanced draw per prop.
+- **Copies culled by cluster.** A prop laid over a whole map is cut into clusters of nearby copies. Each camera and shadow tile draws only the clusters it reaches. At 600 tiles the scene pass falls from 30 ms to 7.6 ms and the shadows from 19 ms to 2.2 ms.
 
 **Physics** ([docs](docs/physics.md))
 - [aephysics](https://github.com/aether-lang-dev/aephysics), a rigid body engine on Box3D's design written in Aether: hulls, meshes, every joint, ragdolls that wear a skinned figure, vehicles, continuous collision, and a parallel step identical to the bit at any thread count.
@@ -179,6 +194,7 @@ How the loop, the behaviours, the renderers and the job pool fit together is in 
 | `people` | A person made in one call (`ae3d.character`): WASD walks it, E sits it on a log, the right mouse aims its pistol. |
 | `street_drive` | Drive the street, then press E and walk it first person on a character controller. |
 | `zombie_city` | The street instanced into a city and a horde hunting the camera; `AE3D_CROWD` sets the count. |
+| `open_world` | The street baked into a city of cells and streamed around a car driving it; `AE3D_CITY=16x12` the large city, `AE3D_VIEW=aerial` flies over the roofs, `AE3D_PERF=1` says what is held. |
 | `net_walk`, `net_cars` | Multiplayer: `./build/net_walk` hosts, `AE3D_NET=join:127.0.0.1 ./build/net_walk` joins. |
 | `gltf_crowd`, `gltf_viewer` | Any glTF figure as a horde, or on a floor playing one of its animations. |
 | `physics` | The reference scenes: `AE3D_PHYSICS_SCENE=pyramid`, `pile`, `ragdolls` or `cloth`. |
@@ -227,6 +243,9 @@ docs/         the documentation, docs/images/ its pictures
 [Crowds](docs/crowds.md) ·
 [Networking](docs/networking.md) ·
 [Pipeline](docs/pipeline.md) ·
+[Streaming](docs/streaming.md) ·
+[Props by rule](docs/scatter.md) ·
+[Scenes in code](docs/scenes-in-code.md) ·
 [Agent channel](docs/agent.md) ·
 [Audio](docs/audio.md) ·
 [Editor](docs/editor.md) ·

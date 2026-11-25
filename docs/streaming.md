@@ -5,11 +5,39 @@ scene into a grid of cells, each with a cell file and a far stand-in.
 `ae3d.stream` then loads the cells around the camera and the players and
 lets them go once they are behind.
 
+![A city of brick terraces from above in the late afternoon, looking down its middle street: damp roads catch the sky, block after block on both sides into the haze](images/open-world.jpg)
+
+`examples/open_world` lays the street's block out as a city, scatters the
+kit's props along every pavement, bakes it into cells of 44 m, and streams
+it around a car driving the middle street. The near cells are the block as
+modelled; past 150 m each is its stand-in, out to 1.4 km. With
+`AE3D_CITY=16x12`, the city above, it is 192 blocks (1,344 by 528 m):
+36,879 models, 5.2 million triangles as modelled and 2.5 million in the
+stand-ins, in 372 cells. It is built a row of blocks at a time and each row
+baked as it is built (`worldbake.begin`, `add`, `finish`), so the program
+holds one row's models and not the city's. Building and baking take 34 s,
+10 s of that the bake, at 274 MB peak resident (M1 Pro). The stream holds
+about 60 cells and 220 MB at its peak.
+
 ## Baking
 
 ```
 err = worldbake.bake(models, flags, 64.0, x0, z0, nx, nz, "build/world/")
 ```
+
+A world too large to build whole is baked in batches:
+
+```
+b = worldbake.begin(64.0, x0, z0, nx, nz, "build/world/")
+...for each part of the world
+err = worldbake.add(b, models, flags)      // its cells written, the models the caller's to free
+err = worldbake.finish(b)                  // world.json; b is freed
+```
+
+Each batch's models are bucketed by cell and its cells written at once. A
+cell takes its models from one batch: a second batch with a model in a
+cell already written is refused, since the file would lose the first
+batch's. A texture's mean colour is read once for the whole bake.
 
 Each model goes into the cell its bounds' centre stands over. `flags`, an
 `int[]` beside the models or null, marks what each model is to the world
@@ -111,9 +139,10 @@ streamed from a standing start.
 
 ### What it holds
 
-`resident_bytes` and `peak_bytes` count what the cells' decodes made: their
-geometry, and the textures they decoded. A cell counts from the moment it
-arrives until it is freed. `missing(st, metres)` counts the cells within
+`resident_bytes` and `peak_bytes` count what the cells' decodes made. A
+cell's geometry counts from the moment it arrives until it is freed. Its
+decoded textures count only until it is resident, when they become the
+renderer's (or are let go, the renderer holding them already). `missing(st, metres)` counts the cells within
 that distance of a focus that are not resident.
 
 A load takes time. The radius should be the distance a cell must be ready
