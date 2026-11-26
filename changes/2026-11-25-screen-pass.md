@@ -21,8 +21,8 @@
 - `examples/screen_pass.ae`, with `tools/screen_pass_spirv.ae` and the
   module it writes: the same picture on Vulkan and OpenGL, every pixel of
   576,000. `docs/screen-pass.md`.
-- Found by the Aether port of Chris Hinsley's Raymarch, which draws his
-  film shader this way: 44 of 360,000 pixels more than 1/255 from his own
-  native code's frame on Vulkan, 46 on OpenGL (M6). The port of his Surface
-  draws in a rectangle under its sliders: 163 of 307,200 on Vulkan, 143 on
+- Checked by a program of its own that draws a raymarched film this way,
+  against reference frames drawn by another renderer: 34 of 360,000 pixels
+  more than 1/255 from them on Vulkan, 36 on OpenGL (M6). Another, a
+  raymarcher, draws in a rectangle under its sliders: 111 of 307,200 on Vulkan, 87 on
   OpenGL.
