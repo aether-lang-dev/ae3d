@@ -80,7 +80,7 @@ exports (
     offscreen_width, offscreen_height, draw, draw_range, set_additive, draw_indirect, draw_cut, draw_pulled, draw_sky, cloud_pass, sky_capture_pass, set_screen_quad, set_blend, set_normal_map, set_emissive_map, set_pose_bank, set_damage_mask,
     set_face_culling, set_shadows, shadows, shadow_begin, shadow_draw, shadow_end, shadow_viewport, shadow_done,
     lamp_shadow_begin, lamp_shadow_tile, lamp_static_begin, lamp_copy, lamp_shadow_generation,
-    clusters_reserve, clusters_lights, clusters_words, set_post, set_screen_pass, set_screen_pass_rect, post_active, set_frame_exposure, frame_exposure, composited, quoted_screen_pass,
+    clusters_reserve, clusters_lights, clusters_words, set_post, set_screen_pass, set_screen_pass_rect, queue_screen_draw, clear_screen_draws, post_active, set_frame_exposure, frame_exposure, composited, quoted_screen_pass,
     set_bloom_intensity, bloom_intensity, draw_calls, pass_ms, pipeline_binds, set_binds, sample_count,
     set_samples, set_scene_depth, scene_depth_ready, resolve_scene_depth, velocity_texture, set_render_scale,
     set_upscaler, upscaler, upscale_targets, upscale_sharpness, set_dof, dof, dof_focus, dof_aperture, dof_max_radius,
@@ -249,6 +249,15 @@ var g_program_x = 0
 var g_program_y = 0
 var g_program_w = 0
 var g_program_h = 0
+// A program's queued draws (queue_screen_draw), drawn in their order over
+// every frame after its screen pass until they are cleared: a raw array of
+// *ScreenDraw, and the passes they draw with, one a shader's SPIR-V, made
+// as they are first wanted and kept (a raw array of *DrawPass).
+var g_draws: ptr = null
+var g_draw_count = 0
+var g_draw_room = 0
+var g_draw_passes: ptr = null
+var g_draw_pass_count = 0
 // The bloom's down pass, written with quote (ae3d.shaders.bloom): one
 // shader, its texel and level set before each draw, the SSR's two blurs and
 // the pyramid's levels drawn from one ring of sets.
@@ -1008,6 +1017,7 @@ shutdown() {
     g_fxaa_pass = null
     vkquote.pass_free(g_program_pass as *QuotedPass)
     g_program_pass = null
+    free_screen_draws()
     vkquote.pass_free(g_easu_pass as *QuotedPass)
     g_easu_pass = null
     vkquote.pass_free(g_rcas_pass as *QuotedPass)
@@ -1212,6 +1222,16 @@ viewport_at(x: int, y: int, w: int, h: int) {
     v.minDepth = 0.0
     v.maxDepth = 1.0
     vk.vkCmdSetViewport(commands_now(), 0, 1, g_viewport)
+    s = g_scissor as *VkRect2D
+    s.offset.x = x
+    s.offset.y = y
+    s.extent.width = w
+    s.extent.height = h
+    vk.vkCmdSetScissor(commands_now(), 0, 1, g_scissor)
+}
+
+// The scissor alone, `w` by `h` from (x, y), none of it off the frame.
+scissor_at(x: int, y: int, w: int, h: int) {
     s = g_scissor as *VkRect2D
     s.offset.x = x
     s.offset.y = y
@@ -2959,6 +2979,7 @@ draw_composite(source: int, bloom: int, dof_texture: int) {
     }
     if !fxaa {
         draw_program_pass(fw, fh)
+        draw_screen_draws(fw, fh)
         draw_view_blits()
     }
     vk.vkCmdEndRenderPass(commands)
@@ -2977,6 +2998,7 @@ draw_composite(source: int, bloom: int, dof_texture: int) {
     ldr = vktargets.ldr_texture()
     draw_quoted(g_fxaa_pass as *QuotedPass, 0, vktexture.view(ldr), vktexture.sampler_of(ldr))
     draw_program_pass(fw, fh)
+    draw_screen_draws(fw, fh)
     draw_view_blits()
     vk.vkCmdEndRenderPass(commands)
     vkhost.set_pass_open(false)
@@ -3015,7 +3037,7 @@ draw_program_pass(fw: int, fh: int) {
     if g_program_shader == null || g_program_spirv == null || g_program_failed { return }
     if g_program_pass == null {
         g_program_pass = vkquote.program_pass_new(g_program_shader as *GpuShader, g_program_spirv as *QuotedSpirv,
-                                                  vktargets.post_pass(), 1) as ptr
+                                                  vktargets.post_pass(), 1, 0) as ptr
         if g_program_pass == null {
             io.stderr_write("ae3d: the program's screen pass ${gpu.shader_name(g_program_shader as *GpuShader)} could not be made\n")
             g_program_failed = true
@@ -3029,6 +3051,202 @@ draw_program_pass(fw: int, fh: int) {
     } else {
         draw_quoted_with(g_program_pass as *QuotedPass, 0)
     }
+}
+
+// One of a program's queued draws: its SPIR-V, which pass of
+// g_draw_passes draws it, where in the frame it is and what it is cut to,
+// in pixels from the top left, and its pixel shader's block as it was
+// queued (gpu.params_write), which it owns.
+struct ScreenDraw {
+    pass: int
+    x: int
+    y: int
+    w: int
+    h: int
+    cx: int
+    cy: int
+    cw: int
+    ch: int
+    params: ptr
+}
+
+// A pass a program's queued draws are drawn with: the SPIR-V it is made
+// from, the shader it was first queued with (for its name and its block's
+// size), the pass once made, and whether it would not make.
+struct DrawPass {
+    spirv: ptr
+    shader: ptr
+    pass: ptr
+    failed: bool
+}
+
+// The pass of g_draw_passes for `spirv`, added if it has none.
+fn draw_pass_of(s: *GpuShader, spirv: *QuotedSpirv) -> int {
+    k = 0
+    while k < g_draw_pass_count {
+        d = (g_draw_passes as ptr[])[k] as *DrawPass
+        if d.spirv == spirv as ptr { return k }
+        k = k + 1
+    }
+    // Its tree checked once, as the pass is first wanted.
+    vkquote.stale(s, spirv.hash, "the program's (ae3d.quotegen)", "build and run the program's generator, the one that calls quotegen.add for it")
+    grown = calloc(g_draw_pass_count + 1, 8)
+    if g_draw_pass_count > 0 { _m = memcpy(grown, g_draw_passes, g_draw_pass_count * 8) }
+    free(g_draw_passes)
+    g_draw_passes = grown
+    d = calloc(1, sizeof(DrawPass)) as *DrawPass
+    d.spirv = spirv as ptr
+    d.shader = s as ptr
+    d.pass = null
+    d.failed = false
+    (g_draw_passes as ptr[])[g_draw_pass_count] = d as ptr
+    g_draw_pass_count = g_draw_pass_count + 1
+    return g_draw_pass_count - 1
+}
+
+// A draw of the program's quoted shader `s` (its SPIR-V `spirv`, made at
+// the program's build by ae3d.quotegen) over every frame from the next, in
+// the rectangle `w` by `h` from (x, y), cut to the rectangle `cw` by `ch`
+// from (cx, cy) (0 wide: the frame), in pixels from the top left, after its
+// screen pass and the draws queued before it, blended over what is there as
+// a premultiplied colour is. Its inputs are the shader's as they are now:
+// the program may set them again and queue another. The shader stays the
+// program's; a tree hashing otherwise than its SPIR-V ends the program, as
+// one of ae3d's own does.
+queue_screen_draw(s: *GpuShader, spirv: *QuotedSpirv, x: int, y: int, w: int, h: int, cx: int, cy: int, cw: int, ch: int) {
+    if s == null || spirv == null || w <= 0 || h <= 0 { return }
+    if g_draw_count == g_draw_room {
+        room = g_draw_room * 2
+        if room < 64 { room = 64 }
+        grown = calloc(room, 8)
+        if g_draw_count > 0 { _m = memcpy(grown, g_draws, g_draw_count * 8) }
+        free(g_draws)
+        g_draws = grown
+        g_draw_room = room
+    }
+    d = calloc(1, sizeof(ScreenDraw)) as *ScreenDraw
+    d.pass = draw_pass_of(s, spirv)
+    d.x = x
+    d.y = y
+    d.w = w
+    d.h = h
+    d.cx = cx
+    d.cy = cy
+    d.cw = cw
+    d.ch = ch
+    d.params = calloc(1, gpu.params_size(s) + 16)
+    gpu.params_write(s, d.params)
+    (g_draws as ptr[])[g_draw_count] = d as ptr
+    g_draw_count = g_draw_count + 1
+}
+
+// The program's queued draws taken off; their passes are kept for the next.
+clear_screen_draws() {
+    k = 0
+    while k < g_draw_count {
+        d = (g_draws as ptr[])[k] as *ScreenDraw
+        free(d.params)
+        free(d as ptr)
+        k = k + 1
+    }
+    g_draw_count = 0
+}
+
+fn free_screen_draws() {
+    clear_screen_draws()
+    free(g_draws)
+    g_draws = null
+    g_draw_room = 0
+    k = 0
+    while k < g_draw_pass_count {
+        d = (g_draw_passes as ptr[])[k] as *DrawPass
+        vkquote.pass_free(d.pass as *QuotedPass)
+        free(d as ptr)
+        k = k + 1
+    }
+    free(g_draw_passes)
+    g_draw_passes = null
+    g_draw_pass_count = 0
+}
+
+// The pass of `d` with room for `wanted` draws a frame, made again bigger
+// (the device idle first) when it has less.
+fn draw_pass_ready(d: *DrawPass, wanted: int) -> bool {
+    if d.failed { return false }
+    if d.pass != null && vkquote.draws_of(d.pass as *QuotedPass) >= wanted { return true }
+    room = 16
+    if d.pass != null {
+        room = vkquote.draws_of(d.pass as *QuotedPass) * 2
+        vk.vkDeviceWaitIdle(vkdevice.device())
+        vkquote.pass_free(d.pass as *QuotedPass)
+        d.pass = null
+    }
+    while room < wanted { room = room * 2 }
+    d.pass = vkquote.program_pass_new(d.shader as *GpuShader, d.spirv as *QuotedSpirv, vktargets.post_pass(), room,
+                                      vkpipes.BLEND_PREMULTIPLIED) as ptr
+    if d.pass == null {
+        io.stderr_write("ae3d: the program's draws of ${gpu.shader_name(d.shader as *GpuShader)} could not be made\n")
+        d.failed = true
+        return false
+    }
+    return true
+}
+
+// The program's queued draws, in their order, over a frame `fw` by `fh`:
+// each one's quad in its rectangle and cut to its clip and the frame.
+draw_screen_draws(fw: int, fh: int) {
+    if g_draw_count == 0 { return }
+    // How many draws each pass has this frame, so each has the room.
+    counts = calloc(g_draw_pass_count + 1, 8)
+    k = 0
+    while k < g_draw_count {
+        d = (g_draws as ptr[])[k] as *ScreenDraw
+        (counts as int[])[d.pass] = (counts as int[])[d.pass] + 1
+        k = k + 1
+    }
+    k = 0
+    while k < g_draw_pass_count {
+        n = (counts as int[])[k]
+        if n > 0 { _r = draw_pass_ready((g_draw_passes as ptr[])[k] as *DrawPass, n) }
+        (counts as int[])[k] = 0
+        k = k + 1
+    }
+    k = 0
+    while k < g_draw_count {
+        d = (g_draws as ptr[])[k] as *ScreenDraw
+        dp = (g_draw_passes as ptr[])[d.pass] as *DrawPass
+        at = (counts as int[])[d.pass]
+        (counts as int[])[d.pass] = at + 1
+        // What is drawn: the rectangle cut to the clip and to the frame.
+        x0 = max_int(d.x, 0)
+        y0 = max_int(d.y, 0)
+        x1 = min_int(d.x + d.w, fw)
+        y1 = min_int(d.y + d.h, fh)
+        if d.cw > 0 && d.ch > 0 {
+            x0 = max_int(x0, d.cx)
+            y0 = max_int(y0, d.cy)
+            x1 = min_int(x1, d.cx + d.cw)
+            y1 = min_int(y1, d.cy + d.ch)
+        }
+        if dp.pass != null && x1 > x0 && y1 > y0 {
+            viewport_at(d.x, d.y, d.w, d.h)
+            scissor_at(x0, y0, x1 - x0, y1 - y0)
+            draw_quoted_params(dp.pass as *QuotedPass, at, d.params)
+        }
+        k = k + 1
+    }
+    free(counts)
+    viewport(fw, fh)
+}
+
+fn min_int(a: int, b: int) -> int {
+    if a < b { return a }
+    return b
+}
+
+fn max_int(a: int, b: int) -> int {
+    if a > b { return a }
+    return b
 }
 
 // FXAA for a frame `w` by `h`: its texel one pixel of that, and the
@@ -3092,9 +3310,15 @@ quoted_cells() {
 // scene's draws alone, on both renderers (docs/rendering.md, "What a frame's
 // draw count is").
 draw_quoted_with(p: *QuotedPass, draw: int) {
+    draw_quoted_params(p, draw, null)
+}
+
+// The same with the pixel shader's block `params` as a program queued it
+// (vkquote.prepare_with); null is the captures' values now.
+draw_quoted_params(p: *QuotedPass, draw: int, params: ptr) {
     if p == null || !vkmesh.drawable(g_screen_quad) || vkmesh.index_count(g_screen_quad) == 0 { return }
     if vkquote.textures(p) > QUOTED_TEXTURES { return }
-    set = vkquote.prepare(p, g_frame, draw, g_quoted_views, g_quoted_samplers)
+    set = vkquote.prepare_with(p, g_frame, draw, g_quoted_views, g_quoted_samplers, params)
     if set == null { return }
     bind_pipeline(vkquote.pipeline(p))
     (g_set_cell as ptr[])[0] = set
