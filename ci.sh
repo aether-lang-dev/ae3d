@@ -289,6 +289,16 @@ suite_failure() {   # suite_failure <output>
     printf '%s\n' "$quiet" | sed 's/^/        /' | tail -12
 }
 
+# The lines a suite asks the log to keep, passing or failing: each one
+# beginning "ci: ", the measure a check is held to beside its bound. A
+# failing suite's own lines are its FAIL lines and its last ones, and a
+# passing suite's none, so how near a bound a check sits was never in a
+# log: test_backend_parity's "two lights" failed two runs in three on
+# llvmpipe with nothing to say by how much (#1101).
+suite_notes() {   # suite_notes <output>
+    printf '%s\n' "$1" | grep -E '^ci: ' | sed 's/^ci: /        | /'
+}
+
 # A crash on a headless runner leaves only "died on signal 11". When the status
 # is a signal and gdb is present, run the program again under it and print the
 # native stack, so the log names the frame that fell over instead of a core
@@ -742,6 +752,7 @@ for suite in $SUITES; do
         fail "$name"
         suite_failure "$output"
     fi
+    suite_notes "$output"
 done
 
 fi
@@ -785,6 +796,7 @@ for name in test_fog test_overlay test_hud_layout test_damage test_backend_parit
     else
         skip "$name under the layer" "$(printf '%s' "$output" | grep -m1 "SKIP" | sed 's/.*SKIP *//')"
     fi
+    suite_notes "$output"
 done
 
 fi

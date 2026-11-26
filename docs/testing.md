@@ -20,6 +20,12 @@ new one is that it says what it measured and what it wanted, in numbers:
 physics: all checks passed (240 fixed steps)
 ```
 
+`ci.sh` prints a failing suite's FAIL lines and its last lines, and a
+passing one's name alone. A line a suite begins with `ci: ` is printed
+under its name either way: the measure a check is held to and its bound,
+so a log says how near the bound a check passed and by how much it
+failed (`test_backend_parity` prints every frame comparison so, #1101).
+
 Most suites are headless: the math, the loaders, the ECS, the horde, the
 flow field, the pose bank, the physics, the scene files, the undo history,
 the input, the agent protocol. The rendering suites draw through the
