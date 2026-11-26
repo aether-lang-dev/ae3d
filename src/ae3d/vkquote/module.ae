@@ -64,18 +64,19 @@ import ae3d.vkdesc
 import ae3d.vkdevice
 import ae3d.vkpipes
 import ae3d.gpu
-import ae3d.gpu (GpuShader)
+import ae3d.gpu (GpuShader, QuotedSpirv)
 import std.io
 
 exports (
-    QuotedPass, pass_new, pair_new, mesh_pair_new, mesh_pipeline, pass_free, set_shader, shader, vertex_shader, vertex_set, prepare, pipeline, layout,
-    textures, set_image_layout, fresh,
+    QuotedPass, pass_new, program_pass_new, program_pair_new, prepare_with, draws_of, stale_pair, pair_new, mesh_pair_new, mesh_pipeline, pass_free, set_shader, shader, vertex_shader, vertex_set, prepare, pipeline, layout,
+    textures, set_image_layout, fresh, stale,
     VertexRing, vertex_ring_new, ring_pipeline, ring_frame, ring_bind, ring_shader, ring_layout, vertex_ring_free
 )
 
 extern calloc(count: int, size: int) -> ptr
 extern free(p: ptr)
 extern exit(code: int)
+extern memcpy(dst: ptr, src: ptr, n: long) -> ptr
 
 struct QuotedPass {
     shader: ptr           // *gpu.GpuShader, the pass's
@@ -101,6 +102,7 @@ struct QuotedPass {
     vsize: int            // the VertexParams block's bytes
     culled: ptr           // a mesh pair's: opaque with back faces culled; null otherwise
     blended: ptr          // a mesh pair's: alpha-blended, depth-tested and not written
+    borrowed: bool        // a program's pass: its shader is the program's, never freed here
 }
 
 // The pass of `s` (which it then owns) drawn into `render_pass` up to
@@ -132,6 +134,109 @@ pass_new(s: *GpuShader, vert: int, frag: int, hash: long, render_pass: @keep ptr
         return null
     }
     if !make_pipeline(p, vert, frag, render_pass, gpu.writes_depth(s), gpu.writes_depth(s)) {
+        pass_free(p)
+        return null
+    }
+    return p
+}
+
+// A program's own screen pass: its quoted shader `s`, which it borrows (the
+// program sets its captures, gpu.set_float and the rest, and frees it after
+// the pass), drawn into `render_pass` up to `draws` times a frame with the
+// SPIR-V of `spirv` (ae3d.quotegen's, made at the program's build from a
+// tree hashing to spirv.hash: a tree hashing otherwise ends the program, as
+// one of ae3d's own does), blended as vkpipes' `blend` says (0, written as
+// it is). Unlike ae3d's passes it may sample no texture: a picture made from
+// its inputs alone, a raymarch. Null when it has neither
+// an input nor a texture, or the device would not make what it needs.
+program_pass_new(s: *GpuShader, spirv: *QuotedSpirv, render_pass: @keep ptr, draws: int, blend: int) -> *QuotedPass {
+    if s == null || spirv == null { return null }
+    stale(s, spirv.hash, "the program's (ae3d.quotegen)", "build and run the program's generator, the one that calls quotegen.add for it")
+    if gpu.params_size(s) < 1 && gpu.samplers_count(s) < 1 {
+        io.stderr_write("ae3d: ${gpu.shader_name(s)}: a program's screen pass has an input or a texture\n")
+        return null
+    }
+    p = calloc(1, sizeof(QuotedPass)) as *QuotedPass
+    p.shader = s as ptr
+    p.borrowed = true
+    p.hash = spirv.hash
+    p.size = gpu.params_size(s)
+    p.textures = gpu.samplers_count(s)
+    p.base = 0
+    if p.size > 0 { p.base = 1 }
+    p.image_layout = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    p.draws = draws
+    if p.draws < 1 { p.draws = 1 }
+    p.sets = calloc(vkdesc.FRAMES * p.draws, 8)
+    p.blocks = calloc(vkdesc.FRAMES * p.draws, 8)
+    if !make_layouts(p) || !make_sets(p) {
+        pass_free(p)
+        return null
+    }
+    v = vkpipes.shader_words(spirv.vert, spirv.vert_bytes)
+    f = vkpipes.shader_words(spirv.frag, spirv.frag_bytes)
+    if !pipeline_of_modules(p, v, f, render_pass, false, false, blend) {
+        pass_free(p)
+        return null
+    }
+    return p
+}
+
+// How many draws a frame the pass has a set and a block for.
+draws_of(p: *QuotedPass) -> int { return p.draws }
+
+// A program's own pair, for its canvas: its vertex shader `vs` and its
+// pixel shader `ps`, which it borrows (the program sets their captures and
+// frees them after), linked by their varyings, drawn with the SPIR-V of
+// `spirv` (ae3d.quotegen.add_pair's, made from trees hashing to spirv.hash
+// between them, gpu.pair_hash) into `render_pass` up to `draws` times a
+// frame: depth-tested and written, opaque, its back faces kept (pipeline)
+// or culled (mesh_pipeline). Either shader may have no input, and its
+// pixel shader may sample no texture. Null, said, when it would not make.
+program_pair_new(vs: *GpuShader, ps: *GpuShader, spirv: *QuotedSpirv, render_pass: @keep ptr, draws: int) -> *QuotedPass {
+    if vs == null || ps == null || spirv == null { return null }
+    why = ""
+    if !gpu.linked(ps) && !gpu.link(vs, ps) { why = gpu.last_error() }
+    if why != "" {
+        io.stderr_write("ae3d: ${why}\n")
+        return null
+    }
+    stale_pair(vs, ps, spirv.hash)
+    p = calloc(1, sizeof(QuotedPass)) as *QuotedPass
+    p.shader = ps as ptr
+    p.vshader = vs as ptr
+    p.borrowed = true
+    p.hash = spirv.hash
+    p.vhash = spirv.hash
+    p.size = gpu.params_size(ps)
+    p.vsize = gpu.params_size(vs)
+    // A vertex shader with no input (a sky's corners in clip space) has a
+    // block all the same, which nothing reads: the pair's sets are the same
+    // shape whatever its shaders take.
+    if p.vsize < 16 { p.vsize = 16 }
+    p.textures = gpu.samplers_count(ps)
+    p.base = 0
+    if p.size > 0 { p.base = 1 }
+    p.image_layout = vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    p.draws = draws
+    if p.draws < 1 { p.draws = 1 }
+    p.sets = calloc(vkdesc.FRAMES * p.draws, 8)
+    p.blocks = calloc(vkdesc.FRAMES * p.draws, 8)
+    p.vsets = calloc(vkdesc.FRAMES * p.draws, 8)
+    p.vblocks = calloc(vkdesc.FRAMES * p.draws, 8)
+    if !make_layouts(p) || !make_sets(p) || !make_vertex_sets(p) {
+        pass_free(p)
+        return null
+    }
+    v = vkpipes.shader_words(spirv.vert, spirv.vert_bytes)
+    f = vkpipes.shader_words(spirv.frag, spirv.frag_bytes)
+    if v != null && f != null {
+        p.pipeline = vkpipes.build_on(v, f, 0, true, true, render_pass, false, false, false, p.layout, false)
+        p.culled = vkpipes.build_on(v, f, 0, true, true, render_pass, true, false, false, p.layout, false)
+    }
+    if v != null { vk.vkDestroyShaderModule(vkhost.device(), v, null) }
+    if f != null { vk.vkDestroyShaderModule(vkhost.device(), f, null) }
+    if p.pipeline == null || p.culled == null {
         pass_free(p)
         return null
     }
@@ -226,10 +331,15 @@ mesh_pipeline(p: *QuotedPass, blended: bool, culled: bool) -> ptr {
 // The pipeline over the words `vert` and `frag`, on the pass's layout, into
 // `render_pass`, depth-tested and depth-written as asked.
 make_pipeline(p: *QuotedPass, vert: int, frag: int, render_pass: @keep ptr, depth_test: bool, depth_write: bool) -> bool {
-    v = vkpipes.shader(vert)
-    f = vkpipes.shader(frag)
+    return pipeline_of_modules(p, vkpipes.shader(vert), vkpipes.shader(frag), render_pass, depth_test, depth_write, 0)
+}
+
+// The pass's pipeline from the modules `v` and `f`, which it destroys,
+// blended as vkpipes' `blend` says.
+pipeline_of_modules(p: *QuotedPass, v: @keep ptr, f: @keep ptr, render_pass: @keep ptr, depth_test: bool, depth_write: bool,
+                    blend: int) -> bool {
     if v != null && f != null {
-        p.pipeline = vkpipes.build_on(v, f, 0, depth_test, depth_write, render_pass, false, false, false, p.layout, false)
+        p.pipeline = vkpipes.build_on(v, f, blend, depth_test, depth_write, render_pass, false, false, false, p.layout, false)
     }
     if v != null { vk.vkDestroyShaderModule(vkhost.device(), v, null) }
     if f != null { vk.vkDestroyShaderModule(vkhost.device(), f, null) }
@@ -321,18 +431,27 @@ make_layouts(p: *QuotedPass) -> bool {
 make_sets(p: *QuotedPass) -> bool {
     d = vkhost.device()
     count = vkdesc.FRAMES * p.draws
+    // A size for each kind of descriptor the pass has, none of 0: the
+    // samplers where it samples a texture (a program's pass may not), the
+    // uniform buffers where it has a block.
     sizes = calloc(2, sizeof(VkDescriptorPoolSize))
-    s0 = sizes as *VkDescriptorPoolSize
-    s0.type = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-    s0.descriptorCount = count * p.textures
-    s1 = (sizes + sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
-    s1.type = vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER
-    s1.descriptorCount = count
+    kinds = 0
+    if p.textures > 0 {
+        s0 = sizes as *VkDescriptorPoolSize
+        s0.type = vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+        s0.descriptorCount = count * p.textures
+        kinds = 1
+    }
+    if p.base == 1 {
+        s1 = (sizes + kinds * sizeof(VkDescriptorPoolSize)) as *VkDescriptorPoolSize
+        s1.type = vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER
+        s1.descriptorCount = count
+        kinds = kinds + 1
+    }
     info = calloc(1, sizeof(VkDescriptorPoolCreateInfo)) as *VkDescriptorPoolCreateInfo
     info.sType = vk.STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
     info.maxSets = count
-    // The uniform buffers' size only where there is a block to bind.
-    info.poolSizeCount = 1 + p.base
+    info.poolSizeCount = kinds
     info.pPoolSizes = sizes
     cell = calloc(1, 8)
     r = vk.vkCreateDescriptorPool(d, info as ptr, null, cell)
@@ -469,10 +588,26 @@ set_shader(p: *QuotedPass, s: *GpuShader) {
 // SPIR-V made from another tree reads its uniforms at another shader's
 // offsets, and one left out of the frame hides the change that was made.
 fresh(s: *GpuShader, made_from: long) {
+    stale(s, made_from, "ae3d.vkspirv's",
+          "./build.sh tools/generate_shaders.ae && ./build/generate_shaders (the generator compiles the trees in, so rebuild it first)")
+}
+
+// A program's pair, whose SPIR-V was made from both trees together.
+stale_pair(vs: *GpuShader, ps: *GpuShader, made_from: long) {
+    got = gpu.pair_hash(vs, ps)
+    if got == made_from { return }
+    io.stderr_write("ae3d: quoted shaders ${gpu.shader_name(vs)} and ${gpu.shader_name(ps)} are stale: the program's SPIR-V for them was made from trees hashing to ${made_from}, and theirs in this program hash to ${got}\n")
+    io.stderr_write("ae3d: regenerate it -- build and run the program's generator, the one that calls quotegen.add_pair for them -- then rebuild this program\n")
+    exit(1)
+}
+
+// The same for a program's own pass, whose SPIR-V its own generator wrote
+// with ae3d.quotegen.
+stale(s: *GpuShader, made_from: long, whose: string, regenerate: string) {
     got = gpu.shader_hash(s)
     if got == made_from { return }
-    io.stderr_write("ae3d: quoted shader ${gpu.shader_name(s)} is stale: ae3d.vkspirv's SPIR-V for it was made from a tree hashing to ${made_from}, and its tree in this program hashes to ${got}\n")
-    io.stderr_write("ae3d: regenerate it -- ./build.sh tools/generate_shaders.ae && ./build/generate_shaders (the generator compiles the trees in, so rebuild it first) -- then rebuild this program\n")
+    io.stderr_write("ae3d: quoted shader ${gpu.shader_name(s)} is stale: ${whose} SPIR-V for it was made from a tree hashing to ${made_from}, and its tree in this program hashes to ${got}\n")
+    io.stderr_write("ae3d: regenerate it -- ${regenerate} -- then rebuild this program\n")
     exit(1)
 }
 
@@ -500,6 +635,15 @@ layout(p: *QuotedPass) -> ptr { return p.layout }
 // its block, the images named at 1... Called once the slot's fence has
 // passed. Null, said once, for a draw past the pass's ring.
 prepare(p: *QuotedPass, slot: int, draw: int, views: ptr, samplers: ptr) -> ptr {
+    return prepare_with(p, slot, draw, views, samplers, null, null)
+}
+
+// The same with the pixel shader's block `params` (gpu.params_size bytes, as
+// gpu.params_write made them when a program queued the draw) in place of
+// the captures' values now: one of a program's queued draws, each with the
+// inputs it was queued with; `vparams` the same of a pair's vertex shader.
+// Null `params` and `vparams` is prepare.
+prepare_with(p: *QuotedPass, slot: int, draw: int, views: ptr, samplers: ptr, params: ptr, vparams: ptr) -> ptr {
     if draw < 0 || draw >= p.draws {
         if !p.overrun {
             io.stderr_write("ae3d: ${gpu.shader_name(p.shader as *GpuShader)} drawn ${draw + 1} times in a frame; its pass has sets for ${p.draws}\n")
@@ -510,7 +654,8 @@ prepare(p: *QuotedPass, slot: int, draw: int, views: ptr, samplers: ptr) -> ptr 
     at = slot * p.draws + draw
     set = (p.sets as ptr[])[at]
     block = (p.blocks as ptr[])[at] as *HostBuffer
-    if set == null || (p.base == 1 && block == null) || views == null || samplers == null { return null }
+    if set == null || (p.base == 1 && block == null) { return null }
+    if p.textures > 0 && (views == null || samplers == null) { return null }
     // The count in a local, never below 0, so the allocations below are not
     // sized by a negative int widened (gcc's -Walloc-size-larger-than).
     n = p.textures
@@ -520,11 +665,19 @@ prepare(p: *QuotedPass, slot: int, draw: int, views: ptr, samplers: ptr) -> ptr 
         if (views as ptr[])[t] == null || (samplers as ptr[])[t] == null { return null }
         t = t + 1
     }
-    if block != null { gpu.params_write(p.shader as *GpuShader, block.mapped) }
+    if block != null && params != null {
+        _m = memcpy(block.mapped, params, p.size)
+    } else if block != null {
+        gpu.params_write(p.shader as *GpuShader, block.mapped)
+    }
     if p.vshader != null {
         vblock = (p.vblocks as ptr[])[at] as *HostBuffer
         if vblock == null { return null }
-        gpu.params_write(p.vshader as *GpuShader, vblock.mapped)
+        if vparams != null {
+            _v = memcpy(vblock.mapped, vparams, p.vsize)
+        } else {
+            gpu.params_write(p.vshader as *GpuShader, vblock.mapped)
+        }
     }
     images = calloc(n, sizeof(VkDescriptorImageInfo))
     writes = calloc(n, sizeof(VkWriteDescriptorSet))
@@ -543,7 +696,7 @@ prepare(p: *QuotedPass, slot: int, draw: int, views: ptr, samplers: ptr) -> ptr 
         write.pImageInfo = image as ptr
         t = t + 1
     }
-    vk.vkUpdateDescriptorSets(vkhost.device(), n, writes, 0, null)
+    if n > 0 { vk.vkUpdateDescriptorSets(vkhost.device(), n, writes, 0, null) }
     free(writes)
     free(images)
     return set
@@ -580,8 +733,10 @@ pass_free(p: *QuotedPass) {
     free(p.blocks)
     free(p.vsets)
     free(p.vblocks)
-    gpu.shader_free(p.shader as *GpuShader)
-    gpu.shader_free(p.vshader as *GpuShader)
+    if !p.borrowed {
+        gpu.shader_free(p.shader as *GpuShader)
+        gpu.shader_free(p.vshader as *GpuShader)
+    }
     free(p as ptr)
 }
 

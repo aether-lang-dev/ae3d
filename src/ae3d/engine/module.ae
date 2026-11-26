@@ -13,6 +13,9 @@ import ae3d.jobs
 import ae3d.platform
 import ae3d.gl
 import ae3d.vulkan
+import ae3d.gpu
+import ae3d.gpu (GpuShader, QuotedSpirv)
+import ae3d.shaderlib (mat4, m4_at, mat4_floats)
 import ae3d.envimage
 import ae3d.agent
 import ae3d.anim
@@ -53,7 +56,9 @@ exports (
     engine_add_light, engine_remove_light,
     engine_camera, engine_window, engine_renderer_failed, engine_backend_name,
     engine_set_size, engine_set_title, engine_set_msaa, engine_set_decorated, engine_set_post,
-    engine_set_render_scale, engine_render_scale, engine_set_upscaler, engine_upscaler, engine_upscale_sharpness, engine_set_depth_of_field, engine_depth_of_field, engine_set_environment, engine_set_environment_yaw, engine_set_environment_look, engine_environment, engine_environment_intensity, engine_environment_yaw, engine_dof_focus, engine_dof_aperture, engine_dof_max_radius, engine_environment_error, UPSCALER_BILINEAR, UPSCALER_SPATIAL, engine_ssao, engine_bloom, engine_fxaa, engine_set_shadows, engine_shadows, engine_set_fog, engine_fog, engine_set_shadow_distance, engine_shadow_distance, engine_set_lamp_shadow_limit, engine_lamp_shadow_limit, transparent_share,
+    engine_set_render_scale, engine_render_scale, engine_set_screen_pass, engine_set_screen_pass_rect, engine_screen_draw, engine_screen_draws_clear, engine_set_screen_clip,
+    engine_canvas_new, engine_canvas_free, engine_canvas_begin, engine_canvas_draw, engine_canvas_show, engine_canvas_lens,
+    engine_mesh_new, engine_mesh_free, engine_set_upscaler, engine_upscaler, engine_upscale_sharpness, engine_set_depth_of_field, engine_depth_of_field, engine_set_environment, engine_set_environment_yaw, engine_set_environment_look, engine_environment, engine_environment_intensity, engine_environment_yaw, engine_dof_focus, engine_dof_aperture, engine_dof_max_radius, engine_environment_error, UPSCALER_BILINEAR, UPSCALER_SPATIAL, engine_ssao, engine_bloom, engine_fxaa, engine_set_shadows, engine_shadows, engine_set_fog, engine_fog, engine_set_shadow_distance, engine_shadow_distance, engine_set_lamp_shadow_limit, engine_lamp_shadow_limit, transparent_share,
     engine_set_vsync, engine_set_camera_input, engine_set_fixed_step,
     engine_set_camera_collision, engine_camera_collision, engine_set_camera_radius, engine_camera_radius,
     engine_camera_move, engine_camera_boom, engine_camera_prepare, engine_viewpoint,
@@ -274,6 +279,20 @@ struct Engine {
     // (UPSCALER_*), and the sharpen's strength after it (#867).
     upscaler: int
     upscale_sharpness: float
+    // A program's own quoted screen pass (engine_set_screen_pass): its tree
+    // and, for Vulkan, the SPIR-V its build made of it.
+    screen_shader: ptr
+    screen_spirv: ptr
+    screen_x: int          // where in the frame (engine_set_screen_pass_rect); 0 wide is all of it
+    screen_y: int
+    screen_w: int
+    screen_h: int
+    // What the program's queued draws are cut to (engine_set_screen_clip); 0
+    // wide is the frame.
+    clip_x: int
+    clip_y: int
+    clip_w: int
+    clip_h: int
     // Depth of field (#870): on or off, the distance in focus, the disc of
     // confusion at infinity and its widest, in pixels of a 1080-line frame.
     dof_on: bool
@@ -1719,6 +1738,196 @@ engine_set_upscaler(e: *Engine, mode: int, sharpness: float) -> int {
     if e.upscale_sharpness > 1.0 { e.upscale_sharpness = 1.0 }
     if e.running { apply_upscaler(e) }
     return e.upscaler
+}
+
+// A full-screen pass of the program's own, written with `quote` (ae3d.gpu's
+// fragment): drawn over every frame, once the scene, its tone curve and
+// FXAA are done, so what it writes is shown as it is, a picture made by the
+// shader alone (a raymarch) or over the scene. `s` stays the program's: it
+// sets the shader's captures between frames (gpu.set_float, set_vec2 and
+// the rest), and frees it once it is taken off or the engine is freed.
+// `spirv` is what Vulkan draws it with, made at the program's build from
+// the same tree by ae3d.quotegen; OpenGL compiles the tree's GLSL and needs
+// none (null). A tree that hashes otherwise than the SPIR-V was made from
+// ends the program, as one of ae3d's own does. Null, null takes it off.
+engine_set_screen_pass(e: *Engine, s: *GpuShader, spirv: *QuotedSpirv) {
+    e.screen_shader = s as ptr
+    e.screen_spirv = spirv as ptr
+    if e.running { apply_screen_pass(e) }
+}
+
+// Where in the frame the screen pass is drawn: `w` by `h` from (x, y), in
+// the framebuffer's pixels from the top left (window points times
+// platform.window_content_scale); 0 wide is the whole frame, as it is
+// unless this is called. The pass's quad fills the rectangle, so its `uv`
+// runs across it, 0 to 1; frag_coord() stays the frame's. The rest of the
+// frame is what the scene and the clear colour make of it.
+engine_set_screen_pass_rect(e: *Engine, x: int, y: int, w: int, h: int) {
+    e.screen_x = x
+    e.screen_y = y
+    e.screen_w = w
+    e.screen_h = h
+    if e.running { apply_screen_pass(e) }
+}
+
+// A draw of the program's quoted shader `s` over every frame from the next,
+// until engine_screen_draws_clear: its quad `w` by `h` from (x, y), in the
+// framebuffer's pixels from the top left, the shader's `uv` running across
+// it, cut to the clip (engine_set_screen_clip). It is drawn after the
+// screen pass and the draws queued before it, blended over what is there
+// as a premultiplied colour is (what it writes is already times its alpha;
+// 1 is opaque), with the shader's inputs as they are now: the program may
+// set them again (gpu.set_float and the rest) and queue it again, a draw
+// each, a sprite. Many shaders may be queued; each is made the first time
+// it is (from `spirv`, ae3d.quotegen's, on Vulkan; compiled on OpenGL,
+// where `spirv` may be null) and kept. The shader stays the program's, and
+// is kept while it is queued. Made once the engine has started.
+engine_screen_draw(e: *Engine, s: *GpuShader, spirv: *QuotedSpirv, x: int, y: int, w: int, h: int) {
+    if s == null { return }
+    if e.api == platform.API_VULKAN && e.backend_state != null {
+        if spirv == null { return }
+        vulkan.renderer_screen_draw(e.backend_state as *VKRenderer, s, spirv, x, y, w, h, e.clip_x, e.clip_y,
+                                    e.clip_w, e.clip_h)
+    } else if e.gl_renderer != null {
+        gl.renderer_screen_draw(e.gl_renderer as *GLRenderer, s, x, y, w, h, e.clip_x, e.clip_y, e.clip_w, e.clip_h)
+    }
+}
+
+// The program's queued draws taken off, to queue the next frame's.
+engine_screen_draws_clear(e: *Engine) {
+    if e.api == platform.API_VULKAN && e.backend_state != null {
+        vulkan.renderer_clear_screen_draws(e.backend_state as *VKRenderer)
+    } else if e.gl_renderer != null {
+        gl.renderer_clear_screen_draws(e.gl_renderer as *GLRenderer)
+    }
+}
+
+// The rectangle the draws queued after this are cut to, `w` by `h` from
+// (x, y) in the framebuffer's pixels from the top left: a widget's, say,
+// that a sprite half out of it is cut at. 0 wide is the frame.
+engine_set_screen_clip(e: *Engine, x: int, y: int, w: int, h: int) {
+    e.clip_x = x
+    e.clip_y = y
+    e.clip_w = w
+    e.clip_h = h
+}
+
+// A canvas of the program's own, `w` by `h` pixels, that its meshes are
+// drawn into with its own quoted shader pairs, depth-tested, each frame
+// before the frame's own passes, and that is shown in a rectangle of the
+// frame as it was drawn (engine_canvas_show): a picture of the program's,
+// lit and shaded as its shaders say, through no tone curve. Its handle, 0
+// when it would not make. Made once the engine has started.
+engine_canvas_new(e: *Engine, w: int, h: int) -> int {
+    if e.api == platform.API_VULKAN && e.backend_state != null {
+        return vulkan.renderer_canvas_new(e.backend_state as *VKRenderer, w, h)
+    } else if e.gl_renderer != null {
+        return gl.renderer_canvas_new(e.gl_renderer as *GLRenderer, w, h)
+    }
+    return 0
+}
+
+engine_canvas_free(e: *Engine, canvas: int) {
+    if e.api == platform.API_VULKAN && e.backend_state != null {
+        vulkan.renderer_canvas_free(e.backend_state as *VKRenderer, canvas)
+    } else if e.gl_renderer != null {
+        gl.renderer_canvas_free(e.gl_renderer as *GLRenderer, canvas)
+    }
+}
+
+// The canvas's meshes taken off, and the colour it is cleared to: the
+// program then queues the next frame's (engine_canvas_draw). What is queued
+// is drawn every frame till this is called again.
+engine_canvas_begin(e: *Engine, canvas: int, red: float, green: float, blue: float, alpha: float) {
+    if e.api == platform.API_VULKAN && e.backend_state != null {
+        vulkan.renderer_canvas_begin(e.backend_state as *VKRenderer, canvas, red, green, blue, alpha)
+    } else if e.gl_renderer != null {
+        gl.renderer_canvas_begin(e.gl_renderer as *GLRenderer, canvas, red, green, blue, alpha)
+    }
+}
+
+// A mesh of the program's (engine_mesh_new) drawn into the canvas by its
+// quoted pair: `vs`, a vertex shader whose quote takes the mesh's vertex
+// (its position, uv and normal, as ae3d.gpu's vertex says) and returns a
+// struct of its clip `position` and its varyings, and `ps`, a pixel shader
+// taking that struct. Both with their inputs as they are now: the program
+// sets them again and queues another, a draw each. Depth-tested and
+// written, in the order queued; its back faces culled when `cull`. Its
+// pixel shader samples `textures` (`count` of the renderer's texture
+// handles, in its order; null and 0 for none). `spirv` is the pair's
+// SPIR-V for Vulkan (ae3d.quotegen.add_pair); OpenGL compiles the pair's
+// GLSL and may have null. Its clip space is OpenGL's on both renderers when
+// its matrix is passed through engine_canvas_lens.
+engine_canvas_draw(e: *Engine, canvas: int, vs: *GpuShader, ps: *GpuShader, spirv: *QuotedSpirv, mesh: int, cull: bool,
+                   textures: ptr, count: int) {
+    if vs == null || ps == null { return }
+    if e.api == platform.API_VULKAN && e.backend_state != null {
+        if spirv == null { return }
+        vulkan.renderer_canvas_draw(e.backend_state as *VKRenderer, canvas, vs, ps, spirv, mesh, cull, textures, count)
+    } else if e.gl_renderer != null {
+        gl.renderer_canvas_draw(e.gl_renderer as *GLRenderer, canvas, vs, ps, mesh, cull, textures, count)
+    }
+}
+
+// The canvas shown in the frame this time, `w` by `h` from (x, y), the
+// framebuffer's pixels from the top left, after the screen pass and the
+// draws: called each frame it is to be seen, as engine_view_blit is.
+engine_canvas_show(e: *Engine, canvas: int, x: int, y: int, w: int, h: int) -> bool {
+    if e.api == platform.API_VULKAN && e.backend_state != null {
+        return vulkan.renderer_canvas_show(e.backend_state as *VKRenderer, canvas, x, y, w, h)
+    } else if e.gl_renderer != null {
+        return gl.renderer_canvas_show(e.gl_renderer as *GLRenderer, canvas, x, y, w, h)
+    }
+    return false
+}
+
+// A projection made for OpenGL's clip space (y up, z -1 to 1, as a frustum
+// is), made the running renderer's: as it is on OpenGL, and on Vulkan its y
+// turned over and its z halved into 0 to 1, as ae3d does its own camera's.
+// What a canvas's vertex shader multiplies by.
+engine_canvas_lens(e: *Engine, m: mat4) -> mat4 {
+    if e.api != platform.API_VULKAN { return m }
+    return mat4_floats(m4_at(m, 0, 0), 0.0 - m4_at(m, 0, 1), 0.5 * (m4_at(m, 0, 2) + m4_at(m, 0, 3)), m4_at(m, 0, 3),
+                       m4_at(m, 1, 0), 0.0 - m4_at(m, 1, 1), 0.5 * (m4_at(m, 1, 2) + m4_at(m, 1, 3)), m4_at(m, 1, 3),
+                       m4_at(m, 2, 0), 0.0 - m4_at(m, 2, 1), 0.5 * (m4_at(m, 2, 2) + m4_at(m, 2, 3)), m4_at(m, 2, 3),
+                       m4_at(m, 3, 0), 0.0 - m4_at(m, 3, 1), 0.5 * (m4_at(m, 3, 2) + m4_at(m, 3, 3)), m4_at(m, 3, 3))
+}
+
+// A mesh of the program's (ae3d.core's mesh_create and mesh_push_*) on the
+// GPU, for engine_canvas_draw: its handle, 0 when there is none. The mesh
+// stays the program's.
+engine_mesh_new(e: *Engine, mesh: ptr) -> int {
+    if e.api == platform.API_VULKAN && e.backend_state != null {
+        return vulkan.renderer_mesh_new(e.backend_state as *VKRenderer, mesh)
+    } else if e.gl_renderer != null {
+        return gl.renderer_mesh_new(e.gl_renderer as *GLRenderer, mesh)
+    }
+    return 0
+}
+
+engine_mesh_free(e: *Engine, mesh: int) {
+    if e.api == platform.API_VULKAN && e.backend_state != null {
+        vulkan.renderer_mesh_free(e.backend_state as *VKRenderer, mesh)
+    } else if e.gl_renderer != null {
+        gl.renderer_mesh_free(e.gl_renderer as *GLRenderer, mesh)
+    }
+}
+
+apply_screen_pass(e: *Engine) {
+    s = e.screen_shader as *GpuShader
+    if e.api == platform.API_VULKAN && e.backend_state != null {
+        if s != null && e.screen_spirv == null {
+            println("ae3d: the screen pass ${gpu.shader_name(s)} has no SPIR-V (ae3d.quotegen), so Vulkan leaves it out")
+            return
+        }
+        vulkan.renderer_set_screen_pass(e.backend_state as *VKRenderer, s, e.screen_spirv as *QuotedSpirv)
+        vulkan.renderer_set_screen_pass_rect(e.backend_state as *VKRenderer, e.screen_x, e.screen_y,
+                                             e.screen_w, e.screen_h)
+    } else if e.gl_renderer != null {
+        gl.renderer_set_screen_pass(e.gl_renderer as *GLRenderer, s)
+        gl.renderer_set_screen_pass_rect(e.gl_renderer as *GLRenderer, e.screen_x, e.screen_y,
+                                         e.screen_w, e.screen_h)
+    }
 }
 
 apply_upscaler(e: *Engine) {
@@ -3383,6 +3592,7 @@ engine_start(e: *Engine, x: int, y: int) -> bool {
     }
     list.clear(e.pending_models)
     apply_ssao(e)
+    apply_screen_pass(e)
     apply_anisotropy(e)
     apply_ground_bounce(e)
     apply_eye(e)
