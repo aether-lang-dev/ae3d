@@ -36,6 +36,8 @@ import ae3d.vkpipes
 import ae3d.vkpick
 import ae3d.vktexture
 import ae3d.vkmesh
+import ae3d.vkcanvas
+import ae3d.vkcanvas (VkCanvas)
 import ae3d.vkrays
 import ae3d.vkscene
 import ae3d.vkspirv
@@ -80,7 +82,8 @@ exports (
     offscreen_width, offscreen_height, draw, draw_range, set_additive, draw_indirect, draw_cut, draw_pulled, draw_sky, cloud_pass, sky_capture_pass, set_screen_quad, set_blend, set_normal_map, set_emissive_map, set_pose_bank, set_damage_mask,
     set_face_culling, set_shadows, shadows, shadow_begin, shadow_draw, shadow_end, shadow_viewport, shadow_done,
     lamp_shadow_begin, lamp_shadow_tile, lamp_static_begin, lamp_copy, lamp_shadow_generation,
-    clusters_reserve, clusters_lights, clusters_words, set_post, set_screen_pass, set_screen_pass_rect, queue_screen_draw, clear_screen_draws, post_active, set_frame_exposure, frame_exposure, composited, quoted_screen_pass,
+    clusters_reserve, clusters_lights, clusters_words, set_post, set_screen_pass, set_screen_pass_rect, queue_screen_draw, clear_screen_draws,
+    canvas_new, canvas_free, canvas_texture, canvas_begin, canvas_draw, post_active, set_frame_exposure, frame_exposure, composited, quoted_screen_pass,
     set_bloom_intensity, bloom_intensity, draw_calls, pass_ms, pipeline_binds, set_binds, sample_count,
     set_samples, set_scene_depth, scene_depth_ready, resolve_scene_depth, velocity_texture, set_render_scale,
     set_upscaler, upscaler, upscale_targets, upscale_sharpness, set_dof, dof, dof_focus, dof_aperture, dof_max_radius,
@@ -258,6 +261,15 @@ var g_draw_count = 0
 var g_draw_room = 0
 var g_draw_passes: ptr = null
 var g_draw_pass_count = 0
+// A program's canvases (canvas_new): a raw array of *Canvas, a freed one's
+// slot null; and the passes of the pairs their meshes are drawn with, one a
+// pair's SPIR-V, made as they are first wanted and kept (*DrawPass, as the
+// draws' are, the pixel shader its shader and the vertex shader beside it).
+var g_canvases: ptr = null
+var g_canvas_count = 0
+var g_pairs: ptr = null
+var g_pair_count = 0
+var g_canvas_clears: ptr = null
 // The bloom's down pass, written with quote (ae3d.shaders.bloom): one
 // shader, its texel and level set before each draw, the SSR's two blurs and
 // the pyramid's levels drawn from one ring of sets.
@@ -1018,6 +1030,7 @@ shutdown() {
     vkquote.pass_free(g_program_pass as *QuotedPass)
     g_program_pass = null
     free_screen_draws()
+    free_canvases()
     vkquote.pass_free(g_easu_pass as *QuotedPass)
     g_easu_pass = null
     vkquote.pass_free(g_rcas_pass as *QuotedPass)
@@ -1407,6 +1420,8 @@ frame_begin(r: float, g: float, b: float, a: float) -> bool {
     vkquote.ring_frame(g_crowd_pull_ring as *VertexRing, g_frame)
     vkquote.ring_frame(g_crowd_depth_ring as *VertexRing, g_frame)
     vkquote.ring_frame(g_crowd_pick_ring as *VertexRing, g_frame)
+    // The program's canvases, before anything of the frame samples them.
+    if !g_view_frame { draw_canvases() }
     vkhost.set_recording(true)
     return true
 }
@@ -3078,6 +3093,34 @@ struct DrawPass {
     shader: ptr
     pass: ptr
     failed: bool
+    vshader: ptr   // a canvas pair's vertex shader; null for a draw's
+}
+
+// A program's canvas: its images, the colour it is cleared to, and the
+// meshes queued for it, a raw array of *CanvasDraw.
+struct Canvas {
+    target: ptr
+    red: float
+    green: float
+    blue: float
+    alpha: float
+    draws: ptr
+    count: int
+    room: int
+}
+
+// A mesh queued for a canvas: which pair of g_pairs draws it, the mesh,
+// whether its back faces are culled, the textures its pixel shader samples
+// (vktexture handles, in its order) and both shaders' blocks as they were
+// queued, which it owns.
+struct CanvasDraw {
+    pair: int
+    mesh: int
+    cull: bool
+    textures: ptr
+    texture_count: int
+    params: ptr
+    vparams: ptr
 }
 
 // The pass of g_draw_passes for `spirv`, added if it has none.
@@ -3239,6 +3282,278 @@ draw_screen_draws(fw: int, fh: int) {
     viewport(fw, fh)
 }
 
+// A canvas `w` by `h` for the program's meshes: its handle, 0 when it would
+// not make (said).
+canvas_new(w: int, h: int) -> int {
+    t = vkcanvas.canvas_new(w, h)
+    if t == null { return 0 }
+    c = calloc(1, sizeof(Canvas)) as *Canvas
+    c.target = t as ptr
+    c.alpha = 1.0
+    k = 0
+    while k < g_canvas_count {
+        if (g_canvases as ptr[])[k] == null {
+            (g_canvases as ptr[])[k] = c as ptr
+            return k + 1
+        }
+        k = k + 1
+    }
+    grown = calloc(g_canvas_count + 1, 8)
+    if g_canvas_count > 0 { _m = memcpy(grown, g_canvases, g_canvas_count * 8) }
+    free(g_canvases)
+    g_canvases = grown
+    (g_canvases as ptr[])[g_canvas_count] = c as ptr
+    g_canvas_count = g_canvas_count + 1
+    return g_canvas_count
+}
+
+fn canvas_at(handle: int) -> *Canvas {
+    if handle < 1 || handle > g_canvas_count { return null }
+    return (g_canvases as ptr[])[handle - 1] as *Canvas
+}
+
+// The canvas's picture as a texture handle, to blit (view_blit) or sample.
+canvas_texture(handle: int) -> int {
+    c = canvas_at(handle)
+    if c == null { return 0 }
+    return vkcanvas.texture(c.target as *VkCanvas)
+}
+
+// The canvas's meshes taken off, and what it is cleared to from the next
+// frame: the program then queues the next frame's.
+canvas_begin(handle: int, red: float, green: float, blue: float, alpha: float) {
+    c = canvas_at(handle)
+    if c == null { return }
+    c.red = red
+    c.green = green
+    c.blue = blue
+    c.alpha = alpha
+    k = 0
+    while k < c.count {
+        d = (c.draws as ptr[])[k] as *CanvasDraw
+        free(d.params)
+        free(d.vparams)
+        free(d.textures)
+        free(d as ptr)
+        k = k + 1
+    }
+    c.count = 0
+}
+
+canvas_free(handle: int) {
+    c = canvas_at(handle)
+    if c == null { return }
+    canvas_begin(handle, 0.0, 0.0, 0.0, 1.0)
+    free(c.draws)
+    vkcanvas.canvas_free(c.target as *VkCanvas)
+    free(c as ptr)
+    (g_canvases as ptr[])[handle - 1] = null
+}
+
+// The pair of g_pairs for `spirv`, added if it has none: its trees checked
+// once, as it is first wanted.
+fn pair_of(vs: *GpuShader, ps: *GpuShader, spirv: *QuotedSpirv) -> int {
+    k = 0
+    while k < g_pair_count {
+        d = (g_pairs as ptr[])[k] as *DrawPass
+        if d.spirv == spirv as ptr {
+            d.shader = ps as ptr
+            d.vshader = vs as ptr
+            return k
+        }
+        k = k + 1
+    }
+    vkquote.stale_pair(vs, ps, spirv.hash)
+    grown = calloc(g_pair_count + 1, 8)
+    if g_pair_count > 0 { _m = memcpy(grown, g_pairs, g_pair_count * 8) }
+    free(g_pairs)
+    g_pairs = grown
+    d = calloc(1, sizeof(DrawPass)) as *DrawPass
+    d.spirv = spirv as ptr
+    d.shader = ps as ptr
+    d.vshader = vs as ptr
+    (g_pairs as ptr[])[g_pair_count] = d as ptr
+    g_pair_count = g_pair_count + 1
+    return g_pair_count - 1
+}
+
+// A mesh (vkmesh's handle) drawn into the canvas every frame from the next
+// till canvas_begin, by the program's pair `vs` and `ps` (their SPIR-V
+// `spirv`, ae3d.quotegen.add_pair's) with both their inputs as they are now,
+// depth-tested, its back faces culled or kept, its pixel shader sampling
+// `textures` (vktexture handles, `count` of them, in its order).
+canvas_draw(handle: int, vs: *GpuShader, ps: *GpuShader, spirv: *QuotedSpirv, mesh: int, cull: bool, textures: ptr,
+            count: int) {
+    c = canvas_at(handle)
+    if c == null || vs == null || ps == null || spirv == null || count > QUOTED_TEXTURES { return }
+    if c.count == c.room {
+        room = c.room * 2
+        if room < 16 { room = 16 }
+        grown = calloc(room, 8)
+        if c.count > 0 { _m = memcpy(grown, c.draws, c.count * 8) }
+        free(c.draws)
+        c.draws = grown
+        c.room = room
+    }
+    d = calloc(1, sizeof(CanvasDraw)) as *CanvasDraw
+    d.pair = pair_of(vs, ps, spirv)
+    d.mesh = mesh
+    d.cull = cull
+    d.texture_count = count
+    d.textures = calloc(count + 1, 8)
+    if count > 0 { _t = memcpy(d.textures, textures, count * 8) }
+    d.params = calloc(1, gpu.params_size(ps) + 16)
+    gpu.params_write(ps, d.params)
+    d.vparams = calloc(1, gpu.params_size(vs) + 16)
+    gpu.params_write(vs, d.vparams)
+    (c.draws as ptr[])[c.count] = d as ptr
+    c.count = c.count + 1
+}
+
+// The pair's pass with room for `wanted` draws a frame, made again bigger
+// (the device idle first) when it has less.
+fn pair_ready(d: *DrawPass, wanted: int) -> bool {
+    if d.failed { return false }
+    if d.pass != null && vkquote.draws_of(d.pass as *QuotedPass) >= wanted { return true }
+    room = 16
+    if d.pass != null {
+        room = vkquote.draws_of(d.pass as *QuotedPass) * 2
+        vk.vkDeviceWaitIdle(vkdevice.device())
+        vkquote.pass_free(d.pass as *QuotedPass)
+        d.pass = null
+    }
+    while room < wanted { room = room * 2 }
+    d.pass = vkquote.program_pair_new(d.vshader as *GpuShader, d.shader as *GpuShader, d.spirv as *QuotedSpirv,
+                                      vkcanvas.pass(), room) as ptr
+    if d.pass == null {
+        io.stderr_write("ae3d: the program's pair ${gpu.shader_name(d.vshader as *GpuShader)} and ${gpu.shader_name(d.shader as *GpuShader)} could not be made\n")
+        d.failed = true
+        return false
+    }
+    return true
+}
+
+// Every canvas drawn, its pass begun cleared and each of its meshes drawn,
+// before the frame's own passes. The pairs' sets are shared by all the
+// canvases of a frame, so each pair has the room for all their draws.
+fn draw_canvases() {
+    if g_canvas_count == 0 { return }
+    counts = calloc(g_pair_count + 1, 8)
+    k = 0
+    while k < g_canvas_count {
+        c = (g_canvases as ptr[])[k] as *Canvas
+        if c != null {
+            j = 0
+            while j < c.count {
+                d = (c.draws as ptr[])[j] as *CanvasDraw
+                (counts as int[])[d.pair] = (counts as int[])[d.pair] + 1
+                j = j + 1
+            }
+        }
+        k = k + 1
+    }
+    k = 0
+    while k < g_pair_count {
+        n = (counts as int[])[k]
+        if n > 0 { _r = pair_ready((g_pairs as ptr[])[k] as *DrawPass, n) }
+        (counts as int[])[k] = 0
+        k = k + 1
+    }
+    if g_canvas_clears == null { g_canvas_clears = calloc(2, 16) }
+    quoted_cells()
+    k = 0
+    while k < g_canvas_count {
+        c = (g_canvases as ptr[])[k] as *Canvas
+        if c != null { draw_canvas(c, counts) }
+        k = k + 1
+    }
+    free(counts)
+    g_bound_texture = 0 - 1
+    g_bound_normal = 0 - 1
+    g_bound_emissive = 0 - 1
+}
+
+fn draw_canvas(c: *Canvas, counts: ptr) {
+    t = c.target as *VkCanvas
+    w = vkcanvas.width(t)
+    h = vkcanvas.height(t)
+    clear = g_canvas_clears as f32[]
+    clear[0] = c.red as f32
+    clear[1] = c.green as f32
+    clear[2] = c.blue as f32
+    clear[3] = c.alpha as f32
+    clear[4] = 1.0 as f32
+    (g_canvas_clears as int[])[5] = 0
+    b = g_begin as *VkRenderPassBeginInfo
+    memset(g_begin, 0, sizeof(VkRenderPassBeginInfo) as long)
+    b.sType = vk.STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+    b.renderPass = vkcanvas.pass()
+    b.framebuffer = vkcanvas.framebuffer(t)
+    b.renderArea.extent.width = w
+    b.renderArea.extent.height = h
+    b.clearValueCount = 2
+    b.pClearValues = g_canvas_clears
+    vk.vkCmdBeginRenderPass(commands_now(), g_begin, vk.SUBPASS_CONTENTS_INLINE)
+    viewport(w, h)
+    j = 0
+    while j < c.count {
+        d = (c.draws as ptr[])[j] as *CanvasDraw
+        dp = (g_pairs as ptr[])[d.pair] as *DrawPass
+        at = (counts as int[])[d.pair]
+        (counts as int[])[d.pair] = at + 1
+        if dp.pass != null && vkmesh.drawable(d.mesh) && vkmesh.index_count(d.mesh) > 0 {
+            draw_canvas_mesh(dp.pass as *QuotedPass, at, d)
+        }
+        j = j + 1
+    }
+    vk.vkCmdEndRenderPass(commands_now())
+}
+
+fn draw_canvas_mesh(p: *QuotedPass, at: int, d: *CanvasDraw) {
+    k = 0
+    while k < d.texture_count {
+        tex = (d.textures as int[])[k]
+        (g_quoted_views as ptr[])[k] = vktexture.view(tex)
+        (g_quoted_samplers as ptr[])[k] = vktexture.sampler_of(tex)
+        k = k + 1
+    }
+    set = vkquote.prepare_with(p, g_frame, at, g_quoted_views, g_quoted_samplers, d.params, d.vparams)
+    vset = vkquote.vertex_set(p, g_frame, at)
+    if set == null || vset == null { return }
+    bind_pipeline(vkquote.mesh_pipeline(p, false, d.cull))
+    (g_set_cell as ptr[])[0] = set
+    vk.vkCmdBindDescriptorSets(commands_now(), vk.PIPELINE_BIND_POINT_GRAPHICS, vkquote.layout(p), 0, 1, g_set_cell, 0, null)
+    (g_set_cell as ptr[])[0] = vset
+    vk.vkCmdBindDescriptorSets(commands_now(), vk.PIPELINE_BIND_POINT_GRAPHICS, vkquote.layout(p), 1, 1, g_set_cell, 0, null)
+    bind_vertices(0, vkmesh.vertex_buffer(d.mesh))
+    bind_vertices(1, identity_buffer())
+    bind_vertices(2, empty_skin_buffer())
+    vk.vkCmdBindIndexBuffer(commands_now(), vkmesh.index_buffer(d.mesh), 0, vk.INDEX_TYPE_UINT32)
+    vk.vkCmdDrawIndexed(commands_now(), vkmesh.index_count(d.mesh), 1, 0, 0, 0)
+}
+
+fn free_canvases() {
+    k = 0
+    while k < g_canvas_count {
+        if (g_canvases as ptr[])[k] != null { canvas_free(k + 1) }
+        k = k + 1
+    }
+    free(g_canvases)
+    g_canvases = null
+    g_canvas_count = 0
+    k = 0
+    while k < g_pair_count {
+        d = (g_pairs as ptr[])[k] as *DrawPass
+        vkquote.pass_free(d.pass as *QuotedPass)
+        free(d as ptr)
+        k = k + 1
+    }
+    free(g_pairs)
+    g_pairs = null
+    g_pair_count = 0
+    vkcanvas.destroy_pass()
+}
+
 fn min_int(a: int, b: int) -> int {
     if a < b { return a }
     return b
@@ -3318,7 +3633,7 @@ draw_quoted_with(p: *QuotedPass, draw: int) {
 draw_quoted_params(p: *QuotedPass, draw: int, params: ptr) {
     if p == null || !vkmesh.drawable(g_screen_quad) || vkmesh.index_count(g_screen_quad) == 0 { return }
     if vkquote.textures(p) > QUOTED_TEXTURES { return }
-    set = vkquote.prepare_with(p, g_frame, draw, g_quoted_views, g_quoted_samplers, params)
+    set = vkquote.prepare_with(p, g_frame, draw, g_quoted_views, g_quoted_samplers, params, null)
     if set == null { return }
     bind_pipeline(vkquote.pipeline(p))
     (g_set_cell as ptr[])[0] = set
