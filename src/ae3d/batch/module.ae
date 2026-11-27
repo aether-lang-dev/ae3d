@@ -1,0 +1,408 @@
+// A frame described in one batch by a host that is not Aether, drawn into
+// a canvas (gl.renderer_canvas_new) and read back.
+//
+// The host is a sae page running three.js (its AeRenderer): it walks its
+// scene once a frame and hands over one buffer, in the layout below, with
+// the camera, every draw's world matrix and material, and the meshes that
+// are new or changed since. ae3d keeps the meshes between batches; a draw
+// names its mesh by the host's id. The buffer is the host's and is not
+// trusted: it is read whole and checked before anything is changed, and a
+// batch that is malformed or over the limits changes nothing and says why.
+//
+// Layout, version 1: 32-bit words, little-endian (u = unsigned, f = float).
+//
+//   u  magic  0x31424541 ("AEB1")     u  version  1
+//   u  words, the whole batch's       u  frame, the host's count
+//   f  view[16]        the eye's view (three.js's matrixWorldInverse), a column at a time
+//   f  projection[16]  OpenGL's clip space (y up, z -1 to 1)
+//   f  clear[4]        red, green, blue, alpha
+//   u  meshes M, then for each:
+//        u id (not 0), u vertices V, u indices I (0: V/3 triangles in order),
+//        f position[3V], f normal[3V], f uv[2V], u index[I]
+//   u  freed F, then F mesh ids
+//   u  draws D, then for each (20 words):
+//        u mesh id, u material (1: normals), u flags (1: both sides), f opacity,
+//        f world[16]
+//
+// Only OpenGL draws a batch so far (the canvas's pair compiled from its
+// trees); Vulkan wants the pair's SPIR-V made at build time.
+
+import std.list
+import std.heap
+import std.mem
+import ae3d.core
+import ae3d.geometry
+import ae3d.gl
+import ae3d.gl (GLRenderer)
+import ae3d.gpu
+import ae3d.gpu (GpuShader)
+import ae3d.shaderlib (mat4, mat4_floats, mul_m4, m4_at)
+import ae3d.batchmaterials
+
+exports (
+    Batch, batch_new, batch_free, batch_set_limits, batch_submit, batch_draw, batch_pixels,
+    batch_width, batch_height, batch_frame, batch_mesh_count, batch_vertex_count, batch_draw_count,
+    batch_triangle_count, MAGIC, VERSION, MATERIAL_NORMAL, FLAG_DOUBLE_SIDE
+)
+
+const MAGIC = 826426689            // "AEB1", 0x31424541
+const VERSION = 1
+const HEADER_WORDS = 40
+const DRAW_WORDS = 20
+const MATERIAL_NORMAL = 1
+const FLAG_DOUBLE_SIDE = 1
+
+struct BatchMesh {
+    id: long
+    handle: int
+    mesh: ptr
+    vertices: int
+    triangles: int
+}
+
+struct Batch {
+    renderer: ptr                  // *GLRenderer, the host's
+    canvas: int
+    width: int
+    height: int
+    meshes: ptr                    // list of *BatchMesh
+    vs: ptr                        // the normal material's pair
+    ps: ptr
+    frame: long
+    draws: int
+    vertices: int                  // live, over every mesh
+    max_meshes: int
+    max_vertices: int
+    max_draws: int
+}
+
+// A batch drawn `w` by `h` by `r`, an OpenGL renderer that is up; null
+// when its canvas would not make.
+batch_new(r: *GLRenderer, w: int, h: int) -> *Batch {
+    canvas = gl.renderer_canvas_new(r, w, h)
+    if canvas == 0 { return null }
+    b = heap.new(Batch)
+    b.renderer = r as ptr
+    b.canvas = canvas
+    b.width = w
+    b.height = h
+    b.meshes = list.new()
+    b.vs = batchmaterials.normal_vertex(mat4_floats(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+                                        mat4_floats(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)) as ptr
+    b.ps = batchmaterials.normal_pixel(1.0) as ptr
+    b.max_meshes = 1024
+    b.max_vertices = 4194304
+    b.max_draws = 16384
+    return b
+}
+
+// What a host allows: live meshes, live vertices over all of them, and
+// draws in one batch. A batch over any is refused whole.
+batch_set_limits(b: *Batch, meshes: int, vertices: int, draws: int) {
+    b.max_meshes = meshes
+    b.max_vertices = vertices
+    b.max_draws = draws
+}
+
+// Every mesh, the canvas and the pair freed: what a host does when the
+// page that made the batch goes.
+batch_free(b: *Batch) {
+    if b == null { return }
+    r = b.renderer as *GLRenderer
+    k = 0
+    while k < list.size(b.meshes) {
+        m = list.get_raw(b.meshes, k) as *BatchMesh
+        gl.renderer_mesh_free(r, m.handle)
+        core.mesh_destroy(m.mesh)
+        heap.free(m)
+        k = k + 1
+    }
+    list.free(b.meshes)
+    gl.renderer_canvas_free(r, b.canvas)
+    gpu.shader_free(b.vs as *GpuShader)
+    gpu.shader_free(b.ps as *GpuShader)
+    heap.free(b)
+}
+
+batch_width(b: *Batch) -> int { return b.width }
+batch_height(b: *Batch) -> int { return b.height }
+batch_frame(b: *Batch) -> long { return b.frame }
+batch_mesh_count(b: *Batch) -> int { return list.size(b.meshes) }
+batch_vertex_count(b: *Batch) -> int { return b.vertices }
+batch_draw_count(b: *Batch) -> int { return b.draws }
+
+batch_triangle_count(b: *Batch) -> int {
+    t = 0
+    k = 0
+    while k < list.size(b.meshes) {
+        t = t + (list.get_raw(b.meshes, k) as *BatchMesh).triangles
+        k = k + 1
+    }
+    return t
+}
+
+fn word(data: ptr, i: int) -> long { return mem.get_u32_le(data, i * 4) }
+fn wint(data: ptr, i: int) -> int { return mem.get_u32_le(data, i * 4) as int }
+fn wf(data: ptr, i: int) -> float { return mem.get_float32(data, i * 4) }
+
+fn m4_read(data: ptr, i: int) -> mat4 {
+    return mat4_floats(wf(data, i), wf(data, i + 1), wf(data, i + 2), wf(data, i + 3),
+                       wf(data, i + 4), wf(data, i + 5), wf(data, i + 6), wf(data, i + 7),
+                       wf(data, i + 8), wf(data, i + 9), wf(data, i + 10), wf(data, i + 11),
+                       wf(data, i + 12), wf(data, i + 13), wf(data, i + 14), wf(data, i + 15))
+}
+
+fn find(b: *Batch, id: long) -> int {
+    k = 0
+    while k < list.size(b.meshes) {
+        if (list.get_raw(b.meshes, k) as *BatchMesh).id == id { return k }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+fn drop_at(b: *Batch, k: int) {
+    m = list.get_raw(b.meshes, k) as *BatchMesh
+    gl.renderer_mesh_free(b.renderer as *GLRenderer, m.handle)
+    core.mesh_destroy(m.mesh)
+    b.vertices = b.vertices - m.vertices
+    heap.free(m)
+    list.remove(b.meshes, k)
+}
+
+// Whether every id the batch draws is a mesh after its meshes and frees:
+// live now and not freed, or sent in this batch.
+fn drawable(b: *Batch, data: ptr, sent_at: int, sent: int, freed_at: int, freed: int, id: long) -> bool {
+    at = sent_at
+    k = 0
+    while k < sent {
+        if word(data, at) == id { return true }
+        v = wint(data, at + 1)
+        n = wint(data, at + 2)
+        at = at + 3 + v * 8 + n
+        k = k + 1
+    }
+    if find(b, id) < 0 { return false }
+    k = 0
+    while k < freed {
+        if word(data, freed_at + k) == id { return false }
+        k = k + 1
+    }
+    return true
+}
+
+// The checks, all of them before anything changes: "" when the batch can
+// be taken, else why not.
+fn check(b: *Batch, data: ptr, bytes: int) -> string {
+    if data == null || bytes < (HEADER_WORDS + 3) * 4 { return "batch: shorter than its header" }
+    if bytes % 4 != 0 { return "batch: not a whole number of words" }
+    words = bytes / 4
+    if word(data, 0) != (MAGIC as long) { return "batch: not a batch (magic)" }
+    if wint(data, 1) != VERSION { return "batch: version ${wint(data, 1)}, not ${VERSION}" }
+    if word(data, 2) != (words as long) { return "batch: says ${word(data, 2)} words, is ${words}" }
+    at = HEADER_WORDS
+    sent = wint(data, at)
+    at = at + 1
+    sent_at = at
+    vertices = b.vertices
+    k = 0
+    while k < sent {
+        if at + 3 > words { return "batch: mesh ${k} runs past the end" }
+        id = word(data, at)
+        v = word(data, at + 1)
+        n = word(data, at + 2)
+        if id == 0 { return "batch: mesh ${k} has id 0" }
+        if v < 3 || v > (b.max_vertices as long) { return "batch: mesh ${id} has ${v} vertices" }
+        if n == 0 && v % 3 != 0 { return "batch: mesh ${id}'s ${v} vertices are not whole triangles" }
+        if n % 3 != 0 || n > (b.max_vertices as long) * 6 { return "batch: mesh ${id} has ${n} indices" }
+        size = 3 + v * 8 + n
+        if (at as long) + size > (words as long) { return "batch: mesh ${id} runs past the end" }
+        base = at + 3 + (v as int) * 8
+        i = 0
+        while (i as long) < n {
+            if word(data, base + i) >= v { return "batch: mesh ${id}'s index ${i} is past its vertices" }
+            i = i + 1
+        }
+        j = sent_at
+        q = 0
+        while q < k {
+            if word(data, j) == id { return "batch: mesh ${id} sent twice" }
+            j = j + 3 + wint(data, j + 1) * 8 + wint(data, j + 2)
+            q = q + 1
+        }
+        old = find(b, id)
+        if old >= 0 { vertices = vertices - (list.get_raw(b.meshes, old) as *BatchMesh).vertices }
+        vertices = vertices + (v as int)
+        at = at + (size as int)
+        k = k + 1
+    }
+    if at + 1 > words { return "batch: no frees" }
+    freed = wint(data, at)
+    at = at + 1
+    freed_at = at
+    if (at as long) + (freed as long) + 1 > (words as long) { return "batch: frees run past the end" }
+    live = list.size(b.meshes)
+    j = sent_at
+    k = 0
+    while k < sent {
+        if find(b, word(data, j)) < 0 { live = live + 1 }
+        j = j + 3 + wint(data, j + 1) * 8 + wint(data, j + 2)
+        k = k + 1
+    }
+    k = 0
+    while k < freed {
+        fid = word(data, at + k)
+        fk = find(b, fid)
+        if fk < 0 { return "batch: frees mesh ${fid}, which is not there" }
+        vertices = vertices - (list.get_raw(b.meshes, fk) as *BatchMesh).vertices
+        live = live - 1
+        k = k + 1
+    }
+    at = at + freed
+    if live > b.max_meshes { return "batch: ${live} meshes, over the limit of ${b.max_meshes}" }
+    if vertices > b.max_vertices { return "batch: ${vertices} vertices, over the limit of ${b.max_vertices}" }
+    draws = wint(data, at)
+    at = at + 1
+    if draws > b.max_draws { return "batch: ${draws} draws, over the limit of ${b.max_draws}" }
+    if (at as long) + (draws as long) * DRAW_WORDS != (words as long) { return "batch: its draws do not end it" }
+    k = 0
+    while k < draws {
+        d = at + k * DRAW_WORDS
+        if !drawable(b, data, sent_at, sent, freed_at, freed, word(data, d)) { return "batch: draw ${k} names mesh ${word(data, d)}, which is not there" }
+        if wint(data, d + 1) != MATERIAL_NORMAL { return "batch: draw ${k}'s material ${wint(data, d + 1)} is not one there is" }
+        if wint(data, d + 2) > FLAG_DOUBLE_SIDE { return "batch: draw ${k}'s flags ${wint(data, d + 2)}" }
+        k = k + 1
+    }
+    return ""
+}
+
+// The cofactors of m's upper three by three (det(m) times its inverse
+// transpose), signed so they keep a normal's side when m mirrors: what
+// takes a normal into the eye's space once normalised.
+fn normal_turn(m: mat4) -> mat4 {
+    a = m4_at(m, 0, 0)
+    bb = m4_at(m, 1, 0)
+    c = m4_at(m, 2, 0)
+    d = m4_at(m, 0, 1)
+    e = m4_at(m, 1, 1)
+    f = m4_at(m, 2, 1)
+    g = m4_at(m, 0, 2)
+    h = m4_at(m, 1, 2)
+    i = m4_at(m, 2, 2)
+    // rows (a b c / d e f / g h i); the cofactor matrix C, C[r][c]
+    c00 = e * i - f * h
+    c01 = 0.0 - (d * i - f * g)
+    c02 = d * h - e * g
+    c10 = 0.0 - (bb * i - c * h)
+    c11 = a * i - c * g
+    c12 = 0.0 - (a * h - bb * g)
+    c20 = bb * f - c * e
+    c21 = 0.0 - (a * f - c * d)
+    c22 = a * e - bb * d
+    det = a * c00 + bb * c01 + c * c02
+    s = 1.0
+    if det < 0.0 { s = 0.0 - 1.0 }
+    // column-major: column c holds C[0][c], C[1][c], C[2][c]
+    return mat4_floats(s * c00, s * c10, s * c20, 0.0,
+                       s * c01, s * c11, s * c21, 0.0,
+                       s * c02, s * c12, s * c22, 0.0,
+                       0.0, 0.0, 0.0, 1.0)
+}
+
+fn make_mesh(data: ptr, at: int) -> ptr {
+    v = wint(data, at + 1)
+    n = wint(data, at + 2)
+    pos = at + 3
+    nor = pos + v * 3
+    uv = nor + v * 3
+    idx = uv + v * 2
+    m = core.mesh_create()
+    count = n
+    if count == 0 { count = v }
+    _r = core.mesh_reserve(m, v, count)
+    k = 0
+    while k < v {
+        _i = geometry.mesh_push_vertex(m, wf(data, pos + k * 3), wf(data, pos + k * 3 + 1), wf(data, pos + k * 3 + 2),
+                                       wf(data, uv + k * 2), wf(data, uv + k * 2 + 1),
+                                       wf(data, nor + k * 3), wf(data, nor + k * 3 + 1), wf(data, nor + k * 3 + 2))
+        k = k + 1
+    }
+    k = 0
+    while k < count {
+        if n == 0 { _x = geometry.mesh_push_index(m, k) } else { _x = geometry.mesh_push_index(m, wint(data, idx + k)) }
+        k = k + 1
+    }
+    return m
+}
+
+// Takes a batch (`bytes` long at `data`, the host's): "" when it was
+// taken, else why it was refused, with nothing changed. The draws it
+// queues are drawn by batch_draw, and stay queued till the next batch.
+batch_submit(b: *Batch, data: ptr, bytes: int) -> string {
+    if b == null { return "batch: none" }
+    why = check(b, data, bytes)
+    if why != "" { return why }
+    r = b.renderer as *GLRenderer
+    b.frame = word(data, 3)
+    view = m4_read(data, 4)
+    lens = m4_read(data, 20)
+    at = HEADER_WORDS
+    sent = wint(data, at)
+    at = at + 1
+    k = 0
+    while k < sent {
+        id = word(data, at)
+        old = find(b, id)
+        if old >= 0 { drop_at(b, old) }
+        m = heap.new(BatchMesh)
+        m.id = id
+        m.mesh = make_mesh(data, at)
+        m.handle = gl.renderer_mesh_new(r, m.mesh)
+        m.vertices = wint(data, at + 1)
+        m.triangles = geometry.mesh_index_count(m.mesh) / 3
+        b.vertices = b.vertices + m.vertices
+        list.add_raw(b.meshes, m as ptr)
+        at = at + 3 + m.vertices * 8 + wint(data, at + 2)
+        k = k + 1
+    }
+    freed = wint(data, at)
+    at = at + 1
+    k = 0
+    while k < freed {
+        drop_at(b, find(b, word(data, at + k)))
+        k = k + 1
+    }
+    at = at + freed
+    draws = wint(data, at)
+    at = at + 1
+    gl.renderer_canvas_begin(r, b.canvas, wf(data, 36), wf(data, 37), wf(data, 38), wf(data, 39))
+    vs = b.vs as *GpuShader
+    ps = b.ps as *GpuShader
+    k = 0
+    while k < draws {
+        d = at + k * DRAW_WORDS
+        mk = find(b, word(data, d))
+        m = list.get_raw(b.meshes, mk) as *BatchMesh
+        eye = mul_m4(view, m4_read(data, d + 4))
+        _a = gpu.set_m4(vs, "mvp", mul_m4(lens, eye))
+        _b = gpu.set_m4(vs, "turn", normal_turn(eye))
+        _c = gpu.set_float(ps, "opacity", wf(data, d + 3))
+        cull = (wint(data, d + 2) & FLAG_DOUBLE_SIDE) == 0
+        gl.renderer_canvas_draw(r, b.canvas, vs, ps, m.handle, cull, null, 0)
+        k = k + 1
+    }
+    b.draws = draws
+    return ""
+}
+
+// The queued draws drawn into the canvas now.
+batch_draw(b: *Batch) {
+    if b == null { return }
+    gl.renderer_draw_canvases(b.renderer as *GLRenderer)
+}
+
+// The canvas as last drawn: RGBA rows, top first, owned by the batch.
+batch_pixels(b: *Batch) -> ptr {
+    if b == null { return null }
+    return gl.renderer_canvas_pixels(b.renderer as *GLRenderer, b.canvas)
+}

@@ -83,3 +83,28 @@ another renderer: at three places on its way, no more than 71 pixels of
 307,200 more than 2/255 from them, on Vulkan and on OpenGL. A pair whose
 vertex shader has no input, a sky's corners in clip space, is drawn as
 well.
+
+## A frame from a host: `ae3d.batch`
+
+A host that is not Aether, a sae page running three.js, describes its frame
+in one buffer a frame (`ae3d.batch`, its layout in the module's header): the
+eye's view and lens, each draw's world matrix and material, and the meshes
+that are new or changed since. `batch_submit` checks the buffer whole and
+refuses one that is malformed or over the host's limits with its reason,
+changing nothing; it then queues a canvas draw for each of the buffer's
+draws with ae3d's own pair for its material (`ae3d.batchmaterials`: the
+first is three.js's MeshNormalMaterial). `batch_draw` draws the canvas and
+`batch_pixels` reads it back, rows top first, for a host that composites
+the picture itself. OpenGL only so far.
+
+```aether
+b = batch.batch_new(renderer, 640, 480)          // a GLRenderer that is up, no window needed
+batch.batch_set_limits(b, 256, 1000000, 4096)    // meshes, vertices, draws
+why = batch.batch_submit(b, data, bytes)         // "" or why it was refused
+batch.batch_draw(b)
+pixels = batch.batch_pixels(b)
+```
+
+`tests/test_batch` holds it to a cube's pose worked out by hand, and draws
+three.js's README cube from the batches its `AeRenderer` made on sae's
+engine, held by three.js's own maths to within 1/255.
