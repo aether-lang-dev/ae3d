@@ -85,6 +85,12 @@ written is what is shown.
 
 ## Checked by
 
+`tests/test_canvas` holds a canvas to what is said here, on OpenGL and on
+Vulkan, every pixel worked out by the test: a 4 x 4 picture read on a card
+whose uv runs 0 to 2 is every texel its bytes exactly, nearest, repeating
+and top row first; and draws with and without `over` laid on each other in
+the order queued, a see-through card behind one drawn before it unseen.
+
 `examples/canvas.ae` draws a turning globe, lit by the sun in bands of
 latitude, into a 480 x 480 canvas in the middle of the frame: the same on
 Vulkan and OpenGL to 1/255 at every pixel of 576,000, with nothing from
