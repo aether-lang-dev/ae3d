@@ -1,0 +1,364 @@
+// A program's canvas (engine_canvas_*), held to what the docs say of it,
+// on OpenGL and on Vulkan, each frame read back with the canvas over the
+// whole of it:
+//
+//   - a picture of the program's (engine_texture_new) is read as its bytes
+//     are, through no colour curve, from its top row, each sample the one
+//     texel it falls in, repeating past 1: a card whose uv runs 0 to 2
+//     across a 4 x 4 picture shows it twice each way, every pixel the
+//     texel its centre falls in, exactly. Linear filtering, an sRGB read,
+//     clamping or a picture turned over each move most of the pixels.
+//   - a draw with `over` is laid on what is there by its alpha
+//     (src * a + dst * (1 - a)), one without is written as it is; each is
+//     depth-tested and writes depth, and the draws are made in the order
+//     queued: a see-through card behind one drawn before it is not seen,
+//     and where it is in front it is laid over what is under.
+//
+// Each case is a band of pixels worked out here, not by a renderer.
+import std.mem
+import ae3d.core
+import ae3d.core (Backend)
+import ae3d.gl
+import ae3d.gl (GLRenderer)
+import ae3d.vulkan
+import ae3d.vulkan (VKRenderer)
+import ae3d.offscreen
+import ae3d.gpu
+import ae3d.gpu (GpuShader, QuotedSpirv)
+import ae3d.shaderlib (vec3, vec4, mat4, mat4_floats, Texture)
+import tests.lib.canvascard
+import tests.lib.canvascard_spirv
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern exit(code: int)
+extern abs(x: int) -> int
+
+const SIZE = 128                   // the frame and the canvas
+const TEXELS = 4                   // the picture, square
+
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        println("  FAIL ${name}")
+        g_failures = g_failures + 1
+    }
+}
+
+// One renderer, drawn offscreen.
+struct Side {
+    name: string
+    vk: bool
+    gl: *GLRenderer
+    vkr: *VKRenderer
+    target: ptr                    // OpenGL's frame
+    pass: *Backend
+}
+
+fn identity() -> mat4 {
+    return mat4_floats(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+}
+
+// OpenGL's clip space made the renderer's, as engine_canvas_lens makes it:
+// on Vulkan y turned over and z halved into 0 to 1.
+fn lens(s: *Side) -> mat4 {
+    if !s.vk { return identity() }
+    return mat4_floats(1.0, 0.0, 0.0, 0.0, 0.0, 0.0 - 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0)
+}
+
+// A card from (x0, y0) to (x1, y1) in clip space, y up, at depth z, its uv
+// (u0, v0) at the top left and (u1, v1) at the bottom right.
+fn card_mesh(x0: float, y0: float, x1: float, y1: float, z: float, u0: float, v0: float, u1: float, v1: float) -> ptr {
+    m = core.mesh_create()
+    n = core.vec3(0.0, 0.0, 1.0)
+    _a = core.mesh_push_vertex(m, core.vec3(x0, y1, z), u0, v0, n)
+    _b = core.mesh_push_vertex(m, core.vec3(x1, y1, z), u1, v0, n)
+    _c = core.mesh_push_vertex(m, core.vec3(x1, y0, z), u1, v1, n)
+    _d = core.mesh_push_vertex(m, core.vec3(x0, y0, z), u0, v1, n)
+    core.mesh_push_triangle(m, 0, 1, 2)
+    core.mesh_push_triangle(m, 0, 2, 3)
+    return m
+}
+
+fn mesh_new(s: *Side, m: ptr) -> int {
+    if s.vk { return vulkan.renderer_mesh_new(s.vkr, m) }
+    return gl.renderer_mesh_new(s.gl, m)
+}
+
+fn canvas_new(s: *Side) -> int {
+    if s.vk { return vulkan.renderer_canvas_new(s.vkr, SIZE, SIZE) }
+    return gl.renderer_canvas_new(s.gl, SIZE, SIZE)
+}
+
+fn canvas_begin(s: *Side, canvas: int) {
+    if s.vk { vulkan.renderer_canvas_begin(s.vkr, canvas, 0.0, 0.0, 0.0, 1.0) } else { gl.renderer_canvas_begin(s.gl, canvas, 0.0, 0.0, 0.0, 1.0) }
+}
+
+fn draw(s: *Side, canvas: int, vs: *GpuShader, ps: *GpuShader, spirv: *QuotedSpirv, mesh: int, over: bool, textures: ptr, count: int) {
+    if s.vk {
+        vulkan.renderer_canvas_draw(s.vkr, canvas, vs, ps, spirv, mesh, false, over, textures, count)
+    } else {
+        gl.renderer_canvas_draw(s.gl, canvas, vs, ps, mesh, false, over, textures, count)
+    }
+}
+
+// The canvas shown over the whole frame, the frame drawn, and its pixels:
+// RGBA rows, top first.
+fn frame(s: *Side, canvas: int, cam: ptr, light: ptr) -> ptr {
+    shown = false
+    if s.vk { shown = vulkan.renderer_canvas_show(s.vkr, canvas, 0, 0, SIZE, SIZE) } else { shown = gl.renderer_canvas_show(s.gl, canvas, 0, 0, SIZE, SIZE) }
+    check("${s.name}: the canvas is shown", shown)
+    core.backend_render(s.pass, cam as *Camera, light as *Light)
+    if s.vk { return vulkan.offscreen_pixels() }
+    return offscreen.target_pixels(s.target)
+}
+
+fn channel(pixels: ptr, x: int, y: int, c: int) -> int {
+    return mem.get_uint8(pixels, (y * SIZE + x) * 4 + c)
+}
+
+// --- a picture of the program's -----------------------------------------------
+
+// Texel (x, y), row 0 the top: low values in it, where an sRGB read is
+// furthest from the bytes.
+fn texel(x: int, y: int, c: int) -> int {
+    if c == 0 { return 9 + 61 * x }
+    if c == 1 { return 9 + 61 * y }
+    if c == 2 { return 240 - 29 * (x + y) }
+    return 255
+}
+
+fn picture_bytes() -> ptr {
+    p = calloc(TEXELS * TEXELS, 4)
+    y = 0
+    while y < TEXELS {
+        x = 0
+        while x < TEXELS {
+            _s = mem.set_u32_le(p, (y * TEXELS + x) * 4, (texel(x, y, 0) + 256 * texel(x, y, 1) + 65536 * texel(x, y, 2) + 16777216 * texel(x, y, 3)) as long)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return p
+}
+
+fn picture_case(s: *Side, cam: ptr, light: ptr) {
+    canvas = canvas_new(s)
+    check("${s.name}: a canvas", canvas != 0)
+    if canvas == 0 { return }
+    bytes = picture_bytes()
+    handle = 0
+    if s.vk { handle = vulkan.renderer_texture_new(s.vkr, TEXELS, TEXELS, bytes) } else { handle = gl.renderer_texture_new(s.gl, TEXELS, TEXELS, bytes) }
+    check("${s.name}: a picture", handle != 0)
+    textures = calloc(1, 8)
+    _t = mem.set_u32_le(textures, 0, handle as long)
+    m = card_mesh(0.0 - 1.0, 0.0 - 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 2.0, 2.0)
+    mesh = mesh_new(s, m)
+    vs = canvascard.card_vertex(lens(s))
+    ps = canvascard.card_picture(Texture { image: null })
+    canvas_begin(s, canvas)
+    draw(s, canvas, vs, ps, canvascard_spirv.picture(), mesh, false, textures, 1)
+    pixels = frame(s, canvas, cam, light)
+    check("${s.name}: picture: a frame", pixels != null)
+    if pixels == null { return }
+
+    // Each pixel's centre at uv 2 * (x + 0.5) / SIZE across, the same down:
+    // the texel it falls in, the picture repeating past 1.
+    wrong = 0
+    worst = 0
+    first = ""
+    y = 0
+    while y < SIZE {
+        x = 0
+        while x < SIZE {
+            tx = (x * 2 * TEXELS / SIZE) % TEXELS
+            ty = (y * 2 * TEXELS / SIZE) % TEXELS
+            c = 0
+            off = false
+            while c < 3 {
+                d = abs(channel(pixels, x, y, c) - texel(tx, ty, c))
+                if d > worst { worst = d }
+                if d > 1 { off = true }
+                c = c + 1
+            }
+            if off {
+                if wrong == 0 {
+                    first = "(${x}, ${y}) is ${channel(pixels, x, y, 0)} ${channel(pixels, x, y, 1)} ${channel(pixels, x, y, 2)}, texel (${tx}, ${ty}) ${texel(tx, ty, 0)} ${texel(tx, ty, 1)} ${texel(tx, ty, 2)}"
+                }
+                wrong = wrong + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    println("  ${s.name}: picture: ${wrong} of ${SIZE * SIZE} pixels not their texel, worst ${worst}/255 ${first}")
+    check("${s.name}: a picture is read nearest, repeating, its bytes as they are, top row first", wrong == 0)
+
+    canvas_begin(s, canvas)
+    if s.vk { vulkan.renderer_canvas_free(s.vkr, canvas) } else { gl.renderer_canvas_free(s.gl, canvas) }
+    if s.vk { vulkan.renderer_texture_free(s.vkr, handle) } else { gl.renderer_texture_free(s.gl, handle) }
+    if s.vk { vulkan.renderer_mesh_free(s.vkr, mesh) } else { gl.renderer_mesh_free(s.gl, mesh) }
+    core.mesh_destroy(m)
+    free(textures)
+    free(bytes)
+}
+
+// --- draws laid over by alpha -----------------------------------------------------
+
+struct Band {
+    x0: int                        // pixels, the band's columns [x0, x1)
+    x1: int
+    y0: int
+    y1: int
+    r: int
+    g: int
+    b: int
+    what: string
+}
+
+fn band(s: *Side, pixels: ptr, b: Band) {
+    wrong = 0
+    worst = 0
+    y = b.y0
+    while y < b.y1 {
+        x = b.x0
+        while x < b.x1 {
+            dr = abs(channel(pixels, x, y, 0) - b.r)
+            dg = abs(channel(pixels, x, y, 1) - b.g)
+            db = abs(channel(pixels, x, y, 2) - b.b)
+            d = dr
+            if dg > d { d = dg }
+            if db > d { d = db }
+            if d > worst { worst = d }
+            if d > 2 { wrong = wrong + 1 }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    mx = (b.x0 + b.x1) / 2
+    my = (b.y0 + b.y1) / 2
+    got = "${channel(pixels, mx, my, 0)} ${channel(pixels, mx, my, 1)} ${channel(pixels, mx, my, 2)}"
+    check("${s.name}: ${b.what}: ${b.r} ${b.g} ${b.b} (${got}, worst ${worst}/255)", wrong == 0)
+}
+
+// The draws, in the order queued, each a colour card from x0 to x1 across
+// and y0 to y1 up at depth z (less is nearer):
+//
+//   1  red, opaque, the whole canvas, z 0.5
+//   2  blue at alpha 0.25 without `over`, x -1 to -0.5, z 0.4: blue as it is
+//   3  green at 0.5 over, x -0.5 to 0.5, z 0.3: on red
+//   4  blue at 0.5 over, x 0 to 1, z 0.2: on 3's green where it is, on red past
+//   5  white at 0.5 over, the top half, z 0.6: behind all of it, unseen
+//   6  yellow at 0.5 over, x -0.75 to 0, the bottom half, z 0.35: in front of
+//      2's blue, laid on it; behind 3, which was drawn before and wrote its
+//      depth, so unseen there
+fn over_case(s: *Side, cam: ptr, light: ptr) {
+    canvas = canvas_new(s)
+    if canvas == 0 { return }
+    n = 0.0 - 1.0
+    meshes = calloc(6, 8)
+    cards = calloc(6, 8)
+    (cards as ptr[])[0] = card_mesh(n, n, 1.0, 1.0, 0.5, 0.0, 0.0, 1.0, 1.0)
+    (cards as ptr[])[1] = card_mesh(n, n, 0.0 - 0.5, 1.0, 0.4, 0.0, 0.0, 1.0, 1.0)
+    (cards as ptr[])[2] = card_mesh(0.0 - 0.5, n, 0.5, 1.0, 0.3, 0.0, 0.0, 1.0, 1.0)
+    (cards as ptr[])[3] = card_mesh(0.0, n, 1.0, 1.0, 0.2, 0.0, 0.0, 1.0, 1.0)
+    (cards as ptr[])[4] = card_mesh(n, 0.0, 1.0, 1.0, 0.6, 0.0, 0.0, 1.0, 1.0)
+    (cards as ptr[])[5] = card_mesh(0.0 - 0.75, n, 0.0, 0.0, 0.35, 0.0, 0.0, 1.0, 1.0)
+    k = 0
+    while k < 6 {
+        (meshes as int[])[k] = mesh_new(s, (cards as ptr[])[k])
+        k = k + 1
+    }
+    vs = canvascard.card_vertex(lens(s))
+    ps = canvascard.card_colour(vec4(vec3(1.0, 1.0, 1.0), 1.0))
+    spirv = canvascard_spirv.colour()
+    canvas_begin(s, canvas)
+    _c1 = gpu.set_vec4(ps, "colour", 1.0, 0.0, 0.0, 1.0)
+    draw(s, canvas, vs, ps, spirv, (meshes as int[])[0], false, null, 0)
+    _c2 = gpu.set_vec4(ps, "colour", 0.0, 0.0, 1.0, 0.25)
+    draw(s, canvas, vs, ps, spirv, (meshes as int[])[1], false, null, 0)
+    _c3 = gpu.set_vec4(ps, "colour", 0.0, 1.0, 0.0, 0.5)
+    draw(s, canvas, vs, ps, spirv, (meshes as int[])[2], true, null, 0)
+    _c4 = gpu.set_vec4(ps, "colour", 0.0, 0.0, 1.0, 0.5)
+    draw(s, canvas, vs, ps, spirv, (meshes as int[])[3], true, null, 0)
+    _c5 = gpu.set_vec4(ps, "colour", 1.0, 1.0, 1.0, 0.5)
+    draw(s, canvas, vs, ps, spirv, (meshes as int[])[4], true, null, 0)
+    _c6 = gpu.set_vec4(ps, "colour", 1.0, 1.0, 0.0, 0.5)
+    draw(s, canvas, vs, ps, spirv, (meshes as int[])[5], true, null, 0)
+    pixels = frame(s, canvas, cam, light)
+    check("${s.name}: over: a frame", pixels != null)
+    if pixels == null { return }
+
+    // Columns: x -1 | -0.75 | -0.5 | 0 | 0.5 | 1 is pixels 0 | 16 | 32 | 64 | 96 | 128;
+    // rows: the top half 0 to 64, the bottom 64 to 128. A pixel off each edge.
+    band(s, pixels, Band { x0: 1, x1: 15, y0: 1, y1: 127, r: 0, g: 0, b: 255, what: "without over, written as it is" })
+    band(s, pixels, Band { x0: 17, x1: 31, y0: 1, y1: 63, r: 0, g: 0, b: 255, what: "a card behind all of it is not seen" })
+    band(s, pixels, Band { x0: 17, x1: 31, y0: 65, y1: 127, r: 128, g: 128, b: 128, what: "yellow at 0.5 over blue" })
+    band(s, pixels, Band { x0: 33, x1: 63, y0: 1, y1: 63, r: 128, g: 128, b: 0, what: "green at 0.5 over red" })
+    band(s, pixels, Band { x0: 33, x1: 63, y0: 65, y1: 127, r: 128, g: 128, b: 0, what: "a card behind one drawn before it is not seen" })
+    band(s, pixels, Band { x0: 65, x1: 95, y0: 1, y1: 127, r: 64, g: 64, b: 128, what: "blue at 0.5 over green over red, in the order queued" })
+    band(s, pixels, Band { x0: 97, x1: 127, y0: 1, y1: 127, r: 128, g: 0, b: 128, what: "blue at 0.5 over red" })
+
+    canvas_begin(s, canvas)
+    if s.vk { vulkan.renderer_canvas_free(s.vkr, canvas) } else { gl.renderer_canvas_free(s.gl, canvas) }
+    k = 0
+    while k < 6 {
+        h = (meshes as int[])[k]
+        if s.vk { vulkan.renderer_mesh_free(s.vkr, h) } else { gl.renderer_mesh_free(s.gl, h) }
+        core.mesh_destroy((cards as ptr[])[k])
+        k = k + 1
+    }
+    free(meshes)
+    free(cards)
+}
+
+main() {
+    cam = core.camera_new(SIZE, SIZE)
+    light = core.light_sun(core.vec3(0.3, 0.6, 0.8))
+
+    context = offscreen.context_create(SIZE, SIZE)
+    if context == null {
+        println("canvas: SKIP no OpenGL context")
+    } else {
+        renderer = gl.renderer_new()
+        pass = gl.backend(renderer)
+        if !core.backend_init(&pass, context, SIZE, SIZE) {
+            println("canvas: FAIL OpenGL would not start")
+            exit(1)
+        }
+        target = offscreen.target_create(SIZE, SIZE)
+        gl.renderer_set_target(renderer, target)
+        side = Side { name: "opengl", vk: false, gl: renderer, vkr: null, target: target, pass: &pass }
+        println("opengl:")
+        picture_case(&side, cam as ptr, light as ptr)
+        over_case(&side, cam as ptr, light as ptr)
+        offscreen.target_destroy(target)
+        gl.renderer_free(renderer)
+        offscreen.context_destroy(context)
+    }
+
+    if !vulkan.available() {
+        println("canvas: SKIP no Vulkan driver (${vulkan.last_error()})")
+    } else {
+        vkr = vulkan.renderer_new()
+        vpass = vulkan.backend(vkr)
+        if !core.backend_init(&vpass, null, SIZE, SIZE) {
+            println("canvas: SKIP Vulkan would not start (${vulkan.last_error()})")
+        } else {
+            vside = Side { name: "vulkan", vk: true, gl: null, vkr: vkr, target: null, pass: &vpass }
+            println("vulkan:")
+            picture_case(&vside, cam as ptr, light as ptr)
+            over_case(&vside, cam as ptr, light as ptr)
+            vulkan.renderer_free(vkr)
+        }
+    }
+
+    if g_failures > 0 {
+        println("canvas: ${g_failures} FAILED")
+        exit(1)
+    }
+    println("canvas: all checks passed")
+}
