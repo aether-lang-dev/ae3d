@@ -1,0 +1,562 @@
+// ci: optimised -- its cost check times the solve, which -O0 makes seven times slower (987 ns a joint a step here against 139 at -O2; 2,046 and 2,116 on linux-3 and macos-3)
+// Secondary motion (#989): spring chains and jiggle (ae3d.springs).
+//
+// A ponytail of four joints on a figure that stands, runs off at 4 m/s,
+// runs on, turns left at 1.5 rad/s, stops hard and stands, stepped at 60 Hz:
+//   - its tip lags: behind its pose's tip as the figure runs off, out of the
+//     turn as it turns;
+//   - it settles in its time constant, tau = 2 / (damping + drag): after
+//     the stop its swing's envelope (its largest distance from where it
+//     comes to rest over each time constant) falls by e^-1 a time constant:
+//     tau read from the 2nd and the 6th time constants after the stop is
+//     at most 1.2 times 2 / (damping + drag). That is the springs' own
+//     (every mode of a chain of springs to its pose, damped in proportion,
+//     dies down at (damping + drag) / 2); with gravity the tail lies on the
+//     back held up against its weight, softer, and its tau is printed;
+//   - it never passes into the body's colliders (a sphere on the head, a
+//     capsule down the trunk): no joint of it is inside one past its hit
+//     radius at any step, 0 mm (rounding, 0.001 mm), and no point between
+//     joints (three a segment) inside the colliders themselves;
+//   - at rest it is still: over the last second it stays within 1 mm of
+//     where it ends; with no gravity it rests within 1 mm of its pose;
+//   - the same to the bit run to run;
+//   - its cost a joint a step, printed (the target: well under 1 us).
+// And a file's own: VRoid Studio's base female (CC0) lists VRM 0.x spring
+// bones (its bust, its skirt) and colliders on its thighs. Imported as
+// chains, run by its animator on the job pool (ae3d.jobs) in the engine's
+// fixed step as the figure is moved round the same course: no skirt joint
+// inside a thigh's collider, at rest within 1 mm, the same to the bit run to
+// run and with the pool off.
+
+import ae3d.core
+import ae3d.engine
+import ae3d.behaviour
+import ae3d.figure
+import ae3d.gltf
+import ae3d.pose
+import ae3d.clips
+import ae3d.animator
+import ae3d.springs
+import std.heap
+import std.string
+
+extern exit(code: int)
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern log(x: float) -> float
+
+ln_ratio(x: float) -> float { return log(x) }
+
+const STEP = 0.016666666666666666
+const VROID = "tests/fixtures/people/vroid_base_female.vrm"
+// The course, seconds: standing, running off, running, turning, stopping, standing.
+const RUN_FROM = 1.0
+const RUN_UP = 0.4
+const TURN_FROM = 3.0
+const TURN_TO = 5.0
+const STOP_TIME = 0.3
+const END = 10.3
+const SPEED = 4.0
+const TURN_RATE = 1.5
+// The ponytail's settings.
+const STIFFNESS = 100.0
+const DAMPING = 3.0
+const DRAG = 1.0
+const HIT = 0.02
+// Inside by more than this is inside (rounding).
+const ROUNDING = 0.000001
+
+var g_checks = 0
+var g_failures = 0
+
+check(name: string, ok: bool) {
+    g_checks = g_checks + 1
+    if ok {
+        println("  ok   ${name}")
+    } else {
+        g_failures = g_failures + 1
+        println("  FAIL ${name}")
+    }
+}
+
+absf(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+mm(x: float) -> float { return x * 1000.0 }
+
+// --- the course -------------------------------------------------------------------------------
+
+struct Course {
+    x: float
+    z: float
+    heading: float                 // radians about up from +z
+    speed: float
+    t: float
+}
+
+course_new() -> *Course { return heap.new(Course) }
+
+// The course a step on: its speed, its heading, its place.
+course_step(c: *Course, h: float) {
+    t = c.t + h
+    speed = 0.0
+    if t > RUN_FROM { speed = SPEED * core.clampf((t - RUN_FROM) / RUN_UP, 0.0, 1.0) }
+    stop_from = TURN_TO
+    if t > stop_from { speed = SPEED * core.clampf(1.0 - (t - stop_from) / STOP_TIME, 0.0, 1.0) }
+    if t > TURN_FROM && t <= TURN_TO { c.heading = c.heading + TURN_RATE * h }
+    c.speed = speed
+    c.x = c.x + core.sin_of(c.heading) * speed * h
+    c.z = c.z + core.cos_of(c.heading) * speed * h
+    c.t = t
+}
+
+course_forward(c: *Course) -> Vec3 { return core.vec3(core.sin_of(c.heading), 0.0, core.cos_of(c.heading)) }
+
+// --- the ponytail -----------------------------------------------------------------------------
+
+const J_ROOT = 0
+const J_HEAD = 3
+const J_TIE = 4
+const J_END = 8
+
+ponytail_rig() -> *pose.Rig {
+    n = 9
+    names = calloc(n, 8)
+    (names as ptr[])[0] = string.keep("root")
+    (names as ptr[])[1] = string.keep("spine")
+    (names as ptr[])[2] = string.keep("chest")
+    (names as ptr[])[3] = string.keep("head")
+    (names as ptr[])[4] = string.keep("tie")
+    (names as ptr[])[5] = string.keep("hair_1")
+    (names as ptr[])[6] = string.keep("hair_2")
+    (names as ptr[])[7] = string.keep("hair_3")
+    (names as ptr[])[8] = string.keep("hair_end")
+    parents = calloc(n, 4) as int[]
+    parents[0] = 0 - 1
+    parents[1] = 0
+    parents[2] = 1
+    parents[3] = 2
+    parents[4] = 3
+    parents[5] = 4
+    parents[6] = 5
+    parents[7] = 6
+    parents[8] = 7
+    rest = calloc(n * pose.FLOATS, 8)
+    k = 0
+    while k < n {
+        pose.set_rotation(rest, k, core.quat_ident())
+        pose.set_scale(rest, k, core.vec3(1.0, 1.0, 1.0))
+        k = k + 1
+    }
+    pose.set_translation(rest, 0, core.vec3(0.0, 1.0, 0.0))
+    pose.set_translation(rest, 1, core.vec3(0.0, 0.25, 0.0))
+    pose.set_translation(rest, 2, core.vec3(0.0, 0.25, 0.0))
+    pose.set_translation(rest, 3, core.vec3(0.0, 0.2, 0.0))
+    pose.set_translation(rest, 4, core.vec3(0.0, 0.05, 0.0 - 0.1))
+    pose.set_translation(rest, 5, core.vec3(0.0, 0.0 - 0.09, 0.0 - 0.05))
+    pose.set_translation(rest, 6, core.vec3(0.0, 0.0 - 0.09, 0.0 - 0.04))
+    pose.set_translation(rest, 7, core.vec3(0.0, 0.0 - 0.09, 0.0 - 0.03))
+    pose.set_translation(rest, 8, core.vec3(0.0, 0.0 - 0.09, 0.0 - 0.02))
+    r = pose.of_joints(n, names, parents, rest)
+    free(names)
+    free(parents as ptr)
+    free(rest)
+    return r
+}
+
+struct Run {
+    lag: float                     // the most the tip trailed its pose's tip along the way run, metres
+    swing: float                   // the most it swung out of the turn, metres
+    peak: float                    // its largest distance from rest after the stop
+    first: float                   // its largest over the second time constant after the stop
+    last: float                    // and over the sixth
+    tau: float                     // the time constant its swing dies down by, measured from those
+    inside: float                  // the deepest a joint went into a collider past its hit radius
+    seg_inside: float              // and a point between two joints
+    seg_body: float                // and such a point into the collider itself
+    still: float                   // the most it moved from where it ends over the last second
+    off_pose: float                // where it ends from its pose's tip
+    sum: float                     // every tail's place every step, summed: the run's bits
+    nanos: long
+    steps: long
+}
+
+// The tip's places each step: x, y, z.
+var g_tips: ptr = null
+var g_goals: ptr = null
+var g_steps = 0
+
+// The deepest point `x` is inside the capsule a-b of radius `rad` (0 or
+// below: outside).
+depth_in(x: Vec3, a: Vec3, b: Vec3, rad: float) -> float {
+    ab = core.v3_sub(b, a)
+    l2 = core.v3_dot(ab, ab)
+    c = a
+    if l2 > 0.0 {
+        u = core.clampf(core.v3_dot(core.v3_sub(x, a), ab) / l2, 0.0, 1.0)
+        c = core.v3_add(a, core.v3_mul(ab, u))
+    }
+    return rad - core.v3_distance(x, c)
+}
+
+ponytail_run(gravity: bool) -> Run {
+    out = Run { lag: 0.0, swing: 0.0, peak: 0.0, first: 0.0, last: 0.0, tau: 0.0, inside: 0.0 - 1.0, seg_inside: 0.0 - 1.0, seg_body: 0.0 - 1.0, still: 0.0, off_pose: 0.0, sum: 0.0, nanos: 0 as long, steps: 0 as long }
+    r = ponytail_rig()
+    sp = springs.springs_new(r)
+    p = springs.params(STIFFNESS, DAMPING, DRAG)
+    if gravity { p = springs.set_gravity(p, core.vec3(0.0, 0.0 - 9.81, 0.0)) }
+    p = springs.set_radius(p, HIT)
+    chain = calloc(4, 4) as int[]
+    chain[0] = 4
+    chain[1] = 5
+    chain[2] = 6
+    chain[3] = 7
+    nlinks = 4
+    springs.chain_add(sp, chain as ptr, nlinks, p)
+    free(chain as ptr)
+    // The head and the trunk.
+    springs.collider_add(sp, J_HEAD, core.vec3(0.0, 0.08, 0.0), core.vec3(0.0, 0.08, 0.0), 0.1, 0)
+    springs.collider_add(sp, 2, core.vec3(0.0, 0.0 - 0.45, 0.0), core.vec3(0.0, 0.1, 0.0), 0.13, 0)
+    pw = pose.new(r)
+    worlds = pose.new(r)
+    c = course_new()
+    steps = (END / STEP) as int
+    if g_tips == null {
+        g_tips = calloc(steps * 3 + 3, 8)
+        g_goals = calloc(steps * 3 + 3, 8)
+    }
+    tips = g_tips as float[]
+    goals = g_goals as float[]
+    tip_node = nlinks - 1
+    k = 0
+    while k < steps {
+        course_step(c, STEP)
+        pose.rest_pose(r, pw)
+        // The figure where the course has it, bobbing as it runs.
+        bob = 0.0
+        if c.speed > 0.5 { bob = 0.03 * core.sin_of(2.0 * 3.141592653589793 * 2.8 * c.t) * c.speed / SPEED }
+        pose.set_translation(pw, J_ROOT, core.vec3(c.x, 1.0 + bob, c.z))
+        pose.set_rotation(pw, J_ROOT, core.quat_rotate(c.heading, core.vec3(0.0, 1.0, 0.0)))
+        springs.solve(sp, pw, STEP, true)
+        pose.world(r, pw, worlds)
+        tip = pose.translation(worlds, J_TIE + nlinks)
+        goal = springs.goal_world(sp, tip_node)
+        tips[k * 3] = tip.x
+        tips[k * 3 + 1] = tip.y
+        tips[k * 3 + 2] = tip.z
+        goals[k * 3] = goal.x
+        goals[k * 3 + 1] = goal.y
+        goals[k * 3 + 2] = goal.z
+        off = core.v3_sub(tip, goal)
+        fwd = course_forward(c)
+        if c.t <= TURN_FROM {
+            behind = 0.0 - core.v3_dot(off, fwd)
+            if behind > out.lag { out.lag = behind }
+        }
+        if c.t > TURN_FROM && c.t <= TURN_TO {
+            // Turning left (about up), the outside is the figure's right.
+            right = core.vec3(0.0 - fwd.z, 0.0, fwd.x)
+            outward = core.v3_dot(off, right)
+            if outward > out.swing { out.swing = outward }
+        }
+        // Each joint of the chain and points between, against each collider.
+        ci = 0
+        while ci < springs.collider_count(sp) {
+            la, lb = springs.collider_local(sp, ci)
+            j = springs.collider_joint(sp, ci)
+            ca = core.v3_add(pose.translation(worlds, j), core.quat_apply(pose.rotation(worlds, j), la))
+            cb = core.v3_add(pose.translation(worlds, j), core.quat_apply(pose.rotation(worlds, j), lb))
+            rad = springs.collider_radius(sp, ci) + HIT
+            jj = 5
+            while jj <= J_END {
+                d = depth_in(pose.translation(worlds, jj), ca, cb, rad)
+                if d > out.inside { out.inside = d }
+                s = 1
+                while s < 4 {
+                    x = core.v3_lerp(pose.translation(worlds, jj - 1), pose.translation(worlds, jj), (s as float) / 4.0)
+                    d2 = depth_in(x, ca, cb, rad)
+                    if d2 > out.seg_inside { out.seg_inside = d2 }
+                    if d2 - HIT > out.seg_body { out.seg_body = d2 - HIT }
+                    s = s + 1
+                }
+                jj = jj + 1
+            }
+            ci = ci + 1
+        }
+        jj = 5
+        while jj <= J_END {
+            q = pose.translation(worlds, jj)
+            out.sum = out.sum + q.x * 1.37 + q.y * 0.71 + q.z * 1.13
+            jj = jj + 1
+        }
+        k = k + 1
+    }
+    g_steps = steps
+    // After the stop: the distance from where it ends.
+    last = steps - 1
+    fx = tips[last * 3]
+    fy = tips[last * 3 + 1]
+    fz = tips[last * 3 + 2]
+    // Its swing's envelope: the largest distance over each time constant
+    // after the stop. The first (still forced as the figure settles on
+    // its feet) is left out; from the second to the sixth it falls as
+    // e^-(t / tau), and tau is read from them.
+    stop_at = ((TURN_TO + STOP_TIME) / STEP) as int
+    tau = 2.0 / (DAMPING + DRAG)
+    span = (tau / STEP) as int
+    k = stop_at
+    while k < steps {
+        d = dist3(tips[k * 3] - fx, tips[k * 3 + 1] - fy, tips[k * 3 + 2] - fz)
+        if d > out.peak { out.peak = d }
+        if k >= stop_at + span && k < stop_at + 2 * span && d > out.first { out.first = d }
+        if k >= stop_at + 5 * span && k < stop_at + 6 * span && d > out.last { out.last = d }
+        if k >= steps - ((1.0 / STEP) as int) && d > out.still { out.still = d }
+        k = k + 1
+    }
+    if out.last > 0.0 && out.first > out.last { out.tau = 4.0 * tau / ln_ratio(out.first / out.last) }
+    out.off_pose = dist3(fx - goals[last * 3], fy - goals[last * 3 + 1], fz - goals[last * 3 + 2])
+    out.nanos = springs.solve_nanos(sp)
+    out.steps = springs.solve_steps(sp)
+    heap.free(c)
+    pose.release(pw)
+    pose.release(worlds)
+    springs.springs_free(sp)
+    pose.rig_free(r)
+    return out
+}
+
+dist3(x: float, y: float, z: float) -> float { return core.sqrt_of(x * x + y * y + z * z) }
+
+// The cost of a joint a step: the ponytail solved on a moving figure many
+// times over (every joint against both colliders).
+cost_per_joint() -> float {
+    r = ponytail_rig()
+    sp = springs.springs_new(r)
+    p = springs.set_radius(springs.set_gravity(springs.params(STIFFNESS, DAMPING, DRAG), core.vec3(0.0, 0.0 - 9.81, 0.0)), HIT)
+    chain = calloc(4, 4) as int[]
+    chain[0] = 4
+    chain[1] = 5
+    chain[2] = 6
+    chain[3] = 7
+    // Eight ponytails on one head: 32 joints a step.
+    copies = 0
+    while copies < 8 {
+        springs.chain_add(sp, chain as ptr, 4, p)
+        copies = copies + 1
+    }
+    free(chain as ptr)
+    springs.collider_add(sp, J_HEAD, core.vec3(0.0, 0.08, 0.0), core.vec3(0.0, 0.08, 0.0), 0.1, 0)
+    springs.collider_add(sp, 2, core.vec3(0.0, 0.0 - 0.45, 0.0), core.vec3(0.0, 0.1, 0.0), 0.13, 0)
+    pw = pose.new(r)
+    pose.rest_pose(r, pw)
+    // The fastest of five blocks of 800 steps, as the benchmarks read their
+    // costs: one long run took in whatever else a shared CI runner ran
+    // (linux-2 and macos-2 read 3,360 ns against 140 here).
+    ns = 0.0 - 1.0
+    k = 0
+    block = 0
+    while block < 5 {
+        nanos_was = springs.solve_nanos(sp)
+        steps_was = springs.solve_steps(sp)
+        stop = k + 800
+        while k < stop {
+            a = (k as float) * 0.02
+            pose.set_translation(pw, J_ROOT, core.vec3(core.sin_of(a) * 2.0, 1.0, core.cos_of(a) * 2.0))
+            pose.set_rotation(pw, J_ROOT, core.quat_rotate(a, core.vec3(0.0, 1.0, 0.0)))
+            springs.solve(sp, pw, STEP, true)
+            k = k + 1
+        }
+        this_block = ((springs.solve_nanos(sp) - nanos_was) as float) / ((springs.solve_steps(sp) - steps_was) as float)
+        if ns < 0.0 || this_block < ns { ns = this_block }
+        block = block + 1
+    }
+    pose.release(pw)
+    springs.springs_free(sp)
+    pose.rig_free(r)
+    return ns
+}
+
+ponytail() {
+    println("a ponytail on a figure that runs off, turns, stops and stands:")
+    tips_bits = calloc(((END / STEP) as int) * 3 + 3, 8)
+    a = ponytail_run(true)
+    n = g_steps * 3
+    k = 0
+    while k < n {
+        (tips_bits as float[])[k] = (g_tips as float[])[k]
+        k = k + 1
+    }
+    b = ponytail_run(true)
+    same = a.sum == b.sum
+    k = 0
+    while k < n {
+        if (tips_bits as float[])[k] != (g_tips as float[])[k] { same = false }
+        k = k + 1
+    }
+    free(tips_bits)
+    tau = 2.0 / (DAMPING + DRAG)
+    c = ponytail_run(false)
+    println("    time constant 2 / (damping + drag) = ${tau} s; tip trailed by ${mm(a.lag)} mm running off, swung ${mm(a.swing)} mm out of the turn")
+    println("    after the stop: ${mm(a.peak)} mm from rest at its most; its envelope ${mm(a.first)} mm over the 2nd time constant, ${mm(a.last)} mm over the 6th: dies down with a time constant of ${a.tau} s (${c.tau} s with no gravity)")
+    println("    deepest into a collider past the hit radius: a joint ${mm(a.inside)} mm, a point between joints ${mm(a.seg_inside)} mm, into the collider itself ${mm(a.seg_body)} mm (below 0: clear)")
+    check("the tip trails its pose's as the figure runs off (more than 10 mm)", a.lag > 0.01)
+    check("it swings out of the turn (more than 5 mm)", a.swing > 0.005)
+    check("it settles in its time constant: its swing dies down by e^-1 a time constant (within 20%)", c.first > 0.001 && c.tau > 0.0 && c.tau <= 1.2 * tau)
+    check("no joint of it ever inside the head's or the trunk's collider (0 mm past its hit radius)", a.inside <= ROUNDING && c.inside <= ROUNDING)
+    check("no point of it ever inside the colliders themselves", a.seg_body <= ROUNDING && c.seg_body <= ROUNDING)
+    check("at rest it is still: within 1 mm over the last second (${mm(a.still)} mm)", a.still <= 0.001)
+    check("the same to the bit run to run", same)
+    check("with no gravity it rests on its pose, within 1 mm (${mm(c.off_pose)} mm)", c.off_pose <= 0.001)
+    ns = cost_per_joint()
+    println("    cost: ${ns} ns a joint a step (8 chains of 4 joints, 2 colliders)")
+    check("its cost a joint a step under 1 us", ns < 1000.0)
+}
+
+// --- VRoid's own spring bones, in the pipeline ------------------------------------------------
+
+struct Mover {
+    o: ptr                         // *GameObject
+    c: ptr                         // *Course
+}
+
+mover_fixed(st: ptr, e: *Engine, dt: float) {
+    m = st as *Mover
+    c = m.c as *Course
+    course_step(c, dt)
+    o = m.o as *GameObject
+    behaviour.object_set_position(o, core.vec3(c.x, 0.0, c.z))
+    behaviour.object_set_rotation(o, core.quat_rotate(c.heading, core.vec3(0.0, 1.0, 0.0)))
+}
+
+struct Vroid {
+    chains: int
+    listed: int
+    colliders: int
+    inside: float
+    still: float
+    lag: float
+    sum: float
+}
+
+vroid_run(pool: bool) -> Vroid {
+    out = Vroid { chains: 0, listed: 0, colliders: 0, inside: 0.0 - 1.0, still: 0.0, lag: 0.0, sum: 0.0 }
+    animator.on_pool(pool)
+    e = engine.engine_new()
+    engine.engine_set_fixed_step(e, STEP)
+    engine.engine_set_interpolation(e, false)
+    o = figure.figure(e, "VRoid", VROID)
+    if o == null {
+        println("  no figure: ${gltf.last_error()}")
+        engine.engine_free(e)
+        return out
+    }
+    c = course_new()
+    mv = Mover { o: o as ptr, c: c as ptr }
+    b = engine.behaviour_new("mover", (&mv) as ptr)
+    b.fixed_update = mover_fixed
+    engine.engine_add_behaviour(e, b)
+    a = animator.attach(e, o)
+    r = animator.rig(a)
+    rest = clips.from_frames(r, "Rest", 2, 30.0)
+    clips.set_looping(rest, true)
+    s = animator.add_state(a, "rest", animator.add_take(a, rest, false), true)
+    animator.play(a, s, 0.0)
+    out.chains = animator.springs_from_file(a)
+    out.listed = springs.vrm_chains(figure.scene(figure.figure_of(o)))
+    sp = animator.springs_of(a)
+    out.colliders = springs.collider_count(sp)
+    worlds = pose.new(r)
+    steps = (END / STEP) as int
+    n = springs.node_count(sp)
+    ends = calloc(n * 3 + 3, 8) as float[]
+    // A skirt's back joint: its tip's lag as the figure runs off.
+    back = 0 - 1
+    i = 0
+    while i < n {
+        if string.contains(pose.name(r, springs.node_joint(sp, i)), "SkirtBack") == 1 && back < 0 { back = i }
+        i = i + 1
+    }
+    k = 0
+    while k < steps {
+        engine.engine_simulate(e, STEP)
+        pose.world(r, animator.pose_now(a), worlds)
+        bp, bq, bs = core.model_drawn_transform(pose.base_model(r))
+        // Each node's tail as drawn, against each collider it is held out of.
+        i = 0
+        while i < n {
+            j = springs.node_joint(sp, i)
+            t = core.v3_add(pose.translation(worlds, j), core.quat_apply(pose.rotation(worlds, j), springs.node_tail(sp, i)))
+            tw = core.v3_add(bp, core.quat_apply(bq, core.vec3(t.x * bs.x, t.y * bs.y, t.z * bs.z)))
+            mask = springs.node_mask(sp, i)
+            ci = 0
+            while ci < springs.collider_count(sp) {
+                if ((mask >> springs.collider_group(sp, ci)) & 1) == 1 {
+                    la, lb = springs.collider_local(sp, ci)
+                    cj = springs.collider_joint(sp, ci)
+                    ca = core.v3_add(pose.translation(worlds, cj), core.quat_apply(pose.rotation(worlds, cj), la))
+                    cb = core.v3_add(pose.translation(worlds, cj), core.quat_apply(pose.rotation(worlds, cj), lb))
+                    caw = core.v3_add(bp, core.quat_apply(bq, core.vec3(ca.x * bs.x, ca.y * bs.y, ca.z * bs.z)))
+                    cbw = core.v3_add(bp, core.quat_apply(bq, core.vec3(cb.x * bs.x, cb.y * bs.y, cb.z * bs.z)))
+                    d = depth_in(tw, caw, cbw, (springs.collider_radius(sp, ci) * bs.x) + springs.node_radius(sp, i))
+                    if d > out.inside { out.inside = d }
+                }
+                ci = ci + 1
+            }
+            out.sum = out.sum + tw.x * 1.37 + tw.y * 0.71 + tw.z * 1.13
+            if k == steps - 1 - ((1.0 / STEP) as int) {
+                ends[i * 3] = tw.x
+                ends[i * 3 + 1] = tw.y
+                ends[i * 3 + 2] = tw.z
+            }
+            if k > steps - 1 - ((1.0 / STEP) as int) {
+                dd = dist3(tw.x - ends[i * 3], tw.y - ends[i * 3 + 1], tw.z - ends[i * 3 + 2])
+                if dd > out.still { out.still = dd }
+            }
+            if i == back && c.t <= TURN_FROM {
+                off = core.v3_sub(springs.tail_world(sp, i), springs.goal_world(sp, i))
+                behind = 0.0 - core.v3_dot(off, course_forward(c))
+                if behind > out.lag { out.lag = behind }
+            }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    free(ends as ptr)
+    pose.release(worlds)
+    heap.free(c)
+    animator.animator_free(a)
+    figure.figures_free(e)
+    engine.engine_free(e)
+    animator.on_pool(true)
+    return out
+}
+
+vroid() {
+    println("VRoid's base female (CC0), its own VRM 0.x spring bones in the animator:")
+    a = vroid_run(true)
+    println("    ${a.listed} chains listed in the file, ${a.chains} imported, ${a.colliders} colliders; a skirt's back trailed ${mm(a.lag)} mm running off")
+    println("    deepest a tail went into a thigh's collider past its hit radius: ${mm(a.inside)} mm (below 0: clear); still over the last second within ${mm(a.still)} mm")
+    check("its chains imported (its bust's and its skirt's), with its thighs' colliders", a.chains == a.listed && a.chains > 0 && a.colliders > 0)
+    check("a skirt's back trails as the figure runs off", a.lag > 0.001)
+    check("no skirt or bust joint inside a collider it is held out of (0 mm past its hit radius)", a.inside <= ROUNDING)
+    check("at rest within 1 mm", a.still <= 0.001)
+    b = vroid_run(true)
+    check("the same to the bit run to run, on the job pool", a.sum == b.sum)
+    c = vroid_run(false)
+    check("and with the pool off", a.sum == c.sum)
+}
+
+main() {
+    println("springs: secondary motion, spring chains and jiggle (#989)")
+    ponytail()
+    vroid()
+    if g_tips != null { free(g_tips) }
+    if g_goals != null { free(g_goals) }
+    if g_failures > 0 {
+        println("springs: ${g_failures} failure(s) of ${g_checks}")
+        exit(1)
+    }
+    println("springs: all checks passed (${g_checks})")
+}

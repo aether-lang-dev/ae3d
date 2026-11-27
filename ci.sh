@@ -118,7 +118,7 @@ in_tier() {   # in_tier <tier>...: whether this run covers any of them
 }
 PLATFORM_SUITES="test_net test_net_authority test_net_budget test_net_delta
     test_net_events test_net_fields test_net_handover test_net_horde
-    test_net_sight test_net_udp test_players test_agent test_agent_net
+    test_net_sight test_net_udp test_net_anim test_fdlibm test_players test_agent test_agent_net
     test_jobs test_assets test_obj_cache test_image_decode test_gltf
     test_loader test_scene_io test_font test_determinism test_gmath
     test_script"
@@ -287,6 +287,16 @@ suite_failure() {   # suite_failure <output>
     quiet="$(printf '%s\n' "$1" | grep -v 'no Vulkan driver')"
     printf '%s\n' "$quiet" | grep -E 'FAIL' | sed 's/^/        /' | head -10
     printf '%s\n' "$quiet" | sed 's/^/        /' | tail -12
+}
+
+# The lines a suite asks the log to keep, passing or failing: each one
+# beginning "ci: ", the measure a check is held to beside its bound. A
+# failing suite's own lines are its FAIL lines and its last ones, and a
+# passing suite's none, so how near a bound a check sits was never in a
+# log: test_backend_parity's "two lights" failed two runs in three on
+# llvmpipe with nothing to say by how much (#1101).
+suite_notes() {   # suite_notes <output>
+    printf '%s\n' "$1" | grep -E '^ci: ' | sed 's/^ci: /        | /'
 }
 
 # A crash on a headless runner leaves only "died on signal 11". When the status
@@ -480,6 +490,21 @@ else
     sed "s/^/        /" /tmp/ae3d_docs.log | head -12
 fi
 
+step "docs/motion's code is its examples' code"
+# Every code block in docs/motion is a region of a program under
+# examples/docs, which the examples' step builds and runs (#1027): a block
+# with no program behind it, or one that drifted from its program, fails.
+./scripts/check_doc_examples.sh >/tmp/ae3d_doc_examples.log 2>&1
+doc_examples_status=$?
+if [ "$doc_examples_status" -eq 0 ]; then
+    pass "$(tail -1 /tmp/ae3d_doc_examples.log)"
+elif [ "$doc_examples_status" -ne 1 ]; then
+    skip "docs/motion's code" "$(head -1 /tmp/ae3d_doc_examples.log)"
+else
+    fail "docs/motion's code differs from examples/docs"
+    sed "s/^/        /" /tmp/ae3d_doc_examples.log | head -24
+fi
+
 # The Vulkan shaders are generated from the GLSL in src/ae3d/shaders, and
 # from the trees of the shaders written with `quote` (ae3d.shaders.fxaa), and
 # checked in. An edit to the GLSL without the generator run after it leaves
@@ -550,6 +575,19 @@ if [ "$(uname -s)" = "Darwin" ]; then
         fail "native/platform/metal_surface.m"
         sed 's/^/        /' /tmp/ae3d_cc.log | head -20
     fi
+fi
+
+# The motion modules retired onto the pipeline (#860, docs/animation-
+# pipeline.md, "The old modules: frozen") stay gone: nothing in the engine,
+# its tests, tools, examples or editor imports one again.
+if in_tier suites && first_shard; then
+step "retired motion modules stay retired"
+if git grep -nE '^import ae3d\.(idle|lookat|feet|locomotion)\b' -- src tests tools examples editor scripts benchmarks >/tmp/ae3d_retired.log 2>/dev/null; then
+    fail "an import of a retired motion module"
+    sed 's/^/        /' /tmp/ae3d_retired.log | head -10
+else
+    pass "no import of ae3d.idle, ae3d.lookat, ae3d.feet or ae3d.locomotion"
+fi
 fi
 
 # One runner is enough to say a module stopped compiling: the check is the
@@ -714,6 +752,7 @@ for suite in $SUITES; do
         fail "$name"
         suite_failure "$output"
     fi
+    suite_notes "$output"
 done
 
 fi
@@ -728,7 +767,7 @@ step "Vulkan under the validation layer, synchronization included"
 # the layer reports fails the suite. The loader names every layer it inserts
 # when asked (VK_LOADER_DEBUG=layer): a run it did not insert the layer into
 # would pass having checked nothing, so that is a skip, never a pass.
-for name in test_fog test_overlay test_hud_layout test_damage test_backend_parity test_gi test_pick test_pick_crowd test_view; do
+for name in test_fog test_overlay test_hud_layout test_damage test_backend_parity test_gi test_pick test_pick_crowd test_view test_skinned_render; do
     if ! built_ok "$name"; then
         skip "$name under the layer" "did not build"
         continue
@@ -757,6 +796,7 @@ for name in test_fog test_overlay test_hud_layout test_damage test_backend_parit
     else
         skip "$name under the layer" "$(printf '%s' "$output" | grep -m1 "SKIP" | sed 's/.*SKIP *//')"
     fi
+    suite_notes "$output"
 done
 
 fi
@@ -808,9 +848,16 @@ fi
 # the eight that build a world at start-up (2 to 5 times slower so) are
 # marked `// ci: optimised`.
 export SUITE_CFLAGS=-O0
-build_together examples/*.ae $scene_tools
+# The showcases and the animation viewer a person watches run as the
+# examples do: the motion showcase crashed on its first frame for 43 commits
+# while every suite passed, its people's shared takes freed under them.
+showcases="tools/anim_showcase.ae tools/plaza_showcase.ae tools/people_plaza.ae tools/anim_viewer.ae"
+# The programs docs/motion shows its code from (#1027): built and run as the
+# examples are, each exiting 0 only when what it did is what the page says.
+doc_examples="$(ls examples/docs/*.ae 2>/dev/null)"
+build_together examples/*.ae $doc_examples $showcases $scene_tools
 unset SUITE_CFLAGS
-for example in examples/*.ae; do
+for example in examples/*.ae $doc_examples $showcases; do
     name="$(basename "$example" .ae)"
     if ! built_ok "$name"; then
         fail "$name (build)"

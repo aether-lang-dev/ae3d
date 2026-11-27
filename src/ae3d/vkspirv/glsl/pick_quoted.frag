@@ -10,6 +10,11 @@ struct Cut {
     int joints0;
     int joints1;
     int joints2;
+    int joints3;
+    int joints4;
+    int joints5;
+    int joints6;
+    int joints7;
 };
 struct Wounds {
     int count;

@@ -13,9 +13,14 @@ struct Cut {
     int joints0;
     int joints1;
     int joints2;
-    char ae_pad1[8];
+    int joints3;
+    int joints4;
+    int joints5;
+    int joints6;
+    int joints7;
+    char ae_pad1[4];
 };
-static_assert(sizeof(Cut) == 64, "Cut: std140");
+static_assert(sizeof(Cut) == 80, "Cut: std140");
 static_assert(__builtin_offsetof(Cut, on) == 0, "Cut.on: std140");
 static_assert(__builtin_offsetof(Cut, plane) == 16, "Cut.plane: std140");
 static_assert(__builtin_offsetof(Cut, detached) == 32, "Cut.detached: std140");
@@ -24,6 +29,11 @@ static_assert(__builtin_offsetof(Cut, noise_scale) == 40, "Cut.noise_scale: std1
 static_assert(__builtin_offsetof(Cut, joints0) == 44, "Cut.joints0: std140");
 static_assert(__builtin_offsetof(Cut, joints1) == 48, "Cut.joints1: std140");
 static_assert(__builtin_offsetof(Cut, joints2) == 52, "Cut.joints2: std140");
+static_assert(__builtin_offsetof(Cut, joints3) == 56, "Cut.joints3: std140");
+static_assert(__builtin_offsetof(Cut, joints4) == 60, "Cut.joints4: std140");
+static_assert(__builtin_offsetof(Cut, joints5) == 64, "Cut.joints5: std140");
+static_assert(__builtin_offsetof(Cut, joints6) == 68, "Cut.joints6: std140");
+static_assert(__builtin_offsetof(Cut, joints7) == 72, "Cut.joints7: std140");
 
 struct Wounds {
     int count;
@@ -171,11 +181,11 @@ struct DrawBlock {
     Cut cut;
     Wounds wounds;
 };
-static_assert(sizeof(DrawBlock) == 2208, "DrawBlock: std140");
+static_assert(sizeof(DrawBlock) == 2224, "DrawBlock: std140");
 static_assert(__builtin_offsetof(DrawBlock, draw) == 0, "DrawBlock.draw: std140");
 static_assert(__builtin_offsetof(DrawBlock, material) == 240, "DrawBlock.material: std140");
 static_assert(__builtin_offsetof(DrawBlock, cut) == 512, "DrawBlock.cut: std140");
-static_assert(__builtin_offsetof(DrawBlock, wounds) == 576, "DrawBlock.wounds: std140");
+static_assert(__builtin_offsetof(DrawBlock, wounds) == 592, "DrawBlock.wounds: std140");
 
 struct CameraBlock {
     Eye eye;

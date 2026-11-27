@@ -67,8 +67,16 @@ if ! command -v "$AETHERC" >/dev/null 2>&1; then
     exit 1
 fi
 
-AETHER_CFLAGS="$(ae cflags 2>/dev/null || true)"
-AETHER_LIBS="$(ae cflags --libs 2>/dev/null || true)"
+# Ask ae for the flags of the compiler this build uses. A toolchain's flags
+# differ by compiler: GCC needs `--param relation-block-limit=0` against its
+# miscompile of float comparisons beside a NaN (aether#3848), which clang would
+# refuse. `--cc` names the compiler (Aether 0.940 on); an older ae, which has
+# no `--cc`, is asked as before.
+ae_cflags() {
+    ae cflags "$@" --cc "$CC" 2>/dev/null || ae cflags "$@" 2>/dev/null || true
+}
+AETHER_CFLAGS="$(ae_cflags)"
+AETHER_LIBS="$(ae_cflags --libs)"
 if [ -z "$AETHER_CFLAGS" ]; then
     echo "ae3d: 'ae cflags' produced nothing; is the toolchain on PATH?" >&2
     exit 1
@@ -89,7 +97,7 @@ fi
 # `ae cflags --cflags` carries -fwrapv once the toolchain fix (aether#1957) is
 # released. Toolchains older than that do not, and ae3d still supports them, so
 # name the flag here when the toolchain has not already supplied it.
-AETHER_COMPILE_FLAGS="$(ae cflags --cflags 2>/dev/null || true)"
+AETHER_COMPILE_FLAGS="$(ae_cflags --cflags)"
 if [ -z "$AETHER_COMPILE_FLAGS" ]; then
     AETHER_COMPILE_FLAGS="$(printf '%s\n' $AETHER_CFLAGS | grep -E '^-I' | tr '\n' ' ')"
 fi

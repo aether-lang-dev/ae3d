@@ -1,0 +1,922 @@
+// Morph targets (#910): imported, drawn on both renderers, played and blended
+// as pose curves.
+//
+// Import: every target's POSITION, NORMAL and TANGENT offsets of three of
+// Khronos' sample files held to the file's own accessors, read here by a
+// reader of this test's (not the importer's), to the bit; a hand-written file's
+// sparse targets (one with no buffer view at all, one substituted over its
+// view), its target names and its default weights; a weights animation's keys
+// as the file has them, LINEAR between them and CUBICSPLINE's Hermite at a
+// half.
+//
+// Drawn: a skinned column with three targets, two of them weighed in and one
+// at zero, bent at its waist. The morphed vertices each renderer leaves in the
+// mesh's vertex buffer, read back, against the CPU's morph (ae3d.morph.apply);
+// on Vulkan also the device's skinning of them (the rays' pass, the same sum
+// the vertex shader makes) against the CPU's morph-then-skin, within 1e-4 m a
+// vertex. A frame whose weights are all zero morphs nothing.
+//
+// Played: the weights as curves on a rig, sampled from a take and blended:
+// a blend of two takes' weights is the linear blend of their numbers, an
+// additive adds them, and an inertialized change starts where the face was.
+
+import std.list
+import std.json
+import std.string
+import std.bytes
+import std.mem
+import ae3d.core
+import ae3d.blob
+import ae3d.gltf
+import ae3d.morph
+import ae3d.anim
+import ae3d.pose
+import ae3d.clips
+import ae3d.skin
+import ae3d.gl
+import ae3d.vulkan
+import ae3d.offscreen
+import ae3d.loader
+import ae3d.geometry
+import ae3d.face
+
+extern calloc(count: int, size: int) -> ptr
+extern free(p: ptr)
+extern memcpy(to: ptr, from: ptr, bytes: long) -> ptr
+extern exit(code: int)
+
+const WIDTH = 192
+const HEIGHT = 144
+const SEGMENTS = 8
+const RADIUS = 0.35
+const HEIGHT_EACH = 0.5
+const QUARTER_TURN = 1.5707963
+
+var g_failures = 0
+
+check(name: string, condition: bool) {
+    if condition {
+        println("  ok   ${name}")
+    } else {
+        println("  FAIL ${name}")
+        g_failures = g_failures + 1
+    }
+}
+
+absf(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+near(a: float, b: float, within: float) -> bool { return absf(a - b) <= within }
+
+// --- the file, read by this test ----------------------------------------------------------------
+
+// A .glb's JSON and binary chunk, read here rather than by ae3d.gltf, so the
+// importer is held to the file and not to itself.
+struct Glb {
+    bytes: ptr
+    root: ptr
+    bin: ptr
+}
+
+glb_open(path: string) -> Glb {
+    out = Glb { bytes: null, root: null, bin: null }
+    raw = blob.read(path)
+    if raw == null { return out }
+    size = blob.last_size()
+    out.bytes = raw
+    at = 12 as long
+    while at + 8 <= size {
+        length = blob.u32(raw, at) as long
+        kind = blob.u32(raw, at + 4)
+        if kind == 0x4E4F534A { out.root = json.parse_raw(bytes.string_from_ptr(blob.slice(raw, at + 8), length as int)) }
+        if kind == 0x004E4942 { out.bin = blob.slice(raw, at + 8) }
+        at = at + 8 + length
+    }
+    return out
+}
+
+glb_close(g: Glb) {
+    if g.root != null { json.free(g.root) }
+    blob.free_bytes(g.bytes)
+}
+
+field_int(node: ptr, name: string, fallback: int) -> int {
+    if node == null { return fallback }
+    f = json.object_get_raw(node, name)
+    if f == null { return fallback }
+    return json.get_int(f)
+}
+
+// Component `c` of element `i` of float accessor `index`, from the file's
+// bytes: its view's offset, its own, the view's stride or a packed one.
+file_float(g: Glb, index: int, i: int, c: int) -> float {
+    accessor = json.array_get_raw(json.object_get_raw(g.root, "accessors"), index)
+    view = json.array_get_raw(json.object_get_raw(g.root, "bufferViews"), field_int(accessor, "bufferView", 0))
+    kind = json.get_string_raw(json.object_get_raw(accessor, "type"))
+    width = 3
+    if kind == "SCALAR" { width = 1 }
+    if kind == "VEC4" { width = 4 }
+    stride = field_int(view, "byteStride", 0)
+    if stride == 0 { stride = width * 4 }
+    at = field_int(view, "byteOffset", 0) + field_int(accessor, "byteOffset", 0) + i * stride + c * 4
+    return blob.f32(g.bin, at as long)
+}
+
+// Every target offset of every primitive of `path` against the importer's,
+// to the bit: positions, normals and tangents. How many numbers were held.
+held_to_file(path: string, label: string) -> int {
+    g = glb_open(path)
+    scene = gltf.load(path)
+    if g.root == null || scene == null {
+        check("${label}: the file opens", false)
+        return 0
+    }
+    compared = 0
+    wrong = 0
+    targets_seen = 0
+    k = 0
+    nodes = json.object_get_raw(g.root, "nodes")
+    meshes = json.object_get_raw(g.root, "meshes")
+    n = 0
+    while n < json.array_size(nodes) {
+        mesh_index = field_int(json.array_get_raw(nodes, n), "mesh", 0 - 1)
+        if mesh_index >= 0 {
+            prims = json.object_get_raw(json.array_get_raw(meshes, mesh_index), "primitives")
+            p = 0
+            while p < json.array_size(prims) {
+                prim = json.array_get_raw(prims, p)
+                model = gltf.primitive(scene, k)
+                set = core.model_morph(model) as *MorphSet
+                targets = json.object_get_raw(prim, "targets")
+                t = 0
+                while targets != null && t < json.array_size(targets) {
+                    target = json.array_get_raw(targets, t)
+                    targets_seen = targets_seen + 1
+                    kinds = 0
+                    while kinds < 3 {
+                        name = "POSITION"
+                        if kinds == 1 { name = "NORMAL" }
+                        if kinds == 2 { name = "TANGENT" }
+                        index = field_int(target, name, 0 - 1)
+                        if index >= 0 {
+                            vertices = field_int(json.array_get_raw(json.object_get_raw(g.root, "accessors"), index), "count", 0)
+                            v = 0
+                            while v < vertices {
+                                c = 0
+                                while c < 3 {
+                                    want = file_float(g, index, v, c)
+                                    got = 0.0
+                                    if kinds == 0 { got = morph.delta(set, t, v, c) }
+                                    if kinds == 1 { got = morph.delta(set, t, v, 4 + c) }
+                                    if kinds == 2 { got = morph.tangent(set, t, v, c) }
+                                    if got != want { wrong = wrong + 1 }
+                                    compared = compared + 1
+                                    c = c + 1
+                                }
+                                v = v + 1
+                            }
+                        }
+                        kinds = kinds + 1
+                    }
+                    t = t + 1
+                }
+                k = k + 1
+                p = p + 1
+            }
+        }
+        n = n + 1
+    }
+    println("  ${label}: ${targets_seen} targets, ${compared} offsets compared with the file, ${wrong} differ; ${gltf.warning_count(scene)} warnings")
+    check("${label}: every imported offset is the file's to the bit", wrong == 0 && compared > 0)
+    gltf.scene_destroy(scene)
+    glb_close(g)
+    return compared
+}
+
+// --- import -------------------------------------------------------------------------------------
+
+import_sparse() {
+    println("sparse targets, names, default weights, a CUBICSPLINE weights animation:")
+    scene = gltf.load("tests/fixtures/gltf/morph_sparse.gltf")
+    if scene == null {
+        check("morph_sparse.gltf loads (${gltf.last_error()})", false)
+        return
+    }
+    check("it loads with no warnings", gltf.warning_count(scene) == 0)
+    quad = gltf.primitive(scene, 0)
+    node = gltf.find(scene, "quad")
+    set = core.model_morph(quad) as *MorphSet
+    check("two targets, named lift and bulge", morph.count(set) == 2 && morph.name(set, 0) == "lift" && morph.name(set, 1) == "bulge")
+    check("their default weights are the mesh's (0.5, 0.25)", morph.default_weight(set, 0) == 0.5 && morph.default_weight(set, 1) == 0.25)
+    // lift: no buffer view, zeros, then vertices 1 and 3 substituted.
+    lift_ok = morph.delta(set, 0, 0, 2) == 0.0 && morph.delta(set, 0, 1, 2) == 1.0 &&
+              morph.delta(set, 0, 2, 2) == 0.0 && morph.delta(set, 0, 3, 2) == 2.0
+    check("lift, sparse over nothing: z offsets 0, 1, 0, 2", lift_ok)
+    // bulge: its view's 0.1 up each, vertex 2 substituted with (0.5, 0.5, 0.5).
+    f32 tenth = 0.1
+    bulge_ok = morph.delta(set, 1, 0, 2) == (tenth as float) && morph.delta(set, 1, 2, 0) == 0.5 &&
+               morph.delta(set, 1, 2, 2) == 0.5 && morph.delta(set, 1, 3, 2) == (tenth as float)
+    check("bulge, sparse over its view: 0.1 up, vertex 2 at (0.5, 0.5, 0.5)", bulge_ok)
+    weights, n = core.model_morph_weights(quad)
+    check("the primitive draws by its node's weights, which start at the mesh's", n == 2 && core.model_morph_weight(node, 0) == 0.5 && weights != null)
+    // The animation: CUBICSPLINE, keys at 0 and 1, values (0, 0) and (1, 1),
+    // out-tangent (1, 0) at the first and in-tangent (0, 1) at the second.
+    clip = gltf.clip(scene, 0)
+    ch = anim.clip_channel(clip, 0)
+    check("the animation is a weights channel two wide, two keys", anim.channel_target(ch) == anim.WEIGHTS && anim.channel_width(ch) == 2 && anim.channel_key_count(ch) == 2)
+    values = calloc(2, 8)
+    anim.sample_weights(ch, 0.5, values)
+    v = values as float[]
+    println("  at 0.5 s: ${v[0]}, ${v[1]} (Hermite: 0.625, 0.375)")
+    check("CUBICSPLINE at half way is glTF's Hermite: 0.625 and 0.375", near(v[0], 0.625, 0.000001) && near(v[1], 0.375, 0.000001))
+    anim.sample_weights(ch, 1.0, values)
+    check("and at its last key, the key's values", v[0] == 1.0 && v[1] == 1.0)
+    free(values)
+    // Played: the node's weights, which its primitive draws by.
+    reg = anim.registry_new()
+    gltf.play(scene, "Swell", reg, false)
+    anim.registry_advance(reg, 0.5)
+    check("played to 0.5 s, the node's weights are the channel's", near(core.model_morph_weight(node, 0), 0.625, 0.000001))
+    anim.registry_free(reg)
+    gltf.scene_destroy(scene)
+}
+
+import_cube() {
+    println("AnimatedMorphCube: its weights animation against the file's keys:")
+    path = "tests/fixtures/gltf/AnimatedMorphCube.glb"
+    g = glb_open(path)
+    scene = gltf.load(path)
+    if g.root == null || scene == null {
+        check("AnimatedMorphCube.glb loads", false)
+        return
+    }
+    animation = json.array_get_raw(json.object_get_raw(g.root, "animations"), 0)
+    sampler = json.array_get_raw(json.object_get_raw(animation, "samplers"), 0)
+    input = field_int(sampler, "input", 0)
+    output = field_int(sampler, "output", 0)
+    ch = null
+    i = 0
+    while i < gltf.clip_count(scene) {
+        c = gltf.clip(scene, i)
+        k = 0
+        while k < anim.clip_channel_count(c) {
+            if anim.channel_target(anim.clip_channel(c, k)) == anim.WEIGHTS { ch = anim.clip_channel(c, k) }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    if ch == null {
+        check("a weights channel was read", false)
+        return
+    }
+    width = anim.channel_width(ch)
+    keys = anim.channel_key_count(ch)
+    wrong = 0
+    k = 0
+    while k < keys {
+        if anim.channel_key_time(ch, k) != file_float(g, input, k, 0) { wrong = wrong + 1 }
+        t = 0
+        while t < width {
+            if anim.channel_key_weight(ch, k, t) != file_float(g, output, k * width + t, 0) { wrong = wrong + 1 }
+            t = t + 1
+        }
+        k = k + 1
+    }
+    println("  ${keys} keys of ${width} weights, ${wrong} differ from the file")
+    check("every key's time and weights are the file's", wrong == 0 && keys > 1)
+    // Sampled between two keys: the straight line between them (LINEAR).
+    values = calloc(width, 8)
+    lerp_wrong = 0
+    k = 0
+    while k + 1 < keys {
+        a = anim.channel_key_time(ch, k)
+        b = anim.channel_key_time(ch, k + 1)
+        anim.sample_weights(ch, (a + b) * 0.5, values)
+        t = 0
+        while t < width {
+            want = (file_float(g, output, k * width + t, 0) + file_float(g, output, (k + 1) * width + t, 0)) * 0.5
+            if !near((values as float[])[t], want, 0.0000001) { lerp_wrong = lerp_wrong + 1 }
+            t = t + 1
+        }
+        k = k + 1
+    }
+    free(values)
+    check("between keys the weights are the line between the file's", lerp_wrong == 0)
+    gltf.scene_destroy(scene)
+    glb_close(g)
+}
+
+// --- the GPU ------------------------------------------------------------------------------------
+
+build_bones() -> ptr {
+    bones = list.new()
+    i = 0
+    while i < SEGMENTS + 1 {
+        bone = loader.cube(0.02)
+        if i == 0 {
+            core.model_set_position(bone, 0.0, 0.0, 0.0)
+        } else {
+            core.model_set_position(bone, 0.0, HEIGHT_EACH, 0.0)
+            core.model_set_parent(bone, list.get_raw(bones, i - 1) as *Model)
+        }
+        list.add_raw(bones, bone as ptr)
+        i = i + 1
+    }
+    return bones
+}
+
+free_bones(bones: ptr) {
+    i = list.size(bones) - 1
+    while i >= 0 {
+        bone = list.get_raw(bones, i) as *Model
+        core.model_set_parent(bone, null)
+        core.model_free(bone)
+        i = i - 1
+    }
+    list.free(bones)
+}
+
+bend(bones: ptr, angle: float) {
+    i = list.size(bones) / 2
+    while i < list.size(bones) {
+        core.model_set_rotation(list.get_raw(bones, i) as *Model, core.quat_rotate(angle, core.vec3(0.0, 0.0, 1.0)))
+        i = i + 1
+    }
+}
+
+// A column of rings, each weighted to the two bones it is between, with
+// three targets: a bulge out from the axis growing up the column, a lean
+// along x, and a twist that is left at zero.
+build_column(bones: ptr) -> *Model {
+    mesh = core.mesh_create()
+    ring = 0
+    while ring <= SEGMENTS {
+        side = 0
+        while side < 4 {
+            angle = side * QUARTER_TURN
+            x = RADIUS * core.cos_of(angle)
+            z = RADIUS * core.sin_of(angle)
+            core.mesh_push_vertex(mesh, core.vec3(x, ring * HEIGHT_EACH, z), (side * 1.0) / 4.0, (ring * 1.0) / SEGMENTS,
+                                  core.v3_normalize(core.vec3(x, 0.0, z)))
+            side = side + 1
+        }
+        ring = ring + 1
+    }
+    ring = 0
+    while ring < SEGMENTS {
+        side = 0
+        while side < 4 {
+            next = (side + 1) % 4
+            core.mesh_push_index(mesh, ring * 4 + side)
+            core.mesh_push_index(mesh, ring * 4 + next)
+            core.mesh_push_index(mesh, (ring + 1) * 4 + next)
+            core.mesh_push_index(mesh, ring * 4 + side)
+            core.mesh_push_index(mesh, (ring + 1) * 4 + next)
+            core.mesh_push_index(mesh, (ring + 1) * 4 + side)
+            side = side + 1
+        }
+        ring = ring + 1
+    }
+    count = list.size(bones)
+    ring = 0
+    while ring <= SEGMENTS {
+        along = (ring * 1.0) / SEGMENTS * ((count - 1) * 1.0)
+        lower = along as int
+        if lower > count - 2 { lower = count - 2 }
+        blend = along - (lower * 1.0)
+        side = 0
+        while side < 4 {
+            core.mesh_set_skin(mesh, ring * 4 + side, lower, lower + 1, 0, 0, 1.0 - blend, blend, 0.0, 0.0)
+            side = side + 1
+        }
+        ring = ring + 1
+    }
+    m = core.model_new()
+    core.model_set_mesh(m, mesh)
+    vertices = core.mesh_vertex_count(mesh)
+    set = morph.set_new(vertices)
+    bulge = morph.add_target(set, "bulge", 0.0)
+    lean = morph.add_target(set, "lean", 0.0)
+    twist = morph.add_target(set, "twist", 0.0)
+    v = 0
+    while v < vertices {
+        up = (v / 4) * 1.0 / SEGMENTS
+        side = v % 4
+        dx = 0.0
+        dz = 0.0
+        if side == 0 { dx = 1.0 }
+        if side == 1 { dz = 1.0 }
+        if side == 2 { dx = 0.0 - 1.0 }
+        if side == 3 { dz = 0.0 - 1.0 }
+        morph.set_delta(set, bulge, v, dx * 0.2 * up, 0.0, dz * 0.2 * up, 0.0, 0.1 * up, 0.0)
+        morph.set_delta(set, lean, v, 0.3 * up * up, 0.05 * up, 0.0, 0.0, 0.0, 0.0)
+        morph.set_delta(set, twist, v, 0.0 - dz * 0.1, 0.0, dx * 0.1, 0.0, 0.0, 0.0)
+        v = v + 1
+    }
+    core.model_set_morph(m, set as ptr)
+    return m
+}
+
+// What the CPU says the device should hold: the morphed vertices
+// (morph.apply), and those skinned by the palette (morph, then skin).
+struct Reference {
+    morphed: ptr                   // f32[vertices * 9]
+    posed: ptr                     // f32[vertices * 3]
+}
+
+reference_of(m: *Model, sk: *Skeleton) -> Reference {
+    n = core.mesh_vertex_count(m.mesh)
+    out = Reference { morphed: calloc(n * 9, 4), posed: calloc(n * 3, 4) }
+    weights, count = core.model_morph_weights(m)
+    morph.apply(m.morph as *MorphSet, m.mesh, weights, count, out.morphed)
+    skin.skeleton_update(sk)
+    palette = core.palette_data(skin.skeleton_palette(sk)) as f32[]
+    o = out.morphed as f32[]
+    p = out.posed as f32[]
+    v = 0
+    while v < n {
+        x = o[v * 9] as float
+        y = o[v * 9 + 1] as float
+        z = o[v * 9 + 2] as float
+        sx = 0.0
+        sy = 0.0
+        sz = 0.0
+        k = 0
+        while k < 4 {
+            w = geometry.mesh_skin_weight(m.mesh, v, k)
+            j = geometry.mesh_skin_joint(m.mesh, v, k) as int
+            if w != 0.0 {
+                b = j * 16
+                sx = sx + w * ((palette[b] as float) * x + (palette[b + 4] as float) * y + (palette[b + 8] as float) * z + (palette[b + 12] as float))
+                sy = sy + w * ((palette[b + 1] as float) * x + (palette[b + 5] as float) * y + (palette[b + 9] as float) * z + (palette[b + 13] as float))
+                sz = sz + w * ((palette[b + 2] as float) * x + (palette[b + 6] as float) * y + (palette[b + 10] as float) * z + (palette[b + 14] as float))
+            }
+            k = k + 1
+        }
+        p[v * 3] = sx as f32
+        p[v * 3 + 1] = sy as f32
+        p[v * 3 + 2] = sz as f32
+        v = v + 1
+    }
+    return out
+}
+
+reference_free(r: Reference) {
+    free(r.morphed)
+    free(r.posed)
+}
+
+// The largest difference, in metres, between `count` vertices' positions in
+// two runs of floats `stride_a` and `stride_b` apart.
+worst(a: ptr, stride_a: int, b: ptr, stride_b: int, count: int) -> float {
+    fa = a as f32[]
+    fb = b as f32[]
+    most = 0.0
+    v = 0
+    while v < count {
+        c = 0
+        while c < 3 {
+            d = absf((fa[v * stride_a + c] as float) - (fb[v * stride_b + c] as float))
+            if d > most { most = d }
+            c = c + 1
+        }
+        v = v + 1
+    }
+    return most
+}
+
+// The column drawn morphed and skinned, against the same column with the
+// CPU's morph baked into its vertices and no targets, skinned by the same
+// bones: the frame the renderer's whole path makes (the morph pass, then the
+// vertex shader's skinning, the shadows and the lighting of the morphed
+// normals) against the frame of the CPU's answer. Returns the channels that
+// differ by more than 2 of 255, and the lit pixels of the first frame.
+struct Parity {
+    differing: int
+    lit: int
+    morph_moved: int               // channels the morph changes, against the column unmorphed
+}
+
+channels_apart(a: ptr, b: ptr, n: int) -> int {
+    count = 0
+    i = 0
+    while i < n {
+        d = (mem.get_byte(a, i) as int) - (mem.get_byte(b, i) as int)
+        if d > 2 || d < 0 - 2 { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+parity(pass: *Backend, cam: *Camera, light: *Light, m: *Model, sk: *Skeleton, frame: fn() -> ptr) -> Parity {
+    n = WIDTH * HEIGHT * 4
+    core.model_set_morph_weight(m, 0, 0.0)
+    core.model_set_morph_weight(m, 1, 0.0)
+    core.backend_render(pass, cam, light)
+    plain = calloc(n, 1)
+    memcpy(plain, frame(), n as long)
+    core.model_set_morph_weight(m, 0, 0.7)
+    core.model_set_morph_weight(m, 1, 0.0 - 0.4)
+    core.backend_render(pass, cam, light)
+    first = calloc(n, 1)
+    memcpy(first, frame(), n as long)
+    moved_by = channels_apart(plain, first, n)
+    free(plain)
+    ref = reference_of(m, sk)
+    baked = core.model_new()
+    geometry.mesh_destroy(baked.mesh)
+    baked.mesh = geometry.mesh_clone(m.mesh)
+    o = ref.morphed as f32[]
+    v = 0
+    while v < core.mesh_vertex_count(m.mesh) {
+        geometry.mesh_set_pos(baked.mesh, v, o[v * 9] as float, o[v * 9 + 1] as float, o[v * 9 + 2] as float)
+        geometry.mesh_set_normal(baked.mesh, v, o[v * 9 + 5] as float, o[v * 9 + 6] as float, o[v * 9 + 7] as float)
+        v = v + 1
+    }
+    core.model_set_skeleton(baked, sk as ptr)
+    core.backend_remove_model(pass, m)
+    core.backend_add_model(pass, baked)
+    core.backend_render(pass, cam, light)
+    second = frame()
+    out = Parity { differing: channels_apart(first, second, n), lit: 0, morph_moved: moved_by }
+    i = 0
+    while i < n {
+        if mem.get_byte(first, i) > 4 { out.lit = out.lit + 1 }
+        i = i + 4
+    }
+    core.backend_remove_model(pass, baked)
+    core.backend_add_model(pass, m)
+    core.model_free(baked)
+    reference_free(ref)
+    free(first)
+    return out
+}
+
+// The largest change a target makes anywhere: what "morphed" has to beat.
+moved(a: ptr, mesh: ptr, count: int) -> float {
+    return worst(a, 9, geometry.mesh_vertex_data(mesh), 9, count)
+}
+
+var g_target: ptr = null
+
+gl_frame() -> ptr { return offscreen.target_pixels(g_target) }
+vk_frame() -> ptr { return vulkan.offscreen_pixels() }
+
+on_gl(cam: *Camera, light: *Light) {
+    println("OpenGL:")
+    context = offscreen.context_create(WIDTH, HEIGHT)
+    if context == null {
+        println("  skip no OpenGL context")
+        return
+    }
+    renderer = gl.renderer_new()
+    pass = gl.backend(renderer)
+    if !core.backend_init(&pass, context, WIDTH, HEIGHT) {
+        println("  skip the OpenGL backend would not initialise")
+        gl.renderer_free(renderer)
+        offscreen.context_destroy(context)
+        return
+    }
+    target = offscreen.target_create(WIDTH, HEIGHT)
+    g_target = target as ptr
+    gl.renderer_set_target(renderer, target)
+    gl.renderer_set_clear_color(renderer, 0.0, 0.0, 0.0)
+    bones = build_bones()
+    sk = skin.skeleton_new()
+    i = 0
+    while i < list.size(bones) {
+        skin.skeleton_add(sk, list.get_raw(bones, i) as *Model)
+        i = i + 1
+    }
+    skin.skeleton_bind(sk)
+    m = build_column(bones)
+    core.model_set_skeleton(m, sk as ptr)
+    core.backend_add_model(&pass, m)
+    n = core.mesh_vertex_count(m.mesh)
+    read = calloc(n * 9, 4)
+
+    core.model_set_morph_weight(m, 0, 0.7)
+    core.model_set_morph_weight(m, 1, 0.0 - 0.4)
+    bend(bones, QUARTER_TURN / 3.0)
+    core.backend_render(&pass, cam, light)
+    passes, written = gl.renderer_morph_stats()
+    ref = reference_of(m, sk)
+    gl.renderer_read_vertices(m, read, n * 36)
+    off = worst(read, 9, ref.morphed, 9, n)
+    println("  2 of 3 targets active: ${passes} pass, ${written} vertices; the read-back morph against the CPU's: ${off} m (the morph moves them ${moved(ref.morphed, m.mesh, n)} m)")
+    check("GL: the morph pass ran once, over every vertex", passes == 1 && written == n)
+    check("GL: the morphed vertices are the CPU's within 1e-4 m", off <= 0.0001 && moved(ref.morphed, m.mesh, n) > 0.1)
+    reference_free(ref)
+
+    core.model_set_morph_weight(m, 0, 0.0)
+    core.model_set_morph_weight(m, 1, 0.0)
+    core.backend_render(&pass, cam, light)
+    gl.renderer_read_vertices(m, read, n * 36)
+    back = moved(read, m.mesh, n)
+    core.backend_render(&pass, cam, light)
+    passes, written = gl.renderer_morph_stats()
+    println("  weights all zero: the bind pose back within ${back} m; the next frame ${passes} passes")
+    check("GL: weights at zero put the bind pose back", back == 0.0)
+    check("GL: and cost nothing after: no pass", passes == 0 && written == 0)
+
+    drawn = parity(&pass, cam, light, m, sk, gl_frame)
+    println("  drawn morphed and skinned: ${drawn.lit} pixels lit, the morph moves ${drawn.morph_moved} channels; against the CPU's morph baked in and skinned, ${drawn.differing} channels differ")
+    check("GL: the morphed, skinned column draws as the CPU's morph skinned does", drawn.differing <= 4 && drawn.morph_moved > 100)
+
+    free(read)
+    core.backend_remove_model(&pass, m)
+    core.backend_cleanup(&pass)
+    core.model_free(m)
+    skin.skeleton_free(sk)
+    free_bones(bones)
+    offscreen.target_destroy(target)
+    gl.renderer_free(renderer)
+    offscreen.context_destroy(context)
+}
+
+on_vulkan(cam: *Camera, light: *Light) {
+    println("Vulkan:")
+    renderer = vulkan.renderer_new()
+    pass = vulkan.backend(renderer)
+    if !core.backend_init(&pass, null, WIDTH, HEIGHT) {
+        println("  skip Vulkan would not start (${vulkan.last_error()})")
+        vulkan.renderer_free(renderer)
+        return
+    }
+    vulkan.renderer_set_clear_color(renderer, 0.0, 0.0, 0.0)
+    // The rays' skinning poses the figure into a buffer the test reads:
+    // the device's own skinning of the morphed vertices.
+    traced = vulkan.renderer_ray_query(renderer)
+    if traced {
+        vulkan.renderer_set_ray_shadows(renderer, true)
+        vulkan.renderer_set_ray_skinned(renderer, 4)
+    }
+    bones = build_bones()
+    sk = skin.skeleton_new()
+    i = 0
+    while i < list.size(bones) {
+        skin.skeleton_add(sk, list.get_raw(bones, i) as *Model)
+        i = i + 1
+    }
+    skin.skeleton_bind(sk)
+    m = build_column(bones)
+    core.model_set_skeleton(m, sk as ptr)
+    core.backend_add_model(&pass, m)
+    n = core.mesh_vertex_count(m.mesh)
+    read = calloc(n * 9, 4)
+    posed = calloc(n * 3, 4)
+
+    core.model_set_morph_weight(m, 0, 0.7)
+    core.model_set_morph_weight(m, 1, 0.0 - 0.4)
+    bend(bones, QUARTER_TURN / 3.0)
+    core.backend_render(&pass, cam, light)
+    meshes, written = vulkan.renderer_morph_stats(renderer)
+    ref = reference_of(m, sk)
+    vulkan.renderer_read_vertices(renderer, m, read, n * 36)
+    off = worst(read, 9, ref.morphed, 9, n)
+    println("  2 of 3 targets active: ${meshes} dispatch, ${written} vertices; the read-back morph against the CPU's: ${off} m")
+    check("Vulkan: the morph dispatched once, over every vertex", meshes == 1 && written == n)
+    check("Vulkan: the morphed vertices are the CPU's within 1e-4 m", off <= 0.0001 && moved(ref.morphed, m.mesh, n) > 0.1)
+    if traced && vulkan.renderer_read_posed(renderer, m, posed) {
+        skinned_off = worst(posed, 3, ref.posed, 3, n)
+        println("  morphed then skinned on the device, against the CPU's morph then skin: ${skinned_off} m")
+        check("Vulkan: morph then skin on the device is the CPU's within 1e-4 m a vertex", skinned_off <= 0.0001)
+    } else {
+        println("  skip the device does not trace rays, whose skinning pass the skinned vertices are read from")
+    }
+    reference_free(ref)
+
+    core.model_set_morph_weight(m, 0, 0.0)
+    core.model_set_morph_weight(m, 1, 0.0)
+    core.backend_render(&pass, cam, light)
+    vulkan.renderer_read_vertices(renderer, m, read, n * 36)
+    back = moved(read, m.mesh, n)
+    core.backend_render(&pass, cam, light)
+    meshes, written = vulkan.renderer_morph_stats(renderer)
+    println("  weights all zero: the bind pose back within ${back} m; the next frame ${meshes} dispatches")
+    check("Vulkan: weights at zero put the bind pose back", back == 0.0)
+    check("Vulkan: and cost nothing after: no dispatch, no copy", meshes == 0 && written == 0)
+
+    drawn = parity(&pass, cam, light, m, sk, vk_frame)
+    println("  drawn morphed and skinned: ${drawn.lit} pixels lit, the morph moves ${drawn.morph_moved} channels; against the CPU's morph baked in and skinned, ${drawn.differing} channels differ")
+    check("Vulkan: the morphed, skinned column draws as the CPU's morph skinned does", drawn.differing <= 4 && drawn.morph_moved > 100)
+
+    free(read)
+    free(posed)
+    core.backend_remove_model(&pass, m)
+    core.backend_cleanup(&pass)
+    core.model_free(m)
+    skin.skeleton_free(sk)
+    free_bones(bones)
+    vulkan.renderer_free(renderer)
+}
+
+// --- curves -------------------------------------------------------------------------------------
+
+curves() {
+    println("weights as pose curves:")
+    scene = gltf.load("tests/fixtures/gltf/AnimatedMorphCube.glb")
+    if scene == null {
+        check("AnimatedMorphCube.glb loads", false)
+        return
+    }
+    // A rig of the cube's one node, and a curve for each of its targets.
+    names = calloc(1, 8)
+    (names as ptr[])[0] = string.keep("root")
+    parents = calloc(1, 4) as int[]
+    parents[0] = 0 - 1
+    rest = calloc(pose.FLOATS, 8)
+    (rest as float[])[6] = 1.0
+    (rest as float[])[7] = 1.0
+    (rest as float[])[8] = 1.0
+    (rest as float[])[9] = 1.0
+    rig = pose.of_joints(1, names, parents, rest)
+    prim = gltf.primitive(scene, 0)
+    first = pose.add_morph_curves(rig, prim)
+    count = pose.curve_count(rig)
+    check("a curve for each of the cube's two targets", first == 0 && count == 2)
+    animation = gltf.animation_name(scene, 0)
+    take = clips.from_scene(rig, scene, animation, 0.0)
+    check("the take of its animation is made", take != null)
+    if take == null { return }
+    // The take's curves are the channel's weights at its frames.
+    ch = null
+    i = 0
+    while i < gltf.clip_count(scene) {
+        c = gltf.clip(scene, i)
+        k = 0
+        while k < anim.clip_channel_count(c) {
+            if anim.channel_target(anim.clip_channel(c, k)) == anim.WEIGHTS { ch = anim.clip_channel(c, k) }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    values = calloc(2, 8)
+    p = pose.new(rig)
+    off = 0.0
+    f = 0
+    while f < clips.frames(take) {
+        at = (f as float) / clips.rate(take)
+        clips.sample_frame(take, rig, f, p)
+        anim.sample_weights(ch, at, values)
+        d = absf(pose.curve(rig, p, 0) - (values as float[])[0]) + absf(pose.curve(rig, p, 1) - (values as float[])[1])
+        if d > off { off = d }
+        f = f + 1
+    }
+    println("  ${clips.frames(take)} frames; the take's curves against the channel: ${off}")
+    check("the take's curves are the channel's weights at its frames", off < 0.000001)
+    // Two takes' worth: the take at two times, blended a third of the way.
+    a = pose.new(rig)
+    b = pose.new(rig)
+    out = pose.new(rig)
+    clips.sample(take, rig, 0.4, false, a)
+    clips.sample(take, rig, 1.3, false, b)
+    pose.blend(rig, a, b, 1.0 / 3.0, out)
+    linear = 0.0
+    q = 0
+    while q < count {
+        want = pose.curve(rig, a, q) + (pose.curve(rig, b, q) - pose.curve(rig, a, q)) / 3.0
+        if absf(pose.curve(rig, out, q) - want) > linear { linear = absf(pose.curve(rig, out, q) - want) }
+        q = q + 1
+    }
+    println("  blend a third of the way: (${pose.curve(rig, out, 0)}, ${pose.curve(rig, out, 1)}) from (${pose.curve(rig, a, 0)}, ${pose.curve(rig, a, 1)}) and (${pose.curve(rig, b, 0)}, ${pose.curve(rig, b, 1)})")
+    check("a blend of two takes' weights is linear", linear < 0.0000001 && absf(pose.curve(rig, a, 0) - pose.curve(rig, b, 0)) + absf(pose.curve(rig, a, 1) - pose.curve(rig, b, 1)) > 0.1)
+    // Additive: b over a as a difference from the rest, half deep.
+    diff = pose.new(rig)
+    pose.difference(rig, b, rig.rest, diff)
+    pose.add(rig, a, diff, 0.5, out)
+    added = absf(pose.curve(rig, out, 0) - (pose.curve(rig, a, 0) + 0.5 * (pose.curve(rig, b, 0) - pose.curve(rig, rig.rest, 0))))
+    check("an additive lays a weight's difference over another's", added < 0.0000001)
+    // Applied: the frame's one write reaches the node the primitive draws by.
+    pose.apply(rig, b)
+    weights, n = core.model_morph_weights(prim)
+    check("a pose applied writes its curves to the weights the mesh draws by", n == 2 && (weights as f32[])[0] as float == (pose.curve(rig, b, 0) as f32) as float)
+    // Mirrored, a face's left side's weights are its right side's.
+    head = core.model_new()
+    core.model_set_morph_weight(head, 2, 0.0)
+    rig2 = pose.of_joints(1, names, parents, rest)
+    pose.add_curve(rig2, "eyeBlinkLeft", head as ptr, 0)
+    pose.add_curve(rig2, "eyeBlinkRight", head as ptr, 1)
+    pose.add_curve(rig2, "jawOpen", head as ptr, 2)
+    face_pose = pose.new(rig2)
+    pose.set_curve(rig2, face_pose, 0, 0.9)
+    pose.set_curve(rig2, face_pose, 1, 0.1)
+    pose.set_curve(rig2, face_pose, 2, 0.5)
+    pose.mirror(rig2, face_pose, face_pose)
+    check("mirrored, eyeBlinkLeft's weight is eyeBlinkRight's and jawOpen keeps its own",
+          pose.curve(rig2, face_pose, 0) == 0.1 && pose.curve(rig2, face_pose, 1) == 0.9 && pose.curve(rig2, face_pose, 2) == 0.5)
+    pose.release(face_pose)
+    pose.rig_free(rig2)
+    core.model_free(head)
+    free(values)
+    pose.release(p)
+    pose.release(a)
+    pose.release(b)
+    pose.release(out)
+    pose.release(diff)
+    clips.take_free(take)
+    pose.rig_free(rig)
+    free(rest)
+    free(parents as ptr)
+    string.release_kept((names as ptr[])[0])
+    free(names)
+    gltf.scene_destroy(scene)
+}
+
+// --- the face set and blinks --------------------------------------------------------------------
+
+faces() {
+    println("the ARKit-like face set, mapped by name:")
+    check("ARKit's own names", face.shape_of("eyeBlinkLeft") == face.EYE_BLINK_LEFT && face.shape_of("jawOpen") == face.JAW_OPEN && face.shape_of("tongueOut") == 51)
+    check("a mesh prefix, separators and _L / _R", face.shape_of("Face.eye_Blink_L") == face.EYE_BLINK_LEFT && face.shape_of("EyeBlink_R") == face.EYE_BLINK_RIGHT)
+    check("Blender's .L / .R and upper case", face.shape_of("mouthSmile.L") == face.MOUTH_SMILE_LEFT && face.shape_of("JAW_OPEN") == face.JAW_OPEN)
+    check("a name that is none of the 52", face.shape_of("lift") < 0 && face.shape_of("eyeBlink") < 0)
+    // A head of four targets named as a tool writes them.
+    m = core.model_new()
+    core.mesh_push_vertex(m.mesh, core.vec3(0.0, 0.0, 0.0), 0.0, 0.0, core.vec3(0.0, 1.0, 0.0))
+    set = morph.set_new(1)
+    morph.add_target(set, "Head.EyeBlink_L", 0.0)
+    morph.add_target(set, "Head.EyeBlink_R", 0.0)
+    morph.add_target(set, "Head.JawOpen", 0.0)
+    morph.add_target(set, "Head.Frown", 0.0)
+    core.model_set_morph(m, set as ptr)
+    map = face.map_of(m)
+    check("a head's targets found: 3 of its 4 are ARKit shapes", face.mapped(map) == 3 && face.target(map, face.EYE_BLINK_RIGHT) == 1 && face.target(map, face.JAW_OPEN) == 2)
+
+    println("procedural blinks, ten minutes at 60 frames a second:")
+    blinker = face.blinker_new(7)
+    dt = 1.0 / 60.0
+    frames = 60 * 600
+    closing = 0.0
+    opening = 0.0
+    closings = 0
+    openings = 0
+    rising = 0.0
+    falling = 0.0
+    was = 0.0
+    shut_frames = 0
+    f = 0
+    while f < frames {
+        face.blink_step(blinker, dt)
+        w = face.blink_weight(blinker)
+        // A closing timed from the lid leaving open to its reaching shut, an
+        // opening from its leaving shut to its being open again.
+        if was == 0.0 && w > 0.0 { rising = 0.0 }
+        if w > 0.0 && w < 1.0 && w > was { rising = rising + dt }
+        if was < 1.0 && w >= 1.0 {
+            closing = closing + rising + dt
+            closings = closings + 1
+        }
+        if was >= 1.0 && w < 1.0 { falling = 0.0 }
+        if w < 1.0 && w > 0.0 && w < was { falling = falling + dt }
+        if was > 0.0 && w == 0.0 {
+            opening = opening + falling + dt
+            openings = openings + 1
+        }
+        if w >= 1.0 { shut_frames = shut_frames + 1 }
+        was = w
+        f = f + 1
+    }
+    per_minute = (face.blinks(blinker) as float) / 10.0
+    close_ms = closing * 1000.0 / (closings as float)
+    open_ms = opening * 1000.0 / (openings as float)
+    println("  ${face.blinks(blinker)} blinks, ${per_minute} a minute; closing ${close_ms} ms, opening ${open_ms} ms (at 60 Hz, to a frame)")
+    check("15 to 20 blinks a minute, as people at rest", per_minute >= 15.0 && per_minute <= 20.0)
+    check("each closes in about 100 ms (within a frame)", close_ms >= 100.0 - 17.0 && close_ms <= 100.0 + 17.0)
+    check("and opens in 150 to 200 ms", open_ms >= 150.0 && open_ms <= 200.0)
+    face.blink_apply(blinker, map)
+    check("a blink weighs both eyes' shapes on the head", core.model_morph_weight(m, 0) == face.blink_weight(blinker) && core.model_morph_weight(m, 1) == face.blink_weight(blinker))
+    face.blinker_free(blinker)
+    face.map_free(map)
+    core.model_free(m)
+}
+
+main() {
+    println("test_morph (#910)")
+    faces()
+    import_sparse()
+    import_cube()
+    println("the samples' offsets against their files:")
+    held_to_file("tests/fixtures/gltf/AnimatedMorphCube.glb", "AnimatedMorphCube")
+    held_to_file("tests/fixtures/gltf/MorphPrimitivesTest.glb", "MorphPrimitivesTest")
+    held_to_file("tests/fixtures/gltf/MorphStressTest.glb", "MorphStressTest")
+    curves()
+
+    cam = core.camera_new(WIDTH, HEIGHT)
+    core.camera_set_position(cam, core.vec3(0.0, 2.0, 7.0))
+    core.camera_look_at(cam, core.vec3(0.0, 2.0, 0.0))
+    light = core.light_directional(core.vec3(0.2, 0.4, 1.0), core.vec3(1.0, 1.0, 1.0), 1.0)
+    on_gl(cam, light)
+    on_vulkan(cam, light)
+    core.light_free(light)
+    core.camera_free(cam)
+
+    if g_failures > 0 {
+        println("test_morph: ${g_failures} FAILED")
+        exit(1)
+    }
+    // ci.sh passes a suite on the words "all checks passed".
+    println("test_morph: all checks passed")
+}
