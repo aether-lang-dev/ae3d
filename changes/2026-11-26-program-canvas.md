@@ -12,11 +12,19 @@
   from an `ae3d.shaderlib` `mat4`. Vulkan: `ae3d.vkcanvas` (images, render
   pass, framebuffer), `vkquote.program_pair_new`; OpenGL: an offscreen
   target with depth. `docs/canvas.md`.
+- `engine_texture_new`: a texture of the program's RGBA bytes for its
+  canvas draws, no colour curve, nearest and repeating, no mips
+  (`vktexture.texture_create_picture`; on OpenGL an RGBA8 texture).
+  `engine_texture_free`.
+- `engine_canvas_draw` takes `over` after `cull`: the draw blended over
+  what is there by its pixel shader's alpha, depth still tested and
+  written (`vkquote.program_pipeline`).
+- `platform.window_set_size`, `window_x`, `window_y`: the window resized
+  in points, and where it is on the desktop.
+- `gpu.set_vec4`: a shader's vec4 input from four numbers, as `set_vec3`
+  sets a vec3.
 - `examples/canvas.ae`: a turning globe in a canvas, the same on Vulkan and
-  OpenGL to 1/255. A program of its own draws a sky and a land, a grid its
-  vertex shader raises into hills, into a canvas: no more than 71 pixels of
-  307,200 more than 2/255 from reference frames drawn by another renderer,
-  on either renderer.
+  OpenGL to 1/255.
 
 ### Fixed
 

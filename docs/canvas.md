@@ -4,8 +4,8 @@ A program can draw meshes of its own with shaders of its own, written in
 Aether with `quote`, into a canvas: a picture with depth, the program's,
 drawn each frame before the frame's own passes and shown in a rectangle of
 the frame as its shaders wrote it, through no tone curve. A world of the
-program's making (a flight over hills a vertex shader raises), or anything
-a vertex and a pixel shader of its own draw better than ae3d's materials.
+program's making (terrain a vertex shader raises, say), or anything a
+vertex and a pixel shader of its own draw better than ae3d's materials.
 
 ```aether
 canvas = engine.engine_canvas_new(e, 480, 480)          // once the engine has started
@@ -13,7 +13,7 @@ globe = engine.engine_mesh_new(e, mesh)                  // an ae3d.core mesh of
 ...
 _l = gpu.set_m4(vs, "lens", engine.engine_canvas_lens(e, frustum))   // each frame
 engine.engine_canvas_begin(e, canvas, 0.1, 0.12, 0.2, 1.0)           // cleared to, and the last frame's draws off
-engine.engine_canvas_draw(e, canvas, vs, ps, globe_spirv.globe(), globe, true, null, 0)
+engine.engine_canvas_draw(e, canvas, vs, ps, globe_spirv.globe(), globe, true, false, null, 0)
 engine.engine_canvas_show(e, canvas, x, y, 480, 480)
 ```
 
@@ -24,14 +24,26 @@ its parameter a struct of the mesh's vertex, fields named as ae3d's vertex
 has them (`position`, `uv`, `normal`), and it returns a struct of its clip
 `position` and its varyings. `ps` is a pixel shader whose parameter is that
 struct. Each has its inputs, the parameters of the functions that make
-them, set between frames with `gpu.set_float`, `set_vec3`, `set_m4` (an
+them, set between frames with `gpu.set_float`, `set_vec3`, `set_vec4`, `set_m4` (an
 `ae3d.shaderlib` `mat4`) and the rest. The pixel shader may sample
-textures, given to the draw as the renderer's texture handles in its order.
+textures, given to the draw as the renderer's texture handles in its order:
+an array of them, 8 bytes each, and how many.
+
+## Pictures of the program's
+
+`engine_texture_new(e, width, height, rgba)` makes a texture of RGBA bytes
+the program has, from the top row: its bytes as they are, through no
+colour curve, sampled nearest (the one texel a place falls in), repeating,
+no mips. So a pixel shader reads exactly the bytes the program gave. The
+program frees it with `engine_texture_free`.
 
 A draw takes both shaders' inputs as they are when it is queued: the
 program sets them again and queues the same pair for the next mesh, a draw
 each. Draws are depth-tested and written, in the order queued, a mesh's
-back faces culled when asked. They stay queued, drawn every frame, until
+back faces culled when asked, and blended over what is there by its
+pixel shader's alpha when asked (`over`, source-alpha blending, depth still
+tested and written): queue see-through meshes after opaque ones, furthest
+first. They stay queued, drawn every frame, until
 `engine_canvas_begin` clears them; a program that changes nothing queues
 nothing.
 
@@ -76,13 +88,13 @@ written is what is shown.
 `examples/canvas.ae` draws a turning globe, lit by the sun in bands of
 latitude, into a 480 x 480 canvas in the middle of the frame: the same on
 Vulkan and OpenGL to 1/255 at every pixel of 576,000, with nothing from
-the Vulkan validation layer. A flight over a land draws its sky and its
-land this way, a grid of 128 x 128 cells its vertex shader raises into
-hills and moves under the eye, and is held to reference frames drawn by
-another renderer: at three places on its way, no more than 71 pixels of
-307,200 more than 2/255 from them, on Vulkan and on OpenGL. A pair whose
-vertex shader has no input, a sky's corners in clip space, is drawn as
-well.
+the Vulkan validation layer.
+
+The canvas has also been used at a larger scale: a terrain grid of
+128 x 128 cells raised by its vertex shader, a pair whose vertex shader has
+no input (corners in clip space), a textured globe, and up to a hundred
+draws a frame of one pair with its inputs set between them, some blended
+with `over`, agreeing between Vulkan and OpenGL to within 2/255.
 
 ## A frame from a host: `ae3d.batch`
 
